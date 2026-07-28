@@ -1,0 +1,646 @@
+# Tailhawk — UI Design
+
+**Version:** 0.1 (draft for adversarial review)
+**Date:** 2026-07-28
+**Companion documents:** [`RESEARCH.md`](RESEARCH.md) · [`SPEC.md`](SPEC.md) · [`PLAN.md`](PLAN.md)
+
+---
+
+> ## ⚠ Phase markers — read this first
+>
+> **`SPEC.md` §15 is authoritative on phasing. This document is not.** An earlier draft carried no
+> phase markers at all and presented the merged view, trace correlation and per-field filter actions
+> as ambient product, with `Ctrl+M` sitting in the v1 keyboard map. A UI implementer works from *this*
+> document — so v1 would have been built with v2 in it, and the discovery would have landed at M7,
+> week 62, the milestone that gates release.
+>
+> Every section below is now tagged:
+>
+> | Tag | Meaning |
+> |---|---|
+> | **`[v1]`** | Ships in v1. The v1 window is §2, and it looks exactly as drawn there. |
+> | **`[v2]`** | Designed now so v1 does not foreclose it. **Not built in v1.** |
+> | **`[v3]`** | Sketched only. |
+
+## 1. Design principles `[v1]`
+
+**Tailhawk — watch your logs like a hawk.**
+
+The identity leads with the idiom, because that is what makes the name decode correctly on first
+contact. Everything else follows from five principles:
+
+1. **The log is the interface.** Chrome is thin, quiet and gets out of the way. At any moment the
+   overwhelming majority of pixels are log content. No ribbon, no toolbar of 30 icons, no MDI child
+   frames.
+2. **Never lie, never silently drop.** A line that could not be parsed is *shown* as unparsed. A guess
+   about format or encoding is *visible* and *one click to change*. A truncated line says it was
+   truncated. A stale network view says it is stale.
+3. **Nothing modal on the hot path.** Filtering, searching, changing a highlight rule, switching
+   format — all happen inline with live preview. Modal dialogs are for genuinely separate tasks
+   (settings, export).
+4. **Progressive, never blocking.** Content paints before the index is built; the scrollbar refines
+   itself; filters stream results. The window is interactive within 150 ms regardless of file size.
+5. **Density without noise.** This is a professional tool used all day. Compact rows, real columns,
+   generous information density — but a restrained palette so that *user* highlight colours are the
+   loudest thing on screen.
+
+### 1.1 What "modern, not MDI" means concretely
+
+| Rejected | Adopted |
+|---|---|
+| MDI child windows with their own title bars | Flat tab strip, drag-to-reorder, drag-out-to-split |
+| Grey 3D-bevelled Win32 chrome | Flat surfaces, Windows 11 Mica on chrome, opaque grid |
+| Toolbar of ambiguous 16×16 icons | Command palette (`Ctrl+K`) + a handful of labelled controls |
+| Modal config dialogs per feature | Inline editors with live preview over real data |
+| Settings spread across 6 tabbed property sheets | One searchable settings surface |
+| Fixed-function status bar | Status bar as a row of **live, clickable chips** |
+
+---
+
+## 2. Main window `[v1]`
+
+**This is the v1 window as it actually is at v1** — no merge tab, no trace popover, no per-field
+filter action.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────────────┐
+│ 🦅  api.log  ×  │ jobdispatcher.log ● × │ nginx-access.log × │  +          ─  □  ✕        │  ← Mica title bar,
+├───────────────────────────────────────────────────────────────────────────────────────────┤     tabs inline
+│ ⌕ Search…              │ ⊕ level >= Warning ⊗ /healthz/ ⊕ Ab timeout  + Filter │ ⚙ Rules  │  ← command bar:
+├──┬────────────┬─────────────────────┬─────┬──────────┬───────────────────────────────────┤     filter CHIPS
+│  │ #          │ Timestamp           │ Lvl │ Logger   │ Message                           │  ← column header
+├──┼────────────┼─────────────────────┼─────┼──────────┼───────────────────────────────────┤
+│  │ 4,182,993  │ 09:14:02.117        │ INF │ Api.Cont │ Started HTTP GET /api/contacts    │▲ │
+│  │ 4,182,994  │ 09:14:02.álig131    │ INF │ Api.Cont │ Query returned 412 rows in 88ms   │█ │  ← scrollbar with
+│▌ │ 4,182,995  │ 09:14:03.884        │ ERR │ Api.Disp │ Failed to dispatch job 41982      │█ │    match density
+│  │            │                     │     │          │ ▸ System.InvalidOperationExcep…   │  │    marks
+│  │ 4,183,001  │ 09:14:04.002        │ WRN │ Api.Cont │ Retry 1/3 for job 41982           │▼ │
+├──┴────────────┴─────────────────────┴─────┴──────────┴───────────────────────────────────┤
+│ ⬤ Following  │ Serilog (file) 99.2% ▾ │ UTF-8 ▾ │ 4,183,001 lines · 8.2 GB │ 3 rules ▾   │  ← status chips
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+   ▲ gutter: bookmark, unparsed stripe, new-data marker
+```
+
+### 2.1 Regions
+
+**Title bar and tab strip.** Tabs live in the title bar to reclaim vertical space. Mica backdrop
+(Windows 11 22621+, probed at runtime). A tab shows a **●** when new content has arrived while
+unfocused. Middle-click closes; drag reorders; drag out of the strip creates a split pane; drag onto
+another window merges. `+` opens a file, a file set, or a watched folder.
+
+**Command bar.** Search on the left; a **filter chip row** on the right; rules button.
+
+**The filter surface is a row of chips, not a text field.** An earlier draft drew a single box, which
+cannot express three of the owner's five daily-use features — include filters, exclude filters, and
+multiple composing text filters. Each chip is one independent predicate object per the grammar in
+`SPEC.md` §7.2:
+
+```
+  ⊕ level >= Warning     include chip, comparison predicate
+  ⊗ /healthz/            exclude chip, regex predicate
+  ⊕ Ab timeout           include chip, plain-text predicate ("Ab" = literal, ".*" = regex)
+  + Filter               add a new chip
+```
+
+- **Click the ⊕/⊗ glyph** to flip a chip between include and exclude — the single most common edit.
+- **Click the chip body** to edit it inline as text; it expands into a field with live validation.
+- **Middle-click or ✕** removes it. Chips are draggable to reorder for readability only; order does
+  not affect the result.
+- A chip naming a column the current format lacks renders in a **warning state** naming the missing
+  field, per §7.2's unknown-field rule — it does not silently match nothing.
+- Chips overflow into a `⋯ +3` affordance rather than wrapping the command bar.
+
+Search remains a single field and accepts plain text or regex via a `.*` toggle. No modal find dialog.
+
+**Column header.** Real, resizable, reorderable, hideable columns — not monospace padding. Sortable
+headers show the sort affordance **only when sorting is eligible** (§11.4 of SPEC: filtered set
+≤ 2M rows); otherwise the affordance is absent rather than present-and-broken.
+
+**Gutter.** Narrow, left of the line-number column. Carries: bookmark marks, a coloured stripe for
+unparsed lines, the new-data separator, and severity as a **redundant non-colour channel** (a shape,
+so severity is legible in High Contrast and to colour-blind users).
+
+**Grid.** Virtualised, `u64` line-index scrolling. Rows are logical records; the `#` column shows
+**physical line numbers** so they match what every other tool reports. A record with continuation lines
+shows a **▸** chevron and expands in place.
+
+**Continuations are collapsed by default**, and this is a correctness requirement, not a preference —
+uniform row height is what makes the `u64` scroll model O(1). MEL Simple logs are multi-line by
+construction, so without collapse-by-default the *base* state of the view would be variable-height.
+Expanded rows are held in a capped side table (`SPEC.md` §6.4).
+
+**There is no word wrap in v1** (`SPEC.md` §6.4) — long lines scroll horizontally instead.
+
+**Scrollbars.** The vertical trough carries **density marks** for search hits and filter matches — a
+whole-file overview for free, and a genuinely liked feature in LogFusion Pro. A **horizontal
+scrollbar** appears when content exceeds the viewport width; its extent comes from the per-block
+`max_byte_len` bound (`SPEC.md` §3.3) and refines as blocks are laid out, so the thumb may shrink
+slightly during a long scroll — it never jitters per vertical scroll. **Shift+wheel** scrolls
+horizontally.
+
+**Status chips.** Every chip is live and clickable:
+
+| Chip | Shows | Click |
+|---|---|---|
+| `⬤ Following` | Follow state | Toggle follow / pin-to-file |
+| `Serilog (file) 99.2% ▾` | Detected format + parse health | Format dropdown / define new |
+| `UTF-8 ▾` | Detected encoding | Encoding override |
+| `4,183,001 lines · 8.2 GB` | Position and size | Go to line |
+| `3 rules ▾` | Active highlight rule set | Rule set switcher |
+| `⚠ Network mode` | *(conditional)* UNC source | Explains the polling interval |
+| `⚠ Settings not saved` | *(conditional)* stateless mode | Explains why |
+
+**Parse health lives in the format chip** — `Serilog (file) 99.2% ▾` — with the full breakdown
+(`99.2% parsed · 812 continuation · 14 unparsed`) on hover. This single number is what lets a user
+judge whether the detected format is right, and it is far more useful than a confidence percentage
+they cannot check.
+
+---
+
+## 3. Split view — the two-pane model
+
+klogg's most-validated layout, plus the in-place hide it has an open request for. Both ship; the user
+chooses per tab.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────────────┐
+│ ⌕ timeout                                    │ ▼ Filter: level >= Warning        ⚙ Rules  │
+├──┬────────────┬─────────────────────┬─────┬──────────┬───────────────────────────────────┤
+│  │ 4,182,993  │ 09:14:02.117        │ INF │ Api.Cont │ Started HTTP GET /api/contacts    │  │  ← full log
+│▌ │ 4,182,995  │ 09:14:03.884        │ ERR │ Api.Disp │ Failed to dispatch job 41982      │  │
+│  │ 4,183,001  │ 09:14:04.002        │ WRN │ Api.Cont │ Retry 1/3 for job 41982           │  │
+╞══╪════════════╪═════════════════════╪═════╪══════════╪═══════════════════════════════════╡  ← draggable
+│  │ 3,918,004  │ 08:51:19.771        │ ERR │ Api.Sql  │ Connection timeout after 30000ms  │  │     splitter
+│▌ │ 4,182,995  │ 09:14:03.884        │ ERR │ Api.Disp │ Failed to dispatch job 41982      │  │  ← matches only
+│  │ 4,190,551  │ 09:22:41.006        │ ERR │ Api.Sql  │ Connection timeout after 30000ms  │  │
+├──┴────────────┴─────────────────────┴─────┴──────────┴───────────────────────────────────┤
+│ 3 of 1,204 matches · scanning 62% ████████░░░░ · cancel                                   │  ← streaming
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Selecting in either pane scrolls the other to the same record. The bottom pane is a real view, not a
+copy — bookmarks, highlight rules and column layout all apply.
+
+**The streaming bar is not cosmetic.** Filtering is a full-file pass (SPEC §7.2), so the UI tells the
+truth about it: partial results appear immediately, the match counter climbs, the scrollbar is
+provisional, and cancel is always available. On UNC sources the filter field requires **Enter** rather
+than filtering as you type, and the field's placeholder says so.
+
+---
+
+## 4. Merged timeline view `[v2]`
+
+**Not built in v1.** Designed now so the v1 grid, record model and source abstraction do not foreclose
+it. The flagship differentiator, and the place where a naive implementation looks broken.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────────────┐
+│ 🦅  Merged: 4 sources  ×  │  +                                        ─  □  ✕            │
+├───────────────────────────────────────────────────────────────────────────────────────────┤
+│ ⌕ Search…                        │ ▼ Filter…                    │ ⏱ Reorder window: 2s ▾  │
+├──┬──────────────────┬────────────┬─────┬─────────────┬───────────────────────────────────┤
+│  │ Timestamp        │ Source     │ Lvl │ Logger      │ Message                           │
+├──┼──────────────────┼────────────┼─────┼─────────────┼───────────────────────────────────┤
+│  │ 09:14:02.117     │ ▌api       │ INF │ Api.Cont    │ Started HTTP GET /api/contacts    │
+│  │ 09:14:02.painted │ ▌gateway   │ INF │ Gw.Proxy    │ Forwarding to api:8080            │
+│  │ 09:14:03.884     │ ▌api       │ ERR │ Api.Disp    │ Failed to dispatch job 41982      │
+│  │ 09:14:03.901     │ ▌jobs      │ WRN │ Job.Runner  │ Job 41982 marked for retry        │
+├──┴──────────────────┴────────────┴─────┴─────────────┴───────────────────────────────────┤
+│░░│ 09:14:04.112     │ ▌jobs      │ INF │ Job.Runner  │ Retry scheduled                   │  ← settling band
+│░░│ 09:14:04.118     │ ▌gateway   │ INF │ Gw.Proxy    │ 502 returned to client            │     (dimmed)
+├───────────────────────────────────────────────────────────────────────────────────────────┤
+│ ⬤ Following · lagging 2s │ 4 sources │ ⚠ gateway: no timezone — using local ▾             │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Four design decisions carry the honesty principle:
+
+- **The settling band is visible.** Records inside the bounded reorder window (default 2s) render
+  dimmed with a hatched gutter. They can and will reorder. Once committed they never move again. Async
+  writers (Serilog batching, NLog `AsyncWrapper`) emit out of timestamp order by up to their flush
+  interval, so without this the viewport jumps under the cursor once a second and the feature reads as
+  buggy.
+- **The lag is stated**, in the status bar: `lagging 2s`. The reorder window is adjustable from the
+  command bar.
+- **Timezone problems are surfaced, not guessed.** A source whose format carries no zone (log4net
+  `%date`, RFC 3164) shows a warning chip with a one-click per-source timezone override. A source that
+  cannot participate at all (Serilog console default has *no date*) is shown greyed in the source list
+  with the reason.
+- **Source colour is a stable left stripe**, not a colour applied to the text — text colour belongs to
+  the user's highlight rules.
+
+**Columns are the union** of participating sources, with `Source` always present. Per-source constants
+(host, service — OTel `resource`) appear in the pane header, not repeated on every row.
+
+**Scrollback is bounded at 1M merged records** (SPEC §8.3). Scrolling beyond it shows a quiet marker —
+*"streaming older records…"* — while a fresh k-way merge runs. It does not pretend to be instant.
+
+---
+
+## 5. Highlight rules and filters
+
+Inline, non-modal, live preview over the real file. This is the surface that replaces LogExpert's
+"set up a dev environment and compile a DLL".
+
+```
+┌─ Rules — “App production” ────────────────────────────────────────────────── ✕ ──┐
+│                                                                                   │
+│  ⣿ ☑  ERROR|FATAL                        .*  ▉ red on ▉ ─    ▸ whole line   ⋮     │
+│  ⣿ ☑  timeout|timed out                  Ab  ▉ amber        ▸ match only    ⋮     │
+│  ⣿ ☑  (?<id>0HN[A-Z0-9]+)                .*  ▉ auto-colour  ▸ identifier    ⋮     │
+│  ⣿ ☐  deprecated                         Ab  ▉ grey         ▸ match only    ⋮     │
+│                                                                                   │
+│  + Add rule                                        Import…  Export…  Apply to ▾   │
+├───────────────────────────────────────────────────────────────────────────────────┤
+│  Preview — 200 lines from this file                                               │
+│  09:14:03.884 ERR Api.Disp  Failed to dispatch job 41982 ▉                        │
+│  08:51:19.771 ERR Api.Sql   Connection timeout after 30000ms ▉                    │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **`.*` / `Ab` toggle** per rule selects regex vs plain text. Regex validity is checked as you type,
+  with the error shown inline — never on OK.
+- **Drag handle (`⣿`)** reorders; precedence is top-down and visible.
+- **Checkbox** enables/disables without deleting — a Hoo WinTail affordance the owner uses.
+- **`Apply to ▾`** binds the set to *this file*, *a glob* (`C:\logs\jobdispatcher\*.log`), or *a
+  detected format*. Binding to a glob or format is the thing no incumbent does.
+- **Import/Export** writes a shareable file — and **imported rules are treated as untrusted**
+  (SPEC §13.1): regexes compile with explicit size limits, and a rule that would arm an action or
+  reference a remote path is rejected on import with a clear explanation.
+- **`identifier`** marks a capture group as correlatable, feeding §7.
+
+Beneath user rules sits the **zero-config semantic layer** — timestamps, durations, GUIDs, IPs, URLs,
+paths, HTTP verbs and status codes, `key=value`, quoted strings — on by default. klogg's fatal UX flaw
+is an empty highlighter set on first run; Tailhawk is useful before you configure anything.
+
+---
+
+## 6. Format detection and the format wizard
+
+### 6.1 The chip
+
+The format chip is the whole trust model in one control:
+
+```
+   Serilog (file) 99.2% ▾
+   ┌────────────────────────────────────────┐
+   │ ✓ Serilog (file)              99.2%    │
+   │   log4net                     71.4%    │  ← runner-up shown when margin < 15%
+   │   Plain text                           │
+   │ ─────────────────────────────────────  │
+   │   Define format from a line…           │
+   │   Import layout from config…           │
+   │   Scan folder for logging config…      │
+   │ ─────────────────────────────────────  │
+   │   Remember for  ○ this file            │
+   │                 ● C:\logs\ndc\*.log    │
+   └────────────────────────────────────────┘
+```
+
+When no format clears 0.75 absolute **and** a 15% margin, the chip renders in a warning state —
+*"Detected: Serilog (file) — also matched log4net"* — rather than silently picking. Silent
+mis-columnising is worse than no columnising.
+
+### 6.2 Define from example
+
+```
+┌─ Define format ───────────────────────────────────────────────────────────── ✕ ──┐
+│  Example line (right-clicked)                                                     │
+│  2026-07-28 09:14:02,117 [12] INFO  Zenith.Automation.Runner - Evaluated 412…     │
+│  ├──── ts ────────────┤ ├th┤ ├lvl┤  ├──── logger ─────────┤   ├─── message ───    │
+│                                                                                   │
+│  Pattern   <ts> [<thread>] <level> <logger> - <message>            Edit as regex… │
+│                                                                                   │
+│  Roles     ts → Timestamp ▾   level → Severity ▾   message → Body ▾               │
+│                                                                                   │
+├───────────────────────────────────────────────────────────────────────────────────┤
+│  Preview — next 200 lines                                    ✓ 198 matched (99%)  │
+│  ┌──────────────────┬────┬─────┬──────────────────────┬────────────────────────┐  │
+│  │ 09:14:02,117     │ 12 │ INFO│ Zenith.Automation.R… │ Evaluated 412 triggers │  │
+│  │ 09:14:03,884     │ 12 │ ERROR│ Zenith.Data.Session │ Could not open connect │  │
+│  └──────────────────┴────┴─────┴──────────────────────┴────────────────────────┘  │
+│                                                    Save as…    Test    Cancel     │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The user drags the boundary handles under the example line; the pattern and the preview update live.
+The generated artefact is a **pattern DSL** string (`<name>` captures, `<_>` discards), not a regex —
+it is what a normal engineer can read and edit, and it compiles to a linear scanner. "Edit as regex"
+is there for the 10% who need it. **Test** re-runs the definition's stored sample lines.
+
+### 6.3 Import from config — the .NET differentiator
+
+```
+┌─ Import layout ───────────────────────────────────────────────────────────── ✕ ──┐
+│  Paste a layout string from your logging config:                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │ ${longdate}|${level:uppercase=true}|${logger}|${message}                     │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│  Recognised as: NLog layout                                          ✓ compiles   │
+│                                                                                   │
+│  ── or ──                                                                         │
+│  🔍 Scan folder for logging config                                                │
+│     Found in C:\dev\ndc\Api\:                                                     │
+│       ● appsettings.json → Serilog:WriteTo:Args:outputTemplate                    │
+│       ○ NLog.config → target "file" layout                                        │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Two clicks instead of a regex-writing session. Serilog `outputTemplate`, NLog `layout`, log4net
+`conversionPattern` and Logback patterns are all accepted.
+
+---
+
+## 7. Trace correlation `[v2]`
+
+**Not built in v1.** Clicking an identifier — a GUID, a `traceparent`, a CLEF `@tr`, or any column marked `identifier` —
+opens an inline affordance rather than a dialog:
+
+```
+│  4,182,995  09:14:03.884  ERR  Api.Disp  Failed to dispatch job 41982
+│                                          trace 4bf92f3577b34da6a3ce929d0e0e4736
+│                                          ┌──────────────────────────────────────┐
+│                                          │ 47 records · 4 sources               │
+│                                          │ ⟨ prev   next ⟩                      │
+│                                          │ ⌕ Filter to this trace               │
+│                                          │ ⊞ Group as one operation             │
+│                                          │ ⧉ Copy trace id                      │
+│                                          └──────────────────────────────────────┘
+```
+
+Every occurrence of that identifier gets a **stable derived colour** across all open sources, so the
+same request is the same colour everywhere. "Group as one operation" collapses a request's lines into
+a single expandable unit (lnav's `opid` model).
+
+---
+
+## 8. Record detail
+
+For very long lines, structured payloads and stack traces, a detail pane (`Ctrl+Enter`, or the row
+chevron) opens at the bottom or right:
+
+```
+┌─ Record 4,182,995 ────────────────────────────────────────────────── ⇱ ⇲  ✕ ──┐
+│  Timestamp   2026-07-28T09:14:03.8841200+01:00                                 │
+│  Severity    ERROR (17)                                                        │
+│  Logger      Zenith.JobDispatcher.Dispatcher                                    │
+│  Trace       4bf92f3577b34da6a3ce929d0e0e4736 · span 00f067aa0ba902b7           │
+│  ───────────────────────────────────────────────────────────────────────────   │
+│  Body        Failed to dispatch job 41982                                      │
+│  Exception   System.InvalidOperationException: Queue 'jobs' is not registered   │
+│                 at Zenith.JobDispatcher.Dispatcher.Dispatch(Job job)            │
+│                 at Zenith.JobDispatcher.Worker.Run()                            │
+│  ───────────────────────────────────────────────────────────────────────────   │
+│  Properties  JobId 41982 · Queue "jobs" · MachineName "APP01"                   │
+│                                                        Raw  Pretty  ⧉ Copy ▾    │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Raw** shows the original bytes exactly as they appear in the file — always available, because the
+record model retains them losslessly. **Pretty** JSON-formats a structured body.
+
+**`[v2]`** — Every field gains a **filter for this value / filter out this value** action, borrowed
+from Grafana, which no desktop log viewer has. It creates an ordinary include or exclude chip in the
+command bar (§2.1), editable as text like any other. **These are buttons in a persistent row on the
+selected field, not hover-only affordances** — hover-only interactions are invisible to keyboard users
+and, more practically, they defeat the RDP scroll-blit path (§15) by dirtying regions on mouse move.
+
+For a truncated long line the Body area shows the cap and the escape:
+
+```
+│  Body        {"request":{"headers":{…32 KB shown of 41.2 MB…                    │
+│              ▸ expand    ▸ open in viewer    ⧉ copy full
+```
+
+---
+
+## 9. Command palette
+
+`Ctrl+K`. The single discovery surface, which is why the chrome can stay thin.
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│ ⌘ merge                                                               │
+├───────────────────────────────────────────────────────────────────────┤
+│  ⊞  Merge open files by timestamp                                     │
+│  ⊞  Merge selected tabs…                                              │
+│  ⏱  Set reorder window…                                    2s         │
+│  ─────────────────────────────────────────────────────────────────    │
+│  Recent                                                               │
+│  ⌕  Filter: level >= Warning                                          │
+│  📁 Open file set: App production                                     │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+Everything reachable by menu is reachable here, plus file sets, watched folders, saved filters and rule
+sets by name.
+
+---
+
+## 10. States that are usually neglected
+
+Honesty principle #2 in practice. Each of these is a designed state, not an error dialog.
+
+**Waiting for a file that does not exist yet** — `tail -F` semantics as the default:
+```
+│                                                                       │
+│                        ⏳  Waiting for                                 │
+│                        C:\logs\jobdispatcher\app.log                   │
+│                        Watching the folder — will start automatically  │
+│                                                                       │
+```
+
+**The writer has locked us out** — the single most useful error in the product, because it names the
+fix on the *writer's* side, which is the only side that can fix it:
+```
+│   ⚠  Cannot read app.log — the writing process has opened it exclusively.        │
+│                                                                                  │
+│      This is a setting on the application that writes the log, not on Tailhawk.  │
+│                                                                                  │
+│      Serilog    add  shared: true  to the file sink                              │
+│      NLog       set  keepFileOpen="false"  or  concurrentWrites="true"           │
+│      log4net    use  <lockingModel type="…FileAppender+MinimalLock"/>            │
+│                                                                    Retry  ▸      │
+```
+
+**Network mode** — a persistent status chip, not a one-time toast: `⚠ Network mode — polling every
+500 ms, updates may lag`.
+
+**Stateless mode** — `⚠ Settings will not be saved` with a tooltip explaining that the exe's folder is
+read-only (running from a share) and offering to use `%APPDATA%` instead.
+
+**Format changed mid-file** — non-modal, in the format chip: *"This file may have changed format —
+re-detect?"* Triggered when the rolling non-match rate exceeds ~20%.
+
+**Skipped ahead under load** — when the render loop drops behind a very fast writer, a quiet inline
+marker: `⋯ skipped ahead — 41,882 lines while catching up`. Data was never lost; the *view* skipped,
+and it says so.
+
+---
+
+## 10b. Remote Desktop — reduced fidelity `[v1]`
+
+`SPEC.md` §3.2 makes RDP a first-class v1 render path with a scroll-blit invariant, and an earlier
+draft of this document never mentioned it — including in the "states that are usually neglected"
+section — while specifying hover interactions that would defeat it. A log viewer is used over RDP and
+on jump boxes constantly, so this is a designed mode, not a degradation.
+
+Detected via `GetSystemMetrics(SM_REMOTESESSION)`. **WARP is not a trigger** — a local software-rendered
+session renders normally.
+
+| Element | Local | Over RDP |
+|---|---|---|
+| Repaint rate | 60 Hz | **~15 Hz**, coalesced |
+| Scrolling | Full redraw | **Scroll-region blit** — only newly exposed rows drawn |
+| Mica / Acrylic chrome | On | **Off** — flat opaque surfaces; translucency is expensive to encode |
+| Smooth / inertial scroll | On | **Off** — snaps to whole rows, so each frame is a clean blit |
+| Hover affordances | Available | **Suppressed** — they dirty regions on mouse move and defeat the blit |
+| Selection, detail actions, per-field filters | Hover or click | **Persistent controls with key bindings** |
+| Density marks in the scrollbar | Live | Redrawn on scroll end, not during |
+| Status chip | — | **`⚠ Remote session — reduced fidelity`**, explaining the changes on hover/focus |
+
+**The design rule this imposes on every other section: no interaction may be hover-only.** Anything
+reachable by hover must also be reachable by keyboard and visible as a persistent control when
+selected. That is also what makes the chrome testable through the v1 UIA provider (§13).
+
+## 11. Visual language
+
+### 11.1 Typography
+
+- **Grid:** Cascadia Mono, falling back to Consolas, then the system monospace. Size and line height
+  user-adjustable; default 9pt at 100%.
+- **Chrome:** Segoe UI Variable where available, Segoe UI otherwise.
+- **The grid renders to an opaque target**, which per `D2D1_TEXT_ANTIALIAS_MODE` gets ClearType by
+  default — but this is a free consequence of the architecture, **not a design goal, not a user
+  setting, and not something schedule is spent on** (SPEC §3.2). Greyscale is an acceptable outcome.
+  Mica is confined to the title bar, tab strip and panels.
+
+### 11.2 Colour
+
+The palette is deliberately restrained so that **user highlight colours are the loudest thing on
+screen**. Severity uses a colour-blind-safe ramp **plus a redundant gutter glyph**, never hue alone:
+
+| Severity | Glyph | Dark theme | Light theme |
+|---|---|---|---|
+| FATAL (21–24) | `■` | magenta-red | dark magenta |
+| ERROR (17–20) | `▲` | red-orange | dark red |
+| WARN (13–16) | `▲` outline | amber | dark amber |
+| INFO (9–12) | `·` | foreground | foreground |
+| DEBUG (5–8) | `·` dim | muted | muted |
+| TRACE (1–4) | `·` faint | more muted | more muted |
+| *(none)* | *(blank)* | foreground | foreground |
+
+Severity with no value renders **blank**, not INFO — W3C, nginx and logfmt rows genuinely have no
+severity and the OTel spec sanctions leaving it empty.
+
+**High Contrast:** system colours are respected and **user highlight rules are suppressed**, with a
+visible chip explaining why — they would otherwise be invisible or illegible.
+
+### 11.3 Density and DPI
+
+Three density settings (Compact / Default / Comfortable) affecting row height only. Per-monitor-V2
+DPI: metrics recompute on `WM_DPICHANGED`, the glyph atlas rebuilds per scale factor, and **column
+advances are integer device pixels** so no drift accumulates. Acceptance test: drag between a 100% and
+a 150% monitor and verify no column misalignment.
+
+---
+
+## 12. Keyboard map
+
+Muscle memory from `less`, Visual Studio and the incumbents, in that order of precedence where they
+conflict.
+
+| Key | Action |
+|---|---|
+| `Ctrl+K` | Command palette |
+| `Ctrl+O` / `Ctrl+Shift+O` | Open file / open file set |
+| `Ctrl+F` / `F3` / `Shift+F3` | Search / next / previous |
+| `Ctrl+L` | Focus filter |
+| `Ctrl+G` | Go to line |
+| `Ctrl+H` | Rules editor |
+| `F` | Toggle follow (also `Ctrl+End` jumps to tail and re-enables) |
+| `Ctrl+Enter` | Record detail pane |
+| `Ctrl+D` / `Ctrl+Shift+D` | Toggle bookmark / bookmarks panel |
+| `Ctrl+Shift+0…9` | Numbered bookmarks (Hoo WinTail parity) |
+| `Ctrl+Shift+1…9` | Ad-hoc colour label on selection (klogg parity) |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl+W` | Close tab |
+| `Ctrl+\` | Split pane |
+| `Shift+wheel` | Horizontal scroll |
+| `Ctrl+M` | **`[v2]`** Merge selected tabs by timestamp |
+| `Ctrl+C` / `Ctrl+Shift+C` | Copy raw / copy as TSV with columns |
+| `Alt+←` / `Alt+→` | Back / forward through view states (nerdlog's idea — filter and position history) |
+| `Home` / `End` / `Ctrl+Home` / `Ctrl+End` | Line and document extremes |
+| `Space` / `b` | Page down / up (`less` muscle memory) |
+
+**Scrolling up while following auto-pauses follow** and shows a `⤓ Jump to end` affordance. This is the
+single most-wanted behaviour in every tail tool and getting it wrong is very visible.
+
+**Smooth and inertial scrolling** uses `WM_POINTER` (or Direct Manipulation) rather than discrete
+`WM_MOUSEWHEEL` deltas — without it the app scrolls in visible jumps next to Edge, VS Code and Terminal,
+which is what makes a hand-rolled Win32 app feel homemade.
+
+**Selection** supports shift-click extension, word and line double/triple click, **rectangular
+selection** (Alt+drag), and autoscroll-on-drag. All hand-written, all specified, because none is free
+in a custom-drawn grid.
+
+---
+
+## 13. Accessibility in the UI
+
+**Split across phases per `SPEC.md` §14.1** — an earlier draft of this section was written in the
+present tense as though all of it shipped in v1, while the plan deferred all of it to v2.
+
+| | Phase |
+|---|---|
+| **Chrome provider** — tabs, buttons, status chips, text fields, palette, dialogs exposed with names, values and focus order | **`[v1]`** |
+| **Grid text provider** — virtualised `ITextProvider`/`ITextRangeProvider` over tens of millions of rows, caret and selection eventing | **`[v2]`** |
+
+The v1 half is not primarily an accessibility feature: it is **the only automated interaction-test
+surface v1 has**. Without it, tabs, drag-out-to-split, the palette, the rules editor, the format
+wizard and eleven text fields are validated forever by one person dragging a mouse.
+
+Design-level consequences of SPEC §14.1:
+
+- **Live-tail is quiet by default.** A screen reader is not fed 1,000 lines/second. An explicit
+  *"read new lines"* action, and an optional *"announce matches of rule X only"* mode, replace naive
+  live-region announcement.
+- **Every status chip is a focusable control** with a name and a value, so the format, encoding, follow
+  state and parse health are all reachable without sight.
+- **Focus order** is defined across the custom-drawn surface: tab strip → search → filter → grid →
+  status chips.
+- **`[v2]`** The grid exposes a virtualised UIA text/table provider.
+- **No interaction is hover-only** (§10b) — a rule imposed by the RDP path, and one that also makes
+  every affordance reachable by keyboard and by an automated test.
+
+---
+
+## 14. First-run experience
+
+There is no wizard, no account, no telemetry consent, and no "getting started" tour. The app opens,
+and if launched without arguments shows a single quiet surface:
+
+```
+│                              🦅                                        │
+│                     Watch your logs like a hawk                        │
+│                                                                        │
+│          Drop a log file here, or press Ctrl+O                         │
+│                                                                        │
+│          Recent                                                        │
+│          C:\logs\ndc\api.log                          8.2 GB           │
+│          App production (file set — 6 files)                           │
+│                                                                        │
+│          Tailhawk never phones home.                                   │
+```
+
+That last line is a deliberate, verifiable claim and a competitive differentiator, so it is stated on
+the surface the user sees first.
+
+**The wording matters and an earlier draft got it wrong.** It said *"Tailhawk makes no network
+connections"* — which is falsified the moment the user opens a log on a UNC share, a first-class v1
+source with its own status chip in this same document. The honest claim, and the one SPEC §13.2
+actually specifies, is that Tailhawk initiates **no outbound connection of its own**: no telemetry, no
+update ping, no font or CDN fetch. Network I/O occurs only to sources the user explicitly opened. The
+CI assertion must be written to observe kernel-mode SMB traffic from a UNC open and *exclude* it,
+rather than asserting zero sockets — otherwise the test either fails on the first UNC fixture or
+proves nothing.
