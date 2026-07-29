@@ -1,6 +1,6 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-29, end of session 3.
+**Paused:** 2026-07-29, session 4.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
 
 ---
@@ -115,6 +115,10 @@ for a solo repo. Commit often; the history is the artefact.
 
 ## ⚠ Read this before the first build of the next session
 
+**Rechecked at the start of session 4: the desktop C++ workload is still NOT installed.** The toolset
+still has only `14.51.36231\lib\onecore` and no `include`, so `.cargo/config.toml` is still required
+and its hardcoded version is still correct. Everything below still applies unchanged.
+
 **Visual Studio was mid-update when session 3 ended, and the desktop C++ workload was going to be
 added afterwards.** That changes the build setup:
 
@@ -139,7 +143,7 @@ added afterwards.** That changes the build setup:
 | **G4** — colour-glyph atlas | Not started. Now unblocked: a working D2D surface exists in `experiments/g3-d2d`. |
 | **G5** — incumbent re-measurement | Not started. Needs BareTail 3.50a and LogExpert 1.41.0 installed — **owner decision, involves downloading third-party binaries.** |
 | **G6** — Hoo WinTail hands-on | Owner task, runs in the background across Phase 0. |
-| **G7** — reproduce egui #1391 | Not started. **Recommended next:** pure logic, no GPU, barely any dependencies, and `RESEARCH.md` §3.4 marks the current diagnosis `[L]` while the whole grid design rests on it. Cheap experiment guarding an expensive assumption. |
+| **G7** — reproduce egui #1391 | **Done. Passes** — the cause is identified. See `experiments/g7-egui-scroll/RESULTS.md`. |
 
 ### G3 result in one line
 
@@ -154,6 +158,23 @@ be built on a worker thread while the window is created. That still leaves a ~11
 floor, so **40 ms was set without measurement and needs re-deriving**, exactly as `PLAN.md` §3
 anticipates for a G3 failure. Variance alone (109 ms spread on an empty window) means any first-paint
 budget must be a percentile, not a mean.
+
+### G7 result in one line
+
+**The cause is `ScrollArea::State::offset` — an f32 holding an absolute content-pixel coordinate.**
+The thumb mapping is exonerated (forward f32 error measures exactly zero) and row-height accumulation
+is not a cause because egui never accumulates.
+
+The finding worth having run the gate for: it breaks in **two independent ways, and fixing one leaves
+the other**. Delta accumulation (`offset -= delta` discards a 2 px drag at 4M rows) was anticipated.
+Row *layout* — `(inner_top - offset) + min_row as f32 * row_h`, two content-magnitude f32s differenced
+to give a sub-row result — was not, and it **survives an exact scroll position**. So `SPEC.md` §6.4's
+`u64` mandate is necessary and not sufficient; a plausible-looking `row * row_h - offset_px` in the
+layout path reproduces the entire bug inside an otherwise correct grid. §6.4 now carries all three
+derived rules and a CI assertion that catches them.
+
+Both of the reporter's thresholds — 2M for onset, 100M for "very broken" — are **predicted from the
+arithmetic alone**, by a model never fitted to them. `RESEARCH.md` §3.4 is now `[V]`.
 
 **Identity sweep: done 2026-07-29.** `RESEARCH.md`, `SPEC.md`, `PLAN.md`, `UI-DESIGN.md`, `LOKI.md`
 and `HANDOFF.md` were swept for employer names, customer names, internal hostnames, service names,
@@ -248,7 +269,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **Filtering is not O(viewport).** Every filter change is a full-file pass. Debounce, stream, and require Enter on network paths. | `SPEC.md` §7.3 |
 | **Continuations collapsed by default**, and no `--wrap` in v1 — both destroy the O(1) `u64` scroll model, and MEL Simple logs are multi-line *by default*. | `SPEC.md` §6.4 |
 | **Accessibility is the only automated UI-test surface** for a custom-drawn grid. The minimal chrome provider is v1 for that reason, not for compliance. | `SPEC.md` §14.1 |
-| **egui's f32 scroll diagnosis is unconfirmed** — the issue reporter explicitly says so. Marked `[L]`, with G7 added to actually diagnose it. | `RESEARCH.md` §3.4 |
+| **A `u64` scroll position is not enough on its own.** G7 found the row-*layout* conversion `row * row_h - offset_px` reproduces egui #1391 in full even when the scroll position is exact. One plausible line, whole bug back. | `SPEC.md` §6.4, `experiments/g7-egui-scroll/RESULTS.md` |
 
 ---
 

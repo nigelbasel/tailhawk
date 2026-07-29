@@ -275,11 +275,23 @@ and closed it as not planned. **[V]**
 - **The scrollbar must be driven by a `u64` line index, never an f32 pixel offset**, and **no f32
   accumulation anywhere in scroll state.** egui issue #1391 reports jitter above ~2M rows and
   breakage above 100M; the reporter *speculates* f32 precision but explicitly says *"I haven't been
-  able to track it down yet."* **[L]** — the symptom is verified, the cause is not. Reproducing #1391
-  and identifying the actual cause is a cheap gating experiment (§12) and worth doing, because the
-  whole grid design rests on it. Adopting the rule regardless is correct either way, but adopting it
-  *and stopping there* would miss a per-wheel-event f32 delta accumulation that reproduces the same
-  jitter in our own grid.
+  able to track it down yet."* **[V] as of 2026-07-29 — G7 reproduced it and identified the cause;
+  see `experiments/g7-egui-scroll/RESULTS.md`.** The reporter's hypothesis was right in kind, and the
+  specific answer changes what the rule has to say:
+  - The culprit is **`ScrollArea::State::offset`, an f32 holding an absolute content-pixel
+    coordinate**. The thumb mapping is *exonerated* — its forward f32 error measures exactly zero at
+    every row count — and row-height accumulation is not a cause because egui never accumulates.
+  - It breaks in **two independent ways**, and fixing one leaves the other. (1) `state.offset -=
+    delta` discards any delta below half a ULP, so a 2 px/frame drag moves 0 px at 4M rows and the
+    wheel stops responding entirely past ~100M. (2) `show_rows` positions rows as
+    `(inner_top - offset) + min_row as f32 * row_h` — two content-magnitude f32s differenced to give
+    a sub-row result, which flings the first row across a 512 px band at 160M rows.
+  - **Failure (2) survives an exact scroll position.** This is the trap the caveat below anticipated,
+    but worse than stated: it is not the delta accumulation, it is the *layout* conversion, so
+    adopting "u64 thumb" and computing `row * row_h - offset_px` afterwards reproduces the entire bug
+    inside an otherwise correct grid. `SPEC.md` §6.4 now carries the derived rule.
+  - Both reported thresholds are **predicted from the arithmetic alone** — 2.0M for the onset and
+    63M–300M for "very broken" — from a model never fitted to them.
 - **Use D3D11, not D3D12/Vulkan/wgpu.** Guaranteed available Windows 7+, has a WARP software
   rasteriser fallback, smaller memory footprint. Plan an explicit chain: D3D11 hardware → D3D11 WARP →
   Direct2D/DXGI. Never panic on `DXGI_ERROR_DEVICE_REMOVED`. **[V]**

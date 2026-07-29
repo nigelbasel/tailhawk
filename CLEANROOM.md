@@ -76,6 +76,7 @@ Append-only. Newest last.
 | Date | Component | Who | Sources consulted | Notes |
 |---|---|---|---|---|
 | 2026-07-29 | *(none — file creation)* | Claude Opus 5, session 2 | `docs/RESEARCH.md` lines 456–465 and 493 only — the §5.3 contamination notice and the "GPL hazard" line | **The technical content of §5.3 was deliberately not read.** Only the warning text and the identification of the affected component were consulted, specifically so this agent remains eligible to implement the index under §1.4. |
+| 2026-07-29 | Virtualised grid — scroll position model | Claude Opus 5, session 4 | **egui 0.17.0**, `egui/src/containers/scroll_area.rs`, at tag `0.17.0` via `raw.githubusercontent.com/emilk/egui/0.17.0/...`; plus `github.com/emilk/egui/issues/1391`. Functions read: `ScrollArea::begin`, `show_rows`, `show_viewport`/`show_viewport_dyn`, `Prepared::end`, `struct State`, and `emath::remap`/`remap_clamp`/`lerp` as quoted within them. | **Permitted — egui is MIT OR Apache-2.0, §3 "Rust crate documentation and source".** Read for G7 (`PLAN.md` §3), to diagnose a *defect* in that code. `experiments/g7-egui-scroll/src/main.rs` deliberately **replicates** the arithmetic in order to measure it, and quotes the original above each function; that file is an experiment and **must not be linked into Tailhawk**. The rules derived into `SPEC.md` §6.4 are the *inverse* of what egui does and were not copied from it. No GPL source was consulted. |
 
 ## 6. Attestation
 

@@ -607,6 +607,28 @@ else is a continuation.
 - **Row/line duality:** rows are logical records; **line numbers shown to the user are physical line
   numbers** so they match what every other tool reports.
 
+**Scroll position representation — three rules, all measured.** `experiments/g7-egui-scroll`
+reproduced egui #1391 and found that the `u64` rule alone is **not** sufficient. Two of the three
+rules below do not follow from it, and each corresponds to a measured failure mode:
+
+1. **Scroll position is `(u64 row, f32 sub_row_px)`**, with `sub_row_px ∈ [0, row_height)`. Never an
+   absolute content-pixel coordinate, in any float width. Wheel and drag deltas are applied to the
+   sub-row remainder and carried into the row index, so a small delta is never added to a large
+   number. *(In egui, `state.offset -= delta` on an f32 content offset discards a 2 px drag entirely
+   at 4M rows and stops responding to the wheel at all past ~100M.)*
+2. **Row layout is computed from `(row − top_row)`, a small integer** — never
+   `row * row_height − scroll_offset_px`. **This is the rule that does not follow from rule 1**, and
+   the one most likely to be reintroduced by someone who believes the `u64` mandate settles the
+   matter. It is a single plausible-looking line that reproduces the whole bug inside an otherwise
+   correct grid: differencing two content-magnitude f32s to obtain a sub-row result flings the first
+   drawn row across a 512 px band at 160M rows, *with the scroll position exact*.
+3. **Never mix screen-space and content-space coordinates in one expression.** Resolve to
+   viewport-relative first, then add the window origin. *(egui's `inner_rect.min − state.offset`
+   destroys the window's y origin outright above ~100M rows.)*
+
+**Required test, and it belongs in CI:** assert that the first drawn row's viewport-relative y stays
+in `(−row_height, 0]` across a scroll sweep at 10⁸ rows. That one assertion catches all three.
+
 **Row height model — this is a load-bearing constraint, not a detail.** The `u64` scroll model gives
 O(1) row→pixel mapping *only* under uniform row height. Two features threatened it:
 
