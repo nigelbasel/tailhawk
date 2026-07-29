@@ -335,11 +335,40 @@ handling with no credential across an origin change, TLS posture with no insecur
 TOML, and the response-parse caps. The §13.2 zero-network CI test must be rewritten **before** the
 first HTTP code lands, not after.
 
-**Still open: where this sits relative to §8.3's merged view.** Now a preference, not a budget
-question. The research's original argument for going first — `ExtentState` is a §8.3 prerequisite —
-is spent, because `ExtentState` lands in v1 regardless (§4). The remaining technical argument is
-that a Loki source delivers `trace_id`/`span_id` free, which argues for landing it near §9 trace
-correlation.
+**Order within v2 — the merged view first, then Loki.** Owner delegated the choice 2026-07-29.
+
+1. **§8.3 merged-by-timestamp view**, local sources only
+2. **Loki client-lite** (stage 1 above)
+3. **§9 trace and identifier correlation**
+4. **Loki stages 2–3**
+
+Four reasons:
+
+- **It keeps the strong privacy claim alive longer.** While no HTTP code exists, §13.2's CI
+  assertion is maximally strong — the process opens no sockets, ever. The first HTTP call weakens it
+  permanently to a conditional that is harder to test and easier to regress. Shipping a headline
+  differentiator under the strong form of the claim is worth having, and it is a one-way door.
+- **The merged view is entirely offline.** Over local sources it needs none of §7, no TLS posture
+  and no CI-test rewrite — the largest block of differentiating work carrying zero network risk.
+- **Merge is easier to get right against the messy inputs first.** §8.3's hard cases — clock skew,
+  RFC 3164 year inference, log4net local-time guessing, the bounded reorder window — all come from
+  *local* logs. A Loki source is the clean input (§2). Build the engine against the awkward sources,
+  then drop in the well-behaved one; the reverse debugs reorder-window and clock-domain problems
+  while simultaneously debugging network paging.
+- **The rate mismatch wants an existing merge engine.** ~466 lines/s remote against ~500k lines/s
+  local is a 1000:1 drowning ratio needing per-source quotas — far easier to reason about once the
+  engine exists and can be measured.
+
+§9 sits *after* client-lite rather than before it because `trace_id` is sparse in local files and
+Loki is where distributed traces actually live — building §9 first means building a feature that
+cannot be dogfooded.
+
+The research's original argument for Loki-first (`ExtentState` is a §8.3 prerequisite) is spent:
+`ExtentState` lands in v1 regardless (§4), and the spill already exists for stdin, so v1 validates
+both load-bearing abstractions before any of this starts.
+
+Independent of the above: the §7 request-level security scaffolding and the §13.2 CI-test rewrite
+have no dependency on the merge engine and can be done at any point before the first HTTP call.
 
 ## 9. Open questions
 

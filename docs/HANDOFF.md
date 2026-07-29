@@ -58,6 +58,10 @@ Headlines:
   contradicts the self-contained copy-and-run promise. Cost is not a constraint on this project, so
   the "86–110% of the v2 budget" objection does not bind. The cost reconciliation is still owed to
   `PLAN.md` §2.3b, but it no longer gates proceeding. See `LOKI.md` §8 for the three stages.
+- **Order within v2:** §8.3 merged view (local only) → Loki client-lite → §9 trace correlation →
+  Loki stages 2–3. The merged view goes first because it is entirely offline and keeps §13.2's
+  "no sockets, ever" CI assertion at full strength until the last possible moment — that weakening
+  is a one-way door. Reasoning in `LOKI.md` §8.
 
 ### 2. Then, in order
 
