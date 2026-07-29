@@ -85,10 +85,16 @@ Three things follow from pushing to GitHub at all, private or not:
    The block-sparse line-offset index is registered **CONTAMINATED and not cleared to implement** —
    it needs a re-derivation entry plus an attestation in `CLEANROOM.md` §6 **before its first line
    of code**.
-2. **Add `LICENSE-MIT`, `LICENSE-APACHE`, `cargo-deny.toml`.** (`git init`, the first commit and the
-   push to `github.com/nigelbasel/tailhawk` — private — are **done**.)
+2. ~~**Add `LICENSE-MIT`, `LICENSE-APACHE`, `cargo-deny.toml`**~~ — **done 2026-07-29.** All three
+   are at the repo root. `cargo-deny.toml` is an allow-list, so GPL/AGPL/LGPL fail without being
+   named and an unreviewed licence fails closed; the reasoning is in `CLEANROOM.md` §7. (`git init`,
+   the first commit and the push to `github.com/nigelbasel/tailhawk` — private — are also done.)
 3. **Run Phase 0** (`PLAN.md` §3) — 4 weeks, seven experiments. **G1 (SMB stale size)** and
    **G4 (colour-glyph atlas composition)** are the two that can change the architecture.
+   **This is now the next item.**
+
+**Working agreement:** commit directly to `master`, no branches, no PRs — tried once, not worth it
+for a solo repo. Commit often; the history is the artefact.
 
 **Identity sweep: done 2026-07-29.** `RESEARCH.md`, `SPEC.md`, `PLAN.md`, `UI-DESIGN.md`, `LOKI.md`
 and `HANDOFF.md` were swept for employer names, customer names, internal hostnames, service names,
