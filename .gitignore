@@ -1,0 +1,7 @@
+/target
+**/target
+*.pdb
+
+# Machine-specific MSVC LIB override — see experiments/g3-d2d/RESULTS.md.
+# Remove once the desktop C++ toolset is installed.
+/.cargo/config.toml
