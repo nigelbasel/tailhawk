@@ -80,13 +80,21 @@ Three things follow from pushing to GitHub at all, private or not:
 - **Open question 2 (employment IP) gets closer.** It is easier to establish a position before code
   exists in a hosted repo than after. Still the owner's to resolve.
 
-1. **Populate `CLEANROOM.md`** — **do this before writing a line of index code, not before
-   publishing.** `RESEARCH.md` §5.3 is GPL-contaminated; the line index must be re-derived from
-   published docs only. This is now the first item on the critical path, not a repo-hygiene chore.
-2. **Add `LICENSE-MIT`, `LICENSE-APACHE`, `cargo-deny.toml`.** (`git init` and the first commit are
-   **done** — `master` exists with the four docs.)
+1. ~~**Populate `CLEANROOM.md`**~~ — **done 2026-07-29.** `CLEANROOM.md` is at the repo root. It
+   records the rule, the allow-list, the component register and an append-only consultation log.
+   The block-sparse line-offset index is registered **CONTAMINATED and not cleared to implement** —
+   it needs a re-derivation entry plus an attestation in `CLEANROOM.md` §6 **before its first line
+   of code**.
+2. **Add `LICENSE-MIT`, `LICENSE-APACHE`, `cargo-deny.toml`.** (`git init`, the first commit and the
+   push to `github.com/nigelbasel/tailhawk` — private — are **done**.)
 3. **Run Phase 0** (`PLAN.md` §3) — 4 weeks, seven experiments. **G1 (SMB stale size)** and
    **G4 (colour-glyph atlas composition)** are the two that can change the architecture.
+
+**Identity sweep: done 2026-07-29.** `RESEARCH.md`, `SPEC.md`, `PLAN.md`, `UI-DESIGN.md`, `LOKI.md`
+and `HANDOFF.md` were swept for employer names, customer names, internal hostnames, service names,
+email addresses, private IPs and local paths. **One hit** — a local profile path in this file's
+Session artefacts section — now genericised. The surviving "employer" references are the policy
+statements themselves (`SPEC.md` §2 and the rules below) and name nobody.
 
 **Deferred until the app runs locally and going online is actually on the table:**
 
@@ -193,10 +201,13 @@ Recorded because each cost real effort to find, and two of them were caught only
 Workflow transcripts and scripts, if any reasoning needs re-checking:
 
 ```
-C:\Users\nigel\.claude\projects\C--dev-git-WinTail\c8d47c59-98d0-40f0-86b8-bcd47f6558a3\
+%USERPROFILE%\.claude\projects\C--dev-git-WinTail\<session-id>\
   workflows\scripts\      ← re-runnable workflow scripts
   subagents\workflows\    ← per-agent transcripts and journal.jsonl
 ```
+
+Session 1 was `c8d47c59-98d0-40f0-86b8-bcd47f6558a3`; session 2 (the Loki run) was
+`c2757c25-1785-4b18-9f85-7283f401aaf1`. These are machine-local and are not part of the repo.
 
 Seven workflows ran this session: competitor/tech/format research, cross-platform, the agentic-native-UI
 thesis, naming (two rounds), OpenTelemetry, the four-artifact adversarial review, and the stopped Loki run.
