@@ -67,6 +67,57 @@ Workflow({ scriptPath: "C:\\Users\\nigel\\.claude\\projects\\C--dev-git-WinTail\
 
 ---
 
+## Dogfooding — first runnable build
+
+The owner has nominated **two real logs currently in daily use** as the first dogfood targets. The
+build does not have to be good; it has to open these two files and follow them. Treat this as the
+acceptance gate for "a first version that can actually run".
+
+Actual paths are **deliberately not recorded in this repo** — they sit inside an employer source
+tree and their content contains customer names. They are held in the private project memory
+(`~/.claude/projects/C--dev-git-WinTail/memory/`). See the identity note below.
+
+| | Corpus A | Corpus B |
+|---|---|---|
+| Size | ~450 KB | ~3.3 MB |
+| State when sampled | idle — batch writer had exited | **live, actively appended** |
+| Encoding | ASCII / UTF-8, no BOM | **UTF-8, no BOM, with non-ASCII** (U+2014 em dash) |
+| Format | single, log4net-shaped | **heterogeneous — three formats in one file** |
+
+**What each one actually tests:**
+
+*Corpus A* — log4net layout, `yyyy-MM-dd HH:mm:ss,fff LEVEL␠␠Logger.Name message`. Note the
+**comma** as the millisecond separator and the padded level field. Straight columnisation exercise
+plus open-a-completed-file.
+
+*Corpus B* is the valuable one, and it breaks several assumptions:
+
+1. **BOM-less UTF-8 with non-ASCII content.** Windows PowerShell 5.1's `Get-Content` renders the em
+   dashes as `â€”` — i.e. a CP1252 default gets this file wrong. This is a ready-made regression
+   test for encoding detection; the correct answer is already known.
+2. **Three formats in one file.** A banner line, then a **tab-delimited section with its own header
+   row** (`TIME⇥INSTANCE⇥STAGE`) carrying **time-only timestamps** (`17:00:02`, no date), then later
+   a different layout entirely (`yyyy-MM-dd HH:mm:ss␠␠[tag]␠␠message`). This confirms `format_id` and
+   `parse_state` must be **per-record, not per-source** — already the model in `SPEC.md` §4, now with
+   a real specimen behind it.
+3. **Time-only timestamps.** `SPEC.md` has **no rule** for a record whose timestamp carries no date.
+   Inherit the date from the last fully-dated record? Leave `timestamp` unset and rely on
+   `observed_timestamp`? **Open — needs a decision.**
+4. **Non-monotonic timestamps.** An `07:14:14` line appears *after* an `09:14:14` line. Nothing may
+   assume within-source ordering. This matters most for the v2 merged timeline.
+
+**What they do not test:** both are single-digit MB. Neither exercises the multi-GB path, the
+block-sparse index, rotation, or UNC latency. A large file and a rolling set are still needed
+separately.
+
+**Identity flag — resolve before the first public commit.** Corpus A lives in an employer repo and
+its log lines contain customer names; Corpus B names customer instances. This runs straight into the
+locked-in "no employer identity anywhere in the repo" decision and into open question 2 below
+(employment IP). Dogfooding against them privately is fine. **Never** paste sample lines, paths, or
+screenshots from either into the repo, an issue, or a release note without scrubbing.
+
+---
+
 ## Traps — do not rediscover these
 
 Recorded because each cost real effort to find, and two of them were caught only by adversarial review.
