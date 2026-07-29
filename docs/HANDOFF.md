@@ -1,24 +1,35 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-28, end of session 1.
-**Everything below is on disk. Nothing is held in a chat session.**
+**Paused:** 2026-07-29, end of session 3.
+**Everything below is on disk and pushed. Nothing is held in a chat session.**
 
 ---
 
 ## Where things stand
 
 The project is **Tailhawk** (command `tailhawk`) — a Windows desktop log tailer/viewer.
-Research, specification, UI design and development plan are **complete and adversarially reviewed twice**.
-**No code has been written.** Nothing has been committed to git; `C:\dev\git\WinTail` is not yet a repo.
+Research, specification, UI design and development plan are complete and adversarially reviewed.
+**Phase 0 has started and the first experiment has produced results.**
 
-### The four documents
+Repo: **`github.com/nigelbasel/tailhawk`, private.** Working directly on `master` — no branches, no
+PRs (tried once, not worth it solo). Commit often; the history is the artefact.
+
+### The documents
 
 | File | State |
 |---|---|
-| `docs/RESEARCH.md` | Complete. §11 records every claim critics refuted. §12 lists the gating experiments. |
+| `docs/RESEARCH.md` | Complete. §11 records every claim critics refuted. §12 lists the gating experiments. **§5.3 is GPL-contaminated — see `CLEANROOM.md`.** |
 | `docs/SPEC.md` | Complete. §16 traces both review rounds. §17 lists open decisions. |
 | `docs/UI-DESIGN.md` | Complete. Phase-tagged `[v1]`/`[v2]`/`[v3]` throughout — **`SPEC.md` §15 is authoritative on phasing, not this document.** |
-| `docs/PLAN.md` | Complete. **v1 = 81.5 person-weeks (~19 months part-time).** |
+| `docs/PLAN.md` | Complete. v1 = 81.5 person-weeks — **the owner considers the estimates extremely conservative and does not treat them as a schedule.** Gates are things to answer, not a timeline. |
+| `docs/LOKI.md` | Complete. Loki-as-a-source design, adversarially reviewed. Decisions settled; not yet folded into `SPEC.md`/`PLAN.md`. |
+| `CLEANROOM.md` | Live. Provenance rule, source allow-list, component register, append-only log. |
+
+### Repo furniture in place
+
+`LICENSE-MIT`, `LICENSE-APACHE` (dual, copyright asserted personally), `cargo-deny.toml`
+(allow-list, so GPL/AGPL/LGPL fail without being named — rationale in `CLEANROOM.md` §7),
+`.gitignore`, `rust-toolchain.toml`, workspace `Cargo.toml`, tracked `Cargo.lock`.
 
 ### Decisions locked in
 
@@ -31,6 +42,12 @@ Research, specification, UI design and development plan are **complete and adver
 - **Merged timeline + trace correlation stay v2** (owner-confirmed).
 - **Personal project**, personal GitHub, no employer identity anywhere in the repo.
 - **Licence: MIT OR Apache-2.0.**
+- **Loki is a client, not a viewer** (2026-07-29). The near-free `logcli | tailhawk -` path is
+  rejected — depending on another CLI binary contradicts the self-contained copy-and-run promise.
+  Staged client-lite → full client. Cost is not a constraint on this project.
+- **v2 order:** §8.3 merged view (local only) → Loki client-lite → §9 trace correlation → Loki
+  stages 2–3. The merged view goes first because it is entirely offline and keeps §13.2's
+  "no sockets, ever" CI assertion at full strength until the last possible moment — a one-way door.
 
 ---
 
@@ -89,12 +106,54 @@ Three things follow from pushing to GitHub at all, private or not:
    are at the repo root. `cargo-deny.toml` is an allow-list, so GPL/AGPL/LGPL fail without being
    named and an unreviewed licence fails closed; the reasoning is in `CLEANROOM.md` §7. (`git init`,
    the first commit and the push to `github.com/nigelbasel/tailhawk` — private — are also done.)
-3. **Run Phase 0** (`PLAN.md` §3) — 4 weeks, seven experiments. **G1 (SMB stale size)** and
-   **G4 (colour-glyph atlas composition)** are the two that can change the architecture.
-   **This is now the next item.**
+3. **Run Phase 0** (`PLAN.md` §3) — **in progress.** See the next section.
 
 **Working agreement:** commit directly to `master`, no branches, no PRs — tried once, not worth it
 for a solo repo. Commit often; the history is the artefact.
+
+---
+
+## ⚠ Read this before the first build of the next session
+
+**Visual Studio was mid-update when session 3 ended, and the desktop C++ workload was going to be
+added afterwards.** That changes the build setup:
+
+- This machine's MSVC toolset had **only the OneCore CRT** (`lib\onecore\x64`) — no desktop
+  `lib\x64`, no `include` at all. Builds fail with `LNK1104: cannot open file 'msvcrt.lib'` without
+  a workaround.
+- The workaround is a **git-ignored `.cargo/config.toml`** setting `LIB` to the OneCore libs plus
+  the Windows SDK. It **hardcodes toolset `14.51.36231`**, which a VS update will very likely bump.
+- **Once the desktop C++ workload is installed, delete `.cargo/config.toml` entirely** — rustc finds
+  everything itself. If a build fails with `LNK1104` and that file still exists, the stale toolset
+  version in it is the first suspect, not the code.
+- **Every G3 number must be re-taken after that install** — they were measured against the OneCore
+  CRT, which is not the shipping configuration.
+
+## Phase 0 — where it got to
+
+| Gate | State |
+|---|---|
+| **G3** — binary size floor + first pixel | **windows-rs + D2D leg done, both CRT configs.** See `experiments/g3-d2d/RESULTS.md`. `eframe+glow` and `eframe+wgpu` legs **not started**, so the comparison G3 exists to make has not been made. |
+| **G1** — SMB stale size | Not started. Needs two hosts and a share; can't be done solo on one machine. |
+| **G2** — read throughput | Not started. Informational only, no pass threshold. |
+| **G4** — colour-glyph atlas | Not started. Now unblocked: a working D2D surface exists in `experiments/g3-d2d`. |
+| **G5** — incumbent re-measurement | Not started. Needs BareTail 3.50a and LogExpert 1.41.0 installed — **owner decision, involves downloading third-party binaries.** |
+| **G6** — Hoo WinTail hands-on | Owner task, runs in the background across Phase 0. |
+| **G7** — reproduce egui #1391 | Not started. **Recommended next:** pure logic, no GPU, barely any dependencies, and `RESEARCH.md` §3.4 marks the current diagnosis `[L]` while the whole grid design rests on it. Cheap experiment guarding an expensive assumption. |
+
+### G3 result in one line
+
+**Size passes by ~8x; first pixel fails by ~6x.** 243,712 bytes with `+crt-static` against a 2 MB
+criterion; 249 ms median first pixel against a 40 ms criterion.
+
+The breakdown is the finding: **drawing is 6 ms.** `CreateHwndRenderTarget` is ~171 ms (D3D device
+and driver init) and `CreateWindowExW` an unanticipated ~73–113 ms, wildly variable. So the
+conclusion is not "D2D is slow" but **"graphics device creation must come off the critical path"** —
+`SPEC.md` already specifies D3D11 + DXGI rather than D2D's `HwndRenderTarget`, and a D3D11 device can
+be built on a worker thread while the window is created. That still leaves a ~113 ms window-creation
+floor, so **40 ms was set without measurement and needs re-deriving**, exactly as `PLAN.md` §3
+anticipates for a G3 failure. Variance alone (109 ms spread on an empty window) means any first-paint
+budget must be a percentile, not a mean.
 
 **Identity sweep: done 2026-07-29.** `RESEARCH.md`, `SPEC.md`, `PLAN.md`, `UI-DESIGN.md`, `LOKI.md`
 and `HANDOFF.md` were swept for employer names, customer names, internal hostnames, service names,
@@ -192,6 +251,17 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **egui's f32 scroll diagnosis is unconfirmed** — the issue reporter explicitly says so. Marked `[L]`, with G7 added to actually diagnose it. | `RESEARCH.md` §3.4 |
 
 ---
+
+## Still owed, not blocking
+
+- **Fold `LOKI.md` into `SPEC.md` §4 and `PLAN.md` §2.3b.** The decisions are settled; the write-up
+  is not yet integrated. The cost reconciliation between the two research rounds is owed to
+  `PLAN.md` but gates nothing.
+- **The highest-value Loki unknown:** is the Loki HTTP API reachable **directly** from a workstation,
+  or only via Grafana's datasource proxy? Every measurement in `LOKI.md` went through the proxy. If
+  proxy-only, that is a different URL shape, a different auth model and roughly +1 PW.
+- **Namespace claims** — GitHub org, crates.io, scoop, winget. Deferred with the rest of the
+  publication work, but unlike the rest **this one decays**: nothing holds `tailhawk` for us.
 
 ## Open questions the owner still needs to answer
 
