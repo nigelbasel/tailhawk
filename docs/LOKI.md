@@ -1,8 +1,8 @@
 # Loki as a Tailhawk source — design note
 
-**Status: research complete, adversarially reviewed, NOT folded into `SPEC.md` or `PLAN.md`.**
-Two blocking decisions belong to the owner before any spec text is written (§8). One decision
-(§4) affects v1 and cannot wait for the rest.
+**Status: research complete, adversarially reviewed, NOT yet folded into `SPEC.md` or `PLAN.md`.**
+The two blocking product decisions were settled by the owner on 2026-07-29 — **Tailhawk is a Loki
+client, staged client-lite first** (§8). One design decision (§4) affects v1 and lands regardless.
 
 Produced 2026-07-29 by a 4-agent workflow: two researchers (API surface; mapping onto the existing
 source/record/filter model) and two hostile critics (product scope; credential and network
@@ -263,7 +263,11 @@ host". The public claim survives unchanged, but the test backing it gets weaker 
 silently if written afterwards — the same failure mode §11.1 was written to prevent for performance
 numbers.
 
-## 8. Cost and sequencing — unresolved, and the owner's call
+## 8. Cost and sequencing
+
+> **The decisions at the end of this section are settled.** The analysis above them is retained
+> because it is what the two rounds actually found, and because the cost reconciliation is still
+> owed to `PLAN.md`.
 
 **Do not adopt either cost figure.** Round 1 said 14–18 PW; round 2 said ~31 PW (range 26–38). A 2x
 disagreement on the number the decision rests on. Round 1 is cheaper because it silently omits six
@@ -301,14 +305,41 @@ level filters, client-side search, per-field filtering, four dedup modes, line w
 prettify, sort order and a log-volume histogram today. Note two of Tailhawk's *v3* items are
 catch-up to Explore, not lead.
 
-### Decisions required before spec text
+### Decisions — settled 2026-07-29 by the owner
 
-1. **Client or viewer?** Should Tailhawk *be* a Loki client — its own query UI, its own filter
-   language, competing with Explore — or a fast local **viewer** over a result set selected
-   elsewhere? The second is a fraction of the cost and does far less damage to the product's
-   identity. The request does not disambiguate, and every cost number below depends on the answer.
-2. **What does it displace?** At round 2's figure, name which of v2's nine items are cut or deferred.
-   This needs confirming by name, not by approving a percentage.
+**Tailhawk is a Loki client.** The `logcli` viewer path is rejected: a dependency on another CLI
+binary contradicts the "single self-contained exe, no runtime deps, copy-and-run" promise that is
+core product identity, and it externalises exactly the part that makes Tailhawk worth using over
+Explore. This overrides the scope critic's recommendation in §8, which was argued primarily on cost.
+
+**Cost is not a constraint.** This is a side project running alongside other work, with no delivery
+date. The "86–110% of the v2 budget" objection therefore does not bind — there is no fixed budget to
+consume and nothing is being displaced. The two cost rounds still need reconciling before `PLAN.md`
+§2.3b gets a number, but the number is no longer a gate on proceeding.
+
+**Staging: client-lite first, then the full client.** The rationale is not cost — it is that
+client-lite exercises only the parts of the design that *survived* re-verification, and defers the
+part that was found unsound.
+
+| Stage | In | Out |
+|---|---|---|
+| **1 — client-lite** | `query_range` GET; hand-typed stream selector; one materialised window to a CLEF spill driven by the existing index and grid; `ExtentState` load-older/load-newer; time range (relative presets + absolute); all chips client-side; token from env var or `--token-from-file`, **memory only, never persisted** | Credential store, pushdown, follow, tail WebSocket, histogram, label browser |
+| **2** | Credential subsystem on the §7 rules (origin-keyed, Credential Manager, no file); poll-based follow with the settling band; timeline histogram | Tail WebSocket |
+| **3** | Chip pushdown with the pushdown/residual split; label and field browser; `index/stats` pre-flight; tail WebSocket with poll reconciliation | — |
+
+**Client-lite is not "security later".** Only the *storage* controls defer, because there is no
+stored secret to protect. Everything in §7 that governs the request itself is required from the
+first HTTP call: the compiled-in endpoint path allowlist, the SSRF controls (no DNS before
+confirmation, deny loopback/link-local/IMDS, address re-check against rebinding), explicit redirect
+handling with no credential across an origin change, TLS posture with no insecure toggle in the
+TOML, and the response-parse caps. The §13.2 zero-network CI test must be rewritten **before** the
+first HTTP code lands, not after.
+
+**Still open: where this sits relative to §8.3's merged view.** Now a preference, not a budget
+question. The research's original argument for going first — `ExtentState` is a §8.3 prerequisite —
+is spent, because `ExtentState` lands in v1 regardless (§4). The remaining technical argument is
+that a Loki source delivers `trace_id`/`span_id` free, which argues for landing it near §9 trace
+correlation.
 
 ## 9. Open questions
 

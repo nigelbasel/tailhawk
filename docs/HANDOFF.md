@@ -53,12 +53,11 @@ Headlines:
   selector; a tight selector is 60–130x faster).
 - **The credential design as researched is unsound** — keying by source name is an exfiltration
   primitive, and "DPAPI or Credential Manager" is not a design.
-- **Cost is unresolved and is the owner's call.** Two rounds disagree 2x. Against the real v2 budget
-  (28–36 PW A) the larger figure is 86–110% of *all* of v2. Two decisions are needed before spec
-  text: **client or viewer?**, and **what does it displace?**
-- **A near-free path neither researcher found:** `logcli … --output=jsonl | tailhawk -` runs against
-  v1's already-planned stdin spill at roughly zero incremental cost, and keeps credentials entirely
-  outside the product.
+- **Decided 2026-07-29: Tailhawk is a Loki client, staged client-lite first.** The near-free
+  `logcli … | tailhawk -` viewer path is **rejected** — a dependency on another CLI binary
+  contradicts the self-contained copy-and-run promise. Cost is not a constraint on this project, so
+  the "86–110% of the v2 budget" objection does not bind. The cost reconciliation is still owed to
+  `PLAN.md` §2.3b, but it no longer gates proceeding. See `LOKI.md` §8 for the three stages.
 
 ### 2. Then, in order
 
