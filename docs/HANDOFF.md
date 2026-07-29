@@ -65,8 +65,20 @@ Headlines:
 
 ### 2. Then, in order
 
-**Owner direction, 2026-07-29: get the whole app running locally before anything goes online.**
-Everything publication-shaped is therefore deferred, and the queue is reordered around that.
+**Owner direction, 2026-07-29: get the whole app running locally, put it in a GitHub repo, publish
+later.** A **private** GitHub repo is not publishing, so it is compatible with everything below.
+Everything genuinely publication-shaped is deferred, and the queue is reordered around that.
+
+Three things follow from pushing to GitHub at all, private or not:
+
+- **Git history is permanent.** Anything committed to a private repo is still in the history when
+  that repo later goes public. The scrubbing rules — no employer identity, no customer names, no
+  dogfood paths or sample lines (see below) — apply from the **first commit**, not from the publish
+  date. There is no later cleanup that is not a history rewrite.
+- **Branching starts.** The standing "commit straight to `master`" rule was explicitly scoped to
+  "until there is a remote". Once the GitHub remote exists, branch-per-change and PRs apply.
+- **Open question 2 (employment IP) gets closer.** It is easier to establish a position before code
+  exists in a hosted repo than after. Still the owner's to resolve.
 
 1. **Populate `CLEANROOM.md`** — **do this before writing a line of index code, not before
    publishing.** `RESEARCH.md` §5.3 is GPL-contaminated; the line index must be re-derived from
