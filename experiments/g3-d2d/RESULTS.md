@@ -17,24 +17,36 @@ Release profile as G3 specifies: `opt-level="z"`, `lto="fat"`, `panic="abort"`, 
 
 ## Binary size
 
-**146,432 bytes (0.14 MB)** — G3 criterion is under 2 MB. **Passes, by ~14x.**
+| Build | Bytes | vs 2 MB criterion |
+|---|---|---|
+| Dynamic CRT | 146,432 (0.14 MB) | **passes, ~14x** |
+| `+crt-static` (as G3 specifies) | 243,712 (0.23 MB) | **passes, ~8x** |
 
-Worth carrying forward: with a 0.14 MB floor, the 15 MB CI gate has far more headroom than assumed.
+Static CRT costs **+97,280 bytes (+66%)** and is the configuration G3 asks for, since a
+copy-and-run single exe should not depend on a redistributable being present.
+
+Worth carrying forward: with a 0.23 MB floor, the 15 MB CI gate has far more headroom than assumed.
 This independently reinforces `docs/LOKI.md` §5 — the claim that an HTTP stack threatened the gate
 was already refuted at +1.68 MB measured, and against this floor it is not close.
 
 ## First pixel
 
-| Phase | Median | Range |
-|---|---|---|
-| `D2D1CreateFactory` | 0.20 ms | 0.14 – 0.38 |
-| `CreateWindowExW` | 113 ms | 21 – 144 |
-| `CreateHwndRenderTarget` | 176 ms | 152 – 210 |
-| `Clear` + `EndDraw` | 6.0 ms | 5.0 – 6.9 |
-| **Total** | **273 ms** | **218 – 327** |
+Seven cold starts per configuration. Medians, with range:
 
-**Against G3's 40 ms criterion: FAIL, by ~7x.** An empty window also exceeds `SPEC.md` §11.3's
-150 ms budget for the whole app painting real content, by ~1.8x.
+| Phase | Dynamic CRT | `+crt-static` |
+|---|---|---|
+| `D2D1CreateFactory` | 0.20 ms (0.14 – 0.38) | 0.18 ms (0.13 – 0.65) |
+| `CreateWindowExW` | 113 ms (21 – 144) | 73 ms (25 – 84) |
+| `CreateHwndRenderTarget` | 176 ms (152 – 210) | 171 ms (156 – 216) |
+| `Clear` + `EndDraw` | 6.0 ms (5.0 – 6.9) | 6.0 ms (5.5 – 6.2) |
+| **Total** | **273 ms (218 – 327)** | **249 ms (194 – 303)** |
+
+**Against G3's 40 ms criterion: FAIL, by ~6x.** An empty window also exceeds `SPEC.md` §11.3's
+150 ms budget for the whole app painting real content, by ~1.7x.
+
+Static CRT is nominally 24 ms faster, but the entire difference sits in `CreateWindowExW` — the
+noisiest phase, with ranges that overlap heavily. **Treat the two configurations as equal on startup
+and choose `+crt-static` on deployment grounds, not performance.**
 
 ## What the breakdown actually says
 
@@ -71,11 +83,12 @@ an empty window on a current machine is the number to build the budget around.
 
 - **Linked against the OneCore CRT, not the desktop CRT.** This machine's MSVC toolset has
   `lib\onecore\x64` but no `lib\x64`, so `LIB` was pointed at the OneCore variant to link at all.
-  The size and timing figures should be re-taken once the desktop C++ toolset is installed.
-- `+crt-static` is **not** applied yet; G3 specifies it, and it will increase the binary size.
+  **The desktop C++ workload is due to be installed; re-take every figure here once it is.**
 - Single machine, single GPU, no cold-boot separation. `PLAN.md` §3 G5 requires a fixed reference
   machine before any of this becomes a published target.
 - Timing excludes process creation, so treat every figure as a lower bound.
+- The `eframe+glow` and `eframe+wgpu` subjects are still outstanding, so the *comparison* G3 was
+  designed to make has not been made — only the windows-rs + D2D leg.
 
 ## Reproducing
 
