@@ -36,26 +36,29 @@ Research, specification, UI design and development plan are **complete and adver
 
 ## Resume here tomorrow
 
-### 1. Finish the Loki source design *(was in flight when we paused)*
+### 1. ~~Finish the Loki source design~~ — **done 2026-07-29, see `docs/LOKI.md`**
 
-A workflow was running and was **stopped cleanly, not completed**. Re-run it — the script is saved:
+The workflow was re-run and completed (4 agents, ~30 min). Results are written up in
+**`docs/LOKI.md`** and are **not** yet folded into `SPEC.md` or `PLAN.md`, deliberately.
 
-```
-Workflow({ scriptPath: "C:\\Users\\nigel\\.claude\\projects\\C--dev-git-WinTail\\c8d47c59-98d0-40f0-86b8-bcd47f6558a3\\workflows\\scripts\\tailhawk-loki-source-wf_08f0220c-eba.js" })
-```
-
-> `resumeFromRunId` is **same-session only**, so tomorrow this is a fresh run. Expect ~35–45 minutes.
-> **Note:** this session exhausted its 200-call WebSearch budget. A new session resets it. The script
-> already instructs agents to use WebFetch against direct URLs rather than search.
-
-**What it is answering:**
-- The Loki HTTP API surface a desktop client needs (`query_range`, the `tail` WebSocket, label/series metadata endpoints, server-side limits).
-- Auth models — self-hosted, `X-Scope-OrgID` multi-tenancy, Grafana Cloud, and querying *through* Grafana's datasource proxy. **Owner deferred the auth decision to this research.**
-- How a query API maps onto a viewport contract built for seekable byte streams. **This is the architectural crux:** "line 4,182,995" and jump-to-line have no meaning in Loki, so the viewport may need to become cursor-based. If that change is small the design is clean; if large, it complicates the grid for the local-file case, which we do not want.
-- Which filter chips can be pushed down into LogQL vs evaluated client-side.
-- Two hostile critics: product scope (does this make a worse Grafana?) and security (**credential storage is the hard problem** — config files are shareable and may sit on a read-only network share; DPAPI is user+machine scoped so a config carried to another machine breaks).
-
-**When it lands:** fold into `SPEC.md` §4 as a source kind, add a costed component to `PLAN.md` §2.3b, and assign a phase. Note the project currently has **no HTTP client dependency at all**, against a 15 MB CI size gate.
+Headlines:
+- **The architectural crux resolved cleanly.** A Loki source materialises pages into the §4.2 stdin
+  spill as CLEF NDJSON; the grid, index, filters, search, sort and export run unchanged. The
+  viewport does **not** become cursor-based.
+- **One thing must land in v1** even though no Loki code ships in v1: `ExtentState` and an opaque
+  `RowId(u64)` (§4 of `LOKI.md`). ~0.5 PW now against a ~3 PW rewrite after the grid ships.
+- **Three research claims died under re-verification** — the binary-size objection to an HTTP stack
+  (measured at +1.68 MB against a 15 MB gate), the choice of `rustls` (pulls a C toolchain via
+  `ring`, contradicting §5.3), and the headline latency figure (an artifact of a pathological
+  selector; a tight selector is 60–130x faster).
+- **The credential design as researched is unsound** — keying by source name is an exfiltration
+  primitive, and "DPAPI or Credential Manager" is not a design.
+- **Cost is unresolved and is the owner's call.** Two rounds disagree 2x. Against the real v2 budget
+  (28–36 PW A) the larger figure is 86–110% of *all* of v2. Two decisions are needed before spec
+  text: **client or viewer?**, and **what does it displace?**
+- **A near-free path neither researcher found:** `logcli … --output=jsonl | tailhawk -` runs against
+  v1's already-planned stdin spill at roughly zero incremental cost, and keeps credentials entirely
+  outside the product.
 
 ### 2. Then, in order
 
