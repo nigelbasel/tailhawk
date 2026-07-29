@@ -65,11 +65,34 @@ Headlines:
 
 ### 2. Then, in order
 
-1. **Resolve the code-signing route** (`PLAN.md` §7.1). Azure Artifact Signing is **ruled out** — its eligibility covers neither South African organizations nor individuals. Confirm **Certum Open Source Code Signing** eligibility for a South African individual (from €69, hardware token shipped internationally). **Not a blocker for v1** — ship unsigned via scoop; it blocks the first *signed* release only.
-2. **Check `tailhawk.com` / `.dev` / `.io`** at a registrar. Never verified.
-3. **Claim namespaces:** GitHub org `tailhawk`, crates.io, scoop, winget. Verified free during naming, but that decays.
-4. **Run Phase 0** (`PLAN.md` §3) — 4 weeks, seven experiments. **G1 (SMB stale size)** and **G4 (colour-glyph atlas composition)** are the two that can change the architecture.
-5. **`git init`** and make the first commit. Add `LICENSE-MIT`, `LICENSE-APACHE`, `CLEANROOM.md`, `cargo-deny.toml`.
+**Owner direction, 2026-07-29: get the whole app running locally before anything goes online.**
+Everything publication-shaped is therefore deferred, and the queue is reordered around that.
+
+1. **Populate `CLEANROOM.md`** — **do this before writing a line of index code, not before
+   publishing.** `RESEARCH.md` §5.3 is GPL-contaminated; the line index must be re-derived from
+   published docs only. This is now the first item on the critical path, not a repo-hygiene chore.
+2. **Add `LICENSE-MIT`, `LICENSE-APACHE`, `cargo-deny.toml`.** (`git init` and the first commit are
+   **done** — `master` exists with the four docs.)
+3. **Run Phase 0** (`PLAN.md` §3) — 4 weeks, seven experiments. **G1 (SMB stale size)** and
+   **G4 (colour-glyph atlas composition)** are the two that can change the architecture.
+
+**Deferred until the app runs locally and going online is actually on the table:**
+
+- **The code-signing route** (`PLAN.md` §7.1). Azure Artifact Signing is **ruled out** — its
+  eligibility covers neither South African organizations nor individuals. Certum Open Source Code
+  Signing eligibility for a South African individual is unconfirmed (from €69, hardware token
+  shipped internationally). Not a blocker for v1 — ship unsigned via scoop; it blocks the first
+  *signed* release only. **Note the linkage:** `LOKI.md` §7 argues signing becomes a prerequisite of
+  the **network feature** specifically, because unsigned + portable + share-distributed + outbound
+  TLS to file-specified hosts is a dropper signature that SmartScreen will never grant reputation
+  to. That is a v2 concern, well after local.
+- **`tailhawk.com` / `.dev` / `.io`** at a registrar. Never verified.
+
+**Not deferred, because it decays:** claiming the **namespaces** — GitHub org `tailhawk`,
+crates.io, scoop, winget. Verified free during naming, but nothing holds them. Losing `tailhawk`
+after four documents and a repo are written around the name means a rename, not an inconvenience.
+Cheap insurance, no publishing implied — an empty GitHub org and a reserved crate name are not a
+release.
 
 ---
 
