@@ -85,10 +85,39 @@ source was consulted for that component.
 
 > *(No attestations yet — no implementation code exists.)*
 
-## 7. Related
+## 7. The dependency allow-list
+
+`cargo-deny.toml` is the counterpart to this file. It governs what Tailhawk **links**; everything
+above governs what its authors **read**. Both are needed and neither substitutes for the other — a
+clean-room process cannot stop a GPL crate arriving transitively, and a licence scanner cannot stop
+someone reading GPL source and writing it out again from memory.
+
+The config carries no comments, so the reasoning lives here:
+
+- **The list is an allow-list, not a deny-list.** Under `[licences] version = 2`, anything not
+  explicitly allowed fails the check. GPL, AGPL and LGPL are therefore rejected without being named,
+  and so is any licence nobody has looked at yet. A new copyleft licence appearing in the ecosystem
+  fails closed. Naming licences to deny would be the weaker construction — it only rejects what
+  someone thought to list.
+- **MPL-2.0 is deliberately absent.** It is only file-level copyleft and plenty of permissive
+  projects accept it, but accepting it means the outbound "MIT OR Apache-2.0" statement no longer
+  describes the whole artefact without qualification. If a genuinely necessary dependency turns up
+  under MPL, add it to `exceptions` for that one crate with a note here — not to `allow`.
+- **`Unicode-3.0` and `Unicode-DFS-2016` are both present** because `unicode-ident` and its
+  relatives changed licence between versions, and the resolved graph can legitimately contain
+  either.
+- **`unknown-registry` and `unknown-git` are `deny`.** A single-file, copy-and-run binary that
+  claims no network I/O of its own should not be built from a source nobody can name. This also
+  makes an unreviewed git dependency a build failure rather than a code-review question.
+- **`multiple-versions` is `warn`, not `deny`.** Duplicate versions in the graph matter here because
+  of the 15 MB binary-size gate in `SPEC.md`, but they are usually somebody else's transitive
+  problem and blocking on them would be noise. Revisit if the gate gets tight.
+- **`yanked = "deny"`** — a yanked crate is a supply-chain signal, and this project has no deadline
+  pressure that would justify shipping one.
+
+## 8. Related
 
 - `LICENSE-MIT`, `LICENSE-APACHE` — the outbound licence.
-- `cargo-deny.toml` — dependency licence allow-list. Governs what Tailhawk **links**; this file
-  governs what its authors **read**. Both are needed; neither substitutes for the other.
+- `cargo-deny.toml` — the config the section above explains.
 - `docs/RESEARCH.md` §11 — the record of which research claims were refuted, including the licensing
   ones.
