@@ -1,0 +1,246 @@
+//! Tailhawk — Windows shell. Owns the window, the message loop and input; hands the core a
+//! drawable and nothing else (`SPEC.md` §3.1).
+//!
+//! M0 is the skeleton: a window that opens, a D3D11 device with the WARP fallback, and the
+//! two-stage first paint. There is no grid yet — that is M3.
+
+#![windows_subsystem = "windows"]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use std::cell::RefCell;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+use tailhawk_core::{background_rgb8, Renderer, WindowHandle};
+use windows::core::{Result, PCWSTR};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer,
+    LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowTextW, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, SW_SHOW,
+    WINDOW_EX_STYLE, WM_DESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+};
+
+/// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
+/// result has to be collected without blocking the loop — a short timer is the least machinery
+/// that does it, and it stops as soon as the device lands.
+const DEVICE_POLL_TIMER: usize = 1;
+const DEVICE_POLL_MS: u32 = 4;
+
+thread_local! {
+    static STATE: RefCell<Option<Shell>> = const { RefCell::new(None) };
+}
+
+struct Shell {
+    /// `None` until the worker hands the device over. While it is `None` the class background
+    /// brush is doing the painting — stage one of the two-stage paint.
+    renderer: Option<Renderer>,
+    pending: Option<Receiver<std::result::Result<Renderer, tailhawk_core::Error>>>,
+}
+
+impl Shell {
+    /// Stage two: adopt the device the moment it arrives, then ask for a repaint.
+    fn poll_device(&mut self, hwnd: HWND) {
+        let Some(rx) = self.pending.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(renderer)) => {
+                let title = format!("Tailhawk — {}", renderer.driver().name());
+                self.renderer = Some(renderer);
+                self.pending = None;
+                set_title(hwnd, &title);
+                stop_polling(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            // Device creation failed on every rung of the chain. The window stays up painting
+            // stage one rather than dying: `SPEC.md` §3.2 forbids panicking on device trouble.
+            Ok(Err(e)) => {
+                self.pending = None;
+                set_title(hwnd, &format!("Tailhawk — no graphics device ({e})"));
+                stop_polling(hwnd);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pending = None;
+                set_title(hwnd, "Tailhawk — graphics worker died");
+                stop_polling(hwnd);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn client_size(hwnd: HWND) -> (u32, u32) {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut rc);
+        }
+        (
+            (rc.right - rc.left).max(1) as u32,
+            (rc.bottom - rc.top).max(1) as u32,
+        )
+    }
+
+    /// Returns false when there is no device yet, so the caller can fall through to
+    /// `DefWindowProcW` and let the class brush paint stage one.
+    fn paint(&mut self, hwnd: HWND) -> bool {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return false;
+        };
+        let (w, h) = Self::client_size(hwnd);
+        if renderer
+            .attach(WindowHandle(hwnd.0 as isize), w, h)
+            .and_then(|()| renderer.paint())
+            .is_err()
+        {
+            // Device lost, or the swapchain could not be rebuilt. Drop back to stage one rather
+            // than tearing the process down; recreating the device is M0+1 work.
+            self.renderer = None;
+            return false;
+        }
+        true
+    }
+
+    fn resize(&mut self, hwnd: HWND) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            let (w, h) = Self::client_size(hwnd);
+            let _ = renderer.resize(w, h);
+        }
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn set_title(hwnd: HWND, title: &str) {
+    let t = wide(title);
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(t.as_ptr()));
+    }
+}
+
+fn stop_polling(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(hwnd, DEVICE_POLL_TIMER);
+    }
+}
+
+extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_TIMER if wparam.0 == DEVICE_POLL_TIMER => {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.poll_device(hwnd);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let painted = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .map(|shell| shell.paint(hwnd))
+                    .unwrap_or(false)
+            });
+            if painted {
+                // The swapchain owns the pixels, so there is no BeginPaint/EndPaint pair here;
+                // the update region still has to be cleared or the loop spins on WM_PAINT.
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ValidateRect(hwnd, None);
+                }
+                LRESULT(0)
+            } else {
+                // Stage one: DefWindowProcW's BeginPaint/EndPaint erases with the class brush,
+                // which is the same colour the renderer clears to.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_SIZE => {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.resize(hwnd);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn main() -> Result<()> {
+    // Device creation starts before the window exists. `experiments/g3-d3d11` measured this
+    // ordering as roughly halving time-to-first-pixel, and windows-rs marks the D3D11 interfaces
+    // Send, so the renderer crosses the channel directly.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Renderer::new());
+    });
+
+    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
+    let class_name = windows::core::w!("TailhawkMain");
+    let (r, g, b) = background_rgb8();
+
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(wndproc),
+        hInstance: instance,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+        // Stage one of the two-stage paint: the system erases with this during ShowWindow, before
+        // any handler of ours runs and long before a device exists. It must be the same colour the
+        // renderer clears to, which is why it comes from the core.
+        hbrBackground: unsafe {
+            CreateSolidBrush(windows::Win32::Foundation::COLORREF(
+                r as u32 | (g as u32) << 8 | (b as u32) << 16,
+            ))
+        },
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    if unsafe { RegisterClassW(&wc) } == 0 {
+        return Err(windows::core::Error::from_win32());
+    }
+
+    STATE.with(|s| {
+        *s.borrow_mut() = Some(Shell {
+            renderer: None,
+            pending: Some(rx),
+        });
+    });
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name,
+            windows::core::w!("Tailhawk"),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            1280,
+            800,
+            None,
+            None,
+            instance,
+            None,
+        )?
+    };
+    unsafe {
+        SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+
+    let mut msg = MSG::default();
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    Ok(())
+}

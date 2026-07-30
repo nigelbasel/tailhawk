@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/tailhawk",
+    "crates/tailhawk-core",
     "experiments/g3-d2d",
     "experiments/g3-d3d11",
     "experiments/g4-glyph-atlas",
