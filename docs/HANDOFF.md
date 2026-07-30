@@ -1,48 +1,59 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-30, session 5, immediately before an owner-initiated reboot.
+**Paused:** 2026-07-30, session 6, after taking the post-reboot measurement set.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
 
 ---
 
-## ⚡ FIRST THING AFTER THE REBOOT — take the cold set, before anything else starts
+## ✅ The cold set is taken — 2026-07-30, session 6
 
-This is time-limited and cannot be redone later in the day. Session 5 established that this machine
-carries a **variable ~40% background load** (Teams, Edge WebView2, Docker, OneDrive, Outlook) which made
-every absolute first-pixel figure unreproducible — the same build gave 96, 112, 126, 139, 154 and
-297 ms. **The minutes after a reboot, before that working set launches, are the only clean baseline
-available.** Do this before opening Teams, Docker or a browser.
+The reboot happened and the set was taken in the first ten minutes, on the existing
+`target-verify-static\release\` binaries with no rebuild. **Six 11-run sets: D2D, D3D11 serial and
+D3D11 earlypaint, each in two conditions** (boot churn at 36% CPU, then quiet at 0–6% CPU), plus a
+quiet G4. Leaked-subject count verified at **0** before and after every set. Full write-ups are in
+`experiments/g3-d3d11/RESULTS.md`, `experiments/g3-d2d/RESULTS.md` and
+`experiments/g4-glyph-atlas/RESULTS.md`.
 
-**No build is needed.** The `+crt-static` binaries already exist in `target-verify-static\release\`
-(git-ignored, so they survive the directory rename). Building would itself load the machine.
+**The branch that held: background load explains the whole absolute spread.** Every quiet figure lands
+at or below the fast end of session 5's range. So G5's reference machine is *not* needed to settle the
+shape of the result — it is still needed before any number is published in `SPEC.md` §11.3.
 
-```powershell
-cd C:\dev\git\Tailhawk          # or WinTail if the rename has not been done yet
+| | session 5 (loaded) | quiet, session 6 |
+|---|---|---|
+| **earlypaint first pixel** | 54.7 / 66.3 ms p50 | **13.1 ms p50, 14.5 p90** |
+| D3D11 serial, total | 126.4 ms p50 | 68.6 ms p50 |
+| D2D, total | 156.7 ms p50 | 75.5 ms p50 |
+| `CreateWindowExW` | 8.5 – 11.9 ms | 3.2 – 3.9 ms |
 
-# Record the machine state first — this is the whole point of the exercise.
-"uptime h : " + [math]::Round(((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalMinutes,1)
-"cpu load : " + (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
-"leaked   : " + @(Get-Process | Where-Object { $_.ProcessName -like 'g3-*' -or $_.ProcessName -like 'g4-*' }).Count
+**Three conclusions changed.**
 
-.\experiments\measure.ps1 -Exe target-verify-static\release\g3-d2d.exe `
-    -OutFile g3-d2d-first-pixel.txt -Columns "factory,window,target,draw,total" -Runs 11
-.\experiments\measure.ps1 -Exe target-verify-static\release\g3-d3d11.exe `
-    -OutFile g3-d3d11-serial.txt     -ExeArgs serial     -Columns "mode,window,device,swapchain,draw,total,driver" -Runs 11
-.\experiments\measure.ps1 -Exe target-verify-static\release\g3-d3d11.exe `
-    -OutFile g3-d3d11-earlypaint.txt -ExeArgs earlypaint -Columns "mode,window,first_pixel,d3d_ready,driver" -Runs 11
-```
+1. **The "~50–60 ms window-presentation floor" does not exist — it was load.** `first_pixel` measures
+   `main()` entry → `FillRect` returning in the first `WM_PAINT`, so `ShowWindow` and paint dispatch are
+   inside the measured region: they cost **~10 ms beyond window creation**, not 50–60. Session 5's
+   "the window is the bottleneck" reframing is **withdrawn**.
+2. **G3's 40 ms first-pixel criterion passes with the two-stage paint** — 13.1 ms p50, 14.5 ms p90,
+   14.5 ms worst of 11 — and fails ~1.7x without it (68.6 ms). **The criterion is a test of paint order,
+   not of the graphics stack**, and `SPEC.md` §3.2's two-stage requirement is now measured as
+   sufficient rather than merely helpful. Still one machine, not the G5 reference machine, and
+   time-to-`FillRect` rather than time-to-photon.
+3. **G4 went the other way and this is the important one.** Rasterisation on the quiet machine is
+   **494–582 ms/frame — the *top* of the earlier 227–582 range**, i.e. **330–388 µs/glyph**. "The spread
+   tracks load" was wrong, a cold run does not bound the cost favourably, and the pessimistic end is the
+   honest figure. **This raises the value of the batched-rasterisation experiment below**, which is now
+   unambiguously the highest-value remaining item.
 
-**What this settles.** If the cold p50s land near the *fast* end of the observed ranges (D2D ~96 ms,
-D3D11 serial ~112 ms, earlypaint ~55 ms), then background load explains the whole spread and those
-become the defensible figures for `SPEC.md` §11.3 — stated as p50/p90, never as a mean. If they land
-high instead, the spread has another cause and G5's reference machine is genuinely required first.
+**Two method notes worth keeping:**
 
-**Also worth doing while the machine is quiet:** re-run G4 (`cargo run --release -p g4-glyph-atlas`,
-~100 s) — its rasterisation figure ranged 227–582 ms/frame purely on load, and a cold number would
-bound the real cost of the renderer's dominant expense.
-
-**Do not** compare two configurations in a fixed order, and remember the leaked-subject trap in the
-Toolchain section — both cost session 5 a wrong conclusion each.
+- **Post-reboot is not quiet, and uptime is the wrong thing to record.** The first four runs of the
+  first set gave 174, 225, 264 and **1604 ms** before settling — boot-time service churn is itself load.
+  The quiet window opened at about six minutes' uptime. **Record CPU load, and re-check it after every
+  set.**
+- **`-OutFile` must match the filename the binary hardcodes** (`g3-d2d-first-pixel.txt`,
+  `g3-d3d11-<mode>.txt`). Any other name and `measure.ps1` polls for a file nobody writes, warns eleven
+  times and throws — a whole set measured nothing before this was spotted.
+- **G4 is `windows_subsystem = "windows"`, so PowerShell does not wait for it.** `& .\g4-glyph-atlas.exe`
+  returns in 0.1 s while the process runs on for ~100 s. Poll for `%TEMP%\g4-glyph-atlas.txt`, then kill
+  the process — it holds a D3D device and is otherwise a leaked subject by the same mechanism as G3's.
 
 ---
 
@@ -58,7 +69,8 @@ subdirectories from sessions 1 and 2.
 
 **What remains** — the rename itself, which cannot be done from inside a Claude session because the
 harness resets the shell CWD into the repo after every tool call, and Windows will not rename a
-directory a process has as its CWD. With Claude closed:
+directory a process has as its CWD. **Session 6 was still in `C--dev-git-WinTail`, so it is still
+outstanding.** With Claude closed — a log-out is a natural moment for it:
 
 ```powershell
 cd C:\dev\git
@@ -127,9 +139,11 @@ PRs (tried once, not worth it solo). Commit often; the history is the artefact.
 
 Phase 0 is **4 of 7 done or dispositioned**. What remains, and an honest read on each:
 
-0. **Batched glyph rasterisation — the highest-value unblocked experiment.** G4 measured DirectWrite at
-   **145–390 µs per glyph** using one `CreateGlyphRunAnalysis` per glyph, which makes a cold viewport of
-   ~1,500 CJK glyphs cost 14–35 frames and is by far the renderer's dominant expense. G4 flagged
+0. **Batched glyph rasterisation — the highest-value unblocked experiment, and session 6 raised its
+   value.** G4 measured DirectWrite at **145–390 µs per glyph** using one `CreateGlyphRunAnalysis` per
+   glyph, which makes a cold viewport of ~1,500 CJK glyphs cost 14–35 frames and is by far the
+   renderer's dominant expense. **The quiet re-take landed at 330–388 µs/glyph — the pessimistic end —
+   so this cost is real and is not an artefact of machine load.** G4 flagged
    batching a whole run into a single analysis as the likely fix and explicitly did **not** test it.
    Attractive because it needs **no GPU and no window** — pure DirectWrite plus timing — so it is immune
    to the D3D-device contamination and the leaked-subject trap that cost session 5 two wrong
@@ -147,15 +161,14 @@ Phase 0 is **4 of 7 done or dispositioned**. What remains, and an honest read on
    hello-worlds would measure binary size for a stack that is triply rejected. The honest move is to
    record the legs as **deliberately not run**, with that reasoning, rather than leave them looking
    outstanding. Owner's call.
-3. ~~**Re-take G3's numbers** once the desktop C++ workload is installed~~ — **done for sizes
-   (unchanged, byte-identical) and for the A/B comparisons.** What remains is a **cold (post-reboot)
-   and a quiet-machine set** to pin down the absolute first-pixel value; see the open item below.
-   Owner-gated, because a reboot is theirs to schedule.
-4. **Test the one surviving first-paint direction:** paint something cheap — a GDI or
-   `WM_ERASEBKGND` fill — before the D3D device exists, then swap in the real renderer. Concurrency has
-   been measured and refuted, so this is the only lever left, and it now looks much better than it did:
-   first pixel would approach ~9 ms of window creation plus a fill, not the ~113 ms floor session 3
-   believed in. Unblocked and doable solo.
+3. ~~**Re-take G3's numbers** once the desktop C++ workload is installed~~ — **fully done.** Sizes
+   (unchanged, byte-identical), the A/B comparisons, and now the **cold and quiet sets** (session 6,
+   above). Nothing further is owed on this machine; the remaining absolute-figure work is G5's reference
+   machine, which is open question 3.
+4. ~~**Test the one surviving first-paint direction:** paint something cheap before the D3D device
+   exists~~ — **done and it works.** It is `earlypaint` in `experiments/g3-d3d11`, it reaches first pixel
+   in **13.1 ms p50** on a quiet machine, and it is what makes G3's 40 ms criterion pass. `SPEC.md` §3.2
+   requires it for v1.
 5. **G1** needs two hosts, **G5** needs a decision on downloading third-party binaries, **G6** is a
    week of the owner's real usage. All three are owner-gated, not work-gated.
 
@@ -277,7 +290,7 @@ caveat.
 
 | Gate | State |
 |---|---|
-| **G3** — binary size floor + first pixel | **Size passes and is settled. First pixel fails and its absolute value is still unsettled.** Two legs done on the desktop CRT: D2D (`experiments/g3-d2d/RESULTS.md`) and D3D11+DXGI (`experiments/g3-d3d11/RESULTS.md`). `eframe` legs not started — see the argument below that they are moot. |
+| **G3** — binary size floor + first pixel | **Size passes and is settled. First pixel now passes too — with the two-stage paint (13.1 ms p50 against 40 ms); it fails ~1.7x without it.** Absolutes settled as far as one machine allows; publishing them still waits on G5. Two legs done on the desktop CRT: D2D (`experiments/g3-d2d/RESULTS.md`) and D3D11+DXGI (`experiments/g3-d3d11/RESULTS.md`). `eframe` legs not started — see the argument below that they are moot. |
 | **G1** — SMB stale size | Not started. Needs two hosts and a share; can't be done solo on one machine. |
 | **G2** — read throughput | Not started. Informational only, no pass threshold. |
 | **G4** — colour-glyph atlas | **Done. Passes**, and it refuted the objection it was built to test. See `experiments/g4-glyph-atlas/RESULTS.md`. |
@@ -287,7 +300,13 @@ caveat.
 
 ### G3 result in one line
 
-**Size passes by ~8x and is settled. First pixel fails by ~3x and its absolute value is not settled.**
+**Size passes by ~8x. First pixel passes by ~3x if something paints before the device exists, and fails
+by ~1.7x if you wait for it — so the gate measures paint order, not the graphics stack.**
+
+The paragraphs below were written before session 6's quiet set and quote the loaded absolutes (126 ms
+total, 117 ms graphics init, a 50–60 ms window-presentation floor). **The ratios and the A/B conclusions
+all stand; the absolute numbers are ~1.8x too high and the window-presentation floor is refuted.**
+Corrected figures are in the session-6 section at the top and in `experiments/g3-d3d11/RESULTS.md`.
 
 **Size is done.** 243,712 bytes with `+crt-static`, 146,432 dynamic, against a 2 MB criterion — and
 **byte-for-byte identical between the OneCore and desktop CRTs**, so the re-take changed nothing. The
@@ -339,9 +358,10 @@ can accumulate between them.
   126 ms where D2D's `HwndRenderTarget` takes 157 ms. The D2D leg was measuring a configuration
   Tailhawk was never going to ship.
 
-**Still owed:** a post-reboot (cold) set and a quiet-machine set. Every session-5 timing was taken with
-a VS installer resident. Variance alone still means any first-paint budget must be a percentile, not a
-mean, and 40 ms needs re-deriving around ~117 ms of unavoidable graphics init.
+~~**Still owed:** a post-reboot (cold) set and a quiet-machine set.~~ **Both taken, session 6.** Every
+session-5 timing was taken with a VS installer resident, which is why they read ~1.8x high. Variance
+still means any first-paint budget must be a percentile, not a mean — but **40 ms does not need
+re-deriving**: it is met at 13.1 ms p50 / 14.5 ms p90 once something paints before the device exists.
 
 ### G4 result in one line
 
@@ -358,10 +378,13 @@ Unified is also 25–32% cheaper on CPU than a two-pass split, and the split can
 - **Eviction passes only with an O(1) policy.** Scanning slots for the oldest costs 4–8 ms/frame under
   thrashing; an intrusive LRU list costs 0.17–0.37 ms. An earlier variable-width-span variant cost
   **106 ms/frame**. Uniform single-glyph slots are what make O(1) possible.
-- **Rasterisation is the real stall: 145–210 µs per glyph.** A cold viewport of ~1,500 CJK glyphs needs
-  220–310 ms — 13–19 frames. So glyph rasterisation must be **off the paint path**, with placeholders
-  filled in over later frames. That is now a v1 requirement and `SPEC.md` did not previously say it.
-  Eviction is three orders of magnitude cheaper than the rasterisation it triggers.
+- **Rasterisation is the real stall: 145–210 µs per glyph, and 330–388 µs on a quiet machine.** A cold
+  viewport of ~1,500 CJK glyphs needs 220–580 ms — 13–35 frames. So glyph rasterisation must be **off the
+  paint path**, with placeholders filled in over later frames. That is now a v1 requirement and
+  `SPEC.md` did not previously say it. Eviction is three orders of magnitude cheaper than the
+  rasterisation it triggers. **Session 6 note: the quiet figure is the *slow* end, so this cost is not a
+  load artefact** — and two phases doing identical work in one quiet process differed by ~18%, so the
+  fixed-order rule applies inside G4's binary too.
 
 ### G7 result in one line
 
@@ -380,18 +403,24 @@ derived rules and a CI assertion that catches them.
 Both of the reporter's thresholds — 2M for onset, 100M for "very broken" — are **predicted from the
 arithmetic alone**, by a model never fitted to them. `RESEARCH.md` §3.4 is now `[V]`.
 
-### Closed: absolute first-pixel figures are blocked on G5, not on a reboot
+### Reopened and then closed properly: the reboot happened, and it did settle something
 
-**Owner will not be rebooting, so this route is closed — and it turns out not to matter.** The cause of
-the instability is identified: **this machine carries a variable ~40% background load** from a normal
-working set (Teams, Edge WebView2, Docker, OneDrive, Outlook), which is not going away. A 21-run D2D set
-spanning it gave a p50 of 297 ms across a 117–783 ms range, with fast runs clustered wherever the load
-happened to dip.
+**Superseded by session 6 — the owner did reboot, and the set was worth taking.** Session 5 wrote this
+section off on the grounds that absolute figures were blocked on G5's reference machine rather than on a
+reboot. That was half right: G5 is still required before any `SPEC.md` §11.3 figure is *published*, but
+the quiet set refuted a design conclusion (the window-presentation floor) and flipped a gate verdict
+(G3's first pixel). Neither of those needed a reference machine — they needed the load removed once.
 
-So the same static build has legitimately produced 96, 112, 126, 139, 154 and 297 ms. **Absolute
-first-paint numbers were never blocked on a reboot — they are blocked on `PLAN.md` §3 G5's fixed
-reference machine**, which open question 3 already required before any `SPEC.md` §11.3 figure is
-published. Nothing further is owed here.
+The diagnosis below stands and explains the spread:
+
+The cause of the instability is identified: **this machine carries a variable ~40% background load** from
+a normal working set (Teams, Edge WebView2, Docker, OneDrive, Outlook), which is not going away. A 21-run
+D2D set spanning it gave a p50 of 297 ms across a 117–783 ms range, with fast runs clustered wherever the
+load happened to dip.
+
+So the same static build has legitimately produced 96, 112, 126, 139, 154 and 297 ms — **and 75.5 ms
+quiet, which is below all of them.** The lesson to carry: a quiet-machine set is cheap, and it is the
+only way to tell a floor from a queue.
 
 **What to do instead, and it is already the practice:** decide with **paired interleaved A/B** on this
 machine — reliable, reproduced across runs, and immune to both load drift and accumulation effects.
@@ -413,11 +442,11 @@ Three of four agree closely; session 3 is the outlier, and its range does not ov
 the CRT change is **not** the cause — the 8.5 ms measurement was taken before the install, on the same
 OneCore toolchain that produced 113 ms.
 
-**What would settle it:** a post-reboot set and a genuinely quiet-machine set (no VS installer, no
-Docker, no browser). Both are owner-gated, since a reboot is theirs to schedule. Until then treat every
-absolute first-pixel number as provisional and rely only on the A/B comparisons, which were each taken
-minutes apart under identical load and are therefore sound: serial vs concurrent, D2D vs D3D11 + DXGI,
-static vs dynamic.
+**What settled it, session 6:** a post-reboot set and a quiet set (no VS installer, no Docker, no
+browser) both give `CreateWindowExW` at 3.2–3.9 ms. With session 5's 8.5–11.9 ms that is three agreeing
+sets against session 3's 113 ms. **Session 3 is the outlier, its cause is unexplained, and it is no
+longer worth explaining.** The A/B comparisons remain the sound part of session 5 and are unaffected:
+serial vs concurrent, D2D vs D3D11 + DXGI, static vs dynamic.
 
 **Identity sweep: done 2026-07-29.** `RESEARCH.md`, `SPEC.md`, `PLAN.md`, `UI-DESIGN.md`, `LOKI.md`
 and `HANDOFF.md` were swept for employer names, customer names, internal hostnames, service names,
@@ -516,6 +545,9 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **A `u64` scroll position is not enough on its own.** G7 found the row-*layout* conversion `row * row_h - offset_px` reproduces egui #1391 in full even when the scroll position is exact. One plausible line, whole bug back. | `SPEC.md` §6.4, `experiments/g7-egui-scroll/RESULTS.md` |
 | **`GetData` returns `S_FALSE` when a D3D11 query isn't ready — and `S_FALSE` is a *success* HRESULT.** `Result<()>` is `Ok`, so `is_err()` is useless as a readiness test. G4's first GPU timings were all 0.000 ms because of it. Detect readiness with a sentinel the driver must overwrite. | `experiments/g4-glyph-atlas/RESULTS.md` |
 | **`DWRITE_GLYPH_RUN::fontFace` is `ManuallyDrop<Option<..>>`.** Writing into it is safe; copying it *out* into an owned interface releases a reference never added, and the underflow surfaces later as a use-after-free. Borrow the face out of a `DWRITE_COLOR_GLYPH_RUN`. | `experiments/g4-glyph-atlas/src/text.rs` |
+| **`measure.ps1 -OutFile` must match the filename the subject hardcodes** — `g3-d2d-first-pixel.txt`, `g3-d3d11-<mode>.txt`. Any other name and the script polls for a file nobody writes, warns eleven times and throws, having measured nothing. | `experiments/measure.ps1` |
+| **A `windows_subsystem = "windows"` exe does not block PowerShell.** `& .\g4-glyph-atlas.exe` returns in 0.1 s while the process runs on for ~100 s. Poll for its report file, then kill it — it holds a D3D device and is otherwise a leaked subject. | `experiments/g4-glyph-atlas` |
+| **A quiet-machine set is how you tell a floor from a queue.** Session 5 derived a "~50–60 ms window-presentation floor" from loaded runs; the quiet re-take put first pixel at 13.1 ms. Conversely G4's rasterisation came in at the *top* of its range when quiet, so the load explanation was wrong in both directions. | `experiments/g3-d3d11/RESULTS.md` |
 | **Never time a frame with `Present` inside the measured region.** The flip model blocks on the back-buffer queue, which pinned every G4 frame to exactly 16.669 ms and hid the real cost entirely. | `experiments/g4-glyph-atlas/RESULTS.md` |
 
 ---
