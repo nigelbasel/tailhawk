@@ -1,7 +1,55 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-30, session 6, after taking the post-reboot measurement set.
+**Paused:** 2026-07-30, session 7, after running the batched-rasterisation experiment.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## ✅ Batched rasterisation is done — 2026-07-30, session 7
+
+The highest-value remaining experiment ran, as `experiments/g4b-batched-raster`. Full write-up in
+`experiments/g4b-batched-raster/RESULTS.md`. Machine quiet throughout (2–5% CPU, zero leaked
+subjects). It answered its own question and then overturned the premise behind it.
+
+**Batching works and is not the win.** Batched cells are **bit-identical** to per-glyph cells at any
+inter-cell gap including zero, so it is safe for an atlas. It is worth **~1.8x on cold glyphs**,
+saturating at **4 glyphs per analysis** — real, worth taking, but not the order of magnitude that made
+it the top-ranked item. Past 256 glyphs per analysis it becomes a *pessimisation*. On warm glyphs it
+wins nothing.
+
+**What actually dominates: a cross-process, capacity-limited system font cache.**
+
+| | µs/glyph |
+|---|---|
+| first process on the machine to rasterise a glyph | **86 – 108** |
+| any later process, same glyph and size | **~3** |
+| capacity | **8,000 – 16,000 distinct glyphs** (bracketed, not pinned) |
+
+36x, and it survives process exit — so it is system state, not process state.
+`Windows Font Cache Service` is the inferred mechanism (not verified; confirming it means stopping a
+system service).
+
+**Three earlier conclusions are corrected.**
+
+1. **G4's 330–388 µs/glyph is a cache-thrash figure.** Its fixture cycles 20,992 distinct CJK glyphs
+   to force *atlas* eviction — which was the point — and incidentally never fits the font cache
+   either. Re-run today the same binary gives **92–97 µs/glyph**. The eviction conclusions (the O(1)
+   LRU requirement, the 20–28x ratio) are untouched and stand.
+2. **Session 6's anomaly is explained, and its mechanism was wrong.** Session 6 saw the quiet
+   post-reboot re-take land at the *top* of the range and concluded "a cold run does not bound this
+   cost favourably — the spread is not load". Right observation, wrong cause: **a reboot empties the
+   font cache**, so that run was the most cache-cold and therefore the slowest. It was never about CPU
+   load in either direction.
+3. **`SPEC.md` §3.2's "rasterisation off the paint path" survives but needs re-scoping — owner's
+   call.** It is a **first-run** cost, not a per-viewport one: a genuinely cold 1,500-glyph viewport is
+   **162.5 ms** (8–10 frames, so placeholders stay a v1 requirement), but steady state is the same
+   viewport in **4.4 ms**, inside one frame. The spec currently implies the former is permanent. Not
+   edited — that is a normative change.
+
+**Method note that cost the session an hour and a wrong answer:** the first version of this experiment
+reported 2.5 µs/glyph and concluded G4 was wrong by 150x. It was measuring cache hits left behind by
+its own previous run. An in-process "is there a cache?" probe cannot detect a cross-process cache and
+returned a confident 0.99x. See the traps table.
 
 ---
 
@@ -139,16 +187,13 @@ PRs (tried once, not worth it solo). Commit often; the history is the artefact.
 
 Phase 0 is **4 of 7 done or dispositioned**. What remains, and an honest read on each:
 
-0. **Batched glyph rasterisation — the highest-value unblocked experiment, and session 6 raised its
-   value.** G4 measured DirectWrite at **145–390 µs per glyph** using one `CreateGlyphRunAnalysis` per
-   glyph, which makes a cold viewport of ~1,500 CJK glyphs cost 14–35 frames and is by far the
-   renderer's dominant expense. **The quiet re-take landed at 330–388 µs/glyph — the pessimistic end —
-   so this cost is real and is not an artefact of machine load.** G4 flagged
-   batching a whole run into a single analysis as the likely fix and explicitly did **not** test it.
-   Attractive because it needs **no GPU and no window** — pure DirectWrite plus timing — so it is immune
-   to the D3D-device contamination and the leaked-subject trap that cost session 5 two wrong
-   conclusions. Could move the number by an order of magnitude. Measure per-glyph vs batched-run,
-   paired and interleaved.
+0. ~~**Batched glyph rasterisation — the highest-value unblocked experiment**~~ — **done, session 7.**
+   See the section at the top and `experiments/g4b-batched-raster/RESULTS.md`. Batching is
+   bit-identical and worth ~1.8x saturating at batch 4; the order of magnitude is not there. The
+   premise — that per-analysis granularity was the dominant cost — is refuted: a cross-process font
+   cache is, and G4's figure was a thrash figure. **Nothing further is owed on this line of work.**
+   What it leaves behind is one decision for the owner: whether to re-scope `SPEC.md` §3.2 from a
+   permanent requirement to a first-run one.
 1. **G2 — read throughput.** Unblocked and doable solo, but **it blocks nothing**: `PLAN.md` §3 marks it
    *"Informational — no pass threshold"* and its "if it fails" column reads *"Nothing."* The no-mmap
    decision is already locked on correctness grounds, so G2 only quantifies what that costs. Note it
@@ -293,7 +338,8 @@ caveat.
 | **G3** — binary size floor + first pixel | **Size passes and is settled. First pixel now passes too — with the two-stage paint (13.1 ms p50 against 40 ms); it fails ~1.7x without it.** Absolutes settled as far as one machine allows; publishing them still waits on G5. Two legs done on the desktop CRT: D2D (`experiments/g3-d2d/RESULTS.md`) and D3D11+DXGI (`experiments/g3-d3d11/RESULTS.md`). `eframe` legs not started — see the argument below that they are moot. |
 | **G1** — SMB stale size | Not started. Needs two hosts and a share; can't be done solo on one machine. |
 | **G2** — read throughput | Not started. Informational only, no pass threshold. |
-| **G4** — colour-glyph atlas | **Done. Passes**, and it refuted the objection it was built to test. See `experiments/g4-glyph-atlas/RESULTS.md`. |
+| **G4** — colour-glyph atlas | **Done. Passes**, and it refuted the objection it was built to test. See `experiments/g4-glyph-atlas/RESULTS.md`. Its rasterisation *absolutes* are superseded by G4b (session 7) as cache-thrash figures; its atlas and eviction conclusions stand. |
+| **G4b** — batched rasterisation | **Done, session 7.** Not a `PLAN.md` gate — a follow-up closing G4's open caveat. Batching is bit-identical and worth ~1.8x; the dominant cost is a cross-process font cache. See `experiments/g4b-batched-raster/RESULTS.md`. |
 | **G5** — incumbent re-measurement | Not started. Needs BareTail 3.50a and LogExpert 1.41.0 installed — **owner decision, involves downloading third-party binaries.** |
 | **G6** — Hoo WinTail hands-on | Owner task, runs in the background across Phase 0. |
 | **G7** — reproduce egui #1391 | **Done. Passes** — the cause is identified. See `experiments/g7-egui-scroll/RESULTS.md`. |
@@ -378,6 +424,9 @@ Unified is also 25–32% cheaper on CPU than a two-pass split, and the split can
 - **Eviction passes only with an O(1) policy.** Scanning slots for the oldest costs 4–8 ms/frame under
   thrashing; an intrusive LRU list costs 0.17–0.37 ms. An earlier variable-width-span variant cost
   **106 ms/frame**. Uniform single-glyph slots are what make O(1) possible.
+- **⚠ Superseded by session 7 — these are cache-miss figures, and the mechanism is a system font
+  cache, not analysis granularity.** Cold is 86–108 µs/glyph and warm is ~3; see the top section. The
+  eviction conclusion below is unaffected. Original text follows.
 - **Rasterisation is the real stall: 145–210 µs per glyph, and 330–388 µs on a quiet machine.** A cold
   viewport of ~1,500 CJK glyphs needs 220–580 ms — 13–35 frames. So glyph rasterisation must be **off the
   paint path**, with placeholders filled in over later frames. That is now a v1 requirement and
@@ -548,6 +597,10 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **`measure.ps1 -OutFile` must match the filename the subject hardcodes** — `g3-d2d-first-pixel.txt`, `g3-d3d11-<mode>.txt`. Any other name and the script polls for a file nobody writes, warns eleven times and throws, having measured nothing. | `experiments/measure.ps1` |
 | **A `windows_subsystem = "windows"` exe does not block PowerShell.** `& .\g4-glyph-atlas.exe` returns in 0.1 s while the process runs on for ~100 s. Poll for its report file, then kill it — it holds a D3D device and is otherwise a leaked subject. | `experiments/g4-glyph-atlas` |
 | **A quiet-machine set is how you tell a floor from a queue.** Session 5 derived a "~50–60 ms window-presentation floor" from loaded runs; the quiet re-take put first pixel at 13.1 ms. Conversely G4's rasterisation came in at the *top* of its range when quiet, so the load explanation was wrong in both directions. | `experiments/g3-d3d11/RESULTS.md` |
+| **⚠ DirectWrite's glyph cache is cross-process, so "run it again" is a *warm* measurement.** The first version of G4b reported 2.5 µs/glyph and concluded G4 was wrong by 150x; it was reading cache hits left by its own previous run. Only the first process to touch a (glyph, size) pair since the cache lost it measures rasterisation. | `experiments/g4b-batched-raster/RESULTS.md` |
+| **An in-process cache probe cannot see a cross-process cache.** Five identical passes gave pass0/pass4 = 0.99x — a confident, worthless "no cache". Vary **em** to get a cold population without a reboot: the cache key includes size. | `experiments/g4b-batched-raster/RESULTS.md` |
+| **A reboot is not a neutral cold start for anything that draws text** — it empties the font cache service, so post-reboot text rendering is several times slower than a quiet warm machine. This is what session 6 misread as "a cold run does not bound the cost favourably". | `experiments/g4b-batched-raster/RESULTS.md` |
+| **Derive an atlas cell from measured glyph bounds, never from em size.** Guessing 20×26 for em 14 clipped 1,086 of 1,500 glyphs — and the clipped cells then compared *equal* between arms, which reads as a correctness pass. Assert `overflow == 0` before believing any bitmap comparison. | `experiments/g4b-batched-raster/RESULTS.md` |
 | **Never time a frame with `Present` inside the measured region.** The flip model blocks on the back-buffer queue, which pinned every G4 frame to exactly 16.669 ms and hid the real cost entirely. | `experiments/g4-glyph-atlas/RESULTS.md` |
 
 ---
@@ -569,6 +622,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 2. **Employment IP position.** If any of this gets built on work equipment or work time, many contracts assign IP. Worth establishing **before the first public commit**, not after the repo has contributors.
 3. **Reference perf machine** — must be fixed before any `[TBM]` target in `SPEC.md` §11.3 becomes a number.
 4. **Hoo WinTail hands-on (G6)** — the owner's installed copy is the only reliable source for which of its features are actually used in a week, and for how its encoding detection really behaves.
+5. **Re-scope `SPEC.md` §3.2's rasterisation requirement?** G4b showed the cost is ~86–108 µs/glyph the first time a (glyph, size) is seen *on that machine* and ~3 µs thereafter, surviving restarts. A cold 1,500-glyph viewport is 162.5 ms; the same viewport warm is 4.4 ms. Placeholders stay a v1 requirement either way, but the spec currently reads as though the cost is permanent. Normative change, so not made — see `experiments/g4b-batched-raster/RESULTS.md` §"Consequences for the design".
 
 ---
 

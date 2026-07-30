@@ -146,7 +146,7 @@ every Latin, CJK and emoji glyph at em 14 fitted the 20×22 box.
 **14 to 35 frames at 60 Hz.** Eviction is three orders of magnitude cheaper than the rasterisation it
 triggers, and rasterisation is the only term large enough to matter.
 
-### ⚠ The spread is not machine load, and the quiet number is the slow one
+### ⚠ The spread is not machine load — and session 7 found what it actually is
 
 This section previously said the spread tracked machine load. **Re-run on a verified quiet machine
 (0–6% CPU, minutes after a reboot, same `+crt-static` binary), rasterisation came in at 494.6 and
@@ -155,6 +155,12 @@ glyph**, so:
 
 - **A cold run does not bound this cost favourably.** The pessimistic end of the earlier range is the
   honest figure to design against, and the "it's just load" reading is withdrawn.
+- **⚠ Mechanism identified, session 7: it is the system font cache, and a reboot empties it.** The
+  observation above is correct and the explanation was incomplete. Glyph rasterisation is backed by a
+  cross-process cache (`Windows Font Cache Service`, inferred), so the post-reboot run was the most
+  *cache*-cold run and therefore the slowest — nothing to do with CPU load in either direction. The
+  same binary re-run on a quiet machine with the cache partly warm gives **92–97 µs/glyph** against
+  this section's 330–388. See `../g4b-batched-raster/RESULTS.md`.
 - **There is a within-process ordering effect of ~18%.** The two overflow phases rasterise *identical*
   work — 1,500 misses, 180,000 total, same glyphs — yet the phase that runs second measured 581.7 ms
   against the first's 494.6 ms, in a single quiet process. So **the fixed-order rule from
@@ -164,22 +170,36 @@ glyph**, so:
 - **The O(1) eviction requirement is reconfirmed on quiet numbers:** 8.51 ms scanning versus 0.31 ms
   with the intrusive list.
 
-The likely cause of the rasterisation cost is granularity: this code calls `CreateGlyphRunAnalysis`
-once **per glyph**, which allocates a COM object and does three interface calls per glyph. Batching a
-whole run into a single analysis should be far cheaper, and is **not tested here** — worth its own
-experiment before the number is treated as a floor. **The quiet re-take raises the value of that
-experiment**: the dominant renderer expense is confirmed at the pessimistic end, and it is not going to
-be explained away by machine state.
+~~The likely cause of the rasterisation cost is granularity~~ — **tested, and it was not the cause.
+See `../g4b-batched-raster/RESULTS.md` (2026-07-30, session 7).**
+
+Batching a whole run into a single `CreateGlyphRunAnalysis` is bit-identical to per-glyph
+rasterisation and worth **~1.8x**, saturating at 4 glyphs per analysis — real, but not the order of
+magnitude this paragraph hoped for, and past 256 glyphs per analysis it is a *pessimisation*.
+
+The dominant cost is instead a **cross-process, capacity-limited system font cache**. The first
+process on a machine to rasterise a glyph pays ~86–108 µs; every process afterwards pays ~3 µs for
+the same glyph, and that survives process exit. Capacity is bracketed between 8,000 and 16,000
+distinct glyphs.
+
+**That makes the figures in this section thrash figures.** The overflow fixture below draws each frame
+from a different slice of the 20,992-codepoint ideograph block so the working set never fits *the
+atlas* — which was the point. It also never fits the *font cache*, which is 2.5x smaller than the
+fixture. The eviction conclusions are unaffected and stand; the rasterisation absolutes describe a
+workload no log viewport reaches.
 
 ## Consequences for the design
 
 1. **`SPEC.md` §11.2's one-instanced-draw rule survives colour emoji.** No re-costing of V2 is
    needed on this account. The mechanism must be recorded, though: dual-source blending with a
    premultiplying mono path, not two atlases in two passes.
-2. **Glyph rasterisation must be off the paint path.** At 145–210 µs/glyph a cold viewport cannot be
-   rasterised within a frame. The grid needs to draw *something* for a glyph that is not yet resident
-   — a placeholder box, or the previous frame's content — and fill in over subsequent frames. This is
-   a v1 requirement, not an optimisation, and `SPEC.md` currently does not say it.
+2. **Glyph rasterisation must be off the paint path** — **still true after session 7, but re-scoped.**
+   The honest figure is ~86–108 µs/glyph the **first time a (glyph, size, rendering mode) is seen on
+   that machine**, which persists across process restarts rather than recurring per viewport. A
+   genuinely cold 1,500-glyph viewport measures **162.5 ms**, still 8–10 frames, so placeholders and
+   fill-in-over-later-frames remain a v1 requirement. Steady state, however, is 1,500 glyphs in
+   **4.4 ms** — inside one frame. This is a first-run-experience requirement, not a permanent tax, and
+   `SPEC.md` §3.2 should say which.
 3. **The atlas is a fixed-slot LRU with uniform slots and an O(1) victim list.** Not a shelf packer,
    not variable-width spans. This is a design constraint with a measured 20x–290x justification.
 4. **Cache the absence of ink.** A glyph with no raster (space, or a codepoint absent from the face)
@@ -221,7 +241,13 @@ be explained away by machine state.
 - **Shaders are compiled at runtime via `D3DCompile`.** `SPEC.md` §3 requires offline compilation
   with embedded bytecode to avoid a `d3dcompiler_47.dll` dependency; that is a packaging concern and
   does not affect these measurements.
-- Rasterisation cost is measured at one-glyph-per-analysis granularity. Batched runs are untested.
+- ~~Rasterisation cost is measured at one-glyph-per-analysis granularity. Batched runs are untested.~~
+  **Tested 2026-07-30 — see `../g4b-batched-raster/RESULTS.md`.** Batching is bit-identical and worth
+  ~1.8x, saturating at 4 glyphs per analysis. It was not the dominant cost; a cross-process font cache
+  is, and every rasterisation figure in this file is a cache-miss figure.
+- **Every µs/glyph figure here is a sustained cache-miss cost.** The fixture cycles 20,992 distinct
+  glyphs against a font cache that holds 8,000–16,000, so it thrashes by construction. Correct for what
+  it measures; not representative of a log viewport.
 - The mono atlas's alpha channel carries the greyscale average, so one sheet serves both subpixel and
   greyscale rendering at no extra memory. Greyscale mode (`MODE_MONO_GREY`) exists in the shader but
   was not separately benchmarked.

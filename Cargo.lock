@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "g4b-batched-raster"
+version = "0.0.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "g7-egui-scroll"
 version = "0.0.0"
 

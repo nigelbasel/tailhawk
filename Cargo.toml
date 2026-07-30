@@ -4,6 +4,7 @@ members = [
     "experiments/g3-d2d",
     "experiments/g3-d3d11",
     "experiments/g4-glyph-atlas",
+    "experiments/g4b-batched-raster",
     "experiments/g7-egui-scroll",
 ]
 
