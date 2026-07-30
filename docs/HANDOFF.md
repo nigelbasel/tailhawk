@@ -42,9 +42,19 @@ usable UI sooner**. The dogfood-first reordering (skip M2, trim M3) was offered 
   pre-existing lints; they are throwaway measurement code whose hand-formatting is part of what they
   record. They are still compiled by the workspace build, so they cannot rot into not building.
 
-**Next: M1 — read and decode** (`PLAN.md` §4). Headless: open a file, detect encoding, stream decoded
-lines with correct carry across read boundaries. **Decode before index** — that ordering is the
-dependency inversion adversarial review caught, and it is why M1 is not the indexer.
+### Start the next session with these two, in order
+
+1. **Check CI has ever actually run** — github.com/nigelbasel/tailhawk/actions. It was added at the
+   end of session 7 and **has never been observed passing**; there is no `gh` CLI on this machine, so
+   it could not be read from inside the session. The specific unknown is whether the **ARM64 leg
+   linked**. If it did, delete the ⚠ from the M0 table above. If it did not, the likely cause is a
+   missing ARM64 MSVC toolchain on the runner image, and the honest fix is to drop the ARM64 leg to
+   `continue-on-error` rather than pretend M0 covered it.
+2. **M1 — read and decode** (`PLAN.md` §4). Headless: open a file, detect encoding, stream decoded
+   lines with correct carry across read boundaries. **Decode before index** — that ordering is the
+   dependency inversion adversarial review caught, and it is why M1 is not the indexer.
+   **Corpus B is a ready-made first test:** BOM-less UTF-8 whose em dashes PowerShell 5.1 renders as
+   `â€"`, so the correct answer is known before a line of code is written.
 
 ---
 
@@ -184,7 +194,9 @@ it and the memory is orphaned again, because the key is the literal path string.
 
 The project is **Tailhawk** (command `tailhawk`) — a Windows desktop log tailer/viewer.
 Research, specification, UI design and development plan are complete and adversarially reviewed.
-**Phase 0 has started and the first experiment has produced results.**
+**Phase 0 is effectively closed and M0 is done — the application runs.** Nothing left in Phase 0 is
+both runnable and blocking: G2 is informational, G3's `eframe` legs are moot, and G1/G5/G6 are
+owner-gated. Five experiments were built and written up (G3 ×2, G4, G4b, G7).
 
 Repo: **`github.com/nigelbasel/tailhawk`, private.** Working directly on `master` — no branches, no
 PRs (tried once, not worth it solo). Commit often; the history is the artefact.
