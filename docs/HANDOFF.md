@@ -622,7 +622,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 2. **Employment IP position.** If any of this gets built on work equipment or work time, many contracts assign IP. Worth establishing **before the first public commit**, not after the repo has contributors.
 3. **Reference perf machine** — must be fixed before any `[TBM]` target in `SPEC.md` §11.3 becomes a number.
 4. **Hoo WinTail hands-on (G6)** — the owner's installed copy is the only reliable source for which of its features are actually used in a week, and for how its encoding detection really behaves.
-5. **Re-scope `SPEC.md` §3.2's rasterisation requirement?** G4b showed the cost is ~86–108 µs/glyph the first time a (glyph, size) is seen *on that machine* and ~3 µs thereafter, surviving restarts. A cold 1,500-glyph viewport is 162.5 ms; the same viewport warm is 4.4 ms. Placeholders stay a v1 requirement either way, but the spec currently reads as though the cost is permanent. Normative change, so not made — see `experiments/g4b-batched-raster/RESULTS.md` §"Consequences for the design".
+5. ~~**Re-scope `SPEC.md` §3.2's rasterisation requirement?**~~ — **done, owner-approved, session 7.** §3.2 now states the cost as a first-run one (86–108 µs/glyph cold, ~3 µs warm, cache capacity 8,000–16,000 distinct glyphs), keeps placeholders as a v1 requirement, forbids deriving a §11.3 steady-state budget from the cold figure, and specifies batching at 4–64 glyphs per analysis. **The same edit also withdrew the refuted "~50–60 ms window-presentation floor"** from the first-paint bullet, which session 6 disproved but which was still stated as fact in the spec.
 
 ---
 

@@ -184,12 +184,24 @@ adding a leaf backend pair and a shell, not publishing an ABI.
   earlier variable-width-span variant cost **106 ms per frame**. Slots touched in the current frame are
   never evicted, or the frame corrupts itself. The cost is atlas density — roughly 46% of the sheet
   goes to padding around narrow Latin glyphs — which is a good trade for a monospace grid.
-- **Glyph rasterisation is off the paint path.** DirectWrite costs **145–210 µs per glyph** at
-  one-`CreateGlyphRunAnalysis`-per-glyph granularity, so a viewport of ~1,500 previously-unseen CJK
-  glyphs needs 220–310 ms — 13 to 19 frames. A glyph that is not yet resident must therefore draw a
-  placeholder and be filled in over subsequent frames; a frame must never block on rasterisation. This
-  is a v1 requirement. *(Batching a whole run into one analysis should be much cheaper and is
-  untested — measure before treating the per-glyph figure as a floor.)*
+- **Glyph rasterisation is off the paint path — a first-run requirement, not a permanent tax.**
+  DirectWrite rasterisation is backed by a **cross-process system font cache**. The first process on a
+  machine to rasterise a given `(glyph, size, rendering mode)` pays **86–108 µs**; every process
+  afterwards pays **~3 µs** for it, and that survives process exit. So a viewport of ~1,500
+  previously-unseen CJK glyphs costs **162 ms — 8 to 10 frames — the first time that machine ever
+  renders them**, and **4.4 ms** every time after. A glyph that is not yet resident must therefore draw
+  a placeholder and be filled in over subsequent frames; a frame must never block on rasterisation.
+  **This is a v1 requirement**, because first run is what a user judges the product on. It is sized for
+  the cold cost, and **no steady-state budget may be derived from the cold figure** — §11.3 targets are
+  steady-state.
+  **Cache capacity is 8,000–16,000 distinct glyphs**, so only a large CJK working set can sustain
+  misses; a Latin log viewport is a few hundred distinct glyphs and never leaves the cache.
+  **Rasterise 4–64 glyphs per `CreateGlyphRunAnalysis`** — measured bit-identical to per-glyph output
+  at any inter-glyph gap including zero, and ~1.8x faster on the cold path. The win saturates at 4;
+  batching a whole viewport is *slower* than batching four.
+  Measured in `experiments/g4b-batched-raster`. *(Trap: the cache is cross-process, so re-running a
+  measurement warms it — only the first process to touch a glyph population measures rasterisation,
+  and a reboot empties the cache rather than providing a neutral cold start.)*
 - **Cache the absence of ink.** A glyph with no raster — a space, or a codepoint absent from the face —
   is cached as a blank occupying no slot. Without this every space is re-rasterised every frame.
 - **Shaders are compiled offline** with fxc/dxc and the bytecode embedded. CI asserts no
@@ -204,9 +216,12 @@ adding a leaf backend pair and a shell, not publishing an ABI.
   second while the off-thread path held at ~135 ms.
   Two things that experiment also settled, so they are not worth re-litigating: a class background
   brush is **equivalent** to a `FillRect` in the paint handler, not better (4 of 12 pairs), so pick
-  whichever is simpler; and the residual floor of ~50–60 ms is **window presentation** —
-  `ShowWindow`, DWM composition, first-paint dispatch — **not graphics initialisation.** Further
-  first-paint optimisation belongs outside the renderer.
+  whichever is simpler; and ~~the residual floor of ~50–60 ms is window presentation~~ — **withdrawn.
+  That floor does not exist; it was background load.** On a quiet machine the two-stage paint reaches
+  first pixel in **13.1 ms p50 / 14.5 ms p90**, with `CreateWindowExW` at 3.2–3.9 ms, so `ShowWindow`
+  plus paint dispatch costs about **10 ms** beyond window creation, not 50–60. The two-stage paint is
+  therefore **sufficient** to meet the 40 ms first-pixel criterion, not merely helpful — it passes by
+  ~3x with it and fails by ~1.7x without.
 - **Text antialiasing: not a design driver, and no user setting.** The log grid renders to an
   **opaque** target, which per `D2D1_TEXT_ANTIALIAS_MODE` gets ClearType by default. We take that if
   it comes free and accept greyscale if it does not. **No `text_rendering` setting ships**, and no
