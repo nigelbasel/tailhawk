@@ -371,7 +371,8 @@ acceptance gate for "a first version that can actually run".
 
 Actual paths are **deliberately not recorded in this repo** — they sit inside an employer source
 tree and their content contains customer names. They are held in the private project memory
-(`~/.claude/projects/C--dev-git-WinTail/memory/`). See the identity note below.
+(the project memory directory, `~/.claude/projects/<project-key>/memory/`, where `<project-key>` is
+the repo path with separators replaced by `-`). See the identity note below.
 
 | | Corpus A | Corpus B |
 |---|---|---|
@@ -462,7 +463,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 Workflow transcripts and scripts, if any reasoning needs re-checking:
 
 ```
-%USERPROFILE%\.claude\projects\C--dev-git-WinTail\<session-id>\
+%USERPROFILE%\.claude\projects\<project-key>\<session-id>\
   workflows\scripts\      ← re-runnable workflow scripts
   subagents\workflows\    ← per-agent transcripts and journal.jsonl
 ```
