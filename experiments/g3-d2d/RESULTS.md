@@ -42,15 +42,16 @@ was already refuted at +1.68 MB measured, and against this floor it is not close
 Seven cold process starts per configuration. Medians, with range. **The session-3 column is retained
 because it did not reproduce, which is itself the finding.**
 
-| Phase | Session 3, OneCore CRT | Session 5, desktop CRT, `+crt-static` |
-|---|---|---|
-| `D2D1CreateFactory` | 0.18 ms (0.13 – 0.65) | 0.11 ms (0.08 – 0.14) |
-| `CreateWindowExW` | **73 – 113 ms (21 – 144)** | **9.27 ms (7.3 – 12.5)** |
-| `CreateHwndRenderTarget` | 171 ms (156 – 216) | 142.55 ms (126 – 163) |
-| `Clear` + `EndDraw` | 6.0 ms (5.5 – 6.2) | 4.59 ms (3.7 – 5.8) |
-| **Total** | **249 ms (194 – 303)** | **156.65 ms (140 – 178)** |
+| Phase | Session 3, OneCore CRT | Session 5, desktop CRT, `+crt-static` | Session 6, quiet machine, same binary |
+|---|---|---|---|
+| `D2D1CreateFactory` | 0.18 ms (0.13 – 0.65) | 0.11 ms (0.08 – 0.14) | 0.076 ms (0.07 – 0.12) |
+| `CreateWindowExW` | **73 – 113 ms (21 – 144)** | **9.27 ms (7.3 – 12.5)** | **3.87 ms (3.5 – 4.9)** |
+| `CreateHwndRenderTarget` | 171 ms (156 – 216) | 142.55 ms (126 – 163) | 68.36 ms (65.6 – 86.2) |
+| `Clear` + `EndDraw` | 6.0 ms (5.5 – 6.2) | 4.59 ms (3.7 – 5.8) | 3.74 ms (2.7 – 7.0) |
+| **Total** | **249 ms (194 – 303)** | **156.65 ms (140 – 178)** | **75.55 ms p50, 87.22 p90 (72.5 – 94.9)** |
 
-**Against G3's 40 ms criterion: still FAIL, by ~4x** (was ~6x). But the shape of the failure changed:
+**Against G3's 40 ms criterion: still FAIL, by ~1.9x** on the quiet machine (was ~4x, and ~6x in
+session 3). The shape of the failure changed twice:
 
 - **`CreateWindowExW` is not expensive.** Session 3 measured 73–113 ms with a 21–144 ms range and this
   document previously concluded *"A floor of ~113 ms for an empty window on a current machine is the
@@ -61,8 +62,14 @@ because it did not reproduce, which is itself the finding.**
   *graphics device creation must come off the critical path* — is **strengthened**, not weakened.
 - **The cause of the discrepancy is not established.** The leading hypothesis was installer load, since
   Visual Studio was mid-update when session 3 ended; but session 5's numbers were taken with a VS
-  installer *also* resident, which argues against it. `docs/HANDOFF.md` carries the open question and
-  the re-take procedure requires a post-reboot set before any of this becomes a `SPEC.md` §11.3 target.
+  installer *also* resident, which argues against it. **Session 6's quiet set gives 3.87 ms, so three
+  sets now agree between 3 and 12 ms and session 3 stands alone.** Its cause is still unexplained and is
+  no longer worth explaining — 113 ms is not a floor, not a target and not reproducible.
+- **Everything here scales with machine load, in one direction.** The session-6 column is the *same
+  binary* on the *same machine* at 0–6% CPU load, minutes after a reboot: total 75.55 ms against
+  156.65. Render-target creation halved (142.55 → 68.36) and remains ~90% of the total, so the
+  conclusion below is unaffected — only the size of the number. Full method and the two-condition
+  comparison are in `experiments/g3-d3d11/RESULTS.md`.
 
 Static vs dynamic on startup: the session-5 dynamic-CRT run gave 147.12 ms (136 – 176) against
 156.65 ms static, i.e. the ordering flipped versus session 3 and both are inside each other's noise.
@@ -117,8 +124,9 @@ is not addressable by threading. The window itself costs ~9 ms.
 - **A Visual Studio installer was resident during the session-5 measurements**, and it demonstrably
   interfered with the build (a `+crt-static` link failed once with `LNK1104: libucrt.lib` and then
   succeeded on retry). Treat the absolute figures as provisional.
-- **No cold-boot separation, and the 13x `CreateWindowExW` discrepancy above is unexplained.** A
-  post-reboot set and a quiet-machine set are both still owed before any figure here becomes a target.
+- ~~**No cold-boot separation**~~ — **both sets taken 2026-07-30 (session 6)**; the quiet column above
+  is one of them. The 13x `CreateWindowExW` discrepancy is still unexplained but is no longer live:
+  session 3 is the outlier against three agreeing sets.
 - Single machine, single GPU. `PLAN.md` §3 G5 requires a fixed reference machine before any of this
   becomes a published target.
 - Timing excludes process creation, so treat every figure as a lower bound.
@@ -141,3 +149,7 @@ cargo build --release            # or with $env:RUSTFLAGS="-C target-feature=+cr
 
 Each process start writes one CSV line — `factory,window,target,draw,total` in milliseconds — to
 `%TEMP%\g3-d2d-first-pixel.txt`. The harness aggregates medians and ranges over 7 cold starts.
+
+**That filename is hardcoded in the binary, so `-OutFile g3-d2d-first-pixel.txt` is mandatory, not a
+label.** Passing any other name makes `measure.ps1` poll for a file nobody writes: every run warns
+*"produced no output"* and the script throws with no measurement taken.

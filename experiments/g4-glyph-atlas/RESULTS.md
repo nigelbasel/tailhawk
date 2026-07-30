@@ -134,21 +134,42 @@ every Latin, CJK and emoji glyph at em 14 fitted the 20×22 box.
 
 ## The actual stall is rasterisation, and it is large
 
-| | per frame (run 1 / 2 / 3) |
-|---|---|
-| DirectWrite rasterisation (1,500 misses) | **312 / 227 / 582 ms** |
-| atlas upload (`UpdateSubresource` ×1,500) | 5.7 / 2.9 / 5.9 ms |
-| eviction bookkeeping (list LRU) | 0.37 / 0.17 / 0.31 ms |
-| GPU draw | 0.22 / 0.18 / 0.19 ms |
+| | per frame (run 1 / 2 / 3) | quiet machine, 2026-07-30 |
+|---|---|---|
+| DirectWrite rasterisation (1,500 misses) | **312 / 227 / 582 ms** | **494.6 / 581.7 ms** |
+| atlas upload (`UpdateSubresource` ×1,500) | 5.7 / 2.9 / 5.9 ms | 5.85 / 5.85 ms |
+| eviction bookkeeping (list LRU) | 0.37 / 0.17 / 0.31 ms | 0.31 ms |
+| eviction bookkeeping (scan LRU) | 4 – 8 ms | 8.51 ms |
+| GPU draw | 0.22 / 0.18 / 0.19 ms | 0.19 / 0.19 ms |
 
-**145–390 µs per glyph**, the spread tracking machine load. A viewport of 1,500 previously-unseen CJK
-glyphs needs 230–580 ms — **14 to 35 frames at 60 Hz.** Eviction is three orders of magnitude cheaper
-than the rasterisation it triggers, and rasterisation is the only term large enough to matter.
+**145–390 µs per glyph.** A viewport of 1,500 previously-unseen CJK glyphs needs 230–580 ms —
+**14 to 35 frames at 60 Hz.** Eviction is three orders of magnitude cheaper than the rasterisation it
+triggers, and rasterisation is the only term large enough to matter.
 
-The likely cause is granularity: this code calls `CreateGlyphRunAnalysis` once **per glyph**, which
-allocates a COM object and does three interface calls per glyph. Batching a whole run into a single
-analysis should be far cheaper, and is **not tested here** — worth its own experiment before the
-number is treated as a floor.
+### ⚠ The spread is not machine load, and the quiet number is the slow one
+
+This section previously said the spread tracked machine load. **Re-run on a verified quiet machine
+(0–6% CPU, minutes after a reboot, same `+crt-static` binary), rasterisation came in at 494.6 and
+581.7 ms per frame — at the *top* of the 227–582 ms range, not the bottom.** That is **330–388 µs per
+glyph**, so:
+
+- **A cold run does not bound this cost favourably.** The pessimistic end of the earlier range is the
+  honest figure to design against, and the "it's just load" reading is withdrawn.
+- **There is a within-process ordering effect of ~18%.** The two overflow phases rasterise *identical*
+  work — 1,500 misses, 180,000 total, same glyphs — yet the phase that runs second measured 581.7 ms
+  against the first's 494.6 ms, in a single quiet process. So **the fixed-order rule from
+  `experiments/g3-d3d11/RESULTS.md` applies inside this binary too**: the two LRU phases run in a fixed
+  order and their raster columns are not comparable to each other. Their *eviction* columns are the
+  measurement that matters and the gap there is 27x, far outside the effect.
+- **The O(1) eviction requirement is reconfirmed on quiet numbers:** 8.51 ms scanning versus 0.31 ms
+  with the intrusive list.
+
+The likely cause of the rasterisation cost is granularity: this code calls `CreateGlyphRunAnalysis`
+once **per glyph**, which allocates a COM object and does three interface calls per glyph. Batching a
+whole run into a single analysis should be far cheaper, and is **not tested here** — worth its own
+experiment before the number is treated as a floor. **The quiet re-take raises the value of that
+experiment**: the dominant renderer expense is confirmed at the pessimistic end, and it is not going to
+be explained away by machine state.
 
 ## Consequences for the design
 

@@ -70,36 +70,91 @@ values drifted between runs with machine load, but the ratio held, which is the 
 12** pairs. So the *mechanism* does not matter — use whichever is simpler. What matters is only that
 something paints without waiting for D3D.
 
-**And that identifies the real remaining floor.** Window creation is ~7 ms, but first pixel lands at
-55–70 ms even when the painting itself is a single `FillRect` and even when the system does it during
-`ShowWindow` with no handler at all. **The residual ~50–60 ms is window presentation — `ShowWindow`,
-DWM composition and first-paint dispatch — not graphics initialisation.** Neither approach can get
-below it, because neither is what is costing the time.
-
-That reframes the whole gate. G3 was set up to ask whether the *graphics stack* could paint fast
-enough. The answer is that once you stop waiting for it, the graphics stack is no longer the
-bottleneck: **the window is.** Any further first-paint work belongs outside the renderer entirely.
+**⚠ This page previously concluded from those 55–70 ms figures that the residual cost was window
+presentation — `ShowWindow`, DWM composition and first-paint dispatch — and therefore outside the
+renderer. That is withdrawn. It was load.** See the next section.
 
 ### Consequence for the design
 
 - **v1 renders in two stages.** Fill immediately with a solid background, bring up D3D on a worker,
-  swap when ready. It halves perceived startup for one `FillRect` and a thread, and the two-stage
-  paint is invisible because both stages draw the same background colour.
-- **The 40 ms criterion should be re-derived against the window-presentation floor**, not against
-  graphics init. At ~55 ms p50 the two-stage approach still misses 40 ms by ~1.4x, but the miss is now
-  almost entirely `ShowWindow`/DWM — outside our control and outside what the criterion was written to
-  test. State the budget as a percentile above the measured floor on the G5 reference machine.
+  swap when ready. It halves perceived startup — and on a quiet machine does far better than halve it
+  — for one `FillRect` and a thread, and the two-stage paint is invisible because both stages draw the
+  same background colour.
+
+## The ~50–60 ms "window-presentation floor" does not exist — it was load
+
+Measured 2026-07-30 (session 6) in the minutes after a reboot, on the **same `+crt-static` binaries**
+from `target-verify-static\release\` — no rebuild, so the subject is byte-identical to the runs above.
+Two conditions, 11 process starts per set, leaked-subject count verified at **0** before and after
+every set.
+
+`first_pixel` is `main()` entry → `FillRect` returning inside the first `WM_PAINT`, so **`ShowWindow`
+and paint dispatch are inside the measured region** — which is what makes the figure interpretable.
+
+| | cold: uptime 3–6 min, 36% load, boot churn | quiet: uptime 6–10 min, 0–6% load | session 5, working-set load |
+|---|---|---|---|
+| `CreateWindowExW` | 4.17 p50 | 3.20 p50 | ~7 |
+| **`earlypaint` first pixel** | **13.4 p50 / 18.0 p90** | **13.1 p50 / 14.5 p90** | 54.7 / 66.3 p50 |
+| `earlypaint` D3D ready | 54.9 p50 | 45.8 p50 | 73.8 p50 |
+| serial, total to first pixel | 84.3 p50 / 118.2 p90 | 68.6 p50 / 81.7 p90 | 126.4 p50 |
+| D2D `HwndRenderTarget`, total | 114.3 p50 (80.8 – 1604.4) | 75.5 p50 / 87.2 p90 | 156.7 p50 |
+
+**`ShowWindow` + DWM composition + first-paint dispatch costs ~10 ms beyond window creation, not
+50–60 ms.** Nothing about window presentation is expensive on this machine.
+
+### The two-stage paint passes the 40 ms criterion
+
+At **13.1 ms p50, 14.5 ms p90, and 14.5 ms worst of 11 runs**, the two-stage paint clears G3's 40 ms
+criterion with ~2.7x headroom. Session 5's recommendation that *"the 40 ms criterion should be
+re-derived against the window-presentation floor"* is **withdrawn** — there is no floor to re-derive it
+against.
+
+**The gate now splits cleanly in two, and the split is the result:**
+
+| | quiet-machine first pixel | vs 40 ms criterion |
+|---|---|---|
+| wait for the graphics device (`serial`) | 68.6 ms p50 | fails ~1.7x |
+| **paint before it exists (`earlypaint`)** | **13.1 ms p50** | **passes, ~3x** |
+
+So the criterion tests the **paint order**, not the graphics stack. `SPEC.md` §3.2 already requires the
+two-stage paint for v1; this is the measurement that says the requirement is sufficient, not merely
+helpful.
+
+Unchanged caveats, and they still bar publishing this as a target: one machine, one GPU, `hardware`
+driver on every run, and **not** the `PLAN.md` §3 G5 reference machine. `first_pixel` is
+time-to-`FillRect`, not time-to-photon — a GDI fill still waits on DWM composition, up to one refresh
+interval more.
+
+### What load explains, and what it does not
+
+- **It explains the whole absolute spread.** Every quiet figure lands at or below the fast end of the
+  range session 5 observed (96, 112, 126, 139, 154, 297 ms). `HANDOFF.md` posed this as a two-way
+  branch; **the first branch is the one that held**, so these are the defensible figures for
+  `SPEC.md` §11.3 — as p50/p90 with the machine state stated, never as a mean.
+- **The two-stage paint is far less load-sensitive, but it is not immune.** Its p50 moved 13.4 → 13.1
+  across this session's two conditions while D2D's moved 114.3 → 75.5 with a 1604 ms outlier inside the
+  same set. But session 5's 54.7–66.3 ms came from the *working-set* load (Teams, Docker, Edge
+  WebView2, OneDrive, Outlook), which is not the same thing as boot churn, and it does delay paint
+  dispatch. The asymmetry is the design argument, not immunity: everything that waits for the device
+  inherits the machine's worst case, and the fill mostly does not.
+- **Post-reboot is not the same as quiet, and uptime is the wrong thing to record.** The first four runs
+  of the first cold set gave totals of 174, 225, 264 and **1604 ms** before settling to 80–114 ms —
+  boot-time service churn is itself load. The quiet window on this machine opened at roughly six
+  minutes' uptime. **Record CPU load, not uptime**, and re-check it after every set.
 
 ## D3D11 + DXGI is materially faster than D2D's HwndRenderTarget
 
 Same machine, same session, same `+crt-static` desktop-CRT build, minutes apart:
 
-| stack | total to first pixel | vs G3's 40 ms criterion |
-|---|---|---|
-| D2D `CreateHwndRenderTarget` | 156.65 ms (140 – 178) | fails ~4x |
-| **D3D11 + DXGI, serial** | **126.39 ms (112 – 150)** | **fails ~3x** |
+| stack | total to first pixel | quiet-machine re-take | vs G3's 40 ms criterion |
+|---|---|---|---|
+| D2D `CreateHwndRenderTarget` | 156.65 ms (140 – 178) | 75.5 ms p50 | fails ~1.9x |
+| **D3D11 + DXGI, serial** | **126.39 ms (112 – 150)** | **68.6 ms p50** | **fails ~1.7x** |
 
-~30 ms, or 19%, for using the stack the spec already mandates. Worth having, and it means the D2D leg
+~30 ms, or 19%, for using the stack the spec already mandates — and **~7 ms, or 9%, on the quiet
+re-take**, so the direction holds but the margin is smaller than the loaded figures suggested. Both
+re-takes were separate 11-run sets minutes apart at 0–6% load, not paired trials, so treat the 9% as
+indicative and the direction as the finding. Worth having, and it means the D2D leg
 was measuring a configuration Tailhawk was never going to ship.
 
 **Both still fail the 40 ms criterion.** Graphics initialisation — `D3D11CreateDevice` plus swapchain
@@ -142,6 +197,10 @@ subject.
   zombie count verified at 0 before and throughout. Earlier revisions of this page quoted numbers taken
   with a Visual Studio installer resident — it also demonstrably broke a build, failing a
   `+crt-static` link with `LNK1104: libucrt.lib` for two crates then succeeding on retry.
+- **The cold and quiet sets are taken (2026-07-30, session 6) and they settle the absolutes as far as
+  one machine can.** The bullets below are retained as the record of why they were needed; where they
+  say a set is owed, it has since been taken — see "The ~50–60 ms window-presentation floor does not
+  exist" above.
 - **Absolute first-pixel values are not stable on this machine, and chasing them is a dead end.** The
   same static build has produced serial totals of 96, 112, 126, 139 and 154 ms. The cause is now
   identified and is not mysterious: **the machine carries a variable ~40% background load** from a
@@ -152,10 +211,11 @@ subject.
   reason it has to be settled before any `SPEC.md` §11.3 number is published.
 - **Use the paired comparisons for every design decision.** Interleaved A/B on the same machine within
   minutes is reliable and reproduced across runs; single absolute numbers from this machine are not. Load affects both arms equally.
-- **A cold set is still owed.** `docs/HANDOFF.md` records that the same `g3-d2d` binary produced a
-  113 ms `CreateWindowExW` median in session 3 and 8.5–11.9 ms in session 5, a 13x discrepancy with
-  non-overlapping ranges and no established cause. Until a post-reboot set and a quiet-machine set
-  agree, no absolute figure here should become a `SPEC.md` §11.3 target.
+- ~~**A cold set is still owed.**~~ **Taken 2026-07-30.** The post-reboot and quiet sets agree with each
+  other and with session 5's `CreateWindowExW` figures: 4.17 and 3.20 ms p50 here against session 5's
+  8.5–11.9 ms, all in the same order of magnitude. **Session 3's 113 ms remains the lone outlier and is
+  now conclusively not a floor** — four independent sets across three sessions land between 3 and 12 ms.
+  Its cause is still unexplained, and no longer worth explaining.
 - Single machine, single GPU, `driver: hardware` on every run. WARP was never exercised.
 - `Present(0, …)`, so the figure is time-to-submission. A photon costs up to one refresh interval
   more. Consistent with the D2D leg's framing, and both exclude process creation and loader time.
@@ -172,4 +232,15 @@ cargo build --release                      # or with $env:RUSTFLAGS="-C target-f
     -ExeArgs concurrent -Columns "mode,window,device_wait,swapchain,draw,total,driver"
 ```
 
-The binary self-terminates after reporting one CSV line to `%TEMP%\g3-d3d11-<mode>.txt`.
+The binary reports one CSV line to `%TEMP%\g3-d3d11-<mode>.txt` and then **waits to be killed** by
+`measure.ps1` — the `PostQuitMessage` it originally had is gone, because self-terminating subjects leak
+(see the trap above). The `earlypaint` leg needs its own column list:
+
+```powershell
+.\experiments\measure.ps1 -Exe target\release\g3-d3d11.exe -OutFile g3-d3d11-earlypaint.txt `
+    -ExeArgs earlypaint -Columns "mode,window,first_pixel,d3d_ready,driver"
+```
+
+**`-OutFile` is not a free choice — it must match the filename the binary hardcodes.** Pass anything
+else and `measure.ps1` polls for a file nobody writes, warns *"run N produced no output"* eleven times
+and throws. It cost a whole set in session 6.
