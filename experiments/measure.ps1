@@ -53,6 +53,13 @@ for ($i = 1; $i -le $Runs; $i++) {
     Start-Sleep -Milliseconds 100
     Get-Process -Id $p.Id -ErrorAction SilentlyContinue |
         Stop-Process -Force -Confirm:$false
+
+    # CRITICAL: dispose the Process object from -PassThru. Without this, a subject that exits on its
+    # own is never reaped -- PowerShell's cached handle keeps the process object alive as a zombie
+    # that still holds its D3D device. Session 5 accumulated 33 of them and D3D11CreateDevice
+    # degraded from 55 ms to 1210 ms as they piled up, silently corrupting every later measurement.
+    try { $p.WaitForExit(2000) | Out-Null } catch {}
+    try { $p.Dispose() } catch {}
     Start-Sleep -Milliseconds 100
 
     if (Test-Path $outPath) {

@@ -156,15 +156,19 @@ that file no longer exists to be the suspect.
   once with `LNK1104: cannot open file 'libucrt.lib'` for two crates while succeeding for the other
   two, then succeeded for all four on an immediate retry — files moving underneath the linker. Every
   session-5 timing was taken with `setup.exe` resident, which is why they are provisional.
-- **The GUI experiment binaries leave unreaped zombies that block `cargo build`.** They exit, but
-  something in the agent's shell keeps their handles, so `tasklist` still lists them while `taskkill`
-  says "no running instance" and `cargo build` fails with `Access is denied (os error 5)` trying to
-  replace the exe. Session 5 accumulated 23 of them. It happens with Bash `&` *and* with
-  `Start-Process` from `measure.ps1`, so it is the shell lifetime, not the launcher.
-  **Workarounds, in order of preference:** run the measurements from a shell you then close; or build
-  into a scratch dir (`$env:CARGO_TARGET_DIR="target-verify"`, which is git-ignored) and measure from
-  there; or verify with `cargo check --workspace` when only correctness matters. Do not spend time
-  trying to kill them — they are already dead.
+- **⚠ A measurement subject that exits on its own is never reaped, and it corrupts the numbers.** This
+  is the single most expensive thing session 5 learned. The dead process keeps its D3D device;
+  `tasklist` lists it, `taskkill` says *"no running instance"*, `cargo build` fails with
+  `Access is denied (os error 5)`, and — the part that actually costs you —
+  **`D3D11CreateDevice` degraded from 55 ms to over 1200 ms as 49 of them piled up**, silently, with no
+  error. It invalidated a whole round of G3 conclusions before it was spotted.
+  **The fix is in the code: experiment binaries must not `PostQuitMessage` after reporting.** They
+  report and wait to be killed by `measure.ps1`. `g3-d2d` did this by accident and leaked zero across
+  22 runs; `g3-d3d11` self-terminated and leaked one per run until it was changed.
+  `$p.Dispose()` in PowerShell does **not** help. If a measurement looks inexplicably slow, count the
+  leaked processes before believing it. If some are already resident, they can only be cleared by
+  killing the holder or rebooting — and meanwhile build into a scratch dir
+  (`$env:CARGO_TARGET_DIR="target-verify"`, git-ignored) or verify with `cargo check --workspace`.
 
 ### Re-take procedure
 
@@ -213,12 +217,26 @@ is the finding: **drawing is 2.6 ms** and **graphics initialisation is 117 ms, o
 `D3D11CreateDevice` 60 ms plus swapchain and RTV creation 57 ms. So the conclusion *"graphics device
 creation must come off the critical path"* is **strengthened**.
 
-**But the fix G3 proposed for it is refuted.** Creating the device on a worker thread concurrently
-with the window came out **11% slower** (140 ms vs 126 ms), and the wait for the worker's device was
-58.6 ms against a serial device cost of 60.0 ms — a 1.4 ms saving. Window creation and D3D11 device
-creation **contend rather than overlap**, and you cannot hide more than `min(window, device)` anyway.
-**The only surviving direction is to paint something cheap before the device exists** and swap in the
-real renderer later; first pixel would then approach ~9 ms plus a GDI fill. Untested.
+**The fix G3 proposed works, but only just.** On a **clean machine**, 10 **paired interleaved** trials:
+concurrent device creation totals **145.7 ms** against serial's **154.2 ms** and wins **7 of 10** — a
+**~8.5 ms, 5.5% saving.** Real, reproducible, and small, exactly what `min(window, device)` allows when
+window creation is only ~10–25 ms. Worth taking; nowhere near enough on its own.
+
+Under **GPU-context pressure** it matters far more: with ~35–49 leaked D3D devices resident, serial
+device creation degraded to a **1155 ms** median while concurrent held at **135 ms**, winning 8/8. The
+likely mechanism — `D3D11CreateDevice` stalling on the `HWND`-owning thread when the driver wants it to
+pump messages — is unconfirmed, but it argues for off-thread device creation as cheap insurance on
+loaded machines, which is where a log viewer lives.
+
+**The bigger lever is still untested:** paint something cheap before the device exists. First pixel
+would approach ~10 ms plus a GDI fill, because none of the ~117 ms of D3D init would be on the critical
+path — a far larger prize than 8.5 ms.
+
+**⚠ Two earlier conclusions here were wrong.** This file previously said concurrency was *refuted* at
+11% slower. That was an artifact of always measuring serial first while leaked D3D devices accumulated
+between the arms. The opposite over-correction (8/8, ~5x) was real only for the heavily-contaminated
+regime. **Rule that came out of it: never compare two configurations in a fixed order** when anything
+can accumulate between them.
 
 **Two of session 3's conclusions are withdrawn:**
 

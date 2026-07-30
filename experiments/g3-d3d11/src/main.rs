@@ -177,7 +177,12 @@ impl App {
                 std::env::temp_dir().join(format!("g3-d3d11-{}.txt", self.mode)),
                 format!("{line}\n"),
             );
-            unsafe { PostQuitMessage(0) };
+            // Deliberately does NOT PostQuitMessage. A subject that exits on its own is never
+            // reaped under the agent's shell — its handle lingers and the dead process keeps its
+            // D3D device. Session 5 accumulated 49 such zombies and watched D3D11CreateDevice
+            // degrade from 55 ms to over 1200 ms, which silently corrupted every measurement taken
+            // after the first. g3-d2d never self-terminates, gets killed by the harness, and leaked
+            // exactly zero. So: report, then wait to be killed.
         }
         Ok(())
     }
