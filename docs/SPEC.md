@@ -164,6 +164,34 @@ adding a leaf backend pair and a shell, not publishing an ABI.
   persistent atlas keyed by `(glyph id, style, dpi scale)`. The viewport renders as one instanced draw
   with foreground colour, background colour and style as per-instance attributes. Per-token colouring
   is therefore free. Never build an `IDWriteTextLayout` per visible line per frame.
+
+  **How one draw serves both monochrome and colour glyphs** — measured in `experiments/g4-glyph-atlas`,
+  which refuted the assumption that it could not. The pixel shader emits **two** outputs and
+  dual-source blending consumes the second: `SV_Target0` carries premultiplied colour, `SV_Target1`
+  carries per-channel coverage, and with `SrcBlend = ONE`, `DestBlend = INV_SRC1_COLOR` the hardware
+  computes `dest = src + dest * (1 - coverage)`. That one equation is simultaneously the correct
+  per-channel (ClearType) blend for a monochrome glyph whose mono path premultiplies in the shader,
+  and the correct premultiplied composite for a colour bitmap. A per-instance `mode` selects between
+  them. **Single-source straight alpha cannot do this** — the blend equation has one alpha per pixel,
+  so it cannot consume three independent coverages; subpixel AA without dual-source blending costs a
+  second pass over the same geometry. *(Trap: the alpha slots take `INV_SRC1_ALPHA`; a `*_COLOR`
+  factor in an alpha slot fails `CreateBlendState` with a bare `E_INVALIDARG`.)*
+- **The atlas is a fixed-slot LRU with uniform slots and an O(1) victim list.** Not a shelf packer and
+  not variable-width spans. Every glyph occupies exactly one slot sized to the widest glyph accepted,
+  so eviction never repacks, never searches for a free run, and never fragments. The victim comes off
+  the head of an intrusive doubly-linked list. **Measured justification:** scanning all slots for the
+  oldest costs 4–8 ms per frame under atlas thrashing against 0.17–0.37 ms for the list, and an
+  earlier variable-width-span variant cost **106 ms per frame**. Slots touched in the current frame are
+  never evicted, or the frame corrupts itself. The cost is atlas density — roughly 46% of the sheet
+  goes to padding around narrow Latin glyphs — which is a good trade for a monospace grid.
+- **Glyph rasterisation is off the paint path.** DirectWrite costs **145–210 µs per glyph** at
+  one-`CreateGlyphRunAnalysis`-per-glyph granularity, so a viewport of ~1,500 previously-unseen CJK
+  glyphs needs 220–310 ms — 13 to 19 frames. A glyph that is not yet resident must therefore draw a
+  placeholder and be filled in over subsequent frames; a frame must never block on rasterisation. This
+  is a v1 requirement. *(Batching a whole run into one analysis should be much cheaper and is
+  untested — measure before treating the per-glyph figure as a floor.)*
+- **Cache the absence of ink.** A glyph with no raster — a space, or a codepoint absent from the face —
+  is cached as a blank occupying no slot. Without this every space is re-rasterised every frame.
 - **Shaders are compiled offline** with fxc/dxc and the bytecode embedded. CI asserts no
   `d3dcompiler_47.dll` import.
 - **Text antialiasing: not a design driver, and no user setting.** The log grid renders to an
@@ -197,7 +225,11 @@ The naive "one character = one fixed-width cell" assumption breaks on real log c
 - **Combining marks** occupy 0 additional cells.
 - **ZWJ emoji sequences** are one cluster; width is determined by emoji presentation.
 - **Colour emoji** render through `TranslateColorGlyphRun` into a separate colour atlas. A monochrome
-  alpha atlas cannot represent them.
+  alpha atlas cannot represent them. Both atlases are sampled in the **same** instanced draw under one
+  blend state — see §3.2. **Colour glyphs carry greyscale coverage, not subpixel**: a coloured layer's
+  three channels cannot survive an alpha composite against a different colour, so layers are averaged
+  before compositing. Harmless for pictorial glyphs, but it means mono and colour differ in AA quality
+  by construction rather than by oversight.
 - **Font fallback** follows a documented chain with a nominated monospace CJK fallback. When a fallback
   font's advance width disagrees with the primary, the cell grid wins and the glyph is centred within
   its cell.

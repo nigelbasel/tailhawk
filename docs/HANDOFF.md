@@ -51,6 +51,31 @@ PRs (tried once, not worth it solo). Commit often; the history is the artefact.
 
 ---
 
+## What is worth doing next, as of session 5
+
+Phase 0 is **4 of 7 done or dispositioned**. What remains, and an honest read on each:
+
+1. **G2 — read throughput.** The only remaining gate that is both unblocked and doable solo. Purely
+   informational (no pass threshold) and it measures the cost of the already-made no-mmap decision so
+   the trade can be stated honestly. Cheap.
+2. **G3's `eframe` legs — argue for skipping them.** G3 exists to *compare* three stacks, but the
+   stack decision is already locked in (windows-rs + D3D11 + DirectWrite), `RESEARCH.md` §3.3 already
+   rejects egui/eframe for the grid on text-AA grounds, and **G7 has now independently confirmed
+   egui's scroll model breaks at exactly the row counts Tailhawk targets.** Building two eframe
+   hello-worlds would measure binary size for a stack that is triply rejected. The honest move is to
+   record the legs as **deliberately not run**, with that reasoning, rather than leave them looking
+   outstanding. Owner's call.
+3. **Re-take G3's numbers** once the desktop C++ workload is installed — still owed, still blocked on
+   an install this session did not make.
+4. **G1** needs two hosts, **G5** needs a decision on downloading third-party binaries, **G6** is a
+   week of the owner's real usage. All three are owner-gated, not work-gated.
+
+**A free by-product worth collecting:** `experiments/g4-glyph-atlas` already builds a D3D11 + DXGI
+flip-model swapchain — the stack `SPEC.md` §3 actually specifies, rather than G3's D2D
+`HwndRenderTarget`. Adding G3-style first-pixel instrumentation to it would directly test G3's central
+conclusion ("graphics device creation must come off the critical path") on the real configuration, for
+very little work. Not done yet.
+
 ## Resume here tomorrow
 
 ### 1. ~~Finish the Loki source design~~ — **done 2026-07-29, see `docs/LOKI.md`**
@@ -137,10 +162,10 @@ added afterwards.** That changes the build setup:
 
 | Gate | State |
 |---|---|
-| **G3** — binary size floor + first pixel | **windows-rs + D2D leg done, both CRT configs.** See `experiments/g3-d2d/RESULTS.md`. `eframe+glow` and `eframe+wgpu` legs **not started**, so the comparison G3 exists to make has not been made. |
+| **G3** — binary size floor + first pixel | **windows-rs + D2D leg done, both CRT configs.** See `experiments/g3-d2d/RESULTS.md`. `eframe+glow` and `eframe+wgpu` legs **not started** — but see the note below on whether they are still worth running. |
 | **G1** — SMB stale size | Not started. Needs two hosts and a share; can't be done solo on one machine. |
 | **G2** — read throughput | Not started. Informational only, no pass threshold. |
-| **G4** — colour-glyph atlas | Not started. Now unblocked: a working D2D surface exists in `experiments/g3-d2d`. |
+| **G4** — colour-glyph atlas | **Done. Passes**, and it refuted the objection it was built to test. See `experiments/g4-glyph-atlas/RESULTS.md`. |
 | **G5** — incumbent re-measurement | Not started. Needs BareTail 3.50a and LogExpert 1.41.0 installed — **owner decision, involves downloading third-party binaries.** |
 | **G6** — Hoo WinTail hands-on | Owner task, runs in the background across Phase 0. |
 | **G7** — reproduce egui #1391 | **Done. Passes** — the cause is identified. See `experiments/g7-egui-scroll/RESULTS.md`. |
@@ -158,6 +183,26 @@ be built on a worker thread while the window is created. That still leaves a ~11
 floor, so **40 ms was set without measurement and needs re-deriving**, exactly as `PLAN.md` §3
 anticipates for a G3 failure. Variance alone (109 ms spread on an empty window) means any first-paint
 budget must be a percentile, not a mean.
+
+### G4 result in one line
+
+**The one-instanced-draw rule survives colour emoji.** `PLAN.md` §3 asserted that a premultiplied
+colour atlas *"cannot share the mono atlas's blend state"*; it can, via **dual-source blending** —
+`SV_Target0` premultiplied colour, `SV_Target1` per-channel coverage, `dest = src + dest*(1-cov)`,
+which is simultaneously the correct ClearType blend and the correct premultiplied composite. Confirmed
+by reading back the frame with a forced-neutral tint, where channel spread can only come from
+per-channel coverage: **ClearType and colour glyphs both present in one draw**. No V2 re-costing owed.
+Unified is also 25–32% cheaper on CPU than a two-pass split, and the split cannot do ClearType at all.
+
+**Two findings the gate did not set out to make, both now in `SPEC.md` §3.2:**
+
+- **Eviction passes only with an O(1) policy.** Scanning slots for the oldest costs 4–8 ms/frame under
+  thrashing; an intrusive LRU list costs 0.17–0.37 ms. An earlier variable-width-span variant cost
+  **106 ms/frame**. Uniform single-glyph slots are what make O(1) possible.
+- **Rasterisation is the real stall: 145–210 µs per glyph.** A cold viewport of ~1,500 CJK glyphs needs
+  220–310 ms — 13–19 frames. So glyph rasterisation must be **off the paint path**, with placeholders
+  filled in over later frames. That is now a v1 requirement and `SPEC.md` did not previously say it.
+  Eviction is three orders of magnitude cheaper than the rasterisation it triggers.
 
 ### G7 result in one line
 
@@ -270,6 +315,9 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **Continuations collapsed by default**, and no `--wrap` in v1 — both destroy the O(1) `u64` scroll model, and MEL Simple logs are multi-line *by default*. | `SPEC.md` §6.4 |
 | **Accessibility is the only automated UI-test surface** for a custom-drawn grid. The minimal chrome provider is v1 for that reason, not for compliance. | `SPEC.md` §14.1 |
 | **A `u64` scroll position is not enough on its own.** G7 found the row-*layout* conversion `row * row_h - offset_px` reproduces egui #1391 in full even when the scroll position is exact. One plausible line, whole bug back. | `SPEC.md` §6.4, `experiments/g7-egui-scroll/RESULTS.md` |
+| **`GetData` returns `S_FALSE` when a D3D11 query isn't ready — and `S_FALSE` is a *success* HRESULT.** `Result<()>` is `Ok`, so `is_err()` is useless as a readiness test. G4's first GPU timings were all 0.000 ms because of it. Detect readiness with a sentinel the driver must overwrite. | `experiments/g4-glyph-atlas/RESULTS.md` |
+| **`DWRITE_GLYPH_RUN::fontFace` is `ManuallyDrop<Option<..>>`.** Writing into it is safe; copying it *out* into an owned interface releases a reference never added, and the underflow surfaces later as a use-after-free. Borrow the face out of a `DWRITE_COLOR_GLYPH_RUN`. | `experiments/g4-glyph-atlas/src/text.rs` |
+| **Never time a frame with `Present` inside the measured region.** The flip model blocks on the back-buffer queue, which pinned every G4 frame to exactly 16.669 ms and hid the real cost entirely. | `experiments/g4-glyph-atlas/RESULTS.md` |
 
 ---
 

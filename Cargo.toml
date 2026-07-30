@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["experiments/g3-d2d", "experiments/g7-egui-scroll"]
+members = ["experiments/g3-d2d", "experiments/g4-glyph-atlas", "experiments/g7-egui-scroll"]
 
 [workspace.package]
 edition = "2021"
