@@ -140,9 +140,44 @@ for a solo repo. Commit often; the history is the artefact.
 
 ## ⚠ Read this before the first build of the next session
 
-**Rechecked at the start of session 4: the desktop C++ workload is still NOT installed.** The toolset
-still has only `14.51.36231\lib\onecore` and no `include`, so `.cargo/config.toml` is still required
-and its hardcoded version is still correct. Everything below still applies unchanged.
+**Status: the owner began installing the desktop C++ workload during session 5.** Until it is
+confirmed present, `.cargo/config.toml` is still required. The checklist below is the transition.
+
+### Post-install checklist — do this in order
+
+1. **Confirm the workload landed.** Both must be true, and note the toolset version may have bumped:
+   ```
+   ls "/c/Program Files/Microsoft Visual Studio Professional/18/Insiders/VC/Tools/MSVC/"*/lib/     # expect x64, not just onecore
+   ls -d "/c/Program Files/Microsoft Visual Studio Professional/18/Insiders/VC/Tools/MSVC/"*/include
+   ```
+2. **Delete `.cargo/config.toml` entirely.** Not edit — delete. rustc finds everything itself once
+   the desktop libs exist. It is git-ignored, so there is nothing to commit.
+3. **Verify a clean build with no `LIB` override.** `cargo clean && cargo build --release`. If this
+   fails with `LNK1104`, the workload is not actually installed correctly — do *not* reinstate the
+   override and carry on measuring, because every number would then still be OneCore.
+4. **Re-take every number.** Both G3 legs and G4 were measured against the OneCore CRT, which is not
+   the shipping configuration. **Take each set twice — once shortly after a reboot and once on a
+   machine that has been up a while with other GPU apps running** — because of the reproducibility
+   problem below. Use `experiments/measure.ps1`:
+   ```powershell
+   # dynamic CRT
+   cargo build --release
+   .\experiments\measure.ps1 -Exe target\release\g3-d2d.exe   -OutFile g3-d2d-first-pixel.txt `
+       -Columns factory,window,target,draw,total
+   .\experiments\measure.ps1 -Exe target\release\g3-d3d11.exe -OutFile g3-d3d11-serial.txt `
+       -ExeArgs serial     -Columns mode,window,device,swapchain,draw,total,driver
+   .\experiments\measure.ps1 -Exe target\release\g3-d3d11.exe -OutFile g3-d3d11-concurrent.txt `
+       -ExeArgs concurrent -Columns mode,window,device_wait,swapchain,draw,total,driver
+
+   # static CRT, as G3 specifies
+   $env:RUSTFLAGS = "-C target-feature=+crt-static"; cargo build --release
+   # ...repeat the three measure.ps1 lines...
+   Remove-Item Env:\RUSTFLAGS
+   ```
+   Then re-run G4 (`cargo run --release -p g4-glyph-atlas`, ~100 s) and update its RESULTS caveat.
+5. **Update the caveats.** `experiments/g3-d2d/RESULTS.md`, `experiments/g4-glyph-atlas/RESULTS.md`
+   and this file all carry an explicit "linked against the OneCore CRT, re-take after install" note.
+   Remove them only once the numbers behind them have actually been replaced.
 
 **Visual Studio was mid-update when session 3 ended, and the desktop C++ workload was going to be
 added afterwards.** That changes the build setup:
@@ -220,6 +255,42 @@ derived rules and a CI assertion that catches them.
 
 Both of the reporter's thresholds — 2M for onset, 100M for "very broken" — are **predicted from the
 arithmetic alone**, by a model never fitted to them. `RESEARCH.md` §3.4 is now `[V]`.
+
+### ⚠ G3's window-creation figure did not reproduce — provisional, session 5
+
+Re-running the **same binary** (146,432 bytes, byte-identical to session 3's dynamic-CRT build) on the
+**same machine** with `experiments/measure.ps1`, 7 runs:
+
+| phase | session 3 median (range) | session 5 median (range) |
+|---|---|---|
+| `D2D1CreateFactory` | 0.20 ms (0.14 – 0.38) | 0.14 ms (0.10 – 0.18) |
+| `CreateWindowExW` | **113 ms (21 – 144)** | **8.5 ms (6.7 – 11.4)** |
+| `CreateHwndRenderTarget` | 176 ms (152 – 210) | 147 ms (110 – 170) |
+| `Clear` + `EndDraw` | 6.0 ms (5.0 – 6.9) | 6.3 ms (4.3 – 8.0) |
+| **total** | **273 ms (218 – 327)** | **161 ms (125 – 185)** |
+
+**A 13x discrepancy in one phase, with non-overlapping ranges.** Consequences:
+
+- **The "~113 ms window-creation floor" that G3 built its conclusion around does not exist**, at least
+  not in this machine state. `experiments/g3-d2d/RESULTS.md` says *"A floor of ~113 ms for an empty
+  window on a current machine is the number to build the budget around"* — that is now in doubt, and
+  so is the trap note about `CreateWindowExW` being "unexpectedly expensive and highly variable".
+- **G3's core conclusion is *strengthened*, not weakened.** Device/render-target creation is now ~91%
+  of total rather than ~64%, so "graphics device creation must come off the critical path" holds more
+  firmly than before.
+- **But the fix G3 proposed is nearly worthless.** Overlapping device creation with window creation can
+  only ever save `min(window, device)`. At 8.5 ms of window creation there is almost nothing to hide
+  behind — confirmed by `experiments/g3-d3d11`, where concurrent mode beat serial by only ~17 ms.
+  The real win has to come from a cheaper device path or from painting *something* before the device
+  exists, not from concurrency.
+- **Leading hypothesis:** session 3's figures were taken while a Visual Studio update was in progress
+  (this file records that VS was mid-update when session 3 ended), so the machine was under installer
+  load. Session 5's were taken while a VS install was *also* running, though, which argues against it.
+  Unexplained, and that is exactly why the re-take needs a cold/warm split.
+
+**Status: provisional.** Still the OneCore CRT, and a single 7-run sample. Do not edit
+`experiments/g3-d2d/RESULTS.md` until the post-install re-take above is done; then rewrite it against
+whatever reproduces.
 
 **Identity sweep: done 2026-07-29.** `RESEARCH.md`, `SPEC.md`, `PLAN.md`, `UI-DESIGN.md`, `LOKI.md`
 and `HANDOFF.md` were swept for employer names, customer names, internal hostnames, service names,

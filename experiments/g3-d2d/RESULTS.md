@@ -1,7 +1,9 @@
 # G3 — binary size floor and first-pixel latency: windows-rs + Direct2D
 
 First subject of `PLAN.md` §3 G3. **Partial: the `eframe+glow` and `eframe+wgpu` subjects are not
-built yet, and `+crt-static` is not yet applied.**
+built.** Both CRT configurations *are* covered — see the size table below. (An earlier revision of
+this line said `+crt-static` was outstanding; it was applied in the same session and the line was
+left stale.)
 
 Measured 2026-07-29.
 
