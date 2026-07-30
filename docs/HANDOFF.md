@@ -1,7 +1,79 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-30, session 5.
+**Paused:** 2026-07-30, session 5, immediately before an owner-initiated reboot.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## ⚡ FIRST THING AFTER THE REBOOT — take the cold set, before anything else starts
+
+This is time-limited and cannot be redone later in the day. Session 5 established that this machine
+carries a **variable ~40% background load** (Teams, Edge WebView2, Docker, OneDrive, Outlook) which made
+every absolute first-pixel figure unreproducible — the same build gave 96, 112, 126, 139, 154 and
+297 ms. **The minutes after a reboot, before that working set launches, are the only clean baseline
+available.** Do this before opening Teams, Docker or a browser.
+
+**No build is needed.** The `+crt-static` binaries already exist in `target-verify-static\release\`
+(git-ignored, so they survive the directory rename). Building would itself load the machine.
+
+```powershell
+cd C:\dev\git\Tailhawk          # or WinTail if the rename has not been done yet
+
+# Record the machine state first — this is the whole point of the exercise.
+"uptime h : " + [math]::Round(((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalMinutes,1)
+"cpu load : " + (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+"leaked   : " + @(Get-Process | Where-Object { $_.ProcessName -like 'g3-*' -or $_.ProcessName -like 'g4-*' }).Count
+
+.\experiments\measure.ps1 -Exe target-verify-static\release\g3-d2d.exe `
+    -OutFile g3-d2d-first-pixel.txt -Columns "factory,window,target,draw,total" -Runs 11
+.\experiments\measure.ps1 -Exe target-verify-static\release\g3-d3d11.exe `
+    -OutFile g3-d3d11-serial.txt     -ExeArgs serial     -Columns "mode,window,device,swapchain,draw,total,driver" -Runs 11
+.\experiments\measure.ps1 -Exe target-verify-static\release\g3-d3d11.exe `
+    -OutFile g3-d3d11-earlypaint.txt -ExeArgs earlypaint -Columns "mode,window,first_pixel,d3d_ready,driver" -Runs 11
+```
+
+**What this settles.** If the cold p50s land near the *fast* end of the observed ranges (D2D ~96 ms,
+D3D11 serial ~112 ms, earlypaint ~55 ms), then background load explains the whole spread and those
+become the defensible figures for `SPEC.md` §11.3 — stated as p50/p90, never as a mean. If they land
+high instead, the spread has another cause and G5's reference machine is genuinely required first.
+
+**Also worth doing while the machine is quiet:** re-run G4 (`cargo run --release -p g4-glyph-atlas`,
+~100 s) — its rasterisation figure ranged 227–582 ms/frame purely on load, and a cold number would
+bound the real cost of the renderer's dominant expense.
+
+**Do not** compare two configurations in a fixed order, and remember the leaked-subject trap in the
+Toolchain section — both cost session 5 a wrong conclusion each.
+
+---
+
+## Directory rename — half done, finish it while Claude is closed
+
+The working directory is being renamed `WinTail` → **`Tailhawk`** (lowercase h, matching the docs and
+the `github.com/nigelbasel/tailhawk` remote). **The context-preserving half is already done:** the
+project-state directory has been copied to the new key, so memory and session history survive.
+
+`C:\Users\nigel\.claude\projects\C--dev-git-Tailhawk\` already holds all 3 memory files and all 3
+session transcripts including session 5's, plus the `workflows/`, `subagents/` and `tool-results/`
+subdirectories from sessions 1 and 2.
+
+**What remains** — the rename itself, which cannot be done from inside a Claude session because the
+harness resets the shell CWD into the repo after every tool call, and Windows will not rename a
+directory a process has as its CWD. With Claude closed:
+
+```powershell
+cd C:\dev\git
+Rename-Item WinTail Tailhawk
+Copy-Item -Recurse -Force "$env:USERPROFILE\.claude\projects\C--dev-git-WinTail\*" `
+                          "$env:USERPROFILE\.claude\projects\C--dev-git-Tailhawk"
+```
+
+The third line re-syncs session 5's final exchanges, which post-date the copy. Then reopen in
+`C:\dev\git\Tailhawk`. **Delete `C--dev-git-WinTail` only after confirming the new location works** — it
+is deliberately kept as a backup. A longer script with checks and verification was written to the
+session scratchpad but is not in the repo.
+
+**If the spelling is ever changed again** — even just the capitalisation — the project key changes with
+it and the memory is orphaned again, because the key is the literal path string. Decide once.
 
 ---
 
@@ -55,9 +127,19 @@ PRs (tried once, not worth it solo). Commit often; the history is the artefact.
 
 Phase 0 is **4 of 7 done or dispositioned**. What remains, and an honest read on each:
 
-1. **G2 — read throughput.** The only remaining gate that is both unblocked and doable solo. Purely
-   informational (no pass threshold) and it measures the cost of the already-made no-mmap decision so
-   the trade can be stated honestly. Cheap.
+0. **Batched glyph rasterisation — the highest-value unblocked experiment.** G4 measured DirectWrite at
+   **145–390 µs per glyph** using one `CreateGlyphRunAnalysis` per glyph, which makes a cold viewport of
+   ~1,500 CJK glyphs cost 14–35 frames and is by far the renderer's dominant expense. G4 flagged
+   batching a whole run into a single analysis as the likely fix and explicitly did **not** test it.
+   Attractive because it needs **no GPU and no window** — pure DirectWrite plus timing — so it is immune
+   to the D3D-device contamination and the leaked-subject trap that cost session 5 two wrong
+   conclusions. Could move the number by an order of magnitude. Measure per-glyph vs batched-run,
+   paired and interleaved.
+1. **G2 — read throughput.** Unblocked and doable solo, but **it blocks nothing**: `PLAN.md` §3 marks it
+   *"Informational — no pass threshold"* and its "if it fails" column reads *"Nothing."* The no-mmap
+   decision is already locked on correctness grounds, so G2 only quantifies what that costs. Note it
+   wants **10 GB of scratch disk**, and its cold half needs a reboot or an elevated standby-list purge —
+   so it is realistically warm-only unless run right after a restart.
 2. **G3's `eframe` legs — argue for skipping them.** G3 exists to *compare* three stacks, but the
    stack decision is already locked in (windows-rs + D3D11 + DirectWrite), `RESEARCH.md` §3.3 already
    rejects egui/eframe for the grid on text-AA grounds, and **G7 has now independently confirmed
