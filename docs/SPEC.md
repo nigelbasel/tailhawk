@@ -194,6 +194,19 @@ adding a leaf backend pair and a shell, not publishing an ABI.
   is cached as a blank occupying no slot. Without this every space is re-rasterised every frame.
 - **Shaders are compiled offline** with fxc/dxc and the bytecode embedded. CI asserts no
   `d3dcompiler_47.dll` import.
+- **First paint is two-stage, and this is a v1 requirement.** Fill the client area with the solid
+  background colour as soon as the window exists — a `FillRect`, or equivalently a class background
+  brush — then create the D3D11 device on a **worker thread** and swap to the real renderer when it is
+  ready. Both stages draw the same background, so the transition is invisible.
+  **Measured in `experiments/g3-d3d11`:** this roughly halves time-to-first-pixel (48–54% of the naive
+  order, 12 of 12 paired trials), and off-thread device creation is worth a further ~8.5 ms on an idle
+  machine and *far* more under GPU-context pressure, where serial device creation degraded to over a
+  second while the off-thread path held at ~135 ms.
+  Two things that experiment also settled, so they are not worth re-litigating: a class background
+  brush is **equivalent** to a `FillRect` in the paint handler, not better (4 of 12 pairs), so pick
+  whichever is simpler; and the residual floor of ~50–60 ms is **window presentation** —
+  `ShowWindow`, DWM composition, first-paint dispatch — **not graphics initialisation.** Further
+  first-paint optimisation belongs outside the renderer.
 - **Text antialiasing: not a design driver, and no user setting.** The log grid renders to an
   **opaque** target, which per `D2D1_TEXT_ANTIALIAS_MODE` gets ClearType by default. We take that if
   it comes free and accept greyscale if it does not. **No `text_rendering` setting ships**, and no

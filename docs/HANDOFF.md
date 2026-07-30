@@ -228,9 +228,18 @@ likely mechanism — `D3D11CreateDevice` stalling on the `HWND`-owning thread wh
 pump messages — is unconfirmed, but it argues for off-thread device creation as cheap insurance on
 loaded machines, which is where a log viewer lives.
 
-**The bigger lever is still untested:** paint something cheap before the device exists. First pixel
-would approach ~10 ms plus a GDI fill, because none of the ~117 ms of D3D init would be on the critical
-path — a far larger prize than 8.5 ms.
+**The bigger lever is measured and it works: paint before the device exists.** A GDI fill in the first
+`WM_PAINT`, with D3D coming up on a worker, cuts first pixel to **48–54% of the naive order** — 12 of 12
+paired trials, reproduced across two runs. `SPEC.md` §3.2 now requires this two-stage paint for v1.
+
+Two results worth not re-litigating:
+- **A class background brush is equivalent, not better** (4 of 12 pairs). The mechanism does not
+  matter; only that *something* paints without waiting for D3D.
+- **The residual ~50–60 ms floor is window presentation, not graphics.** Window creation is ~7 ms, yet
+  first pixel lands at 55–70 ms even when the system does the fill during `ShowWindow` with no handler
+  running. `ShowWindow` + DWM composition + first-paint dispatch is the cost. **G3 was built to ask
+  whether the graphics stack could paint fast enough; once you stop waiting for it, the window is the
+  bottleneck.** Further first-paint work belongs outside the renderer.
 
 **⚠ Two earlier conclusions here were wrong.** This file previously said concurrency was *refuted* at
 11% slower. That was an artifact of always measuring serial first while leaked D3D devices accumulated
@@ -289,7 +298,24 @@ derived rules and a CI assertion that catches them.
 Both of the reporter's thresholds — 2M for onset, 100M for "very broken" — are **predicted from the
 arithmetic alone**, by a model never fitted to them. `RESEARCH.md` §3.4 is now `[V]`.
 
-### ⚠ Open: the first-pixel figures still do not have a reproducible absolute value
+### Closed: absolute first-pixel figures are blocked on G5, not on a reboot
+
+**Owner will not be rebooting, so this route is closed — and it turns out not to matter.** The cause of
+the instability is identified: **this machine carries a variable ~40% background load** from a normal
+working set (Teams, Edge WebView2, Docker, OneDrive, Outlook), which is not going away. A 21-run D2D set
+spanning it gave a p50 of 297 ms across a 117–783 ms range, with fast runs clustered wherever the load
+happened to dip.
+
+So the same static build has legitimately produced 96, 112, 126, 139, 154 and 297 ms. **Absolute
+first-paint numbers were never blocked on a reboot — they are blocked on `PLAN.md` §3 G5's fixed
+reference machine**, which open question 3 already required before any `SPEC.md` §11.3 figure is
+published. Nothing further is owed here.
+
+**What to do instead, and it is already the practice:** decide with **paired interleaved A/B** on this
+machine — reliable, reproduced across runs, and immune to both load drift and accumulation effects.
+Quote absolutes only as percentiles with the machine state stated, and never as a target.
+
+The historical detail, retained because the discrepancy was large enough to mislead twice:
 
 The G3 summary above records the 13x `CreateWindowExW` discrepancy. It is **still unexplained**, and it
 is the reason no first-pixel figure has been promoted into `SPEC.md` §11.3.

@@ -82,8 +82,10 @@ Write-Host ""
 $names = if ($Columns -ne "") { $Columns -split ',' } else { @() }
 $width = ($rows | ForEach-Object { $_.Count } | Measure-Object -Maximum).Maximum
 
-Write-Host ("{0,-14} {1,10} {2,10} {3,10}" -f "column", "median", "min", "max")
-Write-Host ("-" * 48)
+# p90 as well as the median, because SPEC 11.3 requires first-paint budgets to be stated as a
+# percentile — G3 found a 109 ms spread on an empty window, so a mean or median alone is not a budget.
+Write-Host ("{0,-14} {1,10} {2,10} {3,10} {4,10}" -f "column", "p50", "p90", "min", "max")
+Write-Host ("-" * 60)
 for ($c = 0; $c -lt $width; $c++) {
     $vals = @()
     foreach ($r in $rows) {
@@ -100,11 +102,10 @@ for ($c = 0; $c -lt $width; $c++) {
         Write-Host ("{0,-14} {1}" -f $label, $distinct)
         continue
     }
-    $sorted = $vals | Sort-Object
-    $median = $sorted[[int][math]::Floor(($sorted.Count - 1) / 2)]
-    if ($sorted.Count % 2 -eq 0) {
-        $median = ($sorted[$sorted.Count / 2 - 1] + $sorted[$sorted.Count / 2]) / 2
-    }
-    Write-Host ("{0,-14} {1,10:N3} {2,10:N3} {3,10:N3}" -f
-        $label, $median, $sorted[0], $sorted[-1])
+    $sorted = @($vals | Sort-Object)
+    $n = $sorted.Count
+    $p50 = $sorted[[int][math]::Floor(($n - 1) * 0.5)]
+    $p90 = $sorted[[int][math]::Ceiling(($n - 1) * 0.9)]
+    Write-Host ("{0,-14} {1,10:N3} {2,10:N3} {3,10:N3} {4,10:N3}" -f
+        $label, $p50, $p90, $sorted[0], $sorted[-1])
 }

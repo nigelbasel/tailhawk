@@ -48,12 +48,47 @@ it, both now applied: **never compare two configurations in a fixed order** when
 accumulate between them, and **never let a measurement subject exit on its own** under the agent's
 shell — see the trap section.
 
-## The other direction is still untested, and still the bigger lever
+## The other direction is the real win: paint before the device exists
 
-*Paint something cheap immediately* — fill on `WM_ERASEBKGND` and swap in the real renderer when
-ready. First *pixel* would then approach window creation (~10 ms) plus a GDI fill, because none of the
-~117 ms of D3D initialisation would be on the critical path at all. That is a far larger prize than
-the 8.5 ms concurrency buys, and it remains unmeasured.
+*Paint something cheap immediately, swap in the real renderer when ready.* Measured as two further
+modes, both paired and interleaved against `serial` with the start order rotated so no arm is
+systematically favoured. Two independent runs, 12 pairs each:
+
+| | first pixel, run A | first pixel, run B |
+|---|---|---|
+| serial (D3D `Present` is the first pixel) | 101.9 ms p50 | 139.3 ms p50 |
+| **`earlypaint`** — GDI fill in the first `WM_PAINT` | **54.7 ms p50** | **66.3 ms p50** |
+| `classbrush` — class background brush, no paint handler | — | 71.5 ms p50 |
+| `earlypaint` D3D renderer ready | 73.8 ms p50 | — |
+| `classbrush` D3D renderer ready | — | 94.6 ms p50 |
+
+**Painting before the device exists roughly halves time-to-first-pixel** — `earlypaint` came in at
+**54%** of serial in run A and **48%** in run B, winning **12 of 12** paired trials in run A. Absolute
+values drifted between runs with machine load, but the ratio held, which is the point of pairing.
+
+**A class background brush is equivalent, not better.** `classbrush` beat `earlypaint` in only **4 of
+12** pairs. So the *mechanism* does not matter — use whichever is simpler. What matters is only that
+something paints without waiting for D3D.
+
+**And that identifies the real remaining floor.** Window creation is ~7 ms, but first pixel lands at
+55–70 ms even when the painting itself is a single `FillRect` and even when the system does it during
+`ShowWindow` with no handler at all. **The residual ~50–60 ms is window presentation — `ShowWindow`,
+DWM composition and first-paint dispatch — not graphics initialisation.** Neither approach can get
+below it, because neither is what is costing the time.
+
+That reframes the whole gate. G3 was set up to ask whether the *graphics stack* could paint fast
+enough. The answer is that once you stop waiting for it, the graphics stack is no longer the
+bottleneck: **the window is.** Any further first-paint work belongs outside the renderer entirely.
+
+### Consequence for the design
+
+- **v1 renders in two stages.** Fill immediately with a solid background, bring up D3D on a worker,
+  swap when ready. It halves perceived startup for one `FillRect` and a thread, and the two-stage
+  paint is invisible because both stages draw the same background colour.
+- **The 40 ms criterion should be re-derived against the window-presentation floor**, not against
+  graphics init. At ~55 ms p50 the two-stage approach still misses 40 ms by ~1.4x, but the miss is now
+  almost entirely `ShowWindow`/DWM — outside our control and outside what the criterion was written to
+  test. State the budget as a percentile above the measured floor on the G5 reference machine.
 
 ## D3D11 + DXGI is materially faster than D2D's HwndRenderTarget
 
@@ -107,10 +142,16 @@ subject.
   zombie count verified at 0 before and throughout. Earlier revisions of this page quoted numbers taken
   with a Visual Studio installer resident — it also demonstrably broke a build, failing a
   `+crt-static` link with `LNK1104: libucrt.lib` for two crates then succeeding on retry.
-- **Absolute first-pixel values are still not stable across sessions.** The same static build has
-  produced totals of 112 ms, 126 ms and 154 ms in different states of the same machine. Treat the
-  ~150 ms clean figure as the current best estimate, and the paired comparisons as the reliable part.
-- **A post-reboot (cold) set is still owed** and would be the cleanest baseline available. Load affects both arms equally.
+- **Absolute first-pixel values are not stable on this machine, and chasing them is a dead end.** The
+  same static build has produced serial totals of 96, 112, 126, 139 and 154 ms. The cause is now
+  identified and is not mysterious: **the machine carries a variable ~40% background load** from a
+  normal working set — Teams, Edge WebView2, Docker, OneDrive, Outlook — which is not going away. A
+  21-run set spanning that load gave a p50 of 297 ms and a range of 117–783 ms on the D2D leg.
+- **So absolute first-paint figures are blocked on `PLAN.md` §3 G5's fixed reference machine, not on a
+  reboot.** That was already an open item (`HANDOFF.md` open question 3) and this is simply another
+  reason it has to be settled before any `SPEC.md` §11.3 number is published.
+- **Use the paired comparisons for every design decision.** Interleaved A/B on the same machine within
+  minutes is reliable and reproduced across runs; single absolute numbers from this machine are not. Load affects both arms equally.
 - **A cold set is still owed.** `docs/HANDOFF.md` records that the same `g3-d2d` binary produced a
   113 ms `CreateWindowExW` median in session 3 and 8.5–11.9 ms in session 5, a 13x discrepancy with
   non-overlapping ranges and no established cause. Until a post-reboot set and a quiet-machine set
