@@ -86,17 +86,17 @@ readback 1264x761, neutral tint and background:
 ## Draw-call cost
 
 2,860 instances (2,816 mono + 44 colour emoji), 120 measured frames, GPU time from D3D11 timestamp
-queries with the draw repeated 50× inside the bracket. **Two independent runs are quoted** — absolute
-timings move by tens of percent between runs on a loaded desktop, so a single run's figures should
-not be read as precise.
+queries with the draw repeated 50× inside the bracket. **Three independent runs are quoted** — the
+third on the desktop CRT after the toolchain change. Absolute timings move by tens of percent between
+runs on a loaded desktop, so no single run's figures should be read as precise.
 
 | configuration | draws | CPU p50 | GPU p50 |
 |---|---|---|---|
-| **unified — 1 draw, 1 blend state** | 1 | **0.268 / 0.373 ms** | 0.036 / 0.029 ms |
-| split — 2 draws, 2 blend states | 2 | 0.394 / 0.501 ms | 0.019 / 0.023 ms |
+| **unified — 1 draw, 1 blend state** | 1 | **0.268 / 0.373 / 0.426 ms** | 0.036 / 0.029 / 0.071 ms |
+| split — 2 draws, 2 blend states | 2 | 0.394 / 0.501 / 0.503 ms | 0.019 / 0.023 / 0.040 ms |
 
-**Unified is 25–32% cheaper on CPU in both runs** — the split has to sort the instance buffer to
-partition it by mode, and set state twice. On GPU both sit at 0.02–0.04 ms, which is 0.2% of a
+**Unified is cheaper on CPU in all three runs, by 15–32%** — the split has to sort the instance buffer
+to partition it by mode, and set state twice. On GPU both sit under 0.08 ms, well under 0.5% of a
 16.7 ms frame; dual-source blending is not measurably expensive at this scale.
 
 **The split is not actually an equivalent alternative.** Its mono pass uses a single-source
@@ -112,13 +112,13 @@ The CJK fixture streams a different 1,500-glyph slice of the 20,992-codepoint id
 frame, so the working set never fits and essentially every glyph evicts another. 120 frames, atlas
 capacity 2,346 slots, 180,000 misses and 177,654 evictions in each run.
 
-| eviction policy | bookkeeping per frame (run 1 / run 2) |
+| eviction policy | bookkeeping per frame (run 1 / 2 / 3) |
 |---|---|
-| scan LRU — O(capacity) per miss | **7.58 / 4.35 ms** |
-| list LRU — O(1) per miss | **0.37 / 0.17 ms** |
+| scan LRU — O(capacity) per miss | **7.58 / 4.35 / 8.51 ms** |
+| list LRU — O(1) per miss | **0.37 / 0.17 / 0.31 ms** |
 
-**A 20–25x difference in both runs, and it decides the criterion.** The obvious implementation — scan
-every slot for the oldest — spends 4–8 ms per frame purely on bookkeeping, up to half a 60 Hz frame
+**A 20–28x difference in every run, and it decides the criterion.** The obvious implementation — scan
+every slot for the oldest — spends 4–9 ms per frame purely on bookkeeping, up to half a 60 Hz frame
 budget, before any rasterising or drawing. An intrusive doubly-linked LRU over slot indices costs
 0.17–0.37 ms for the same 1,500 evictions, or well under a microsecond each.
 
@@ -134,16 +134,16 @@ every Latin, CJK and emoji glyph at em 14 fitted the 20×22 box.
 
 ## The actual stall is rasterisation, and it is large
 
-| | per frame (run 1 / run 2) |
+| | per frame (run 1 / 2 / 3) |
 |---|---|
-| DirectWrite rasterisation (1,500 misses) | **312 / 227 ms** |
-| atlas upload (`UpdateSubresource` ×1,500) | 5.7 / 2.9 ms |
-| eviction bookkeeping (list LRU) | 0.37 / 0.17 ms |
-| GPU draw | 0.22 / 0.18 ms |
+| DirectWrite rasterisation (1,500 misses) | **312 / 227 / 582 ms** |
+| atlas upload (`UpdateSubresource` ×1,500) | 5.7 / 2.9 / 5.9 ms |
+| eviction bookkeeping (list LRU) | 0.37 / 0.17 / 0.31 ms |
+| GPU draw | 0.22 / 0.18 / 0.19 ms |
 
-**145–210 µs per glyph, or roughly 5,000–7,000 glyphs/second.** A viewport of 1,500
-previously-unseen CJK glyphs needs 220–310 ms — 13 to 19 frames at 60 Hz. Eviction is three orders of
-magnitude cheaper than the rasterisation it triggers.
+**145–390 µs per glyph**, the spread tracking machine load. A viewport of 1,500 previously-unseen CJK
+glyphs needs 230–580 ms — **14 to 35 frames at 60 Hz.** Eviction is three orders of magnitude cheaper
+than the rasterisation it triggers, and rasterisation is the only term large enough to matter.
 
 The likely cause is granularity: this code calls `CreateGlyphRunAnalysis` once **per glyph**, which
 allocates a COM object and does three interface calls per glyph. Batching a whole run into a single
@@ -190,8 +190,11 @@ number is treated as a floor.
 
 ## Caveats — read before quoting these numbers
 
-- **Still linked against the OneCore CRT**, like G3 — the desktop C++ workload is not installed on
-  this machine. Re-take after it is.
+- ~~Still linked against the OneCore CRT~~ — **resolved 2026-07-30.** Re-run on the **desktop CRT** with
+  `+crt-static` after the workload was installed and the `LIB` override deleted. Every conclusion
+  reproduced: unified still cheaper on CPU, eviction ratio still 20–28x, correctness readback
+  bit-identical. Run 3 in the tables above is that run. A Visual Studio installer was resident for it,
+  which is the likely reason its absolute rasterisation figure is the highest of the three.
 - Single machine, single GPU, `driver: hardware`. WARP was not exercised, and it is the rung where a
   dual-source-blend assumption is most likely to differ.
 - **Shaders are compiled at runtime via `D3DCompile`.** `SPEC.md` §3 requires offline compilation

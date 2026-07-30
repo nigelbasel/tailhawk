@@ -1,6 +1,6 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-29, session 4.
+**Paused:** 2026-07-30, session 5.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
 
 ---
@@ -65,16 +65,21 @@ Phase 0 is **4 of 7 done or dispositioned**. What remains, and an honest read on
    hello-worlds would measure binary size for a stack that is triply rejected. The honest move is to
    record the legs as **deliberately not run**, with that reasoning, rather than leave them looking
    outstanding. Owner's call.
-3. **Re-take G3's numbers** once the desktop C++ workload is installed — still owed, still blocked on
-   an install this session did not make.
-4. **G1** needs two hosts, **G5** needs a decision on downloading third-party binaries, **G6** is a
+3. ~~**Re-take G3's numbers** once the desktop C++ workload is installed~~ — **done for sizes
+   (unchanged, byte-identical) and for the A/B comparisons.** What remains is a **cold (post-reboot)
+   and a quiet-machine set** to pin down the absolute first-pixel value; see the open item below.
+   Owner-gated, because a reboot is theirs to schedule.
+4. **Test the one surviving first-paint direction:** paint something cheap — a GDI or
+   `WM_ERASEBKGND` fill — before the D3D device exists, then swap in the real renderer. Concurrency has
+   been measured and refuted, so this is the only lever left, and it now looks much better than it did:
+   first pixel would approach ~9 ms of window creation plus a fill, not the ~113 ms floor session 3
+   believed in. Unblocked and doable solo.
+5. **G1** needs two hosts, **G5** needs a decision on downloading third-party binaries, **G6** is a
    week of the owner's real usage. All three are owner-gated, not work-gated.
 
-**A free by-product worth collecting:** `experiments/g4-glyph-atlas` already builds a D3D11 + DXGI
-flip-model swapchain — the stack `SPEC.md` §3 actually specifies, rather than G3's D2D
-`HwndRenderTarget`. Adding G3-style first-pixel instrumentation to it would directly test G3's central
-conclusion ("graphics device creation must come off the critical path") on the real configuration, for
-very little work. Not done yet.
+~~**A free by-product worth collecting:** adding G3-style first-pixel instrumentation to the D3D11 +
+DXGI path~~ — **done**, as `experiments/g3-d3d11`, and it paid for itself twice: it refuted the
+worker-thread fix and showed the specified stack is ~30 ms faster than the D2D one G3 measured.
 
 ## Resume here tomorrow
 
@@ -138,66 +143,55 @@ for a solo repo. Commit often; the history is the artefact.
 
 ---
 
-## ⚠ Read this before the first build of the next session
+## Toolchain — resolved, 2026-07-30
 
-**Status: the owner began installing the desktop C++ workload during session 5.** Until it is
-confirmed present, `.cargo/config.toml` is still required. The checklist below is the transition.
+**The desktop C++ workload is installed and `.cargo/config.toml` is deleted.** The whole OneCore
+workaround is gone: toolset `14.51.36231` now has `lib\x64`, `lib\x86` and `include`, the version did
+not bump, and `cargo build --release` links with no `LIB` override. If a future `LNK1104` appears,
+that file no longer exists to be the suspect.
 
-### Post-install checklist — do this in order
+**Two things learned during the transition, worth keeping:**
 
-1. **Confirm the workload landed.** Both must be true, and note the toolset version may have bumped:
-   ```
-   ls "/c/Program Files/Microsoft Visual Studio Professional/18/Insiders/VC/Tools/MSVC/"*/lib/     # expect x64, not just onecore
-   ls -d "/c/Program Files/Microsoft Visual Studio Professional/18/Insiders/VC/Tools/MSVC/"*/include
-   ```
-2. **Delete `.cargo/config.toml` entirely.** Not edit — delete. rustc finds everything itself once
-   the desktop libs exist. It is git-ignored, so there is nothing to commit.
-3. **Verify a clean build with no `LIB` override.** `cargo clean && cargo build --release`. If this
-   fails with `LNK1104`, the workload is not actually installed correctly — do *not* reinstate the
-   override and carry on measuring, because every number would then still be OneCore.
-4. **Re-take every number.** Both G3 legs and G4 were measured against the OneCore CRT, which is not
-   the shipping configuration. **Take each set twice — once shortly after a reboot and once on a
-   machine that has been up a while with other GPU apps running** — because of the reproducibility
-   problem below. Use `experiments/measure.ps1`:
-   ```powershell
-   # dynamic CRT
-   cargo build --release
-   .\experiments\measure.ps1 -Exe target\release\g3-d2d.exe   -OutFile g3-d2d-first-pixel.txt `
-       -Columns factory,window,target,draw,total
-   .\experiments\measure.ps1 -Exe target\release\g3-d3d11.exe -OutFile g3-d3d11-serial.txt `
-       -ExeArgs serial     -Columns mode,window,device,swapchain,draw,total,driver
-   .\experiments\measure.ps1 -Exe target\release\g3-d3d11.exe -OutFile g3-d3d11-concurrent.txt `
-       -ExeArgs concurrent -Columns mode,window,device_wait,swapchain,draw,total,driver
+- **Do not build or measure while a Visual Studio installer is resident.** A `+crt-static` link failed
+  once with `LNK1104: cannot open file 'libucrt.lib'` for two crates while succeeding for the other
+  two, then succeeded for all four on an immediate retry — files moving underneath the linker. Every
+  session-5 timing was taken with `setup.exe` resident, which is why they are provisional.
+- **The GUI experiment binaries leave unreaped zombies that block `cargo build`.** They exit, but
+  something in the agent's shell keeps their handles, so `tasklist` still lists them while `taskkill`
+  says "no running instance" and `cargo build` fails with `Access is denied (os error 5)` trying to
+  replace the exe. Session 5 accumulated 23 of them. It happens with Bash `&` *and* with
+  `Start-Process` from `measure.ps1`, so it is the shell lifetime, not the launcher.
+  **Workarounds, in order of preference:** run the measurements from a shell you then close; or build
+  into a scratch dir (`$env:CARGO_TARGET_DIR="target-verify"`, which is git-ignored) and measure from
+  there; or verify with `cargo check --workspace` when only correctness matters. Do not spend time
+  trying to kill them — they are already dead.
 
-   # static CRT, as G3 specifies
-   $env:RUSTFLAGS = "-C target-feature=+crt-static"; cargo build --release
-   # ...repeat the three measure.ps1 lines...
-   Remove-Item Env:\RUSTFLAGS
-   ```
-   Then re-run G4 (`cargo run --release -p g4-glyph-atlas`, ~100 s) and update its RESULTS caveat.
-5. **Update the caveats.** `experiments/g3-d2d/RESULTS.md`, `experiments/g4-glyph-atlas/RESULTS.md`
-   and this file all carry an explicit "linked against the OneCore CRT, re-take after install" note.
-   Remove them only once the numbers behind them have actually been replaced.
+### Re-take procedure
 
-**Visual Studio was mid-update when session 3 ended, and the desktop C++ workload was going to be
-added afterwards.** That changes the build setup:
+Still owed: a **post-reboot (cold)** set and a **quiet-machine (warm)** set, because of the
+reproducibility problem below. Sizes are done and did not move.
 
-- This machine's MSVC toolset had **only the OneCore CRT** (`lib\onecore\x64`) — no desktop
-  `lib\x64`, no `include` at all. Builds fail with `LNK1104: cannot open file 'msvcrt.lib'` without
-  a workaround.
-- The workaround is a **git-ignored `.cargo/config.toml`** setting `LIB` to the OneCore libs plus
-  the Windows SDK. It **hardcodes toolset `14.51.36231`**, which a VS update will very likely bump.
-- **Once the desktop C++ workload is installed, delete `.cargo/config.toml` entirely** — rustc finds
-  everything itself. If a build fails with `LNK1104` and that file still exists, the stale toolset
-  version in it is the first suspect, not the code.
-- **Every G3 number must be re-taken after that install** — they were measured against the OneCore
-  CRT, which is not the shipping configuration.
+```powershell
+cargo build --release            # or $env:RUSTFLAGS="-C target-feature=+crt-static"
+.\experiments\measure.ps1 -Exe target\release\g3-d2d.exe   -OutFile g3-d2d-first-pixel.txt `
+    -Columns "factory,window,target,draw,total"
+.\experiments\measure.ps1 -Exe target\release\g3-d3d11.exe -OutFile g3-d3d11-serial.txt `
+    -ExeArgs serial     -Columns "mode,window,device,swapchain,draw,total,driver"
+.\experiments\measure.ps1 -Exe target\release\g3-d3d11.exe -OutFile g3-d3d11-concurrent.txt `
+    -ExeArgs concurrent -Columns "mode,window,device_wait,swapchain,draw,total,driver"
+```
+
+**Quote `-Columns`** — PowerShell parses a bare comma-separated list as an array and the script
+rejects it. Then re-run G4 (`cargo run --release -p g4-glyph-atlas`, ~100 s) and drop its OneCore
+caveat.
+
+---
 
 ## Phase 0 — where it got to
 
 | Gate | State |
 |---|---|
-| **G3** — binary size floor + first pixel | **windows-rs + D2D leg done, both CRT configs.** See `experiments/g3-d2d/RESULTS.md`. `eframe+glow` and `eframe+wgpu` legs **not started** — but see the note below on whether they are still worth running. |
+| **G3** — binary size floor + first pixel | **Size passes and is settled. First pixel fails and its absolute value is still unsettled.** Two legs done on the desktop CRT: D2D (`experiments/g3-d2d/RESULTS.md`) and D3D11+DXGI (`experiments/g3-d3d11/RESULTS.md`). `eframe` legs not started — see the argument below that they are moot. |
 | **G1** — SMB stale size | Not started. Needs two hosts and a share; can't be done solo on one machine. |
 | **G2** — read throughput | Not started. Informational only, no pass threshold. |
 | **G4** — colour-glyph atlas | **Done. Passes**, and it refuted the objection it was built to test. See `experiments/g4-glyph-atlas/RESULTS.md`. |
@@ -207,17 +201,38 @@ added afterwards.** That changes the build setup:
 
 ### G3 result in one line
 
-**Size passes by ~8x; first pixel fails by ~6x.** 243,712 bytes with `+crt-static` against a 2 MB
-criterion; 249 ms median first pixel against a 40 ms criterion.
+**Size passes by ~8x and is settled. First pixel fails by ~3x and its absolute value is not settled.**
 
-The breakdown is the finding: **drawing is 6 ms.** `CreateHwndRenderTarget` is ~171 ms (D3D device
-and driver init) and `CreateWindowExW` an unanticipated ~73–113 ms, wildly variable. So the
-conclusion is not "D2D is slow" but **"graphics device creation must come off the critical path"** —
-`SPEC.md` already specifies D3D11 + DXGI rather than D2D's `HwndRenderTarget`, and a D3D11 device can
-be built on a worker thread while the window is created. That still leaves a ~113 ms window-creation
-floor, so **40 ms was set without measurement and needs re-deriving**, exactly as `PLAN.md` §3
-anticipates for a G3 failure. Variance alone (109 ms spread on an empty window) means any first-paint
-budget must be a percentile, not a mean.
+**Size is done.** 243,712 bytes with `+crt-static`, 146,432 dynamic, against a 2 MB criterion — and
+**byte-for-byte identical between the OneCore and desktop CRTs**, so the re-take changed nothing. The
+15 MB CI gate has vastly more headroom than assumed. Static costs a flat +97,280 bytes.
+
+**First pixel fails, and the shape of the failure changed completely.** On the specified stack
+(D3D11 + DXGI, `+crt-static`, desktop CRT) it is **126 ms** against a 40 ms criterion. The breakdown
+is the finding: **drawing is 2.6 ms** and **graphics initialisation is 117 ms, or 92% of the total** —
+`D3D11CreateDevice` 60 ms plus swapchain and RTV creation 57 ms. So the conclusion *"graphics device
+creation must come off the critical path"* is **strengthened**.
+
+**But the fix G3 proposed for it is refuted.** Creating the device on a worker thread concurrently
+with the window came out **11% slower** (140 ms vs 126 ms), and the wait for the worker's device was
+58.6 ms against a serial device cost of 60.0 ms — a 1.4 ms saving. Window creation and D3D11 device
+creation **contend rather than overlap**, and you cannot hide more than `min(window, device)` anyway.
+**The only surviving direction is to paint something cheap before the device exists** and swap in the
+real renderer later; first pixel would then approach ~9 ms plus a GDI fill. Untested.
+
+**Two of session 3's conclusions are withdrawn:**
+
+- **The "~113 ms `CreateWindowExW` floor" does not exist.** The byte-identical binary on the same
+  machine gives **9.3 ms** (7.3 – 12.5), a 13x discrepancy with non-overlapping ranges. The cause is
+  not established — installer load is the leading hypothesis but session 5 also had an installer
+  resident, which argues against it.
+- **Using the spec's own stack is worth ~30 ms**, unprompted: D3D11 + DXGI reaches first pixel in
+  126 ms where D2D's `HwndRenderTarget` takes 157 ms. The D2D leg was measuring a configuration
+  Tailhawk was never going to ship.
+
+**Still owed:** a post-reboot (cold) set and a quiet-machine set. Every session-5 timing was taken with
+a VS installer resident. Variance alone still means any first-paint budget must be a percentile, not a
+mean, and 40 ms needs re-deriving around ~117 ms of unavoidable graphics init.
 
 ### G4 result in one line
 
@@ -256,41 +271,27 @@ derived rules and a CI assertion that catches them.
 Both of the reporter's thresholds — 2M for onset, 100M for "very broken" — are **predicted from the
 arithmetic alone**, by a model never fitted to them. `RESEARCH.md` §3.4 is now `[V]`.
 
-### ⚠ G3's window-creation figure did not reproduce — provisional, session 5
+### ⚠ Open: the first-pixel figures still do not have a reproducible absolute value
 
-Re-running the **same binary** (146,432 bytes, byte-identical to session 3's dynamic-CRT build) on the
-**same machine** with `experiments/measure.ps1`, 7 runs:
+The G3 summary above records the 13x `CreateWindowExW` discrepancy. It is **still unexplained**, and it
+is the reason no first-pixel figure has been promoted into `SPEC.md` §11.3.
 
-| phase | session 3 median (range) | session 5 median (range) |
-|---|---|---|
-| `D2D1CreateFactory` | 0.20 ms (0.14 – 0.38) | 0.14 ms (0.10 – 0.18) |
-| `CreateWindowExW` | **113 ms (21 – 144)** | **8.5 ms (6.7 – 11.4)** |
-| `CreateHwndRenderTarget` | 176 ms (152 – 210) | 147 ms (110 – 170) |
-| `Clear` + `EndDraw` | 6.0 ms (5.0 – 6.9) | 6.3 ms (4.3 – 8.0) |
-| **total** | **273 ms (218 – 327)** | **161 ms (125 – 185)** |
+| `CreateWindowExW`, same binary, same machine | median (range) |
+|---|---|
+| session 3, OneCore CRT | **113 ms** (21 – 144) |
+| session 5, OneCore CRT, before the install | **8.5 ms** (6.7 – 11.4) |
+| session 5, desktop CRT, `+crt-static` | **9.3 ms** (7.3 – 12.5) |
+| session 5, desktop CRT, dynamic | **11.9 ms** (9.9 – 26.5) |
 
-**A 13x discrepancy in one phase, with non-overlapping ranges.** Consequences:
+Three of four agree closely; session 3 is the outlier, and its range does not overlap the others. So
+the CRT change is **not** the cause — the 8.5 ms measurement was taken before the install, on the same
+OneCore toolchain that produced 113 ms.
 
-- **The "~113 ms window-creation floor" that G3 built its conclusion around does not exist**, at least
-  not in this machine state. `experiments/g3-d2d/RESULTS.md` says *"A floor of ~113 ms for an empty
-  window on a current machine is the number to build the budget around"* — that is now in doubt, and
-  so is the trap note about `CreateWindowExW` being "unexpectedly expensive and highly variable".
-- **G3's core conclusion is *strengthened*, not weakened.** Device/render-target creation is now ~91%
-  of total rather than ~64%, so "graphics device creation must come off the critical path" holds more
-  firmly than before.
-- **But the fix G3 proposed is nearly worthless.** Overlapping device creation with window creation can
-  only ever save `min(window, device)`. At 8.5 ms of window creation there is almost nothing to hide
-  behind — confirmed by `experiments/g3-d3d11`, where concurrent mode beat serial by only ~17 ms.
-  The real win has to come from a cheaper device path or from painting *something* before the device
-  exists, not from concurrency.
-- **Leading hypothesis:** session 3's figures were taken while a Visual Studio update was in progress
-  (this file records that VS was mid-update when session 3 ended), so the machine was under installer
-  load. Session 5's were taken while a VS install was *also* running, though, which argues against it.
-  Unexplained, and that is exactly why the re-take needs a cold/warm split.
-
-**Status: provisional.** Still the OneCore CRT, and a single 7-run sample. Do not edit
-`experiments/g3-d2d/RESULTS.md` until the post-install re-take above is done; then rewrite it against
-whatever reproduces.
+**What would settle it:** a post-reboot set and a genuinely quiet-machine set (no VS installer, no
+Docker, no browser). Both are owner-gated, since a reboot is theirs to schedule. Until then treat every
+absolute first-pixel number as provisional and rely only on the A/B comparisons, which were each taken
+minutes apart under identical load and are therefore sound: serial vs concurrent, D2D vs D3D11 + DXGI,
+static vs dynamic.
 
 **Identity sweep: done 2026-07-29.** `RESEARCH.md`, `SPEC.md`, `PLAN.md`, `UI-DESIGN.md`, `LOKI.md`
 and `HANDOFF.md` were swept for employer names, customer names, internal hostnames, service names,
