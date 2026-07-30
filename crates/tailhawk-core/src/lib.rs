@@ -93,7 +93,38 @@ impl Renderer {
     /// Draws one frame and presents it. At M0 this is the background clear and nothing else —
     /// the grid arrives at M3.
     pub fn paint(&mut self) -> Result<()> {
-        self.gpu.clear(BACKGROUND)?;
+        self.gpu.draw_background(BACKGROUND)?;
         self.gpu.present()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two stages of the first paint must be the same colour (`SPEC.md` §3.2). They are
+    /// necessarily expressed twice — GDI wants 8-bit channels, the render target wants floats —
+    /// and if they ever drift apart the handover from the class brush to the renderer becomes a
+    /// visible flash on every cold start. That is the whole reason both live in this crate.
+    #[test]
+    fn both_paint_stages_are_the_same_colour() {
+        let (r, g, b) = background_rgb8();
+        for (channel, expected) in BACKGROUND[..3].iter().zip([r, g, b]) {
+            let as_8bit = (channel * 255.0).round() as u8;
+            assert_eq!(
+                as_8bit,
+                expected,
+                "BACKGROUND {BACKGROUND:?} and background_rgb8() {:?} disagree",
+                (r, g, b)
+            );
+        }
+    }
+
+    #[test]
+    fn background_is_opaque() {
+        assert_eq!(
+            BACKGROUND[3], 1.0,
+            "a translucent background would composite against whatever is behind the window"
+        );
     }
 }

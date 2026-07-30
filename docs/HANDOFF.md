@@ -1,7 +1,50 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-30, session 7, after running the batched-rasterisation experiment.
+**Paused:** 2026-07-30, session 7, after finishing M0.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## 🚀 M0 is done — 2026-07-30, session 7. There is a running application.
+
+`cargo run --release -p tailhawk` opens a window. That is the command to use whenever you want to
+start something up and look at it; it will show progressively more as M1–M3 land.
+
+**Owner direction, session 7:** keep to the planned milestone order — **M2 is not deferred**. This is
+a side project, it does not need to be in daily use, and **robustness is preferred over reaching a
+usable UI sooner**. The dogfood-first reordering (skip M2, trim M3) was offered and declined.
+
+| M0 criterion (`PLAN.md` §4) | State |
+|---|---|
+| Cargo workspace with the core/shell split from commit one | **Done** — `crates/tailhawk-core` (portable, owns rendering) + `crates/tailhawk` (window, message loop) |
+| A window that opens | **Done** — verified opening, responding, titled with the driver it got |
+| D3D11 device with the WARP fallback chain | **Done** — hardware → WARP; comes up on hardware here |
+| An embedded shader | **Done** — `fxc` at build time via `build.rs`, DXBC embedded, CI asserts no `d3dcompiler` import |
+| `+crt-static` | **Done** — 249,344 bytes, imports **only OS DLLs**; the dynamic build needs `vcruntime140.dll`, the static one does not |
+| CI producing x64 and ARM64 under the size gate | **Done, x64 verified locally. ⚠ ARM64 unverified** — this machine's VS install has no ARM64 linker, so that leg is proven only when CI first runs. `fail-fast: false`, so x64 still reports. |
+| **Done:** opens on a clean Windows 10 1809 VM with no runtime installed | **Not literally tested** — no such VM here. The dependency surface that criterion is really about *is* verified: only OS DLLs. |
+
+**Choices worth not re-litigating:**
+
+- **The core cannot name an `HWND`.** The drawable crosses the seam as an opaque `WindowHandle(isize)`,
+  so `SPEC.md` §3.1's portability rule is enforced by the type rather than by discipline.
+- **Leaf backends are modules inside the core, not separate crates.** Splitting them buys nothing
+  until a second platform exists, and it is a mechanical move when one does.
+- **Both paint stages take their colour from one constant** in the core, with a unit test asserting
+  the `f32` and 8-bit forms agree. They are necessarily written twice — GDI wants bytes, the render
+  target wants floats — and drift would show as a flash on every cold start.
+- **Stage one is the class background brush**, which the system draws during `ShowWindow` before any
+  handler runs. §3.2 measured a brush as *equivalent* to a `FillRect`, so this is the simpler of two
+  equal options.
+- **M0 draws through the shader rather than `ClearRenderTargetView`.** Same pixels, more cost — the
+  point is that the offline-compile path M3 depends on is proven now rather than then.
+- **`clippy` and `fmt` in CI are scoped to the product crates.** The experiment crates trip four
+  pre-existing lints; they are throwaway measurement code whose hand-formatting is part of what they
+  record. They are still compiled by the workspace build, so they cannot rot into not building.
+
+**Next: M1 — read and decode** (`PLAN.md` §4). Headless: open a file, detect encoding, stream decoded
+lines with correct carry across read boundaries. **Decode before index** — that ordering is the
+dependency inversion adversarial review caught, and it is why M1 is not the indexer.
 
 ---
 

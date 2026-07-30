@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # SPEC.md §2: copy-and-run on a machine with no runtime installed. The dynamic build imports
+  # vcruntime140.dll and the CRT api-sets; the static one imports only OS DLLs, so the shipped
+  # artefact is always static.
+  RUSTFLAGS: -C target-feature=+crt-static
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel and both targets, so rustup resolves this with no
+      # version named here.
+      - name: Show toolchain
+        run: |
+          rustup show
+          rustc --version --verbose
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      # Host-only: the runner cannot execute an ARM64 binary, and clippy/tests are
+      # architecture-independent, so running them once on x64 is sufficient.
+      # Product crates only, for the same reason as the format check. The experiments are still
+      # compiled by the workspace build above, so they cannot rot into not building — they just do
+      # not have to satisfy lints written after they were finished.
+      - name: Clippy
+        if: matrix.arch == 'x64'
+        run: cargo clippy --release -p tailhawk -p tailhawk-core --target ${{ matrix.target }} -- -D warnings
+
+      # Product crates only. The experiment crates under experiments/ are throwaway measurement
+      # code whose hand-formatting is part of what they record; reformatting them would churn
+      # files kept for their history, not their style.
+      - name: Format
+        if: matrix.arch == 'x64'
+        run: cargo fmt -p tailhawk -p tailhawk-core -- --check
+
+      - name: Test
+        if: matrix.arch == 'x64'
+        run: cargo test --release --workspace --target ${{ matrix.target }}
+
+      # PLAN.md M0: an x64 and ARM64 exe under the size gate. The 15 MB gate is from SPEC.md §11.2;
+      # G3 measured the skeleton at ~250 KB, so this is an alarm for accidental bloat — a jump of
+      # two orders of magnitude means something large was linked in by mistake.
+      - name: Size gate
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/tailhawk.exe"
+          $bytes = (Get-Item $exe).Length
+          $limit = 15MB
+          "tailhawk.exe (${{ matrix.arch }}): $bytes bytes, gate $limit"
+          if ($bytes -gt $limit) { throw "size gate exceeded: $bytes > $limit" }
+
+      # SPEC.md §3.2 requires shaders compiled offline with the bytecode embedded. A runtime
+      # D3DCompile would add a d3dcompiler_47.dll import, which is redistributable-only. Import
+      # names are stored as plain ASCII, so absence of the string proves absence of the import.
+      - name: Assert no runtime shader compiler
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/tailhawk.exe"
+          $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          if ($ascii -match 'd3dcompiler') { throw "d3dcompiler is imported - a shader is being compiled at runtime" }
+          "no d3dcompiler import"
+
+      # SPEC.md §2's copy-and-run promise. The static build must name only OS DLLs; an import of
+      # vcruntime140.dll or the CRT api-sets means it needs a redistributable installed.
+      - name: Assert no CRT redistributable dependency
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/tailhawk.exe"
+          $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          $dlls = [regex]::Matches($ascii, '[A-Za-z0-9_\-\.]+\.dll') | ForEach-Object { $_.Value.ToLower() } | Sort-Object -Unique
+          "imports: $($dlls -join ', ')"
+          $banned = $dlls | Where-Object { $_ -match 'vcruntime|msvcp|api-ms-win-crt' }
+          if ($banned) { throw "needs a CRT redistributable: $($banned -join ', ')" }
+          "static CRT confirmed"
+
+      # Unsigned: the code-signing route is still open (PLAN.md §7.1 - Azure Artifact Signing is
+      # ruled out on geographic eligibility, Certum unconfirmed). Shipping unsigned is a legitimate
+      # v1 posture, so this is the placeholder the M0 criterion asks for.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailhawk-${{ matrix.arch }}-unsigned
+          path: target/${{ matrix.target }}/release/tailhawk.exe
+          if-no-files-found: error
