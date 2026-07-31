@@ -2,7 +2,9 @@
 //! drawable and nothing else (`SPEC.md` §3.1).
 //!
 //! M0 is the skeleton: a window that opens, a D3D11 device with the WARP fallback, and the
-//! two-stage first paint. There is no grid yet — that is M3.
+//! two-stage first paint. M1 adds reading and decoding, which is headless — the only thing the
+//! shell does with it is report what the core found, in the title bar, because there is no grid to
+//! render it into until M3.
 
 #![windows_subsystem = "windows"]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -10,7 +12,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use tailhawk_core::{background_rgb8, Renderer, WindowHandle};
+use tailhawk_core::{background_rgb8, FileSource, Renderer, WindowHandle};
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect};
@@ -37,6 +39,11 @@ struct Shell {
     /// brush is doing the painting — stage one of the two-stage paint.
     renderer: Option<Renderer>,
     pending: Option<Receiver<std::result::Result<Renderer, tailhawk_core::Error>>>,
+    /// What the two workers have reported so far. Either can land first, so the title is rebuilt
+    /// from both rather than written by whichever finishes.
+    driver: Option<String>,
+    reading: Option<Receiver<String>>,
+    file: Option<String>,
 }
 
 impl Shell {
@@ -47,11 +54,10 @@ impl Shell {
         };
         match rx.try_recv() {
             Ok(Ok(renderer)) => {
-                let title = format!("Tailhawk — {}", renderer.driver().name());
+                self.driver = Some(renderer.driver().name().to_owned());
                 self.renderer = Some(renderer);
                 self.pending = None;
-                set_title(hwnd, &title);
-                stop_polling(hwnd);
+                self.refresh_title(hwnd);
                 unsafe {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
@@ -60,15 +66,49 @@ impl Shell {
             // stage one rather than dying: `SPEC.md` §3.2 forbids panicking on device trouble.
             Ok(Err(e)) => {
                 self.pending = None;
-                set_title(hwnd, &format!("Tailhawk — no graphics device ({e})"));
-                stop_polling(hwnd);
+                self.driver = Some(format!("no graphics device ({e})"));
+                self.refresh_title(hwnd);
             }
             Err(TryRecvError::Disconnected) => {
                 self.pending = None;
-                set_title(hwnd, "Tailhawk — graphics worker died");
-                stop_polling(hwnd);
+                self.driver = Some("graphics worker died".to_owned());
+                self.refresh_title(hwnd);
             }
             Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn poll_file(&mut self, hwnd: HWND) {
+        let Some(rx) = self.reading.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(summary) => {
+                self.reading = None;
+                self.file = Some(summary);
+                self.refresh_title(hwnd);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.reading = None;
+                self.file = Some("read failed".to_owned());
+                self.refresh_title(hwnd);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn refresh_title(&self, hwnd: HWND) {
+        let mut title = String::from("Tailhawk");
+        for part in [self.driver.as_deref(), self.file.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            title.push_str(" — ");
+            title.push_str(part);
+        }
+        set_title(hwnd, &title);
+        if self.pending.is_none() && self.reading.is_none() {
+            stop_polling(hwnd);
         }
     }
 
@@ -111,6 +151,36 @@ impl Shell {
     }
 }
 
+/// Opens a file, detects its encoding and streams every line, reporting what happened.
+///
+/// This is the whole of M1 made visible. It counts lines rather than keeping them because there is
+/// nowhere to put them yet — the grid is M3 and the index is M2 — and holding a few million
+/// `String`s to prove they decoded would be the wrong shape to keep.
+fn summarise(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+    let mut source = match FileSource::open(path) {
+        Ok(source) => source,
+        Err(e) => return format!("{name}: {e}"),
+    };
+
+    let detection = *source.detection();
+    let mut lines = 0usize;
+    if let Err(e) = source.read_to_end(|_| lines += 1) {
+        return format!("{name}: {e}");
+    }
+
+    let flag = if detection.disagreed { " (mixed?)" } else { "" };
+    format!(
+        "{name}: {}{flag}, {lines} lines, {} bytes",
+        detection.charset.name(),
+        source.offset()
+    )
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -134,6 +204,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.poll_device(hwnd);
+                    shell.poll_file(hwnd);
                 }
             });
             LRESULT(0)
@@ -183,6 +254,20 @@ fn main() -> Result<()> {
         let _ = tx.send(Renderer::new());
     });
 
+    // M1's demo, and the dogfood path. A bare positional path only — the option surface is §12.2
+    // and lands at M8; guessing at it now would be work thrown away.
+    //
+    // It reads on a worker for the same reason the device does. A multi-GB file read on the window
+    // thread would undo the two-stage paint that `experiments/g3-d3d11` measured at 13.1 ms, and
+    // the first log opened this way is meant to be a real one.
+    let reading = std::env::args_os().nth(1).map(|arg| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(summarise(std::path::Path::new(&arg)));
+        });
+        rx
+    });
+
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let class_name = windows::core::w!("TailhawkMain");
     let (r, g, b) = background_rgb8();
@@ -211,6 +296,9 @@ fn main() -> Result<()> {
         *s.borrow_mut() = Some(Shell {
             renderer: None,
             pending: Some(rx),
+            driver: None,
+            reading,
+            file: None,
         });
     });
 
