@@ -1,7 +1,113 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-30, session 7, after finishing M0.
+**Paused:** 2026-07-31, session 8, most of the way through M1.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## 🚀 M1 is most of the way done — 2026-07-31, session 8. It reads real files.
+
+```
+cargo run --release -p tailhawk -- C:\path\to\some.log
+```
+
+opens a window whose title reports what the core made of the file — encoding, line count, bytes. That
+is M1's demo. It is headless work, so the title bar is the only surface it has until the grid arrives
+at M3.
+
+Verified end to end on the static build:
+
+| File | Title reported |
+|---|---|
+| BOM-less UTF-8 with em dashes (Corpus B's shape) | `UTF-8, 5 lines, 171 bytes` |
+| UTF-8 with BOM | `UTF-8, 2 lines, 107 bytes` |
+| UTF-16LE with BOM | `UTF-16LE, 3 lines, 228 bytes` |
+
+**56 tests, all passing.** `cargo test -p tailhawk-core`.
+
+| M1 criterion (`PLAN.md` §4) | State |
+|---|---|
+| **E5** — encoding detection (BOM, NUL-parity, UTF-8 validation, chardetng) | **Done** — `crates/tailhawk-core/src/encoding.rs` |
+| **E6** — incremental streaming decode, carry across boundaries | **Done** — `crates/tailhawk-core/src/lines.rs` |
+| **E1** — source abstraction, open/share modes, writer-safety guarantee | **Done** — `crates/tailhawk-core/src/file.rs`, with the rotation-loop test *and* a negative control |
+| **E2** — overlapped `ReadFile` layer **on IOCP** | **Half done.** Overlapped reads with explicit `OVERLAPPED.Offset` work and are tested. **The IOCP with 4–8 outstanding requests is not built** — reads are issued one at a time. That is a throughput property with no consumer until M4's 50 MB/s criterion, so it was left rather than built blind. |
+| Encoding fixture matrix decodes correctly | **Done** — BOM'd ×5, BOM-less UTF-8/16LE/16BE/32LE/32BE, head-vs-tail mixed, truncated-mid-sequence, binary-embedded, DBCS |
+| Rotation loop shows no sharing violation on the writer side | **Done** — and paired with a negative control that opens `FILE_SHARE_READ` only and asserts the writer *is* locked out |
+| Fuzz targets clean | **Not started.** See below — this is the next thing. |
+
+### Start the next session with this
+
+**M1's last criterion: fuzz targets.** The decoder is the right target — it takes arbitrary bytes and
+must never panic, never lose a byte from the offset count, and never produce a line containing `\r` or
+`\n`. Note the practical snag before reaching for it: `cargo-fuzz` wants libFuzzer and is a poor fit on
+MSVC Windows. Two honest options, and it is worth 20 minutes deciding rather than fighting the first:
+
+1. `arbitrary` + a hand-rolled loop over a corpus, run in CI as an ordinary test with a time budget.
+2. `cargo-fuzz` under the `x86_64-pc-windows-msvc` libFuzzer support, which does exist but is
+   under-travelled.
+
+**The boundary-invariance test is already most of the value** — it feeds every input at every possible
+split and asserts the lines are identical, and it found three real bugs (below). A fuzzer adds
+arbitrary *content* on top of arbitrary *framing*. Do not let it block M2.
+
+### Choices worth not re-litigating
+
+- **UTF-32 is hand-written, and it is not gold-plating.** The WHATWG Encoding Standard excludes UTF-16
+  and UTF-32 *detection* and excludes UTF-32 entirely, so `encoding_rs` cannot be delegated to for the
+  parts §5.6 cares most about on Windows. `Charset` is therefore an enum wrapping `&'static Encoding`
+  plus two UTF-32 variants, not a bare `&'static Encoding`.
+- **`Charset::code_unit()` and `Charset::allows_parallel_indexing()` exist now, in M1.** §5.3 requires
+  encoding to be resolved before *chunk assignment*, not merely before indexing. Putting the types M2
+  needs into M1 is what makes "decode before index" structural rather than a note in a plan.
+- **`detect` takes the codepage fallback as a parameter.** The core may not name a Win32 function
+  (§3.1), so `system_codepage()` lives behind `cfg(windows)` and is passed in.
+- **Line emission is a callback**, not an iterator. A line that spans chunks lives in the decoder's
+  `pending` buffer and one that does not is borrowed from the scratch buffer; a callback serves both
+  without allocating per line.
+- **`FileSource::pump` holds a trailing partial line rather than emitting it.** A writer that has
+  flushed half a line is the normal state of a live log.
+- **Following, polling and rotation *handling* are absent on purpose.** They are M4. What M1 owes is
+  that the bytes arrive correctly and the writer is never impeded.
+
+### ⚠ One spec claim did not survive measurement — owner's call
+
+`SPEC.md` §5.3 disables parallel indexing for DBCS codepages, and gives as the reason that **"`0x0A`
+is a legal trail byte"** in codepages 932/936/950/949. **It is not.** The test
+`no_dbcs_encoding_puts_0a_in_a_trail_byte` walks every code point in all four encodings and finds no
+character whose encoding contains `0x0A` anywhere but the first byte.
+
+The **conclusion** still stands on §5.3's *other* stated ground — you cannot tell a lead byte from a
+trail byte at an arbitrary offset, so decode needs forward resync from a known boundary. But
+**newline scanning specifically looks safe to parallelise**, and that is what the index actually does.
+
+`allows_parallel_indexing()` still returns `false` for DBCS, deliberately: widening it is an M2
+decision with a normative spec edit attached, and this file does not make those. The measurement is
+kept as a test rather than a comment so it fails if `encoding_rs`'s tables ever change underneath the
+claim.
+
+### Size: the binary doubled, and it is still 3.2% of the gate
+
+| | static `tailhawk.exe` |
+|---|---|
+| M0, session 7 | 249,344 |
+| M1, with `encoding_rs` + `chardetng` linked | **502,784** |
+| CI gate (`SPEC.md` §11.2) | 15,728,640 |
+
+Worth recording rather than acting on. Note that the figure only moved once the **shell** referenced
+the core's new code — before that LTO stripped both crates entirely and the exe was byte-identical to
+M0's, which is a misleading way to measure a dependency.
+
+---
+
+## ✅ CI is green, and the ARM64 unknown is closed — 2026-07-31, session 8
+
+Session 7 left this as the first thing to check. It has run twice and both runs succeeded.
+**The ARM64 leg linked** — run #2 (`dbe45b6`) produced `tailhawk-arm64-unsigned` alongside the x64
+artefact. The ⚠ is deleted from the M0 table below. There is still no `gh` CLI on this machine; the
+Actions page was read through the browser.
+
+The only warning on either run is the Node 20 deprecation notice on `actions/checkout`, `actions/cache`
+and `actions/upload-artifact`. Cosmetic, and it will resolve itself when those actions bump.
 
 ---
 
@@ -21,7 +127,7 @@ usable UI sooner**. The dogfood-first reordering (skip M2, trim M3) was offered 
 | D3D11 device with the WARP fallback chain | **Done** — hardware → WARP; comes up on hardware here |
 | An embedded shader | **Done** — `fxc` at build time via `build.rs`, DXBC embedded, CI asserts no `d3dcompiler` import |
 | `+crt-static` | **Done** — 249,344 bytes, imports **only OS DLLs**; the dynamic build needs `vcruntime140.dll`, the static one does not |
-| CI producing x64 and ARM64 under the size gate | **Done, x64 verified locally. ⚠ ARM64 unverified** — this machine's VS install has no ARM64 linker, so that leg is proven only when CI first runs. `fail-fast: false`, so x64 still reports. |
+| CI producing x64 and ARM64 under the size gate | **Done and verified, session 8.** Both legs succeeded on the runner; the ARM64 artefact exists. This machine's VS install has no ARM64 linker, so CI is the only place that leg is provable — and it proved. |
 | **Done:** opens on a clean Windows 10 1809 VM with no runtime installed | **Not literally tested** — no such VM here. The dependency surface that criterion is really about *is* verified: only OS DLLs. |
 
 **Choices worth not re-litigating:**
@@ -42,19 +148,8 @@ usable UI sooner**. The dogfood-first reordering (skip M2, trim M3) was offered 
   pre-existing lints; they are throwaway measurement code whose hand-formatting is part of what they
   record. They are still compiled by the workspace build, so they cannot rot into not building.
 
-### Start the next session with these two, in order
-
-1. **Check CI has ever actually run** — github.com/nigelbasel/tailhawk/actions. It was added at the
-   end of session 7 and **has never been observed passing**; there is no `gh` CLI on this machine, so
-   it could not be read from inside the session. The specific unknown is whether the **ARM64 leg
-   linked**. If it did, delete the ⚠ from the M0 table above. If it did not, the likely cause is a
-   missing ARM64 MSVC toolchain on the runner image, and the honest fix is to drop the ARM64 leg to
-   `continue-on-error` rather than pretend M0 covered it.
-2. **M1 — read and decode** (`PLAN.md` §4). Headless: open a file, detect encoding, stream decoded
-   lines with correct carry across read boundaries. **Decode before index** — that ordering is the
-   dependency inversion adversarial review caught, and it is why M1 is not the indexer.
-   **Corpus B is a ready-made first test:** BOM-less UTF-8 whose em dashes PowerShell 5.1 renders as
-   `â€"`, so the correct answer is known before a line of code is written.
+~~**Start the next session by checking CI and then starting M1**~~ — **both done, session 8.** CI is
+green including ARM64; M1 is most of the way through. See the two sections above.
 
 ---
 
@@ -158,35 +253,29 @@ shape of the result — it is still needed before any number is published in `SP
 
 ---
 
-## Directory rename — half done, finish it while Claude is closed
+## Directory rename — done, but as `TailHawk`. Settle the capital H or leave it alone.
 
-The working directory is being renamed `WinTail` → **`Tailhawk`** (lowercase h, matching the docs and
-the `github.com/nigelbasel/tailhawk` remote). **The context-preserving half is already done:** the
-project-state directory has been copied to the new key, so memory and session history survive.
+The rename happened. The working directory is **`C:\dev\git\TailHawk`** — **capital H**, where the
+plan said lowercase. Everything works: the project key is `C--dev-git-TailHawk`, memory lives there
+and loads, and session 8 ran entirely from it.
 
-`C:\Users\nigel\.claude\projects\C--dev-git-Tailhawk\` already holds all 3 memory files and all 3
-session transcripts including session 5's, plus the `workflows/`, `subagents/` and `tool-results/`
-subdirectories from sessions 1 and 2.
+**It is only cosmetic, and changing it is not free.** The project key is the literal path string, so
+another rename orphans the memory again and needs the same copy step. The remote
+(`github.com/nigelbasel/tailhawk`) and every document already say lowercase, so the directory is the
+only place the capital H appears — and nothing reads the directory name.
 
-**What remains** — the rename itself, which cannot be done from inside a Claude session because the
-harness resets the shell CWD into the repo after every tool call, and Windows will not rename a
-directory a process has as its CWD. **Session 6 was still in `C--dev-git-WinTail`, so it is still
-outstanding.** With Claude closed — a log-out is a natural moment for it:
+**Recommendation: leave it.** If it is ever changed anyway, the procedure is unchanged from before —
+it cannot be done from inside a session, because the harness resets the shell CWD into the repo after
+every tool call and Windows will not rename a directory a process has as its CWD:
 
 ```powershell
 cd C:\dev\git
-Rename-Item WinTail Tailhawk
-Copy-Item -Recurse -Force "$env:USERPROFILE\.claude\projects\C--dev-git-WinTail\*" `
+Rename-Item TailHawk Tailhawk
+Copy-Item -Recurse -Force "$env:USERPROFILE\.claude\projects\C--dev-git-TailHawk\*" `
                           "$env:USERPROFILE\.claude\projects\C--dev-git-Tailhawk"
 ```
 
-The third line re-syncs session 5's final exchanges, which post-date the copy. Then reopen in
-`C:\dev\git\Tailhawk`. **Delete `C--dev-git-WinTail` only after confirming the new location works** — it
-is deliberately kept as a backup. A longer script with checks and verification was written to the
-session scratchpad but is not in the repo.
-
-**If the spelling is ever changed again** — even just the capitalisation — the project key changes with
-it and the memory is orphaned again, because the key is the literal path string. Decide once.
+**Decide once.** Every change of spelling — even just capitalisation — orphans the memory again.
 
 ---
 
@@ -194,12 +283,14 @@ it and the memory is orphaned again, because the key is the literal path string.
 
 The project is **Tailhawk** (command `tailhawk`) — a Windows desktop log tailer/viewer.
 Research, specification, UI design and development plan are complete and adversarially reviewed.
-**Phase 0 is effectively closed and M0 is done — the application runs.** Nothing left in Phase 0 is
-both runnable and blocking: G2 is informational, G3's `eframe` legs are moot, and G1/G5/G6 are
-owner-gated. Five experiments were built and written up (G3 ×2, G4, G4b, G7).
+**Phase 0 is effectively closed, M0 is done, and M1 is most of the way through — the application
+opens real log files and decodes them correctly.** Nothing left in Phase 0 is both runnable and
+blocking: G2 is informational, G3's `eframe` legs are moot, and G1/G5/G6 are owner-gated. Five
+experiments were built and written up (G3 ×2, G4, G4b, G7).
 
-Repo: **`github.com/nigelbasel/tailhawk`, private.** Working directly on `master` — no branches, no
-PRs (tried once, not worth it solo). Commit often; the history is the artefact.
+Repo: **`github.com/nigelbasel/tailhawk`, private. CI is green on both x64 and ARM64.** Working
+directly on `master` — no branches, no PRs (tried once, not worth it solo). Commit often; the history
+is the artefact.
 
 ### The documents
 
@@ -580,6 +671,16 @@ release.
 
 ## Dogfooding — first runnable build
 
+**Now actionable, as of session 8.** `cargo run --release -p tailhawk -- <path>` opens a file, detects
+its encoding and streams every line, reporting the result in the title bar. That is enough to run
+against both corpora and see whether the encoding and line count are right — it is not enough to
+*read* them, which needs M3.
+
+**Worth doing early rather than late:** the value of the two corpora is that the correct answer is
+already known, and a wrong answer this session is far cheaper than a wrong answer after the index and
+grid are built on top of it. Corpus B in particular should report **UTF-8** and its em dashes must
+survive; if the title says `windows-1252` the detector is wrong.
+
 The owner has nominated **two real logs currently in daily use** as the first dogfood targets. The
 build does not have to be good; it has to open these two files and follow them. Treat this as the
 acceptance gate for "a first version that can actually run".
@@ -657,6 +758,12 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **A reboot is not a neutral cold start for anything that draws text** — it empties the font cache service, so post-reboot text rendering is several times slower than a quiet warm machine. This is what session 6 misread as "a cold run does not bound the cost favourably". | `experiments/g4b-batched-raster/RESULTS.md` |
 | **Derive an atlas cell from measured glyph bounds, never from em size.** Guessing 20×26 for em 14 clipped 1,086 of 1,500 glyphs — and the clipped cells then compared *equal* between arms, which reads as a correctness pass. Assert `overflow == 0` before believing any bitmap comparison. | `experiments/g4b-batched-raster/RESULTS.md` |
 | **Never time a frame with `Present` inside the measured region.** The flip model blocks on the back-buffer queue, which pinned every G4 frame to exactly 16.669 ms and hid the real cost entirely. | `experiments/g4-glyph-atlas/RESULTS.md` |
+| **Test a streaming decoder at *every* split, not a plausible one.** Feeding each fixture at every chunk size from 1 byte upwards found three bugs a single-gulp read cannot: UTF-32 at 1 byte/read decoded to nothing at all; a pending CR resolved against a chunk that decoded to *no characters*, giving every CRLF a phantom empty line; and a UTF-32 unit left at EOF was dropped instead of becoming U+FFFD. All three pass at chunk sizes that happen to land on boundaries. | `crates/tailhawk-core/src/lines.rs` |
+| **A decoded chunk can be empty.** UTF-16LE fed one byte at a time produces text on only every second read. Any per-chunk state machine that assumes "a chunk has content" — the pending-CR carry is one — resolves against a character that has not arrived yet. | `crates/tailhawk-core/src/lines.rs` |
+| **`0x0A` is *not* a legal DBCS trail byte**, contrary to `SPEC.md` §5.3. Measured across every code point of codepages 932/936/950/949. The parallel-indexing restriction survives on §5.3's other ground (lead/trail ambiguity at an arbitrary offset), but the stated reason is wrong and newline scanning specifically looks safe. | `crates/tailhawk-core/src/encoding.rs` |
+| **A tail encoding sample is meaningless without its absolute offset.** NUL-position parity is relative to the start of the *file*; probing a sample that begins at an odd offset reports UTF-16**BE** for a UTF-16**LE** file — a confident, exactly-wrong answer. | `crates/tailhawk-core/src/encoding.rs` |
+| **A share-mode test that only checks the happy path proves nothing.** `writer_safety_…` passes whether or not `FILE_SHARE_DELETE` is set, unless it is paired with a negative control that opens read-shared only and asserts the writer *is* blocked. A share mode is exactly the kind of constant that gets tidied by someone who does not know what it costs. | `crates/tailhawk-core/src/file.rs` |
+| **LTO makes an unreferenced dependency free, which is a misleading way to measure one.** Adding `encoding_rs` + `chardetng` left the exe byte-identical at 249,344 while nothing called them; it went to 502,784 the moment the shell did. Measure a dependency's size *after* wiring it in, never before. | `crates/tailhawk/src/main.rs` |
 
 ---
 
@@ -678,6 +785,15 @@ Recorded because each cost real effort to find, and two of them were caught only
 3. **Reference perf machine** — must be fixed before any `[TBM]` target in `SPEC.md` §11.3 becomes a number.
 4. **Hoo WinTail hands-on (G6)** — the owner's installed copy is the only reliable source for which of its features are actually used in a week, and for how its encoding detection really behaves.
 5. ~~**Re-scope `SPEC.md` §3.2's rasterisation requirement?**~~ — **done, owner-approved, session 7.** §3.2 now states the cost as a first-run one (86–108 µs/glyph cold, ~3 µs warm, cache capacity 8,000–16,000 distinct glyphs), keeps placeholders as a v1 requirement, forbids deriving a §11.3 steady-state budget from the cold figure, and specifies batching at 4–64 glyphs per analysis. **The same edit also withdrew the refuted "~50–60 ms window-presentation floor"** from the first-paint bullet, which session 6 disproved but which was still stated as fact in the spec.
+6. **`SPEC.md` §5.3's DBCS rationale is factually wrong — correct it, and decide whether the
+   conclusion changes.** `0x0A` is not a legal trail byte in codepages 932/936/950/949; this is
+   measured, not argued (`no_dbcs_encoding_puts_0a_in_a_trail_byte`). The restriction on parallel
+   indexing survives on the *other* ground §5.3 gives, but the two grounds have different scope: the
+   surviving one blocks parallel **decode**, while the refuted one was the only argument against
+   parallel **newline scanning** — which is what the index actually does. Needed before M2 picks its
+   threading model. The code currently takes the conservative reading.
+7. **How to fuzz, for M1's last criterion.** `cargo-fuzz` on MSVC Windows, or `arbitrary` plus a plain
+   test-harness loop with a time budget. Not a hard blocker on M2; see the M1 section at the top.
 
 ---
 
