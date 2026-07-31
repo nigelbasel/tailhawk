@@ -9,11 +9,17 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod encoding;
+pub mod lines;
+
 #[cfg(windows)]
 mod gpu;
 
 #[cfg(windows)]
 pub use gpu::Driver;
+
+pub use encoding::{detect, Charset, Confidence, Detection, Sample};
+pub use lines::LineDecoder;
 
 /// An opaque platform window handle. On Windows this is an `HWND`; the core never interprets it,
 /// it only passes it to the presentation backend.
