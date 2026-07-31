@@ -106,7 +106,16 @@ Session 7 left this as the first thing to check. It has run twice and both runs 
 artefact. The ⚠ is deleted from the M0 table below. There is still no `gh` CLI on this machine; the
 Actions page was read through the browser.
 
-The only warning on either run is the Node 20 deprecation notice on `actions/checkout`, `actions/cache`
+**Run #3 carried all of M1's code and passed on both architectures** — clippy, `fmt`, 56 tests, the
+size gate, and both binary-content assertions (no `d3dcompiler`, no CRT redistributable).
+`encoding_rs` and `chardetng` cross-compile to ARM64 without complaint.
+
+**`cargo-deny` now runs, and it caught its own config on the first try.** The job was added in session
+8 and failed immediately — not on a dependency, but because the config was named `cargo-deny.toml`,
+which `cargo deny` does not look for. Renamed to `deny.toml`; the job is green and the allow-list is
+now genuinely enforced rather than described. Both halves of that are in the traps table.
+
+The only warning on any run is the Node 20 deprecation notice on `actions/checkout`, `actions/cache`
 and `actions/upload-artifact`. Cosmetic, and it will resolve itself when those actions bump.
 
 ---
