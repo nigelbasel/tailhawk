@@ -69,21 +69,31 @@ arbitrary *content* on top of arbitrary *framing*. Do not let it block M2.
 - **Following, polling and rotation *handling* are absent on purpose.** They are M4. What M1 owes is
   that the bytes arrive correctly and the writer is never impeded.
 
-### ⚠ One spec claim did not survive measurement — owner's call
+### ✅ `SPEC.md` §5.3's DBCS exception is withdrawn — owner-approved, session 8
 
-`SPEC.md` §5.3 disables parallel indexing for DBCS codepages, and gives as the reason that **"`0x0A`
-is a legal trail byte"** in codepages 932/936/950/949. **It is not.** The test
-`no_dbcs_encoding_puts_0a_in_a_trail_byte` walks every code point in all four encodings and finds no
-character whose encoding contains `0x0A` anywhere but the first byte.
+The spec disabled parallel indexing for codepages 932/936/950/949 on the grounds that `0x0A` is a
+legal trail byte in them. **It is not**, and the property turned out to be far more general than the
+DBCS carve-out it was raised against — so the exception was **deleted rather than narrowed**.
 
-The **conclusion** still stands on §5.3's *other* stated ground — you cannot tell a lead byte from a
-trail byte at an arbitrary offset, so decode needs forward resync from a known boundary. But
-**newline scanning specifically looks safe to parallelise**, and that is what the index actually does.
+Two exhaustive tests in `crates/tailhawk-core/src/encoding.rs`, over eight multi-byte encodings and
+ten single-byte representatives:
 
-`allows_parallel_indexing()` still returns `false` for DBCS, deliberately: widening it is an M2
-decision with a normative spec edit attached, and this file does not make those. The measurement is
-kept as a test rather than a comment so it fails if `encoding_rs`'s tables ever change underneath the
-claim.
+| | What it drives | Result |
+|---|---|---|
+| `a_0a_byte_is_always_a_terminator_in_every_byte_oriented_encoding` | every code point through every encoder | no character but U+000A produces a `0x0A`; U+000A always does |
+| `a_0a_byte_is_never_consumed_as_a_trail_byte_by_any_decoder` | all 65,536 two-byte prefixes into every decoder, followed by `0x0A` | the newline survives every time |
+
+**The second one is the test that matters, and the first version of this work did not have it.** A
+scan reads arbitrary bytes off disk, not bytes some encoder produced, so the question is whether a
+`0x0A` can be *consumed* as a trail byte — not whether one can be *written* there. Decoders accept
+sequences encoders never emit. Measuring only the encoder side would have been a plausible,
+confident, and insufficient basis for a normative change.
+
+**What replaced it.** `allows_parallel_indexing()` is gone: it could only return `true`, and
+`code_unit()` now carries the whole rule. In its place is `is_random_access_decodable()`, which is
+false for **`ISO-2022-JP` alone** — escape-driven, so a line start is a *character* boundary but not
+a *decoder* boundary. That constrains **viewport decode only, never the scan**, and it is the last
+of what §5.3 used to claim.
 
 ### Size: the binary doubled, and it is still 3.2% of the gate
 
@@ -769,7 +779,9 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **Never time a frame with `Present` inside the measured region.** The flip model blocks on the back-buffer queue, which pinned every G4 frame to exactly 16.669 ms and hid the real cost entirely. | `experiments/g4-glyph-atlas/RESULTS.md` |
 | **Test a streaming decoder at *every* split, not a plausible one.** Feeding each fixture at every chunk size from 1 byte upwards found three bugs a single-gulp read cannot: UTF-32 at 1 byte/read decoded to nothing at all; a pending CR resolved against a chunk that decoded to *no characters*, giving every CRLF a phantom empty line; and a UTF-32 unit left at EOF was dropped instead of becoming U+FFFD. All three pass at chunk sizes that happen to land on boundaries. | `crates/tailhawk-core/src/lines.rs` |
 | **A decoded chunk can be empty.** UTF-16LE fed one byte at a time produces text on only every second read. Any per-chunk state machine that assumes "a chunk has content" — the pending-CR carry is one — resolves against a character that has not arrived yet. | `crates/tailhawk-core/src/lines.rs` |
-| **`0x0A` is *not* a legal DBCS trail byte**, contrary to `SPEC.md` §5.3. Measured across every code point of codepages 932/936/950/949. The parallel-indexing restriction survives on §5.3's other ground (lead/trail ambiguity at an arbitrary offset), but the stated reason is wrong and newline scanning specifically looks safe. | `crates/tailhawk-core/src/encoding.rs` |
+| **`0x0A` is *not* a legal DBCS trail byte**, contrary to what `SPEC.md` §5.3 said until session 8. It is always a line terminator, in every byte-oriented encoding — so parallel indexing needs no encoding-specific exception at all, only code-unit alignment. | `crates/tailhawk-core/src/encoding.rs` |
+| **Measure the decoder, not the encoder, when the question is "what can appear in a file".** The encoder-side test — every code point through every encoder — was persuasive and would have been an insufficient basis for a normative spec change: decoders accept sequences encoders never emit. The test that actually settles it drives all 65,536 two-byte prefixes *into* each decoder. Both pass; only one of them is evidence. | `crates/tailhawk-core/src/encoding.rs` |
+| **A predicate that can only return one value is a fact, not an API.** `allows_parallel_indexing()` became unconditionally `true` once the exception was withdrawn, so it was deleted and `code_unit()` carries the rule. What replaced it — `is_random_access_decodable()`, false for `ISO-2022-JP` alone — is non-vacuous and about a different question. | `crates/tailhawk-core/src/encoding.rs` |
 | **A tail encoding sample is meaningless without its absolute offset.** NUL-position parity is relative to the start of the *file*; probing a sample that begins at an odd offset reports UTF-16**BE** for a UTF-16**LE** file — a confident, exactly-wrong answer. | `crates/tailhawk-core/src/encoding.rs` |
 | **A share-mode test that only checks the happy path proves nothing.** `writer_safety_…` passes whether or not `FILE_SHARE_DELETE` is set, unless it is paired with a negative control that opens read-shared only and asserts the writer *is* blocked. A share mode is exactly the kind of constant that gets tidied by someone who does not know what it costs. | `crates/tailhawk-core/src/file.rs` |
 | **`cargo deny` looks for `deny.toml`, not `cargo-deny.toml`.** The config was misnamed from session 2 to session 8. The first time anything ran it, it logged one `[WARN] unable to find a config path` and then rejected all 26 crates including MIT and Apache-2.0, because the default allow-list is empty. A misnamed config silently stops being the policy, and only running the tool reveals it. | `deny.toml`, `CLEANROOM.md` §7 |
@@ -796,13 +808,12 @@ Recorded because each cost real effort to find, and two of them were caught only
 3. **Reference perf machine** — must be fixed before any `[TBM]` target in `SPEC.md` §11.3 becomes a number.
 4. **Hoo WinTail hands-on (G6)** — the owner's installed copy is the only reliable source for which of its features are actually used in a week, and for how its encoding detection really behaves.
 5. ~~**Re-scope `SPEC.md` §3.2's rasterisation requirement?**~~ — **done, owner-approved, session 7.** §3.2 now states the cost as a first-run one (86–108 µs/glyph cold, ~3 µs warm, cache capacity 8,000–16,000 distinct glyphs), keeps placeholders as a v1 requirement, forbids deriving a §11.3 steady-state budget from the cold figure, and specifies batching at 4–64 glyphs per analysis. **The same edit also withdrew the refuted "~50–60 ms window-presentation floor"** from the first-paint bullet, which session 6 disproved but which was still stated as fact in the spec.
-6. **`SPEC.md` §5.3's DBCS rationale is factually wrong — correct it, and decide whether the
-   conclusion changes.** `0x0A` is not a legal trail byte in codepages 932/936/950/949; this is
-   measured, not argued (`no_dbcs_encoding_puts_0a_in_a_trail_byte`). The restriction on parallel
-   indexing survives on the *other* ground §5.3 gives, but the two grounds have different scope: the
-   surviving one blocks parallel **decode**, while the refuted one was the only argument against
-   parallel **newline scanning** — which is what the index actually does. Needed before M2 picks its
-   threading model. The code currently takes the conservative reading.
+6. ~~**`SPEC.md` §5.3's DBCS rationale is factually wrong**~~ — **done, owner-approved, session 8.**
+   The exception was deleted rather than narrowed, because the decoder-side measurement showed the
+   property is universal across every byte-oriented encoding. §5.3 now states code-unit alignment as
+   the *only* constraint on chunking, records both measurements, and keeps one much narrower rule:
+   `ISO-2022-JP` cannot be decoded from an arbitrary line, because it is stateful. **M2 may index in
+   parallel for every encoding.** See the section at the top.
 7. **How to fuzz, for M1's last criterion.** `cargo-fuzz` on MSVC Windows, or `arbitrary` plus a plain
    test-harness loop with a time budget. Not a hard blocker on M2; see the M1 section at the top.
 

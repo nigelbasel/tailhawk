@@ -1,8 +1,8 @@
 //! Encoding detection — `SPEC.md` §5.6.
 //!
 //! This runs **before** indexing, not merely before decoding. §5.3's chunk-assignment invariant
-//! needs [`Charset::code_unit`] and [`Charset::allows_parallel_indexing`] to exist before a single
-//! byte offset is recorded, which is why M1 is this module and not the indexer.
+//! needs [`Charset::code_unit`] to exist before a single byte offset is recorded, which is why M1
+//! is this module and not the indexer.
 //!
 //! Two things here are hand-written rather than delegated to `encoding_rs`, both for the same
 //! reason: the WHATWG Encoding Standard excludes UTF-16 and UTF-32 *detection*, and excludes UTF-32
@@ -42,6 +42,13 @@ impl Charset {
     ///
     /// Splitting a UTF-16 file at an odd offset swaps every subsequent byte pair, so the newline
     /// scan looks for `0A 00` in a stream where it is now written `00 0A`.
+    ///
+    /// **This is the *only* constraint on chunking the newline scan.** There is no encoding-
+    /// specific exception, and in particular no DBCS one — see
+    /// `a_0a_byte_is_never_consumed_as_a_trail_byte_by_any_decoder`, which drives all 65,536
+    /// two-byte prefixes into every supported decoder and finds that a `0x0A` byte is always a
+    /// line terminator. An earlier draft of §5.3 asserted the opposite and disabled the parallel
+    /// path for codepages 932/936/950/949; that was measured false and the exception is gone.
     pub fn code_unit(&self) -> usize {
         match self {
             Charset::Utf32Le | Charset::Utf32Be => 4,
@@ -50,24 +57,18 @@ impl Charset {
         }
     }
 
-    /// Whether the index may be built by scanning independent chunks concurrently.
+    /// Whether decoding can start at an arbitrary indexed line without replaying what came before.
     ///
-    /// `SPEC.md` §5.3 disables the parallel path for the DBCS codepages (932/936/950/949). Note
-    /// that the *reason* the spec gives — that `0x0A` is a legal trail byte — does not survive
-    /// measurement; see `no_dbcs_encoding_puts_0a_in_a_trail_byte` below. The restriction is kept
-    /// because the conclusion is defensible on the other ground the spec states (forward resync
-    /// from a known boundary), and relaxing it is an M2 decision with an owner-visible spec edit
-    /// attached, not something to quietly widen here.
-    pub fn allows_parallel_indexing(&self) -> bool {
-        match self {
-            Charset::Utf32Le | Charset::Utf32Be => true,
-            Charset::Whatwg(e) => {
-                e.is_single_byte()
-                    || *e == encoding_rs::UTF_8
-                    || *e == encoding_rs::UTF_16LE
-                    || *e == encoding_rs::UTF_16BE
-            }
-        }
+    /// True for every encoding here except ISO-2022-JP, which is escape-driven: the same bytes mean
+    /// different characters depending on shift state established earlier in the file. A line start
+    /// is always a *character* boundary — that follows from `0x0A` never being a trail byte — but
+    /// for a stateful encoding it is not a *decoder* boundary.
+    ///
+    /// This is all that remains of `SPEC.md` §5.3's restriction, and note how much narrower it is
+    /// than what that section used to say: it constrains **viewport decode**, not the newline scan,
+    /// and it catches one encoding rather than four codepages.
+    pub fn is_random_access_decodable(&self) -> bool {
+        !matches!(self, Charset::Whatwg(e) if *e == encoding_rs::ISO_2022_JP)
     }
 }
 
@@ -553,7 +554,6 @@ mod tests {
         let d = detect(&bytes, None, encoding_rs::SHIFT_JIS);
         assert_ne!(d.charset, Charset::UTF_8, "it is not valid UTF-8");
         assert_eq!(d.confidence, Confidence::Low, "step 4 is always a guess");
-        assert!(!d.charset.allows_parallel_indexing());
     }
 
     /// §5.6: head and tail disagreeing is resolved in favour of the tail, because the tail is what
@@ -605,8 +605,11 @@ mod tests {
         assert_eq!(Charset::Whatwg(encoding_rs::WINDOWS_1252).code_unit(), 1);
     }
 
+    /// DBCS **is** chunkable, as of the session-8 spec change. Kept as an explicit test because
+    /// the previous rule said the opposite for two milestones, and a reader who half-remembers it
+    /// should trip over this rather than reintroduce the exception.
     #[test]
-    fn dbcs_is_excluded_from_parallel_indexing() {
+    fn dbcs_is_chunkable_and_needs_no_special_case() {
         for e in [
             encoding_rs::SHIFT_JIS,
             encoding_rs::GBK,
@@ -614,51 +617,139 @@ mod tests {
             encoding_rs::BIG5,
             encoding_rs::EUC_KR,
         ] {
-            assert!(
-                !Charset::Whatwg(e).allows_parallel_indexing(),
-                "{} must take the single-threaded path (SPEC.md §5.3)",
+            let c = Charset::Whatwg(e);
+            assert_eq!(
+                c.code_unit(),
+                1,
+                "{} is byte-oriented, so any chunk boundary is aligned",
                 e.name()
             );
+            assert!(c.is_random_access_decodable(), "{} is stateless", e.name());
         }
+    }
+
+    /// The one encoding that still cannot be decoded from an arbitrary line — and the reason is
+    /// shift state, not trail bytes.
+    #[test]
+    fn iso_2022_jp_is_the_only_encoding_needing_sequential_decode() {
+        assert!(!Charset::Whatwg(encoding_rs::ISO_2022_JP).is_random_access_decodable());
         for c in [
             Charset::UTF_8,
             Charset::UTF_16LE,
             Charset::Utf32Le,
             Charset::Whatwg(encoding_rs::WINDOWS_1252),
+            Charset::Whatwg(encoding_rs::SHIFT_JIS),
         ] {
-            assert!(c.allows_parallel_indexing(), "{} may be chunked", c.name());
+            assert!(c.is_random_access_decodable(), "{} is stateless", c.name());
         }
     }
 
-    /// `SPEC.md` §5.3 justifies the DBCS restriction by asserting that `0x0A` is a legal trail
-    /// byte in codepages 932/936/950/949. This measures it, and the assertion does not hold: no
-    /// character in any of those encodings encodes to a sequence containing `0x0A` anywhere but
-    /// the first byte. The restriction still stands on the spec's *other* ground — you cannot tell
-    /// a lead byte from a trail byte at an arbitrary offset, so decode needs forward resync — but
-    /// **newline scanning specifically is safe**, which is a live M2 question rather than a
-    /// settled one.
+    /// Every byte-oriented encoding Tailhawk can be asked to read.
     ///
-    /// Kept as a test rather than a comment so it fails if a future `encoding_rs` changes the
-    /// tables underneath the claim.
+    /// UTF-16 is absent because the WHATWG standard makes it decode-only — `Encoding::encode` on
+    /// `UTF_16LE` emits UTF-8, so it cannot answer a question about UTF-16 bytes. UTF-16 and UTF-32
+    /// are covered instead by [`Charset::code_unit`], which is the mechanism that makes them safe.
+    /// `REPLACEMENT` is absent because it is not an encoding — it decodes any input to a single
+    /// U+FFFD and exists to neutralise a handful of attack-prone labels.
+    const BYTE_ORIENTED: &[&Encoding] = &[
+        encoding_rs::UTF_8,
+        // Multi-byte legacy.
+        encoding_rs::BIG5,
+        encoding_rs::EUC_JP,
+        encoding_rs::EUC_KR,
+        encoding_rs::GBK,
+        encoding_rs::GB18030,
+        encoding_rs::SHIFT_JIS,
+        // Stateful, and therefore the one most likely to break the invariant.
+        encoding_rs::ISO_2022_JP,
+        // Single-byte, one per family — enough to catch a C0 remapping.
+        encoding_rs::WINDOWS_1252,
+        encoding_rs::WINDOWS_1251,
+        encoding_rs::WINDOWS_874,
+        encoding_rs::ISO_8859_2,
+        encoding_rs::ISO_8859_7,
+        encoding_rs::ISO_8859_8_I,
+        encoding_rs::KOI8_R,
+        encoding_rs::IBM866,
+        encoding_rs::MACINTOSH,
+        encoding_rs::X_USER_DEFINED,
+    ];
+
+    /// **The invariant the whole parallel index rests on: a `0x0A` byte in the stream is always a
+    /// line terminator, never part of some other character.**
+    ///
+    /// It has two directions and both matter. If some character encoded to a sequence *containing*
+    /// `0x0A`, a chunked scan would invent line breaks inside characters. If U+000A encoded to
+    /// something without a `0x0A` byte, a chunked scan would miss line breaks entirely. Either one
+    /// silently corrupts the index, and neither shows up in an ASCII fixture.
+    ///
+    /// **This is the measurement that refuted `SPEC.md` §5.3's stated reason.** The spec asserted
+    /// `0x0A` was a legal trail byte in codepages 932/936/950/949. It is not — and the property
+    /// turns out to be universal across every byte-oriented encoding in the WHATWG standard, not a
+    /// lucky property of those four. That is not an accident: the standard's own encoders are
+    /// ASCII-transparent in the C0 range by construction.
+    ///
+    /// Kept as a test rather than a comment so it fails if `encoding_rs`'s tables ever move
+    /// underneath the claim.
     #[test]
-    fn no_dbcs_encoding_puts_0a_in_a_trail_byte() {
-        for e in [
-            encoding_rs::SHIFT_JIS,
-            encoding_rs::GBK,
-            encoding_rs::BIG5,
-            encoding_rs::EUC_KR,
-        ] {
+    fn a_0a_byte_is_always_a_terminator_in_every_byte_oriented_encoding() {
+        for e in BYTE_ORIENTED {
             for cp in 0u32..=0x10FFFF {
                 let Some(ch) = char::from_u32(cp) else {
                     continue;
                 };
                 let mut buf = [0u8; 4];
                 let (bytes, _, _) = e.encode(ch.encode_utf8(&mut buf));
-                if let Some(pos) = bytes.iter().position(|b| *b == 0x0A) {
-                    assert_eq!(
-                        pos,
-                        0,
-                        "{}: U+{cp:04X} encodes to {bytes:02X?}, with 0x0A at index {pos}",
+
+                if ch == '\n' {
+                    // No false negatives: the terminator must still be findable as a raw byte.
+                    // ISO-2022-JP may prefix a state-reset escape, which is why this asks for
+                    // containment rather than equality.
+                    assert!(
+                        bytes.contains(&0x0A),
+                        "{}: U+000A encodes to {bytes:02X?}, which a byte scan cannot find",
+                        e.name()
+                    );
+                    continue;
+                }
+
+                // No false positives: nothing else may contain the byte, in any position.
+                assert!(
+                    !bytes.contains(&0x0A),
+                    "{}: U+{cp:04X} encodes to {bytes:02X?}, which contains a 0x0A that is not a \
+                     line terminator — a chunked newline scan would split inside this character",
+                    e.name()
+                );
+            }
+        }
+    }
+
+    /// The same invariant from the side that actually matters, and the one the test above does
+    /// **not** cover.
+    ///
+    /// That test asks what an *encoder* emits. A parallel scan reads arbitrary bytes off disk, and
+    /// decoders accept plenty of sequences no encoder produces — non-canonical mappings, reserved
+    /// lead bytes, truncated forms. So the question is not "can a `0x0A` be *written* into a trail
+    /// position" but "can a `0x0A` be *consumed* as one". If any lead byte could swallow a
+    /// following `0x0A`, a chunked scan would find a line break the decoder does not agree exists,
+    /// and the index would disagree with the text.
+    ///
+    /// This drives every two-byte prefix — all 65,536 — into each decoder followed by `0x0A`, and
+    /// asserts the newline always survives. It covers the multi-byte lead/trail space directly,
+    /// including GB18030's four-byte form and ISO-2022-JP's shift states.
+    #[test]
+    fn a_0a_byte_is_never_consumed_as_a_trail_byte_by_any_decoder() {
+        for e in BYTE_ORIENTED {
+            for first in 0u8..=0xFF {
+                for second in 0u8..=0xFF {
+                    // A trailing byte after the newline so the decoder is never left mid-sequence
+                    // waiting for input, which would be a different failure than the one at issue.
+                    let input = [first, second, 0x0A, b'x'];
+                    let (text, _) = e.decode_without_bom_handling(&input);
+                    assert!(
+                        text.contains('\n'),
+                        "{}: {input:02X?} decodes to {text:?} — the 0x0A was swallowed, so a \
+                         chunked scan would see a line break the decoder does not",
                         e.name()
                     );
                 }

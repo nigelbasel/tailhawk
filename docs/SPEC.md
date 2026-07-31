@@ -405,12 +405,34 @@ delta-encoded.
 - Each block additionally stores `max_byte_len` and an `all_ascii` flag (§3.3) — both free during the
   newline scan, unlike cell counts.
 
-**Parallel indexing invariant — this was wrong in research and is corrected here:**
+**Parallel indexing invariant — corrected twice; the second correction is measured, not argued:**
 
 > Chunk boundaries **must** be aligned to the code-unit size relative to the BOM: 2 bytes for UTF-16,
-> 4 for UTF-32. For DBCS codepages (932/936/950/949) `0x0A` is a legal trail byte, so the parallel
-> path is **disabled** and indexing is single-threaded with forward resync. **Encoding must be
-> resolved before chunk assignment, not merely before indexing.**
+> 4 for UTF-32. **That is the only constraint.** Every byte-oriented encoding may be chunked at any
+> boundary, because **a `0x0A` byte is always a line terminator and never part of another
+> character.** **Encoding must be resolved before chunk assignment, not merely before indexing.**
+
+**The DBCS exception is withdrawn — 2026-07-31.** This section previously disabled the parallel path
+for codepages 932/936/950/949 on the grounds that `0x0A` is a legal trail byte in them. **It is
+not.** Two exhaustive measurements, in `crates/tailhawk-core/src/encoding.rs`, over the eight
+multi-byte encodings and ten single-byte representatives:
+
+- **Encoder side** — every code point, in every one. No character other than U+000A encodes to a
+  sequence containing `0x0A`, and U+000A always encodes to a sequence containing it. So a byte scan
+  suffers neither false positives nor false negatives.
+- **Decoder side, which is the one that governs** — a scan reads arbitrary bytes off disk, not bytes
+  some encoder produced, so the real question is whether a `0x0A` can be *consumed* as a trail byte,
+  not whether one can be *written* there. All 65,536 two-byte prefixes were fed to each decoder
+  followed by `0x0A`. The newline survives every time; no lead byte swallows it. This covers
+  GB18030's four-byte form and ISO-2022-JP's shift states.
+
+**What survives is much narrower, and it is not about the scan.** A line start is always a
+*character* boundary — that follows directly from the above — but for a **stateful** encoding it is
+not a *decoder* boundary. `ISO-2022-JP` is escape-driven: the same bytes mean different characters
+depending on shift state established earlier in the file, so a viewport decode beginning at line *N*
+cannot be correct without replaying the escapes before it. It is the only stateful encoding in the
+supported set. This is carried by `Charset::is_random_access_decodable()` and constrains **viewport
+decode only, never the newline scan.**
 
 ### 5.4 Following
 
@@ -1361,7 +1383,7 @@ on a roadmap date.
 | Finding | Resolved by |
 |---|---|
 | mmap contradiction across topics | §5.2 — excluded entirely, with the rotation-blocking rationale |
-| "Parallel indexing is context-free" is false for UTF-16/DBCS | §5.3 — alignment invariant stated |
+| "Parallel indexing is context-free" is false for UTF-16/DBCS | §5.3 — alignment invariant stated. **Half-retracted 2026-07-31:** true for UTF-16/32, where alignment is the fix; **false for DBCS**, measured. The finding was right that the research claim needed challenging and wrong about which half failed. |
 | Memory model budgets only the line index | §11.2 — whole-system table with per-feature O() |
 | "Beat BareTail's 2 MB" | §11.2 — retired; flatness claim substituted |
 | Fabricated ripgrep throughput → search targets | §11.1, §11.3 — search target deliberately unset, [TBM] |
