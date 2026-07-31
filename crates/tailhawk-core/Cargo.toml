@@ -21,6 +21,12 @@ version = "0.58"
 features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    # CreateFileW and CreateEventW both take a SECURITY_ATTRIBUTES pointer, so their bindings are
+    # gated behind this even though both are passed None here.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",

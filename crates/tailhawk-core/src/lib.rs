@@ -13,10 +13,16 @@ pub mod encoding;
 pub mod lines;
 
 #[cfg(windows)]
+pub mod file;
+
+#[cfg(windows)]
 mod gpu;
 
 #[cfg(windows)]
 pub use gpu::Driver;
+
+#[cfg(windows)]
+pub use file::{FileError, FileIdentity, FileSource, LogFile};
 
 pub use encoding::{detect, Charset, Confidence, Detection, Sample};
 pub use lines::LineDecoder;
