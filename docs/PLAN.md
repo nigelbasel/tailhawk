@@ -350,7 +350,7 @@ identity is unresolved (§7).
 4. **Fix the reference perf machine** so [TBM] targets can become numbers.
 5. **Run G6** (Hoo WinTail hands-on) — it is free, it may change v1 scope, and it is the only real user
    research available.
-6. **Decide the repo licence** and add `LICENSE-MIT`, `LICENSE-APACHE`, `CLEANROOM.md`, `cargo-deny.toml`.
+6. **Decide the repo licence** and add `LICENSE-MIT`, `LICENSE-APACHE`, `CLEANROOM.md`, `deny.toml`.
 
 ---
 

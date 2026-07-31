@@ -90,10 +90,17 @@ source was consulted for that component.
 
 ## 7. The dependency allow-list
 
-`cargo-deny.toml` is the counterpart to this file. It governs what Tailhawk **links**; everything
+`deny.toml` is the counterpart to this file. It governs what Tailhawk **links**; everything
 above governs what its authors **read**. Both are needed and neither substitutes for the other — a
 clean-room process cannot stop a GPL crate arriving transitively, and a licence scanner cannot stop
 someone reading GPL source and writing it out again from memory.
+
+**The filename is not cosmetic.** It was `cargo-deny.toml` from 2026-07-29 to 2026-07-31, which is
+**not a name `cargo deny` looks for** — it searches for `deny.toml` (or `.cargo/deny.toml`). Nothing
+ran the tool until session 8, and when it did, it logged one `[WARN] unable to find a config path,
+falling back to default config` and then rejected all 26 crates in the graph, MIT and Apache-2.0
+included, because the default allow-list is empty. **A misnamed config fails open in the sense that
+matters — it silently stops being the policy — and it took running the tool to find out.**
 
 The config carries no comments, so the reasoning lives here:
 
@@ -121,6 +128,6 @@ The config carries no comments, so the reasoning lives here:
 ## 8. Related
 
 - `LICENSE-MIT`, `LICENSE-APACHE` — the outbound licence.
-- `cargo-deny.toml` — the config the section above explains.
+- `deny.toml` — the config the section above explains.
 - `docs/RESEARCH.md` §11 — the record of which research claims were refuted, including the licensing
   ones.

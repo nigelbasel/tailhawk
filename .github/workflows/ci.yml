@@ -18,7 +18,7 @@ jobs:
   # cover: a copyleft crate arriving transitively. Until M1 the only dependency was `windows` and
   # nothing ran the config, so the allow-list was documentation rather than a gate.
   #
-  # Runs on Linux and once only. cargo-deny.toml pins the target triple itself, so the dependency
+  # Runs on Linux and once only. deny.toml pins the target triple itself, so the dependency
   # graph it resolves is the Windows one regardless of which runner asks.
   deny:
     runs-on: ubuntu-latest

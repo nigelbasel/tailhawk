@@ -305,7 +305,7 @@ is the artefact.
 
 ### Repo furniture in place
 
-`LICENSE-MIT`, `LICENSE-APACHE` (dual, copyright asserted personally), `cargo-deny.toml`
+`LICENSE-MIT`, `LICENSE-APACHE` (dual, copyright asserted personally), `deny.toml`
 (allow-list, so GPL/AGPL/LGPL fail without being named — rationale in `CLEANROOM.md` §7),
 `.gitignore`, `rust-toolchain.toml`, workspace `Cargo.toml`, tracked `Cargo.lock`.
 
@@ -418,8 +418,8 @@ Three things follow from pushing to GitHub at all, private or not:
    The block-sparse line-offset index is registered **CONTAMINATED and not cleared to implement** —
    it needs a re-derivation entry plus an attestation in `CLEANROOM.md` §6 **before its first line
    of code**.
-2. ~~**Add `LICENSE-MIT`, `LICENSE-APACHE`, `cargo-deny.toml`**~~ — **done 2026-07-29.** All three
-   are at the repo root. `cargo-deny.toml` is an allow-list, so GPL/AGPL/LGPL fail without being
+2. ~~**Add `LICENSE-MIT`, `LICENSE-APACHE`, `deny.toml`**~~ — **done 2026-07-29.** All three
+   are at the repo root. `deny.toml` is an allow-list, so GPL/AGPL/LGPL fail without being
    named and an unreviewed licence fails closed; the reasoning is in `CLEANROOM.md` §7. (`git init`,
    the first commit and the push to `github.com/nigelbasel/tailhawk` — private — are also done.)
 3. **Run Phase 0** (`PLAN.md` §3) — **in progress.** See the next section.
@@ -763,6 +763,8 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **`0x0A` is *not* a legal DBCS trail byte**, contrary to `SPEC.md` §5.3. Measured across every code point of codepages 932/936/950/949. The parallel-indexing restriction survives on §5.3's other ground (lead/trail ambiguity at an arbitrary offset), but the stated reason is wrong and newline scanning specifically looks safe. | `crates/tailhawk-core/src/encoding.rs` |
 | **A tail encoding sample is meaningless without its absolute offset.** NUL-position parity is relative to the start of the *file*; probing a sample that begins at an odd offset reports UTF-16**BE** for a UTF-16**LE** file — a confident, exactly-wrong answer. | `crates/tailhawk-core/src/encoding.rs` |
 | **A share-mode test that only checks the happy path proves nothing.** `writer_safety_…` passes whether or not `FILE_SHARE_DELETE` is set, unless it is paired with a negative control that opens read-shared only and asserts the writer *is* blocked. A share mode is exactly the kind of constant that gets tidied by someone who does not know what it costs. | `crates/tailhawk-core/src/file.rs` |
+| **`cargo deny` looks for `deny.toml`, not `cargo-deny.toml`.** The config was misnamed from session 2 to session 8. The first time anything ran it, it logged one `[WARN] unable to find a config path` and then rejected all 26 crates including MIT and Apache-2.0, because the default allow-list is empty. A misnamed config silently stops being the policy, and only running the tool reveals it. | `deny.toml`, `CLEANROOM.md` §7 |
+| **A config file nothing executes is documentation.** `deny.toml` and `CLEANROOM.md` §7 described a licence gate for two sessions while no CI job invoked it. Whenever a policy file is added, add the thing that runs it in the same commit. | `.github/workflows/ci.yml` |
 | **LTO makes an unreferenced dependency free, which is a misleading way to measure one.** Adding `encoding_rs` + `chardetng` left the exe byte-identical at 249,344 while nothing called them; it went to 502,784 the moment the shell did. Measure a dependency's size *after* wiring it in, never before. | `crates/tailhawk/src/main.rs` |
 
 ---
