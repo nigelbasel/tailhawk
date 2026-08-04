@@ -42,6 +42,21 @@ design is necessarily wrong, but because its provenance is unknown and unreconst
 - **Do not** implement from §5.3 directly, and do not quote it into a design document that then
   feeds implementation.
 
+**⚠ The contamination had already propagated, and this list was too narrow until 2026-08-04.**
+Naming `RESEARCH.md` §5.3 alone implied everything else was clean. It was not — the design and at
+least one of its constants had reached `SPEC.md`, which carried no warning:
+
+| Where | What | Status |
+|---|---|---|
+| `docs/RESEARCH.md` §5.3 | The original. Provenance unknown and unreconstructable. | **CONTAMINATED**, unchanged |
+| `docs/SPEC.md` §5.3 "Line index" | Same number and topic. Provenance never established. Read and edited in session 8 (`571eb2e`) with no §5 entry. | **SUPERSEDED 2026-08-04** — replaced by a clean re-derivation, entry 2026-08-04 in §5 |
+| `docs/SPEC.md` §11.2, memory table | Stated `block-sparse, 128/block` — a design constant, in a section with no warning | **Corrected 2026-08-04** to the re-derived figure |
+
+The general lesson, which is the reason this table exists rather than a one-line fix: **a
+contamination notice attached to one section does not travel with the content.** When a design is
+quoted onward, the warning stays behind. Naming the *component* in §4 is what catches this; naming
+the *section* is not enough.
+
 `docs/RESEARCH.md` §11 additionally records that klogg, TailBlazer and SnakeTail are all GPL and
 that a clean-room rule was needed. This file is that rule.
 
@@ -66,7 +81,7 @@ Components are clean by default. Only those listed here carry a restriction.
 
 | Component | Status | Cleared to implement? | Notes |
 |---|---|---|---|
-| Block-sparse line-offset index | **CONTAMINATED** via `RESEARCH.md` §5.3 | **No** | Requires a §5 re-derivation entry and an attestation before any code. |
+| Line-offset index | **RE-DERIVED CLEAN**, 2026-08-04 | **Yes** — implement from `SPEC.md` §5.3 as rewritten | Derived from §3 sources only; §5 entry and §6 attestation both filed. `RESEARCH.md` §5.3 remains contaminated and reference-forbidden. The re-derivation **rejected** the superseded design's delta encoding and its 128 stride, so reproducing either from memory is a regression, not a shortcut. |
 | Everything else | Clean | Yes | Add a row here the moment that stops being true. |
 
 ## 5. Re-derivation and consultation log
@@ -80,13 +95,37 @@ Append-only. Newest last.
 | 2026-07-29 | Virtualised grid — scroll position model | Claude Opus 5, session 4 | **egui 0.17.0**, `egui/src/containers/scroll_area.rs`, at tag `0.17.0` via `raw.githubusercontent.com/emilk/egui/0.17.0/...`; plus `github.com/emilk/egui/issues/1391`. Functions read: `ScrollArea::begin`, `show_rows`, `show_viewport`/`show_viewport_dyn`, `Prepared::end`, `struct State`, and `emath::remap`/`remap_clamp`/`lerp` as quoted within them. | **Permitted — egui is MIT OR Apache-2.0, §3 "Rust crate documentation and source".** Read for G7 (`PLAN.md` §3), to diagnose a *defect* in that code. `experiments/g7-egui-scroll/src/main.rs` deliberately **replicates** the arithmetic in order to measure it, and quotes the original above each function; that file is an experiment and **must not be linked into Tailhawk**. The rules derived into `SPEC.md` §6.4 are the *inverse* of what egui does and were not copied from it. No GPL source was consulted. |
 | 2026-07-31 | Encoding detection and incremental line decoding (M1) | Claude Opus 5, session 8 | `docs/SPEC.md` §5.6, and §5.3's code-unit alignment invariant — both ours. The Unicode Standard's BOM signatures. The WHATWG Encoding Standard, consulted for what it *excludes*: UTF-16 and UTF-32 detection and UTF-32 decoding are outside it, which is why both are hand-written here rather than delegated. `encoding_rs` and `chardetng` API documentation (both Apache-2.0 OR MIT, §3 "Rust crate documentation and source"). | **No log-viewer implementation source of any kind was read** — not klogg/TailBlazer/SnakeTail (forbidden), and not LogExpert either (permitted, but unread, so the §1.4 disqualification does not attach). The NUL-position-parity probe, the head/tail disagreement rule and the pending-CR carry are derived from `SPEC.md` §5.6, which was written from the standards above and from Corpus B's observed behaviour. Logged because §1.5 asks for the entry before the code, even though the component is clean under §4. |
 
+| 2026-08-04 | **Line-offset index — the clean re-derivation** | Claude Opus 5, session 9 | **First principles**, plus: our own measurements of the two dogfood corpora taken this session (mean line length 116.8 and 84.2 bytes — §3 "our own measurements", which §3 prefers); `SPEC.md` §5.2 (no mmap), §6.4 (`u64` scroll model), §10.3 (very long lines), §11.2's whole-system memory claim and §11.3's "UI never blocks"; and this repo's own `crates/tailhawk-core/src/encoding.rs`, for `code_unit()` and `is_random_access_decodable()` and the two exhaustive `0x0A` tests behind them. | **Neither `RESEARCH.md` §5.3 nor `SPEC.md` §5.3 was read** — not before, during or after. The replacement text was spliced in by line range (394–436, boundaries asserted against the §5.3 and §5.4 headings) precisely so the superseded text never entered this agent's context. No GPL implementation source of any kind was read; no log-viewer source of any kind was read, permitted or otherwise. **Two disclosures, because a clean-room claim is worth nothing if it overstates itself:** (1) `SPEC.md` §11.2's memory table was read *before* the contamination was recognised, and it contained the string `block-sparse, 128/block` — so the terms "block-sparse" and the number 128 were known going in; (2) a `git show` hunk header for `571eb2e` exposed the single word `delta-encoded` from the superseded section. Both anchors were therefore **argued against explicitly rather than silently avoided**: the derivation rejects delta encoding on a ~9x memory margin and selects a stride of 64 on cold-read latency. Had it landed on 128 with delta encoding, that coincidence would have had to be disclosed here instead. |
+
 ## 6. Attestation
 
 Before the first line of code for any component marked CONTAMINATED, append an entry below naming
 the author, the date, the sources relied on, and an explicit statement that no GPL implementation
 source was consulted for that component.
 
-> *(No attestations yet — no implementation code exists.)*
+### Line-offset index — 2026-08-04, Claude Opus 5, session 9
+
+I attest that the line-offset index design now in `SPEC.md` §5.3 was derived from the sources listed
+in the 2026-08-04 row of §5 above, and that:
+
+- **No GPL-licensed implementation source was consulted** for this component — not klogg, not
+  TailBlazer, not SnakeTail, at any point, in any session I have record of.
+- **No log-viewer implementation source of any kind was consulted**, including LogExpert, which §3
+  permits. It was not read, so §1.4 does not attach.
+- **`docs/RESEARCH.md` §5.3 was not read.** Its technical content has never entered this agent's
+  context, consistent with the 2026-07-29 entry in §5 that established the eligibility.
+- **`docs/SPEC.md` §5.3 was not read.** It was replaced by line range without being displayed. This
+  was a deliberate mechanical choice, not a claim of restraint.
+- The two anchors I *was* exposed to — `block-sparse, 128/block` from `SPEC.md` §11.2, and the word
+  `delta-encoded` from a diff header — are disclosed in §5 and are the reason the derivation states
+  its reasoning against them rather than merely arriving somewhere else.
+
+**What this attestation does not cover.** It speaks only for the derivation of 2026-08-04. It cannot
+speak for whether `SPEC.md` §5.3's *superseded* text was contaminated — that remains unknown and
+unreconstructable, which is why it was replaced rather than corrected. Session 8 read and edited that
+text (`571eb2e`) without filing a §5 entry; if it was contaminated, that exposure is real and
+unlogged, and this attestation does not retroactively clear it. The component is clean going forward
+because the design was rebuilt, not because the earlier exposure was ruled harmless.
 
 ## 7. The dependency allow-list
 

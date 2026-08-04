@@ -393,46 +393,120 @@ undesirable.
 
 ### 5.3 Line index
 
-**Design:** block-sparse, 128 lines per block, absolute `u64` anchor per block, intra-block deltas
-delta-encoded.
+> **Clean-room re-derivation, 2026-08-04.** This section was rewritten from first principles under
+> `CLEANROOM.md` §2, which requires the index to be derived from §3 allow-listed sources only. The
+> previous text shared its number and topic with the contaminated `RESEARCH.md` §5.3 and its
+> provenance was unestablished. Neither section was read during this derivation. Sources relied on
+> are recorded in `CLEANROOM.md` §5; the attestation is §6. **The design below differs materially
+> from what it replaces** — see "What this replaces" at the end.
 
-- **Codec: hand-rolled group-varint in safe Rust.** streamvbyte is a C library; pulling it via `cc-rs`
-  reintroduces a C toolchain and contradicts the zero-C-dependency position. Decode speed is
-  irrelevant at UI scroll rates — 128 values per lookup.
-- **Overflow is specified, not assumed.** A block whose span exceeds `u32` (128 lines averaging 40 MB
-  — real, for request/response body logging) falls back to storing absolute `u64` offsets, flagged in
-  block metadata.
-- Each block additionally stores `max_byte_len` and an `all_ascii` flag (§3.3) — both free during the
-  newline scan, unlike cell counts.
+#### What the index owes
 
-**Parallel indexing invariant — corrected twice; the second correction is measured, not argued:**
+| | Requirement | Why |
+|---|---|---|
+| **R1** | line number → byte offset, in bounded time | §6.4's scroll position is a `u64` line number; the renderer must turn it into a read |
+| **R2** | byte offset → line number | "go to offset", and re-anchoring the viewport after truncation (§5.5) |
+| **R3** | append in O(1) amortised, without rebuilding | following a live writer is the normal state, not an edge case |
+| **R4** | memory O(lines) with a **small** constant | §11.2 claims flatness as file size grows; the index is the structure most able to break it |
+| **R5** | usable while incomplete | §11.3 requires the UI never block on indexing; a partial index must serve the viewport it has |
+| **R6** | constructible in parallel | §11.3's throughput, and the whole file must be walked once regardless |
 
-> Chunk boundaries **must** be aligned to the code-unit size relative to the BOM: 2 bytes for UTF-16,
-> 4 for UTF-32. **That is the only constraint.** Every byte-oriented encoding may be chunked at any
-> boundary, because **a `0x0A` byte is always a line terminator and never part of another
-> character.** **Encoding must be resolved before chunk assignment, not merely before indexing.**
+#### The structure
 
-**The DBCS exception is withdrawn — 2026-07-31.** This section previously disabled the parallel path
-for codepages 932/936/950/949 on the grounds that `0x0A` is a legal trail byte in them. **It is
-not.** Two exhaustive measurements, in `crates/tailhawk-core/src/encoding.rs`, over the eight
-multi-byte encodings and ten single-byte representatives:
+**Sparse anchors, with a forward scan between them.**
 
-- **Encoder side** — every code point, in every one. No character other than U+000A encodes to a
-  sequence containing `0x0A`, and U+000A always encodes to a sequence containing it. So a byte scan
-  suffers neither false positives nor false negatives.
-- **Decoder side, which is the one that governs** — a scan reads arbitrary bytes off disk, not bytes
-  some encoder produced, so the real question is whether a `0x0A` can be *consumed* as a trail byte,
-  not whether one can be *written* there. All 65,536 two-byte prefixes were fed to each decoder
-  followed by `0x0A`. The newline survives every time; no lead byte swallows it. This covers
-  GB18030's four-byte form and ISO-2022-JP's shift states.
+- Every `S`-th line's absolute byte offset is stored as a `u64` **anchor**. Nothing is stored for
+  the lines between.
+- To reach line `n`: take anchor `n / S`, read forward from it, and count `n % S` line terminators
+  with a `memchr`-class scan.
+- Anchors live in **fixed-size blocks of 4,096**, not one flat vector. This is an allocation
+  decision, not a compression one: a followed file grows without bound, and appending to a flat
+  vector of tens of millions of entries reallocates and copies the whole thing at exactly the moment
+  the UI is trying to stay at 60 Hz.
 
-**What survives is much narrower, and it is not about the scan.** A line start is always a
-*character* boundary — that follows directly from the above — but for a **stateful** encoding it is
-not a *decoder* boundary. `ISO-2022-JP` is escape-driven: the same bytes mean different characters
-depending on shift state established earlier in the file, so a viewport decode beginning at line *N*
-cannot be correct without replaying the escapes before it. It is the only stateful encoding in the
-supported set. This is carried by `Charset::is_random_access_decodable()` and constrains **viewport
-decode only, never the newline scan.**
+`S` is a power of two, so `n / S` and `n % S` are a shift and a mask.
+
+#### Deriving S
+
+Measured mean line length on the two real corpora (`CLEANROOM.md` §5 — our own measurements, which
+§3 prefers): **116.8 and 84.2 bytes**. The working figure below is 100 B/line, which puts a 10 GB
+file at 10^8 lines.
+
+| Design | bytes/line | index at 10 GB | forward scan per lookup |
+|---|---|---|---|
+| absolute `u64` per line | 8.000 | **800 MB** | none |
+| `u32` relative to a block base | 4.060 | 406 MB | none |
+| `u16` delta + escapes | 2.100 | 210 MB | block-local sum |
+| `u8` delta + escapes | 1.100 | 110 MB | block-local sum |
+| **sparse anchor, S = 16** | 0.500 | 50.0 MB | 1.6 KB |
+| **sparse anchor, S = 64** | **0.125** | **12.5 MB** | **6.3 KB** |
+| sparse anchor, S = 256 | 0.031 | 3.1 MB | 25.0 KB |
+| sparse anchor, S = 1024 | 0.008 | 0.8 MB | 100.0 KB |
+
+**Memory is not the binding constraint, and that is the finding.** Every sparse variant is already
+negligible against §11.2's 120 MB whole-process claim — the difference between 12.5 MB and 0.8 MB
+does not matter, so `S` should be chosen on *latency*, not size.
+
+The binding constraint is the **cold** forward scan. Between anchors the bytes must be read (§5.2
+forbids mmap), and on a random seek — a scrollbar drag — that read is not in page cache. At
+`S = 1024` every dragged frame pays a 100 KB read; at `S = 64` it pays 6.3 KB, which is under two
+pages and well inside a typical readahead. Warm, all of these are sub-microsecond `memchr` and the
+choice is irrelevant.
+
+**`S = 64`.** It costs 12.5 MB on a 10 GB file — 0.125% of it — and keeps the worst random-access
+read small enough to be one I/O.
+
+#### Delta encoding is not needed, and is rejected
+
+A delta or block-relative scheme optimises the per-line cost of storing *every* line. Once lines
+between anchors are not stored at all, there is nothing left for it to compress: the best delta
+scheme in the table is **110 MB against sparse anchoring's 12.5 MB**, nearly 9x worse, while adding
+a per-block escape mechanism, a variable-width decode and a block-local summation on every lookup.
+
+**Sparse anchoring is both an order of magnitude smaller and materially simpler.** Long lines
+(§10.3) also break delta schemes precisely where they are least welcome — a 1 MB line is an escape
+in every one of them, and is unremarkable to an anchor.
+
+#### Alignment, and the only encoding constraint
+
+Chunk boundaries — for the parallel scan and for anchor placement — must be **code-unit aligned**
+(`Charset::code_unit()`). Splitting a UTF-16 file at an odd offset swaps every subsequent byte pair,
+so the scan hunts `0A 00` in a stream where it is now written `00 0A`.
+
+**That is the only constraint.** There is no encoding-specific exception and in particular no DBCS
+one: `0x0A` is always a line terminator, never a trail byte, in every byte-oriented encoding. This
+is measured, not assumed — `a_0a_byte_is_never_consumed_as_a_trail_byte_by_any_decoder` drives all
+65,536 two-byte prefixes into every supported decoder. An earlier draft asserted the opposite and
+disabled the parallel path for codepages 932/936/950/949; that was withdrawn in session 8.
+
+`ISO-2022-JP` constrains **viewport decode only, never the scan**. It is escape-driven, so a line
+start is a character boundary but not a decoder boundary, and decoding must begin from a known
+shift state rather than from an arbitrary anchor (`Charset::is_random_access_decodable()`).
+
+#### Construction
+
+**Parallel.** The file is divided into code-unit-aligned chunks, one worker each; each counts
+terminators and emits anchors at its own local stride. A prefix sum over the per-chunk line counts
+converts local anchor numbering to global. No worker needs any other worker's result to scan.
+
+**Progressive (R5).** Anchors are published as they are produced. Until the scan completes, the
+total line count is a lower bound and the scrollbar is proportional to bytes indexed rather than
+lines — §11.3 requires the UI never block on this.
+
+**Append (R3).** Following adds terminators to the end. Every `S`-th one appends an anchor; the rest
+cost nothing. A block fills and the next is allocated. Nothing existing is rewritten, which is what
+makes appending free rather than amortised.
+
+**Truncation and rotation (§5.5)** discard anchors from the truncation point on. Because anchors are
+absolute offsets and blocks are independent, this is a truncate of the anchor array, not a rebuild.
+
+#### What this replaces
+
+The superseded design was block-sparse with delta encoding, at 128 lines per block — a shape whose
+provenance `CLEANROOM.md` §2 records as unreconstructable. The re-derivation **does not reproduce
+it**: it keeps blocking (for allocation, not compression), rejects delta encoding on a ~9x memory
+argument, and lands on a stride of 64 chosen against cold-read latency rather than 128 chosen
+against nothing recorded. `SPEC.md` §11.2's memory line is updated to match.
 
 ### 5.4 Following
 
@@ -1069,7 +1143,7 @@ and features are constrained to fit it.
 
 | Structure | Order | 10 GB / 50 M lines | Notes |
 |---|---|---|---|
-| Line index (block-sparse, 128/block) | O(lines) | **~56 MB** | ~0.56% of file; sparse fallback ~100 KB |
+| Line index (sparse anchors, S = 64) | O(lines) | **~6.3 MB** | 0.125 B/line — re-derived, §5.3. Was ~56 MB under the superseded block-sparse/delta design. |
 | Decoder state | O(1) per source | negligible | |
 | Viewport + overscan | O(viewport) | < 1 MB | |
 | Column parse cache | O(viewport) | < 1 MB | Parsed lazily, visible rows only |

@@ -1,14 +1,54 @@
 # Handoff — resume here
 
 **Paused:** 2026-08-04, session 9. **M1 is complete.** The encoding gate is
-verified against both real corpora, and M2 is blocked on a provenance decision.
+verified against both real corpora, and M2 is unblocked — the index is re-derived clean.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
 
 ---
 
-## 🛑 M2 is blocked on a provenance decision — 2026-08-04, session 9. Owner's call, and it is a one-way door.
+## ✅ M2 is unblocked — the index was re-derived clean, 2026-08-04, session 9
 
-**Do not start M2 code until this is settled.** `CLEANROOM.md` §2 names `docs/RESEARCH.md` §5.3 as
+**`SPEC.md` §5.3 has been replaced by a clean-room re-derivation, and the index is cleared to
+implement.** `CLEANROOM.md` §4 now reads **RE-DERIVED CLEAN / Yes**, with the §5 entry and the §6
+attestation both filed. **M2 can start.**
+
+**The owner's decision was "re-derive clean, replace §5.3"** — not "log the risk and proceed", and
+not the strictest quarantine option. Recorded because the cheaper option was genuinely available and
+was declined.
+
+**Why it was not the owner's to answer as originally framed, which was my error.** The four questions
+below were put to the owner as provenance questions. He rightly refused them: he was never the
+reader — agent sessions wrote `RESEARCH.md` and `SPEC.md`, so he had no basis to attest to anything.
+Three of the four then turned out not to be decisions at all. `CLEANROOM.md` §2 already records the
+provenance as "unknown and unreconstructable", which *is* the finding; unreconstructable provenance
+means fail closed, and §2 already specified the remedy. Only the risk-appetite question was ever his.
+**Lesson: do not escalate a question whose answer is already written down, and check who could
+possibly know before asking anyone.**
+
+### What the re-derivation actually changed — it did not reproduce the old design
+
+| | Superseded | Re-derived |
+|---|---|---|
+| Structure | block-sparse, delta-encoded | **sparse anchors + forward scan**; blocking kept for *allocation*, not compression |
+| Stride | 128 lines/block | **64 lines/anchor**, chosen against cold-read latency |
+| Index size, 10 GB | ~56 MB | **~6.3 MB** |
+| Delta encoding | yes | **rejected** — ~9x worse than sparse anchoring, and long lines (§10.3) escape in every delta scheme |
+
+**The finding that drove it: memory is not the binding constraint.** Every sparse variant is
+negligible against §11.2's 120 MB claim, so the stride is chosen on the *cold* forward-scan read —
+6.3 KB at S=64 against 100 KB at S=1024 — not on size. Derived from the two corpora's measured mean
+line lengths (116.8 and 84.2 bytes), which §3 permits and prefers.
+
+**Neither §5.3 was read.** The replacement was spliced by line range (394–436, boundaries asserted
+against the §5.3/§5.4 headings) so the superseded text never entered context. Two anchors *were*
+disclosed rather than hidden — `block-sparse, 128/block` from §11.2, read before the problem was
+recognised, and the word `delta-encoded` from a diff header — and the derivation argues against both
+explicitly. Had it landed on 128 with delta encoding, that coincidence would have needed disclosing
+instead.
+
+### The original blocker, retained because the containment failure is the reusable lesson
+
+`CLEANROOM.md` §2 named `docs/RESEARCH.md` §5.3 as
 *the* contaminated section and requires the index to be re-derived from §3 sources before any code.
 Session 2 logged that §5.3's technical content was **deliberately not read**, specifically to keep
 this agent eligible to write the index under §1.4's "whoever reads, doesn't write".
@@ -29,20 +69,27 @@ content permanently disqualifies the reader from writing that component. Guessin
 this agent's eligibility for M2 or puts unestablished provenance into the codebase, and neither is
 recoverable after the fact.
 
-**What the owner needs to decide:**
+**How the four questions resolved:**
 
-1. Is `SPEC.md` §5.3 a restatement of the contaminated section, or independently derived?
-2. Does `128/block` have establishable provenance, or must it be re-derived and allowed to land on a
-   different number?
-3. Does `CLEANROOM.md` §2's affected-section list need widening to name the `SPEC.md` sections — and
-   §4's register updating to match?
-4. Is this agent still eligible to write the index, having read §11.2's constant?
+1. ~~Is `SPEC.md` §5.3 a restatement, or independently derived?~~ — **moot.** Replaced rather than
+   adjudicated. Unknowable either way, which was itself the answer.
+2. ~~Does `128/block` have establishable provenance?~~ — **no, and it is gone.** The re-derivation
+   landed on 64 for reasons it states.
+3. ~~Widen §2's affected-section list?~~ — **done.** §2 now carries a propagation table naming both
+   `SPEC.md` sections, and §4's register is updated.
+4. ~~Is this agent still eligible?~~ — **yes, with disclosure.** Neither §5.3 was read; the two
+   anchors that were seen are recorded in §5 and §6 and argued against in the derivation.
 
-**A clean path exists and does not need §5.3 at all.** The cleanroom process requires deriving from
-§3's allow-list — published docs, specifications, our own measurements — and `SPEC.md` §5.3 is *not*
-on that list. So the re-derivation can proceed from first principles regardless of how 1–3 are
-answered; what it must not do is take its parameters from either §5.3. Question 4 is the one that
-genuinely gates who writes it.
+**The reusable lesson, now in `CLEANROOM.md` §2:** *a contamination notice attached to one section
+does not travel with the content.* When a design is quoted onward, the warning stays behind — which
+is exactly how `SPEC.md` came to carry the design with no warning on it. **Naming the component in
+§4 catches this; naming the section does not.** Session 8 read and edited `SPEC.md` §5.3 (`571eb2e`)
+without filing a §5 entry, and nothing flagged it at the time.
+
+**⚠ What the attestation deliberately does not cover.** It speaks only for the 2026-08-04
+derivation. If the superseded `SPEC.md` §5.3 *was* contaminated, session 8's exposure was real and
+unlogged, and nothing here retroactively clears it. The component is clean going forward because the
+design was **rebuilt**, not because the earlier exposure was ruled harmless.
 
 ---
 
@@ -941,9 +988,9 @@ Recorded because each cost real effort to find, and two of them were caught only
 7. ~~**How to fuzz, for M1's last criterion.**~~ — **done, session 9.** An ordinary `#[test]` with a
    deterministic seed and no dependency, not `cargo-fuzz`. The deciding argument was ARM64, not MSVC.
    **M1 is complete.** See the M1 section at the top.
-8. **🛑 The provenance questions above — these block M2 and nothing else can start it.** Four of
-   them, at the top of this file. They are the owner's because §1.4 is a one-way door, not because
-   the technical work is unclear.
+8. ~~**The provenance questions above.**~~ — **resolved, session 9.** The index was re-derived clean
+   and `SPEC.md` §5.3 replaced; `CLEANROOM.md` §4 reads RE-DERIVED CLEAN. **M2 is unblocked.** Three
+   of the four were not decisions at all — see the section at the top.
 
 ---
 
