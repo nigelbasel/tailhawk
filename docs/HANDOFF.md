@@ -6,6 +6,41 @@ verified against both real corpora, and M2 is unblocked — the index is re-deri
 
 ---
 
+## 🚧 M2 started — E3 (the index structure) is done, 2026-08-04, session 9
+
+`crates/tailhawk-core/src/index.rs`. **73 tests, all passing**, fmt and clippy clean.
+
+| M2 criterion (`PLAN.md` §4) | State |
+|---|---|
+| **E3** — line index | **Done.** `LineIndex` (sparse anchors, blocked allocation) + `LineScanner` (terminator matching with cross-chunk carry), per the re-derived `SPEC.md` §5.3. |
+| **E4** — background + parallel indexer, code-unit alignment invariant | **Not started.** The scanner is already the right shape for it: it holds no index and no I/O, so one per chunk shares nothing. |
+| **E8** — record model + OTel mapping + severity tables | **Not started.** Independent of E3/E4. |
+| **Done:** index a 10 GB fixture with bounded memory | **Not run** — needs 10 GB of scratch disk. The per-line cost *is* asserted (`the_index_costs_what_section_11_2_says_it_does`, < 0.14 B/line over 1 M lines), so the budget is tested even though the fixture is not. |
+| **Done:** 4 GB UTF-16LE indexed on 8 threads is byte-identical to serial | **Not run** — needs E4. |
+
+**Two deliberate omissions.** Truncation/rotation handling is **not** in `LineIndex` — that is M4
+(§5.5, E7), and building it now would be speculative. `memchr` is **not** used: the scan is a scalar
+loop, which is correct and simple; if the 10 GB criterion or M4's 50 MB/s needs it, optimise then,
+with a measurement.
+
+**Three tests worth knowing about:**
+
+- `a_misaligned_0a_is_not_a_terminator_in_utf16` — the silent-corruption class `PLAN.md` marks E4
+  **High** risk. `U+4A00` encodes LE as `00 4A`, so a scanner ignoring alignment finds a `0x0A` and
+  splits the file in the wrong place. This is the test that will fail if someone "simplifies" the
+  scanner to a `memchr` over raw bytes.
+- `the_index_line_count_agrees_with_the_decoder` — the index scans *bytes*, the decoder decodes
+  *characters*, and they must agree on how many lines exist. Different routes to the same number, so
+  it is a real cross-check. Covers the trailing-terminator case where a line start at EOF is not a
+  line.
+- `line_starts_are_identical_however_the_bytes_are_chunked` — the E4 precondition. If a scan depends
+  on where reads landed, a parallel indexer and a serial one disagree.
+
+**`PLAN.md`'s E3 row was stale and is corrected** — it still described "block-sparse, group-varint,
+u64 overflow fallback", which the re-derivation rejected.
+
+---
+
 ## ✅ M2 is unblocked — the index was re-derived clean, 2026-08-04, session 9
 
 **`SPEC.md` §5.3 has been replaced by a clean-room re-derivation, and the index is cleared to

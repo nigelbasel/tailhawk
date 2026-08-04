@@ -54,7 +54,7 @@ Two ranges are given per component: **A** (solo developer, agent-assisted, the w
 |---|---|---|---|---|
 | E1 | Source abstraction, open/share modes, writer-safety guarantee | 1.0 | 2.0 | High — the rotation-loop test is the guarantee |
 | E2 | Overlapped `ReadFile` layer on IOCP | 1.0 | 2.0 | Medium |
-| E3 | Line index: block-sparse, group-varint, u64 overflow fallback | 1.5 | 3.0 | Medium |
+| E3 | Line index: sparse anchors + forward scan (re-derived 2026-08-04; group-varint rejected, see SPEC §5.3) | 1.5 | 3.0 | Medium |
 | E4 | Background + parallel indexer with the code-unit alignment invariant | 1.5 | 3.0 | **High** — silent corruption class |
 | E5 | Encoding detection (BOM, NUL-parity, UTF-8 validation, chardetng) | 1.5 | 3.0 | **High** — silent corruption class |
 | E6 | Incremental streaming decode, carry across boundaries | 1.0 | 2.0 | **High** |

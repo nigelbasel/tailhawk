@@ -57,6 +57,27 @@ impl Charset {
         }
     }
 
+    /// The byte sequence a `U+000A` line terminator takes in this encoding.
+    ///
+    /// The index scans for *bytes*, never for decoded characters — decoding 10 GB to find newlines
+    /// would defeat the point (`SPEC.md` §5.3). That is only sound because a `0x0A` byte is always
+    /// a terminator and never a trail byte, which
+    /// `a_0a_byte_is_never_consumed_as_a_trail_byte_by_any_decoder` establishes by driving all
+    /// 65,536 two-byte prefixes into every supported decoder.
+    ///
+    /// **A match is only a terminator when it starts at a multiple of [`code_unit`](Self::code_unit)
+    /// from the start of the file.** `0A 00` appears inside `U+000A U+0000` and inside `U+4A00`
+    /// alike; only the alignment tells them apart.
+    pub fn line_terminator(&self) -> &'static [u8] {
+        match self {
+            Charset::Utf32Le => &[0x0A, 0x00, 0x00, 0x00],
+            Charset::Utf32Be => &[0x00, 0x00, 0x00, 0x0A],
+            Charset::Whatwg(e) if *e == encoding_rs::UTF_16LE => &[0x0A, 0x00],
+            Charset::Whatwg(e) if *e == encoding_rs::UTF_16BE => &[0x00, 0x0A],
+            Charset::Whatwg(_) => &[0x0A],
+        }
+    }
+
     /// Whether decoding can start at an arbitrary indexed line without replaying what came before.
     ///
     /// True for every encoding here except ISO-2022-JP, which is escape-driven: the same bytes mean
