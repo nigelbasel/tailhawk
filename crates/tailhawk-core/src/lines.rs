@@ -535,4 +535,121 @@ mod tests {
             ]
         );
     }
+
+    /// xorshift64*, so the fuzz loop below needs no dependency and therefore no `deny.toml`
+    /// review. A fuzzer needs a *reproducible* seed far more than it needs a good distribution.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Uniform random bytes almost never produce a `CRLF` pair, a valid multi-byte sequence or a
+    /// BOM, so a uniform fuzzer explores none of the states that actually carry across chunks.
+    /// Drawing most bytes from this alphabet is what makes the loop hit them.
+    const INTERESTING: &[u8] = &[
+        0x00, 0x09, 0x0A, 0x0D, 0x1B, 0x20, 0x41, 0x7F, 0x80, 0xBF, 0xC2, 0xE2, 0xEF, 0xBB, 0xBF,
+        0xF0, 0xF4, 0xFE, 0xFF,
+    ];
+
+    fn arbitrary_bytes(rng: &mut Rng) -> Vec<u8> {
+        let len = rng.below(129);
+        (0..len)
+            .map(|_| {
+                if rng.below(4) == 0 {
+                    rng.below(256) as u8
+                } else {
+                    INTERESTING[rng.below(INTERESTING.len())]
+                }
+            })
+            .collect()
+    }
+
+    fn decode_all(charset: Charset, bytes: &[u8], chunk: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut d = LineDecoder::new(charset);
+        for part in bytes.chunks(chunk.max(1)) {
+            d.push(part, |l| out.push(l.to_owned()));
+        }
+        d.finish(|l| out.push(l.to_owned()));
+        out
+    }
+
+    /// The fuzz target `PLAN.md` §4 asks of M1, as an ordinary test rather than under `cargo-fuzz`.
+    ///
+    /// **Why not `cargo-fuzz`:** it requires libFuzzer, which is poorly supported on MSVC and
+    /// effectively absent on Windows ARM64 — and CI builds both. An ordinary `#[test]` runs in the
+    /// existing job on both architectures with no new tooling, and a fixed iteration count keeps CI
+    /// deterministic in a way a wall-clock budget would not. Raise `TAILHAWK_FUZZ_ITERS` for a
+    /// longer local soak.
+    ///
+    /// The boundary-invariance tests above feed *fixed* inputs at every split; this feeds
+    /// *arbitrary* content at several splits. Three properties, none of which may depend on how the
+    /// bytes were framed:
+    ///
+    /// 1. No input panics the decoder.
+    /// 2. No emitted line contains `\r` or `\n` — a terminator must never survive as content.
+    /// 3. The lines are identical however the same bytes are chunked, including invalid ones.
+    ///    Replacement characters are part of the output and must land in the same places.
+    #[test]
+    fn arbitrary_bytes_decode_the_same_however_they_are_chunked() {
+        let charsets = [
+            Charset::UTF_8,
+            Charset::UTF_16LE,
+            Charset::UTF_16BE,
+            Charset::Utf32Le,
+            Charset::Utf32Be,
+            Charset::Whatwg(encoding_rs::WINDOWS_1252),
+            Charset::Whatwg(encoding_rs::SHIFT_JIS),
+            Charset::Whatwg(encoding_rs::GBK),
+            Charset::Whatwg(encoding_rs::BIG5),
+            Charset::Whatwg(encoding_rs::EUC_KR),
+            Charset::Whatwg(encoding_rs::ISO_2022_JP),
+        ];
+
+        let iters: usize = std::env::var("TAILHAWK_FUZZ_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400);
+
+        let mut seeds = Rng(0x7a11_4841_574b_0001);
+        for _ in 0..iters {
+            let seed = seeds.next();
+            let bytes = arbitrary_bytes(&mut Rng(seed));
+
+            for charset in charsets {
+                let reference = decode_all(charset, &bytes, bytes.len().max(1));
+
+                for line in &reference {
+                    assert!(
+                        !line.contains(['\n', '\r']),
+                        "{} kept a terminator as content: {line:?}, seed {seed:#018x}, bytes {bytes:02x?}",
+                        charset.name()
+                    );
+                }
+
+                for chunk in [1, 2, 3, 5, 7, 13] {
+                    let split = decode_all(charset, &bytes, chunk);
+                    assert_eq!(
+                        split,
+                        reference,
+                        "{} framed {chunk} bytes at a time disagrees with one gulp, \
+                         seed {seed:#018x}, bytes {bytes:02x?}",
+                        charset.name()
+                    );
+                }
+            }
+        }
+    }
 }

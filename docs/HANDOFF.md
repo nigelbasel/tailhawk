@@ -1,8 +1,48 @@
 # Handoff — resume here
 
-**Paused:** 2026-08-04, session 9. M1 still most of the way through; the encoding gate is now
-verified against both real corpora.
+**Paused:** 2026-08-04, session 9. **M1 is complete.** The encoding gate is
+verified against both real corpora, and M2 is blocked on a provenance decision.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## 🛑 M2 is blocked on a provenance decision — 2026-08-04, session 9. Owner's call, and it is a one-way door.
+
+**Do not start M2 code until this is settled.** `CLEANROOM.md` §2 names `docs/RESEARCH.md` §5.3 as
+*the* contaminated section and requires the index to be re-derived from §3 sources before any code.
+Session 2 logged that §5.3's technical content was **deliberately not read**, specifically to keep
+this agent eligible to write the index under §1.4's "whoever reads, doesn't write".
+
+**That containment is understated, and the design has propagated into `SPEC.md`:**
+
+| Where | What |
+|---|---|
+| `SPEC.md` §5.3 "Line index" | Same section number *and* topic as the contaminated `RESEARCH.md` §5.3. **Not read this session.** Its provenance is unestablished. |
+| `SPEC.md` §11.2, memory budget table | States **"Line index (block-sparse, 128/block)"** — a specific design constant, in a section carrying no contamination warning. **This was read**, while deliberately avoiding §5.3. |
+
+§2 explicitly forbids quoting §5.3 "into a design document that then feeds implementation", which is
+what appears to have happened. Whether `128` was derived independently or traces to GPL source is
+exactly the thing nobody recorded — the original sin §2 describes, now one document further on.
+
+**Why this cannot be resolved by just pressing on.** Rule §1.4 is irreversible: reading contaminated
+content permanently disqualifies the reader from writing that component. Guessing wrong costs either
+this agent's eligibility for M2 or puts unestablished provenance into the codebase, and neither is
+recoverable after the fact.
+
+**What the owner needs to decide:**
+
+1. Is `SPEC.md` §5.3 a restatement of the contaminated section, or independently derived?
+2. Does `128/block` have establishable provenance, or must it be re-derived and allowed to land on a
+   different number?
+3. Does `CLEANROOM.md` §2's affected-section list need widening to name the `SPEC.md` sections — and
+   §4's register updating to match?
+4. Is this agent still eligible to write the index, having read §11.2's constant?
+
+**A clean path exists and does not need §5.3 at all.** The cleanroom process requires deriving from
+§3's allow-list — published docs, specifications, our own measurements — and `SPEC.md` §5.3 is *not*
+on that list. So the re-derivation can proceed from first principles regardless of how 1–3 are
+answered; what it must not do is take its parameters from either §5.3. Question 4 is the one that
+genuinely gates who writes it.
 
 ---
 
@@ -91,22 +131,38 @@ Verified end to end on the static build:
 | **E2** — overlapped `ReadFile` layer **on IOCP** | **Half done.** Overlapped reads with explicit `OVERLAPPED.Offset` work and are tested. **The IOCP with 4–8 outstanding requests is not built** — reads are issued one at a time. That is a throughput property with no consumer until M4's 50 MB/s criterion, so it was left rather than built blind. |
 | Encoding fixture matrix decodes correctly | **Done** — BOM'd ×5, BOM-less UTF-8/16LE/16BE/32LE/32BE, head-vs-tail mixed, truncated-mid-sequence, binary-embedded, DBCS |
 | Rotation loop shows no sharing violation on the writer side | **Done** — and paired with a negative control that opens `FILE_SHARE_READ` only and asserts the writer *is* locked out |
-| Fuzz targets clean | **Not started.** See below — this is the next thing. |
+| Fuzz targets clean | **Done, session 9** — `arbitrary_bytes_decode_the_same_however_they_are_chunked` in `crates/tailhawk-core/src/lines.rs`. |
 
-### Start the next session with this
+### ✅ M1 is complete — the fuzz criterion closed, session 9
 
-**M1's last criterion: fuzz targets.** The decoder is the right target — it takes arbitrary bytes and
-must never panic, never lose a byte from the offset count, and never produce a line containing `\r` or
-`\n`. Note the practical snag before reaching for it: `cargo-fuzz` wants libFuzzer and is a poor fit on
-MSVC Windows. Two honest options, and it is worth 20 minutes deciding rather than fighting the first:
+**Option 1 was taken: an ordinary `#[test]`, not `cargo-fuzz`.** The deciding argument was not the
+MSVC awkwardness the previous session flagged but **ARM64** — libFuzzer is effectively absent on
+Windows ARM64 and CI builds both architectures, so `cargo-fuzz` would have covered one leg of the
+matrix at best. The test runs in the existing job on both, with no new tooling.
 
-1. `arbitrary` + a hand-rolled loop over a corpus, run in CI as an ordinary test with a time budget.
-2. `cargo-fuzz` under the `x86_64-pc-windows-msvc` libFuzzer support, which does exist but is
-   under-travelled.
+**It needs no dependency at all.** A ten-line xorshift64* in the test module replaced `arbitrary`,
+which keeps the `deny.toml` allow-list out of the decision entirely. A fuzzer needs a *reproducible
+seed* far more than a good distribution, and a fixed iteration count keeps CI deterministic where a
+wall-clock budget would not. `TAILHAWK_FUZZ_ITERS` raises it for a local soak.
 
-**The boundary-invariance test is already most of the value** — it feeds every input at every possible
-split and asserts the lines are identical, and it found three real bugs (below). A fuzzer adds
-arbitrary *content* on top of arbitrary *framing*. Do not let it block M2.
+**Most bytes are drawn from an interesting alphabet, not uniformly.** Uniform random bytes almost
+never produce a `CRLF` pair, a valid multi-byte sequence or a BOM — so a uniform fuzzer explores none
+of the states that actually carry across chunk boundaries, which is the whole point.
+
+Three properties, none of which may depend on framing: no input panics; no emitted line contains
+`\r` or `\n`; and the lines are identical however the same bytes are chunked, **including invalid
+ones** — replacement characters are output too, and must land in the same places.
+
+**Soaked at 40,000 iterations × 11 charsets × 7 framings — about 3.1 million decode runs, clean**, in
+17 s release. That includes the two cases most likely to break the property: `ISO-2022-JP`, which is
+stateful, and UTF-32, where a truncated unit at EOF was one of the three original bugs. CI runs 400
+iterations (~1.9 s).
+
+**59 tests, all passing.** `fmt` and `clippy` clean on the product crates.
+
+The pre-existing boundary-invariance tests feed *fixed* inputs at every possible split; this feeds
+*arbitrary content* at several splits. They are complementary, and the older ones remain the source
+of the three real bugs found so far.
 
 ### Choices worth not re-litigating
 
@@ -882,8 +938,12 @@ Recorded because each cost real effort to find, and two of them were caught only
    the *only* constraint on chunking, records both measurements, and keeps one much narrower rule:
    `ISO-2022-JP` cannot be decoded from an arbitrary line, because it is stateful. **M2 may index in
    parallel for every encoding.** See the section at the top.
-7. **How to fuzz, for M1's last criterion.** `cargo-fuzz` on MSVC Windows, or `arbitrary` plus a plain
-   test-harness loop with a time budget. Not a hard blocker on M2; see the M1 section at the top.
+7. ~~**How to fuzz, for M1's last criterion.**~~ — **done, session 9.** An ordinary `#[test]` with a
+   deterministic seed and no dependency, not `cargo-fuzz`. The deciding argument was ARM64, not MSVC.
+   **M1 is complete.** See the M1 section at the top.
+8. **🛑 The provenance questions above — these block M2 and nothing else can start it.** Four of
+   them, at the top of this file. They are the owner's because §1.4 is a one-way door, not because
+   the technical work is unclear.
 
 ---
 
