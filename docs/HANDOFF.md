@@ -1,7 +1,65 @@
 # Handoff — resume here
 
-**Paused:** 2026-07-31, session 8, most of the way through M1.
+**Paused:** 2026-08-04, session 9. M1 still most of the way through; the encoding gate is now
+verified against both real corpora.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## ✅ Dogfooded against both real corpora — 2026-08-04, session 9. The encoding gate passes.
+
+Both corpora were opened with the M1 build and their reported figures checked against independently
+computed ground truth. **Both are exactly right.** Paths stay in project memory, not here.
+
+| | Tailhawk reported | Independently computed | |
+|---|---|---|---|
+| Corpus A | `UTF-8, 85,763 lines, 10,015,454 bytes` | 85,762 `LF` + an unterminated trailing line; CRLF throughout; zero non-ASCII | ✅ |
+| Corpus B | `UTF-8, 109,855 lines, 9,246,865 bytes` | 109,855 `LF`, ends with `LF`, no trailing partial; strict UTF-8 decode succeeds | ✅ |
+
+**The encoding regression this was built to catch did not fire.** Corpus B is now **9.2 MB of
+BOM-less UTF-8** carrying **47,101 U+2014 em dashes and 643 U+2713 check marks** (143,232 non-ASCII
+bytes, exactly 3 bytes each). It was reported as UTF-8. A CP1252 default would have mangled every
+one of them, which is the failure `Get-Content` still exhibits on this file.
+
+**The `+1` on corpus A is correct, not an off-by-one.** `Decoder::finish` deliberately flushes a
+trailing unterminated line at end-of-stream, while `pump` holds it during streaming. Corpus B, which
+ends with `LF`, shows no such adjustment — the two together are the evidence the rule is right.
+
+**E1's writer-safety guarantee paid off against a real writer.** `[IO.File]::ReadAllBytes` **could
+not open corpus A at all** — sharing violation, because the live writer holds it — while Tailhawk
+read it without trouble. Until now that guarantee was only exercised by its own unit test and its
+negative control.
+
+### Both corpora have outgrown their description, and corpus A rotates hard
+
+The figures in the Dogfooding section below were sampled 2026-07-29 and are **stale**:
+
+| | as sampled | 2026-08-04 |
+|---|---|---|
+| Corpus A | ~450 KB, *idle* | **grew 2.7 → 10 MB in ~3 minutes, then rotated back to 1.2 MB while being watched** |
+| Corpus B | ~3.3 MB | **9.2 MB** |
+
+Corpus A is no longer an idle-file test — it is a **fast-growing, actively-rotating** one, and it
+rotated under observation without prompting. That makes it a far better **M4** subject than the
+handoff previously assumed, and it is the only rotation specimen available that is real rather than
+synthetic. M1 does not follow, so Tailhawk simply read what existed at open time.
+
+### Owner direction, session 9: keep the milestone order — no UI work brought forward
+
+M1 has no visible surface and was never scoped to have one: `paint()` draws `BACKGROUND` and nothing
+else, and the title bar is the only place the file result surfaces. Confirmed this session by
+screenshot — every pixel of the client area is **RGB(18, 20, 23)**, exactly `background_rgb8()`, on
+the hardware driver. A correctly-painted M1 window and a dead one are indistinguishable to the eye,
+because the v1 palette is near-black.
+
+Three options were put to the owner: keep the order, build a throwaway visible spike (~1 day,
+DirectWrite straight to the window, no index), or genuinely reorder M3 ahead of M2. **The owner chose
+to keep the order**, and added that **there is no need to dogfood again until real logs actually
+render** — i.e. at M3. This is consistent with the session-7 decision to prefer robustness over
+reaching a usable UI sooner, now taken a second time with the visible consequence in front of them.
+
+**So: no further dogfooding is owed until M3.** What was owed — "do the corpora decode correctly
+before the index and grid are built on top of them" — is discharged above.
 
 ---
 
@@ -303,7 +361,8 @@ Copy-Item -Recurse -Force "$env:USERPROFILE\.claude\projects\C--dev-git-TailHawk
 The project is **Tailhawk** (command `tailhawk`) — a Windows desktop log tailer/viewer.
 Research, specification, UI design and development plan are complete and adversarially reviewed.
 **Phase 0 is effectively closed, M0 is done, and M1 is most of the way through — the application
-opens real log files and decodes them correctly.** Nothing left in Phase 0 is both runnable and
+opens real log files and decodes them correctly, now verified against both real corpora (session 9)
+rather than fixtures alone.** Nothing left in Phase 0 is both runnable and
 blocking: G2 is informational, G3's `eframe` legs are moot, and G1/G5/G6 are owner-gated. Five
 experiments were built and written up (G3 ×2, G4, G4b, G7).
 
@@ -690,15 +749,21 @@ release.
 
 ## Dogfooding — first runnable build
 
-**Now actionable, as of session 8.** `cargo run --release -p tailhawk -- <path>` opens a file, detects
-its encoding and streams every line, reporting the result in the title bar. That is enough to run
-against both corpora and see whether the encoding and line count are right — it is not enough to
+**✅ Done, session 9 — the encoding gate passed on both corpora. See the section at the top for the
+measured result, and note the size/behaviour figures in this section are the 2026-07-29 sample and
+are now stale.** Nothing further is owed here until **M3**, by owner decision: no need to dogfood
+again until real logs actually render.
+
+~~**Now actionable, as of session 8.**~~ `cargo run --release -p tailhawk -- <path>` opens a file,
+detects its encoding and streams every line, reporting the result in the title bar. That is enough to
+run against both corpora and see whether the encoding and line count are right — it is not enough to
 *read* them, which needs M3.
 
-**Worth doing early rather than late:** the value of the two corpora is that the correct answer is
-already known, and a wrong answer this session is far cheaper than a wrong answer after the index and
-grid are built on top of it. Corpus B in particular should report **UTF-8** and its em dashes must
-survive; if the title says `windows-1252` the detector is wrong.
+~~**Worth doing early rather than late:**~~ **— and it was.** The value of the two corpora is that the
+correct answer is already known, and a wrong answer this session is far cheaper than a wrong answer
+after the index and grid are built on top of it. Corpus B in particular should report **UTF-8** and
+its em dashes must survive; if the title says `windows-1252` the detector is wrong. **It reported
+UTF-8 and all 47,101 em dashes survived.**
 
 The owner has nominated **two real logs currently in daily use** as the first dogfood targets. The
 build does not have to be good; it has to open these two files and follow them. Treat this as the
@@ -787,6 +852,9 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **`cargo deny` looks for `deny.toml`, not `cargo-deny.toml`.** The config was misnamed from session 2 to session 8. The first time anything ran it, it logged one `[WARN] unable to find a config path` and then rejected all 26 crates including MIT and Apache-2.0, because the default allow-list is empty. A misnamed config silently stops being the policy, and only running the tool reveals it. | `deny.toml`, `CLEANROOM.md` §7 |
 | **A config file nothing executes is documentation.** `deny.toml` and `CLEANROOM.md` §7 described a licence gate for two sessions while no CI job invoked it. Whenever a policy file is added, add the thing that runs it in the same commit. | `.github/workflows/ci.yml` |
 | **LTO makes an unreferenced dependency free, which is a misleading way to measure one.** Adding `encoding_rs` + `chardetng` left the exe byte-identical at 249,344 while nothing called them; it went to 502,784 the moment the shell did. Measure a dependency's size *after* wiring it in, never before. | `crates/tailhawk/src/main.rs` |
+| **Never check a live file's reported size against a separately-stat'd one.** Corpus A read 5,587,678 bytes against a stat of 2,773,726 taken a minute earlier and looked like a 2.01x bug — a suspiciously exact ratio, which is what made it convincing. The file had simply grown. **To verify counts, snapshot the file first and run against the frozen copy;** use the live file only to exercise sharing and rotation. | session 9 |
+| **The obvious verification tools cannot open a live log at all.** `[IO.File]::ReadAllBytes` and anything else opening share-`Read` fails with a sharing violation against a real writer — the very case Tailhawk exists to handle. Take ground truth through `[IO.File]::Open($p,'Open','Read','ReadWrite,Delete')`. Reaching for the naive reader first reads as "the file is locked", not "my reader is wrong". | session 9 |
+| **A correctly-painted window and a dead one are indistinguishable at this palette.** `BACKGROUND` is RGB(18, 20, 23), so an M1 window that is working perfectly looks like an empty frame — the owner reasonably reported seeing nothing. **Do not debug this by looking.** Screenshot the client area and assert the pixels equal `background_rgb8()`; that distinguishes "painting correctly" from "not painting" in one step. | `crates/tailhawk-core/src/lib.rs` |
 
 ---
 
