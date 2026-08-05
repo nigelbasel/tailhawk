@@ -13,6 +13,13 @@ publish.workspace = true
 encoding_rs = "0.8"
 chardetng = "0.1"
 
+# `SPEC.md` §3.3's cell model: the unit is the grapheme cluster (UAX #29) and East Asian Wide and
+# Fullwidth clusters take two cells. Both are pure Rust with no C toolchain, and both are
+# Apache-2.0 OR MIT under `deny.toml`. Hand-rolling either means shipping — and ageing — a copy of
+# the Unicode character database, which is the opposite of a maintainable position.
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
 # The leaf backends are modules here rather than separate crates. `SPEC.md` §3.1 puts them inside
 # the core, and splitting them into crates buys nothing until a second platform exists — at which
 # point the split is a mechanical move, not a redesign.

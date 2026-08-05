@@ -9,6 +9,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod cell;
 pub mod encoding;
 pub mod index;
 pub mod indexer;
@@ -27,6 +28,7 @@ pub use gpu::Driver;
 #[cfg(windows)]
 pub use file::{FileError, FileIdentity, FileSource, LogFile};
 
+pub use cell::{Cell, CellModel};
 pub use encoding::{detect, Charset, Confidence, Detection, Sample};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
 pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};

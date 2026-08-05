@@ -1,9 +1,85 @@
 # Handoff — resume here
 
-**Paused:** 2026-08-05, session 10. **M1 is complete, and M2's three components — E3, E4 and E8 —
-are all done.** What remains in M2 is only the two done-criteria that need large fixtures.
-**M3, the grid, is next, and `PLAN.md` marks it the highest-risk milestone.**
-**Everything below is on disk and pushed. Nothing is held in a chat session.**
+**Paused:** 2026-08-05, session 10. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
+both architectures. Only M2's two large-fixture done-criteria remain unrun. **M3 has started with V4,
+the cell model**; `PLAN.md` marks M3 the highest-risk milestone, with a stop-and-reconsider gate at
+>50% overrun. **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## 🚧 M3 has started — V4, the cell model, 2026-08-05, session 10
+
+`crates/tailhawk-core/src/cell.rs`. **125 tests, all passing**, fmt and clippy clean.
+
+**M3 is `PLAN.md`'s highest-risk milestone** (11 weeks, with a stop-and-reconsider gate at >50%
+overrun), so it starts with the piece that is portable, headless and needs no device: §3.3's cell
+model. V1's device work is largely M0's already; V2 (the atlas) and V3 (the grid) both sit on top of
+this arithmetic, and §3.3's acceptance test — *columns line up* — is decided here rather than in
+DirectWrite.
+
+**The rule: delegate to `unicode-width`'s cluster-aware `UnicodeWidthStr::width`, one cluster at a
+time.** It already handles ZWJ sequences, regional-indicator pairs, keycaps, presentation selectors,
+conjoining jamo and spacing marks. Exactly two things are layered on top: a control character takes a
+visible cell (§5.6 forbids dropping it), and an emoji-modifier sequence is two cells rather than the
+2 + 2 `unicode-width` gives it.
+
+**⚠ The first version of this file hand-rolled that algorithm and was wrong four ways** — see the
+review section below. The reason is worth keeping: the premise was that a cluster's width is its
+*base's* width, on the theory that anything cluster-aware must be summing code points and would call
+`👨‍👩‍👧‍👦` eight cells. `UnicodeWidthStr::width` in `unicode-width` 0.2 does not sum — it segments — and
+that premise cost four defects, three deleted special cases and a test that asserted the wrong
+answer for a script §3.3's own acceptance test names.
+
+**Two dependencies were added**, `unicode-segmentation` and `unicode-width` — pure Rust, no C
+toolchain, Apache-2.0 OR MIT, so `deny.toml` admits them without a new entry. The alternative is
+shipping and then ageing our own copy of the Unicode character database, which is not a maintainable
+position for a project that expects to see CJK, Devanagari, RTL and emoji in real logs.
+
+**§13.4's "reveal invisibles" toggle is a width question, not only a painting one** — a revealed
+zero-width space occupies a cell — so `CellModel` carries the flag. That is also what makes a Trojan
+Source `U+202E` override visible rather than merely isolated.
+
+**⚠ But §13.4 cannot yet be claimed, and the gap is asserted rather than hidden.** The toggle reveals
+an invisible that forms its *own* cluster — `U+200B`, `U+202E` — and **not** one absorbed into a
+preceding cluster: `a` + ZWJ, `a` + a tag character (`U+E0067`, the hidden-text vector), `a` + a
+variation selector. Closing it needs `General_Category` data to tell a `Cf` character from a
+legitimate combining mark, which must *not* be revealed, and probably needs reveal mode to segment
+differently rather than only measure differently.
+`revealing_does_not_yet_reach_an_invisible_inside_a_cluster` pins the current behaviour so the gap
+stays visible.
+
+### V4's review found six defects, and the two hit-test ones were the dangerous pair
+
+| Defect | Effect |
+|---|---|
+| **A stray `U+FE0F` was treated as "make this two cells"** on *any* base | VS16 means something only on an `Emoji=Yes` base. **928,985** `<base> U+FE0F` clusters were over-counted. Appending three bytes anywhere in a line shifted every column to its right — attacker-controllable, and §13.4 calls a viewer that can be made to lie a real defect. |
+| **`U+FE0E` likewise, under-counting** | A wide ideograph followed by a stray VS15 got one cell and painted over its neighbour. 182,716 under-counts. |
+| **Multi-jamo Hangul** | `ᄀᄀ가` is one cluster of four cells; base-width said two. |
+| **Devanagari and Thai spacing marks** | `कि` is two cells, not one. §3.3's "combining marks occupy 0 additional cells" is true of `Mn`/`Me`, **not** of `Mc` — and a *test of ours asserted the wrong answer*, for a script §3.3's acceptance test names by name. |
+| **A zero-width cluster stole the next cluster's column** in `byte_at_cell` (`width.max(1)`) | 57 of 104 visible clusters hit-tested to the wrong byte. `"\u{202E}abc"` — §13.4's own Trojan Source example — returned the override's offset for a click on `a`. A caret placed from a click did not sit where the user clicked. |
+| **Reveal-invisibles misses invisibles inside a cluster** | Documented above rather than fixed. |
+
+**The reviewer verified all of it empirically** — a probe crate outside the repo, on the same locked
+crate versions, sweeping every scalar value and fuzzing 500,000 strings — rather than reasoning about
+Unicode from memory. That is the difference between this review and a plausible-sounding one, and it
+is worth insisting on for anything touching Unicode.
+
+It also confirmed **no panic, no non-char-boundary result, and `cell_count <= line.len()` across
+every scalar value and both fuzz corpora** — which is the property §3.3's `max_byte_len` upper bound
+for the scrollbar depends on.
+
+**⚠ The binary did not grow, and that figure means nothing yet.** The static `tailhawk.exe` is
+**502,784 bytes — byte-for-byte the M1 figure**, with two Unicode-table crates newly linked. That is
+LTO stripping code the *shell* never references: nothing in `crates/tailhawk` calls the cell model,
+the record model or the indexer. Session 8 recorded exactly this trap when `encoding_rs` first went
+in, and it applies to everything M2 and M3 have added so far. **The real size cost of the Unicode
+tables lands the moment the grid references them**, and that is the measurement to take at V3 — not
+this one.
+
+**Out of scope for this file, deliberately:** font fallback and the colour-glyph atlas are V2;
+§3.3's `max_byte_len` / `all_ascii` horizontal-extent rule belongs with V3's scrollbar, because it is
+the scrollbar that needs a conservative upper bound before layout has run. `cell_count_never_exceeds_byte_length`
+is the test that pins the property that rule depends on.
 
 ---
 
