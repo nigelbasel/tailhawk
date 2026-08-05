@@ -77,9 +77,14 @@ jobs:
         if: matrix.arch == 'x64'
         run: cargo fmt -p tailhawk -p tailhawk-core -- --check
 
+      # --nocapture because several tests need a D3D11 device, a window station or an installed
+      # font, and skip loudly rather than fail when the runner has none. Without it cargo captures
+      # the output of passing tests, so a skip and a real run are indistinguishable in the log and
+      # a skipped device test reads as a green one. The skip messages are the only evidence either
+      # way, so they have to reach the log.
       - name: Test
         if: matrix.arch == 'x64'
-        run: cargo test --release --workspace --target ${{ matrix.target }}
+        run: cargo test --release --workspace --target ${{ matrix.target }} -- --nocapture
 
       # PLAN.md M0: an x64 and ARM64 exe under the size gate. The 15 MB gate is from SPEC.md §11.2;
       # G3 measured the skeleton at ~250 KB, so this is an alarm for accidental bloat — a jump of

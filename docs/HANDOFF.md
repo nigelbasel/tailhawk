@@ -243,6 +243,19 @@ in, and it applies to everything M2 and M3 have added so far. **The real size co
 tables lands the moment the grid references them**, and that is the measurement to take at V3 — not
 this one.
 
+**CI is green on all three of session 11's commits** — `6d38a0e` (V1), `51a1bcf` (the allocator) and
+`d66d551` (the rasteriser), runs `31011208042`, `31012052003` and `31013496467`, x64 and **ARM64**
+both. DirectWrite cross-compiles to ARM64 without complaint, and the runner ran the same 158 + 1
+tests this machine does.
+
+**⚠ Whether the device and font tests actually *did* anything on the runner was not knowable from
+that log, and the CI step is changed so the next one says.** Those tests skip loudly rather than fail
+when there is no D3D11 device, no window station or no usable font — but `cargo test` captures the
+output of passing tests, so a skip and a real run look identical in the log, and a skipped test still
+counts as passed. The `Test` step now runs with `-- --nocapture`, which is the only thing that makes
+the distinction visible. **A green device test is not evidence the device path ran** unless the skip
+message is absent from the log.
+
 ### ▶ Resume here: V2's sheets, upload and instanced draw
 
 ~~V1 still owes device-removed recovery~~ — **V1 is done; V2's allocator and rasteriser are done**,
