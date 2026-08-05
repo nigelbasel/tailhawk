@@ -89,6 +89,13 @@ struct ChunkScan {
     anchors: Vec<u64>,
     /// The last line start found, so the merge can tell a terminator at end of file from a line.
     last_start: Option<u64>,
+    /// One past the last byte actually read, or `None` if the chunk read nothing at all.
+    ///
+    /// This is what the trailing-terminator test compares against, and it is **not** the same as the
+    /// chunk's nominal end: `end` was sampled before the scan, and a writer that copy-truncates
+    /// (§5.5) can leave the file shorter than that. Testing against the nominal end would miss the
+    /// terminator and invent a line at a byte that no longer exists.
+    data_end: Option<u64>,
 }
 
 /// Indexes `[start, end)` in parallel.
@@ -127,7 +134,10 @@ pub fn build_index<R: ChunkReader + ?Sized>(
 
     let chunks: Vec<(u64, u64)> = (start..end)
         .step_by(opts.chunk_bytes as usize)
-        .map(|from| (from, (from + opts.chunk_bytes).min(end)))
+        // Saturating because `chunk_bytes` is caller-supplied: a chunk size near `u64::MAX` would
+        // otherwise overflow to a `to` below `from`, and the chunk's lines would vanish silently
+        // in release, where the add does not panic.
+        .map(|from| (from, from.saturating_add(opts.chunk_bytes).min(end)))
         .collect();
 
     let next = AtomicUsize::new(0);
@@ -166,18 +176,24 @@ pub fn build_index<R: ChunkReader + ?Sized>(
     })?;
 
     let mut final_start = None;
+    let mut data_end = None;
     for (nth, scan) in scans.iter_mut().enumerate() {
         let scan = scan
             .take()
             .ok_or_else(|| Error(format!("chunk {nth} was never scanned")))?;
         final_start = scan.last_start.or(final_start);
+        data_end = scan.data_end.or(data_end);
         index.append_chunk(scan.lines, &scan.anchors);
     }
 
-    // A terminator as the file's last bytes opens a line start at end of file, and that is not a
+    // A terminator as the file's last bytes opens a line start at end of data, and that is not a
     // line. `LineDecoder::finish` draws the same distinction, and the two must agree or the grid
     // and the index disagree about how many rows exist.
-    if final_start == Some(end) {
+    //
+    // Compared against the bytes actually read, never against `end`: `end` was sampled before the
+    // scan, and a file truncated in between is shorter than it. Testing `end` there would leave the
+    // phantom line in place — the exact disagreement the paragraph above exists to prevent.
+    if final_start.is_some() && final_start == data_end {
         index.pop_line();
     }
 
@@ -195,12 +211,6 @@ fn scan_chunk<R: ChunkReader + ?Sized>(
     buf: &mut [u8],
 ) -> Result<ChunkScan> {
     let mut scan = ChunkScan::default();
-    if owns_first_line {
-        scan.lines = 1;
-        scan.anchors.push(from);
-        scan.last_start = Some(from);
-    }
-
     let mut scanner = LineScanner::new(charset, from);
     let mut at = from;
     while at < to {
@@ -208,8 +218,16 @@ fn scan_chunk<R: ChunkReader + ?Sized>(
         let read = reader.read_at(at, &mut buf[..want])?;
         if read == 0 {
             // The file shrank under us. Rotation and truncation are M4's (§5.5); all this owes is
-            // to stop rather than spin.
+            // to stop rather than spin — and to not claim bytes it never saw, which is why the
+            // opening line is seeded below rather than up front.
             break;
+        }
+        if owns_first_line && scan.lines == 0 {
+            // The file's opening line, seeded only now that a byte is known to exist. A file that
+            // was sized and then truncated to nothing has no first line to own.
+            scan.lines = 1;
+            scan.anchors.push(from);
+            scan.last_start = Some(from);
         }
         scanner.push(&buf[..read], |offset| {
             if scan.lines.is_multiple_of(stride) {
@@ -219,6 +237,7 @@ fn scan_chunk<R: ChunkReader + ?Sized>(
             scan.last_start = Some(offset);
         });
         at += read as u64;
+        scan.data_end = Some(at);
     }
 
     Ok(scan)
@@ -673,6 +692,68 @@ mod tests {
                 "line {line} landed at {a:?}, which is not an aligned offset after the BOM"
             );
         }
+    }
+
+    /// `end` is sampled before the scan starts, so a writer that copy-truncates (§5.5, one of the
+    /// three rotation modes M4 must survive) leaves the file shorter than the range being indexed.
+    ///
+    /// Two things must hold, and neither did in the first version of this file: a range that reads
+    /// nothing produces **no** lines rather than one phantom line at `start`, and the
+    /// trailing-terminator rule must be tested against the bytes actually read rather than against
+    /// `end` — otherwise the terminator goes unnoticed and the index claims a line at a byte that
+    /// no longer exists.
+    #[test]
+    fn a_file_that_shrank_after_it_was_sized_reports_only_what_is_there() {
+        // Sized at 40 bytes, then truncated to nothing.
+        let index = build_index(&b""[..], Charset::UTF_8, 0, 40, &options(4, 8, 3))
+            .expect("in-memory build");
+        assert!(
+            index.is_empty(),
+            "a range that read nothing has no lines, not one at the start offset"
+        );
+        assert_eq!(index.anchor_at_or_before(0), None);
+
+        // Sized at 40 bytes, then truncated to 4 — which end with a terminator.
+        let bytes = b"a\nb\n";
+        for chunk in [2u64, 4, 8, 64] {
+            let index = build_index(&bytes[..], Charset::UTF_8, 0, 40, &options(4, chunk, 3))
+                .expect("in-memory build");
+            assert_eq!(
+                index.line_count(),
+                2,
+                "chunked {chunk}: the terminator at the new end of data must not open a third line"
+            );
+            assert_index_finds_every_line(Charset::UTF_8, bytes, &index);
+        }
+
+        // And truncated to 3, which do *not* end with a terminator.
+        let index = build_index(&b"a\nb"[..], Charset::UTF_8, 0, 40, &options(4, 2, 3))
+            .expect("in-memory build");
+        assert_eq!(index.line_count(), 2);
+        assert_index_finds_every_line(Charset::UTF_8, b"a\nb", &index);
+    }
+
+    /// `chunk_bytes` is caller-supplied and the chunk end is `from + chunk_bytes`. A size near
+    /// `u64::MAX` passes both validation gates, so the addition has to saturate: it panics in debug
+    /// and — worse — wraps to a `to` below `from` in release, silently dropping the chunk's lines.
+    #[test]
+    fn an_absurd_chunk_size_saturates_rather_than_overflowing() {
+        let bytes = b"one\ntwo\nthree\n";
+        let index = build_index(
+            &bytes[..],
+            Charset::UTF_8,
+            0,
+            bytes.len() as u64,
+            &IndexOptions {
+                stride: 4,
+                chunk_bytes: u64::MAX - 1,
+                read_bytes: 64,
+                threads: 2,
+            },
+        )
+        .expect("in-memory build");
+        assert_eq!(index.line_count(), 3);
+        assert_index_finds_every_line(Charset::UTF_8, bytes, &index);
     }
 
     #[test]

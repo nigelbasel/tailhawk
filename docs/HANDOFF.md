@@ -1,8 +1,74 @@
 # Handoff — resume here
 
-**Paused:** 2026-08-05, session 10. **M1 is complete; M2's E3 and E4 are done.** What is left in M2
-is **E8** (record model + OTel mapping) and the two done-criteria that need large fixtures.
+**Paused:** 2026-08-05, session 10. **M1 is complete, and M2's three components — E3, E4 and E8 —
+are all done.** What remains in M2 is only the two done-criteria that need large fixtures.
+**M3, the grid, is next, and `PLAN.md` marks it the highest-risk milestone.**
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## 🚧 E8 is done — the record model, 2026-08-05, session 10
+
+`crates/tailhawk-core/src/record.rs`. **106 tests, all passing**, fmt and clippy clean.
+
+The OTel-shaped record of §6.1, the severity banding of §6.2, and the tables every format detector
+(E9/E10) will resolve through. Nothing here parses anything — this is the shape the parsers fill.
+
+**The severity tables were transcribed from the OpenTelemetry spec, not written from knowledge, and
+that decision paid for itself immediately.** The first draft was written from memory and had **syslog
+Emergency at 23 with Alert and Critical in the FATAL band** — the appendix says **21, 19 and 18** —
+and **`java.util.logging` FINER at 3** where the appendix says **5**, a whole band out. Every one of
+those was plausible, confident and wrong, in the one table whose entire purpose is that a WARN means
+the same number in every format. `CLEANROOM.md` §5 carries the entry.
+
+| Table | Source |
+|---|---|
+| syslog (RFC 5424), log4j, Zap, Windows Event Log, `java.util.logging` | **OTel Appendix B, transcribed** |
+| HTTP-status aliases (§6.2) | **Ours** — Appendix A describes the Apache access log but assigns it no severity. Opt-in, and labelled as ours in the code. |
+| the generic level-word table | Ours, a union of the above plus the abbreviations real writers emit |
+
+**Three decisions worth not re-litigating.**
+
+- **Absent severity is `None`, and zero is not representable.** The OTel spec allows both a zero and
+  omission; carrying both would be two spellings of one state. `UI-DESIGN.md` §11.2 renders it blank,
+  never INFO.
+- **`resource` is deliberately not on `Record`** — §6.1's own field table says it "belongs to the
+  pane, not the row", which is what makes §8.3's merged-view column problem answerable.
+- **`raw` is decoded text where §6.1 says "the original bytes".** Every consumer works in decoded
+  text. But it *is* a loss — U+FFFD does not invert — so `Record::span` carries the byte offset and
+  length, and **that** is what keeps §10.2's "copy preserving original bytes" and §10.3's "search and
+  copy operate on the untruncated bytes" reachable. `raw` is the convenient form, not the
+  authoritative one.
+
+**`verbose` and `critical` are genuinely ambiguous across frameworks** — Serilog's `Verbose` is its
+lowest level, Windows Event Log's is DEBUG (5); `Critical` is FATAL (21) in .NET and ERROR2 (18) in
+Windows Event Log. Both are resolved against the *normative* table, since Appendix B has a Windows
+table and no .NET one.
+
+---
+
+## 🔍 Both components were reviewed adversarially before commit — and the review found real defects
+
+Two independent review agents were run over E4 and E8. **This is the practice the owner asked for on
+2026-08-05, and it is the condition attached to working without checkpoints — keep doing it.** It was
+not ceremonial; four real defects came out of it, none of which the test suites had caught.
+
+| Found in | Defect | Status |
+|---|---|---|
+| `indexer.rs` | **A file that shrank after being sized invented a line.** `end` is sampled before the scan, so a copy-truncating writer (§5.5, one of the three rotation modes) leaves the file shorter. A range that read *nothing* still reported one line at `start`, and the trailing-terminator test compared against `end` rather than the bytes actually read, so `a\nb\n` sized at 40 reported **3 lines where there are 2**. | **Fixed**, with `a_file_that_shrank_after_it_was_sized_reports_only_what_is_there`. Reverting the fix reproduces the 3-vs-2 failure. |
+| `indexer.rs` | `from + chunk_bytes` overflowed on an absurd caller-supplied chunk size — panic in debug, and in release it wraps to `to < from` and **silently drops the chunk's lines**. | **Fixed** with `saturating_add`, plus a test. |
+| `record.rs` | **`java.util.logging` FINER and FINE were a band out** (see above). | **Fixed** against the spec, with the mapping test. |
+| `record.rs` | **`level >= Critical` excluded the rows whose level reads `Critical`** — the band name parsed as FATAL (21) while a `Critical` row resolved to 18. §6.2's whole purpose is that this cannot happen. | **Fixed**, and `a_name_means_the_same_thing_however_it_is_resolved` now asserts the invariant for *every* name both resolvers accept. |
+
+Two further findings were about honesty rather than behaviour, and both are corrected: the
+`CLEANROOM.md` §5 entry for E8 **had not been filed** while the code claimed it had (§1.5 requires it
+*before* the code — this is the second time that rule has slipped, and the entry says so), and
+`LineScanner`'s comment about a failed partial match **misdescribed its own mechanism**.
+
+**The reviewer also confirmed, by building an out-of-tree differential fuzzer, that the parallel and
+serial indexes agree** — exhaustively over short UTF-8 and UTF-16 strings at every chunk size, thread
+count and stride, plus randomised UTF-32. That is the strongest evidence yet for M2's headline
+criterion, short of the 4 GB fixture.
 
 ---
 
@@ -19,7 +85,7 @@ the crash a non-event.
 |---|---|
 | **E3** — line index | **Done**, session 9. |
 | **E4** — background + parallel indexer, code-unit alignment invariant | **Parallel: done.** `build_index` splits the file into code-unit-aligned chunks, one `LineScanner` per chunk on `std::thread::scope`, merged by prefix sum. **"Background": not done** — it is a synchronous call, see below. |
-| **E8** — record model + OTel mapping + severity tables | **Not started.** Independent of E3/E4. |
+| **E8** — record model + OTel mapping + severity tables | **Done**, session 10 — see the E8 section above. |
 | **Done:** index a 10 GB fixture with bounded memory | **Not run** — needs 10 GB of scratch disk. Peak indexing memory is now *asserted by construction* rather than hoped for: `read_bytes × threads` (2 MB at the defaults) plus the anchors, with **no per-chunk buffer of line starts**. |
 | **Done:** 4 GB UTF-16LE on 8 threads is byte-identical to serial | **Run in miniature, not at 4 GB.** `a_real_file_indexes_the_same_on_many_threads_as_on_one` drives a real `LogFile` on all cores over a 20,000-line UTF-16LE fixture with a BOM and misaligned-`0x0A` decoys, and compares serial against parallel line by line *and* against the decoder. The property is tested; the scale is not. |
 
@@ -119,7 +185,7 @@ serial-vs-parallel comparison to prove anything on its own.
 |---|---|
 | **E3** — line index | **Done.** `LineIndex` (sparse anchors, blocked allocation) + `LineScanner` (terminator matching with cross-chunk carry), per the re-derived `SPEC.md` §5.3. |
 | **E4** — background + parallel indexer, code-unit alignment invariant | **Not started.** The scanner is already the right shape for it: it holds no index and no I/O, so one per chunk shares nothing. |
-| **E8** — record model + OTel mapping + severity tables | **Not started.** Independent of E3/E4. |
+| **E8** — record model + OTel mapping + severity tables | **Done**, session 10 — see the E8 section above. |
 | **Done:** index a 10 GB fixture with bounded memory | **Not run** — needs 10 GB of scratch disk. The per-line cost *is* asserted (`the_index_costs_what_section_11_2_says_it_does`, < 0.14 B/line over 1 M lines), so the budget is tested even though the fixture is not. |
 | **Done:** 4 GB UTF-16LE indexed on 8 threads is byte-identical to serial | **Not run** — needs E4. |
 

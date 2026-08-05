@@ -294,8 +294,12 @@ impl LineScanner {
                     }
                     continue;
                 }
-                // A failed continuation. The byte is still eligible to open a fresh match, which
-                // matters for `00 00 00 0A` in UTF-32BE where a run of NULs precedes the real one.
+                // A failed continuation. Reset and let the alignment test below decide: a byte that
+                // broke a partial match sits at a non-aligned offset by construction — it is
+                // `matched` bytes past an aligned one, and `matched` is between 1 and
+                // `code_unit - 1` — so it can never open a new match itself. The next *aligned*
+                // byte can, which is what carries `00 00 00 0A` in UTF-32BE past a preceding run
+                // of NULs (`a_failed_partial_match_can_still_open_a_new_one`).
                 self.matched = 0;
             }
 

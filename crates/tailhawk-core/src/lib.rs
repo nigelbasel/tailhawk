@@ -13,6 +13,7 @@ pub mod encoding;
 pub mod index;
 pub mod indexer;
 pub mod lines;
+pub mod record;
 
 #[cfg(windows)]
 pub mod file;
@@ -30,6 +31,10 @@ pub use encoding::{detect, Charset, Confidence, Detection, Sample};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
 pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};
 pub use lines::LineDecoder;
+pub use record::{
+    AttributeValue, FormatId, ParseState, Record, Resource, Severity, SeverityBand, Timestamp,
+    TraceContext, ERROR_THRESHOLD,
+};
 
 /// An opaque platform window handle. On Windows this is an `HWND`; the core never interprets it,
 /// it only passes it to the presentation backend.
