@@ -1,8 +1,90 @@
 # Handoff — resume here
 
-**Paused:** 2026-08-04, session 9. **M1 is complete.** The encoding gate is
-verified against both real corpora, and M2 is unblocked — the index is re-derived clean.
+**Paused:** 2026-08-05, session 10. **M1 is complete; M2's E3 and E4 are done.** What is left in M2
+is **E8** (record model + OTel mapping) and the two done-criteria that need large fixtures.
 **Everything below is on disk and pushed. Nothing is held in a chat session.**
+
+---
+
+## 🚧 E4 is done — the parallel indexer, 2026-08-05, session 10
+
+`crates/tailhawk-core/src/indexer.rs`, plus a segment directory added to `index.rs`. **85 tests, all
+passing**, fmt and clippy clean.
+
+**Session 9's machine crashed mid-session.** Nothing was lost — the tree was clean and `6b76992` was
+already pushed. Worth knowing only because "commit often; the history is the artefact" is what made
+the crash a non-event.
+
+| M2 criterion (`PLAN.md` §4) | State |
+|---|---|
+| **E3** — line index | **Done**, session 9. |
+| **E4** — background + parallel indexer, code-unit alignment invariant | **Parallel: done.** `build_index` splits the file into code-unit-aligned chunks, one `LineScanner` per chunk on `std::thread::scope`, merged by prefix sum. **"Background": not done** — it is a synchronous call, see below. |
+| **E8** — record model + OTel mapping + severity tables | **Not started.** Independent of E3/E4. |
+| **Done:** index a 10 GB fixture with bounded memory | **Not run** — needs 10 GB of scratch disk. Peak indexing memory is now *asserted by construction* rather than hoped for: `read_bytes × threads` (2 MB at the defaults) plus the anchors, with **no per-chunk buffer of line starts**. |
+| **Done:** 4 GB UTF-16LE on 8 threads is byte-identical to serial | **Run in miniature, not at 4 GB.** `a_real_file_indexes_the_same_on_many_threads_as_on_one` drives a real `LogFile` on all cores over a 20,000-line UTF-16LE fixture with a BOM and misaligned-`0x0A` decoys, and compares serial against parallel line by line *and* against the decoder. The property is tested; the scale is not. |
+
+### The one design decision, and why it went the way it did
+
+**A worker cannot know the global line number its chunk starts at** — that is settled only once every
+earlier chunk has finished counting. So a worker anchors from *its own* first line, and the merge
+records the base. `LineIndex` therefore grew a **segment directory**: one small entry per chunk,
+binary-searched on lookup, and a serially built or followed index is a single segment where lookup
+degenerates to the old `n / S`.
+
+**The alternative was rejected on memory.** Workers could instead buffer every line start so the merge
+picks the globally aligned ones, which would make the parallel index bit-identical to the serial one.
+That costs 8 bytes per line of transient buffer — an 8 MB chunk of *empty lines* is 64 MB per worker,
+8 workers is half a gigabyte, against §11.2's 120 MB whole-process claim. Empty lines are not exotic
+input. `a_file_of_nothing_but_terminators_indexes_correctly` is the test that stands where that design
+would have failed.
+
+`SPEC.md` §5.3 already specified this in "Construction" ("emits anchors at its own local stride. A
+prefix sum over the per-chunk line counts converts local anchor numbering to global") — the segment
+directory is that sentence made concrete. §5.3's "The structure" has been extended to describe it, and
+`CLEANROOM.md` §5 carries the entry §1.5 asks for.
+
+### What "background" still means, and it is genuinely not done
+
+`build_index` is **synchronous**: it blocks until the whole range is indexed. §5.3's **R5** — anchors
+published as they are produced, the UI never blocking, the line count a lower bound until the scan
+completes — **is not implemented**. Nothing consumes an index yet, so a progressive-publication API
+built now would be built blind against a caller that arrives at M3. The pieces are shaped for it: the
+merge is already a fold over independent per-chunk results in file order.
+
+### Three tests worth knowing about
+
+- `a_terminator_is_never_split_by_an_aligned_boundary` — the whole parallel scan rests on
+  `line_terminator().len() == code_unit()` for every charset, which is what makes a code-unit-aligned
+  boundary unable to fall *inside* a terminator. If an encoding ever arrives where that is false,
+  chunked scanning needs a carry between workers and this is the test that says so.
+- `a_misaligned_0a_survives_every_chunk_boundary` — E3's silent-corruption test, now driven at every
+  legal chunk size rather than one.
+- `a_real_file_indexes_the_same_on_many_threads_as_on_one` — the only test that exercises `LogFile` as
+  a `ChunkReader`. Concurrent positional reads through one handle are a property of `LogFile`, not of
+  the indexer, and no in-memory reader can test it.
+
+**Three negative controls were run rather than assumed** — each mutation was applied, the failure
+observed, and the mutation reverted:
+
+| Mutation | Result |
+|---|---|
+| alignment guard disabled, odd chunk size in UTF-16LE | **2 lines found where there are 3** — silent corruption, the exact class `PLAN.md` marks E4 High risk. The guard is load-bearing. |
+| first chunk stops owning the file's opening line | 7 of 11 fail |
+| the trailing-terminator `pop_line` removed | 7 of 11 fail |
+
+**One thing the negative controls exposed:** `many_threads_and_one_thread_agree_anchor_for_anchor`
+**passed under two of the three mutations**. It is a *consistency* test, so it cannot catch a bug both
+paths share. The correctness comes from `a_parallel_index_agrees_with_the_decoder_on_the_line_count`
+and from resolving every line against an independent scan. Worth remembering before trusting a
+serial-vs-parallel comparison to prove anything on its own.
+
+### Deliberate omissions
+
+- **R2 (byte offset → line number) is still not implemented.** `offset_of_line` covers R1; the inverse
+  has no caller until "go to offset" and §5.5's re-anchoring after truncation.
+- **`memchr` is still absent**, as in E3. The scan is a scalar loop.
+- **Truncation and rotation remain M4.** A chunk read that returns zero stops rather than spins, and
+  that is all the indexer owes until E7.
 
 ---
 

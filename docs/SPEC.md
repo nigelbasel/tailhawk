@@ -426,6 +426,15 @@ undesirable.
 
 `S` is a power of two, so `n / S` and `n % S` are a shift and a mask.
 
+**Anchors are grouped into segments, each carrying its own base line number.** A parallel worker
+cannot know the global line number its chunk starts at — that is settled only once every earlier
+chunk has finished counting — so it anchors from its own first line and the merge records the base
+(see "Construction" below). Reaching line `n` therefore finds the segment covering `n` first, by
+binary search over one entry per chunk — about 1,300 entries at 10 GB, so a handful of steps — and
+then takes anchor `(n − base) / S` within it. **A serially built or followed index is a single
+segment**, where this degenerates to exactly the `n / S` above; the directory is what lets the
+parallel and serial paths share one structure instead of two.
+
 #### Deriving S
 
 Measured mean line length on the two real corpora (`CLEANROOM.md` §5 — our own measurements, which

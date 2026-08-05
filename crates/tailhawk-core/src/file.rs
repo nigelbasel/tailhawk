@@ -394,7 +394,7 @@ fn win32_code(e: &windows::core::Error) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::encoding::{Charset, Confidence};
     use std::fs;
@@ -403,10 +403,13 @@ mod tests {
 
     /// A scratch directory that removes itself. Not `tempfile` — the dependency surface of a
     /// copy-and-run binary is a design constraint (`SPEC.md` §2), and this is eight lines.
-    struct Scratch(PathBuf);
+    ///
+    /// `pub(crate)` so the indexer's tests can build a real file rather than keeping a second copy
+    /// of this in step with it.
+    pub(crate) struct Scratch(PathBuf);
 
     impl Scratch {
-        fn new(tag: &str) -> Self {
+        pub(crate) fn new(tag: &str) -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir()
@@ -414,7 +417,7 @@ mod tests {
             fs::create_dir_all(&dir).expect("scratch directory");
             Scratch(dir)
         }
-        fn join(&self, name: &str) -> PathBuf {
+        pub(crate) fn join(&self, name: &str) -> PathBuf {
             self.0.join(name)
         }
     }

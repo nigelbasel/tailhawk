@@ -38,10 +38,27 @@ pub struct Anchor {
     pub offset: u64,
 }
 
+/// A run of lines whose anchors are regularly spaced from the run's own first line.
+///
+/// A serially-built index is one segment. The parallel indexer (E4) adds one per chunk, because a
+/// worker cannot know the global line number its chunk starts at — that is only settled once every
+/// earlier chunk has finished counting — so it anchors from its own first line and the merge
+/// records the base. `SPEC.md` §5.3's "prefix sum over the per-chunk line counts converts local
+/// anchor numbering to global" is this field.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Segment {
+    base_line: u64,
+    first_anchor: u64,
+}
+
 /// Sparse line starts, in append-only fixed-size blocks.
+#[derive(Debug)]
 pub struct LineIndex {
     stride: u64,
     blocks: Vec<Vec<u64>>,
+    /// Ascending by `base_line`, and never empty once any line exists.
+    segments: Vec<Segment>,
+    anchors: u64,
     lines: u64,
 }
 
@@ -66,6 +83,8 @@ impl LineIndex {
         Self {
             stride,
             blocks: Vec::new(),
+            segments: Vec::new(),
+            anchors: 0,
             lines: 0,
         }
     }
@@ -75,21 +94,86 @@ impl LineIndex {
     /// The caller owns line numbering: the *n*-th call is line *n*. Line 0 starts after the byte
     /// order mark, not at zero, which is why this takes an offset rather than deriving one.
     pub fn push_line(&mut self, offset: u64) {
-        if self.lines.is_multiple_of(self.stride) {
-            if self
-                .blocks
-                .last()
-                .is_none_or(|b| b.len() == ANCHORS_PER_BLOCK)
-            {
-                self.blocks.push(Vec::with_capacity(ANCHORS_PER_BLOCK));
+        let base = match self.segments.last() {
+            Some(s) => s.base_line,
+            None => {
+                self.segments.push(Segment {
+                    base_line: self.lines,
+                    first_anchor: self.anchors,
+                });
+                self.lines
             }
-            // `last_mut` cannot be None: the branch above guarantees a block with room.
-            self.blocks
-                .last_mut()
-                .expect("a block was just ensured")
-                .push(offset);
+        };
+        if (self.lines - base).is_multiple_of(self.stride) {
+            self.push_anchor(offset);
         }
         self.lines += 1;
+    }
+
+    /// Appends a whole chunk's worth of lines, anchored from the chunk's own first line.
+    ///
+    /// This is the merge half of the parallel indexer: `anchors` are the offsets of the chunk's
+    /// local lines `0, stride, 2·stride, …`, and the chunk's base line number is however many lines
+    /// have already been appended. Chunks must be merged **in file order**.
+    ///
+    /// # Panics
+    /// If `anchors` does not hold exactly one entry per stride of `lines` — that mismatch means a
+    /// worker and the merge disagree about the stride, which would silently misplace every lookup
+    /// in the chunk.
+    pub fn append_chunk(&mut self, lines: u64, anchors: &[u64]) {
+        assert_eq!(
+            anchors.len() as u64,
+            lines.div_ceil(self.stride),
+            "a chunk of {lines} lines at stride {} needs {} anchors, not {}",
+            self.stride,
+            lines.div_ceil(self.stride),
+            anchors.len()
+        );
+        if lines == 0 {
+            return;
+        }
+        self.segments.push(Segment {
+            base_line: self.lines,
+            first_anchor: self.anchors,
+        });
+        for &offset in anchors {
+            self.push_anchor(offset);
+        }
+        self.lines += lines;
+    }
+
+    fn push_anchor(&mut self, offset: u64) {
+        if self
+            .blocks
+            .last()
+            .is_none_or(|b| b.len() == ANCHORS_PER_BLOCK)
+        {
+            self.blocks.push(Vec::with_capacity(ANCHORS_PER_BLOCK));
+        }
+        // `last_mut` cannot be None: the branch above guarantees a block with room.
+        self.blocks
+            .last_mut()
+            .expect("a block was just ensured")
+            .push(offset);
+        self.anchors += 1;
+    }
+
+    fn pop_anchor(&mut self) {
+        if let Some(block) = self.blocks.last_mut() {
+            block.pop();
+        }
+        if self.blocks.last().is_some_and(|b| b.is_empty()) {
+            self.blocks.pop();
+        }
+        self.anchors = self.anchors.saturating_sub(1);
+    }
+
+    fn anchor(&self, nth: u64) -> Option<u64> {
+        let nth = usize::try_from(nth).ok()?;
+        self.blocks
+            .get(nth / ANCHORS_PER_BLOCK)?
+            .get(nth % ANCHORS_PER_BLOCK)
+            .copied()
     }
 
     /// Removes the most recently pushed line.
@@ -103,13 +187,14 @@ impl LineIndex {
             return;
         }
         self.lines -= 1;
-        if self.lines.is_multiple_of(self.stride) {
-            if let Some(block) = self.blocks.last_mut() {
-                block.pop();
-            }
-            if self.blocks.last().is_some_and(|b| b.is_empty()) {
-                self.blocks.pop();
-            }
+        let Some(&Segment { base_line, .. }) = self.segments.last() else {
+            return;
+        };
+        if (self.lines - base_line).is_multiple_of(self.stride) {
+            self.pop_anchor();
+        }
+        if self.lines == base_line {
+            self.segments.pop();
         }
     }
 
@@ -131,14 +216,15 @@ impl LineIndex {
         if line >= self.lines {
             return None;
         }
-        let nth = (line / self.stride) as usize;
-        let offset = *self
-            .blocks
-            .get(nth / ANCHORS_PER_BLOCK)?
-            .get(nth % ANCHORS_PER_BLOCK)?;
+        // Every segment's `base_line` is <= `self.lines`, and segment 0's is the first line there
+        // is, so a line inside the index always lands in a segment.
+        let nth_segment = self.segments.partition_point(|s| s.base_line <= line) - 1;
+        let segment = self.segments[nth_segment];
+        let local = line - segment.base_line;
+        let step = local / self.stride;
         Some(Anchor {
-            line: (nth as u64) * self.stride,
-            offset,
+            line: segment.base_line + step * self.stride,
+            offset: self.anchor(segment.first_anchor + step)?,
         })
     }
 
@@ -150,6 +236,14 @@ impl LineIndex {
                 .iter()
                 .map(|b| b.capacity() * std::mem::size_of::<u64>())
                 .sum::<usize>()
+            + self.segments.capacity() * std::mem::size_of::<Segment>()
+    }
+
+    /// How many separately-anchored runs the index is in — one for a serial build, one per chunk
+    /// for a parallel one. Exposed so a test can assert the directory stays small rather than
+    /// growing with the file.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
     }
 
     pub fn stride(&self) -> u64 {

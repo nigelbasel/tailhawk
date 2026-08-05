@@ -11,6 +11,7 @@
 
 pub mod encoding;
 pub mod index;
+pub mod indexer;
 pub mod lines;
 
 #[cfg(windows)]
@@ -27,6 +28,7 @@ pub use file::{FileError, FileIdentity, FileSource, LogFile};
 
 pub use encoding::{detect, Charset, Confidence, Detection, Sample};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
+pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};
 pub use lines::LineDecoder;
 
 /// An opaque platform window handle. On Windows this is an `HWND`; the core never interprets it,
