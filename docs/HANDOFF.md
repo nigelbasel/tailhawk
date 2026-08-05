@@ -8,12 +8,13 @@ held in a chat session.**
 
 ---
 
-## 🚧 V2 has started — the atlas allocator, 2026-08-05, session 11
+## 🚧 V2 has started — the atlas allocator and the rasteriser, 2026-08-05, session 11
 
-`crates/tailhawk-core/src/atlas.rs`. **150 tests, all passing**, fmt and clippy clean. This is the
-half of the atlas that touches no device: which glyph lives in which cell, which cell is given up
-when the sheet is full, and which glyphs are known to have no ink. **Rasterising into those cells is
-not written yet** — that is the DirectWrite leaf, and it is the next thing to build.
+`crates/tailhawk-core/src/atlas.rs` and `crates/tailhawk-core/src/raster.rs`. **159 tests, all
+passing** (158 core + the shell's one), fmt and clippy clean. Between them: which glyph lives in
+which cell, which cell is given up when the sheet is full, which glyphs have no ink, and what the
+pixels of a cell actually are. **Neither is wired to a device yet** — the sheets, the upload and the
+instanced draw are the next thing to build.
 
 **Nothing here was designed this session.** Every rule is a conclusion of `g4-glyph-atlas` or
 `g4b-batched-raster`, and the module cites the measurement beside each one:
@@ -54,9 +55,49 @@ resident; if the head was used this frame then every slot was, and `insert` repo
 | `lookup` no longer touches — i.e. FIFO, not LRU | `the_glyph_nobody_asked_for_is_the_one_evicted` fails |
 | eviction forgets to drop the victim's map entry | **3 tests fail**, including the thrashing one, where two keys end up pointing at one slot |
 
-**⚠ What V2 still owes**, in the order it is worth building: the DirectWrite rasteriser (batch 4–64
-glyphs per `CreateGlyphRunAnalysis` — bit-identical and ~1.8x on the cold path, a *pessimisation*
-past 256); the two sheets and the upload; the dual-source blend state and the instanced draw
+### The rasteriser — `raster.rs`, mono only
+
+`Rasteriser` holds an `IDWriteFactory2` and needs **no device and no window**, which is why all of
+this is testable in-process. `resolve` walks a candidate family list; `measure_cell` derives the
+uniform cell from measured bounds; `rasterise` fills one cell per glyph as RGBA — **R, G, B are the
+three ClearType coverages and A is their average**, so one sheet serves subpixel and greyscale at no
+extra memory (G4).
+
+**`BATCH = 16`**, inside G4b's measured 4–64 window and well clear of the 256 mark where the larger
+intermediate bitmap makes batching *slower* than not batching.
+
+**G4b's headline finding is now a regression test in the product**:
+`batched_rasterisation_is_bit_identical_to_one_glyph_at_a_time` compares batch 4, 16 and 64 against
+one-glyph-at-a-time over printable ASCII. Grid fitting and the ClearType filter are both
+position-dependent, so this could legitimately have been false; if a future DirectWrite makes it
+false, batching has to go, and that test is what will say so.
+
+**A glyph with no ink is `None`, decided by inspecting the cell rather than the strip.** G4b detected
+blanks per *chunk*; within a non-empty strip an individual space is an all-zero cell, and missing it
+is G4's 440-spurious-misses-per-frame bug.
+
+**Two negative controls fired; one did not, and that one changed the code.**
+
+| Mutation | Result |
+|---|---|
+| the run advance no longer matches the slicing step | the bit-identical test fails |
+| empty rectangles are allowed into the measured extent | 2 tests fail — **but only after the extent fold was extracted** |
+
+The extent fold is now the free function `tighten`, tested on synthetic rectangles, because **on the
+faces this machine has, the mutation was a no-op**: an empty `RECT{0,0,0,0}` already sits inside the
+ink extent of printable ASCII, so including it changes nothing and no test over real glyphs can tell
+the two behaviours apart. It matters on a face whose ink box does not contain the origin, and since
+the cell origin *is* every glyph's placement offset, getting it wrong shifts the whole grid. Worth
+remembering as a shape: **a control that does not fire is a statement about the fixture, not about
+the code.**
+
+**⚠ No size figure is quoted for the DirectWrite dependency, deliberately.** Nothing in
+`crates/tailhawk` references the atlas or the rasteriser, so LTO strips both and the exe would
+measure unchanged. Session 8 recorded exactly this trap when `encoding_rs` first went in. **The real
+cost lands when the grid references them**, which is V3.
+
+**⚠ What V2 still owes**, in the order it is worth building: the two sheets and the upload; the
+dual-source blend state and the instanced draw
 (`SrcBlend = ONE`, `DestBlend = INV_SRC1_COLOR`, and **the alpha slots take `INV_SRC1_ALPHA` or
 `CreateBlendState` fails with a bare `E_INVALIDARG`**); the colour path through
 `TranslateColorGlyphRun`; and the placeholder-and-fill-in-later behaviour that keeps rasterisation
@@ -202,10 +243,13 @@ in, and it applies to everything M2 and M3 have added so far. **The real size co
 tables lands the moment the grid references them**, and that is the measurement to take at V3 — not
 this one.
 
-### ▶ Resume here: V2's rasteriser
+### ▶ Resume here: V2's sheets, upload and instanced draw
 
-~~V1 still owes device-removed recovery~~ — **V1 is done, and V2 is started**, both session 11; see
-the two sections at the top of this file. M3's remaining work is **the rest of V2**, then V3 and V11.
+~~V1 still owes device-removed recovery~~ — **V1 is done; V2's allocator and rasteriser are done**,
+all session 11; see the two sections at the top of this file. What is left of V2 is the device half:
+two textures, the upload, the dual-source blend state, the instanced draw, the colour path through
+`TranslateColorGlyphRun`, and the placeholder-and-fill-in-later behaviour that keeps rasterisation
+off the paint path. Then V3 and V11.
 
 - **V3 (grid)** owes §3.3's `max_byte_len` / `all_ascii` extent fields. **These must be captured
   during the index scan** — §3.3 says they are free there, and the reason is that recovering them
