@@ -8,6 +8,12 @@ publish.workspace = true
 [dependencies]
 tailhawk-core = { path = "../tailhawk-core" }
 
+# The shell is the only crate allowed to own a window (`SPEC.md` §3.1), so it is the only place
+# `SPEC.md` §3.2's device-removed recovery can be tested with a real swapchain attached. Under
+# resolver 2 this does not switch the feature on for `cargo build`.
+[dev-dependencies]
+tailhawk-core = { path = "../tailhawk-core", features = ["test-hooks"] }
+
 [dependencies.windows]
 version = "0.58"
 features = [

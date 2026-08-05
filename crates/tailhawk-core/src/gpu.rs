@@ -3,7 +3,7 @@
 //! Derived from `experiments/g3-d3d11` and `experiments/g4-glyph-atlas`, which established the
 //! device/swapchain shape and measured the cost of getting here.
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{E_UNEXPECTED, HWND};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
@@ -15,9 +15,10 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIFactory2, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    CreateDXGIFactory2, IDXGIFactory2, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS,
+    DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 use crate::{Error, Result, WindowHandle};
@@ -46,24 +47,125 @@ impl Driver {
     }
 }
 
+/// The failures that mean *the device object you are holding is gone*, as opposed to *that call
+/// was wrong*.
+///
+/// `SPEC.md` §3.2: "**Never panic on device-removed** — that is the exact bug that crashes wgpu
+/// apps on driver auto-update." A driver update, a TDR, a GPU reset, an external monitor being
+/// unplugged and a laptop switching between its integrated and discrete GPUs all arrive here. None
+/// of them is a program error, and each is recoverable by building a new device.
+///
+/// The list is deliberately only the four DXGI codes, each taken from the `windows` crate's own
+/// generated bindings rather than written out. It is not the last word on the question —
+/// [`Gpu::was_lost`] asks the device itself as well, which is what covers a call that fails with
+/// some other code while the device is being removed underneath it.
+fn is_device_lost(code: windows::core::HRESULT) -> bool {
+    [
+        DXGI_ERROR_DEVICE_REMOVED,
+        DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_DEVICE_HUNG,
+        DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+    ]
+    .contains(&code)
+}
+
+/// What to do about a device that has just been lost.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Next {
+    /// Build a new device on this rung of §3.2's chain and carry on.
+    Retry(Driver),
+    /// Stop rebuilding. The caller reports the failure and the shell falls back to the flat
+    /// background it painted before a device existed — which is still not a panic.
+    GiveUp,
+}
+
+/// How many devices will be built for one unbroken run of losses before the renderer concludes
+/// that the problem is not transient.
+///
+/// A driver auto-update loses the device once. A GPU that is genuinely failing loses it every
+/// frame, and rebuilding a D3D11 device on every `WM_PAINT` is worse for the user than a static
+/// window: it is a hot loop that keeps the machine busy while showing nothing.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// `SPEC.md` §3.2's device-removed policy, kept apart from the D3D calls so it can be tested
+/// without a GPU.
+///
+/// The one subtlety is what counts as recovery. Only a frame that needed **no** recovery clears
+/// the streak: a device that dies and is rebuilt on every single frame would otherwise reset the
+/// count each time and rebuild for ever.
+struct Recovery {
+    driver: Driver,
+    streak: u32,
+}
+
+impl Recovery {
+    fn new(driver: Driver) -> Self {
+        Self { driver, streak: 0 }
+    }
+
+    /// A frame that drew and presented with no device trouble at all.
+    fn on_clean_frame(&mut self) {
+        self.streak = 0;
+    }
+
+    fn on_loss(&mut self) -> Next {
+        self.streak += 1;
+        if self.streak > MAX_ATTEMPTS {
+            return Next::GiveUp;
+        }
+        // The first loss keeps the rung it was on: a driver update or a TDR leaves the hardware
+        // perfectly able to host the next device, and dropping to WARP over one blip would trade
+        // the GPU away for nothing. A device that dies *again* before a clean frame is not a blip,
+        // so from the second attempt on it is WARP, which cannot be removed by a driver.
+        if self.streak == 1 {
+            Next::Retry(self.driver)
+        } else {
+            Next::Retry(Driver::Warp)
+        }
+    }
+
+    /// Records the rung a rebuilt device actually landed on, which is not always the rung asked
+    /// for — `create_resources` still walks the chain.
+    fn on_rebuilt(&mut self, driver: Driver) {
+        self.driver = driver;
+    }
+}
+
 /// DXBC produced by `fxc` in `build.rs`. Embedded, so nothing compiles a shader at runtime and
 /// the binary carries no `d3dcompiler_47.dll` import (`SPEC.md` §3.2).
 const BACKGROUND_VS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/background_vs.cso"));
 const BACKGROUND_PS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/background_ps.cso"));
 
-pub struct Gpu {
+/// Everything whose lifetime is the device's. When the device goes, all of this goes with it —
+/// which is why it is one struct: recovery replaces the whole of it and cannot leave a shader or
+/// a buffer behind that belongs to a dead device.
+struct Resources {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    pub driver: Driver,
-    swapchain: Option<IDXGISwapChain1>,
-    rtv: Option<ID3D11RenderTargetView>,
+    driver: Driver,
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     frame_cb: ID3D11Buffer,
-    size: (u32, u32),
 }
 
-fn create_device(driver: Driver) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+pub struct Gpu {
+    res: Resources,
+    swapchain: Option<IDXGISwapChain1>,
+    rtv: Option<ID3D11RenderTargetView>,
+    /// Remembered so a rebuilt device can re-attach itself without the shell being told anything
+    /// happened.
+    window: Option<WindowHandle>,
+    size: (u32, u32),
+    recovery: Recovery,
+    /// Counts devices, not losses: it starts at 1 and rises by one per rebuild. Tests assert on
+    /// it because "did the renderer really replace the device" is otherwise invisible from
+    /// outside.
+    generation: u32,
+    #[cfg(any(test, feature = "test-hooks"))]
+    inject_loss: bool,
+}
+
+fn create_device(driver: Driver) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
     let driver_type = match driver {
         Driver::Hardware => D3D_DRIVER_TYPE_HARDWARE,
         Driver::Warp => D3D_DRIVER_TYPE_WARP,
@@ -91,59 +193,102 @@ fn create_device(driver: Driver) -> Result<(ID3D11Device, ID3D11DeviceContext)> 
     ))
 }
 
-impl Gpu {
-    pub fn new() -> Result<Self> {
-        let (device, context, driver) = match create_device(Driver::Hardware) {
+/// Walks `SPEC.md` §3.2's chain from `prefer` downwards. Asking for WARP asks for WARP only —
+/// that is what makes the escalation in [`Recovery::on_loss`] mean anything.
+fn create_resources(prefer: Driver) -> Result<Resources> {
+    let (device, context, driver) = match prefer {
+        Driver::Warp => {
+            let (d, c) = create_device(Driver::Warp)?;
+            (d, c, Driver::Warp)
+        }
+        Driver::Hardware => match create_device(Driver::Hardware) {
             Ok((d, c)) => (d, c, Driver::Hardware),
             Err(_) => {
                 let (d, c) = create_device(Driver::Warp)?;
                 (d, c, Driver::Warp)
             }
-        };
-        let mut vs = None;
-        let mut ps = None;
-        let mut frame_cb = None;
-        // A float4 is already the 16-byte multiple a constant buffer requires, so no padding.
-        let initial = crate::BACKGROUND;
-        let cb_desc = D3D11_BUFFER_DESC {
-            ByteWidth: std::mem::size_of_val(&initial) as u32,
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-            ..Default::default()
-        };
-        let cb_data = D3D11_SUBRESOURCE_DATA {
-            pSysMem: initial.as_ptr().cast(),
-            ..Default::default()
-        };
-        unsafe {
-            device.CreateVertexShader(BACKGROUND_VS, None, Some(&mut vs))?;
-            device.CreatePixelShader(BACKGROUND_PS, None, Some(&mut ps))?;
-            device.CreateBuffer(&cb_desc, Some(&cb_data), Some(&mut frame_cb))?;
-        }
+        },
+    };
 
+    let mut vs = None;
+    let mut ps = None;
+    let mut frame_cb = None;
+    // A float4 is already the 16-byte multiple a constant buffer requires, so no padding.
+    let initial = crate::BACKGROUND;
+    let cb_desc = D3D11_BUFFER_DESC {
+        ByteWidth: std::mem::size_of_val(&initial) as u32,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        ..Default::default()
+    };
+    let cb_data = D3D11_SUBRESOURCE_DATA {
+        pSysMem: initial.as_ptr().cast(),
+        ..Default::default()
+    };
+    unsafe {
+        device.CreateVertexShader(BACKGROUND_VS, None, Some(&mut vs))?;
+        device.CreatePixelShader(BACKGROUND_PS, None, Some(&mut ps))?;
+        device.CreateBuffer(&cb_desc, Some(&cb_data), Some(&mut frame_cb))?;
+    }
+
+    Ok(Resources {
+        device,
+        context,
+        driver,
+        vs: vs.expect("vertex shader out param is set on success"),
+        ps: ps.expect("pixel shader out param is set on success"),
+        frame_cb: frame_cb.expect("constant buffer out param is set on success"),
+    })
+}
+
+impl Gpu {
+    pub fn new() -> Result<Self> {
+        let res = create_resources(Driver::Hardware)?;
         Ok(Self {
-            device,
-            context,
-            driver,
+            recovery: Recovery::new(res.driver),
+            res,
             swapchain: None,
             rtv: None,
-            vs: vs.expect("vertex shader out param is set on success"),
-            ps: ps.expect("pixel shader out param is set on success"),
-            frame_cb: frame_cb.expect("constant buffer out param is set on success"),
+            window: None,
             size: (1, 1),
+            generation: 1,
+            #[cfg(any(test, feature = "test-hooks"))]
+            inject_loss: false,
         })
+    }
+
+    pub fn driver(&self) -> Driver {
+        self.res.driver
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     pub fn attach(&mut self, window: WindowHandle, width: u32, height: u32) -> Result<()> {
         if self.swapchain.is_some() {
             return Ok(());
         }
+        self.window = Some(window);
+        self.size = (width.max(1), height.max(1));
+        self.create_swapchain()?;
+        Ok(())
+    }
+
+    fn create_swapchain(&mut self) -> windows::core::Result<()> {
+        let Some(window) = self.window else {
+            return Ok(());
+        };
         // CreateDXGIFactory2 rather than walking device → adapter → parent, so the factory is a
-        // 1.2+ interface and `CreateSwapChainForHwnd` exists on it.
+        // 1.2+ interface and `CreateSwapChainForHwnd` exists on it. It is also built fresh every
+        // time rather than cached: a factory created before a device was removed is stale, and
+        // making a swapchain from a stale factory is the classic way a "recovered" renderer
+        // presents to nothing.
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
+        let (width, height) = self.size;
         let desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width.max(1),
-            Height: height.max(1),
+            Width: width,
+            Height: height,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -155,21 +300,27 @@ impl Gpu {
             ..Default::default()
         };
         let swapchain = unsafe {
-            factory.CreateSwapChainForHwnd(&self.device, HWND(window.0 as _), &desc, None, None)?
+            factory.CreateSwapChainForHwnd(
+                &self.res.device,
+                HWND(window.0 as _),
+                &desc,
+                None,
+                None,
+            )?
         };
         self.swapchain = Some(swapchain);
-        self.size = (width.max(1), height.max(1));
         self.create_rtv()
     }
 
-    fn create_rtv(&mut self) -> Result<()> {
+    fn create_rtv(&mut self) -> windows::core::Result<()> {
         let Some(sc) = self.swapchain.as_ref() else {
             return Ok(());
         };
         let back: ID3D11Texture2D = unsafe { sc.GetBuffer(0)? };
         let mut rtv = None;
         unsafe {
-            self.device
+            self.res
+                .device
                 .CreateRenderTargetView(&back, None, Some(&mut rtv))?;
         }
         self.rtv = rtv;
@@ -177,25 +328,88 @@ impl Gpu {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        self.size = (width.max(1), height.max(1));
         if self.swapchain.is_none() {
             return Ok(());
         }
         // The RTV holds a reference to the back buffer and ResizeBuffers fails while it is alive.
         self.rtv = None;
-        self.size = (width.max(1), height.max(1));
         {
             let sc = self.swapchain.as_ref().expect("checked above");
             unsafe {
                 sc.ResizeBuffers(
                     0,
-                    width.max(1),
-                    height.max(1),
+                    self.size.0,
+                    self.size.1,
                     DXGI_FORMAT_B8G8R8A8_UNORM,
                     DXGI_SWAP_CHAIN_FLAG(0),
                 )?;
             }
         }
-        self.create_rtv()
+        self.create_rtv()?;
+        Ok(())
+    }
+
+    /// Draws and presents one frame, replacing the device if it has been lost.
+    ///
+    /// `SPEC.md` §3.2's device-removed requirement lives here rather than in the shell, because
+    /// the shell cannot act on the distinction: everything it could do about a lost device is
+    /// something the renderer can do better, and the one thing it must never do is panic.
+    pub fn render_frame(&mut self, colour: [f32; 4]) -> Result<()> {
+        let e = match self.frame(colour) {
+            Ok(()) => {
+                self.recovery.on_clean_frame();
+                return Ok(());
+            }
+            Err(e) => e,
+        };
+        if !self.was_lost(&e) {
+            return Err(e.into());
+        }
+        match self.recovery.on_loss() {
+            Next::GiveUp => Err(Error(format!(
+                "the graphics device was lost {MAX_ATTEMPTS} times without recovering: {e}"
+            ))),
+            Next::Retry(driver) => {
+                self.rebuild(driver)?;
+                // One retry, then out. A second loss in the same frame is next frame's problem,
+                // and going round again here would let one `WM_PAINT` spin.
+                self.frame(colour).map_err(Into::into)
+            }
+        }
+    }
+
+    /// Distinguishes "the device is gone" from "that call was wrong".
+    ///
+    /// The HRESULT is not always enough on its own: a call can fail with a generic error in the
+    /// instant a device is being removed, so the device is asked directly as well. Getting this
+    /// wrong in the permissive direction would rebuild the device over a genuine bug and hide it.
+    fn was_lost(&self, e: &windows::core::Error) -> bool {
+        if is_device_lost(e.code()) {
+            return true;
+        }
+        unsafe { self.res.device.GetDeviceRemovedReason().is_err() }
+    }
+
+    fn rebuild(&mut self, driver: Driver) -> Result<()> {
+        // Order matters: everything the old device owns is released before a new one is asked
+        // for, so a driver that is mid-reset is not being asked to host two devices at once.
+        self.rtv = None;
+        self.swapchain = None;
+        self.res = create_resources(driver)?;
+        self.recovery.on_rebuilt(self.res.driver);
+        self.generation += 1;
+        self.create_swapchain()?;
+        Ok(())
+    }
+
+    fn frame(&mut self, colour: [f32; 4]) -> windows::core::Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if std::mem::take(&mut self.inject_loss) {
+            return Err(windows::core::Error::from(DXGI_ERROR_DEVICE_REMOVED));
+        }
+        self.draw_background(colour);
+        self.present()
     }
 
     /// Draws the background as one fullscreen triangle through the embedded shaders.
@@ -203,16 +417,19 @@ impl Gpu {
     /// A `ClearRenderTargetView` would produce the same pixels more cheaply. Drawing it exercises
     /// the offline-compiled path — bytecode, shader creation, constant buffer, draw — which is the
     /// point at M0: the pipeline the grid depends on at M3 is proven now rather than then.
-    pub fn draw_background(&mut self, colour: [f32; 4]) -> Result<()> {
+    fn draw_background(&mut self, colour: [f32; 4]) {
         let Some(rtv) = self.rtv.clone() else {
-            return Ok(());
+            return;
         };
         let (w, h) = self.size;
+        // Nothing on this path returns an HRESULT. A lost device is not reported by the immediate
+        // context at all — the calls are recorded and discarded — which is why `Present` is what
+        // actually surfaces it.
         unsafe {
-            self.context
-                .UpdateSubresource(&self.frame_cb, 0, None, colour.as_ptr().cast(), 0, 0);
-            self.context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
-            self.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            let ctx = &self.res.context;
+            ctx.UpdateSubresource(&self.res.frame_cb, 0, None, colour.as_ptr().cast(), 0, 0);
+            ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
                 Width: w as f32,
@@ -220,21 +437,217 @@ impl Gpu {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
-            self.context
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            self.context.VSSetShader(&self.vs, None);
-            self.context.PSSetShader(&self.ps, None);
-            self.context
-                .PSSetConstantBuffers(0, Some(&[Some(self.frame_cb.clone())]));
-            self.context.Draw(3, 0);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.res.vs, None);
+            ctx.PSSetShader(&self.res.ps, None);
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.res.frame_cb.clone())]));
+            ctx.Draw(3, 0);
         }
-        Ok(())
     }
 
-    pub fn present(&self) -> Result<()> {
-        if let Some(sc) = &self.swapchain {
-            unsafe { sc.Present(1, DXGI_PRESENT(0)).ok()? };
+    fn present(&self) -> windows::core::Result<()> {
+        match (&self.swapchain, self.window) {
+            (Some(sc), _) => unsafe { sc.Present(1, DXGI_PRESENT(0)).ok() },
+            // Attached to a window but holding no swapchain is not a state that can be presented
+            // from, and it is exactly what a rebuild that forgot to re-attach would leave behind.
+            // Reporting it is what stops a "recovered" renderer from returning `Ok` for ever
+            // while nothing reaches the screen.
+            (None, Some(_)) => Err(windows::core::Error::from(E_UNEXPECTED)),
+            // No window yet. The device is still asked whether it is alive, so a loss before the
+            // first attach is not held back until one arrives.
+            (None, None) => unsafe { self.res.device.GetDeviceRemovedReason() },
         }
-        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn simulate_device_loss(&mut self) {
+        self.inject_loss = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::Interface;
+    use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_INVALID_CALL;
+
+    // The policy half needs no GPU at all, which is the point of separating it.
+
+    #[test]
+    fn a_first_loss_is_retried_on_the_rung_it_was_already_on() {
+        let mut r = Recovery::new(Driver::Hardware);
+        assert_eq!(r.on_loss(), Next::Retry(Driver::Hardware));
+    }
+
+    #[test]
+    fn a_device_that_dies_again_before_a_clean_frame_drops_to_warp() {
+        let mut r = Recovery::new(Driver::Hardware);
+        r.on_loss();
+        assert_eq!(r.on_loss(), Next::Retry(Driver::Warp));
+        assert_eq!(r.on_loss(), Next::Retry(Driver::Warp));
+    }
+
+    #[test]
+    fn a_clean_frame_clears_the_streak_so_the_next_loss_starts_over() {
+        let mut r = Recovery::new(Driver::Hardware);
+        r.on_loss();
+        r.on_loss();
+        r.on_clean_frame();
+        assert_eq!(
+            r.on_loss(),
+            Next::Retry(Driver::Hardware),
+            "a device that recovered and then ran normally has earned the hardware rung back"
+        );
+    }
+
+    /// The loop this bounds is the reason the rule exists: without it, a GPU that loses its device
+    /// every frame turns `WM_PAINT` into a device-creation hot loop.
+    #[test]
+    fn a_device_that_will_not_stay_up_is_eventually_given_up_on() {
+        let mut r = Recovery::new(Driver::Hardware);
+        for attempt in 1..=MAX_ATTEMPTS {
+            assert!(
+                matches!(r.on_loss(), Next::Retry(_)),
+                "attempt {attempt} of {MAX_ATTEMPTS} should still be worth making"
+            );
+        }
+        assert_eq!(r.on_loss(), Next::GiveUp);
+        assert_eq!(r.on_loss(), Next::GiveUp, "give-up is not a one-shot state");
+    }
+
+    #[test]
+    fn a_rebuild_that_lands_on_warp_makes_warp_the_rung_that_is_retried() {
+        let mut r = Recovery::new(Driver::Hardware);
+        r.on_loss();
+        r.on_rebuilt(Driver::Warp);
+        r.on_clean_frame();
+        assert_eq!(
+            r.on_loss(),
+            Next::Retry(Driver::Warp),
+            "hardware was already tried and did not hold; the first retry should not go back to it"
+        );
+    }
+
+    #[test]
+    fn only_device_loss_counts_as_device_loss() {
+        for lost in [
+            DXGI_ERROR_DEVICE_REMOVED,
+            DXGI_ERROR_DEVICE_RESET,
+            DXGI_ERROR_DEVICE_HUNG,
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        ] {
+            assert!(is_device_lost(lost), "{lost:?} means the device is gone");
+        }
+        // A programming error must not be laundered into a device rebuild, which would rebuild
+        // the device on every frame and hide the bug behind it.
+        for kept in [E_INVALIDARG, DXGI_ERROR_INVALID_CALL, E_OUTOFMEMORY] {
+            assert!(!is_device_lost(kept), "{kept:?} is our bug, not the GPU's");
+        }
+    }
+
+    /// The device half. A machine with neither a GPU nor WARP cannot run this, so it says so
+    /// loudly rather than passing quietly — a skipped device test that reads as green is exactly
+    /// how this code would rot.
+    fn gpu_or_skip(what: &str) -> Option<Gpu> {
+        match Gpu::new() {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                eprintln!("SKIPPED {what}: no D3D11 device on this machine ({e})");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn a_lost_device_is_replaced_and_the_frame_after_it_succeeds() {
+        let Some(mut gpu) =
+            gpu_or_skip("a_lost_device_is_replaced_and_the_frame_after_it_succeeds")
+        else {
+            return;
+        };
+        let before = gpu.res.device.as_raw();
+        assert_eq!(gpu.generation(), 1);
+
+        gpu.simulate_device_loss();
+        gpu.render_frame(crate::BACKGROUND)
+            .expect("a lost device is rebuilt, not reported");
+
+        assert_eq!(gpu.generation(), 2, "the device should have been replaced");
+        assert_ne!(
+            before,
+            gpu.res.device.as_raw(),
+            "the renderer kept the device it was told had gone"
+        );
+    }
+
+    /// `SPEC.md` §3.2 forbids panicking on device-removed. It does not forbid *failing*, and the
+    /// bounded-attempts rule means a persistently dead device eventually does fail — as an `Err`
+    /// the shell reports, with the flat background still on screen.
+    #[test]
+    fn a_device_that_is_lost_every_frame_fails_rather_than_looping_or_panicking() {
+        let Some(mut gpu) =
+            gpu_or_skip("a_device_that_is_lost_every_frame_fails_rather_than_looping_or_panicking")
+        else {
+            return;
+        };
+        for _ in 0..MAX_ATTEMPTS {
+            gpu.simulate_device_loss();
+            gpu.render_frame(crate::BACKGROUND)
+                .expect("attempts within the budget recover");
+        }
+        gpu.simulate_device_loss();
+        assert!(
+            gpu.render_frame(crate::BACKGROUND).is_err(),
+            "the budget should have run out"
+        );
+        assert_eq!(
+            gpu.generation(),
+            1 + MAX_ATTEMPTS,
+            "giving up must not build another device"
+        );
+    }
+
+    /// The realistic case, and the one the attempt budget could easily break: a machine that loses
+    /// its device occasionally — a driver update, a GPU switch — over a long-running session. Each
+    /// loss must be recovered from indefinitely, because they are separated by frames that worked.
+    #[test]
+    fn losses_separated_by_clean_frames_are_recovered_from_indefinitely() {
+        let Some(mut gpu) =
+            gpu_or_skip("losses_separated_by_clean_frames_are_recovered_from_indefinitely")
+        else {
+            return;
+        };
+        let rounds = MAX_ATTEMPTS * 2 + 1;
+        for round in 0..rounds {
+            gpu.simulate_device_loss();
+            gpu.render_frame(crate::BACKGROUND)
+                .unwrap_or_else(|e| panic!("loss {round} should still be recoverable: {e}"));
+            gpu.render_frame(crate::BACKGROUND).expect("a clean frame");
+        }
+        assert_eq!(gpu.generation(), 1 + rounds);
+        assert_eq!(
+            gpu.driver(),
+            Driver::Hardware,
+            "a device that keeps recovering has no reason to be demoted to WARP"
+        );
+    }
+
+    /// The escalation is not merely policy: a real rebuild has to land on WARP too.
+    #[test]
+    fn repeated_loss_moves_the_real_device_onto_warp() {
+        let Some(mut gpu) = gpu_or_skip("repeated_loss_moves_the_real_device_onto_warp") else {
+            return;
+        };
+        for _ in 0..2 {
+            gpu.simulate_device_loss();
+            gpu.render_frame(crate::BACKGROUND)
+                .expect("attempts within the budget recover");
+        }
+        assert_eq!(
+            gpu.driver(),
+            Driver::Warp,
+            "the second loss without a clean frame should have given up on the hardware rung"
+        );
     }
 }

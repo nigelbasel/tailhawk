@@ -6,7 +6,9 @@
 //! shell does with it is report what the core found, in the title bar, because there is no grid to
 //! render it into until M3.
 
-#![windows_subsystem = "windows"]
+// The shipped binary is a GUI app with no console. A test harness is not: as a windows-subsystem
+// executable it would have nowhere to print, so the attribute is dropped for `cargo test`.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
@@ -135,10 +137,18 @@ impl Shell {
             .and_then(|()| renderer.paint())
             .is_err()
         {
-            // Device lost, or the swapchain could not be rebuilt. Drop back to stage one rather
-            // than tearing the process down; recreating the device is M0+1 work.
+            // The renderer rebuilds a lost device itself, so an error here means it tried and
+            // gave up. Drop back to stage one rather than tearing the process down — `SPEC.md`
+            // §3.2 forbids dying on device trouble, and the class brush still paints.
             self.renderer = None;
             return false;
+        }
+        // Recovery can move the device onto WARP, and the title is the only place this build
+        // says which rung it is on. It is read back rather than remembered for that reason.
+        let driver = renderer.driver().name();
+        if self.driver.as_deref() != Some(driver) {
+            self.driver = Some(driver.to_owned());
+            self.refresh_title(hwnd);
         }
         true
     }
@@ -331,4 +341,107 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// Creates a real, unshown window to hang a swapchain on. Unshown is deliberate: the test
+    /// needs a valid `HWND` and a presenting swapchain, not a flash of a window on the desktop of
+    /// whoever is running the suite.
+    extern "system" fn test_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    fn hidden_window() -> Option<HWND> {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None).ok()?.into() };
+        let class_name = windows::core::w!("TailhawkDeviceLossTest");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(test_wndproc),
+            hInstance: instance,
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        if unsafe { RegisterClassW(&wc) } == 0 {
+            return None;
+        }
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class_name,
+                windows::core::w!("tailhawk device loss test"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                320,
+                240,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .ok()
+    }
+
+    /// The half of `SPEC.md` §3.2's device-removed recovery that the core cannot test on its own.
+    ///
+    /// The core's own tests rebuild a device with no window attached, which leaves the riskiest
+    /// part uncovered: after a device is removed, the DXGI factory that made the swapchain is
+    /// stale, and a renderer that reuses it comes back "recovered" while presenting to nothing.
+    /// Only a crate that may own an `HWND` can catch that, and by §3.1 that is the shell.
+    ///
+    /// It skips loudly rather than failing where there is no device or no window station — a
+    /// headless CI runner is a real possibility and a silently-green device test is worse than an
+    /// absent one.
+    #[test]
+    fn a_device_lost_with_a_window_attached_comes_back_presenting() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED a_device_lost_with_a_window_attached_comes_back_presenting: no D3D11 device ({e})");
+                return;
+            }
+        };
+        let Some(hwnd) = hidden_window() else {
+            eprintln!("SKIPPED a_device_lost_with_a_window_attached_comes_back_presenting: no window station");
+            return;
+        };
+
+        let window = WindowHandle(hwnd.0 as isize);
+        renderer.attach(window, 320, 240).expect("attach");
+        renderer.paint().expect("the first frame presents");
+        assert_eq!(renderer.device_generation(), 1);
+
+        renderer.simulate_device_loss();
+        renderer
+            .paint()
+            .expect("a lost device is rebuilt and the frame is redrawn, not reported");
+        assert_eq!(
+            renderer.device_generation(),
+            2,
+            "the device should have been replaced"
+        );
+
+        // A swapchain rebuilt from a stale factory can still present the frame it was made for.
+        // Resizing and presenting again is what a swapchain belonging to a dead device cannot do.
+        renderer.resize(400, 300).expect("resize after recovery");
+        renderer.paint().expect("a frame after recovery and resize");
+        assert_eq!(
+            renderer.device_generation(),
+            2,
+            "nothing after the rebuild should have needed another one"
+        );
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }

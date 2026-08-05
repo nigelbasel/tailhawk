@@ -5,6 +5,17 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes `Renderer::simulate_device_loss`, so the shell's tests can drive `SPEC.md` §3.2's
+# device-removed recovery against a real window and a real swapchain. D3D11 offers no way to
+# remove a device on purpose, so the alternative is not testing the recovery path at all.
+#
+# It is a feature rather than `cfg(test)` because the swapchain half of recovery can only be
+# tested from a crate that is allowed to own a window, which the core is not (§3.1). Under
+# resolver 2 a feature enabled by a dev-dependency does not reach a plain `cargo build`, so the
+# shipped binary does not carry the hook.
+test-hooks = []
+
 [dependencies]
 # `SPEC.md` §5.6's resolution order. Both are pure Rust with no C toolchain, which §5.3's
 # zero-C-dependency position requires, and both are Apache-2.0 OR MIT under `deny.toml`.

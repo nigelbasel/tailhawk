@@ -1,9 +1,78 @@
 # Handoff — resume here
 
-**Paused:** 2026-08-05, session 10. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
-both architectures. Only M2's two large-fixture done-criteria remain unrun. **M3 has started with V4,
-the cell model**; `PLAN.md` marks M3 the highest-risk milestone, with a stop-and-reconsider gate at
->50% overrun. **Everything below is on disk and pushed. Nothing is held in a chat session.**
+**Paused:** 2026-08-05, session 11. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
+both architectures. Only M2's two large-fixture done-criteria remain unrun. **M3 is under way: V4
+(the cell model) and V1 (the device) are both done**; `PLAN.md` marks M3 the highest-risk milestone,
+with a stop-and-reconsider gate at >50% overrun. **Everything below is on disk and pushed. Nothing is
+held in a chat session.**
+
+---
+
+## ✅ V1 is done — device-removed recovery, 2026-08-05, session 11
+
+`crates/tailhawk-core/src/gpu.rs`. **136 tests, all passing** (135 core + the shell's one), fmt and
+clippy clean. The device, swapchain and WARP chain were already M0's; what V1 owed was the recovery,
+and `SPEC.md` §3.2 states it as a prohibition — "**Never panic on device-removed** — that is the
+exact bug that crashes wgpu apps on driver auto-update."
+
+**A lost device is now rebuilt inside `Renderer::paint`, and the shell is never told.** A driver
+auto-update, a TDR, a GPU reset, unplugging an external monitor, a laptop switching between its
+integrated and discrete GPUs — all of them arrive as the same four `DXGI_ERROR_DEVICE_*` codes, none
+is a program error, and each is answered by building a new device and redrawing the frame.
+
+**The policy is separated from the D3D calls so it can be tested without a GPU**, and it has one
+subtlety worth not re-deriving:
+
+| Rule | Why |
+|---|---|
+| First loss retries **the same rung** | A driver update leaves the hardware perfectly able to host the next device. Dropping to WARP over one blip trades the GPU away for nothing. |
+| Second loss with no clean frame in between **pins WARP** | A device that dies again immediately is not a blip, and WARP cannot be removed by a driver. |
+| **Only a frame that needed no recovery clears the streak** | Otherwise a device that dies and is rebuilt on *every* frame resets the count each time and rebuilds for ever. |
+| Three rebuilds in one unbroken streak, then **give up** | Rebuilding a D3D11 device on every `WM_PAINT` is worse for the user than a static window. Giving up returns `Err`; the shell drops to the flat background it painted before a device existed, which is still not a panic. |
+
+**The DXGI factory is rebuilt with the swapchain rather than cached, and that is the actual trap.** A
+factory created before a device was removed is stale; a renderer that reuses it comes back
+"recovered" while presenting to nothing. `present()` also *fails* rather than silently succeeding
+when a window is attached but no swapchain exists — which is precisely the state a rebuild that
+forgot to re-attach leaves behind.
+
+### How something D3D11 gives you no way to trigger got tested anyway
+
+D3D11 has no `RemoveDevice` — D3D12 does — and the real causes are a driver update or a TDR, neither
+of which a test can arrange. So a `test-hooks` feature injects the `DXGI_ERROR_DEVICE_REMOVED`, and
+**everything after that point is the real path**: the same classification, the same policy, a real
+device rebuild, a real `Present`. Under resolver 2 a feature turned on by a dev-dependency does not
+reach `cargo build`, and `cargo tree -e normal` confirms the shipped binary does not carry the hook.
+
+**The swapchain half of recovery is tested from the *shell* crate, not the core.** The core may not
+own a window (§3.1), so its own device tests rebuild with nothing attached — and a rebuild that drops
+the swapchain passes all of them. `crates/tailhawk/src/main.rs` has the one test that attaches a real
+hidden window, loses the device, and then resizes and presents again.
+
+**Three negative controls, each applied, observed and reverted:**
+
+| Mutation | Result |
+|---|---|
+| `rebuild` does not re-create the swapchain | **Only the shell test fails.** All 135 core tests pass. That failure is the entire justification for testing this from the shell. |
+| escalation removed (always retry the current rung) | 2 tests fail, including the one that checks a *real* rebuilt device landed on WARP |
+| the clean-frame reset removed | `losses_separated_by_clean_frames_are_recovered_from_indefinitely` fails — the realistic case, a machine that loses its device occasionally over a long session |
+
+**One from-memory constant was written and deleted before commit.** The first draft carried
+`D3DDDIERR_DEVICEREMOVED = 0x88760870`, recalled rather than looked up. Grepping both installed
+Windows SDKs found no such symbol, so it went. The four DXGI codes are each taken from the `windows`
+crate's generated bindings, and `was_lost` asks `GetDeviceRemovedReason()` as well — which covers a
+call that fails with some other code while the device is being removed underneath it, and is why the
+exotic constant bought nothing anyway. Same failure mode as E8's severity tables; caught before
+commit this time rather than by review.
+
+**Two smaller things came with it.** `Renderer::driver()` is now live rather than fixed at startup —
+recovery can move the device to WARP and the title bar is the only place this build says which rung
+it is on, so the shell re-reads it after each paint. And `#![windows_subsystem = "windows"]` is now
+`cfg_attr(not(test), …)`: a GUI-subsystem test harness has nowhere to print.
+
+**Static `tailhawk.exe` is 505,856 bytes**, against 502,784 at M1 and V4. Still 3.2% of §11.2's
+15 MB gate. Smoke-tested: the static build opens, comes up on the hardware rung, and titles itself
+`Tailhawk — hardware`.
 
 ---
 
@@ -78,9 +147,10 @@ this one.
 
 ### ▶ Resume here: V2 or V3
 
-Both sit directly on `cell.rs` and neither is started. **V1 is largely M0's already** — device,
-swapchain and the WARP chain exist; what V1 still owes is **device-removed recovery**, which is small
-and has no dependencies, so it is the cheapest thing to pick up cold.
+Both sit directly on `cell.rs` and neither is started. ~~V1 still owes device-removed recovery~~ —
+**V1 is done, session 11; see the section at the top of this file.** So M3's remaining work is V2,
+V3 and V11, and **V2 is the one to take next**: V3's grid has to draw something, and the atlas is
+what it draws with.
 
 - **V3 (grid)** owes §3.3's `max_byte_len` / `all_ascii` extent fields. **These must be captured
   during the index scan** — §3.3 says they are free there, and the reason is that recovering them

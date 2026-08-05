@@ -99,9 +99,19 @@ impl Renderer {
         })
     }
 
-    /// Which rung of the fallback chain the device actually came up on.
+    /// Which rung of the fallback chain the device is *currently* on.
+    ///
+    /// This can change while the renderer is running: `SPEC.md` §3.2's device-removed recovery
+    /// drops to WARP when a device will not stay up, so a caller that shows this to the user
+    /// should re-read it rather than cache it.
     pub fn driver(&self) -> Driver {
-        self.gpu.driver
+        self.gpu.driver()
+    }
+
+    /// How many graphics devices this renderer has built, starting at 1. It rises when a lost
+    /// device is replaced, which is otherwise an entirely invisible event.
+    pub fn device_generation(&self) -> u32 {
+        self.gpu.generation()
     }
 
     /// Binds the renderer to a window. Idempotent.
@@ -115,9 +125,25 @@ impl Renderer {
 
     /// Draws one frame and presents it. At M0 this is the background clear and nothing else —
     /// the grid arrives at M3.
+    ///
+    /// A device lost between frames — a driver auto-update, a TDR, a GPU switch — is rebuilt
+    /// here and the frame is redrawn, so the caller sees `Ok` and never learns it happened.
+    /// `SPEC.md` §3.2 forbids panicking on device-removed; an `Err` here means the device could
+    /// not be rebuilt after several attempts, not that the process should end.
     pub fn paint(&mut self) -> Result<()> {
-        self.gpu.draw_background(BACKGROUND)?;
-        self.gpu.present()
+        self.gpu.render_frame(BACKGROUND)
+    }
+
+    /// Makes the next [`paint`](Self::paint) see the device as removed, so the recovery path runs
+    /// for real against a real device.
+    ///
+    /// D3D11 has no API for removing a device — unlike D3D12's `RemoveDevice` — and the genuine
+    /// causes are a driver update or a TDR, neither of which a test can arrange. Everything after
+    /// the injected `DXGI_ERROR_DEVICE_REMOVED` is the real path: the same classification, the
+    /// same policy, a real device rebuild and a real `Present`.
+    #[cfg(feature = "test-hooks")]
+    pub fn simulate_device_loss(&mut self) {
+        self.gpu.simulate_device_loss();
     }
 }
 
