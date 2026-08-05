@@ -248,13 +248,24 @@ this one.
 both. DirectWrite cross-compiles to ARM64 without complaint, and the runner ran the same 158 + 1
 tests this machine does.
 
-**⚠ Whether the device and font tests actually *did* anything on the runner was not knowable from
-that log, and the CI step is changed so the next one says.** Those tests skip loudly rather than fail
-when there is no D3D11 device, no window station or no usable font — but `cargo test` captures the
-output of passing tests, so a skip and a real run look identical in the log, and a skipped test still
-counts as passed. The `Test` step now runs with `-- --nocapture`, which is the only thing that makes
-the distinction visible. **A green device test is not evidence the device path ran** unless the skip
-message is absent from the log.
+### ✅ The device and font tests really do run on the CI runner — checked, not assumed
+
+**The `Test` step runs with `-- --nocapture`, and that is load-bearing.** Several tests skip loudly
+rather than fail when there is no D3D11 device, no window station or no usable font — but `cargo
+test` captures the output of *passing* tests, so without `--nocapture` a skip and a real run are
+indistinguishable in the log and a skipped device test reads as a green one. **A green device test is
+not evidence the device path ran** unless the skip message is absent.
+
+Run `31013808780` (`06005e0`) is the first with the messages visible: **no `SKIPPED` line anywhere in
+the log**, against 8 `test result: ok` lines from the same fetch, so the log was genuinely read. So
+the GitHub `windows-latest` runner has a D3D11 device, a window station and one of the candidate
+faces, and it exercised device-removed recovery with a real swapchain and rasterised real glyphs.
+That was an open question — the tests were written to degrade rather than fail precisely because a
+headless runner was a real possibility.
+
+**This paragraph replaces a claim I made without checking.** Session 11 first asserted the runner had
+not skipped them, on the strength of the test *counts* — which cannot show it either way, because a
+skipped test still counts as passed. The counts were right and the inference was not.
 
 ### ▶ Resume here: V2's sheets, upload and instanced draw
 
