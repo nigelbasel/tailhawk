@@ -2,9 +2,66 @@
 
 **Paused:** 2026-08-05, session 11. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
 both architectures. Only M2's two large-fixture done-criteria remain unrun. **M3 is under way: V4
-(the cell model) and V1 (the device) are both done**; `PLAN.md` marks M3 the highest-risk milestone,
-with a stop-and-reconsider gate at >50% overrun. **Everything below is on disk and pushed. Nothing is
+(the cell model) and V1 (the device) are done, and V2 has started with the atlas allocator**;
+`PLAN.md` marks M3 the highest-risk milestone, with a stop-and-reconsider gate at >50% overrun. **Everything below is on disk and pushed. Nothing is
 held in a chat session.**
+
+---
+
+## 🚧 V2 has started — the atlas allocator, 2026-08-05, session 11
+
+`crates/tailhawk-core/src/atlas.rs`. **150 tests, all passing**, fmt and clippy clean. This is the
+half of the atlas that touches no device: which glyph lives in which cell, which cell is given up
+when the sheet is full, and which glyphs are known to have no ink. **Rasterising into those cells is
+not written yet** — that is the DirectWrite leaf, and it is the next thing to build.
+
+**Nothing here was designed this session.** Every rule is a conclusion of `g4-glyph-atlas` or
+`g4b-batched-raster`, and the module cites the measurement beside each one:
+
+| Rule | The measurement behind it |
+|---|---|
+| Uniform slots, one glyph each | A variant allowing a glyph to span adjacent slots cost **106 ms/frame** — the victim search became O(capacity × span) and had to find a free *run* |
+| O(1) intrusive victim list | **4–9 ms/frame** scanning for the oldest against **0.17–0.37 ms** for the list. 20–28x in every run |
+| A slot touched this frame is never evicted | Otherwise the frame overwrites a cell it is about to draw from |
+| Cache the absence of ink | G4's first run: exactly **440 spurious misses per frame** from ten spaces per row |
+| The slot size comes from measured bounds, never from em | G4b guessed 20×26 for em 14 and clipped **1,086 of 1,500** glyphs — and the clipped cells then compared *equal*, which reads as a correctness pass |
+
+**Vacant slots start at the head of the LRU list**, so allocation and eviction are the same operation
+and neither needs a search or a separate free list. The head is either an empty cell or the oldest
+resident; if the head was used this frame then every slot was, and `insert` reports
+`SheetFullThisFrame` rather than corrupting the frame.
+
+**Three decisions the experiments did not settle.**
+
+- **The key carries the face and a synthetic-style flag**, not just §3.2's "(glyph id, style, dpi
+  scale)". Glyph ids are face-local, and font fallback (§3.3) means one viewport draws from several
+  faces at once — glyph 42 of the CJK fallback is not glyph 42 of the primary. Bold and italic are
+  normally separate faces and so are already covered; what is not is a *synthetic* bold or oblique
+  applied to the same face, which is the same glyph id at the same size with a different raster.
+- **The size in the key is whole device pixels**, not points and not a scale factor, because §3.2
+  requires integer device-pixel advances and a float key could hold two rasters that round to one
+  cell.
+- **The blank set is bounded and dropped wholesale when it overflows.** A blank costs no slot, so
+  nothing else bounds it, and a viewer left open for days on logs full of unusual codepoints would
+  grow the map for ever. Rebuilding a blank costs one miss, not a rasterisation, so it does not earn
+  an LRU of its own.
+
+**Three negative controls, each applied, observed and reverted:**
+
+| Mutation | Result |
+|---|---|
+| the never-evict-this-frame guard removed | `a_slot_used_in_this_frame_is_never_evicted` fails |
+| `lookup` no longer touches — i.e. FIFO, not LRU | `the_glyph_nobody_asked_for_is_the_one_evicted` fails |
+| eviction forgets to drop the victim's map entry | **3 tests fail**, including the thrashing one, where two keys end up pointing at one slot |
+
+**⚠ What V2 still owes**, in the order it is worth building: the DirectWrite rasteriser (batch 4–64
+glyphs per `CreateGlyphRunAnalysis` — bit-identical and ~1.8x on the cold path, a *pessimisation*
+past 256); the two sheets and the upload; the dual-source blend state and the instanced draw
+(`SrcBlend = ONE`, `DestBlend = INV_SRC1_COLOR`, and **the alpha slots take `INV_SRC1_ALPHA` or
+`CreateBlendState` fails with a bare `E_INVALIDARG`**); the colour path through
+`TranslateColorGlyphRun`; and the placeholder-and-fill-in-later behaviour that keeps rasterisation
+off the paint path. **Read both `RESULTS.md` files before writing any of it** — G4's absolute
+µs/glyph figures are cache-thrash figures and are superseded by G4b.
 
 ---
 
@@ -145,12 +202,10 @@ in, and it applies to everything M2 and M3 have added so far. **The real size co
 tables lands the moment the grid references them**, and that is the measurement to take at V3 — not
 this one.
 
-### ▶ Resume here: V2 or V3
+### ▶ Resume here: V2's rasteriser
 
-Both sit directly on `cell.rs` and neither is started. ~~V1 still owes device-removed recovery~~ —
-**V1 is done, session 11; see the section at the top of this file.** So M3's remaining work is V2,
-V3 and V11, and **V2 is the one to take next**: V3's grid has to draw something, and the atlas is
-what it draws with.
+~~V1 still owes device-removed recovery~~ — **V1 is done, and V2 is started**, both session 11; see
+the two sections at the top of this file. M3's remaining work is **the rest of V2**, then V3 and V11.
 
 - **V3 (grid)** owes §3.3's `max_byte_len` / `all_ascii` extent fields. **These must be captured
   during the index scan** — §3.3 says they are free there, and the reason is that recovering them

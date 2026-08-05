@@ -9,6 +9,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod atlas;
 pub mod cell;
 pub mod encoding;
 pub mod index;
@@ -28,6 +29,9 @@ pub use gpu::Driver;
 #[cfg(windows)]
 pub use file::{FileError, FileIdentity, FileSource, LogFile};
 
+pub use atlas::{
+    Atlas, FaceId, GlyphId, GlyphKey, Ink, InsertError, Placement, Residency, SlotId, Synthetic,
+};
 pub use cell::{Cell, CellModel};
 pub use encoding::{detect, Charset, Confidence, Detection, Sample};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
