@@ -23,6 +23,29 @@ the crash a non-event.
 | **Done:** index a 10 GB fixture with bounded memory | **Not run** — needs 10 GB of scratch disk. Peak indexing memory is now *asserted by construction* rather than hoped for: `read_bytes × threads` (2 MB at the defaults) plus the anchors, with **no per-chunk buffer of line starts**. |
 | **Done:** 4 GB UTF-16LE on 8 threads is byte-identical to serial | **Run in miniature, not at 4 GB.** `a_real_file_indexes_the_same_on_many_threads_as_on_one` drives a real `LogFile` on all cores over a 20,000-line UTF-16LE fixture with a BOM and misaligned-`0x0A` decoys, and compares serial against parallel line by line *and* against the decoder. The property is tested; the scale is not. |
 
+**CI is green on `87d1cae`** — run `31000029072`, 2m15s, all three jobs: `deny`, x64 and **ARM64**,
+with both unsigned artefacts produced. `std::thread::scope` and the indexer cross-compile to ARM64
+without complaint.
+
+### `gh` is installed now — stop reading the Actions page in a browser
+
+`winget install --id GitHub.cli`, done in session 10. Authenticated as `nigelbasel`, scopes
+`gist`/`read:org`/`repo`.
+
+**A session that has not been restarted since the install will not find it on `PATH`** — use the full
+path, which needs the quotes:
+
+```bash
+"/c/Program Files/GitHub CLI/gh.exe" run list --limit 5
+"/c/Program Files/GitHub CLI/gh.exe" run view <run-id>
+```
+
+Two notes for whoever sets this up again. `gh auth login` **exceeds a 120 s tool timeout and lands in
+the background** — that is normal, not a hang: it prints a one-time code and then polls until the code
+is entered at `github.com/login/device`. Nothing is written to `~/.config/gh` until that happens, so
+`gh auth status` reports "not logged into any hosts" for the whole waiting period even though the
+flow is working. Logging in to github.com in a browser is *not* the same step as submitting the code.
+
 ### The one design decision, and why it went the way it did
 
 **A worker cannot know the global line number its chunk starts at** — that is settled only once every
@@ -391,8 +414,8 @@ M0's, which is a misleading way to measure a dependency.
 
 Session 7 left this as the first thing to check. It has run twice and both runs succeeded.
 **The ARM64 leg linked** — run #2 (`dbe45b6`) produced `tailhawk-arm64-unsigned` alongside the x64
-artefact. The ⚠ is deleted from the M0 table below. There is still no `gh` CLI on this machine; the
-Actions page was read through the browser.
+artefact. The ⚠ is deleted from the M0 table below. ~~There is still no `gh` CLI on this machine; the
+Actions page was read through the browser.~~ — **`gh` is installed as of session 10**, see below.
 
 **Run #3 carried all of M1's code and passed on both architectures** — clippy, `fmt`, 56 tests, the
 size gate, and both binary-content assertions (no `d3dcompiler`, no CRT redistributable).
