@@ -76,6 +76,22 @@ in, and it applies to everything M2 and M3 have added so far. **The real size co
 tables lands the moment the grid references them**, and that is the measurement to take at V3 — not
 this one.
 
+### ▶ Resume here: V2 or V3
+
+Both sit directly on `cell.rs` and neither is started. **V1 is largely M0's already** — device,
+swapchain and the WARP chain exist; what V1 still owes is **device-removed recovery**, which is small
+and has no dependencies, so it is the cheapest thing to pick up cold.
+
+- **V3 (grid)** owes §3.3's `max_byte_len` / `all_ascii` extent fields. **These must be captured
+  during the index scan** — §3.3 says they are free there, and the reason is that recovering them
+  later means a second pass over 10 GB. `index.rs` has neither field yet. Do this *with* V3's
+  scrollbar, not before, but do not let V3 ship without it.
+- **V2 (atlas)** is the higher-risk half and has the most prior art already measured:
+  `experiments/g4-glyph-atlas/RESULTS.md` and `experiments/g4b-batched-raster/RESULTS.md` settle the
+  eviction policy, the batching win (~1.8x, saturating at 4) and the cross-process font-cache
+  behaviour. **Read both before writing any rasterisation code** — G4's absolute µs/glyph figures are
+  cache-thrash figures and are superseded by G4b.
+
 **Out of scope for this file, deliberately:** font fallback and the colour-glyph atlas are V2;
 §3.3's `max_byte_len` / `all_ascii` horizontal-extent rule belongs with V3's scrollbar, because it is
 the scrollbar that needs a conservative upper bound before layout has run. `cell_count_never_exceeds_byte_length`
