@@ -12,6 +12,7 @@
 pub mod atlas;
 pub mod cell;
 pub mod encoding;
+pub mod grid;
 pub mod index;
 pub mod indexer;
 pub mod lines;
@@ -49,6 +50,7 @@ pub use atlas::{
 };
 pub use cell::{Cell, CellModel};
 pub use encoding::{detect, Charset, Confidence, Detection, Sample};
+pub use grid::{Grid, PlacedRow, Scroll};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
 pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};
 pub use lines::LineDecoder;
