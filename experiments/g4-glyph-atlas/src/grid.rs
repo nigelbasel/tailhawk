@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct3D::{
     ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_BUFFER,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
+    ID3D11Buffer, ID3D11BlendState, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
     ID3D11Query, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11VertexShader,
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC,
     D3D11_BLEND_INV_SRC1_ALPHA, D3D11_BLEND_INV_SRC1_COLOR, D3D11_BLEND_INV_SRC_ALPHA,
@@ -162,7 +162,10 @@ fn compile(entry: &str, target: &str) -> Result<ID3DBlob> {
     if let Err(e) = hr {
         if let Some(err) = errors {
             let msg = unsafe {
-                std::slice::from_raw_parts(err.GetBufferPointer() as *const u8, err.GetBufferSize())
+                std::slice::from_raw_parts(
+                    err.GetBufferPointer() as *const u8,
+                    err.GetBufferSize(),
+                )
             };
             crate::emit_err(&String::from_utf8_lossy(msg));
         }
@@ -360,15 +363,11 @@ impl Grid {
         let raster = if colour_wanted {
             match text::raster_colour(&self.fonts, face, glyph, EM, [1.0, 1.0, 1.0, 1.0]) {
                 Ok(Some(r)) => Some(r),
-                Ok(None) => text::raster_mono(&self.fonts, face, glyph, EM)
-                    .ok()
-                    .flatten(),
+                Ok(None) => text::raster_mono(&self.fonts, face, glyph, EM).ok().flatten(),
                 Err(_) => None,
             }
         } else {
-            text::raster_mono(&self.fonts, face, glyph, EM)
-                .ok()
-                .flatten()
+            text::raster_mono(&self.fonts, face, glyph, EM).ok().flatten()
         };
         let t1 = crate::now();
         self.cache.stats.raster_ns += ns(t0, t1);
@@ -419,11 +418,7 @@ impl Grid {
         let (x, y) = (alloc.col * SLOT_W, alloc.row * SLOT_H);
 
         let t2 = crate::now();
-        let tex = if raster.colour {
-            &self.colour
-        } else {
-            &self.mono
-        };
+        let tex = if raster.colour { &self.colour } else { &self.mono };
         tex.upload(&self.ctx_of(), x, y, w, h, &raster.pixels);
         let t3 = crate::now();
         self.cache.stats.upload_ns += ns(t2, t3);
@@ -522,13 +517,7 @@ impl Grid {
         unsafe {
             let mut mapped = Default::default();
             if ctx
-                .Map(
-                    &self.consts,
-                    0,
-                    D3D11_MAP_WRITE_DISCARD,
-                    0,
-                    Some(&mut mapped),
-                )
+                .Map(&self.consts, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
                 .is_ok()
             {
                 std::ptr::copy_nonoverlapping(&c, mapped.pData as *mut Consts, 1);
@@ -553,7 +542,10 @@ impl Grid {
             ctx.VSSetShaderResources(0, Some(&[Some(self.instance_srv.clone())]));
             ctx.PSSetShaderResources(
                 1,
-                Some(&[Some(self.mono.srv.clone()), Some(self.colour.srv.clone())]),
+                Some(&[
+                    Some(self.mono.srv.clone()),
+                    Some(self.colour.srv.clone()),
+                ]),
             );
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             let blend = if unified {
@@ -883,9 +875,7 @@ impl Grid {
             "atlas {ATLAS_W}x{ATLAS_H}, slot {SLOT_W}x{SLOT_H}, em {EM}, slots {}\n\n",
             self.cache.slots.capacity()
         ));
-        s.push_str(
-            "| phase | draws | instances | cpu p50 | cpu p99 | gpu p50 | gpu p99 | gpu max |\n",
-        );
+        s.push_str("| phase | draws | instances | cpu p50 | cpu p99 | gpu p50 | gpu p99 | gpu max |\n");
         s.push_str("|---|---|---|---|---|---|---|---|\n");
         for p in &self.phases {
             let c = pct(&p.cpu_ms);
@@ -965,8 +955,10 @@ fn fixture_mixed() -> Vec<Vec<(u16, u32)>> {
     let template = "2026-07-30 09:14:02,431 INFO  Tailhawk.Grid  atlas warm, viewport painted ";
     (0..44)
         .map(|r| {
-            let mut row: Vec<(u16, u32)> =
-                template.chars().map(|c| (FACE_MONO, c as u32)).collect();
+            let mut row: Vec<(u16, u32)> = template
+                .chars()
+                .map(|c| (FACE_MONO, c as u32))
+                .collect();
             row.push((FACE_EMOJI, EMOJI[r % EMOJI.len()]));
             row
         })
