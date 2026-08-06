@@ -1,5 +1,53 @@
 # Handoff — resume here
 
+## ✅ Visual reordering — `bidi.rs`, and the level `shape.rs` was throwing away — 2026-08-06, session 14
+
+**267 tests, all passing**, fmt and clippy clean on the two shipped crates. `shape.rs` measured in
+session 13 that `GetGlyphs` returns a right-to-left run's glyphs in **logical** order and recorded
+that "visual reordering is the drawing code's job, and V3 owes it". **That debt is now paid.**
+
+`crates/tailhawk-core/src/bidi.rs` is UAX #9 rule L2 and nothing else — portable, device-free,
+testable against the standard without a font. `Shaped::visual_glyphs()` is the DirectWrite-side entry
+point, and the real-font test asserts the exact inverse of session 13's finding: alef came back at
+glyph index 0 from `GetGlyphs`, and must come back **last** from `visual_glyphs`.
+
+### ⚠ `shape.rs` was storing `right_to_left: bool` and the magnitude of the level was lost
+
+L2 needs the *number*, not the parity. An odd/even bit cannot tell a left-to-right phrase embedded in
+a right-to-left sentence (level 2 inside level 1) from an unrelated left-to-right run at level 0, and
+the two paint in different places. `Run` now carries `level: u8` with `right_to_left()` derived from
+it, and `Shaped::runs` exposes it. `AnalyzeBidi` was already reporting the resolved level correctly —
+it was being discarded one line after arriving.
+
+### Three findings, each from a control that fired
+
+| Claim | How it was checked |
+|---|---|
+| **Per-*glyph* levels, not per-run** — reordering runs alone puts the runs in the right places and leaves the glyphs *inside* a right-to-left run in logical order. The bug moves from the line to the word. | Rewrote `visual_glyphs` to reorder runs only: **2 real-font tests fail**, including the Arabic word. |
+| **"Lowest odd level" is not "lowest level."** Taking the minimum level starts the loop at 0, whose window is the whole line — **it reverses every left-to-right line in the file.** | **8 tests fail**, including `visual_glyphs_leaves_a_left_to_right_line_alone`. |
+| **The loop counts *down*.** Ascending reverses the outer run first and then flips the embedded phrase back inside it, giving a plausible line with the embedded fragment backwards. | 3 fail, including the mixed real-font line. |
+
+### ⚠ A symmetric nesting cannot see the pass order, and two fixtures were symmetric
+
+Reversing a window and then reversing a sub-window **symmetric about its centre** gives the same
+answer either way round. `ABokCD` at levels `[1,1,2,2,1,1]` agrees under both orders — it reads as a
+passing test of a property it cannot observe, and the ascending control did not fire on
+`a_doubly_nested_embedding_carries_its_inner_block_as_a_unit` for exactly that reason. Both fixtures
+are now off-centre, and the control fires on both. Same shape as `raster.rs`'s `tighten` and
+`shape.rs`'s `glyph_range`: **a control that does not fire is a statement about the fixtures.**
+
+Two of my own test *expectations* were also wrong and the code was right — `[124,125,125,124]`
+reorders only the level-125 pair, because 124 is even. Corrected in the test, not the algorithm.
+
+### ▶ Resume here: the last V3 piece
+
+- **Horizontal scrolling**, which §3.3's extent fields exist to size. It is the only V3 item left.
+- **Still nothing consumes `Grid`, `Selection` or `visual_glyphs`.** All three are exported and
+  unwired, so their defects stay latent until a viewport is attached — and the static exe is
+  unchanged, so every size figure quoted since M2 remains an LTO artefact.
+
+---
+
 ## ✅ V3's selection model — `selection.rs`, plus `cell.rs`'s two new functions — 2026-08-06, session 14
 
 **251 tests, all passing** (251 core + the shell's one), fmt and clippy clean on the two shipped

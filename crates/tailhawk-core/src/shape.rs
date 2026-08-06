@@ -127,6 +127,23 @@ pub struct ClusterGlyphs {
     pub glyph_count: usize,
 }
 
+/// One shaped run, and the resolved bidi level that decides where it is painted.
+///
+/// **The level is kept as a number, not as a `right_to_left` flag.** UAX #9's reordering needs the
+/// magnitude: an odd/even bit cannot distinguish a left-to-right phrase embedded in a right-to-left
+/// sentence (level 2 inside level 1) from an unrelated left-to-right run at level 0, and the two are
+/// painted in different places. `shape.rs` itself only ever asks whether the level is odd, which is
+/// how the flag survived until [`crate::bidi`] needed the rest of it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShapedRun {
+    /// The resolved bidi level, from `AnalyzeBidi`. Odd is right-to-left.
+    pub level: u8,
+    /// Index into [`Shaped::glyphs`] of this run's first glyph.
+    pub first_glyph: usize,
+    /// How many consecutive glyphs belong to it.
+    pub glyph_count: usize,
+}
+
 /// The result of shaping one line.
 ///
 /// `glyphs`, `advances` and `offsets` are parallel arrays; `clusters` is in logical order and
@@ -134,19 +151,45 @@ pub struct ClusterGlyphs {
 ///
 /// **The glyph arrays are in logical order too, including for right-to-left runs** — that was
 /// measured, not assumed, and it is the opposite of the obvious guess. See
-/// `directwrite_returns_glyphs_in_logical_order`. Visual reordering is the drawing code's job.
+/// `directwrite_returns_glyphs_in_logical_order`. [`Shaped::visual_glyphs`] is the reordering.
 #[derive(Clone, Debug, Default)]
 pub struct Shaped {
     pub glyphs: Vec<GlyphId>,
     pub advances: Vec<f32>,
     pub offsets: Vec<GlyphOffset>,
     pub clusters: Vec<ClusterGlyphs>,
+    /// The runs, in **logical** order, each with the level [`Shaped::visual_glyphs`] reorders by.
+    pub runs: Vec<ShapedRun>,
 }
 
 impl Shaped {
     /// The glyphs that draw one cluster. Empty when the cluster was absorbed into a ligature.
     pub fn glyphs_of(&self, cluster: &ClusterGlyphs) -> &[GlyphId] {
         &self.glyphs[cluster.first_glyph..cluster.first_glyph + cluster.glyph_count]
+    }
+
+    /// Glyph indices in the order they are painted, left to right.
+    ///
+    /// **The whole reason this exists is that `GetGlyphs` does not do it.** It returns a
+    /// right-to-left run's glyphs in *logical* order, which was measured rather than assumed
+    /// (`directwrite_returns_glyphs_in_logical_order`), so painting `self.glyphs` in array order
+    /// draws Arabic and Hebrew backwards.
+    ///
+    /// **One level per glyph, not one per run, and that is not an optimisation left on the table.**
+    /// Reordering runs alone puts the runs in the right places and leaves the glyphs *inside* a
+    /// right-to-left run still in logical order — the bug moves from the line to the word. Expanding
+    /// each run's level across its glyphs makes UAX #9's own reversal do both jobs in one pass,
+    /// because reversing a window at level ≥ N reverses the items within it as well as the blocks.
+    ///
+    /// The identity for a line with no right-to-left content, which is almost every line in almost
+    /// every log.
+    pub fn visual_glyphs(&self) -> Vec<usize> {
+        let mut levels = vec![0u8; self.glyphs.len()];
+        for run in &self.runs {
+            let end = (run.first_glyph + run.glyph_count).min(levels.len());
+            levels[run.first_glyph.min(end)..end].fill(run.level);
+        }
+        crate::bidi::visual_order(&levels)
     }
 
     /// The cluster containing a byte offset, if any.
@@ -163,7 +206,13 @@ struct Run {
     unit: usize,
     unit_len: usize,
     script: DWRITE_SCRIPT_ANALYSIS,
-    right_to_left: bool,
+    level: u8,
+}
+
+impl Run {
+    fn right_to_left(&self) -> bool {
+        self.level % 2 == 1
+    }
 }
 
 /// What the sink collects. Shared with the COM object by `Rc` rather than read back out of it,
@@ -574,7 +623,7 @@ impl Shaper {
                 unit: w[0],
                 unit_len: w[1] - w[0],
                 script: at(&collected.scripts, w[0]).unwrap_or_default(),
-                right_to_left: at(&collected.levels, w[0]).unwrap_or(0) % 2 == 1,
+                level: at(&collected.levels, w[0]).unwrap_or(0),
             })
             .collect())
     }
@@ -593,7 +642,7 @@ impl Shaper {
         // which is what lets a run start in the middle of the line's buffer.
         let start = PCWSTR(line.text[run.unit..].as_ptr());
         let sideways = false;
-        let rtl = run.right_to_left;
+        let rtl = run.right_to_left();
         let locale = PCWSTR(self.locale.as_ptr());
 
         let mut cluster_map = vec![0u16; len];
@@ -668,6 +717,11 @@ impl Shaper {
         };
 
         let base = out.glyphs.len();
+        out.runs.push(ShapedRun {
+            level: run.level,
+            first_glyph: base,
+            glyph_count: count,
+        });
         out.glyphs.extend_from_slice(&glyphs);
         out.advances.extend_from_slice(&advances);
         out.offsets.extend(offsets.iter().map(|o| GlyphOffset {
@@ -1238,6 +1292,117 @@ mod tests {
         );
     }
 
+    /// The other half of the finding above: `visual_glyphs` is what puts that array right.
+    ///
+    /// Same discriminator — alef joins to its right but not its left, so it is identifiable in the
+    /// `.cmap` and is unambiguously the *last* thing painted in a right-to-left word. It came back
+    /// at glyph index 0 from `GetGlyphs`; it must come back last here.
+    #[test]
+    fn visual_glyphs_paints_a_right_to_left_run_the_other_way_round() {
+        let Some((shaper, face)) = shaper_and_face(
+            "visual_glyphs_paints_a_right_to_left_run_the_other_way_round",
+            ARABIC,
+        ) else {
+            return;
+        };
+        let word = "\u{627}\u{628}\u{628}";
+        if !covered(&face, word) {
+            eprintln!("SKIPPED visual_glyphs_...: {} lacks Arabic", face.family);
+            return;
+        }
+        let shaped = shaper.shape(&face, word, EM).expect("shape");
+        assert!(
+            shaped.runs.iter().any(|r| r.level % 2 == 1),
+            "the run must actually be marked right-to-left: {:?}",
+            shaped.runs
+        );
+
+        let order = shaped.visual_glyphs();
+        assert_eq!(
+            order,
+            vec![2, 1, 0],
+            "an all-right-to-left word paints back to front; glyphs were {:?}",
+            shaped.glyphs
+        );
+
+        let alef = face.glyph_indices(&[0x627])[0];
+        assert_eq!(
+            shaped.glyphs[*order.last().expect("a glyph")],
+            alef,
+            "alef is logically first and so is painted last (rightmost)"
+        );
+    }
+
+    /// A Latin line is the overwhelmingly common case and must not be permuted at all.
+    #[test]
+    fn visual_glyphs_leaves_a_left_to_right_line_alone() {
+        let Some((shaper, face)) =
+            shaper_and_face("visual_glyphs_leaves_a_left_to_right_line_alone", LATIN)
+        else {
+            return;
+        };
+        let shaped = shaper
+            .shape(&face, "2026-08-06 WARN retrying", EM)
+            .expect("shape");
+        assert_eq!(
+            shaped.visual_glyphs(),
+            (0..shaped.glyphs.len()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Latin either side of Arabic: the Arabic reverses, the Latin does not, and — the part run-level
+    /// reordering alone gets wrong — the glyphs *inside* the Arabic reverse with it.
+    #[test]
+    fn a_mixed_line_reverses_only_its_right_to_left_run() {
+        let Some((shaper, face)) =
+            shaper_and_face("a_mixed_line_reverses_only_its_right_to_left_run", ARABIC)
+        else {
+            return;
+        };
+        let line = "GET \u{627}\u{628}\u{628} 200";
+        if !covered(&face, line) {
+            eprintln!("SKIPPED a_mixed_line_...: {} lacks coverage", face.family);
+            return;
+        }
+        let shaped = shaper.shape(&face, line, EM).expect("shape");
+        let order = shaped.visual_glyphs();
+
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..shaped.glyphs.len()).collect::<Vec<_>>());
+
+        let rtl: Vec<&ShapedRun> = shaped.runs.iter().filter(|r| r.level % 2 == 1).collect();
+        assert!(!rtl.is_empty(), "runs were {:?}", shaped.runs);
+        for run in rtl {
+            let range = run.first_glyph..run.first_glyph + run.glyph_count;
+            let painted: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|i| range.contains(i))
+                .collect();
+            let mut descending = painted.clone();
+            descending.sort_unstable_by(|a, b| b.cmp(a));
+            assert_eq!(
+                painted, descending,
+                "the glyphs of a right-to-left run must paint in descending logical order; \
+                 order was {order:?} for runs {:?}",
+                shaped.runs
+            );
+        }
+
+        for run in shaped.runs.iter().filter(|r| r.level % 2 == 0) {
+            let range = run.first_glyph..run.first_glyph + run.glyph_count;
+            let painted: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|i| range.contains(i))
+                .collect();
+            let mut ascending = painted.clone();
+            ascending.sort_unstable();
+            assert_eq!(painted, ascending, "a left-to-right run keeps its order");
+        }
+    }
+
     /// A ZWJ emoji sequence is one cluster however many code points it holds — and the shaper must
     /// agree with `cell.rs` about that, or the grid draws six glyphs in a two-column cell.
     #[test]
@@ -1317,7 +1482,7 @@ mod tests {
                 .runs(&line)
                 .expect("runs")
                 .iter()
-                .map(|r| r.right_to_left)
+                .map(|r| r.right_to_left())
                 .collect::<Vec<_>>()
         };
 
