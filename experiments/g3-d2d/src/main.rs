@@ -92,7 +92,12 @@ impl Renderer {
         let target = self.target.as_ref().expect("target created above");
         unsafe {
             target.BeginDraw();
-            target.Clear(Some(&D2D1_COLOR_F { r: 0.09, g: 0.10, b: 0.12, a: 1.0 }));
+            target.Clear(Some(&D2D1_COLOR_F {
+                r: 0.09,
+                g: 0.10,
+                b: 0.12,
+                a: 1.0,
+            }));
             target.EndDraw(None, None)?;
         }
         if !self.reported {
@@ -128,7 +133,9 @@ fn report(p: Phases) {
         "{:.3},{:.3},{:.3},{:.3},{:.3}",
         p.factory, p.window, p.target, p.first_draw, p.total
     );
-    let text = format!("g3-d2d {line}\0").encode_utf16().collect::<Vec<u16>>();
+    let text = format!("g3-d2d {line}\0")
+        .encode_utf16()
+        .collect::<Vec<u16>>();
     unsafe {
         windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(PCWSTR(text.as_ptr()));
     }
@@ -146,7 +153,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = r.paint(hwnd);
                 }
             });
-            unsafe { let _ = ValidateRect(hwnd, None); };
+            unsafe {
+                let _ = ValidateRect(hwnd, None);
+            };
             LRESULT(0)
         }
         WM_SIZE => {
@@ -216,7 +225,9 @@ fn main() -> Result<()> {
         }
     });
 
-    unsafe { let _ = ShowWindow(hwnd, SW_SHOW); };
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    };
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {

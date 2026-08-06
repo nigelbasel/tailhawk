@@ -181,6 +181,85 @@ impl CellModel {
         }
         line.len()
     }
+
+    /// The bytes a half-open **range** of cell columns covers — what a selection copies.
+    ///
+    /// **This is not `byte_at_cell(start)..byte_at_cell(end)`, and the difference is §5.6.**
+    /// `byte_at_cell` skips zero-width clusters because they cannot be clicked, and composing two of
+    /// them therefore **drops them from the copied bytes**. `"\u{202E}abc"` — the Trojan Source line
+    /// §13.4 names — puts the override and `a` both at column 0, so selecting the whole visible line
+    /// would yield `abc` and silently discard the attacker-supplied override. §5.6 forbids discarding
+    /// content silently, and a copy that launders a bidi override is the worst version of it: the
+    /// user pastes something that reads differently from what they selected.
+    ///
+    /// So the two ends round **outwards**, not the same way:
+    ///
+    /// - the **start** takes the *lowest* byte at that column, pulling in zero-width clusters sitting
+    ///   there;
+    /// - the **end** takes the *highest*, pulling in zero-width clusters trailing the last visible
+    ///   one.
+    ///
+    /// **A zero-width cluster on an interior boundary therefore belongs to both neighbours**, and
+    /// that is deliberate: two adjacent selections copy it twice rather than neither. Duplicating an
+    /// invisible character is a cosmetic wrong answer; losing one changes what the text means.
+    ///
+    /// A column landing inside a wide cluster takes the whole cluster at either end, for the same
+    /// reason [`CellModel::byte_at_cell`] does — half a CJK character is not a thing to select, and
+    /// the byte offset that would express it is one the decoder cannot honour.
+    ///
+    /// **An empty column range is empty in bytes too**, and that needs saying because the outward
+    /// rounding above would otherwise contradict it: a zero-width cluster sitting exactly on the
+    /// caret's column satisfies *both* ends of a `c..c` range, so a caret would have copied the bidi
+    /// override next to it. A caret is not a selection and copies nothing.
+    pub fn byte_span(&self, line: &str, cells: core::ops::Range<usize>) -> core::ops::Range<usize> {
+        if cells.start >= cells.end {
+            let at = self.byte_at_cell(line, cells.start);
+            return at..at;
+        }
+        let mut start = None;
+        let mut end = None;
+        for cluster in self.cells(line) {
+            let starts_here = cluster.cell + cluster.width > cells.start
+                || (cluster.width == 0 && cluster.cell >= cells.start);
+            if start.is_none() && starts_here {
+                start = Some(cluster.byte);
+            }
+            let inside =
+                cluster.cell < cells.end || (cluster.width == 0 && cluster.cell == cells.end);
+            if start.is_some() && inside {
+                end = Some(cluster.byte + cluster.byte_len);
+            }
+        }
+        let start = start.unwrap_or(line.len());
+        start..end.unwrap_or(start).max(start)
+    }
+
+    /// The cell columns of the word around a column — what a double-click selects.
+    ///
+    /// **Word boundaries are UAX #29's**, taken from the same segmenter as the grapheme clusters, so
+    /// `192.168.1.1` and `foo_bar` stay whole while `foo-bar` and `2026-08-06` split at the hyphens.
+    /// That last pair is the one a log reader will notice, and it is a deliberate cost: the
+    /// alternative is a hand-written character-class table, and this module's history is that every
+    /// hand-written rule about text turned out to be wrong in at least four ways. A log-aware
+    /// granularity — one that treats a timestamp or a path as a unit — is a separate, later thing,
+    /// not a tweak to this.
+    ///
+    /// A column past the end of the line selects nothing there rather than the last word: clicking
+    /// the empty space to the right of a short line means the empty space.
+    pub fn word_at_cell(&self, line: &str, cell: usize) -> core::ops::Range<usize> {
+        let byte = self.byte_at_cell(line, cell);
+        if byte >= line.len() {
+            let end = self.cell_count(line);
+            return end..end;
+        }
+        for (at, word) in line.split_word_bound_indices() {
+            if byte < at + word.len() {
+                return self.cell_at_byte(line, at)..self.cell_at_byte(line, at + word.len());
+            }
+        }
+        let end = self.cell_count(line);
+        end..end
+    }
 }
 
 #[cfg(test)]

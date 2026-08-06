@@ -374,10 +374,7 @@ fn t5_thresholds(out: &mut String, row_h_ws: f32) {
         "Geometric scan in 1% steps of `total_rows`, worst case over the three probe points. \
          Resolution is therefore ±1%.\n"
     );
-    let _ = writeln!(
-        out,
-        "| symptom | predicted first total_rows |"
-    );
+    let _ = writeln!(out, "| symptom | predicted first total_rows |");
     let _ = writeln!(out, "|---|---|");
 
     let worst_probe = |n: u64, rh: f32, delta: f32| {
@@ -488,7 +485,10 @@ fn t6_controls(out: &mut String, row_h_ws: f32) {
     }
     let rows_moved = rs.top_row as f64 * row_h_ws as f64 + rs.sub_px as f64 - start_px;
 
-    let _ = writeln!(out, "| representation | moved (px) | error vs {expected:.0} px |");
+    let _ = writeln!(
+        out,
+        "| representation | moved (px) | error vs {expected:.0} px |"
+    );
     let _ = writeln!(out, "|---|---|---|");
     let _ = writeln!(
         out,
@@ -540,19 +540,17 @@ fn t7_origin_loss(out: &mut String, row_h_ws: f32) {
         "`INNER_TOP` is {INNER_TOP} px. The column is what is left of it after the subtraction: \
          `(INNER_TOP - offset) - (0.0 - offset)`.\n"
     );
-    let _ = writeln!(out, "| total_rows | retained at 50% (px) | retained at 90% (px) |");
+    let _ = writeln!(
+        out,
+        "| total_rows | retained at 50% (px) | retained at 90% (px) |"
+    );
     let _ = writeln!(out, "|---|---|---|");
     for &n in &ROW_COUNTS {
         let retained = |frac: f32| {
             let o = max_offset(n, row_h_ws) * frac;
             (INNER_TOP - o) - (0.0 - o)
         };
-        let _ = writeln!(
-            out,
-            "| {n} | {} | {} |",
-            retained(0.5),
-            retained(0.9)
-        );
+        let _ = writeln!(out, "| {n} | {} | {} |", retained(0.5), retained(0.9));
     }
 }
 

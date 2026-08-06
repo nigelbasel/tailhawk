@@ -17,6 +17,7 @@ pub mod index;
 pub mod indexer;
 pub mod lines;
 pub mod record;
+pub mod selection;
 
 #[cfg(windows)]
 pub mod file;
@@ -54,6 +55,8 @@ pub use grid::{Grid, PlacedRow, Scroll};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
 pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};
 pub use lines::LineDecoder;
+pub use selection::{Position, RowEnd, RowSpan, Selection, SelectionMode};
+
 pub use record::{
     AttributeValue, FormatId, ParseState, Record, Resource, Severity, SeverityBand, Timestamp,
     TraceContext, ERROR_THRESHOLD,

@@ -45,8 +45,8 @@ use std::time::Instant;
 use windows::core::Result;
 use windows::Win32::Foundation::{BOOL, RECT};
 use windows::Win32::Graphics::DirectWrite::{
-    IDWriteFontFace, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_MEASURING_MODE_NATURAL,
-    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXTURE_CLEARTYPE_3x1,
+    DWRITE_TEXTURE_CLEARTYPE_3x1, IDWriteFontFace, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_DEFAULT,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
     DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE,
 };
 
@@ -518,7 +518,10 @@ fn coldsweep() -> Result<()> {
             let slice = &block[k * SLICE..(k + 1) * SLICE];
             let arm = rasterise(&f, &f.face, slice, BATCHES[k].min(SLICE), cell, PAD, *em)?;
             if arm.overflow != 0 {
-                println!("  !! batch {} overflowed {} cells", BATCHES[k], arm.overflow);
+                println!(
+                    "  !! batch {} overflowed {} cells",
+                    BATCHES[k], arm.overflow
+                );
             }
             result[k][col] = arm.timing.total() * 1000.0 / SLICE as f64;
         }
@@ -647,7 +650,9 @@ fn main() -> Result<()> {
 
     // ---- Reconciliation: does G4's own call shape reproduce G4's number? ----
     say!("== reconciliation: this arm vs a replica of G4's raster_mono ==");
-    let mine = rasterise(&f, &f.face, &glyphs, 1, cell, PAD, EM)?.timing.total();
+    let mine = rasterise(&f, &f.face, &glyphs, 1, cell, PAD, EM)?
+        .timing
+        .total();
     let g4 = rasterise_g4_shape(&f, &f.face, &glyphs, EM)?;
     say!(
         "batch 1, hoisted scratch : {mine:>8.2} ms ({:.1} us/glyph)",
@@ -690,10 +695,12 @@ fn main() -> Result<()> {
     say!(
         "verdict: {}",
         match usable_pad {
-            Some(p) =>
-                format!("USABLE — bit-identical to per-glyph rasterisation at an inter-cell pad of {p} px"),
-            None => "NOT USABLE at any pad tried — a glyph in a run differs from the same glyph alone"
-                .to_string(),
+            Some(p) => format!(
+                "USABLE — bit-identical to per-glyph rasterisation at an inter-cell pad of {p} px"
+            ),
+            None =>
+                "NOT USABLE at any pad tried — a glyph in a run differs from the same glyph alone"
+                    .to_string(),
         }
     );
     say!("");
@@ -759,7 +766,11 @@ fn main() -> Result<()> {
             .zip(&totals[0])
             .filter(|(x, y)| x < y)
             .count();
-        let ratios: Vec<f64> = totals[k].iter().zip(&totals[0]).map(|(x, y)| y / x).collect();
+        let ratios: Vec<f64> = totals[k]
+            .iter()
+            .zip(&totals[0])
+            .map(|(x, y)| y / x)
+            .collect();
         let mut r = ratios.clone();
         say!(
             "batch {b:>5}: wins {wins}/{TRIALS} | speedup p50 {:.2}x | min {:.2}x | max {:.2}x",

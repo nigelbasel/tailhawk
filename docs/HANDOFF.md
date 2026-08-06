@@ -1,5 +1,74 @@
 # Handoff — resume here
 
+## ✅ V3's selection model — `selection.rs`, plus `cell.rs`'s two new functions — 2026-08-06, session 14
+
+**251 tests, all passing** (251 core + the shell's one), fmt and clippy clean on the two shipped
+crates. Stream and block selection, double-click words, triple-click lines, and the resolution from
+cell columns to bytes. `PLAN.md`'s V3 row is "u64 scroll model, hit-test, selection" — **the third
+item is now done**, and the two remaining V3 pieces are visual reordering for RTL runs and horizontal
+scrolling.
+
+### The axes are not symmetric, and the API shape follows from that
+
+A row is a `u64` and a column is a `usize`, because a document has up to 2⁶⁴ rows and §10.3 bounds a
+line. **`Selection::row_span(row)` is O(1) and this module never iterates its own rows** — a caller
+paints by asking `Grid::visible` which rows are on screen and then asking about each, so selecting a
+whole 10 GB file costs a viewport, not a document. `last_row` is inclusive for the same reason the
+grid avoids content magnitudes: the exclusive form is `last + 1`, which overflows on a selection one
+Ctrl+A wide.
+
+`RowEnd::ToLineEnd` is a symbolic value rather than a column, and cannot be replaced by one: an
+interior stream row runs past its last character to take the line terminator, and this module does
+not know how long any line is.
+
+### ⚠ `byte_at_cell(start)..byte_at_cell(end)` is not the byte range of a selection — it is §5.6
+
+The obvious composition **drops zero-width clusters from the copied bytes**, because `byte_at_cell`
+skips them by design (they cannot be clicked). `"\u{202E}abc"` — the Trojan Source line §13.4 names —
+puts the override and `a` both at column 0, so selecting the visible line yields `abc` and **silently
+launders the attacker-supplied override out of what the user pastes**. §5.6 forbids discarding content
+silently, and this is the worst version of it: the paste reads differently from the selection.
+
+`CellModel::byte_span` rounds the two ends **outwards** instead — the start takes the lowest byte at
+its column, the end the highest. A zero-width cluster on an interior boundary therefore belongs to
+**both** neighbours, deliberately: copying an invisible character twice is cosmetic, losing one
+changes what the text means. Reverting to the naive composition fails
+`selecting_a_line_carries_its_zero_width_content` with `3..6` against `0..6`.
+
+### 🔍 Self-review found three defects before the code was committed
+
+| Defect | Effect |
+|---|---|
+| **The outward rounding contradicted the empty case** | A zero-width cluster on the caret's own column satisfies *both* ends of a `c..c` range, so **a caret copied the bidi override next to it**. An empty column range is now empty in bytes, and `byte_range`'s special case disappeared with it. |
+| **`Selection::line` saturated at `u64::MAX`** | `row + 1` saturating collapses focus onto anchor, so a triple-click on the last representable row selected **nothing at all** rather than the line — silently. It now runs to the far end of the row's own content and takes no break, there being no following row to separate it from. |
+| **`start()`/`end()` were not mode-aware** | For a block dragged from `(2, 9)` to `(5, 3)`, `anchor.min(focus)` answers `(2, 9)` — a corner that is neither the rectangle's top-left nor anywhere the user pointed. A caller placing a caret or scrolling to the selection lands off to the right of the block it means to show. |
+
+**Four negative controls, each applied, observed and reverted:** the naive byte composition (1 fail,
+on the §5.6 case); block claiming the line break (2 fail); the empty-selection guard removed from
+`row_span` (2 fail); and the three fixes reverted together (**3 fail, one per fix, no overlap**).
+
+### Word granularity is UAX #29's, and that is a deliberate cost
+
+`CellModel::word_at_cell` takes boundaries from the same segmenter as the grapheme clusters, so
+`192.168.1.1` and `foo_bar` stay whole while **`foo-bar` and `2026-08-06` split at the hyphens** —
+the one a log reader will notice. The alternative is a hand-written character-class table, and this
+module's history is that every hand-written rule about text was wrong in at least four ways. A
+log-aware granularity that treats a timestamp or a path as a unit is a separate later thing.
+
+**Not modelled, and recorded rather than papered over:** *sticky* granularity — dragging after a
+double-click continuing to snap to whole words — which `UI-DESIGN.md` §12 implies. Extension itself
+is `set_focus` and belongs to the caller's input handling; autoscroll-on-drag is the grid's.
+
+### ▶ Resume here
+
+- **Visual reordering for right-to-left runs** — `shape.rs` established this is the drawing code's job.
+- **Horizontal scrolling**, which §3.3's extent fields exist to size.
+- **Still nothing consumes `Grid` or `Selection`.** Both are exported and unwired, so their defects
+  stay latent until a viewport is attached — and the static exe is still unchanged, so every size
+  figure quoted since M2 remains an LTO artefact.
+
+---
+
 ## ✅ V3 has started — the scroll model, and the extent fields it owed — 2026-08-06, session 13
 
 `crates/tailhawk-core/src/grid.rs`, plus `SPEC.md` §3.3's extent fields in `index.rs`/`indexer.rs`.

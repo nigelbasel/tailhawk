@@ -179,8 +179,7 @@ impl App {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let sc =
-                unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None)? };
+            let sc = unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None)? };
             let back: ID3D11Texture2D = unsafe { sc.GetBuffer(0)? };
             let mut rtv = None;
             unsafe { device.CreateRenderTargetView(&back, None, Some(&mut rtv))? };
@@ -263,9 +262,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             .encode_utf16()
                             .collect::<Vec<u16>>();
                         unsafe {
-                            windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(
-                                PCWSTR(t.as_ptr()),
-                            );
+                            windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(PCWSTR(
+                                t.as_ptr(),
+                            ));
                         }
                     }
                 }
@@ -351,15 +350,16 @@ fn main() -> Result<()> {
 
     // earlypaint deliberately does NOT wait for the device here — the whole point is to reach
     // WM_PAINT and get a pixel up while the worker is still initialising the driver.
-    let (device, context, driver, pending, t_device) = if mode == "earlypaint" || mode == "classbrush" {
-        (None, None, "pending", rx, 0)
-    } else {
-        let (d, c, n) = match rx {
-            Some(rx) => rx.recv().expect("device thread did not report")?,
-            None => create_device()?,
+    let (device, context, driver, pending, t_device) =
+        if mode == "earlypaint" || mode == "classbrush" {
+            (None, None, "pending", rx, 0)
+        } else {
+            let (d, c, n) = match rx {
+                Some(rx) => rx.recv().expect("device thread did not report")?,
+                None => create_device()?,
+            };
+            (Some(d), Some(c), n, None, now())
         };
-        (Some(d), Some(c), n, None, now())
-    };
 
     STATE.with(|s| {
         *s.borrow_mut() = Some(App {
