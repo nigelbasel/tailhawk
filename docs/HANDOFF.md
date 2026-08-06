@@ -1,5 +1,91 @@
 # Handoff — resume here
 
+## ✅ V3 has started — the scroll model, and the extent fields it owed — 2026-08-06, session 13
+
+`crates/tailhawk-core/src/grid.rs`, plus `SPEC.md` §3.3's extent fields in `index.rs`/`indexer.rs`.
+**229 tests, all passing** (229 core + the shell's one), fmt and clippy clean, CI green on x64 and
+ARM64. **Both of V3's two prerequisites from session 11's note are now done.**
+
+### The grid: `u64` scroll, row layout, hit-test
+
+`SPEC.md` §6.4's three rules, enforced structurally. [`Scroll`] is `(u64 row, f32 sub_row_px)` and
+**cannot represent a content-pixel offset**; `visible()` computes each row's `y` from a loop counter,
+never from `row * row_height − offset`. §6.4's required CI test is in CI.
+
+**⚠ §6.4's claim that the first-row assertion "catches all three" is not true of *this* grid, and
+the test was strengthened because of it.** Reintroducing rule 2 faithfully leaves the **first** row
+exact — with an exact `(u64, f32)` position the two content-magnitude terms are the same expression
+and cancel perfectly at `i = 0`. The damage lands on every row after it. egui's first row is
+misplaced only because its `offset` is an independently-rounded `f32`, which is rule 1's violation as
+well. **The sweep now asserts every visible row.** Verified by mutation both ways.
+
+`experiments/g7-egui-scroll/src/main.rs` was **deliberately not opened** — it replicates egui's
+arithmetic and `CLEANROOM.md` says it must not be linked in. Everything came from §6.4 and G7's own
+`RESULTS.md`, which state the rules as the inverse of what egui does. The §5 entry was filed
+**before** the code (`5adea80`), and says exactly that.
+
+### 🔍 Review found four defects in the grid, and the first two were live bugs
+
+| Defect | Effect |
+|---|---|
+| **`clamp` was one-sided** | It only pulled the position *back* when past the end. **Shrinking** the viewport moves the end *up*, so nothing fired: dragging an 800 px window to 600 px while tailing left the newest 10 rows off screen with `is_at_bottom` quietly false. A row-height/DPI increase did the same. §5.4's whole feature, broken by an ordinary resize. Fixed: a viewport that *was* following stays pinned. |
+| **One `NaN` blanked the grid permanently** | `NaN.clamp(0,1)` is `NaN`, so it reached `sub_row_px`; `visible()` then computed a row count of zero and **drew nothing, for ever**, with no scroll able to clear it (`NaN + delta` is `NaN`). A scrollbar dividing by a not-yet-laid-out track height produces one on frame 1. `INFINITY` reached the same state through `0.0 * inf`. Fixed, and `f32::max` alone is *not* enough — it neutralises `NaN` but passes `INFINITY`. |
+| **Hit-test had no lower bound** | Only the top edge was guarded, so `row_at_y(900)` on an 800 px viewport returned row 47 when the last drawn row was 42 — a drag-select leaving the bottom selects rows nobody can see. |
+| **The module doc overclaimed** | "No content-magnitude number is formed anywhere in this module" is false: `thumb_fraction`/`scroll_to_fraction` form them deliberately in `f64` (and G7 exonerated exactly that mapping). Reworded to what is true. |
+
+A fifth finding was the sharpest: **`the_sub_row_remainder_never_leaves_its_band` could not observe
+the failure mode it is named for**, because `clamp` rewrote an out-of-band remainder before the test
+could read it. The carry arithmetic is now the free function `carry`, tested on its **unrepaired**
+output. Same shape as `raster.rs`'s `tighten` and `shape.rs`'s `glyph_range`: extract the arithmetic
+so a test can see it before anything downstream tidies up.
+
+**One live bug was found by my own test before review**: scrolling far up saturated the row at 0 but
+left the remainder behind, landing at `(0, 16 px)` — a *lower* position than the top. The row and the
+remainder have to be clamped as a pair, which is why `step` is a function.
+
+**Four negative controls, each applied, observed and reverted:** rule 2 reintroduced faithfully
+(2 fail, and the strengthened required test makes 3); the one-sided clamp restored (**2 fail**); the
+`NaN`/infinity guards removed (1 fail); the hit-test lower bound removed (2 fail).
+
+### §3.3's horizontal extent, captured during the scan
+
+`Extent` on `LineIndex`, fed by `LineScanner` — one `OR` per byte for `all_ascii`, and a running max
+for `max_byte_len`. §3.3 says these are free during the newline scan and that recovering them later
+means a second pass over 10 GB.
+
+**The subtlety is that a long line straddles a chunk boundary.** Workers keep no per-line buffer by
+design, so the max has to be tracked as the bytes go past — and **taking the max of two half-lines
+understates the answer**, which would make §3.3's "upper bound" not one and let content be wider than
+the scrollbar admits. `Extent::merge` carries a head and tail fragment and adds them across the join.
+Tested against an independent scan at chunk sizes 1–4096 and 1–8 threads.
+
+**`all_ascii` is a statement about bytes, and `exact_cells` is where the encoding is resolved.** A
+UTF-16LE file of pure ASCII has every byte below `0x80` — the high halves are `0x00` — but its byte
+length is twice its cell count, so it returns `None` rather than claiming exactness. §3.3 is also
+explicit that a max *cell* count is **not** free here: it needs grapheme segmentation at 10–50× the
+cost, and the cell model does not exist when the index is built.
+
+**⚠ Following does not widen the extent yet.** `push_line` cannot: a line start alone gives no
+length, since the line is not over until the next one begins. That belongs with M4's follow work and
+is asserted in the doc rather than left to be discovered.
+
+### ▶ Resume here: the rest of V3
+
+- **Selection** — `PLAN.md`'s V3 row is "u64 scroll model, hit-test, selection", and selection is the
+  piece not started. `cell.rs::byte_at_cell` is the horizontal half; the vertical half is `Grid`.
+- **Visual reordering for right-to-left runs**, which `shape.rs` established is the drawing code's
+  job (see below).
+- **Horizontal scrolling**, which is what the extent above exists to size. §6.4 cut `--wrap` from v1
+  in its favour.
+- **Nothing consumes `Grid` yet** — it is exported but unwired, so the review's findings were latent
+  rather than live. They become live the moment a viewport is attached.
+
+**And the size question is now genuinely answerable**, because the grid is the thing that was going
+to reference the atlas and the shaper. It still does not: `crates/tailhawk` references neither, so
+the static exe is unchanged and every figure quoted since M2 remains an LTO artefact.
+
+---
+
 ## ✅ The shaping bridge is built — `shape.rs`, 2026-08-06, session 13
 
 `crates/tailhawk-core/src/shape.rs`. **199 tests, all passing** (198 core + the shell's one), fmt and
@@ -99,20 +185,20 @@ session at all — the ordering finding came from a probe against the running Di
 
 ### ▶ Resume here: V3, the grid
 
-Everything V3 needed from V2 now exists. The two things `SPEC.md` §3.3 still names, unchanged from
-session 11's note below: the **u64 scroll model, hit-test and selection**, and the
-**`max_byte_len` / `all_ascii` extent fields captured during the index scan** — §5.3 says they are
-free there and recovering them later means a second pass over 10 GB. `index.rs` has neither field.
-Do it *with* V3's scrollbar; do not let V3 ship without it.
+~~Everything V3 needed from V2 now exists. The two things `SPEC.md` §3.3 still names: the **u64
+scroll model, hit-test and selection**, and the **`max_byte_len` / `all_ascii` extent fields
+captured during the index scan**.~~ — **the scroll model, hit-test and the extent fields are all
+done; see the top of this file. Selection is what remains of V3.**
 
 ---
 
 **Paused:** 2026-08-06, session 13. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
 both architectures. Only M2's two large-fixture done-criteria remain unrun. **M3 is under way: V4
-(the cell model), V1 (the device), V2's monochrome path and the shaping bridge are all done; V3, the
-grid, is next and nothing blocks it.** `PLAN.md` marks M3 the highest-risk milestone, with a
-stop-and-reconsider gate at >50% overrun. **Everything below is on disk and pushed. Nothing is
-held in a chat session.**
+(the cell model), V1 (the device), V2's monochrome path, the shaping bridge and V3's scroll model
+are all done. What is left in M3: V3's selection, V2's colour path and per-DPI rebuild, and wiring
+any of it to the shell — nothing in `crates/tailhawk` references the grid, the atlas or the shaper
+yet.** `PLAN.md` marks M3 the highest-risk milestone, with a stop-and-reconsider gate at >50%
+overrun. **Everything below is on disk and pushed. Nothing is held in a chat session.**
 
 ---
 
@@ -496,9 +582,10 @@ sections at the top of this file.
    and nothing bridges them.~~ — **done, session 13.** `shape.rs` bridges them via
    `IDWriteTextAnalyzer`. What V3 inherits from it: **glyphs come back in logical order even for
    right-to-left runs, so V3 owes the visual reordering**, and font fallback is the caller's job.
-2. **The extent fields must be captured during the index scan** — §3.3 says they are free there, and
-   the reason is that recovering them later means a second pass over 10 GB. `index.rs` has neither
-   field. Do it *with* V3's scrollbar, but do not let V3 ship without it.
+2. ~~**The extent fields must be captured during the index scan** — §3.3 says they are free there,
+   and the reason is that recovering them later means a second pass over 10 GB. `index.rs` has
+   neither field.~~ — **done, session 13.** `Extent` on `LineIndex`, fed by `LineScanner`, stitched
+   across chunk boundaries. See the top of this file.
 
 **And the size question finally becomes answerable at V3.** Every figure quoted since M2 has been
 LTO stripping code the shell never references. The moment the grid references the atlas, the real cost
