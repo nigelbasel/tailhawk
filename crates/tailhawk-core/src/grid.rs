@@ -37,10 +37,17 @@
 //! ## What enforces it here
 //!
 //! [`Scroll`] cannot represent a content-pixel offset, and [`Grid::visible`] hands out a
-//! viewport-relative `y` computed from a loop counter. **No content-magnitude number is formed
-//! anywhere in this module** — the largest float in any layout expression is one row height. That is
-//! why `the_first_row_stays_in_band_at_a_hundred_million_rows`, §6.4's required CI test, can pass by
-//! construction rather than by luck.
+//! viewport-relative `y` computed from a loop counter. **No content-magnitude number is formed in
+//! any layout or scroll-position expression** — the largest float in either is one row height, or
+//! the caller's own delta.
+//!
+//! That qualifier is exact rather than decorative, and two places sit outside it deliberately.
+//! [`Grid::thumb_fraction`] and [`Grid::scroll_to_fraction`] *do* form content-magnitude numbers, in
+//! `f64`: the scrollbar has to divide the position by the document length, there is no way around
+//! it, and G7 measured that mapping's error at **exactly zero** because it divides two large numbers
+//! rather than differencing them. And a caller who passes `scroll_by_px` a delta of tens of millions
+//! of pixels gets `f32` precision on their own delta — [`Grid::scroll_by_rows`] is the way to move
+//! that far.
 
 /// Where the viewport sits in the document.
 ///
@@ -115,29 +122,37 @@ impl Grid {
         self.scroll
     }
 
-    /// The document grew or shrank. The scroll position is re-clamped, which is what keeps a
-    /// followed file that rotated (§5.5) from leaving the viewport past the end.
+    /// The document grew or shrank.
+    ///
+    /// **A viewport that was against the end stays against it**, which is what makes following a
+    /// growing file work; one that was not keeps its top row, so a user who has scrolled up to read
+    /// something is not yanked to the bottom every time a line arrives. Shrinking pulls a stranded
+    /// viewport back, which is what a rotated or truncated file (§5.5) needs.
     pub fn set_total_rows(&mut self, total_rows: u64) {
+        let following = self.is_following();
         self.total_rows = total_rows;
-        self.clamp();
+        self.settle(following);
     }
 
     pub fn set_viewport_px(&mut self, viewport_px: f32) {
-        self.viewport_px = viewport_px.max(0.0);
-        self.clamp();
+        let following = self.is_following();
+        self.viewport_px = finite_or(viewport_px, 0.0).max(0.0);
+        self.settle(following);
     }
 
     /// Changes the row height — a DPI change, or a font-size change.
     ///
     /// **The top row is kept, and the sub-row remainder is scaled with it.** Keeping the pixel
     /// offset instead would move the view by a different number of rows at each DPI, which is the
-    /// column-drift §3.3's acceptance test watches for, one axis over.
+    /// column-drift §3.3's acceptance test watches for, one axis over. A viewport that was following
+    /// the end keeps following it instead.
     pub fn set_row_height(&mut self, row_height: f32) {
-        let row_height = row_height.max(1.0);
+        let following = self.is_following();
+        let row_height = finite_or(row_height, 1.0).max(1.0);
         let fraction = self.scroll.sub_row_px / self.row_height;
         self.row_height = row_height;
         self.scroll.sub_row_px = fraction * row_height;
-        self.clamp();
+        self.settle(following);
     }
 
     /// Scrolls by a pixel delta — a wheel notch, or a drag. Positive moves *down* the document.
@@ -145,11 +160,14 @@ impl Grid {
     /// **The delta lands on the remainder and is carried into the row index**, which is rule 1. The
     /// arithmetic never sees a number larger than one row height plus the delta itself, so a 2 px
     /// drag moves 2 px at row zero and at row 10⁸ alike.
+    ///
+    /// A non-finite delta is ignored rather than propagated — see [`Scroll`].
     pub fn scroll_by_px(&mut self, delta_px: f32) {
-        let carried = self.scroll.sub_row_px + delta_px;
-        let rows = (carried / self.row_height).floor();
-        let sub_row_px = carried - rows * self.row_height;
-        self.scroll = step(self.scroll.row, rows as i64, sub_row_px);
+        if !delta_px.is_finite() {
+            return;
+        }
+        let (rows, sub_row_px) = carry(self.scroll.sub_row_px, delta_px, self.row_height);
+        self.scroll = step(self.scroll.row, rows, sub_row_px);
         self.clamp();
     }
 
@@ -207,12 +225,23 @@ impl Grid {
         })
     }
 
-    /// The row a viewport-relative y lands on, or `None` past the last row.
+    /// The row a viewport-relative y lands on, or `None` outside the drawn rows.
     ///
     /// **`y` is viewport-relative, not screen-absolute** — rule 3. A caller holding a window-space
     /// point subtracts the viewport origin *first*, in whatever space that is, and passes the small
     /// number here.
+    ///
+    /// **Bounded at both edges, and the lower one was missing.** Only the top was guarded at first,
+    /// so a `y` below the viewport happily returned a row that had never been drawn — `row_at_y(900)`
+    /// on an 800 px viewport answered row 47 when the last drawn row was 42. A drag-select that
+    /// leaves the bottom of the grid is exactly how a caller reaches that, and it would select rows
+    /// nobody can see.
     pub fn row_at_y(&self, y: f32) -> Option<u64> {
+        // `is_nan` spelled out rather than relying on a negated comparison: a NaN y must hit
+        // nothing, and `!(y < viewport)` says so only by accident of IEEE semantics.
+        if y.is_nan() || y >= self.viewport_px {
+            return None;
+        }
         let offset = (y + self.scroll.sub_row_px) / self.row_height;
         if offset < 0.0 {
             return None;
@@ -242,7 +271,14 @@ impl Grid {
     }
 
     /// Drags the thumb to a fraction of the document.
+    ///
+    /// A non-finite fraction is ignored. `NaN` is not exotic here: a scrollbar handler computing
+    /// `y / track_height` produces one the first time it is asked before layout has given the track
+    /// a height, and `NaN.clamp(0.0, 1.0)` is `NaN` rather than a bound.
     pub fn scroll_to_fraction(&mut self, fraction: f32) {
+        if !fraction.is_finite() {
+            return;
+        }
         let max = self.max_scroll();
         let full = max.row as f64 + (max.sub_row_px / self.row_height) as f64;
         let at = full * fraction.clamp(0.0, 1.0) as f64;
@@ -283,7 +319,38 @@ impl Grid {
         }
     }
 
+    /// Whether the viewport is following the end *and* that means anything.
+    ///
+    /// **A grid with no rows or no viewport is vacuously at the bottom**, and treating that as
+    /// "following" is wrong: a freshly built grid is at the top with nothing in it, so the first
+    /// `set_total_rows` / `set_viewport_px` would pin it to the end and it would never be at the top
+    /// again. Following is only a meaningful state once there is something to follow.
+    fn is_following(&self) -> bool {
+        self.total_rows > 0 && self.viewport_px > 0.0 && self.is_at_bottom()
+    }
+
+    /// Re-clamps after a geometry change, re-pinning to the end if that is where we were.
+    ///
+    /// **A one-sided clamp is not enough, and that was a real defect.** Clamping only pulls the
+    /// position *back* when it is past the end. Growing the viewport moves the end further down, so
+    /// the old position is now past it and the clamp fires; **shrinking** the viewport moves the end
+    /// *up*, nothing fires, and a viewport that was following the tail is left stranded above it —
+    /// silently, with `is_at_bottom` flipping to false. Dragging a window shorter while tailing a
+    /// file stopped showing the tail, which is §5.4's whole feature.
+    fn settle(&mut self, following: bool) {
+        if following {
+            self.scroll = self.max_scroll();
+        }
+        self.clamp();
+    }
+
     fn clamp(&mut self) {
+        // A remainder that is not a number cannot be compared into range, and it poisons every
+        // expression it reaches: `visible` computes an empty row count from it and the grid draws
+        // nothing at all, permanently, because no later scroll can clear it either.
+        if !self.scroll.sub_row_px.is_finite() {
+            self.scroll.sub_row_px = 0.0;
+        }
         let max = self.max_scroll();
         if (self.scroll.row, self.scroll.sub_row_px) > (max.row, max.sub_row_px) {
             self.scroll = max;
@@ -292,6 +359,40 @@ impl Grid {
             self.scroll.sub_row_px = 0.0;
         }
     }
+}
+
+/// A finite value, or `fallback` if it is `NaN` or infinite.
+///
+/// `f32::max` is not enough on its own: it neutralises `NaN` (`NaN.max(1.0) == 1.0`) but passes
+/// `INFINITY` straight through, and an infinite row height makes `viewport − 0.0 * inf` a `NaN` that
+/// ends up in the scroll position.
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
+/// Splits a pixel delta into whole rows and a remainder in `[0, row_height)`.
+///
+/// **A free function so the raw result can be tested.** The remainder is mathematically in band by
+/// construction, but `f32` rounding can put it a hair outside, and the grid's `clamp` would then
+/// silently rewrite it — which means a test reading `sub_row_px` off the grid cannot see whether
+/// this arithmetic was ever out of band. It reads the band invariant off a value nothing has had a
+/// chance to correct.
+fn carry(sub_row_px: f32, delta_px: f32, row_height: f32) -> (i64, f32) {
+    let carried = sub_row_px + delta_px;
+    let mut rows = (carried / row_height).floor();
+    let mut sub = carried - rows * row_height;
+    // Rounding repair only. Both branches move the position by less than one ULP of `carried`.
+    if sub < 0.0 {
+        sub = 0.0;
+    } else if sub >= row_height {
+        sub -= row_height;
+        rows += 1.0;
+    }
+    (rows as i64, sub)
 }
 
 /// Moves a scroll position by a signed row delta, saturating at row zero.
@@ -595,6 +696,186 @@ mod tests {
                 total - 1,
                 "the newest row should be the one on screen"
             );
+        }
+    }
+
+    /// **Shrinking the window must not silently stop the tail.** A one-sided clamp only pulls back
+    /// when the position is *past* the end; shrinking moves the end up instead, so nothing fired and
+    /// a viewport that was following was left stranded above it. Dragging an 800 px window to 600 px
+    /// while tailing left the newest 10 rows off screen, with `is_at_bottom` quietly false.
+    #[test]
+    fn a_window_resize_does_not_break_following() {
+        for viewport in [1000.0f32, 900.0, 800.0, 700.0, 600.0, 400.0, 137.0] {
+            let mut g = grid(1000, 800.0);
+            g.scroll_to_bottom();
+            assert!(g.is_at_bottom());
+
+            g.set_viewport_px(viewport);
+            assert!(
+                g.is_at_bottom(),
+                "resizing 800 -> {viewport} px stopped following"
+            );
+            assert_eq!(
+                g.visible().last().expect("rows").row,
+                999,
+                "resizing 800 -> {viewport} px lost the newest row"
+            );
+        }
+    }
+
+    /// The same for a font-size or DPI change, which moves the end for the same reason.
+    #[test]
+    fn a_row_height_change_does_not_break_following() {
+        for row_height in [10.0f32, 19.0, 24.0, 28.5, 38.0] {
+            let mut g = grid(1000, 800.0);
+            g.scroll_to_bottom();
+
+            g.set_row_height(row_height);
+            assert!(
+                g.is_at_bottom(),
+                "a row height of {row_height} stopped following"
+            );
+            assert_eq!(g.visible().last().expect("rows").row, 999);
+        }
+    }
+
+    /// But a reader who has scrolled up is **not** dragged to the end by an arriving line, or by a
+    /// resize. Sticky-follow that is not conditional is just as broken as no follow at all.
+    #[test]
+    fn a_reader_who_scrolled_up_is_left_where_they_are() {
+        let mut g = grid(1000, 800.0);
+        g.scroll_to_row(400);
+        let before = g.scroll();
+
+        g.set_total_rows(1200);
+        assert_eq!(g.scroll(), before, "an arriving line yanked the view");
+        g.set_viewport_px(600.0);
+        assert_eq!(g.scroll(), before, "a resize yanked the view");
+        assert!(!g.is_at_bottom());
+    }
+
+    /// A freshly built grid is at the **top**, not the bottom. It is vacuously "at the bottom" while
+    /// it has no rows and no viewport, and an unconditional sticky-follow read that as intent and
+    /// pinned every new grid to the end of its document.
+    #[test]
+    fn a_new_grid_starts_at_the_top() {
+        let g = grid(1000, 800.0);
+        assert_eq!(g.scroll(), Scroll::TOP);
+        assert_eq!(g.visible().next().expect("rows").row, 0);
+
+        // In either assignment order.
+        let mut g = Grid::new(ROW_H);
+        g.set_viewport_px(800.0);
+        g.set_total_rows(1000);
+        assert_eq!(g.scroll(), Scroll::TOP);
+    }
+
+    /// **A single `NaN` must not be able to blank the grid for good.** `NaN.clamp(0.0, 1.0)` is
+    /// `NaN`, so it reached `sub_row_px`; from there `visible()` computed a row count of zero and
+    /// drew nothing, `is_at_bottom` was false for ever, and no later scroll could clear it because
+    /// `NaN + delta` is `NaN`. A scrollbar handler dividing by a not-yet-laid-out track height
+    /// produces one on the first frame.
+    #[test]
+    fn a_non_finite_input_cannot_poison_the_scroll_position() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut g = grid(1000, 800.0);
+            g.scroll_to_row(500);
+
+            g.scroll_to_fraction(bad);
+            assert!(
+                g.scroll().sub_row_px.is_finite(),
+                "scroll_to_fraction({bad})"
+            );
+            g.scroll_by_px(bad);
+            assert!(g.scroll().sub_row_px.is_finite(), "scroll_by_px({bad})");
+            g.set_row_height(bad);
+            assert!(g.row_height().is_finite(), "set_row_height({bad})");
+            assert!(g.scroll().sub_row_px.is_finite(), "set_row_height({bad})");
+            g.set_viewport_px(bad);
+            assert!(g.viewport_px().is_finite(), "set_viewport_px({bad})");
+
+            // And the grid still works afterwards.
+            g.set_viewport_px(800.0);
+            g.set_row_height(ROW_H);
+            g.scroll_by_px(53.0);
+            assert!(
+                g.visible().next().is_some(),
+                "after {bad} the grid drew nothing at all"
+            );
+            assert!(g.thumb_fraction().is_finite());
+        }
+    }
+
+    /// Hit-test is bounded at the **bottom** as well as the top. Only the top was guarded at first,
+    /// so a y below the viewport returned a row that had never been drawn — which a drag-select
+    /// leaving the bottom of the grid produces immediately.
+    #[test]
+    fn a_click_below_the_viewport_hits_nothing() {
+        let g = grid(1_000_000, 800.0);
+        let last = g.visible().last().expect("rows");
+        assert!(g.row_at_y(799.0).is_some());
+        assert_eq!(g.row_at_y(800.0), None, "the row below the viewport edge");
+        assert_eq!(g.row_at_y(900.0), None);
+        assert_eq!(g.row_at_y(5000.0), None);
+        assert!(
+            last.row <= 42,
+            "the fixture assumes a 43-row viewport, got {}",
+            last.row
+        );
+    }
+
+    /// Every y outside the drawn rows must hit nothing, and every y inside must hit the row that
+    /// was drawn there — the round trip in both directions, not just outwards from `visible`.
+    #[test]
+    fn hit_test_is_exactly_the_inverse_of_layout() {
+        let mut g = grid(160_000_000, 800.0);
+        g.scroll_to_fraction(0.61);
+        g.scroll_by_px(3.0);
+
+        let drawn: std::collections::BTreeMap<u64, f32> =
+            g.visible().map(|p| (p.row, p.y)).collect();
+        let mut y = -2.0f32 * ROW_H;
+        while y < 800.0 + 2.0 * ROW_H {
+            match g.row_at_y(y) {
+                Some(row) => {
+                    let top = *drawn
+                        .get(&row)
+                        .unwrap_or_else(|| panic!("y={y} hit row {row}, which was never drawn"));
+                    assert!(
+                        y >= top && y < top + ROW_H,
+                        "y={y} hit row {row}, drawn at {top}..{}",
+                        top + ROW_H
+                    );
+                }
+                None => assert!(
+                    !(0.0..800.0).contains(&y),
+                    "y={y} is inside the viewport but hit nothing"
+                ),
+            }
+            y += 0.37;
+        }
+    }
+
+    /// **The band invariant, read off the raw arithmetic.** Reading `sub_row_px` back off the grid
+    /// cannot see this: `clamp` rewrites an out-of-band remainder before any test can look at it, so
+    /// the assertion was guarding a value that had already been repaired. `carry` returns the
+    /// unrepaired result.
+    #[test]
+    fn the_carry_never_leaves_the_band() {
+        let deltas = [
+            0.5f32, -0.5, 19.0, -19.0, 1e6, -1e6, 0.001, -0.001, 53.0, -53.0, 1e9, -1e9, 3.8e8,
+            -3.8e8, 1e-7, 18.999998,
+        ];
+        for row_height in [1.0f32, 16.0, 19.0, 28.5] {
+            for sub in [0.0f32, 0.5, row_height * 0.5, row_height - 0.001] {
+                for delta in deltas {
+                    let (_, out) = carry(sub, delta, row_height);
+                    assert!(
+                        (0.0..row_height).contains(&out),
+                        "carry({sub}, {delta}, {row_height}) gave {out}, outside [0, {row_height})"
+                    );
+                }
+            }
         }
     }
 

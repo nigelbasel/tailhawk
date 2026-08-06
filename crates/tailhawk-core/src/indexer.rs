@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::encoding::Charset;
-use crate::index::{LineIndex, LineScanner, ANCHOR_STRIDE};
+use crate::index::{Extent, LineIndex, LineScanner, ANCHOR_STRIDE};
 use crate::{Error, Result};
 
 /// Positional reads, which is all the indexer needs of a source.
@@ -89,6 +89,8 @@ struct ChunkScan {
     anchors: Vec<u64>,
     /// The last line start found, so the merge can tell a terminator at end of file from a line.
     last_start: Option<u64>,
+    /// This chunk's horizontal extent (§3.3), joined to its neighbours in file order.
+    extent: Extent,
     /// One past the last byte actually read, or `None` if the chunk read nothing at all.
     ///
     /// This is what the trailing-terminator test compares against, and it is **not** the same as the
@@ -177,14 +179,19 @@ pub fn build_index<R: ChunkReader + ?Sized>(
 
     let mut final_start = None;
     let mut data_end = None;
+    // §3.3's horizontal extent. Folded in file order rather than max-ed, because a line cut in two
+    // by a chunk boundary is one line — see `Extent::merge`.
+    let mut extent = Extent::EMPTY;
     for (nth, scan) in scans.iter_mut().enumerate() {
         let scan = scan
             .take()
             .ok_or_else(|| Error(format!("chunk {nth} was never scanned")))?;
         final_start = scan.last_start.or(final_start);
         data_end = scan.data_end.or(data_end);
+        extent = extent.merge(scan.extent);
         index.append_chunk(scan.lines, &scan.anchors);
     }
+    index.set_extent(extent);
 
     // A terminator as the file's last bytes opens a line start at end of data, and that is not a
     // line. `LineDecoder::finish` draws the same distinction, and the two must agree or the grid
@@ -240,6 +247,7 @@ fn scan_chunk<R: ChunkReader + ?Sized>(
         scan.data_end = Some(at);
     }
 
+    scan.extent = scanner.extent();
     Ok(scan)
 }
 
@@ -344,6 +352,160 @@ mod tests {
             None,
             "one line past the end must be None rather than a clamp"
         );
+    }
+
+    /// The longest line in bytes, worked out the slow and obvious way, for the scan to be measured
+    /// against.
+    fn longest_line(charset: Charset, bytes: &[u8]) -> u64 {
+        let starts = line_starts(charset, bytes);
+        let terminator = charset.line_terminator();
+        let term_len = terminator.len() as u64;
+        // The final line ends before a trailing terminator, if there is one. Counting that
+        // terminator as content is what the first version of this helper did, and it reported the
+        // one-byte file "\n" as having a one-byte line rather than an empty one.
+        let last_end = bytes.len() as u64
+            - if bytes.ends_with(terminator) {
+                term_len
+            } else {
+                0
+            };
+        let mut longest = 0u64;
+        for (i, start) in starts.iter().enumerate() {
+            let end = match starts.get(i + 1) {
+                Some(next) => next - term_len,
+                None => last_end,
+            };
+            longest = longest.max(end - start);
+        }
+        longest
+    }
+
+    /// **The extent must agree with an independent measurement at every chunk size and thread
+    /// count.** The interesting case is a line longer than a chunk: the scan sees only fragments of
+    /// it, and taking the max of those fragments would *understate* the answer — which would make
+    /// §3.3's "upper bound" not one, and let content be wider than the scrollbar admits.
+    #[test]
+    fn the_horizontal_extent_agrees_with_an_independent_scan() {
+        let long = "x".repeat(500);
+        let corpus = format!("short\na bit longer\n{long}\ntail\n{long}{long}\nlast line here");
+        let bytes = corpus.as_bytes();
+        let want = longest_line(Charset::UTF_8, bytes);
+        assert_eq!(want, 1000, "the fixture should contain a 1,000-byte line");
+
+        for chunk_bytes in [1u64, 2, 7, 64, 300, 1024, 4096] {
+            for threads in [1usize, 2, 8] {
+                let index = build_index(
+                    bytes,
+                    Charset::UTF_8,
+                    0,
+                    bytes.len() as u64,
+                    &options(4, chunk_bytes, threads),
+                )
+                .expect("build");
+                assert_eq!(
+                    index.extent().max_line_bytes(),
+                    want,
+                    "chunk {chunk_bytes}, {threads} threads: a line spanning chunks was not stitched"
+                );
+            }
+        }
+    }
+
+    /// The bound must never be *below* the true longest line, whatever the input — that is the
+    /// direction that matters, because an understated bound clips content out of reach.
+    #[test]
+    fn the_extent_is_never_an_underestimate() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"\n\n\n".to_vec(),
+            b"no terminator at all".to_vec(),
+            b"a\nbb\nccc".to_vec(),
+            b"trailing\n".to_vec(),
+            "x".repeat(300).into_bytes(),
+            format!("{}\n{}", "y".repeat(200), "z".repeat(199)).into_bytes(),
+        ];
+        for bytes in &cases {
+            let want = longest_line(Charset::UTF_8, bytes);
+            for chunk_bytes in [1u64, 3, 16, 512] {
+                for threads in [1usize, 4] {
+                    let index = build_index(
+                        &bytes[..],
+                        Charset::UTF_8,
+                        0,
+                        bytes.len() as u64,
+                        &options(2, chunk_bytes, threads),
+                    )
+                    .expect("build");
+                    let got = index.extent().max_line_bytes();
+                    assert!(
+                        got >= want,
+                        "{:?} at chunk {chunk_bytes}/{threads} threads: bound {got} is below the \
+                         true longest line {want}",
+                        String::from_utf8_lossy(bytes)
+                    );
+                    assert_eq!(got, want, "and it should be tight, not merely safe");
+                }
+            }
+        }
+    }
+
+    /// `all_ascii` is a statement about bytes, and `exact_cells` is where the encoding is resolved.
+    /// A UTF-16LE file of pure ASCII has all its bytes below `0x80` — the high halves are `0x00` —
+    /// but its byte length is twice its cell count, so it must **not** claim to be exact.
+    #[test]
+    fn only_a_byte_oriented_all_ascii_run_gives_an_exact_cell_count() {
+        let ascii = b"hello there\nshort\n";
+        let index = build_index(
+            &ascii[..],
+            Charset::UTF_8,
+            0,
+            ascii.len() as u64,
+            &options(2, 4, 2),
+        )
+        .expect("build");
+        assert!(index.extent().all_ascii());
+        assert_eq!(
+            index.extent().exact_cells(Charset::UTF_8),
+            Some(11),
+            "an all-ASCII UTF-8 run knows its own cell count"
+        );
+
+        let wide = "héllo thère\nshort\n".as_bytes();
+        let index = build_index(
+            wide,
+            Charset::UTF_8,
+            0,
+            wide.len() as u64,
+            &options(2, 4, 2),
+        )
+        .expect("build");
+        assert!(!index.extent().all_ascii(), "é is not ASCII");
+        assert_eq!(index.extent().exact_cells(Charset::UTF_8), None);
+        assert!(
+            index.extent().max_line_bytes() >= 11,
+            "but the byte bound still covers it"
+        );
+
+        let utf16 = utf16le("hello there\nshort\n");
+        let index = build_index(
+            &utf16[..],
+            Charset::UTF_16LE,
+            0,
+            utf16.len() as u64,
+            &options(2, 4, 2),
+        )
+        .expect("build");
+        assert!(
+            index.extent().all_ascii(),
+            "UTF-16LE ASCII really does have every byte below 0x80"
+        );
+        assert_eq!(
+            index.extent().exact_cells(Charset::UTF_16LE),
+            None,
+            "but 22 bytes is 11 cells, so the byte length is not the cell count"
+        );
+        assert_eq!(index.extent().max_line_bytes(), 22);
     }
 
     /// The invariant the whole parallel scan rests on: a code-unit-aligned boundary cannot fall

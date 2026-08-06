@@ -38,6 +38,126 @@ pub struct Anchor {
     pub offset: u64,
 }
 
+/// The horizontal extent of a run of lines — `SPEC.md` §3.3's `max_byte_len` and `all_ascii`.
+///
+/// **The scrollbar needs a horizontal extent before anything has been laid out.** §3.3 forbids
+/// deriving it from the currently-visible lines, because that is what produces the horizontal-thumb
+/// jitter every tool in this category has. So it is captured during the newline scan, where it is
+/// nearly free — recovering it afterwards means a second pass over 10 GB.
+///
+/// **Bytes, not cells, and that distinction is the point.** §3.3 is explicit that a max *cell* count
+/// is **not** free during the index pass: grapheme segmentation with East Asian Width costs 10–50×
+/// a newline scan, and it needs the cell model, which does not exist when the index is built. What
+/// is free is the byte length, and **no encoding produces more cells than bytes**, so this is a
+/// conservative upper bound that the layout refines lazily as blocks are actually drawn.
+///
+/// Where `all_ascii` holds in a byte-oriented encoding, the bound is **exact** — see
+/// [`Extent::exact_cells`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Extent {
+    /// Longest line lying wholly inside this run, terminator excluded.
+    max_complete: u64,
+    /// The leading fragment: bytes before this run's first terminator. A complete line only once
+    /// something is known to precede it — for the file's first chunk, nothing does, so it *is* one.
+    head: u64,
+    /// The trailing fragment: bytes after this run's last terminator.
+    tail: u64,
+    /// Whether the run contains a terminator at all. Without one it is a single fragment and
+    /// `head == tail == ` the whole run.
+    terminated: bool,
+    all_ascii: bool,
+}
+
+impl Default for Extent {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl Extent {
+    /// The identity for [`merge`](Self::merge): no bytes, and vacuously all-ASCII.
+    pub const EMPTY: Self = Self {
+        max_complete: 0,
+        head: 0,
+        tail: 0,
+        terminated: false,
+        all_ascii: true,
+    };
+
+    /// Joins two adjacent runs, **in file order**.
+    ///
+    /// **The whole reason this is not a plain `max` is the line that straddles the boundary.** The
+    /// parallel indexer splits the file at code-unit-aligned offsets, not at line boundaries, so a
+    /// long line is routinely cut in two — and taking the max of the two halves *understates* the
+    /// extent, which would make the "upper bound" not one. The trailing fragment of the earlier run
+    /// and the leading fragment of the later one are the same line, so they are added.
+    pub fn merge(self, next: Self) -> Self {
+        let joined = self.tail.saturating_add(next.head);
+        let all_ascii = self.all_ascii && next.all_ascii;
+        match (self.terminated, next.terminated) {
+            // Neither run has a terminator: the two are one fragment still in progress.
+            (false, false) => Self {
+                max_complete: 0,
+                head: joined,
+                tail: joined,
+                terminated: false,
+                all_ascii,
+            },
+            (false, true) => Self {
+                max_complete: next.max_complete.max(joined),
+                head: joined,
+                tail: next.tail,
+                terminated: true,
+                all_ascii,
+            },
+            (true, false) => Self {
+                max_complete: self.max_complete.max(joined),
+                head: self.head,
+                tail: joined,
+                terminated: true,
+                all_ascii,
+            },
+            (true, true) => Self {
+                max_complete: self.max_complete.max(next.max_complete).max(joined),
+                head: self.head,
+                tail: next.tail,
+                terminated: true,
+                all_ascii,
+            },
+        }
+    }
+
+    /// The longest line in bytes, terminator excluded — **an upper bound on cells**.
+    ///
+    /// The head and tail fragments are folded in here rather than during [`merge`](Self::merge),
+    /// because a fragment only becomes a complete line once the run is known to be the whole file:
+    /// the leading fragment is line 0, and the trailing fragment is the last line, which has no
+    /// terminator after it.
+    pub fn max_line_bytes(self) -> u64 {
+        self.max_complete.max(self.head).max(self.tail)
+    }
+
+    /// Every byte of the run is below `0x80`.
+    ///
+    /// Note this is a statement about **bytes**, not decoded characters: a UTF-16LE file of pure
+    /// ASCII satisfies it, because its high bytes are `0x00`. [`exact_cells`](Self::exact_cells) is
+    /// where that distinction is resolved.
+    pub fn all_ascii(self) -> bool {
+        self.all_ascii
+    }
+
+    /// The exact cell count, when it is knowable without laying anything out.
+    ///
+    /// One byte per character *and* one cell per character is the only case where the byte length
+    /// **is** the cell count, so this needs both an all-ASCII run and a byte-oriented encoding.
+    /// **UTF-16 and UTF-32 return `None` even when the text is pure ASCII** — their byte length is
+    /// 2× or 4× the cell count, so [`max_line_bytes`](Self::max_line_bytes) is a valid but loose
+    /// bound there. Tightening that is a lazy-refinement job for the layout, not a scan-time one.
+    pub fn exact_cells(self, charset: Charset) -> Option<u64> {
+        (self.all_ascii && charset.code_unit() == 1).then(|| self.max_line_bytes())
+    }
+}
+
 /// A run of lines whose anchors are regularly spaced from the run's own first line.
 ///
 /// A serially-built index is one segment. The parallel indexer (E4) adds one per chunk, because a
@@ -60,6 +180,7 @@ pub struct LineIndex {
     segments: Vec<Segment>,
     anchors: u64,
     lines: u64,
+    extent: Extent,
 }
 
 impl Default for LineIndex {
@@ -86,7 +207,23 @@ impl LineIndex {
             segments: Vec::new(),
             anchors: 0,
             lines: 0,
+            extent: Extent::EMPTY,
         }
+    }
+
+    /// `SPEC.md` §3.3's horizontal extent, captured during the scan.
+    ///
+    /// **⚠ Only what [`crate::build_index`] measured.** Lines appended afterwards by
+    /// [`push_line`](Self::push_line) — a followed file growing (§5.4) — do **not** update it,
+    /// because a line start alone does not give a length: the line is not over until the next one
+    /// begins. Following is M4's, and widening the extent as the tail arrives belongs with it.
+    pub fn extent(&self) -> Extent {
+        self.extent
+    }
+
+    /// Records the extent measured while scanning. Called once, by the indexer, in file order.
+    pub fn set_extent(&mut self, extent: Extent) {
+        self.extent = extent;
     }
 
     /// Records the start of the next line. Call once per line, in order.
@@ -263,6 +400,18 @@ pub struct LineScanner {
     offset: u64,
     /// Bytes of the terminator matched so far, carried from an earlier chunk if need be.
     matched: usize,
+    /// Where this scanner's run began, so the leading fragment's length is known.
+    run_start: u64,
+    /// The first and last line starts emitted, which bound the head and tail fragments.
+    first_start: Option<u64>,
+    last_start: Option<u64>,
+    /// Longest line lying wholly inside this run. §3.3's `max_byte_len`, before the fragments at
+    /// either end are folded in.
+    max_complete: u64,
+    /// Every byte seen, OR-ed together. One instruction per byte, which is what makes §3.3's
+    /// "genuinely free during the newline scan" true rather than aspirational; the high bit of the
+    /// accumulator answers `all_ascii` at the end.
+    or_bits: u8,
 }
 
 impl LineScanner {
@@ -273,7 +422,57 @@ impl LineScanner {
             code_unit: charset.code_unit() as u64,
             offset: start_offset,
             matched: 0,
+            run_start: start_offset,
+            first_start: None,
+            last_start: None,
+            max_complete: 0,
+            or_bits: 0,
         }
+    }
+
+    /// This run's contribution to `SPEC.md` §3.3's horizontal extent.
+    ///
+    /// Adjacent runs are joined with [`Extent::merge`], which is what stitches a line cut in half by
+    /// a chunk boundary back together.
+    pub fn extent(&self) -> Extent {
+        let terminator = self.terminator.len() as u64;
+        let all_ascii = self.or_bits < 0x80;
+        match (self.first_start, self.last_start) {
+            (Some(first), Some(last)) => Extent {
+                max_complete: self.max_complete,
+                // `first` is one past the terminator, and a terminator cannot straddle the start of
+                // a run — every scanner begins with nothing matched — so this cannot underflow.
+                head: first - terminator - self.run_start,
+                tail: self.offset - last,
+                terminated: true,
+                all_ascii,
+            },
+            // No terminator anywhere in the run: it is one unfinished fragment, and whether it is a
+            // line at all depends on what sits either side of it.
+            _ => {
+                let whole = self.offset - self.run_start;
+                Extent {
+                    max_complete: 0,
+                    head: whole,
+                    tail: whole,
+                    terminated: false,
+                    all_ascii,
+                }
+            }
+        }
+    }
+
+    /// Records a line start for the extent. Separate from emitting it, because the caller decides
+    /// what to do with the offset and this has to happen either way.
+    fn note_line_start(&mut self, start: u64) {
+        if let Some(previous) = self.last_start {
+            let terminator = self.terminator.len() as u64;
+            self.max_complete = self.max_complete.max(start - previous - terminator);
+        }
+        if self.first_start.is_none() {
+            self.first_start = Some(start);
+        }
+        self.last_start = Some(start);
     }
 
     /// Feeds one read's worth of bytes, calling `on_line_start` with the absolute offset of the
@@ -284,12 +483,14 @@ impl LineScanner {
         for &b in bytes {
             let at = self.offset;
             self.offset += 1;
+            self.or_bits |= b;
 
             if self.matched > 0 {
                 if b == self.terminator[self.matched] {
                     self.matched += 1;
                     if self.matched == self.terminator.len() {
                         self.matched = 0;
+                        self.note_line_start(self.offset);
                         on_line_start(self.offset);
                     }
                     continue;
@@ -305,6 +506,7 @@ impl LineScanner {
 
             if at.is_multiple_of(self.code_unit) && b == self.terminator[0] {
                 if self.terminator.len() == 1 {
+                    self.note_line_start(self.offset);
                     on_line_start(self.offset);
                 } else {
                     self.matched = 1;
