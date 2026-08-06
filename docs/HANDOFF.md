@@ -1,49 +1,117 @@
 # Handoff — resume here
 
-## ▶ 🚧 Session 12 (2026-08-06) opened the shaping bridge and stopped early — resume exactly here
+## ✅ The shaping bridge is built — `shape.rs`, 2026-08-06, session 13
 
-**No code exists yet. Stopped on token budget, deliberately, before writing `shape.rs`.** What is
-done and committed (`04cd386`): the CLEANROOM §5 entry for **text shaping — cluster → glyph ids,
-the V2/V3 bridge** — filed *before* the code for once, as §1.5 requires. Do not re-file it.
+`crates/tailhawk-core/src/shape.rs`. **199 tests, all passing** (198 core + the shell's one), fmt and
+clippy clean, CI green on x64 and ARM64. **The V2/V3 gap is closed.** `glyphs.rs`'s test-only
+`glyphs_for` — one code point, one glyph — now has a real replacement: `Shaper::shape` takes a line
+and a face and returns, per grapheme cluster, which glyph ids draw it. **V3 may be built on this.**
 
-**The vendor call sequence was read this session (Microsoft Learn, not recalled), and the facts
-worth not re-fetching are:**
+**It holds no device and no window**, like `raster.rs`, so every test runs in-process. The call
+sequence is `AnalyzeScript` + `AnalyzeBidi` → `GetGlyphs` → `GetGlyphPlacements`, and the module
+authors both COM callbacks (`IDWriteTextAnalysisSource` / `IDWriteTextAnalysisSink`) as one object.
 
-- Sequence: `AnalyzeScript(source, pos, len, sink)` → `GetGlyphs` → `GetGlyphPlacements`, analyzer
-  from `IDWriteFactory2::CreateTextAnalyzer()`.
-- **All positions are UTF-16 code units** — the bridge must map cluster byte ranges (UTF-8, from
-  `cell.rs`) to UTF-16 ranges and back.
-- `GetGlyphs`: per-glyph buffer estimate **3·len/2 + 16**, not guaranteed; on
-  `HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)` grow and retry. `clusterMap` maps each UTF-16
-  position to its first glyph; derive each grapheme cluster's glyph range from clusterMap
-  boundaries.
-- `GetTextAtPosition` returns the **remainder** of the block from the position (not the whole
-  block); returning NULL means end of text. Callbacks should stub with a constant + `S_OK`, never
-  `E_NOTIMPL`. `GetTextBeforePosition` returns the block *ending* at the position.
-- `windows` 0.58 has everything needed: `IDWriteTextAnalysisSource_Impl` /
-  `IDWriteTextAnalysisSink_Impl` traits exist in its DirectWrite `impl.rs` (signatures use raw
-  `*mut *mut u16` out-params), and implementing them needs the **`implement` feature added to the
-  windows dependency in `crates/tailhawk-core/Cargo.toml`** — not yet added.
-- Sink trait also carries `SetBidiLevel` — plan was to run `AnalyzeBidi` too and pass
-  `isRightToLeft = (resolved level odd)` per run, so Arabic gets correct joining forms.
+### ⚠ `GetGlyphs` returns glyphs in *logical* order, even with `isRightToLeft = true`
 
-**Design decisions taken (argued nowhere else yet):** shape per script run; keep the module
-device-free like `raster.rs` so it tests headless; output per-cluster glyph ranges as the currency
-the grid consumes; `Face` needs a `pub(crate)` accessor for its private `IDWriteFontFace`.
+**This was written from memory the other way round and two tests failed.** The obvious guess is that
+a right-to-left run comes back already reversed. It does not — the array is in logical order and
+`clusterMap` still rises. **Visual reordering is the drawing code's job, and V3 owes it.**
 
-**Next concrete steps:** add `implement` feature → write `crates/tailhawk-core/src/shape.rs`
-(source + sink structs, run segmentation, GetGlyphs retry loop, cluster mapping) → register in
-`lib.rs` → tests (ASCII identity vs `glyph_indices`, Devanagari `कि` mark attachment, Arabic
-contextual forms differing by position, ZWJ emoji one cluster) → negative controls applied,
-observed, reverted → fmt/clippy/tests → commit → CI with the `--nocapture` skip-check → adversarial
-review (the owner's standing condition) → update this file.
+The discriminator is worth keeping: **alef joins to its right but not its left**, so `ابب` is
+unambiguously `[alef, beh-initial, beh-final]` logically and the reverse visually, and alef's glyph
+is identifiable from the `.cmap`. It came back at index 0. `directwrite_returns_glyphs_in_logical_order`
+pins it; `an_arabic_run_resolves_to_a_right_to_left_bidi_level` proves the run really was marked RTL,
+so the finding is about DirectWrite rather than about a run that was never flagged.
+
+`glyph_range` deliberately does **not** depend on the answer: it reads the map's direction from the
+map. That is why the fix was a doc correction rather than a rewrite.
+
+### 🔍 The adversarial review found two real defects, and both were live bugs
+
+The owner's standing condition, and it paid again. Neither was caught by the 25 tests that existed.
+
+| Defect | Effect |
+|---|---|
+| **`glyph_range` asked only whether the cluster's *first* position was shared** | The two clusterings do not nest. A grapheme cluster whose first position was swallowed by a preceding ligature but whose *later* positions open a DirectWrite cluster of their own was declared absorbed, and **its glyph was claimed by nobody and never drawn**. `\u{200B}\u{FE0F}\u{E0067}` is a real line that does it — and the dropped glyph was a **tag character**, the hidden-text vector §13.4 names and §5.6 forbids discarding silently. Fixed: ownership is decided by where a DirectWrite cluster *opens*. |
+| **`snap_to_cluster` moved a straddling boundary *backwards*, which deleted it** | A cluster's start is usually already a cut, so the moved boundary collapsed onto it and vanished — and the run then swallowed everything to the next surviving cut. `بि` is one cluster (`U+093F` is `Mc`), so `بिक्षि tail` shaped the **whole Devanagari word as right-to-left Arabic**: conjunct ligature lost, matra not reordered, cluster **77% wider** — column drift against §3.3's own acceptance test. It reached past the script too: `GET /a بिक्षि 200` shaped the trailing `200` as Arabic. **Six attacker-supplied bytes changing the rest of the line is exactly what §13.4 calls a real defect.** Fixed: boundaries snap *forward* to the cluster's end, a position no earlier cut can occupy. |
+
+Two more findings were about honesty and are corrected: the doc for `glyph_range`/`ClusterGlyphs`
+stated the buggy rule as if it were the right one, and **`every_glyph_is_claimed_by_exactly_one_cluster`
+did not test the property it claimed to** — it drove only one-code-unit clusters, and multi-unit
+clusters are the entire reason shaping exists. It now sweeps every monotonic map of up to four
+positions, rising *and* falling, crossed with **every partition of those positions into clusters**;
+that cross product is what surfaced the dropped glyph. A `u32` truncation guard on absurd line
+lengths and one genuinely dead filter went with them.
+
+**Both fixes were verified by reverting them**: restoring the old absorbed rule fails 3 tests
+including the real-text sweep; restoring backward snapping fails 3 including the Devanagari one.
+
+### Seven negative controls on the original, each applied, observed and reverted
+
+| Mutation | Result |
+|---|---|
+| ligature "absorbed" guard removed | 2 fail — both clusters claim one glyph |
+| neighbour search made forward-only (the left-to-right assumption) | 2 fail |
+| forward scan past equal `clusterMap` entries dropped | 2 fail |
+| UTF-16 length replaced by byte length | **8 fail** |
+| `E_NOTIMPL` returned from `GetLocaleName` | **9 fail** — every DirectWrite test |
+| wrong HRESULT compared in the retry loop | 1 fail |
+| forward scan started at `start+1` rather than `start+len` | **did not fire** |
+
+**The one that did not fire changed the code, again.** It was a no-op on every fixture, but it is not
+redundant: a grapheme cluster DirectWrite splits into two of its own gives a rising map *inside* one
+cluster, and the two forms differ there. `a_cluster_directwrite_splits_still_takes_all_of_its_glyphs`
+is that case, and the control fires with it present. Same shape as `raster.rs`'s `tighten` — **a
+control that does not fire is a statement about the fixtures.** It is now three for three.
+
+### Two claims that were measured rather than asserted
+
+- **Which source callbacks actually run.** Instrumenting all five showed `AnalyzeScript`/`AnalyzeBidi`
+  calling `GetTextAtPosition`, **`GetLocaleName` and `GetParagraphReadingDirection`** — and *not*
+  `GetTextBeforePosition` or `GetNumberSubstitution`. `E_NOTIMPL` from the latter two is harmless;
+  from `GetLocaleName` it fails the whole analysis. The comment now says only that.
+- **The retry loop is exercised, not assumed.** `shape_from` takes the first buffer guess, so
+  starving it to one glyph drives the real `ERROR_INSUFFICIENT_BUFFER` path — the same trick
+  `rasterise_in_batches` uses for batch size. A bounded-growth test covers the give-up path too.
+
+### What shaping still owes
+
+- **Visual reordering for right-to-left runs.** Established above as the caller's job; nothing does
+  it yet. V3.
+- **Font fallback.** `shape` takes one face and a codepoint it lacks shapes to `.notdef`, exactly as
+  `Face::glyph_indices` behaves. Noticing that and trying the next face is the caller's, and
+  `GlyphKey` is keyed by face precisely so a fallback glyph cannot collide.
+- **The locale is fixed at `en-us`.** It selects language-specific forms (`locl`); a log file carries
+  no language tag, so a stable wrong answer beats a guessed one — but it is a limitation, not a
+  decision.
+- **Nothing consumes `Shaped` yet**, so `advances` and `offsets` are produced and unused. They are
+  what places marks *within* a cluster; §3.3 still gives the cell grid the final say on where a
+  cluster starts.
+
+**⚠ Static `tailhawk.exe` is 506,368 bytes — byte-for-byte the previous figure, and it means
+nothing.** Nothing in `crates/tailhawk` references shaping, so LTO strips the whole module. Session 8
+recorded this trap and it still applies: **the real size cost lands at V3**, when the grid references
+the atlas and the shaper together.
+
+**CLEANROOM needs nothing.** Session 12 filed the §5 entry (`04cd386`) *before* the code, which is
+what §1.5 asks and what had slipped three times. No source outside the repo was consulted this
+session at all — the ordering finding came from a probe against the running DirectWrite, not a page.
+
+### ▶ Resume here: V3, the grid
+
+Everything V3 needed from V2 now exists. The two things `SPEC.md` §3.3 still names, unchanged from
+session 11's note below: the **u64 scroll model, hit-test and selection**, and the
+**`max_byte_len` / `all_ascii` extent fields captured during the index scan** — §5.3 says they are
+free there and recovering them later means a second pass over 10 GB. `index.rs` has neither field.
+Do it *with* V3's scrollbar; do not let V3 ship without it.
 
 ---
 
-**Paused:** 2026-08-05, session 11. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
+**Paused:** 2026-08-06, session 13. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
 both architectures. Only M2's two large-fixture done-criteria remain unrun. **M3 is under way: V4
-(the cell model) and V1 (the device) are done, and V2 has started with the atlas allocator**;
-`PLAN.md` marks M3 the highest-risk milestone, with a stop-and-reconsider gate at >50% overrun. **Everything below is on disk and pushed. Nothing is
+(the cell model), V1 (the device), V2's monochrome path and the shaping bridge are all done; V3, the
+grid, is next and nothing blocks it.** `PLAN.md` marks M3 the highest-risk milestone, with a
+stop-and-reconsider gate at >50% overrun. **Everything below is on disk and pushed. Nothing is
 held in a chat session.**
 
 ---
@@ -77,11 +145,13 @@ glyph it cannot render.
 | a no-ink glyph is not recorded as blank | `a_space_is_recorded_as_blank_and_stops_being_a_miss` fails — G4's 440-misses-per-frame bug |
 | *(the placeholder path, tested by the two assertions in `asking_for_a_glyph_never_rasterises_it`: the placeholder occupies exactly the cell the real glyph will, and the second frame samples a different slot)* | |
 
-**⚠ Shaping is not solved and nothing here pretends otherwise.** The one-code-point-one-glyph mapping
-used by the tests is `glyphs_for`, confined to the test module **on purpose**, with a comment saying
-it is wrong for Devanagari, Arabic and anything else §3.3 names. **V3 must not be built on it.** What
-`GlyphCache` takes is a glyph id, which is the right currency; deciding *which* glyph ids draw a
-cluster is the missing piece between §3.3's cell model and this.
+**⚠ Shaping is not solved and nothing here pretends otherwise.** ~~The one-code-point-one-glyph
+mapping used by the tests is `glyphs_for`, confined to the test module **on purpose**, with a comment
+saying it is wrong for Devanagari, Arabic and anything else §3.3 names. **V3 must not be built on
+it.**~~ — **solved in session 13 by `shape.rs`; see the top of this file.** `glyphs_for` is still
+test-only and still wrong, and still must not be used; `Shaper::shape` is what V3 builds on. What
+`GlyphCache` takes is a glyph id, which was already the right currency — deciding *which* glyph ids
+draw a cluster is what the shaper now answers.
 
 **Still owed by V2:** the colour path through `TranslateColorGlyphRun` into a second sheet; §3.2's
 per-DPI rebuild (`Atlas::clear` exists for it, nothing calls it, and `GlyphCache` has no way to change
@@ -422,10 +492,10 @@ sections at the top of this file.
 **V3 is the grid: the u64 scroll model, hit-test and selection, plus §3.3's `max_byte_len` /
 `all_ascii` extent fields.** Two things to settle before writing much of it:
 
-1. **Cluster → glyph ids.** `GlyphCache` speaks glyph ids and `cell.rs` speaks grapheme clusters, and
-   nothing bridges them. The test-only `glyphs_for` in `glyphs.rs` is one code point to one glyph and
-   is **wrong** for anything needing marks, ligatures or reordering. Bridging it properly means
-   `IDWriteTextAnalyzer`, which is the piece of DirectWrite V2 has not touched yet.
+1. ~~**Cluster → glyph ids.** `GlyphCache` speaks glyph ids and `cell.rs` speaks grapheme clusters,
+   and nothing bridges them.~~ — **done, session 13.** `shape.rs` bridges them via
+   `IDWriteTextAnalyzer`. What V3 inherits from it: **glyphs come back in logical order even for
+   right-to-left runs, so V3 owes the visual reordering**, and font fallback is the caller's job.
 2. **The extent fields must be captured during the index scan** — §3.3 says they are free there, and
    the reason is that recovering them later means a second pass over 10 GB. `index.rs` has neither
    field. Do it *with* V3's scrollbar, but do not let V3 ship without it.
