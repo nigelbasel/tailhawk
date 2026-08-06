@@ -112,10 +112,12 @@ pub struct GlyphOffset {
 
 /// One grapheme cluster and the glyphs that draw it.
 ///
-/// **`glyph_count` may be zero.** A ligature covers several clusters with one glyph, and DirectWrite
-/// reports the glyph against the first of them; the rest genuinely draw nothing of their own. That
-/// is a real state, not a failure, and it is reported rather than smoothed over — a grid that puts
-/// one glyph in one cell needs to *know* two clusters merged.
+/// **`glyph_count` may be zero.** A ligature covers several clusters with one glyph, and it is
+/// reported against the first of them; the rest genuinely draw nothing of their own. That is a real
+/// state, not a failure — a grid that puts one glyph in one cell needs to *know* two clusters merged.
+///
+/// It is decided by whether any of the cluster's positions **opens** a DirectWrite cluster, not by
+/// whether its first position was shared. The weaker test dropped glyphs; see [`glyph_range`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ClusterGlyphs {
     pub span: ClusterSpan,
@@ -366,9 +368,26 @@ fn cluster_spans(line: &str) -> Vec<ClusterSpan> {
 /// **measured and came out the opposite way from the obvious guess**: see
 /// `directwrite_returns_glyphs_in_logical_order`.
 ///
-/// Returns `(first, count)`. **A count of zero means the cluster was absorbed into its predecessor's
-/// ligature** — that is, the position before it maps to the same glyph. Reported rather than
-/// smoothed over: a grid that puts one cluster in one cell needs to know two of them merged.
+/// Returns `(first, count)`. **A count of zero means every one of the cluster's positions belongs to
+/// a DirectWrite cluster that started before it** — it was swallowed by a preceding ligature and
+/// draws nothing of its own. Reported rather than smoothed over: a grid that puts one cluster in one
+/// cell needs to know two of them merged.
+///
+/// ## Ownership is decided by where a DirectWrite cluster *starts*
+///
+/// The two clusterings do not nest. DirectWrite's boundaries and `unicode-segmentation`'s can
+/// interleave, so one grapheme cluster's positions can span the tail of one DirectWrite cluster and
+/// the whole of the next. The rule is that a grapheme cluster owns every DirectWrite cluster whose
+/// **first** position falls inside it, and a position starts one when it is position zero or its map
+/// entry differs from the position before.
+///
+/// **Asking only whether the cluster's own first position was shared — which is what this did — drops
+/// glyphs.** With `map = [0, 0, 1]` and grapheme clusters `(0..1)` and `(1..3)`, the second cluster's
+/// first position shares glyph 0 with the first cluster, so it was declared absorbed and returned
+/// zero glyphs; but its *second* position starts a new DirectWrite cluster, and glyph 1 was then
+/// claimed by nobody and never drawn. `\u{200B}\u{FE0F}\u{E0067}` is a real line that does this — and
+/// the glyph it dropped belonged to a tag character, the hidden-text vector `SPEC.md` §13.4 names,
+/// which §5.6 requires never be silently discarded.
 fn glyph_range(
     cluster_map: &[u16],
     glyph_count: usize,
@@ -378,15 +397,22 @@ fn glyph_range(
     if len == 0 || start >= cluster_map.len() {
         return (glyph_count, 0);
     }
-    let first = cluster_map[start] as usize;
-    if start > 0 && cluster_map[start - 1] == cluster_map[start] {
-        return (first.min(glyph_count), 0);
-    }
+    let end = (start + len).min(cluster_map.len());
+    let starts_a_run = |p: usize| p == 0 || cluster_map[p] != cluster_map[p - 1];
 
-    // The distinct value on each side. Forward has to skip equal entries: a cluster several code
-    // units long maps every one of them to the same glyph.
-    let mut ahead = (start + len).min(cluster_map.len());
-    while ahead < cluster_map.len() && cluster_map[ahead] as usize == first {
+    // The first position of the cluster that opens a DirectWrite cluster of its own. Without one,
+    // every glyph the cluster touches is its predecessor's.
+    let Some(opening) = (start..end).find(|p| starts_a_run(*p)) else {
+        return ((cluster_map[start] as usize).min(glyph_count), 0);
+    };
+    let first = cluster_map[opening] as usize;
+
+    // The limit is the neighbouring distinct entry that sits *after* this cluster in the glyph
+    // array. Forward has to skip equal entries — a cluster several code units long maps all of them
+    // to one glyph — and is measured from the cluster's last entry, which may differ from its first.
+    let last = cluster_map[end - 1] as usize;
+    let mut ahead = end;
+    while ahead < cluster_map.len() && cluster_map[ahead] as usize == last {
         ahead += 1;
     }
     let neighbours = [
@@ -405,18 +431,33 @@ fn glyph_range(
     (first, limit.min(glyph_count).saturating_sub(first))
 }
 
-/// The largest cluster start at or before `unit`.
+/// Moves a run boundary onto the nearest grapheme cluster boundary, **forwards**.
 ///
 /// Script and bidi boundaries are found on the raw text and need not agree with grapheme cluster
 /// boundaries — a combining mark can carry a different script from its base, and an isolate control
 /// is its own bidi run inside somebody's cluster. **A cluster is indivisible**: shaping half of one
-/// in each of two runs would give a mark no base to attach to. So a boundary is moved back to the
-/// cluster that contains it, and whichever run owns a cluster's start owns all of it.
+/// in each of two runs would give a mark no base to attach to. So a boundary landing inside a cluster
+/// has to move, and the cluster goes wholesale to the run on one side or the other.
+///
+/// **It moves to the cluster's end, not its start, and that is the whole point.** Moving backwards
+/// looks equivalent — the straddling cluster simply joins the later run instead of the earlier one —
+/// but the cluster's start is very often *already* a boundary, and then the moved boundary lands on
+/// an existing one and **disappears from the set entirely**. The run does not merely absorb one
+/// cluster; it swallows everything up to the next surviving boundary.
+///
+/// The cost of getting this wrong is not subtle. `"بि"` is one grapheme cluster — `U+093F` is a
+/// spacing mark, so it joins the Arabic letter before it — and it straddles the Arabic/Devanagari
+/// script boundary. Snapping backwards deleted that boundary, so `"بिक्षि tail"` shaped its entire
+/// Devanagari word as right-to-left Arabic: the conjunct ligature lost, the matra not reordered,
+/// four glyphs where two belong and the cluster **77% wider**, which is column drift against §3.3's
+/// own acceptance test. It reaches past the script too — `"GET /a بिक्षि 200"` shaped the trailing
+/// space and `200` as Arabic. Six attacker-supplied bytes changing the rendering of the rest of the
+/// line is exactly what §13.4 calls a real defect.
 fn snap_to_cluster(unit: usize, spans: &[ClusterSpan]) -> usize {
     match spans.binary_search_by_key(&unit, |s| s.unit) {
-        Ok(i) => spans[i].unit,
+        Ok(_) => unit,
         Err(0) => 0,
-        Err(i) => spans[i - 1].unit,
+        Err(i) => spans[i - 1].unit + spans[i - 1].unit_len,
     }
 }
 
@@ -472,6 +513,17 @@ impl Shaper {
             return Ok(Shaped::default());
         }
         let text: Vec<u16> = line.encode_utf16().collect();
+        // Every position DirectWrite takes is a `u32`. A line past that would be analysed as a
+        // truncated prefix and the clusters beyond it would fall in no run and vanish from the
+        // result — a silent disagreement with `cell.rs` about how many clusters a line has, which
+        // the grid assumes cannot happen. Refusing is the honest answer; §10.3's long-line handling
+        // is a different problem from pretending this one does not exist.
+        if text.len() > u32::MAX as usize {
+            return Err(Error(format!(
+                "a line of {} UTF-16 code units is past what DirectWrite can analyse",
+                text.len()
+            )));
+        }
         let line = Line {
             text: &text,
             spans: &spans,
@@ -505,7 +557,7 @@ impl Shaper {
         }
         let collected = collected.borrow();
 
-        // A boundary from either analysis starts a run, moved back to the cluster containing it.
+        // A boundary from either analysis starts a run, moved onto a cluster boundary first.
         let mut cuts = BTreeSet::from([0usize, line.text.len()]);
         for (position, _, _) in &collected.scripts {
             cuts.insert(snap_to_cluster(*position as usize, line.spans));
@@ -514,6 +566,7 @@ impl Shaper {
             cuts.insert(snap_to_cluster(*position as usize, line.spans));
         }
 
+        // `cuts` is a set, so consecutive pairs are strictly increasing and every run is non-empty.
         let cuts: Vec<usize> = cuts.into_iter().collect();
         Ok(cuts
             .windows(2)
@@ -523,7 +576,6 @@ impl Shaper {
                 script: at(&collected.scripts, w[0]).unwrap_or_default(),
                 right_to_left: at(&collected.levels, w[0]).unwrap_or(0) % 2 == 1,
             })
-            .filter(|r| r.unit_len > 0)
             .collect())
     }
 
@@ -803,6 +855,24 @@ mod tests {
         assert_eq!(glyph_range(&map, 2, 3, 1), (1, 1));
     }
 
+    /// **The dropped-glyph case, in the two shapes a review found it in.** A grapheme cluster whose
+    /// *first* position was swallowed by the previous cluster's ligature, but whose later positions
+    /// open a DirectWrite cluster of their own. Asking only about the first position calls the whole
+    /// thing absorbed and the later glyph is claimed by nobody.
+    #[test]
+    fn a_cluster_that_starts_inside_a_ligature_still_owns_what_follows() {
+        // Cluster (0..1) takes glyph 0; cluster (1..3) shares position 1 with it but opens a new
+        // DirectWrite cluster at position 2, so glyph 1 is its own.
+        let map = [0u16, 0, 1];
+        assert_eq!(glyph_range(&map, 2, 0, 1), (0, 1));
+        assert_eq!(glyph_range(&map, 2, 1, 2), (1, 1));
+
+        // The mirror: the ligature is inside cluster (0..2), and cluster (2..3) is fully absorbed.
+        let map = [0u16, 1, 1];
+        assert_eq!(glyph_range(&map, 2, 0, 2), (0, 2));
+        assert_eq!(glyph_range(&map, 2, 2, 1), (1, 0));
+    }
+
     /// A cluster that is several code units long is still one entry's worth of glyphs — every
     /// position within it maps to the same first glyph.
     #[test]
@@ -829,46 +899,141 @@ mod tests {
         assert_eq!(glyph_range(&map, 3, 2, 1), (2, 1));
     }
 
-    /// Every glyph is claimed exactly once, whichever way the map runs. This is the property the
-    /// grid actually depends on: a glyph claimed twice draws twice, and one claimed by nobody
-    /// silently disappears.
+    /// **Every glyph is claimed by exactly one cluster.** This is the property the grid depends on:
+    /// a glyph claimed twice draws twice, and one claimed by nobody silently disappears.
+    ///
+    /// It is swept exhaustively over every monotonic `clusterMap` of up to four positions, rising
+    /// and falling, crossed with **every way of partitioning those positions into grapheme
+    /// clusters** — because the two clusterings do not nest, and the partition is the axis that
+    /// matters. An earlier version of this test drove only one-code-unit clusters and passed while
+    /// `glyph_range` dropped glyphs on `map = [0, 0, 1]` split as `(0..1)(1..3)`. Multi-unit clusters
+    /// are the entire reason shaping exists — surrogate pairs, matras, ZWJ sequences — so a sweep
+    /// that omits them is a source of false confidence rather than a check.
     #[test]
     fn every_glyph_is_claimed_by_exactly_one_cluster() {
-        for (map, glyph_count) in [
-            (vec![0u16, 1, 2], 3),
-            (vec![0u16, 1, 3], 4),
-            (vec![0u16, 0, 1], 2),
-            (vec![2u16, 1, 0], 3),
-            (vec![3u16, 1, 0], 4),
-            (vec![0u16, 0, 0], 1),
-        ] {
-            let mut claims = vec![0usize; glyph_count];
-            for start in 0..map.len() {
-                let (first, count) = glyph_range(&map, glyph_count, start, 1);
-                for c in claims.iter_mut().skip(first).take(count) {
-                    *c += 1;
+        let mut checked = 0usize;
+        for map in monotonic_maps(4) {
+            let glyph_count = *map.iter().max().expect("non-empty") as usize + 1;
+            for extra in 0..2 {
+                let glyph_count = glyph_count + extra;
+                for partition in partitions(map.len()) {
+                    let mut claims = vec![0usize; glyph_count];
+                    for (start, len) in &partition {
+                        let (first, count) = glyph_range(&map, glyph_count, *start, *len);
+                        assert!(
+                            first + count <= glyph_count,
+                            "map {map:?} cluster ({start},{len}) escapes {glyph_count} glyphs"
+                        );
+                        for c in claims.iter_mut().skip(first).take(count) {
+                            *c += 1;
+                        }
+                    }
+                    assert!(
+                        claims.iter().all(|c| *c == 1),
+                        "map {map:?} over {glyph_count} glyphs, clusters {partition:?}, \
+                         claimed {claims:?}"
+                    );
+                    checked += 1;
                 }
             }
-            assert!(
-                claims.iter().all(|c| *c == 1),
-                "map {map:?} over {glyph_count} glyphs claimed {claims:?}"
-            );
         }
+        assert!(checked > 500, "the sweep should be broad, ran {checked}");
+    }
+
+    /// Every non-decreasing map starting at 0 with steps of 0, 1 or 2, plus each one's falling
+    /// mirror — the shape a visually-ordered run would have.
+    fn monotonic_maps(max_len: usize) -> Vec<Vec<u16>> {
+        let mut out = Vec::new();
+        for len in 1..=max_len {
+            let mut rising: Vec<Vec<u16>> = vec![vec![0u16]];
+            for _ in 1..len {
+                rising = rising
+                    .into_iter()
+                    .flat_map(|m| {
+                        let last = *m.last().expect("non-empty");
+                        (0..=2u16).map(move |step| {
+                            let mut next = m.clone();
+                            next.push(last + step);
+                            next
+                        })
+                    })
+                    .collect();
+            }
+            for m in rising {
+                let top = *m.iter().max().expect("non-empty");
+                out.push(m.iter().rev().map(|v| top - v).collect());
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    /// Every way of cutting `n` positions into contiguous non-empty clusters, as `(start, len)`.
+    fn partitions(n: usize) -> Vec<Vec<(usize, usize)>> {
+        (0..1u32 << (n.saturating_sub(1)))
+            .map(|bits| {
+                let mut out = Vec::new();
+                let mut start = 0;
+                for p in 1..n {
+                    if bits & (1 << (p - 1)) != 0 {
+                        out.push((start, p - start));
+                        start = p;
+                    }
+                }
+                out.push((start, n - start));
+                out
+            })
+            .collect()
     }
 
     #[test]
-    fn a_boundary_inside_a_cluster_moves_back_to_its_start() {
+    fn a_boundary_inside_a_cluster_moves_forward_to_its_end() {
         let spans = cluster_spans("a\u{1F600}b");
-        // Units: 0 = 'a', 1..3 = the emoji, 3 = 'b'.
+        // Units: 0 = 'a', 1..3 = the emoji, 3 = 'b', 4 = end.
         assert_eq!(snap_to_cluster(0, &spans), 0);
         assert_eq!(snap_to_cluster(1, &spans), 1);
         assert_eq!(
             snap_to_cluster(2, &spans),
-            1,
-            "a boundary on the low surrogate must not split the pair"
+            3,
+            "a boundary on the low surrogate must not split the pair, and must not vanish either"
         );
         assert_eq!(snap_to_cluster(3, &spans), 3);
-        assert_eq!(snap_to_cluster(9, &spans), 3);
+        assert_eq!(snap_to_cluster(9, &spans), 4);
+    }
+
+    /// **A boundary must survive being moved.** Snapping backwards lands an interior boundary on the
+    /// cluster's start, which is usually already a cut — and a boundary that collapses onto an
+    /// existing one is a boundary deleted, letting the earlier run swallow everything up to the next
+    /// surviving cut. Snapping forwards cannot do that, because a cluster's end is a position no
+    /// earlier cut can occupy.
+    #[test]
+    fn a_snapped_boundary_is_never_the_run_start_it_would_collapse_into() {
+        for line in [
+            "a\u{1F600}b",
+            "\u{628}\u{93F}\u{915}",
+            "\u{1F468}\u{200D}\u{1F469}x",
+            "e\u{301}\u{302}f",
+            "\r\na",
+        ] {
+            let spans = cluster_spans(line);
+            for span in &spans {
+                // Every position strictly inside a cluster must land past the cluster's own start,
+                // which is the cut it would otherwise be swallowed by.
+                for interior in span.unit + 1..span.unit + span.unit_len {
+                    let snapped = snap_to_cluster(interior, &spans);
+                    assert_eq!(
+                        snapped,
+                        span.unit + span.unit_len,
+                        "{line:?}: the boundary at {interior} should land on the cluster's end"
+                    );
+                    assert!(
+                        snapped > span.unit,
+                        "{line:?}: the boundary at {interior} collapsed onto the cut at {}",
+                        span.unit
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1208,6 +1373,115 @@ mod tests {
         assert!(
             shaper.shape(&face, &line, EM).is_ok(),
             "and the real estimate must be nowhere near that bound"
+        );
+    }
+
+    /// **No glyph is ever left unclaimed on real text.** Driven over the adversarial alphabet §13.4
+    /// cares about — tag characters, variation selectors, bidi controls, zero-width spaces, controls
+    /// — which is where a review found `glyph_range` dropping a tag character's glyph on
+    /// `\u{200B}\u{FE0F}\u{E0067}`. §5.6 forbids discarding exactly that content silently.
+    #[test]
+    fn no_glyph_of_a_real_line_goes_unclaimed() {
+        let Some((shaper, face)) = shaper_and_face("no_glyph_of_a_real_line_goes_unclaimed", LATIN)
+        else {
+            return;
+        };
+        let alphabet = [
+            "\u{200B}",
+            "\u{FE0F}",
+            "\u{FE0E}",
+            "\u{E0067}",
+            "\u{202E}",
+            "\u{200D}",
+            "\u{7F}",
+            "a",
+            "\u{1F600}",
+            "\u{301}",
+            "\u{FFFD}",
+            "\0",
+        ];
+
+        let mut lines = 0;
+        for a in &alphabet {
+            for b in &alphabet {
+                for c in &alphabet {
+                    let line = format!("{a}{b}{c}");
+                    let shaped = shaper.shape(&face, &line, EM).expect("shape");
+                    let mut claims = vec![0usize; shaped.glyphs.len()];
+                    for cluster in &shaped.clusters {
+                        for i in 0..cluster.glyph_count {
+                            claims[cluster.first_glyph + i] += 1;
+                        }
+                    }
+                    assert!(
+                        claims.iter().all(|c| *c == 1),
+                        "{line:?} claimed {claims:?} over {} glyphs, clusters {:?}",
+                        shaped.glyphs.len(),
+                        shaped.clusters
+                    );
+                    lines += 1;
+                }
+            }
+        }
+        assert!(lines > 1000, "the sweep should be broad, ran {lines}");
+    }
+
+    /// **A straddling cluster must not hand its whole line to the wrong script.** `U+093F` is a
+    /// spacing mark, so `بि` is one grapheme cluster across the Arabic/Devanagari boundary. When the
+    /// snapped boundary collapsed, everything after it shaped as right-to-left Arabic — the conjunct
+    /// ligature lost and the cluster 77% wider, which is column drift against §3.3's acceptance test.
+    #[test]
+    fn a_cluster_straddling_a_script_boundary_does_not_swallow_the_rest_of_the_line() {
+        let Some((shaper, face)) = shaper_and_face(
+            "a_cluster_straddling_a_script_boundary_does_not_swallow_the_rest_of_the_line",
+            DEVANAGARI,
+        ) else {
+            return;
+        };
+        let word = "\u{915}\u{94D}\u{937}\u{93F}";
+        if !covered(&face, "\u{915}\u{94D}\u{937}\u{93F}") {
+            eprintln!(
+                "SKIPPED a_cluster_straddling...: {} lacks Devanagari",
+                face.family
+            );
+            return;
+        }
+
+        let alone = shaper.shape(&face, word, EM).expect("shape");
+        let glyphs_of_word = |prefix: &str| -> Vec<GlyphId> {
+            let line = format!("{prefix}{word}");
+            let shaped = shaper.shape(&face, &line, EM).expect("shape");
+            let from = prefix.len();
+            shaped
+                .clusters
+                .iter()
+                .filter(|c| c.span.byte >= from)
+                .flat_map(|c| shaped.glyphs_of(c).to_vec())
+                .collect()
+        };
+
+        // The controls: prefixes that end on a cluster boundary must not disturb the word.
+        for prefix in ["x", "\u{628}"] {
+            assert_eq!(
+                glyphs_of_word(prefix),
+                alone.glyphs,
+                "the prefix {prefix:?} changed how the Devanagari word shapes"
+            );
+        }
+
+        // And the case that matters: an Arabic letter followed by a Devanagari **spacing** mark is
+        // one grapheme cluster straddling the script boundary. `U+093F` is `Mc`, so it joins the
+        // letter before it — which is what puts a cluster across the boundary at all.
+        let straddle = "\u{628}\u{93F}";
+        assert_eq!(
+            cluster_spans(straddle).len(),
+            1,
+            "the fixture only tests anything if these two really are one cluster"
+        );
+        assert_eq!(
+            glyphs_of_word(straddle),
+            alone.glyphs,
+            "a cluster straddling the boundary handed the rest of the line to the wrong script"
         );
     }
 
