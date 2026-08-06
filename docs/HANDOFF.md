@@ -1,5 +1,45 @@
 # Handoff — resume here
 
+## ▶ 🚧 Session 12 (2026-08-06) opened the shaping bridge and stopped early — resume exactly here
+
+**No code exists yet. Stopped on token budget, deliberately, before writing `shape.rs`.** What is
+done and committed (`04cd386`): the CLEANROOM §5 entry for **text shaping — cluster → glyph ids,
+the V2/V3 bridge** — filed *before* the code for once, as §1.5 requires. Do not re-file it.
+
+**The vendor call sequence was read this session (Microsoft Learn, not recalled), and the facts
+worth not re-fetching are:**
+
+- Sequence: `AnalyzeScript(source, pos, len, sink)` → `GetGlyphs` → `GetGlyphPlacements`, analyzer
+  from `IDWriteFactory2::CreateTextAnalyzer()`.
+- **All positions are UTF-16 code units** — the bridge must map cluster byte ranges (UTF-8, from
+  `cell.rs`) to UTF-16 ranges and back.
+- `GetGlyphs`: per-glyph buffer estimate **3·len/2 + 16**, not guaranteed; on
+  `HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)` grow and retry. `clusterMap` maps each UTF-16
+  position to its first glyph; derive each grapheme cluster's glyph range from clusterMap
+  boundaries.
+- `GetTextAtPosition` returns the **remainder** of the block from the position (not the whole
+  block); returning NULL means end of text. Callbacks should stub with a constant + `S_OK`, never
+  `E_NOTIMPL`. `GetTextBeforePosition` returns the block *ending* at the position.
+- `windows` 0.58 has everything needed: `IDWriteTextAnalysisSource_Impl` /
+  `IDWriteTextAnalysisSink_Impl` traits exist in its DirectWrite `impl.rs` (signatures use raw
+  `*mut *mut u16` out-params), and implementing them needs the **`implement` feature added to the
+  windows dependency in `crates/tailhawk-core/Cargo.toml`** — not yet added.
+- Sink trait also carries `SetBidiLevel` — plan was to run `AnalyzeBidi` too and pass
+  `isRightToLeft = (resolved level odd)` per run, so Arabic gets correct joining forms.
+
+**Design decisions taken (argued nowhere else yet):** shape per script run; keep the module
+device-free like `raster.rs` so it tests headless; output per-cluster glyph ranges as the currency
+the grid consumes; `Face` needs a `pub(crate)` accessor for its private `IDWriteFontFace`.
+
+**Next concrete steps:** add `implement` feature → write `crates/tailhawk-core/src/shape.rs`
+(source + sink structs, run segmentation, GetGlyphs retry loop, cluster mapping) → register in
+`lib.rs` → tests (ASCII identity vs `glyph_indices`, Devanagari `कि` mark attachment, Arabic
+contextual forms differing by position, ZWJ emoji one cluster) → negative controls applied,
+observed, reverted → fmt/clippy/tests → commit → CI with the `--nocapture` skip-check → adversarial
+review (the owner's standing condition) → update this file.
+
+---
+
 **Paused:** 2026-08-05, session 11. **M1 and M2 are complete** — E3, E4 and E8 all done, CI green on
 both architectures. Only M2's two large-fixture done-criteria remain unrun. **M3 is under way: V4
 (the cell model) and V1 (the device) are done, and V2 has started with the atlas allocator**;
