@@ -5,7 +5,8 @@
 
 use windows::Win32::Foundation::{E_UNEXPECTED, HWND};
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
@@ -180,7 +181,13 @@ fn create_device(driver: Driver) -> windows::core::Result<(ID3D11Device, ID3D11D
             // BGRA_SUPPORT keeps the Direct2D interop path open, which the third fallback rung
             // will need.
             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_FLAG(0),
-            None,
+            // Feature level 11_0 and nothing lower. The glyph pass reads its quads from a
+            // `StructuredBuffer` in the vertex shader, which is shader model 5 — on a feature-level
+            // 10 device the shaders would simply fail to create, at which point there is no text.
+            // Better to fall to WARP, which is always 11_0, than to come up on a device that cannot
+            // draw. 11_1 is deliberately *not* requested: a runtime that does not know it rejects
+            // the whole array with `E_INVALIDARG` rather than skipping the entry.
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
             D3D11_SDK_VERSION,
             Some(&mut device),
             None,
@@ -462,6 +469,159 @@ impl Gpu {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn simulate_device_loss(&mut self) {
         self.inject_loss = true;
+    }
+}
+
+/// A device and a render target with no window and no swapchain, plus readback.
+///
+/// This is how the glyph pass is tested: draw into a texture, copy it to a staging texture, map it,
+/// and assert on the pixels. **Reading the pixels back is the only way to know the blend equation is
+/// doing what `SPEC.md` §3.2 says it does** — every call can succeed while producing the wrong
+/// composite, and a swapchain's back buffer is undefined after a flip-model `Present`.
+/// `cfg(test)` alone, not the `test-hooks` feature: this is only ever used by this crate's own
+/// tests, and under the feature without `cfg(test)` it would be an unreachable public API inside a
+/// private module — which is dead code, not a hook.
+#[cfg(test)]
+pub(crate) mod offscreen {
+    use windows::Win32::Graphics::Direct3D11::{
+        ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
+        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+        D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+        D3D11_VIEWPORT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    use crate::Result;
+
+    /// A mapped copy of the target. Channels are **BGRA**, in that order, because that is the
+    /// swapchain format the real renderer uses and testing a different one would test a different
+    /// path.
+    pub struct Pixels {
+        data: Vec<u8>,
+        width: u32,
+        stride: usize,
+    }
+
+    impl Pixels {
+        pub fn at(&self, x: u32, y: u32) -> [u8; 4] {
+            assert!(x < self.width, "x {x} is outside the target");
+            let i = y as usize * self.stride + x as usize * 4;
+            [
+                self.data[i],
+                self.data[i + 1],
+                self.data[i + 2],
+                self.data[i + 3],
+            ]
+        }
+    }
+
+    pub struct Offscreen {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        target: ID3D11Texture2D,
+        staging: ID3D11Texture2D,
+        rtv: ID3D11RenderTargetView,
+        width: u32,
+        height: u32,
+    }
+
+    impl Offscreen {
+        pub fn new(width: u32, height: u32) -> Result<Self> {
+            let (device, context) = super::create_device(super::Driver::Hardware)
+                .or_else(|_| super::create_device(super::Driver::Warp))?;
+
+            let mut desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut target = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut target))? };
+            let target = target.expect("target out param is set on success");
+
+            // A render target cannot be mapped, so the readback goes through a staging copy.
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            let mut staging = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging))? };
+
+            let mut rtv = None;
+            unsafe { device.CreateRenderTargetView(&target, None, Some(&mut rtv))? };
+
+            let offscreen = Self {
+                device,
+                context,
+                target,
+                staging: staging.expect("staging out param is set on success"),
+                rtv: rtv.expect("rtv out param is set on success"),
+                width,
+                height,
+            };
+            offscreen.bind();
+            Ok(offscreen)
+        }
+
+        pub fn device(&self) -> &ID3D11Device {
+            &self.device
+        }
+
+        pub fn context(&self) -> &ID3D11DeviceContext {
+            &self.context
+        }
+
+        fn bind(&self) {
+            unsafe {
+                self.context
+                    .OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
+                self.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: self.width as f32,
+                    Height: self.height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]));
+            }
+        }
+
+        pub fn clear(&self, colour: [f32; 4]) {
+            unsafe { self.context.ClearRenderTargetView(&self.rtv, &colour) };
+        }
+
+        pub fn read_back(&self) -> Result<Pixels> {
+            unsafe { self.context.CopyResource(&self.staging, &self.target) };
+            let mut mapped = Default::default();
+            unsafe {
+                self.context
+                    .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?
+            };
+            let stride = mapped.RowPitch as usize;
+            let mut data = vec![0u8; stride * self.height as usize];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    mapped.pData.cast::<u8>(),
+                    data.as_mut_ptr(),
+                    data.len(),
+                );
+                self.context.Unmap(&self.staging, 0);
+            }
+            Ok(Pixels {
+                data,
+                width: self.width,
+                stride,
+            })
+        }
     }
 }
 

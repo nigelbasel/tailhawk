@@ -24,6 +24,12 @@ pub mod file;
 pub mod raster;
 
 #[cfg(windows)]
+pub mod sheet;
+
+#[cfg(windows)]
+pub mod text;
+
+#[cfg(windows)]
 mod gpu;
 
 #[cfg(windows)]

@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADER: &str = "shaders/background.hlsl";
+const BACKGROUND: &str = "shaders/background.hlsl";
+const GLYPHS: &str = "shaders/glyphs.hlsl";
 
 /// Highest-versioned x64 `fxc.exe` from an installed Windows SDK, or `$FXC` if set.
 fn find_fxc() -> Option<PathBuf> {
@@ -42,13 +43,13 @@ fn find_fxc() -> Option<PathBuf> {
     found.pop()
 }
 
-fn compile(fxc: &Path, out_dir: &Path, entry: &str, profile: &str, output: &str) {
+fn compile(fxc: &Path, out_dir: &Path, source: &str, entry: &str, profile: &str, output: &str) {
     let target = out_dir.join(output);
     let result = Command::new(fxc)
         .args(["/nologo", "/T", profile, "/E", entry, "/O3", "/WX"])
         .arg("/Fo")
         .arg(&target)
-        .arg(SHADER)
+        .arg(source)
         .output()
         .unwrap_or_else(|e| panic!("could not run {}: {e}", fxc.display()));
 
@@ -62,7 +63,8 @@ fn compile(fxc: &Path, out_dir: &Path, entry: &str, profile: &str, output: &str)
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed={SHADER}");
+    println!("cargo:rerun-if-changed={BACKGROUND}");
+    println!("cargo:rerun-if-changed={GLYPHS}");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=FXC");
 
@@ -78,6 +80,24 @@ fn main() {
          SPEC.md §3.2 requires shaders to be compiled offline, so there is no runtime fallback.",
     );
 
-    compile(&fxc, &out_dir, "vs_main", "vs_5_0", "background_vs.cso");
-    compile(&fxc, &out_dir, "ps_main", "ps_5_0", "background_ps.cso");
+    compile(
+        &fxc,
+        &out_dir,
+        BACKGROUND,
+        "vs_main",
+        "vs_5_0",
+        "background_vs.cso",
+    );
+    compile(
+        &fxc,
+        &out_dir,
+        BACKGROUND,
+        "ps_main",
+        "ps_5_0",
+        "background_ps.cso",
+    );
+    // Shader model 5 for the `StructuredBuffer` the instanced draw reads its quads from, which is
+    // also why the device must come up at feature level 11 — see `text.rs`.
+    compile(&fxc, &out_dir, GLYPHS, "vs_main", "vs_5_0", "glyphs_vs.cso");
+    compile(&fxc, &out_dir, GLYPHS, "ps_main", "ps_5_0", "glyphs_ps.cso");
 }

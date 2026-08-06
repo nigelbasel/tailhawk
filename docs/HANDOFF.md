@@ -8,6 +8,68 @@ held in a chat session.**
 
 ---
 
+## 🚧 V2's glyph pass draws, and the pixels were read back — 2026-08-06, session 11
+
+`crates/tailhawk-core/src/text.rs`, `sheet.rs`, `shaders/glyphs.hlsl`, plus an offscreen test
+harness in `gpu.rs`. **166 tests, all passing**, fmt and clippy clean. `SPEC.md` §3.2's single
+instanced draw now exists: one `DrawInstanced` over a structured buffer of glyph quads, with
+per-instance foreground colour, so per-token colouring is free.
+
+**The dual-source blend state is real and verified against actual pixels.** `SrcBlend = ONE`,
+`DestBlend = INV_SRC1_COLOR`, the pixel shader emitting premultiplied colour in `SV_Target0` and
+per-channel coverage in `SV_Target1`, so the hardware computes `dest = c0 + dest * (1 - c1)`. The
+trap G4 found is in the code with a comment on it: **the alpha slots take `INV_SRC1_ALPHA`; a
+`*_COLOR` factor in an alpha slot fails `CreateBlendState` with a bare `E_INVALIDARG`.**
+
+**Everything is tested by drawing into an offscreen target and reading the pixels back** — no window
+and no swapchain, via `gpu::offscreen`. That is the only way to know: every call can succeed while
+producing the wrong composite, and a flip-model back buffer is undefined after `Present`.
+
+### ⚠ The ClearType test passed for the wrong reason, and the negative control is what caught it
+
+The first version drew a **light tint over a dark backdrop** and asserted channel spread. It passed —
+and it **also passed with the blend rewired to a single alpha**, which is exactly the state the test
+exists to reject. The spread was coming from `c0.rgb = tint.rgb * cov`, the *source* term, which is
+per-channel no matter what the destination factor does.
+
+The arrangement that discriminates is **black ink on light neutral paper**: with `tint.rgb = 0` the
+source contributes nothing, so every channel of the result comes from `dest * (1 - c1)` alone.
+Rewired to a single alpha it now returns `[109, 109, 109]` — perfectly neutral, the collapse made
+visible. It also asserts the *ordering*, not just the spread: the channel given the most coverage is
+attenuated most, so it comes back darkest.
+
+This is the second time this session that **a control which did not fire changed the code rather than
+being written off** (the first was the rasteriser's cell extent). It is the most useful habit in this
+project: a test that passes tells you nothing until you have watched it fail.
+
+| Mutation | Result |
+|---|---|
+| `DestBlendAlpha` set to `INV_SRC1_COLOR` | **all 7 fail** — `CreateBlendState` rejects it outright, which is G4's documented trap |
+| `DestBlend` set to `INV_SRC1_ALPHA` (one alpha, not three coverages) | the ClearType test fails — **only after it was rewritten**; the original passed |
+| `Instance` fields reordered, same size | 2 fail. Same-size layout drift is the real hazard: a structured buffer is read as raw bytes, so it does not fail to compile, it draws nonsense |
+
+### Four decisions worth not re-litigating
+
+- **The device now demands feature level 11_0** and nothing lower. The glyph pass reads its quads
+  from a `StructuredBuffer` in the *vertex* shader, which is shader model 5; on a feature-level 10
+  device the shaders simply fail to create, and there is no text. Better to fall to WARP, which is
+  always 11_0. **11_1 is deliberately not requested** — a runtime that does not know it rejects the
+  whole array with `E_INVALIDARG` rather than skipping the entry.
+- **The sheet is `D3D11_USAGE_DEFAULT` with `UpdateSubresource`, not `DYNAMIC` with `Map`.** A
+  dynamic texture must be mapped `WRITE_DISCARD`, which throws away every glyph already resident.
+  The whole point of an atlas is that they stay.
+- **Point sampling, clamped.** A cell is addressed in whole texels at the scale it was rasterised
+  for, so filtering can only blur it — and bleed the neighbouring slot's ink in at the edges.
+- **The colour sheet is not created yet, and `t2` is left unbound on purpose.** An unbound SRV
+  samples as zero, so a stray `MODE_COLOUR` instance draws nothing rather than garbage — which a
+  test asserts. Creating an empty 4 MB texture nothing writes to would be worse.
+
+**Static `tailhawk.exe` is 506,368 bytes** — still 3.2% of §11.2's 15 MB gate, and still not a
+measurement of the atlas, because nothing in the shell references it yet. The build runs and comes up
+on the hardware rung with feature level 11_0 enforced.
+
+---
+
 ## 🚧 V2 has started — the atlas allocator and the rasteriser, 2026-08-05, session 11
 
 `crates/tailhawk-core/src/atlas.rs` and `crates/tailhawk-core/src/raster.rs`. **159 tests, all
@@ -96,12 +158,13 @@ the code.**
 measure unchanged. Session 8 recorded exactly this trap when `encoding_rs` first went in. **The real
 cost lands when the grid references them**, which is V3.
 
-**⚠ What V2 still owes**, in the order it is worth building: the two sheets and the upload; the
-dual-source blend state and the instanced draw
+**⚠ What V2 still owed at the time of this section** — the sheet, the blend state and the draw
+have since been built; see the section above. Left after that: the colour path and the join. ~~the
+two sheets and the upload; the dual-source blend state and the instanced draw
 (`SrcBlend = ONE`, `DestBlend = INV_SRC1_COLOR`, and **the alpha slots take `INV_SRC1_ALPHA` or
 `CreateBlendState` fails with a bare `E_INVALIDARG`**); the colour path through
 `TranslateColorGlyphRun`; and the placeholder-and-fill-in-later behaviour that keeps rasterisation
-off the paint path. **Read both `RESULTS.md` files before writing any of it** — G4's absolute
+off the paint path.~~ **Read both `RESULTS.md` files before writing any of it** — G4's absolute
 µs/glyph figures are cache-thrash figures and are superseded by G4b.
 
 ---
@@ -267,13 +330,21 @@ headless runner was a real possibility.
 not skipped them, on the strength of the test *counts* — which cannot show it either way, because a
 skipped test still counts as passed. The counts were right and the inference was not.
 
-### ▶ Resume here: V2's sheets, upload and instanced draw
+### ▶ Resume here: wire the four V2 pieces together, then V3
 
-~~V1 still owes device-removed recovery~~ — **V1 is done; V2's allocator and rasteriser are done**,
-all session 11; see the two sections at the top of this file. What is left of V2 is the device half:
-two textures, the upload, the dual-source blend state, the instanced draw, the colour path through
-`TranslateColorGlyphRun`, and the placeholder-and-fill-in-later behaviour that keeps rasterisation
-off the paint path. Then V3 and V11.
+~~V1 still owes device-removed recovery~~; ~~V2 owes the sheets and the draw~~ — **V1 is done, and
+V2's four pieces all exist**: the allocator (`atlas.rs`), the rasteriser (`raster.rs`), the sheet
+(`sheet.rs`) and the draw (`text.rs`). See the sections at the top of this file.
+
+**Nothing connects them yet, and that join is the next piece of work.** It needs: a cache that turns
+a `GlyphKey` into an `Instance` — atlas lookup, queue the misses, rasterise them, upload into the
+returned slot, emit the quad; and the rule that makes it legal, `SPEC.md` §3.2's *a frame must never
+block on rasterisation*, so a miss draws a placeholder and is filled in on a later frame. **Rasterise
+after presenting, not before drawing** — that ordering is the whole requirement, and a genuinely cold
+1,500-glyph viewport is 162 ms, 8–10 frames, so it is not a theoretical concern.
+
+Still owed after that: the colour path through `TranslateColorGlyphRun` into a second sheet, and
+`SPEC.md` §3.2's per-DPI rebuild (`Atlas::clear` exists for it; nothing calls it). Then V3 and V11.
 
 - **V3 (grid)** owes §3.3's `max_byte_len` / `all_ascii` extent fields. **These must be captured
   during the index scan** — §3.3 says they are free there, and the reason is that recovering them
