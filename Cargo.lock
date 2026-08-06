@@ -112,6 +112,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

@@ -27,6 +27,9 @@ pub mod glyphs;
 pub mod raster;
 
 #[cfg(windows)]
+pub mod shape;
+
+#[cfg(windows)]
 pub mod sheet;
 
 #[cfg(windows)]
@@ -53,6 +56,8 @@ pub use record::{
     AttributeValue, FormatId, ParseState, Record, Resource, Severity, SeverityBand, Timestamp,
     TraceContext, ERROR_THRESHOLD,
 };
+#[cfg(windows)]
+pub use shape::{ClusterGlyphs, ClusterSpan, GlyphOffset, Shaped, Shaper};
 
 /// An opaque platform window handle. On Windows this is an `HWND`; the core never interprets it,
 /// it only passes it to the presentation backend.

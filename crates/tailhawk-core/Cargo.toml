@@ -34,9 +34,20 @@ unicode-width = "0.2"
 # The leaf backends are modules here rather than separate crates. `SPEC.md` §3.1 puts them inside
 # the core, and splitting them into crates buys nothing until a second platform exists — at which
 # point the split is a mechanical move, not a redesign.
+# `#[implement]` expands to paths rooted at `::windows_core`, so the crate `windows` re-exports as
+# `windows::core` has to be a direct dependency under its own name as well. Same crate, same
+# version — `windows` 0.58 depends on exactly this — so it adds nothing to the build but a name.
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.58"
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
+    # `SPEC.md` §3.3's shaping needs `IDWriteTextAnalyzer::AnalyzeScript`, which does not return its
+    # result — it calls back into an `IDWriteTextAnalysisSource` we supply for the text and an
+    # `IDWriteTextAnalysisSink` we supply for the runs. Authoring a COM object in Rust is what this
+    # feature is for; there is no way to shape without it.
+    "implement",
     "Win32_Foundation",
     "Win32_Globalization",
     # CreateFileW and CreateEventW both take a SECURITY_ATTRIBUTES pointer, so their bindings are

@@ -100,6 +100,17 @@ impl Face {
         }
         out
     }
+
+    /// The underlying DirectWrite face, for the calls this module does not make.
+    ///
+    /// `crate::shape` needs it because `IDWriteTextAnalyzer::GetGlyphs` shapes *against a face* —
+    /// which glyph draws a cluster is a property of the face's tables, not of the codepoints. Kept
+    /// `pub(crate)` so the face stays an opaque handle outside the crate: a caller holding an
+    /// `IDWriteFontFace` could rasterise behind the atlas's back, which is exactly what
+    /// `SPEC.md` §3.2's never-block-a-frame rule is structured to prevent.
+    pub(crate) fn font_face(&self) -> &IDWriteFontFace {
+        &self.face
+    }
 }
 
 pub struct Rasteriser {
