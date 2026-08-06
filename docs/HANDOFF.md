@@ -8,6 +8,49 @@ held in a chat session.**
 
 ---
 
+## ✅ V2's mono path is joined up end to end — 2026-08-06, session 11
+
+`crates/tailhawk-core/src/glyphs.rs`. **171 tests, all passing**, fmt and clippy clean. Glyph id in,
+quad out: `GlyphCache` owns the rasteriser, the atlas, the sheet and the face, and
+`real_text_reaches_real_pixels` drives "Hi" all the way from a code point to dark pixels on light
+paper in an offscreen target. **The monochrome half of V2 works.**
+
+**The rule it exists to enforce is `SPEC.md` §3.2's *a frame must never block on rasterisation*, and
+it is enforced structurally rather than by discipline.** `quad` cannot rasterise — it has no way to.
+A glyph that is not resident returns a **placeholder** quad and joins a queue; `flush_misses` does
+the rasterising, and the caller runs it **after presenting**. That ordering is the whole requirement:
+a genuinely cold 1,500-glyph viewport is 162 ms, 8–10 frames, because DirectWrite's cross-process
+font cache is empty for those glyphs the first time a machine ever draws them.
+
+**The placeholder is a hollow box, and it lives outside every slot the atlas can hand out.** The
+sheet is 1024×1024 but the atlas is told it is one cell-row shorter, so the reserved cell cannot be
+evicted no matter how hard the atlas thrashes — which is what stops a full sheet from having nothing
+to draw a miss with. A hollow box rather than a solid block because a screen of solid blocks reads as
+corruption while a screen of outlines reads as loading, and it is what a terminal already shows for a
+glyph it cannot render.
+
+**Three negative controls, each applied, observed and reverted:**
+
+| Mutation | Result |
+|---|---|
+| the atlas is given the placeholder's row | **all 6 fail** — and loudly, because `Sheet::upload` refuses the out-of-sheet write rather than corrupting a slot. The reserved row is load-bearing |
+| a no-ink glyph is not recorded as blank | `a_space_is_recorded_as_blank_and_stops_being_a_miss` fails — G4's 440-misses-per-frame bug |
+| *(the placeholder path, tested by the two assertions in `asking_for_a_glyph_never_rasterises_it`: the placeholder occupies exactly the cell the real glyph will, and the second frame samples a different slot)* | |
+
+**⚠ Shaping is not solved and nothing here pretends otherwise.** The one-code-point-one-glyph mapping
+used by the tests is `glyphs_for`, confined to the test module **on purpose**, with a comment saying
+it is wrong for Devanagari, Arabic and anything else §3.3 names. **V3 must not be built on it.** What
+`GlyphCache` takes is a glyph id, which is the right currency; deciding *which* glyph ids draw a
+cluster is the missing piece between §3.3's cell model and this.
+
+**Still owed by V2:** the colour path through `TranslateColorGlyphRun` into a second sheet; §3.2's
+per-DPI rebuild (`Atlas::clear` exists for it, nothing calls it, and `GlyphCache` has no way to change
+`px_per_em` yet); re-priming the placeholder after a device rebuild (`prime` is separate from `new`
+precisely so it can be, but nothing wires it to the recovery path); and moving rasterisation to a
+worker rather than merely after the present.
+
+---
+
 ## 🚧 V2's glyph pass draws, and the pixels were read back — 2026-08-06, session 11
 
 `crates/tailhawk-core/src/text.rs`, `sheet.rs`, `shaders/glyphs.hlsl`, plus an offscreen test
@@ -330,21 +373,26 @@ headless runner was a real possibility.
 not skipped them, on the strength of the test *counts* — which cannot show it either way, because a
 skipped test still counts as passed. The counts were right and the inference was not.
 
-### ▶ Resume here: wire the four V2 pieces together, then V3
+### ▶ Resume here: V3, and the shaping gap in front of it
 
-~~V1 still owes device-removed recovery~~; ~~V2 owes the sheets and the draw~~ — **V1 is done, and
-V2's four pieces all exist**: the allocator (`atlas.rs`), the rasteriser (`raster.rs`), the sheet
-(`sheet.rs`) and the draw (`text.rs`). See the sections at the top of this file.
+~~V1 still owes device-removed recovery~~; ~~V2 owes the sheets and the draw~~; ~~nothing connects the
+four pieces~~ — **V1 is done and V2's mono path is joined up end to end**, all session 11. See the
+sections at the top of this file.
 
-**Nothing connects them yet, and that join is the next piece of work.** It needs: a cache that turns
-a `GlyphKey` into an `Instance` — atlas lookup, queue the misses, rasterise them, upload into the
-returned slot, emit the quad; and the rule that makes it legal, `SPEC.md` §3.2's *a frame must never
-block on rasterisation*, so a miss draws a placeholder and is filled in on a later frame. **Rasterise
-after presenting, not before drawing** — that ordering is the whole requirement, and a genuinely cold
-1,500-glyph viewport is 162 ms, 8–10 frames, so it is not a theoretical concern.
+**V3 is the grid: the u64 scroll model, hit-test and selection, plus §3.3's `max_byte_len` /
+`all_ascii` extent fields.** Two things to settle before writing much of it:
 
-Still owed after that: the colour path through `TranslateColorGlyphRun` into a second sheet, and
-`SPEC.md` §3.2's per-DPI rebuild (`Atlas::clear` exists for it; nothing calls it). Then V3 and V11.
+1. **Cluster → glyph ids.** `GlyphCache` speaks glyph ids and `cell.rs` speaks grapheme clusters, and
+   nothing bridges them. The test-only `glyphs_for` in `glyphs.rs` is one code point to one glyph and
+   is **wrong** for anything needing marks, ligatures or reordering. Bridging it properly means
+   `IDWriteTextAnalyzer`, which is the piece of DirectWrite V2 has not touched yet.
+2. **The extent fields must be captured during the index scan** — §3.3 says they are free there, and
+   the reason is that recovering them later means a second pass over 10 GB. `index.rs` has neither
+   field. Do it *with* V3's scrollbar, but do not let V3 ship without it.
+
+**And the size question finally becomes answerable at V3.** Every figure quoted since M2 has been
+LTO stripping code the shell never references. The moment the grid references the atlas, the real cost
+of `encoding_rs`, the two Unicode-table crates and DirectWrite all land at once.
 
 - **V3 (grid)** owes §3.3's `max_byte_len` / `all_ascii` extent fields. **These must be captured
   during the index scan** — §3.3 says they are free there, and the reason is that recovering them
