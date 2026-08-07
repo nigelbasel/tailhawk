@@ -341,6 +341,17 @@ impl FileSource {
         &self.file
     }
 
+    /// Takes the open handle back, dropping the streaming state.
+    ///
+    /// **Detection has to happen before indexing** — §5.3's chunk assignment needs the code-unit
+    /// width — but the indexer wants the *file*, not a decoder wrapped round it. Without this the
+    /// caller would open the path a second time, which is not merely wasteful: the two handles
+    /// could land on different files if the log rotates between them, and the index would then
+    /// describe bytes that the reads no longer return.
+    pub fn into_file(self) -> LogFile {
+        self.file
+    }
+
     /// Byte offset the decoder has consumed to. This is what the index is built from, and what
     /// makes the BOM's bytes count even though they are never rendered (§5.6).
     pub fn offset(&self) -> u64 {

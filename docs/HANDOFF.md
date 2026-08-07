@@ -1,5 +1,54 @@
 # Handoff — resume here
 
+## ✅ Tailhawk renders a real log file — 2026-08-07, session 15
+
+**A 17 MB, 200,000-line file opens, indexes, and draws as text in the grid.** That is M3's first
+end-to-end frame, and getting there took two bugs that only a real file could surface.
+
+`rows.rs` is the new join: given a reader, an index and a charset it answers *what does row N say*.
+`Document` in the shell holds file + index + view + rows, is built on a worker, and crosses the
+channel whole. `Shell::paint` sets the metrics from the measured face **every frame** (§3.1 wants
+them re-derived, and a DPI change between frames is exactly what a cached cell gets wrong), lays the
+view out, fetches the visible rows and calls `Renderer::paint_rows`.
+
+### The design claim in `rows.rs`, and why it is measured in bytes
+
+A viewport is a run of **consecutive** rows, so `fetch` resolves the *first* through `offset_of_line`
+and decodes forward, rather than resolving each row. **Measured: 69,088 bytes for a screenful at row
+4,000, against 3,340,670 for the same fifty rows one at a time — 48×.** The per-row version is
+*correct*, which is why no other test can catch it; the guard counts bytes rather than time, so it is
+deterministic and cannot flake the way the paint.rs duration assertion did. Its control reports the
+two arms as byte-identical.
+
+### ⚠ Two bugs that no test would have found
+
+**The window rendered a perfect grid of placeholder boxes and no text.** §3.2 puts rasterisation
+*after* the present, so a cold atlas draws a box in every cell — and nothing asked for a second
+frame, because an idle window gets one `WM_PAINT` and then silence. The first fix was wrong in an
+instructive way: calling `InvalidateRect` from inside `paint` does nothing at all, because `WM_PAINT`
+calls `ValidateRect` **after** `paint` returns and wipes the region. The flag is now raised in `paint`
+and acted on by the handler after it validates.
+
+**Then the background went pure black.** `TextPipeline::draw` binds a dual-source blend state and
+never restores it, and `draw_background` set none — so frame 1 inherited the default and was right,
+and every frame after it blended the background against an undefined second source. This is **M0 code
+that had been correct for fifteen sessions** because nothing else had ever bound a blend state. At
+RGB(18,20,23) against RGB(0,0,0) the difference is invisible; it was caught by sampling the
+screenshot, which is the procedure the traps table already prescribed for this palette. Verified:
+**92,756 pixels at exactly `background_rgb8()` and zero black**, against 92,711 black before.
+
+**Neither has an automated regression test, and that is the honest state.** `Gpu::draw_background`
+needs a swapchain, so the background path cannot be driven from the offscreen harness that covers the
+text pass — making it testable means letting `Gpu` render to an offscreen RTV, which is the next
+piece of work here and is not done. Both are in the traps table instead, which is weaker.
+
+### What still is not there
+
+Nothing scrolls. There is no input handling at all — no wheel, no keys, no scrollbar — so the
+viewport is pinned at row 0. M3's done-criterion is "scroll a 50M-line file smoothly", and the frame
+now exists to scroll; the input that would move it does not. `flush_misses` also still repaints once
+per cold frame rather than budgeting rasterisation across frames.
+
 ## ✅ The renderer owns the text pass, keyed to the device that built it — 2026-08-07, session 15
 
 `Renderer` now holds `Option<(u32, Painter)>` — the painter **and the device generation it was built
@@ -2238,6 +2287,8 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **A bounded axis does not excuse §6.4's rule 3.** `x + offset_px` looks safe once the offset is provably exact and provably small enough — but at 96,624 px one ULP is 0.008 px, and a click 0.0012 px inside a column rounds up onto the next boundary and hit-tests to the right. Two exact terms do not make an exact sum. Resolve to the leftmost visible column first, then measure in viewport-sized numbers. | `crates/tailhawk-core/src/hgrid.rs` |
 | **Snap the drawn offset, never the stored one.** Whole-pixel column positions are required — a fractional x resamples ClearType's horizontal subpixel coverage — but rounding the offset *in the state* makes a 0.4 px/frame trackpad round to zero every frame and the view never moves. Store exact, round once at layout, shared by every column so the spacing cannot drift. | `crates/tailhawk-core/src/hgrid.rs` |
 | **A regression guard must assert a ratio, never a duration.** The first cost guard for the text pass asserted "under a second", measured 0.21 s alone, 0.60 s under full-suite load and 2.76–7.49 s in repeats — a flake that also made my "two orders of magnitude of headroom" claim wrong. This machine's ~40% background load is the thing `experiments/g3-d3d11` spent two sessions establishing; a duration threshold encodes the idle machine that never exists. Compare two arms **interleaved** and assert their ratio: `the_layout_cost_does_not_scale_…` runs 240 vs 24 columns five times alternating, compares medians, and its control fires at **12.9x** against a 3.0 threshold — a margin load cannot manufacture. | `crates/tailhawk-core/src/paint.rs` |
+| **D3D11's context is global, and a pass that does not set a state inherits the last one's.** `TextPipeline::draw` binds a dual-source blend state and does not restore it; `draw_background` set none at all. Frame 1 therefore got the default and was correct, and **every frame after it rendered the background pure black** — the background shader emits one output, so blending it against an undefined second source collapses to zero. At RGB(18,20,23) against RGB(0,0,0) this is invisible to the eye, and it was M0 code that had been right for fifteen sessions because nothing else had ever set a blend state. **Found by dogfooding a real file, not by any test.** Every pass must declare the states it depends on. | `crates/tailhawk-core/src/gpu.rs` |
+| **`InvalidateRect` during `WM_PAINT` does nothing** — the handler calls `ValidateRect` after `paint` returns, which clears exactly the region just invalidated. A frame that needs a successor has to raise a flag and let the handler invalidate *after* validating. The symptom is a window that renders its cold first frame and then freezes: with §3.2's rasterise-after-present, that is a full screen of placeholder boxes and no text, which reads as a layout bug rather than a missing repaint. | `crates/tailhawk/src/main.rs` |
 | **A correctly-painted window and a dead one are indistinguishable at this palette.** `BACKGROUND` is RGB(18, 20, 23), so an M1 window that is working perfectly looks like an empty frame — the owner reasonably reported seeing nothing. **Do not debug this by looking.** Screenshot the client area and assert the pixels equal `background_rgb8()`; that distinguishes "painting correctly" from "not painting" in one step. | `crates/tailhawk-core/src/lib.rs` |
 
 ---

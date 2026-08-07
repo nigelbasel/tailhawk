@@ -495,6 +495,14 @@ impl Gpu {
             let ctx = &self.res.context;
             ctx.UpdateSubresource(&self.res.frame_cb, 0, None, colour.as_ptr().cast(), 0, 0);
             ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            // **The background is opaque, and it has to say so rather than inherit.** D3D11's
+            // context is global and `TextPipeline::draw` leaves its dual-source blend state bound;
+            // the background's pixel shader emits one output, so blending it against an undefined
+            // second source produced **pure black**. It was invisible until something else set a
+            // blend state: frame 1 got the default and was right, every frame after it was black,
+            // and at this palette (RGB 18,20,23 against 0,0,0) nobody would catch that by looking.
+            // Found by dogfooding the first real file, not by any test.
+            ctx.OMSetBlendState(None, None, 0xFFFF_FFFF);
             ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,

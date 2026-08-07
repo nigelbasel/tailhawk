@@ -19,6 +19,7 @@ pub mod index;
 pub mod indexer;
 pub mod lines;
 pub mod record;
+pub mod rows;
 pub mod selection;
 pub mod view;
 
@@ -66,6 +67,7 @@ pub use hgrid::{HGrid, MAX_CELL_WIDTH_PX, RENDER_CAP_CELLS};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
 pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};
 pub use lines::LineDecoder;
+pub use rows::Rows;
 pub use selection::{Position, RowEnd, RowSpan, Selection, SelectionMode};
 pub use view::{RowSlice, View};
 
