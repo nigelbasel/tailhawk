@@ -157,8 +157,10 @@ parity, **accessibility**) adds **≈ 28–36 weeks A**, of which accessibility 
 
 - They are **estimates, not commitments**, and the ±40% band applies.
 - The largest single risk is **V2+V3+V4 (8.5 weeks A)** — the renderer and grid. Zed's calibration
-  point suggests this could be double. If the M2 milestone (§4) overruns by more than 50%, the plan
-  says stop and reconsider rather than push on.
+  point suggests this could be double. If the **M3** milestone (§4) overruns by more than 50%, the
+  plan says stop and reconsider rather than push on. *(This said M2 until session 15 — residue from
+  the decode-before-index resequencing that moved the grid out of M2. The gate itself is stated
+  correctly at §4's M3; only the back-reference was stale.)*
 - **Nothing here is discounted for "agents will write it".** The A column already contains that
   discount; applying it twice is how plans fail.
 - The owner's stated appetite is *full vision, however long it takes*. This plan therefore optimises
@@ -300,7 +302,7 @@ confirmed (§7) — **it does not gate this milestone.**
 
 | Decision | Reversible until | Cost of reversing after |
 |---|---|---|
-| **Stack (windows-rs + D3D11 + DirectWrite)** | **End of M2** | Most of the view layer — ~8–10 weeks |
+| **Stack (windows-rs + D3D11 + DirectWrite)** | **End of M3** | Most of the view layer — ~8–10 weeks |
 | **No-mmap read path** | M1 | Low — the read layer is behind a trait |
 | **Line index codec** | M1 | Low — index is rebuildable |
 | **OTel record model** | M4 | Medium — every format mapping touches it |
@@ -317,13 +319,13 @@ identity is unresolved (§7).
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| R1 | **M2 renderer overruns** (Zed: 4 engineers × 6 weeks) | High | High | Explicit 50% overrun gate; egui-chrome fallback stays viable because the grid is hand-written either way |
+| R1 | **M3 renderer overruns** (Zed: 4 engineers × 6 weeks) | High | High | Explicit 50% overrun gate; egui-chrome fallback stays viable because the grid is hand-written either way |
 | R2 | **SMB polling is unreliable** (G1 fails) | Medium | High | Gating experiment before design is committed; periodic-reopen fallback designed in advance |
 | R3 | **No code-signing route confirmed.** Azure Artifact Signing excludes South Africa entirely; Certum OSS eligibility unconfirmed; any signed route needs a physical token shipped internationally | **High** | Medium — blocks the first *signed* release, not the first release | Confirm Certum eligibility now; price one OV fallback; **ship v1 unsigned via scoop** and add signing when a route is confirmed. Choose the identity once and never change it |
 | R4 | **Scope drift toward observability** | Medium | High | OTLP receiver explicitly deferred and gated; positioning statement in SPEC §1.1 |
 | R5 | **Solo maintainer burnout** — klogg's exact failure mode | Medium | Fatal | Each milestone ships something usable; M5 is daily-useful at week 32 |
 | R6 | **Accessibility deferred to v2 blocks adoption** | Medium | Medium | Stated openly; UIA is also the only UI-test surface, so it is scheduled, not dropped |
-| R7 | **Colour emoji / CJK breaks the cell model late** | Medium | High | V4 is a first-class M2 component with a fixture, not an afterthought |
+| R7 | **Colour emoji / CJK breaks the cell model late** | Medium | High | V4 is a first-class M3 component with a fixture, not an afterthought |
 | R8 | **A GPL clean-room violation** from klogg-derived design | Low | **Severe** — legal | `CLEANROOM.md`, specification from published docs only, `cargo-deny` licence gate |
 | R9 | **Performance claims cannot be substantiated** | Medium | Medium | All targets [TBM]; dedicated perf box; no published number without a measurement |
 | R10 | **WSL / VS Code "good enough"** wins adoption | Medium | Medium | Differentiate on columnisation + multi-GB + merged view, which neither does |

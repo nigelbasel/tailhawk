@@ -250,7 +250,12 @@ The naive "one character = one fixed-width cell" assumption breaks on real log c
 
 - The unit is the **grapheme cluster**, not the code point.
 - **East Asian Wide** and **Fullwidth** clusters occupy **2 cells**.
-- **Combining marks** occupy 0 additional cells.
+- **Non-spacing combining marks** (`Mn`, `Me`) occupy 0 additional cells. **Spacing marks** (`Mc`)
+  do not: a Devanagari or Bengali matra is part of the same grapheme cluster but carries its own
+  advance, so `कि` is one cluster of **2 cells**, as is Thai SARA AM. *An earlier draft of this
+  bullet said "combining marks occupy 0 additional cells" without the distinction, and a test of
+  ours asserted the wrong answer for it — for a script this section's own acceptance test names.
+  Corrected in `cell.rs` first; the correction reached here in session 15.*
 - **ZWJ emoji sequences** are one cluster; width is determined by emoji presentation.
 - **Colour emoji** render through `TranslateColorGlyphRun` into a separate colour atlas. A monochrome
   alpha atlas cannot represent them. Both atlases are sampled in the **same** instanced draw under one
@@ -800,7 +805,15 @@ rules below do not follow from it, and each corresponds to a measured failure mo
    destroys the window's y origin outright above ~100M rows.)*
 
 **Required test, and it belongs in CI:** assert that the first drawn row's viewport-relative y stays
-in `(−row_height, 0]` across a scroll sweep at 10⁸ rows. That one assertion catches all three.
+in `(−row_height, 0]` across a scroll sweep at 10⁸ rows, **and that every other visible row sits
+exactly `i × row_height` below it**.
+
+*~~That one assertion catches all three.~~ **Withdrawn — true of egui's architecture, not of ours.**
+The first-row assertion alone does not catch rule 2 once the position is an exact `(u64, f32)`: the
+two content-magnitude terms are then the same expression and cancel perfectly at `i = 0`, so a
+faithful rule-2 reintroduction leaves the first row exact and misplaces every row after it. egui's
+first row is misplaced only because its `offset` is an independently-rounded `f32`, which violates
+rule 1 as well. Measured by mutation both ways in `grid.rs`.*
 
 **Rules 1 and 2 are about an unbounded axis; rule 3 is not, and it applies to horizontal scrolling
 too.** A line is bounded by §10.3's render cap, so the horizontal offset may be an ordinary pixel

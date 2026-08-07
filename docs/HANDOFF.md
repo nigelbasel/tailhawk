@@ -1,5 +1,52 @@
 # Handoff — resume here
 
+## ✅ Doc consistency sweep — six stale claims, two of them normative — 2026-08-07, session 15
+
+A 12-agent workflow swept all six documents plus `CLEANROOM.md` for claims still stated as current
+fact that a measurement, a later correction or the code contradicts. Four finders, then an
+adversarial verifier per candidate told to **refute** it and to default to "not real" when unsure.
+**Six confirmed, two refuted**, all six independently re-checked against the files before editing.
+
+### The finding behind the finding: a correction has to be *swept for*, not applied where it was noticed
+
+**Three of the six are the same error.** Session 8 measured that `0x0A` is never a DBCS trail byte
+and corrected `SPEC.md` §5.3 — and left **three other copies standing**: `RESEARCH.md` §5.8 (stamped
+**`[V]`**, the document's strongest confidence marker), `RESEARCH.md` §11's refuted-claims table (the
+section §0 tells readers to consult *before quoting anything*), and this file's own traps table,
+three rows above the entry refuting it. The wrong rationale outlived its correction by seven
+sessions in the two places most likely to be trusted.
+
+Same shape as the fourth: `PLAN.md` §2.5 still pointed the stop-and-reconsider gate at **M2**, residue
+from the decode-before-index resequencing that moved the grid to M3. §4 was corrected; four
+back-references were not. All four now read M3.
+
+### The two normative ones, both in `SPEC.md`
+
+| Was | Now |
+|---|---|
+| §3.3: "**Combining marks** occupy 0 additional cells" | Split into `Mn`/`Me` (0 cells) and **`Mc` spacing marks**, which carry their own advance — `कि` is one cluster of **2 cells**. `cell.rs` has known this since V4's review; the spec did not. **Devanagari is named in §3.3's own acceptance test**, so an implementer following the spec would have rendered that fixture with every following column a cell out. |
+| §6.4: "That one assertion catches all three" | Withdrawn. It is true of egui's architecture, not ours: with an exact `(u64, f32)` position the two content-magnitude terms are the *same expression* and cancel at `i = 0`, so a faithful rule-2 reintroduction leaves the **first** row exact. The required test now asserts every visible row. Measured by mutation in `grid.rs` in session 13; the spec kept the refuted sentence until now. |
+
+### The two refutations were both right, and one caught my own misreading
+
+- **"Branching starts once the remote exists"** (this file, session-9 planning text) — refuted:
+  the working agreement fifteen lines below it already records "commit directly to `master`, no
+  branches, no PRs — tried once, not worth it", and the newer current-state section repeats it. The
+  verifier also caught that the finder had misidentified which bullet list the line belonged to.
+- **`CLEANROOM.md` §1.5 "log before you code"** — refuted on the right grounds: a rule is not
+  falsified by being broken, and the document already records three of its own slips by name.
+  What survives is an observation about this session's discipline, not a documentation defect —
+  **`hgrid.rs`, `view.rs` and `bidi.rs` have no §5 entry**, and §5's last row still stops at V3.
+
+### ⚠ Four findings were dropped unverified, and they are not "no"
+
+The workflow verifies the two most severe per document and logged what it dropped rather than
+truncating silently: `HANDOFF.md:786`, `HANDOFF.md:1463`, `RESEARCH.md:593`, `LOKI.md:118`,
+`PLAN.md:176`, `PLAN.md:324`, `SPEC.md:265`. Unverified is unverified — they were the *less* severe
+of their batch, not refuted.
+
+---
+
 ## ◐ The consumer has started — `view.rs`, the portable half — 2026-08-07, session 15
 
 **293 tests, all passing**, fmt and clippy clean on the two shipped crates. `view.rs` composes
@@ -1965,7 +2012,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 
 | Trap | Where |
 |---|---|
-| **The index depends on encoding.** Decode *must* precede index — chunk boundaries need code-unit alignment, and `0x0A` is a legal DBCS trail byte. The first plan drafted them 13 weeks apart and would have thrown away tested work. | `PLAN.md` §4 |
+| **The index depends on encoding.** Decode *must* precede index — chunk boundaries need code-unit alignment. The first plan drafted them 13 weeks apart and would have thrown away tested work. *(This row also carried "and `0x0A` is a legal DBCS trail byte" until session 15, three rows above the entry refuting it. A reference table is read one row at a time, so each row has to stand alone.)* | `PLAN.md` §4 |
 | **`RESEARCH.md` §5.3 is GPL-contaminated.** The line index must be **re-derived from published docs only**, with `CLEANROOM.md` populated *before* writing code. Do not implement from that section. | `RESEARCH.md` §5.3 |
 | **Serilog and NLog roll to *new filenames* by default.** Neither copy-truncate nor rename-and-recreate describes it. Rolling sets (§5.5b) are v1 for this reason. | `SPEC.md` §5.5b |
 | **Every ripgrep throughput figure in circulation is fabricated.** The cited article publishes timings only. The search performance target is deliberately unset. | `RESEARCH.md` §11 |

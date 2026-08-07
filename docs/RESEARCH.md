@@ -634,12 +634,17 @@ segmentation and East Asian Width must be in the cell model from day one.** **[L
 **Parallel newline indexing is NOT context-free [REFUTED].** The research asserted chunk boundaries can
 be assigned arbitrarily. False for two encodings we differentiate on: a boundary at an **odd** byte
 offset misaligns every UTF-16 code unit in that chunk (finding `0A` bytes that are the low half of an
-unrelated code unit, missing real `0A 00` terminators); and in DBCS codepages (932/936/950/949) `0x0A`
-is a **legal trail byte**, producing phantom line breaks. Concretely: a 4GB PowerShell UTF-16LE
+unrelated code unit, missing real `0A 00` terminators); ~~and in DBCS codepages (932/936/950/949)
+`0x0A` is a **legal trail byte**, producing phantom line breaks~~ — **the DBCS half is withdrawn,
+session 8: measured false.** `a_0a_byte_is_never_consumed_as_a_trail_byte_by_any_decoder`
+(`crates/tailhawk-core/src/encoding.rs`) drives all 65,536 two-byte prefixes into every byte-oriented
+decoder; `0x0A` is never swallowed as a trail byte. See `SPEC.md` §5.3. Concretely: a 4GB PowerShell UTF-16LE
 transcript indexed on 8 threads at 64MB chunks — seven boundaries land on even offsets by luck, one
 does not, and ~500MB has garbage line offsets that only surface when scrolled into. **Chunk boundaries
-must be aligned to the code-unit size relative to the BOM; for DBCS the parallel path must be disabled
-or each worker must resync forward.** **[V]**
+must be aligned to the code-unit size relative to the BOM. That is the only constraint** — there is
+no DBCS exception and the parallel path is disabled for no byte-oriented encoding. **[V]** *(The
+original form of this requirement disabled the parallel path for codepages 932/936/950/949; that was
+withdrawn in session 8 and the correction reached this document in session 15.)*
 
 ---
 
@@ -1000,7 +1005,7 @@ must be resolved in `SPEC.md`, not rediscovered later.
 | "Zed ships subpixel AA through Rust/DirectWrite/D3D11" | **[REFUTED]** The Zed blog says nothing about subpixel, ClearType or `text_rendering_mode`. Sourced from an unofficial community tips site. |
 | "BareTail: 30 files at ~2MB RSS" as a target | **[REFUTED as a target]** A single 2019 forum comment, not a controlled benchmark, and implausible — a bare Win32 window exceeds that before opening a file. Meanwhile D3D11+DXGI+DirectWrite costs 30–60MB before reading a byte. **This comparison is unwinnable and must not be published.** Realistic and still competitive: *"under 120MB RSS with 30 files open totalling 200GB, flat as file size grows"* — **the flatness is the defensible claim, not the absolute number.** |
 | "glogg: 700MB RSS on a 20GB file" → "35MB index per GB" | **[REFUTED as an anchor]** glogg-era, second-hand from a blog comment, for a different program. Compute from the now-verified scheme instead. |
-| "Parallel newline indexing is context-free" | **[REFUTED]** False for UTF-16 (odd-offset boundaries misalign code units) and DBCS (`0x0A` is a legal trail byte). See §5.8. |
+| "Parallel newline indexing is context-free" | **[REFUTED for UTF-16 only]** False for UTF-16: odd-offset boundaries misalign code units. **The DBCS half of this verdict was itself withdrawn in session 8** — `0x0A` is never a trail byte in any byte-oriented encoding, measured exhaustively; chunk boundaries need code-unit alignment and nothing else. See §5.8 and `SPEC.md` §5.3. |
 | "mmap is the default for few-huge-files" | **[REFUTED]** Contradicted by two other topics; sourced from a Linux benchmark never validated on Windows. §5.1 resolves against mmap. |
 | "AccessKit collapses a11y to a single tree-provider" | **[REFUTED]** It gives platform adapters, not a virtualised tree. A 10M-row grid needs hand-written `ITextProvider`. |
 | Qt's LGPL static-linking blocker | **[REFUTED for this project]** The blocker assumed a closed-source product. The project is open source, so static LGPL linking is fine. Qt still loses on size and modern appearance. |
