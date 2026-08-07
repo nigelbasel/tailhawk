@@ -1,5 +1,57 @@
 # Handoff — resume here
 
+## ✅ The renderer owns the text pass, keyed to the device that built it — 2026-08-07, session 15
+
+`Renderer` now holds `Option<(u32, Painter)>` — the painter **and the device generation it was built
+against** — plus `paint_rows`, which draws a viewport of text over the background and presents it.
+`CLEANROOM.md`'s paint.rs row already named this work in advance, so no new provenance was needed.
+
+**The generation is stored rather than an invalidation flag being set**, and the reason is the
+failure mode: a `Painter` owns a `GlyphCache` owns a `Sheet`, which is a texture belonging to one
+`ID3D11Device`. Drawing from a released device's sheet **does not fail** — it produces nothing and
+reports success. A flag has to be remembered at every site that could invalidate it; a comparison
+cannot be forgotten. Control: replacing the comparison with `slot.is_none()` leaves the painter keyed
+to generation 1 after a loss, and the test fails on that identity.
+
+**The rebuild check runs inside the draw callback, not before the frame.** `gpu.rs`'s recovery
+replaces a device *mid-frame* and redraws, so a check done beforehand would be correct for the first
+attempt and wrong for the retry — the exact frame that matters. `render_frame_with` therefore hands
+the callback the device, its context, **and the generation**, and `ensure_painter` is called from
+inside. The disjoint-field destructure in `paint_rows` is what makes that borrow legal.
+
+`flush_misses` is now wired, after the present, which is what `render_frame_with` returning means.
+Without it the atlas never gains a glyph: every frame would queue the same misses and draw the same
+placeholder boxes for ever. Control: removing the call makes the second frame queue 27 glyphs again.
+
+### Two things this turned up that were not the point
+
+- **`Laid::rasterised` counts glyphs that gained *ink*, not glyphs that were *resolved*.** A blank
+  glyph — the space — is recorded via `insert_blank` so it is never asked for again, and `continue`s
+  without incrementing. My first assertion demanded `rasterised == queued` and failed 26 against 27;
+  the test was wrong about the code, not the other way round. Resolution is what the *next* frame's
+  `queued == 0` proves, and that is what the test asserts now.
+- **`cell()` builds the text resources on demand**, because otherwise the caller cannot break the
+  chicken-and-egg: a `View` needs the cell metrics before it can say which rows are visible, and the
+  painter that measures the cell would only exist after a frame had been drawn.
+
+### ⚠ What is deliberately not covered
+
+- **The pixels, on this path.** A `Renderer` with no window holds no render target, so
+  `a_rebuilt_device_gets_rebuilt_text_resources` can only check the generation identity;
+  `paint.rs`'s `a_viewport_of_rows_reaches_real_pixels` covers pixels against an `Offscreen`. The gap
+  matters *because* the guarded failure is silent — a stale painter and a correct one are
+  indistinguishable from the return value, which is why the identity is asserted directly rather
+  than inferred from a frame that returned `Ok`.
+- **A draw error is never classified as device loss.** `FrameError` keeps device loss as a
+  `windows::core::Error` all the way to `was_lost`, which needs the `HRESULT`; the text pass reports
+  a `crate::Error` with no `HRESULT` left to read, so such a frame returns `Err` and does not
+  recover. The next frame meets the same loss in `present`, which is typed, and recovers there —
+  one dropped frame, not a stuck renderer. Widening it means giving `crate::Error` somewhere to
+  carry an `HRESULT`.
+- **Nothing shows a real file yet.** The shell still opens the log only to count lines for the title
+  bar. Connecting `FileSource` → `build_index` → `LineDecoder` → `View` → `paint_rows` is the next
+  M3 step and is untouched here.
+
 ## ✅ Adversarial review of the M3 viewport — three live bugs, one of them pre-existing — 2026-08-07, session 15
 
 A 12-agent workflow reviewed `hgrid.rs`, `view.rs` and `paint.rs` across four independent lenses

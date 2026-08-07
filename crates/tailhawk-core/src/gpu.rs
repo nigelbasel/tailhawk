@@ -248,6 +248,26 @@ fn create_resources(prefer: Driver) -> Result<Resources> {
     })
 }
 
+/// Why a frame's two failure kinds are not one type.
+///
+/// Device loss has to stay a `windows::core::Error` all the way to [`Gpu::was_lost`], which
+/// classifies it from the `HRESULT` **and** by asking the device directly — flattening it to a
+/// string first would throw away the only evidence that distinguishes "the device is gone" from
+/// "that call was wrong", and getting that wrong in the permissive direction rebuilds the device
+/// over a genuine bug and hides it.
+///
+/// **⚠ A `Draw` error is therefore never treated as device loss, and that is a deliberate narrowing
+/// rather than a proof.** The text pass can in principle meet a removed device of its own — a failed
+/// buffer map — and it reports that as a `crate::Error` with no `HRESULT` left to read. Such a frame
+/// returns `Err` and the recovery path does not run for it; the *next* frame hits the same loss in
+/// `present`, which is typed, and recovers there. One dropped frame, not a stuck renderer. Widening
+/// this means giving `crate::Error` somewhere to carry an `HRESULT`, which is a change to the
+/// crate's error type and is not made here.
+enum FrameError {
+    Device(windows::core::Error),
+    Draw(Error),
+}
+
 impl Gpu {
     pub fn new() -> Result<Self> {
         let res = create_resources(Driver::Hardware)?;
@@ -270,6 +290,14 @@ impl Gpu {
 
     pub fn generation(&self) -> u32 {
         self.generation
+    }
+
+    /// The current device and its immediate context, for resources built outside a frame.
+    ///
+    /// Whatever is built from these belongs to [`generation`](Self::generation) **at the moment of
+    /// the call** and must be re-checked against it afterwards, because a rebuild replaces both.
+    pub(crate) fn resources(&self) -> (&ID3D11Device, &ID3D11DeviceContext) {
+        (&self.res.device, &self.res.context)
     }
 
     pub fn attach(&mut self, window: WindowHandle, width: u32, height: u32) -> Result<()> {
@@ -363,12 +391,30 @@ impl Gpu {
     /// the shell cannot act on the distinction: everything it could do about a lost device is
     /// something the renderer can do better, and the one thing it must never do is panic.
     pub fn render_frame(&mut self, colour: [f32; 4]) -> Result<()> {
-        let e = match self.frame(colour) {
+        self.render_frame_with(colour, &mut |_, _, _| Ok(()))
+    }
+
+    /// The same frame, with a pass drawn between the background and the present.
+    ///
+    /// `draw` receives the device, its immediate context, and **the device's generation**. The
+    /// generation is not a convenience: on the recovery path below, `draw` is called a second time
+    /// against a *different* device, and anything it owns that the old device created — a glyph
+    /// atlas texture, a vertex buffer, a shader — is dead. Handing it the generation is what lets it
+    /// notice, and drawing a sheet from the previous device silently produces nothing rather than
+    /// failing, which is the one outcome §3.2's recovery must not leave behind.
+    pub fn render_frame_with(
+        &mut self,
+        colour: [f32; 4],
+        draw: &mut dyn FnMut(&ID3D11Device, &ID3D11DeviceContext, u32) -> Result<()>,
+    ) -> Result<()> {
+        let e = match self.frame_with(colour, draw) {
             Ok(()) => {
                 self.recovery.on_clean_frame();
                 return Ok(());
             }
-            Err(e) => e,
+            // Not a device question — see [`FrameError`]. Out, unclassified and unretried.
+            Err(FrameError::Draw(e)) => return Err(e),
+            Err(FrameError::Device(e)) => e,
         };
         if !self.was_lost(&e) {
             return Err(e.into());
@@ -381,7 +427,13 @@ impl Gpu {
                 self.rebuild(driver)?;
                 // One retry, then out. A second loss in the same frame is next frame's problem,
                 // and going round again here would let one `WM_PAINT` spin.
-                self.frame(colour).map_err(Into::into)
+                //
+                // `rebuild` has already bumped the generation, so `draw` sees a new one here and is
+                // expected to replace whatever the dead device owned before it draws.
+                self.frame_with(colour, draw).map_err(|e| match e {
+                    FrameError::Draw(e) => e,
+                    FrameError::Device(e) => e.into(),
+                })
             }
         }
     }
@@ -410,13 +462,20 @@ impl Gpu {
         Ok(())
     }
 
-    fn frame(&mut self, colour: [f32; 4]) -> windows::core::Result<()> {
+    fn frame_with(
+        &mut self,
+        colour: [f32; 4],
+        draw: &mut dyn FnMut(&ID3D11Device, &ID3D11DeviceContext, u32) -> Result<()>,
+    ) -> std::result::Result<(), FrameError> {
         #[cfg(any(test, feature = "test-hooks"))]
         if std::mem::take(&mut self.inject_loss) {
-            return Err(windows::core::Error::from(DXGI_ERROR_DEVICE_REMOVED));
+            return Err(FrameError::Device(windows::core::Error::from(
+                DXGI_ERROR_DEVICE_REMOVED,
+            )));
         }
         self.draw_background(colour);
-        self.present()
+        draw(&self.res.device, &self.res.context, self.generation).map_err(FrameError::Draw)?;
+        self.present().map_err(FrameError::Device)
     }
 
     /// Draws the background as one fullscreen triangle through the embedded shaders.

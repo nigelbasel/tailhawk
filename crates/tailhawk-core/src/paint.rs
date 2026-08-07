@@ -76,6 +76,10 @@ pub struct Laid {
     /// **Rows that failed to shape and drew nothing.** See [`Painter::lay_out`] — this is the count
     /// that must never be silent, because the alternative it replaced was losing the whole frame.
     pub failed_rows: usize,
+    /// Glyphs [`Painter::flush_misses`] rasterised after this frame was presented — the number that
+    /// pairs with [`queued`](Self::queued). Set by the caller that owns the present, so it is zero
+    /// on a `lay_out` that was not part of one.
+    pub rasterised: usize,
 }
 
 impl Laid {
@@ -85,6 +89,7 @@ impl Laid {
         self.rtl_runs += other.rtl_runs;
         self.truncated_rows += other.truncated_rows;
         self.failed_rows += other.failed_rows;
+        self.rasterised += other.rasterised;
     }
 }
 

@@ -23,6 +23,9 @@ pub mod selection;
 pub mod view;
 
 #[cfg(windows)]
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
+
+#[cfg(windows)]
 pub mod file;
 
 #[cfg(windows)]
@@ -96,6 +99,22 @@ pub const fn background_rgb8() -> (u8, u8, u8) {
     (18, 20, 23)
 }
 
+/// Faces to resolve the grid's font from, most monospace-appropriate first.
+///
+/// All four ship with Windows and the list degrades rather than fails: Cascadia Mono is the modern
+/// terminal face, Consolas has been in the box since Vista, Courier New since forever, and Segoe UI
+/// is the proportional last resort that keeps a face resolvable on a stripped install. §3.1's cell
+/// grid tolerates a proportional face — it measures one and uses it — so the fallback degrades the
+/// *look* and not the correctness.
+pub const DEFAULT_FONTS: &[&str] = &["Cascadia Mono", "Consolas", "Courier New", "Segoe UI"];
+
+/// Provisional. §3.1 requires this to be re-derived per monitor from the DPI, which needs the
+/// window's monitor and is the shell's to supply; until then the grid is built at 100%.
+pub const DEFAULT_PX_PER_EM: u16 = 16;
+
+/// The grid's foreground. Provisional alongside [`BACKGROUND`] — `UI-DESIGN.md` §10 pins no hex.
+pub const INK: [f32; 4] = [0.878, 0.890, 0.906, 1.0];
+
 /// Errors that cross the seam. Deliberately opaque — the shell can report one but cannot act on
 /// the distinction, and `SPEC.md` §3.2 forbids panicking on device loss.
 #[derive(Debug)]
@@ -111,6 +130,40 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Builds the text resources if the slot is empty or was built for a **different device**, and
+/// hands back whatever is now current.
+///
+/// The staleness test is a generation comparison rather than a flag, because a flag has to be
+/// remembered at every site that could invalidate it and a comparison cannot be forgotten. The cost
+/// of getting it wrong is not an error: a `Sheet` from a released device draws **nothing**, so a
+/// renderer that recovered from device loss would return `Ok` for ever while the screen stayed
+/// blank — the outcome `SPEC.md` §3.2's recovery exists to prevent.
+///
+/// Taking the device rather than the `Gpu` is what lets the **in-frame** caller use it: during
+/// `render_frame_with` the `Gpu` is mutably borrowed and cannot lend its device out, but the draw
+/// callback is handed one — and that path is the one that matters, because it is the retry after a
+/// mid-frame rebuild.
+#[cfg(windows)]
+fn ensure_painter<'a>(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    generation: u32,
+    slot: &'a mut Option<(u32, paint::Painter)>,
+    candidates: &[String],
+    px_per_em: u16,
+) -> Result<&'a mut paint::Painter> {
+    if !matches!(slot, Some((built_for, _)) if *built_for == generation) {
+        // Released before the replacement is asked for, so a driver mid-reset is not holding two
+        // atlases at once.
+        *slot = None;
+        let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let mut fresh = paint::Painter::new(device, &names, px_per_em)?;
+        fresh.prime(context);
+        *slot = Some((generation, fresh));
+    }
+    Ok(&mut slot.as_mut().expect("just built").1)
+}
+
 /// The renderer the shell drives.
 ///
 /// Construction creates the graphics device and is the expensive step — `experiments/g3-d3d11`
@@ -119,6 +172,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(windows)]
 pub struct Renderer {
     gpu: gpu::Gpu,
+    /// The text pass, and **the device generation it was built against**.
+    ///
+    /// Not an invalidation flag, because a flag can be forgotten to be set. A `Painter` owns a
+    /// `GlyphCache`, which owns a `Sheet` — a texture belonging to one `ID3D11Device`. When
+    /// `gpu.rs` replaces a lost device, drawing from the old sheet does not fail; it silently
+    /// produces **nothing**, which is the exact failure §3.2's recovery exists to prevent and the
+    /// hardest kind to notice. Storing the generation alongside makes staleness a comparison that
+    /// [`ensure_painter`] cannot skip.
+    painter: Option<(u32, paint::Painter)>,
+    font_candidates: Vec<String>,
+    px_per_em: u16,
 }
 
 #[cfg(windows)]
@@ -131,7 +195,39 @@ impl Renderer {
     pub fn new() -> Result<Self> {
         Ok(Self {
             gpu: gpu::Gpu::new()?,
+            painter: None,
+            font_candidates: DEFAULT_FONTS.iter().map(|s| (*s).to_owned()).collect(),
+            px_per_em: DEFAULT_PX_PER_EM,
         })
+    }
+
+    /// The cell the current face measures to, as `(width, height)` in device pixels.
+    ///
+    /// **This is what [`View::set_metrics`](view::View::set_metrics) must be fed**, per §3.1's
+    /// integer cell advances re-derived from the face at the current scale — a constant would drift
+    /// from the font the moment the DPI changes.
+    ///
+    /// It builds the text resources if they are not up yet, because the alternative is a
+    /// chicken-and-egg the caller cannot break: a `View` needs the cell before it can say which rows
+    /// are visible, and the painter that measures the cell would otherwise only exist once a frame
+    /// has been drawn. Re-read it after a resize or a DPI change rather than caching it.
+    pub fn cell(&mut self) -> Result<(f32, f32)> {
+        let Self {
+            gpu,
+            painter,
+            font_candidates,
+            px_per_em,
+        } = self;
+        let (device, context) = gpu.resources();
+        let p = ensure_painter(
+            device,
+            context,
+            gpu.generation(),
+            painter,
+            font_candidates,
+            *px_per_em,
+        )?;
+        Ok((p.cell_width(), p.row_height()))
     }
 
     /// Which rung of the fallback chain the device is *currently* on.
@@ -169,6 +265,78 @@ impl Renderer {
         self.gpu.render_frame(BACKGROUND)
     }
 
+    /// Draws one frame of text over the background and presents it.
+    ///
+    /// `line_at` returns a row's text, or `None` for a row not in memory yet — which draws nothing
+    /// rather than blocking, per §11.3. The returned [`Laid`](paint::Laid) carries the counts the
+    /// text pass is obliged to disclose: glyphs queued for rasterisation, rows truncated, rows that
+    /// failed to shape, and RTL runs it could not place.
+    ///
+    /// **The painter is rebuilt inside the frame, not before it.** A device lost *during* this call
+    /// is replaced by `gpu.rs` and the frame is redrawn against the new device — at which point the
+    /// glyph atlas from the old one is a texture no longer bound to anything, and drawing from it
+    /// produces nothing at all rather than an error. So the rebuild check lives in the draw callback
+    /// where it sees the generation of whichever device is actually current, and it runs on the
+    /// retry as well as the first attempt.
+    ///
+    /// **⚠ Rasterisation still has no home on this path.** `flush_misses` must run *after*
+    /// presenting, per §3.2 and `experiments/g4b-batched-raster`'s 162 ms cold viewport, and nothing
+    /// calls it yet — so a cold frame draws placeholder boxes and the next frame draws them again.
+    /// Wiring it needs a post-present hook the shell drives; that is the next M3 step, not this one.
+    pub fn paint_rows(
+        &mut self,
+        view: &view::View,
+        mut line_at: impl FnMut(u64) -> Option<String>,
+    ) -> Result<paint::Laid> {
+        // Disjoint field borrows: the callback needs `painter` mutably while `gpu` is borrowed for
+        // the frame. Destructuring is what makes that legal, and it is also what forces the painter
+        // to be reachable from inside the retry.
+        let Self {
+            gpu,
+            painter,
+            font_candidates,
+            px_per_em,
+        } = self;
+        let mut laid = paint::Laid::default();
+
+        gpu.render_frame_with(BACKGROUND, &mut |device, context, generation| {
+            let p = ensure_painter(
+                device,
+                context,
+                generation,
+                painter,
+                font_candidates,
+                *px_per_em,
+            )?;
+
+            p.begin_frame();
+            laid = p.lay_out(view, INK, &mut line_at)?;
+            // The view's own viewport, not the swapchain's. They are the same number when the
+            // shell keeps them in step, and taking it from the view keeps `gpu` out of this
+            // closure — which is what makes the disjoint borrow above hold.
+            p.draw(
+                context,
+                (
+                    view.hgrid().viewport_px().max(1.0) as u32,
+                    view.grid().viewport_px().max(1.0) as u32,
+                ),
+            )
+        })?;
+
+        // **After presenting, which is what `render_frame_with` returning means.** §3.2 requires
+        // the ordering and `experiments/g4b-batched-raster` measured why: a genuinely cold
+        // 1,500-glyph viewport costs 162 ms, eight to ten frames' worth, and paying it before the
+        // present would stall every one of them. Paying it *nowhere* is not the alternative it might
+        // look like — the atlas would never fill, so every frame would draw placeholder boxes for
+        // ever and `queued` would never fall to zero.
+        if let Some((generation, p)) = painter.as_mut() {
+            debug_assert_eq!(*generation, gpu.generation());
+            let (_, context) = gpu.resources();
+            laid.rasterised = p.flush_misses(context)?;
+        }
+        Ok(laid)
+    }
+
     /// Makes the next [`paint`](Self::paint) see the device as removed, so the recovery path runs
     /// for real against a real device.
     ///
@@ -185,6 +353,109 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A renderer and a view sized to it, or `None` on a machine with no usable device.
+    #[cfg(windows)]
+    fn renderer_or_skip(what: &str) -> Option<(Renderer, view::View)> {
+        let mut r = match Renderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping {what}: no graphics device ({e})");
+                return None;
+            }
+        };
+        let (cw, rh) = r.cell().expect("the face measures");
+        let mut v = view::View::new(cw, rh);
+        v.set_viewport(80.0 * cw, 8.0 * rh);
+        v.grid_mut().set_total_rows(8);
+        v.hgrid_mut().set_columns(80);
+        Some((r, v))
+    }
+
+    /// The text resources are keyed to the device that built them, and a rebuild replaces them.
+    ///
+    /// **⚠ What this test can and cannot prove, stated rather than implied.** It proves the painter
+    /// is re-created for the new generation, which is the mechanism. It does **not** prove the
+    /// pixels, because a `Renderer` with no window holds no render target and there is nothing to
+    /// read back — `paint.rs`'s `a_viewport_of_rows_reaches_real_pixels` covers that against an
+    /// `Offscreen`. The gap matters because the failure being guarded is *silent*: a `Sheet` from a
+    /// released device draws nothing and reports success, so a stale painter and a correct one are
+    /// indistinguishable from the return value alone. The generation identity is the only thing a
+    /// headless test can check, and it is checked directly rather than inferred.
+    #[cfg(all(windows, feature = "test-hooks"))]
+    #[test]
+    fn a_rebuilt_device_gets_rebuilt_text_resources() {
+        let Some((mut r, view)) = renderer_or_skip("a_rebuilt_device_gets_rebuilt_text_resources")
+        else {
+            return;
+        };
+        let line = |row: u64| Some(format!("row {row} — the quick brown fox"));
+
+        let first = r.paint_rows(&view, line).expect("the first text frame");
+        assert!(first.quads > 0, "nothing was laid out");
+        assert_eq!(r.device_generation(), 1);
+        assert_eq!(
+            r.painter.as_ref().map(|(g, _)| *g),
+            Some(1),
+            "the painter should be keyed to the device that built it"
+        );
+
+        r.simulate_device_loss();
+        let after = r
+            .paint_rows(&view, line)
+            .expect("a text frame across a device loss still presents");
+
+        assert_eq!(r.device_generation(), 2, "the device was not rebuilt");
+        assert_eq!(
+            r.painter.as_ref().map(|(g, _)| *g),
+            Some(2),
+            "the painter is still keyed to the dead device — its atlas draws nothing and says nothing"
+        );
+        assert!(after.quads > 0, "the frame after recovery laid nothing out");
+        // The new atlas starts empty, so the recovered frame queues its glyphs again and pays for
+        // them after presenting. That it is non-zero is the evidence the cache really was replaced.
+        assert!(
+            after.queued > 0,
+            "the recovered frame queued nothing, so the old atlas was probably reused"
+        );
+    }
+
+    /// The atlas fills, and it fills *after* the present.
+    ///
+    /// Without `flush_misses` on this path the cache would never gain a glyph: every frame would
+    /// queue the same misses, draw the same placeholder boxes and report the same `queued`. The
+    /// second frame's numbers are what distinguish "rasterisation happened" from "the frame merely
+    /// returned `Ok`".
+    #[cfg(windows)]
+    #[test]
+    fn the_second_frame_is_warm() {
+        let Some((mut r, view)) = renderer_or_skip("the_second_frame_is_warm") else {
+            return;
+        };
+        let line = |_| Some("the quick brown fox jumps over the lazy dog".to_owned());
+
+        let cold = r.paint_rows(&view, line).expect("cold frame");
+        assert!(cold.queued > 0, "a cold atlas queued nothing");
+        // **`rasterised` counts glyphs that gained ink, not glyphs that were resolved**, and the
+        // difference is the space: `flush_misses` records a blank glyph so it is never asked for
+        // again but does not count it as landed. This fixture has one space, so the two numbers
+        // differ by exactly one — and asserting equality here was wrong about the code rather than
+        // the code being wrong. Resolution is what the next frame proves.
+        assert!(
+            cold.rasterised > 0 && cold.rasterised <= cold.queued,
+            "{} rasterised against {} queued",
+            cold.rasterised,
+            cold.queued
+        );
+
+        let warm = r.paint_rows(&view, line).expect("warm frame");
+        assert_eq!(
+            warm.queued, 0,
+            "the second frame queued {} glyphs, so the first frame's rasterisation was lost",
+            warm.queued
+        );
+        assert!(warm.quads > 0);
+    }
 
     /// The two stages of the first paint must be the same colour (`SPEC.md` §3.2). They are
     /// necessarily expressed twice — GDI wants 8-bit channels, the render target wants floats —

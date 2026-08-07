@@ -55,7 +55,7 @@ pub struct RowSlice {
     /// per cluster, and asking per cluster measured 16.4 s for one frame of 32 KB lines. This
     /// value is already computed here to produce `x`; handing it over costs nothing.
     pub column: usize,
-    /// **This row's visible bytes hit [`MAX_SLICE_BYTES`] and the tail was dropped.**
+    /// **This row's visible bytes hit `MAX_SLICE_BYTES` and the tail was dropped.**
     ///
     /// The cap is deliberate and the comment in [`View::slice`] says why, but "an ordinary line
     /// never reaches it" is not the same as "no on-screen line reaches it". A cell costs `1 + 2n`

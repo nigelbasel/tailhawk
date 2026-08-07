@@ -175,7 +175,7 @@ impl Grid {
     ///
     /// A delta against a viewport with no height is dropped, like [`scroll_by_px`](Self::scroll_by_px):
     /// there is nothing on screen to move relative to, and moving the position anyway would be
-    /// indistinguishable from the minimise defect [`max_scroll`](Self::max_scroll) records.
+    /// indistinguishable from the minimise defect `max_scroll` records.
     pub fn scroll_by_rows(&mut self, delta_rows: i64) {
         if self.viewport_px <= 0.0 {
             return;
