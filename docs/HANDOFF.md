@@ -1,5 +1,78 @@
 # Handoff — resume here
 
+## ✅ V3 is complete — horizontal scrolling, `hgrid.rs` — 2026-08-07, session 15
+
+**286 tests, all passing**, fmt and clippy clean on the two shipped crates. `PLAN.md`'s V3 row is
+"u64 scroll model, hit-test, selection"; with `grid.rs`, `selection.rs`, `bidi.rs` and now
+`hgrid.rs`, **every V3 item is done.** This is the piece §3.3's extent fields were captured for and
+the one §6.4 cut `--wrap` from v1 in favour of.
+
+### The two axes are not symmetric, and the reason is §10.3
+
+`Scroll` cannot hold a content-pixel offset because a document has 2⁶⁴ rows. **The horizontal axis is
+bounded**, so `HGrid` holds a plain `offset_px: f32` — and what bounds it is §10.3's **32 KB inline
+render cap**, not good manners. No encoding produces more cells than bytes (§3.3), so a rendered line
+is at most 32,768 cells however long the line in the file is; with a bounded cell width the widest
+content this module can form is 2²⁴ px exactly, the last integer `f32` represents.
+
+**That is a dependency between two sections that did not previously reference each other**, and
+`SPEC.md` §3.3 now records it: raising the render cap to "unlimited" is not a rendering-only change,
+because it puts §6.4's `(index, remainder)` obligation back on this axis. The assertion that fails is
+`the_render_cap_is_what_keeps_every_column_exact`.
+
+### ⚠ Rule 3 survives boundedness, and it was a live bug in my first version
+
+Having argued that rules 1 and 2 do not apply here, the third one still did. `column_at_x` resolved a
+click as `x + offset_px` — a screen-space coordinate added to a content-magnitude one, which is
+exactly what §6.4 rule 3 forbids — and **it hit-tested one column to the right**: at a 96,624 px
+offset one ULP is 0.0078 px, so a click at `x = 231.99881` inside a column drawn at 232 rounds *up*
+onto the boundary. Both terms exact, sum not. Found by `hit_test_is_exactly_the_inverse_of_layout` on
+its first run, not by review.
+
+`first_visible()` is where the content magnitude now stops: the offset resolves to the leftmost
+column once, and layout, hit-test and `visible_columns` all measure from there in viewport-sized
+numbers. `reveal` compares `end_px − offset` against the viewport rather than `offset + viewport` for
+the same reason. **§6.4 now says rule 3 is not excused by a bounded axis** — the note a future
+implementer needs, since the natural inference from "bounded" is that none of the three apply.
+
+### The offset is stored exactly and drawn snapped, and both halves are load-bearing
+
+Layout rounds the offset to a whole device pixel because a glyph bitmap placed at a fractional x
+resamples ClearType's **horizontal** subpixel coverage — colour fringing, not blur. It rounds it
+**once**, shared by every column, so adjacent columns stay exactly one cell apart rather than 7 px
+and then 8. Rounding the *stored* offset instead is the worse bug and has its own test: a trackpad
+delivering 0.4 px per frame would round to zero every frame and the view would never move at all.
+
+### Six negative controls, each applied, observed and reverted
+
+| Control | Fails |
+|---|---|
+| Layout does not snap the offset | **3** — including the spacing test and the sub-pixel drag |
+| The *stored* offset is rounded instead | 1 — the sub-pixel drag vanishes |
+| Hit-test adds the click to the content offset (rule 3) | 1 — the inverse test, as above |
+| The clamp only guards the near edge | **4** — a refined extent and a widened window both strand the view |
+| A cell-width change keeps the pixel offset, not the column | 1 — §3.3's column drift, one axis over |
+| `reveal` always aligns to the left edge | 2 — every keystroke jerks the view |
+
+### Two things this hands to the painter rather than solving
+
+- **A wide cluster straddling the left edge starts before `visible_columns().start`.** Painting from
+  `start` cuts it in half — but `CellModel::byte_span` already rounds both ends outwards, so it
+  returns the cluster whole, and `x_of_column` is deliberately unclamped so the painter can place it
+  at a negative x. The two pieces compose; nothing new was needed.
+- **`set_columns` is never to be fed from the lines currently on screen.** §3.3 says so and names the
+  symptom — the horizontal-thumb jitter every other viewer has. Nothing enforces it structurally.
+
+### ▶ Resume here
+
+**V3 is done, so the next thing is a consumer.** `Grid`, `HGrid`, `Selection` and `visual_glyphs`
+are all exported and **all four are unwired** — every defect found in the last three sessions was
+latent, and they become live the moment a viewport is attached. The static exe is still unchanged,
+so every size figure quoted since M2 remains an LTO artefact. Attaching a viewport is what settles
+both at once.
+
+---
+
 ## ✅ Visual reordering — `bidi.rs`, and the level `shape.rs` was throwing away — 2026-08-06, session 14
 
 **267 tests, all passing**, fmt and clippy clean on the two shipped crates. `shape.rs` measured in
@@ -1881,6 +1954,9 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **LTO makes an unreferenced dependency free, which is a misleading way to measure one.** Adding `encoding_rs` + `chardetng` left the exe byte-identical at 249,344 while nothing called them; it went to 502,784 the moment the shell did. Measure a dependency's size *after* wiring it in, never before. | `crates/tailhawk/src/main.rs` |
 | **Never check a live file's reported size against a separately-stat'd one.** Corpus A read 5,587,678 bytes against a stat of 2,773,726 taken a minute earlier and looked like a 2.01x bug — a suspiciously exact ratio, which is what made it convincing. The file had simply grown. **To verify counts, snapshot the file first and run against the frozen copy;** use the live file only to exercise sharing and rotation. | session 9 |
 | **The obvious verification tools cannot open a live log at all.** `[IO.File]::ReadAllBytes` and anything else opening share-`Read` fails with a sharing violation against a real writer — the very case Tailhawk exists to handle. Take ground truth through `[IO.File]::Open($p,'Open','Read','ReadWrite,Delete')`. Reaching for the naive reader first reads as "the file is locked", not "my reader is wrong". | session 9 |
+| **`cargo fmt --all` reformats the frozen experiment sources**, which are the record of how each measurement was taken and must not be tidied — session 14 already had to put them back once (`3ede15b`), and session 15 did it again the same way. Format the shipped crates by name: `cargo fmt -p tailhawk-core -p tailhawk`. | `experiments/` |
+| **A bounded axis does not excuse §6.4's rule 3.** `x + offset_px` looks safe once the offset is provably exact and provably small enough — but at 96,624 px one ULP is 0.008 px, and a click 0.0012 px inside a column rounds up onto the next boundary and hit-tests to the right. Two exact terms do not make an exact sum. Resolve to the leftmost visible column first, then measure in viewport-sized numbers. | `crates/tailhawk-core/src/hgrid.rs` |
+| **Snap the drawn offset, never the stored one.** Whole-pixel column positions are required — a fractional x resamples ClearType's horizontal subpixel coverage — but rounding the offset *in the state* makes a 0.4 px/frame trackpad round to zero every frame and the view never moves. Store exact, round once at layout, shared by every column so the spacing cannot drift. | `crates/tailhawk-core/src/hgrid.rs` |
 | **A correctly-painted window and a dead one are indistinguishable at this palette.** `BACKGROUND` is RGB(18, 20, 23), so an M1 window that is working perfectly looks like an empty frame — the owner reasonably reported seeing nothing. **Do not debug this by looking.** Screenshot the client area and assert the pixels equal `background_rgb8()`; that distinguishes "painting correctly" from "not painting" in one step. | `crates/tailhawk-core/src/lib.rs` |
 
 ---

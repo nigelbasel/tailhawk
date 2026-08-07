@@ -268,6 +268,14 @@ The naive "one character = one fixed-width cell" assumption breaks on real log c
   actually laid out. Extent is never derived from currently-visible lines — that causes the documented
   horizontal-thumb jitter.
 
+  **The extent the scrollbar uses is capped by §10.3's render cap**, not by the file's longest line: a
+  41 MB line is truncated at 32 KB inline, so nothing past 32,768 cells is ever drawn and scrolling
+  there would address pixels the grid cannot reach. The cap is also what keeps the horizontal axis
+  inside `f32`'s exactly-representable integer range (32,768 cells × a bounded cell width < 2²⁴ px),
+  which is why §6.4's rules 1 and 2 are not needed on this axis. **Raising the cap to "unlimited" is
+  therefore not a rendering-only change** — it reintroduces the `(index, remainder)` obligation
+  horizontally.
+
   *An earlier draft claimed max cell count was "captured free during the index pass". It is not:
   grapheme segmentation with East Asian Width costs 10–50× a newline scan, and it requires the cell
   model, which does not exist when the index is built.*
@@ -793,6 +801,13 @@ rules below do not follow from it, and each corresponds to a measured failure mo
 
 **Required test, and it belongs in CI:** assert that the first drawn row's viewport-relative y stays
 in `(−row_height, 0]` across a scroll sweep at 10⁸ rows. That one assertion catches all three.
+
+**Rules 1 and 2 are about an unbounded axis; rule 3 is not, and it applies to horizontal scrolling
+too.** A line is bounded by §10.3's render cap, so the horizontal offset may be an ordinary pixel
+count — but a click resolved as `x + offset_px` still hit-tested one column to the right at a 96,624 px
+offset, because one ULP there is 0.008 px and a fractional `x` rounds up onto the next column
+boundary. Both terms being exact does not make their sum exact. Resolve the offset to the leftmost
+visible column once, then measure the click from there in viewport-sized numbers.
 
 **Row height model — this is a load-bearing constraint, not a detail.** The `u64` scroll model gives
 O(1) row→pixel mapping *only* under uniform row height. Two features threatened it:
