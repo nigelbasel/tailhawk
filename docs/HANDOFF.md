@@ -1,5 +1,49 @@
 # Handoff — resume here
 
+## ◐ The consumer has started — `view.rs`, the portable half — 2026-08-07, session 15
+
+**293 tests, all passing**, fmt and clippy clean on the two shipped crates. `view.rs` composes
+`Grid`, `HGrid` and `CellModel` into one viewport, so **the four modules that were exported and
+unwired are wired**. It is still device-free and headless: it holds no font, no device and no
+window, and nothing in it draws.
+
+### The two joins that are silent when wrong, encoded once
+
+- **`View::slice`** returns the bytes of a line to draw and the x to draw them at. `byte_span`'s
+  outward rounding — built for §5.6, so a copy cannot launder a zero-width override — returns a
+  straddling wide cluster **whole**, and the slice is then placed at **that cluster's own column**
+  rather than the one the viewport asked for. Drawing it at `visible_columns().start` shifts the
+  whole line right by the part that is off screen.
+- **`View::position_at`** pairs the two hit-tests into `selection::Position`, so a caller cannot
+  combine a row from one frame with a column from another.
+
+**Two negative controls, applied, observed and reverted:** the slice drawn at the asked-for column
+(1 fail, the CJK straddle); the byte range composed as `byte_at_cell(start)..byte_at_cell(end)`
+(1 fail, the Trojan Source line's override dropped from the drawn bytes).
+
+### ▶ Resume here: the device half, and one design constraint already found
+
+`Renderer::paint` is still the background clear — its own doc says "the grid arrives at M3". The
+constraint that shapes what comes next, found by reading `gpu.rs` rather than by being bitten:
+
+**⚠ A `GlyphCache` holds a `Sheet`, which is a texture owned by the device.** `gpu.rs`'s recovery
+rebuilds a lost device and bumps `device_generation()`, so text resources held *alongside* the
+renderer would keep drawing from a dead sheet after a TDR or a driver update — silently, and §3.2
+forbids making that a panic. So `Renderer` must own `Shaper` + `GlyphCache` + `TextPipeline` and key
+them to the generation counter. `View` stays portable and holds none of it.
+
+Two more things settled by that reading:
+
+- **The pen is cell-driven, not advance-driven.** §3.3 says that where a fallback face's advance
+  disagrees with the primary, the cell grid wins and the glyph is centred in its cell. So a cluster
+  is placed at `x_of_column`, and the shaper's offsets position glyphs *within* the cluster.
+- **⚠ Bidi placement is a gap, and must not be shipped silently wrong.** `visual_glyphs` orders the
+  glyphs *inside* a run, but which column an RTL run's clusters occupy is a separate question that
+  `cell.rs` answers in logical order. The first painting slice should be correct for LTR and
+  explicit about RTL rather than drawing Arabic in the wrong columns and looking finished.
+
+---
+
 ## ✅ V3 is complete — horizontal scrolling, `hgrid.rs` — 2026-08-07, session 15
 
 **286 tests, all passing**, fmt and clippy clean on the two shipped crates. `PLAN.md`'s V3 row is
