@@ -29,6 +29,9 @@ pub mod file;
 pub mod glyphs;
 
 #[cfg(windows)]
+pub mod paint;
+
+#[cfg(windows)]
 pub mod raster;
 
 #[cfg(windows)]
