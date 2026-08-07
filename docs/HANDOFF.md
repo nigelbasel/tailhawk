@@ -38,6 +38,28 @@ back-references were not. All four now read M3.
   What survives is an observation about this session's discipline, not a documentation defect —
   **`hgrid.rs`, `view.rs` and `bidi.rs` have no §5 entry**, and §5's last row still stops at V3.
 
+### The `CLEANROOM.md` §1.5 debt is paid, and the rule now executes
+
+`selection.rs`, `bidi.rs`, `hgrid.rs` and `view.rs` had **no §5 entry at all** — the fourth slip of
+"log before you code". The entry is filed, and **marked as the retroactive thing it is**: only
+`hgrid.rs` and `view.rs` were written by the agent filing it, so for the other two the row records
+what the code and commits show rather than a first-hand attestation. That distinction is the whole
+value of the file and collapsing it would have been worse than the omission.
+
+**The pattern named in the device-recovery row has a second form.** That row said §1.5 slips when a
+component starts as "a small addition to something that already exists". These were four *new
+files*, and it slipped anyway — because each felt like the continuation of a V3 row already filed.
+A pointer row only works when the later work is inside the scope the earlier row named, and
+"the scroll model, row layout and hit-test" named none of them.
+
+**So §1.5 is now a CI gate** (`provenance`, in `ci.yml`): every module in `crates/tailhawk-core/src`
+must be named in `CLEANROOM.md`. This is the file's own recorded lesson applied to itself — "a config
+file nothing executes is documentation" — and it asserts only the weakest mechanical form: it cannot
+check that the entry came first, is accurate, or is honest. **It would not have caught the `cell.rs`
+additions either**, since that file was already named. What it catches is the failure that has
+actually happened every time: a new module arriving with no entry. Verified by deleting the new row —
+all four modules are reported.
+
 ### ⚠ Four findings were dropped unverified, and they are not "no"
 
 The workflow verifies the two most severe per document and logged what it dropped rather than

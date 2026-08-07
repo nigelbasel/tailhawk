@@ -28,6 +28,36 @@ jobs:
         with:
           command: check
 
+  # CLEANROOM.md §1.5 — "the §5 entry for a component is written and committed *before* the first
+  # line of that component". That rule has slipped four times, and each slip was found by a later
+  # review rather than by the process. HANDOFF.md's own traps table records why: "a config file
+  # nothing executes is documentation", and §1.5 was documentation.
+  #
+  # This asserts only the weakest mechanical form of it — that every shipped module is *named*
+  # somewhere in CLEANROOM.md. It cannot check that the entry came first, that it is accurate, or
+  # that it is honest; a human still has to read it. What it does catch is the failure that has
+  # actually happened every time: a new module arriving with no entry at all.
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every core module is named in CLEANROOM.md
+        shell: bash
+        run: |
+          missing=()
+          for f in crates/tailhawk-core/src/*.rs; do
+            n=$(basename "$f")
+            # lib.rs is the crate root, not a component: it declares modules and re-exports them.
+            [ "$n" = "lib.rs" ] && continue
+            grep -qF -- "$n" CLEANROOM.md || missing+=("$n")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "CLEANROOM.md §5 names no entry for: ${missing[*]}"
+            echo "Add the entry before the code, per §1.5 — not after this gate fails."
+            exit 1
+          fi
+          echo "every core module is named in CLEANROOM.md"
+
   build:
     runs-on: windows-latest
     strategy:
