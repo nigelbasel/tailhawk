@@ -20,6 +20,7 @@ pub mod indexer;
 pub mod lines;
 pub mod record;
 pub mod selection;
+pub mod view;
 
 #[cfg(windows)]
 pub mod file;
@@ -60,6 +61,7 @@ pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
 pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};
 pub use lines::LineDecoder;
 pub use selection::{Position, RowEnd, RowSpan, Selection, SelectionMode};
+pub use view::{RowSlice, View};
 
 pub use record::{
     AttributeValue, FormatId, ParseState, Record, Resource, Severity, SeverityBand, Timestamp,
