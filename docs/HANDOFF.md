@@ -1,5 +1,120 @@
 # Handoff — resume here
 
+## ✅ Adversarial review of the M3 viewport — three live bugs, one of them pre-existing — 2026-08-07, session 15
+
+A 12-agent workflow reviewed `hgrid.rs`, `view.rs` and `paint.rs` across four independent lenses
+(precision, content loss, device lifetime, state transitions), each candidate then handed to a
+verifier told to **refute** it. **Seven confirmed, one refuted.** Every fix below has a negative
+control that was applied, observed and reverted.
+
+**This is the second time in one session that review found what my own tests could not**, and the
+pattern is worth naming: both times the tests were *correct* and *insufficient* in the same way —
+they used small fixtures near the origin, where an asymptotic cost and a boundary overrun are both
+invisible.
+
+### ⚠ The text pass was quadratic, and four of the four lenses found it independently
+
+`lay_out_row` asked `CellModel::cell_at_byte` for a column **once per cluster**, and that call
+re-walks the line's graphemes from byte zero. So a frame cost O(visible columns × horizontal scroll
+offset). Measured, release: **a screenful of 32 KB lines scrolled to the middle took 16.4 seconds**,
+against a 16.67 ms budget — and §10.3 puts exactly those lines in scope, citing klogg hanging
+"deadly" on them as the behaviour to avoid. An ordinary 2 KB JSON record at column 1,024 cost
+651 ms.
+
+The column is now carried across clusters and advanced by each cluster's width, which is exact
+because `shape.rs` and `cell.rs` segment with the same `grapheme_indices(true)` and `byte_span`
+rounds the slice outwards to whole clusters. `RowSlice` carries the starting column it was already
+computing. A **second, independent** term came from `CellModel::byte_span` having no early exit —
+190 ms/frame at horizontal offset *zero* — now stopped once the clusters are past the range.
+
+**⚠ It is faster, and it is still not fast enough. Do not read the passing test as a budget.** The
+residual walk is linear in the scroll offset — roughly **200 ms** for that frame against 16.67 ms.
+Removing it needs the cell model to stop starting from byte zero: a per-row cluster anchor, the same
+shape as the line index's anchors, one axis over. **That is an open M3 item, not a solved one.**
+
+### ⚠ A cluster's glyphs could be painted over the next column — §13.4
+
+`a` followed by U+E0067 TAG LATIN SMALL LETTER G is **one** cluster the cell model calls one cell
+wide, and it shapes to **two** glyphs each carrying a full advance, the second being `.notdef` — a
+hollow box with real ink. The within-cluster pen had no bound, so the box landed in the next column.
+`"a" + "\u{E0067}".repeat(20) + "SECRET"` painted a box over each of the next twenty columns:
+attacker-supplied invisibles blotting out the text after them, which is §13.4's hidden-text vector
+rendered as a viewer that can be made to lie.
+
+§3.3 gives the cell grid the last word *between* clusters; nothing said what happens **within** one,
+and the answer is the same authority. The pen and each glyph's x now clamp to the cluster's own last
+cell. **Control: 25 quads land past column 1 without the clamp, where only 6 characters live.**
+
+### ⚠ Minimising the window destroyed the reading position and follow — and this one predates today
+
+`grid.rs`, from session 13, reviewed twice before. `max_scroll` answered `Scroll::TOP` for a
+zero-height viewport; `TOP` is the *lower* bound, so `clamp` read it as a cap and rewrote the
+position to row 0, and on restore `is_following` had already been false-d out by its own viewport
+guard, so nothing re-pinned. **Tailing a 50M-line log, minimise, restore: top of the file, follow
+silently off.** Every Windows app gets a 0×0 client area on minimise, so this needed no unusual
+input at all — it was latent only because nothing drives the grid yet.
+
+**The controls are the interesting part here.** Reverting `max_scroll` fails 4 tests. Reverting
+`is_following` fails **none** — so by this project's own standard that half was unjustified. It is
+not: it is load-bearing for *the file growing while minimised*, which is the case a tail tool exists
+for and which no test covered. The missing test now exists, and the control fires on it. **A control
+that does not fire is a statement about the tests, not about the change.**
+
+### One cluster can be the whole line
+
+`"a" + "\u{0301}".repeat(16000)` is 32 KB — §10.3's supported inline size — as **one** cluster in
+**one** cell, shaping to 16,001 glyphs and emitting 16,001 quads stacked on column zero. The column
+window cannot narrow it, because it is one cell wide. `View::slice` now caps the bytes handed to the
+shaper, snapping **inward** to a `char` boundary — outward would restore the whole cluster and
+defeat the cap.
+
+### The refuted one, and what it left behind
+
+"Shaping the visible slice rather than the whole line makes bidi levels a function of scroll
+position" — refuted, because `visual_glyphs` is never called from `paint.rs` and placement is
+logical, so resolved levels affect nothing drawn. **But that is only true while RTL placement is
+unimplemented.** When it lands, shaping a slice becomes a real defect: the reading order of what is
+on screen would depend on where the window is scrolled. Recorded here so the fix and the trap arrive
+together.
+
+### ⚠ Three findings were dropped unverified by the cap — all three were real
+
+`view.rs:113` and `paint.rs:157` (twice, from two lenses). **The workflow's per-lens verification cap
+is a real limit, not a filter.** It logged what it dropped, and all three dropped items turned out to
+be genuine — one of them the second-largest finding in the run.
+
+The `view.rs` one was **live-bug** severity: the `byte_span` full scan, fixed above.
+
+The `paint.rs:157` pair was recovered from the run log, which had kept the *location* and the *lens*
+(`content-loss`, `state-machine`, both "latent") but **not the finding text**. That was enough to
+re-derive both, and both were right:
+
+- **`View::slice`'s 8 KB byte cap can truncate a row that is on screen.** "An ordinary line never
+  reaches it" is true and is not the claim that matters. A cell costs `1 + 2n` bytes with `n`
+  combining marks, so around twenty marks per base character puts a **300-column** row past the cap —
+  far narrower than any real viewport, and §13.4 makes hostile text an explicit threat model. The
+  right-hand part of the row then draws nothing and the row looks like it simply ends. The cap stays,
+  because the 16,001-quads-on-one-column case it exists for is worse; it now reports itself through
+  `RowSlice::truncated` and `Laid::truncated_rows`. `a_row_whose_visible_bytes_are_capped_says_so`
+  pins the reachable case, and it earned its keep by failing informatively when the first fixture was
+  wrong.
+- **One row that failed to shape abandoned the whole frame.** `lay_out` propagated `?` from
+  `lay_out_row`, so fifty rows already laid out were discarded and the caller, seeing `Err`, drew
+  nothing — one malformed line freezing a viewer that is following a live log. The `None` arm one
+  line up already had the right answer for exactly this shape of problem. The row is now skipped and
+  `Laid::failed_rows` counts it.
+
+**⚠ `failed_rows` has no test that exercises it, and the reason is worth carrying forward.** A
+negative control on that change does not fire, so by this project's rule the question was put
+directly: what legal `&str` makes DirectWrite fail? Six hostile fixtures were tried — 5,000 combining
+marks in one run, private-use, unassigned and noncharacter code points, tag characters, 2,000 stacked
+bidi overrides — and **all six shape**. The error path is reachable only on a system-level failure
+(COM error, corrupt font, allocation failure), which no test can produce without a seam, and none was
+added. `hostile_text_shapes_rather_than_failing` records that evidence rather than asserting an
+excuse; if a fixture there ever *does* error, `failed_rows` becomes testable that day.
+
+---
+
 ## ✅ Doc consistency sweep — six stale claims, two of them normative — 2026-08-07, session 15
 
 A 12-agent workflow swept all six documents plus `CLEANROOM.md` for claims still stated as current
@@ -2070,6 +2185,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **`cargo fmt --all` reformats the frozen experiment sources**, which are the record of how each measurement was taken and must not be tidied — session 14 already had to put them back once (`3ede15b`), and session 15 did it again the same way. Format the shipped crates by name: `cargo fmt -p tailhawk-core -p tailhawk`. | `experiments/` |
 | **A bounded axis does not excuse §6.4's rule 3.** `x + offset_px` looks safe once the offset is provably exact and provably small enough — but at 96,624 px one ULP is 0.008 px, and a click 0.0012 px inside a column rounds up onto the next boundary and hit-tests to the right. Two exact terms do not make an exact sum. Resolve to the leftmost visible column first, then measure in viewport-sized numbers. | `crates/tailhawk-core/src/hgrid.rs` |
 | **Snap the drawn offset, never the stored one.** Whole-pixel column positions are required — a fractional x resamples ClearType's horizontal subpixel coverage — but rounding the offset *in the state* makes a 0.4 px/frame trackpad round to zero every frame and the view never moves. Store exact, round once at layout, shared by every column so the spacing cannot drift. | `crates/tailhawk-core/src/hgrid.rs` |
+| **A regression guard must assert a ratio, never a duration.** The first cost guard for the text pass asserted "under a second", measured 0.21 s alone, 0.60 s under full-suite load and 2.76–7.49 s in repeats — a flake that also made my "two orders of magnitude of headroom" claim wrong. This machine's ~40% background load is the thing `experiments/g3-d3d11` spent two sessions establishing; a duration threshold encodes the idle machine that never exists. Compare two arms **interleaved** and assert their ratio: `the_layout_cost_does_not_scale_…` runs 240 vs 24 columns five times alternating, compares medians, and its control fires at **12.9x** against a 3.0 threshold — a margin load cannot manufacture. | `crates/tailhawk-core/src/paint.rs` |
 | **A correctly-painted window and a dead one are indistinguishable at this palette.** `BACKGROUND` is RGB(18, 20, 23), so an M1 window that is working perfectly looks like an empty frame — the owner reasonably reported seeing nothing. **Do not debug this by looking.** Screenshot the client area and assert the pixels equal `background_rgb8()`; that distinguishes "painting correctly" from "not painting" in one step. | `crates/tailhawk-core/src/lib.rs` |
 
 ---

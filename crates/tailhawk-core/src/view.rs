@@ -31,6 +31,14 @@ use crate::grid::Grid;
 use crate::hgrid::HGrid;
 use crate::selection::Position;
 
+/// The most bytes of one row handed to the shaper in a frame.
+///
+/// Not a line-length limit — §10.3's 32 KB render cap is that, and it is enforced on the *extent*
+/// in [`crate::hgrid`]. This bounds the one case the column window cannot: a single grapheme
+/// cluster that is itself megabytes long, which occupies one cell and shapes to one glyph per
+/// combining mark. Generous enough that no ordinary line reaches it.
+const MAX_SLICE_BYTES: usize = 8 * 1024;
+
 /// The part of one row's line that the viewport shows, and where to draw it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowSlice {
@@ -40,6 +48,26 @@ pub struct RowSlice {
     /// Viewport-relative x for the first byte's column. **Negative when a cluster straddles the
     /// left edge**, which is the case this type exists for.
     pub x: f32,
+    /// The cell column [`bytes`](Self::bytes) starts at.
+    ///
+    /// **Carried rather than left to the caller to re-derive**, because re-deriving it is
+    /// `cell_at_byte`, which walks the line's graphemes from byte zero. A painter needs a column
+    /// per cluster, and asking per cluster measured 16.4 s for one frame of 32 KB lines. This
+    /// value is already computed here to produce `x`; handing it over costs nothing.
+    pub column: usize,
+    /// **This row's visible bytes hit [`MAX_SLICE_BYTES`] and the tail was dropped.**
+    ///
+    /// The cap is deliberate and the comment in [`View::slice`] says why, but "an ordinary line
+    /// never reaches it" is not the same as "no on-screen line reaches it". A cell costs `1 + 2n`
+    /// bytes with `n` combining marks, so around twenty marks per base character puts a *200-column*
+    /// row past 8 KB — narrower than any real viewport, and §13.4 makes hostile text an explicit
+    /// threat model rather than a curiosity. When that happens the right-hand part of the row draws
+    /// nothing at all and the row looks like it simply ends.
+    ///
+    /// Silently is the part that is not acceptable: §5.6 governs the clipboard, not the screen, but
+    /// a viewer that shows two thirds of a line and looks complete is the same failure one surface
+    /// over. So the cap stays and it reports itself.
+    pub truncated: bool,
 }
 
 /// The two axes and the cell model, as one viewport.
@@ -110,10 +138,34 @@ impl View {
     /// error.
     pub fn slice(&self, line: &str) -> RowSlice {
         let visible = self.hgrid.visible_columns();
-        let bytes = self.cells.byte_span(line, visible.clone());
+        let mut bytes = self.cells.byte_span(line, visible.clone());
+
+        // **A slice is bounded in columns but not in bytes, and one cluster can be the whole line.**
+        // `"a" + "\u{0301}".repeat(16000)` is 32 KB — exactly §10.3's supported inline size — and it
+        // is *one* grapheme cluster occupying *one* cell. The column window cannot narrow it, so the
+        // whole 32 KB reaches the shaper, comes back as 16,001 glyphs, and emits 16,001 cell-sized
+        // quads stacked on one column. Nothing downstream bounds that: the atlas is per glyph, and
+        // the instance buffer is per quad.
+        //
+        // So the cap goes here, where "which bytes of this row are drawn" is already decided, and it
+        // bounds shaping, glyph count and instances together. The end snaps **inward** to a `char`
+        // boundary rather than outward to a cluster one — outward would restore the entire cluster
+        // and defeat the cap. It is the same truncation §10.3 already sanctions, and an ordinary
+        // line never reaches it: a 32 KB ASCII line still slices to its visible columns.
+        let truncated = bytes.len() > MAX_SLICE_BYTES;
+        if truncated {
+            let mut end = bytes.start + MAX_SLICE_BYTES;
+            while end > bytes.start && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            bytes.end = end;
+        }
+
         if bytes.is_empty() {
             return RowSlice {
                 x: self.hgrid.x_of_column(visible.start),
+                column: visible.start,
+                truncated,
                 bytes,
             };
         }
@@ -123,6 +175,8 @@ impl View {
         let first_column = self.cells.cell_at_byte(line, bytes.start);
         RowSlice {
             x: self.hgrid.x_of_column(first_column),
+            column: first_column,
+            truncated,
             bytes,
         }
     }
@@ -204,6 +258,74 @@ mod tests {
             "the override was dropped from the drawn bytes"
         );
         assert!(line[slice.bytes].starts_with('\u{202E}'));
+    }
+
+    /// **One cluster can be the whole line, and the column window cannot narrow it.** 16,000
+    /// combining acutes on one base is 32 KB — §10.3's supported inline size — as a single cluster
+    /// in a single cell, which shapes to 16,001 glyphs and would emit 16,001 quads stacked on
+    /// column zero. The byte cap is the only thing between that line and the frame.
+    #[test]
+    fn a_single_cluster_the_size_of_the_whole_line_is_capped() {
+        let line = format!("a{}", "\u{0301}".repeat(16_000));
+        assert_eq!(
+            CellModel::new().cell_count(&line),
+            1,
+            "the fixture is meant to be one cell"
+        );
+
+        let v = view(100, 4_000, 80.0, 190.0);
+        let slice = v.slice(&line);
+        assert!(
+            slice.bytes.len() <= MAX_SLICE_BYTES,
+            "{} bytes reached the shaper",
+            slice.bytes.len()
+        );
+        assert!(
+            line.is_char_boundary(slice.bytes.end),
+            "the cap cut a character in half"
+        );
+        // And an ordinary wide line is untouched by it.
+        let ordinary = "x".repeat(32_000);
+        assert!(v.slice(&ordinary).bytes.len() < 200);
+    }
+
+    /// The cap can bite a row that is *on screen and within §10.3's render cap*, and when it does the
+    /// row must not look complete.
+    ///
+    /// "An ordinary line never reaches it" is true and is not the claim that matters. A cell costs
+    /// `1 + 2n` bytes with `n` combining marks, so twenty marks per base character — Zalgo, which
+    /// §13.4 puts squarely in scope — puts a 200-column row past 8 KB. 200 columns is roughly 1,600
+    /// px: narrower than any real viewport, so the dropped tail is text the user is looking at.
+    #[test]
+    fn a_row_whose_visible_bytes_are_capped_says_so() {
+        let cell = format!("a{}", "\u{0301}".repeat(20));
+        let line = cell.repeat(300);
+        assert_eq!(
+            CellModel::new().cell_count(&line),
+            300,
+            "the fixture is meant to be 300 ordinary-width cells"
+        );
+
+        // A viewport showing all 300 of them — no horizontal scrolling involved.
+        let v = view(100, 4_000, 300.0 * CELL_W, 190.0);
+        let slice = v.slice(&line);
+        assert!(
+            slice.truncated,
+            "{} bytes of a 300-column row fitted under the cap after all — \
+             re-derive the fixture rather than deleting the test",
+            slice.bytes.len()
+        );
+        assert!(slice.bytes.len() <= MAX_SLICE_BYTES);
+
+        // The dropped tail is the point: the row draws short of its last visible column.
+        let drawn = CellModel::new().cell_count(&line[slice.bytes.clone()]);
+        assert!(
+            drawn < 300,
+            "the cap reported truncation without dropping anything"
+        );
+
+        // An ordinary line that fills the same viewport is not flagged.
+        assert!(!v.slice(&"x".repeat(32_000)).truncated);
     }
 
     #[test]

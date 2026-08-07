@@ -219,6 +219,16 @@ impl CellModel {
         let mut start = None;
         let mut end = None;
         for cluster in self.cells(line) {
+            // **Stop once the columns are behind us.** Clusters come in increasing column order, so
+            // nothing at a column past `cells.end` can widen either bound — and without this the
+            // loop walks every cluster in the line whatever the range asked for. That was free
+            // while this was called once per copy; `view.rs` calls it once per row per frame, and
+            // 50 rows of 32 KB lines measured 190 ms a frame against a 16.67 ms budget, at
+            // horizontal offset *zero*. The condition is `>` rather than `>=` because a zero-width
+            // cluster sitting exactly on `cells.end` is still inside, by the outward rounding above.
+            if start.is_some() && cluster.cell > cells.end {
+                break;
+            }
             let starts_here = cluster.cell + cluster.width > cells.start
                 || (cluster.width == 0 && cluster.cell >= cells.start);
             if start.is_none() && starts_here {
@@ -628,6 +638,74 @@ mod tests {
                 width(line),
                 line.len()
             );
+        }
+    }
+
+    /// **The early exit must not change a single answer.** `byte_span` stops once the clusters are
+    /// past the requested range, which turned a per-row full-line walk into a bounded one — but it
+    /// is a change to the module whose whole history is that every hand-written rule about text was
+    /// wrong in at least four ways. So this runs the loop with the exit removed and requires the
+    /// two to agree on every range of every fixture, including the zero-width boundary cases the
+    /// outward rounding exists for.
+    #[test]
+    fn the_early_exit_agrees_with_a_full_scan_on_every_range() {
+        /// `byte_span` with the early exit deleted — the previous implementation, kept here as the
+        /// oracle rather than in the module.
+        fn full_scan(
+            m: &CellModel,
+            line: &str,
+            cells: core::ops::Range<usize>,
+        ) -> core::ops::Range<usize> {
+            if cells.start >= cells.end {
+                let at = m.byte_at_cell(line, cells.start);
+                return at..at;
+            }
+            let (mut start, mut end) = (None, None);
+            for cluster in m.cells(line) {
+                let starts_here = cluster.cell + cluster.width > cells.start
+                    || (cluster.width == 0 && cluster.cell >= cells.start);
+                if start.is_none() && starts_here {
+                    start = Some(cluster.byte);
+                }
+                let inside =
+                    cluster.cell < cells.end || (cluster.width == 0 && cluster.cell == cells.end);
+                if start.is_some() && inside {
+                    end = Some(cluster.byte + cluster.byte_len);
+                }
+            }
+            let start = start.unwrap_or(line.len());
+            start..end.unwrap_or(start).max(start)
+        }
+
+        let lines = [
+            "",
+            "plain ascii log line",
+            "\u{202E}abc",
+            "abc\u{202E}",
+            "a\u{200B}\u{FE0F}b",
+            "日本語のログ行",
+            "a日b語c",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} family",
+            "कि and ि alone",
+            "ｆｕｌｌｗｉｄｔｈ",
+            "a\u{0}b\u{1B}c",
+            "\u{202E}\u{200B}\u{200D}",
+        ];
+        for model in [CellModel::new(), CellModel::revealing()] {
+            for line in lines {
+                let cells = model.cell_count(line);
+                for start in 0..=cells + 2 {
+                    for end in 0..=cells + 2 {
+                        let range = start..end;
+                        assert_eq!(
+                            model.byte_span(line, range.clone()),
+                            full_scan(&model, line, range.clone()),
+                            "{line:?} over {range:?}, reveal={}",
+                            model.reveal_invisibles
+                        );
+                    }
+                }
+            }
         }
     }
 }

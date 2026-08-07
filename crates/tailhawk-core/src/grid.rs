@@ -163,7 +163,7 @@ impl Grid {
     ///
     /// A non-finite delta is ignored rather than propagated — see [`Scroll`].
     pub fn scroll_by_px(&mut self, delta_px: f32) {
-        if !delta_px.is_finite() {
+        if !delta_px.is_finite() || self.viewport_px <= 0.0 {
             return;
         }
         let (rows, sub_row_px) = carry(self.scroll.sub_row_px, delta_px, self.row_height);
@@ -172,7 +172,14 @@ impl Grid {
     }
 
     /// Scrolls by whole rows — a key press, or a page.
+    ///
+    /// A delta against a viewport with no height is dropped, like [`scroll_by_px`](Self::scroll_by_px):
+    /// there is nothing on screen to move relative to, and moving the position anyway would be
+    /// indistinguishable from the minimise defect [`max_scroll`](Self::max_scroll) records.
     pub fn scroll_by_rows(&mut self, delta_rows: i64) {
+        if self.viewport_px <= 0.0 {
+            return;
+        }
         self.scroll = step(self.scroll.row, delta_rows, self.scroll.sub_row_px);
         self.clamp();
     }
@@ -295,9 +302,21 @@ impl Grid {
     /// content-magnitude number this whole module exists to avoid, so the bottom is derived from
     /// how many rows fit in the viewport — a small number — and subtracted from the row count in
     /// integer space.
+    /// **⚠ A zero-height viewport must not answer `TOP` here, and answering it was a real defect.**
+    /// `TOP` is the *lower* bound, so [`clamp`](Self::clamp) read it as a hard cap and rewrote the
+    /// position: minimising a window reports a 0×0 client area, and a reader tailing a 50M-line log
+    /// came back at row 0 with follow silently off. A viewport with no height has no bottom to
+    /// rest a row on, so the honest answer is that nothing constrains the position — the far end of
+    /// the document — and the real bound returns with the window.
     fn max_scroll(&self) -> Scroll {
-        if self.row_height <= 0.0 || self.viewport_px <= 0.0 {
+        if self.row_height <= 0.0 {
             return Scroll::TOP;
+        }
+        if self.viewport_px <= 0.0 {
+            return Scroll {
+                row: self.total_rows,
+                sub_row_px: 0.0,
+            };
         }
         let whole = (self.viewport_px / self.row_height).floor();
         let leftover_px = self.viewport_px - whole * self.row_height;
@@ -325,8 +344,12 @@ impl Grid {
     /// "following" is wrong: a freshly built grid is at the top with nothing in it, so the first
     /// `set_total_rows` / `set_viewport_px` would pin it to the end and it would never be at the top
     /// again. Following is only a meaningful state once there is something to follow.
+    /// **The viewport guard that used to be here threw the follow intent away on restore.** With
+    /// [`max_scroll`](Self::max_scroll) now meaningful at zero height, `is_at_bottom` is a real
+    /// question while minimised, and `total_rows > 0` is what actually protects the fresh-grid case
+    /// this guard was written for.
     fn is_following(&self) -> bool {
-        self.total_rows > 0 && self.viewport_px > 0.0 && self.is_at_bottom()
+        self.total_rows > 0 && self.is_at_bottom()
     }
 
     /// Re-clamps after a geometry change, re-pinning to the end if that is where we were.
@@ -721,6 +744,69 @@ mod tests {
                 "resizing 800 -> {viewport} px lost the newest row"
             );
         }
+    }
+
+    /// **Minimising the window must not lose the reading position, or follow.** A `WM_SIZE` on
+    /// minimise reports a 0×0 client area, so this sequence happens to every user of every Windows
+    /// app. It used to destroy both: `max_scroll` answered `Scroll::TOP` at zero height, `clamp`
+    /// read that lower bound as a cap and rewrote the position to row 0, and on restore
+    /// `is_following` had already been false-d out by its own viewport guard, so nothing re-pinned.
+    /// Tailing a 50M-line log, minimise, restore, and you were at the top of the file with follow
+    /// silently off.
+    #[test]
+    fn minimising_and_restoring_keeps_the_position_and_the_follow_state() {
+        // Following the tail.
+        let mut g = grid(1_000_000, 800.0);
+        g.scroll_to_bottom();
+        let tail = g.scroll();
+
+        g.set_viewport_px(0.0);
+        assert_eq!(g.visible().count(), 0, "a minimised window draws nothing");
+        g.set_viewport_px(800.0);
+
+        assert!(g.is_at_bottom(), "restoring stopped following the tail");
+        assert_eq!(g.scroll(), tail, "restoring moved the view");
+        assert_eq!(g.visible().last().expect("rows").row, 999_999);
+
+        // And a reader who had scrolled up keeps their place rather than being taken anywhere.
+        let mut g = grid(1_000_000, 800.0);
+        g.scroll_to_row(400_000);
+        let reading = g.scroll();
+        g.set_viewport_px(0.0);
+        g.set_viewport_px(800.0);
+        assert_eq!(g.scroll(), reading, "restoring lost the reading position");
+        assert!(!g.is_at_bottom());
+    }
+
+    /// **And the log keeps being written while the window is minimised**, which is the whole point
+    /// of a tail tool: the interesting case is precisely the one where you are not looking.
+    ///
+    /// This is the sequence that makes the `is_following` half of the minimise fix load-bearing.
+    /// Without it, `is_following` is false while the viewport is zero, so rows arriving during the
+    /// minimise do not move the pinned position; the view then restores to wherever the tail *was*
+    /// when the window went away, with follow off, and the newest lines are off screen. The
+    /// position-only fix does not catch it — the clamp has nothing to pull back, because the
+    /// position is short of the end rather than past it.
+    #[test]
+    fn a_file_that_grows_while_minimised_is_still_followed_on_restore() {
+        let mut g = grid(1_000_000, 800.0);
+        g.scroll_to_bottom();
+
+        g.set_viewport_px(0.0);
+        for total in [1_000_100u64, 1_000_400, 1_002_000] {
+            g.set_total_rows(total);
+        }
+        g.set_viewport_px(800.0);
+
+        assert!(
+            g.is_at_bottom(),
+            "the tail was lost while the window was down"
+        );
+        assert_eq!(
+            g.visible().last().expect("rows").row,
+            1_001_999,
+            "restored short of the newest row"
+        );
     }
 
     /// The same for a font-size or DPI change, which moves the end for the same reason.

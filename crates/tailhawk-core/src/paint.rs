@@ -70,6 +70,12 @@ pub struct Laid {
     /// the module note. Zero for almost every line in almost every log; non-zero is a correctness
     /// claim this module is not yet entitled to make.
     pub rtl_runs: usize,
+    /// Rows whose visible bytes hit [`RowSlice::truncated`](crate::view::RowSlice::truncated) and
+    /// therefore drew short of their last visible column.
+    pub truncated_rows: usize,
+    /// **Rows that failed to shape and drew nothing.** See [`Painter::lay_out`] — this is the count
+    /// that must never be silent, because the alternative it replaced was losing the whole frame.
+    pub failed_rows: usize,
 }
 
 impl Laid {
@@ -77,6 +83,8 @@ impl Laid {
         self.quads += other.quads;
         self.queued += other.queued;
         self.rtl_runs += other.rtl_runs;
+        self.truncated_rows += other.truncated_rows;
+        self.failed_rows += other.failed_rows;
     }
 }
 
@@ -130,6 +138,15 @@ impl Painter {
 
     /// Lays out every visible row. `line_at` returns a row's text, or `None` for a row whose bytes
     /// are not in memory yet — which draws nothing rather than blocking, per §11.3.
+    ///
+    /// **A row that fails to shape costs that row and no others.** `shape` returns `Err` for a
+    /// DirectWrite analysis or `GetGlyphs` failure, and propagating it from here used to abandon the
+    /// whole frame: fifty rows already laid out were discarded and the caller, seeing `Err`, drew
+    /// nothing. One malformed line would freeze a viewer that is following a live log — the failure
+    /// mode a tail tool exists to not have. The same reasoning already governs the `None` arm one
+    /// line up, and it does not become weaker because the cause is a font engine rather than a
+    /// pending read. The row is skipped, [`Laid::failed_rows`] counts it, and the other forty-nine
+    /// reach the screen.
     pub fn lay_out(
         &mut self,
         view: &View,
@@ -142,7 +159,10 @@ impl Painter {
             let Some(line) = line_at(row) else {
                 continue;
             };
-            total.merge(self.lay_out_row(view, &line, y, tint)?);
+            match self.lay_out_row(view, &line, y, tint) {
+                Ok(laid) => total.merge(laid),
+                Err(_) => total.failed_rows += 1,
+            }
         }
         Ok(total)
     }
@@ -163,21 +183,53 @@ impl Painter {
 
         let mut laid = Laid {
             rtl_runs: shaped.runs.iter().filter(|r| r.level % 2 == 1).count(),
+            truncated_rows: usize::from(slice.truncated),
             ..Laid::default()
         };
 
+        // **The column is carried, not re-derived per cluster**, and that is a measured
+        // requirement rather than tidiness. `cell_at_byte` re-walks the line's graphemes from byte
+        // zero on every call, so asking it once per cluster made a frame O(columns × scroll
+        // offset): 50 rows of 32 KB lines scrolled to the middle measured **16.4 seconds** against
+        // a 16.67 ms budget, and §10.3 puts exactly those lines in scope, citing klogg hanging
+        // "deadly" on them as the behaviour to avoid.
+        //
+        // Carrying it is exact because `shape.rs` segments with the same `grapheme_indices(true)`
+        // that `CellModel::cells` uses, and `byte_span` rounds the slice outwards to whole
+        // clusters — so `shaped.clusters` *is* the slice's cluster partition, in logical order.
+        let mut column = slice.column;
+        let cell_width = view.hgrid().cell_width();
+
         for cluster in &shaped.clusters {
-            if cluster.glyph_count == 0 {
-                // Absorbed into a preceding ligature. A real state, not a failure: the glyph that
-                // draws this cluster was already emitted against the cluster it was reported on.
+            let start = slice.bytes.start + cluster.span.byte;
+            let cells = view
+                .cells()
+                .cluster_width(&line[start..start + cluster.span.byte_len]);
+            let at = column;
+            column += cells;
+
+            // **After the advance, never before.** A cluster absorbed into a preceding ligature
+            // draws nothing of its own but still occupies its cells, and skipping the advance
+            // would shift the rest of the row left by one cluster per ligature.
+            if cluster.glyph_count == 0 || cells == 0 {
+                // `cells == 0` is a zero-width cluster — a bidi override, a joiner. It occupies no
+                // column, so it draws nothing here; §13.4's reveal toggle is what gives it a cell,
+                // and `byte_span` is what keeps it in the *copied* bytes per §5.6. Drawing it
+                // anyway is not neutral: its glyph carries a full advance and lands on the next
+                // character. See `last_x` below.
                 continue;
             }
-            // The cluster's byte offset is relative to the slice; the column is a property of the
-            // whole line, so the slice's own start has to go back on before asking.
-            let column = view
-                .cells()
-                .cell_at_byte(line, slice.bytes.start + cluster.span.byte);
-            let cluster_x = view.hgrid().x_of_column(column);
+
+            let cluster_x = view.hgrid().x_of_column(at);
+            // **The cluster's own cells bound its glyphs.** §3.3 gives the cell grid the last word
+            // between clusters; nothing said what happens *within* one, and the answer is the
+            // same authority. A cluster the cell model calls one cell wide can shape to several
+            // full-advance glyphs — `a` followed by U+E0067 TAG LATIN SMALL LETTER G is one
+            // width-1 cluster that shapes to two glyphs of ~8.2 px each — so an unbounded pen
+            // walks the second glyph straight over the next column. Twenty tag characters paint a
+            // box over each of the next twenty columns, which is §13.4's hidden-text vector
+            // rendered as a viewer that can be made to lie about what a line says.
+            let last_x = cluster_x + (cells - 1) as f32 * cell_width;
 
             let mut pen = cluster_x;
             for i in cluster.first_glyph..cluster.first_glyph + cluster.glyph_count {
@@ -185,7 +237,7 @@ impl Painter {
                 let before = self.cache.pending();
                 if let Some(quad) = self.cache.quad(
                     shaped.glyphs[i],
-                    pen + offset.advance,
+                    (pen + offset.advance).min(last_x),
                     baseline_y - offset.ascender,
                     tint,
                 ) {
@@ -193,9 +245,9 @@ impl Painter {
                     laid.quads += 1;
                 }
                 laid.queued += self.cache.pending() - before;
-                // Within the cluster only. The next *cluster* starts at its own column, never here
-                // — see the module note on why the cell grid wins.
-                pen += shaped.advances[i];
+                // Within the cluster only, and never past its last cell. The next *cluster* starts
+                // at its own column — see the module note on why the cell grid wins.
+                pen = (pen + shaped.advances[i]).min(last_x);
             }
         }
         Ok(laid)
@@ -369,6 +421,50 @@ mod tests {
         drop(off);
     }
 
+    /// **A cluster's glyphs stay inside the cluster's cells, and §13.4 is why this matters.**
+    ///
+    /// `a` followed by U+E0067 TAG LATIN SMALL LETTER G is **one** cluster the cell model calls one
+    /// cell wide, and it shapes to two glyphs each carrying a full advance — the second being
+    /// `.notdef`, a hollow box with real ink. An unbounded within-cluster pen walks that box into
+    /// the next column and paints it over the following character. Twenty tag characters put a box
+    /// over each of the next twenty columns, so an attacker-supplied invisible blots out the text
+    /// after it: §13.4's hidden-text vector rendered as a viewer that can be made to lie.
+    #[test]
+    fn a_clusters_glyphs_cannot_be_painted_over_the_next_column() {
+        let Some((off, mut painter)) = painter_or_skip("a_clusters_glyphs_stay_in_their_cells")
+        else {
+            return;
+        };
+        let view = view_for(&painter, 1, 200);
+        let line = format!("a{}SECRET", "\u{E0067}".repeat(20));
+        assert_eq!(
+            view.cells().cluster_width("a\u{E0067}"),
+            1,
+            "the fixture assumes the tag is absorbed into a one-cell cluster"
+        );
+
+        painter.begin_frame();
+        painter
+            .lay_out_row(&view, &line, 0.0, INK)
+            .expect("lay out");
+
+        // Column 0 is the whole `a` + tags cluster. Nothing it emits may reach column 1, where the
+        // `S` of SECRET is drawn.
+        let column_1_x = view.hgrid().x_of_column(1) + painter.cache.cell().left as f32;
+        let intruders = painter
+            .instances()
+            .iter()
+            .filter(|q| q.pos[0] >= column_1_x)
+            .count();
+        let letters = "SECRET".len();
+        assert!(
+            intruders <= letters,
+            "{intruders} quads land at or past column 1, which holds only {letters} characters — \
+             the cluster's glyphs are being painted over the text after it"
+        );
+        drop(off);
+    }
+
     /// **The gap, pinned.** An Arabic row shapes correctly and is placed in logical columns, which
     /// is wrong — and this must be visible rather than inferred. The day columns become bidi-aware,
     /// this test fails and its message says what to do.
@@ -389,6 +485,76 @@ mod tests {
             laid.rtl_runs > 0,
             "an Arabic run must be reported as unplaced while columns are logical — \
              if bidi column placement has landed, delete this test and the module note with it"
+        );
+        drop(off);
+    }
+
+    /// **The test the existing ones could not be: a wide line, scrolled a long way in.**
+    ///
+    /// Every other test here uses lines of 30–70 characters at or near column zero, where an
+    /// O(columns × scroll offset) layout is indistinguishable from a linear one. Adversarial review
+    /// measured the real shape: a screenful of 32 KB lines scrolled to the middle took **16.4
+    /// seconds** for one frame, because the column of every cluster was re-derived by walking the
+    /// line's graphemes from byte zero. §10.3 puts exactly these lines in scope and cites klogg
+    /// hanging "deadly" on them as the behaviour to avoid.
+    ///
+    /// **⚠ This asserts a ratio, not a duration, and the first version of it asserted a duration.**
+    /// That version measured 0.21 s alone and 0.60 s inside the full suite, and failed — this
+    /// machine carries a variable ~40% background load, which `experiments/g3-d3d11` spent two
+    /// sessions establishing and which produced 96, 112, 126, 139, 154 and 297 ms for one binary.
+    /// The project's own rule came out of that: decide with **paired interleaved A/B**, never with
+    /// an absolute.
+    ///
+    /// So both arms run in one process, alternating, at the *same* scroll offset with only the
+    /// number of visible columns differing. The defect's cost is `columns × offset`, so a ten-fold
+    /// difference in columns showed up as a ten-fold difference in time; the fix's cost is
+    /// dominated by the offset, which both arms share, so they land on top of each other. Load
+    /// affects both arms equally and cancels.
+    ///
+    /// **What this does not assert is that the frame is fast enough.** It is not: the residual
+    /// linear-in-offset walk is ~200 ms for this frame against a 16.67 ms budget. That is recorded
+    /// as an open item rather than hidden behind a passing test — see the module note.
+    #[test]
+    fn the_layout_cost_does_not_scale_with_the_number_of_visible_columns() {
+        let Some((off, mut painter)) = painter_or_skip("the_layout_cost_does_not_scale") else {
+            return;
+        };
+        // §10.3's supported inline size, as an ordinary wide record.
+        let line = "abcdefgh 0123456789 ".repeat(32 * 1024 / 20);
+        let cell_w = painter.cell_width();
+
+        let frame = |painter: &mut Painter, columns: usize| {
+            let mut view = view_for(painter, 8, line.len() as u64);
+            view.set_viewport(columns as f32 * cell_w, 8.0 * painter.row_height());
+            view.hgrid_mut().scroll_to_column(16_384);
+            let started = std::time::Instant::now();
+            painter.begin_frame();
+            for row in 0..8 {
+                painter
+                    .lay_out_row(&view, &line, row as f32 * painter.row_height(), INK)
+                    .expect("lay out");
+            }
+            assert!(!painter.instances().is_empty(), "nothing was drawn");
+            started.elapsed()
+        };
+
+        // Interleaved, never one arm and then the other: the fixed-order comparison is the mistake
+        // that made session 5 report concurrency as 11% slower when it was faster.
+        let (mut wide, mut narrow) = (Vec::new(), Vec::new());
+        for _ in 0..5 {
+            wide.push(frame(&mut painter, 240));
+            narrow.push(frame(&mut painter, 24));
+        }
+        wide.sort();
+        narrow.sort();
+        let ratio = wide[2].as_secs_f64() / narrow[2].as_secs_f64().max(1e-9);
+
+        assert!(
+            ratio < 3.0,
+            "ten times the columns cost {ratio:.1}x the time ({:?} against {:?}) — \
+             the layout is scaling with the column count again, which is the per-cluster walk",
+            wide[2],
+            narrow[2]
         );
         drop(off);
     }
@@ -443,5 +609,56 @@ mod tests {
             }
         }
         lowest
+    }
+
+    /// **Why [`Laid::failed_rows`] has no test that exercises it, recorded as evidence rather than
+    /// asserted as an excuse.**
+    ///
+    /// `lay_out` containing a row's shaping failure instead of propagating it is a real change —
+    /// propagating cost the whole frame — but a negative control on it does not fire, and by this
+    /// project's rule that is a statement about the tests. So the question was put directly: what
+    /// legal `&str` makes DirectWrite fail? These six are the hostile shapes that plausibly could —
+    /// 5,000 combining marks in one run (the `GetGlyphs` buffer-doubling path, `MAX_RETRIES`),
+    /// private-use, unassigned and noncharacter code points, tag characters, and 2,000 stacked bidi
+    /// overrides. **All six shape.** The error path is reachable only on a system-level failure — a
+    /// COM error, a corrupt font, allocation failure — which no test can produce without a seam.
+    ///
+    /// That is worth knowing beyond this test: it means the containment protects against something
+    /// rare and catastrophic rather than something routine, and it is why no seam was added to prove
+    /// it. If a fixture here ever *does* error, `failed_rows` becomes testable and should get a real
+    /// test that day.
+    #[test]
+    fn hostile_text_shapes_rather_than_failing() {
+        let Some((_off, mut painter)) = painter_or_skip("hostile_text_shapes") else {
+            return;
+        };
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "many marks one run",
+                format!("a{}", "\u{0301}".repeat(5000)),
+            ),
+            ("private use", "\u{E000}".repeat(100)),
+            ("unassigned", "\u{0378}".repeat(100)),
+            ("noncharacter", "\u{FFFE}\u{FFFF}".repeat(50)),
+            ("tags", format!("a{}", "\u{E0067}".repeat(500))),
+            ("deep overrides", "\u{202D}".repeat(2000)),
+        ];
+        let view = view_for(&painter, 4, 100_000);
+        for (name, line) in &cases {
+            painter.begin_frame();
+            painter
+                .lay_out_row(&view, line, 0.0, INK)
+                .unwrap_or_else(|e| panic!("{name} failed to shape: {e:?} — see this test's note"));
+        }
+
+        // And a frame of them reports no failures, which is the contract `lay_out` now owes.
+        painter.begin_frame();
+        let laid = painter
+            .lay_out(&view, INK, |row| {
+                cases.get(row as usize).map(|(_, line)| line.clone())
+            })
+            .expect("a frame of hostile rows is still a frame");
+        assert_eq!(laid.failed_rows, 0);
+        assert!(laid.quads > 0);
     }
 }
