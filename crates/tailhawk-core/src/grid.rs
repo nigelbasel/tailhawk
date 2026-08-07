@@ -348,7 +348,11 @@ impl Grid {
     /// [`max_scroll`](Self::max_scroll) now meaningful at zero height, `is_at_bottom` is a real
     /// question while minimised, and `total_rows > 0` is what actually protects the fresh-grid case
     /// this guard was written for.
-    fn is_following(&self) -> bool {
+    /// **Derived, never stored** — which is what makes "scrolling up auto-pauses follow"
+    /// (`UI-DESIGN.md` §12) fall out of the scroll model rather than needing to be implemented. The
+    /// shell reads it to drive the `⬤ Following` chip and to decide whether new rows should pull the
+    /// view along.
+    pub fn is_following(&self) -> bool {
         self.total_rows > 0 && self.is_at_bottom()
     }
 

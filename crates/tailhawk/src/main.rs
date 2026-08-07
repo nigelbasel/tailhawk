@@ -2,9 +2,12 @@
 //! drawable and nothing else (`SPEC.md` §3.1).
 //!
 //! M0 is the skeleton: a window that opens, a D3D11 device with the WARP fallback, and the
-//! two-stage first paint. M1 adds reading and decoding, which is headless — the only thing the
-//! shell does with it is report what the core found, in the title bar, because there is no grid to
-//! render it into until M3.
+//! two-stage first paint. M1 added reading and decoding. **M3 joins them**: a [`Document`] opens and
+//! indexes a log on a worker, and `WM_PAINT` lays a viewport of it out and draws it.
+//!
+//! Input lives here and only here, per §3.1 — a message becomes a [`Navigate`], and `grid.rs`
+//! decides what moving means. Nothing in this file computes a scroll position; `SPEC.md` §6.4 spent
+//! two experiments arguing how that arithmetic must be done and it is done there.
 
 // The shipped binary is a GUI app with no console. A test harness is not: as a windows-subsystem
 // executable it would have nowhere to print, so the attribute is dropped for `cargo test`.
@@ -23,11 +26,18 @@ use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemServices::MK_SHIFT;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_B, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_SPACE, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer,
     LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowTextW, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, SW_SHOW,
-    WINDOW_EX_STYLE, WM_DESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG,
+    SPI_GETWHEELSCROLLLINES, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
+    WINDOW_EX_STYLE, WM_DESTROY, WM_KEYDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE,
+    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -125,6 +135,54 @@ impl Document {
         // why the rest is missing; those rows simply draw nothing.
         let _ = self.rows.fetch(&self.file, &self.index, first, count);
     }
+
+    /// Applies one navigation intent. Returns whether anything actually moved.
+    ///
+    /// **The return value is what stops the window repainting on every key.** A `PageDown` at the
+    /// end of the file is a no-op, and invalidating for it would burn a frame to draw the same
+    /// pixels — which matters here because a frame is a full re-fetch and re-shape of the viewport.
+    fn navigate(&mut self, n: Navigate) -> bool {
+        let before = (self.view.grid().scroll(), self.view.hgrid().offset_px());
+        let row_h = self.view.grid().row_height().max(1.0);
+        let page_rows = ((self.view.grid().viewport_px() / row_h).floor() as i64 - 1).max(1);
+
+        match n {
+            Navigate::ByPixels(px) => self.view.grid_mut().scroll_by_px(px),
+            Navigate::ByRows(d) => self.view.grid_mut().scroll_by_rows(d),
+            Navigate::ByPages(d) => self.view.grid_mut().scroll_by_rows(d * page_rows),
+            Navigate::ByColumns(d) => self.view.hgrid_mut().scroll_by_columns(d),
+            Navigate::DocStart => self.view.grid_mut().scroll_to_row(0),
+            Navigate::DocEnd => self.view.grid_mut().scroll_to_bottom(),
+            Navigate::LineStart => self.view.hgrid_mut().scroll_to_start(),
+            Navigate::LineEnd => self.view.hgrid_mut().scroll_to_end(),
+        }
+
+        (self.view.grid().scroll(), self.view.hgrid().offset_px()) != before
+    }
+}
+
+/// One navigation intent, as the shell reads it from a message.
+///
+/// **The shell decides what a key means; the core decides what moving means.** `SPEC.md` §3.1 puts
+/// the grid in the core, and §6.4's three scroll rules are already implemented and tested there — so
+/// nothing here computes a position. This type is the whole of the seam: a `WM_KEYDOWN` becomes a
+/// `Navigate`, and `grid.rs` does the arithmetic that §6.4 argues about.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Navigate {
+    /// Vertical, in pixels. **Pixels rather than rows even for the wheel**, because §6.4's rule 1
+    /// applies deltas to the sub-row remainder and carries into the row index — which is what lets a
+    /// precision touchpad's sub-notch delta move the view at all instead of rounding to zero.
+    ByPixels(f32),
+    ByRows(i64),
+    ByColumns(i64),
+    /// Screenfuls, less one row of overlap — the line you were reading stays on screen.
+    ByPages(i64),
+    DocStart,
+    /// Also re-enables follow: `Grid::is_following` is *derived* from being at the bottom, so
+    /// arriving there is the same event as turning it back on.
+    DocEnd,
+    LineStart,
+    LineEnd,
 }
 
 struct Shell {
@@ -285,12 +343,46 @@ impl Shell {
         true
     }
 
+    /// Applies a navigation intent and asks for a frame only if the view moved.
+    fn navigate(&mut self, hwnd: HWND, n: Navigate) {
+        let moved = self.document.as_mut().is_some_and(|doc| doc.navigate(n));
+        if moved {
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+        }
+    }
+
     fn resize(&mut self, hwnd: HWND) {
         if let Some(renderer) = self.renderer.as_mut() {
             let (w, h) = Self::client_size(hwnd);
             let _ = renderer.resize(w, h);
         }
     }
+}
+
+/// The user's lines-per-notch setting.
+///
+/// **Read every time rather than cached**, because it is a control-panel setting that can change
+/// while the app runs, and because the "wheel scrolls a whole screen" accessibility value
+/// (`WHEEL_PAGESCROLL`) arrives through the same channel. Hard-coding 3 is what makes an app scroll
+/// at a different speed from every other window on the desktop.
+fn wheel_lines() -> u32 {
+    let mut lines: u32 = 3;
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some(std::ptr::addr_of_mut!(lines).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() || lines == 0 {
+        return 3;
+    }
+    // `WHEEL_PAGESCROLL` means "a screen at a time". A page is handled by `ByPages`, and clamping
+    // here keeps one notch from flinging the view an arbitrary distance.
+    lines.min(64)
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -356,6 +448,81 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
             });
             LRESULT(0)
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let delta = (wparam.0 >> 16) as i16 as f32 / WHEEL_DELTA as f32;
+            let shift = wparam.0 as u32 & MK_SHIFT.0 != 0;
+            let n = if msg == WM_MOUSEHWHEEL {
+                // A tilt wheel's positive delta is to the *right*, which is the opposite sign
+                // convention from the vertical wheel.
+                Navigate::ByColumns((delta * wheel_lines() as f32).round() as i64)
+            } else if shift {
+                // `UI-DESIGN.md` §12: Shift+wheel is horizontal.
+                Navigate::ByColumns(-(delta * wheel_lines() as f32).round() as i64)
+            } else {
+                // **Pixels, not rows.** §6.4 rule 1 carries the remainder into the row index, so a
+                // precision touchpad sending less than a full `WHEEL_DELTA` notch still moves the
+                // view instead of rounding to nothing. Positive delta is away from the user, which
+                // moves the content *down* and the row index *up*, hence the negation.
+                let row_h = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|sh| sh.document.as_ref())
+                        .map_or(1.0, |d| d.view.grid().row_height())
+                });
+                Navigate::ByPixels(-delta * wheel_lines() as f32 * row_h)
+            };
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.navigate(hwnd, n);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            // `VIRTUAL_KEY` is a newtype, so its constants cannot appear in a pattern — bare
+            // `VK_UP` there binds a variable and matches everything, which compiles into a keyboard
+            // where every key is `Up`. Comparing the raw code keeps them as patterns.
+            const UP: u16 = VK_UP.0;
+            const DOWN: u16 = VK_DOWN.0;
+            const LEFT: u16 = VK_LEFT.0;
+            const RIGHT: u16 = VK_RIGHT.0;
+            const PRIOR: u16 = VK_PRIOR.0;
+            const NEXT: u16 = VK_NEXT.0;
+            const SPACE: u16 = VK_SPACE.0;
+            const B: u16 = VK_B.0;
+            const HOME: u16 = VK_HOME.0;
+            const END: u16 = VK_END.0;
+            // `UI-DESIGN.md` §12's navigation map. Everything else in that table needs a feature
+            // that does not exist yet, so it is not bound to a no-op here.
+            let n = match wparam.0 as u16 {
+                UP => Some(Navigate::ByRows(-1)),
+                DOWN => Some(Navigate::ByRows(1)),
+                LEFT => Some(Navigate::ByColumns(-1)),
+                RIGHT => Some(Navigate::ByColumns(1)),
+                PRIOR => Some(Navigate::ByPages(-1)),
+                NEXT | SPACE => Some(Navigate::ByPages(1)),
+                // `b` for page-up is `less` muscle memory, and the table asks for it by name.
+                B => Some(Navigate::ByPages(-1)),
+                // Ctrl makes Home/End document extremes; bare, they are line extremes.
+                HOME if ctrl => Some(Navigate::DocStart),
+                END if ctrl => Some(Navigate::DocEnd),
+                HOME => Some(Navigate::LineStart),
+                END => Some(Navigate::LineEnd),
+                _ => None,
+            };
+            match n {
+                Some(n) => {
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            shell.navigate(hwnd, n);
+                        }
+                    });
+                    LRESULT(0)
+                }
+                None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            }
         }
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
@@ -557,5 +724,89 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
+    }
+
+    /// A real file on disk, because `Document` owns a `LogFile` and there is no seam for a fake one
+    /// — the index and the reads have to agree about the same bytes, which is the point.
+    fn scratch_log(name: &str, lines: usize) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        let mut text = String::new();
+        for i in 0..lines {
+            text.push_str(&format!("line {i} — a log record with some width to it\n"));
+        }
+        std::fs::write(&path, text).expect("write the fixture");
+        path
+    }
+
+    /// The navigation arithmetic, without a window or a device.
+    ///
+    /// `Document::navigate` is where a key becomes a movement, and it is the half of input handling
+    /// that can be tested — the `WM_KEYDOWN` → [`Navigate`] mapping needs a message pump and is
+    /// covered only by running the app. The cell metrics are supplied rather than measured, so this
+    /// does not need a face either.
+    #[test]
+    fn navigating_moves_by_the_amounts_the_key_map_promises() {
+        let path = scratch_log("tailhawk_nav_test.log", 5_000);
+        let mut doc = Document::open(&path).expect("open the fixture");
+        // 20 rows of 10 px in a 200 px viewport.
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.index.line_count(), 5_000);
+        assert_eq!(doc.view.grid().scroll().row, 0);
+
+        // **A page is a screenful less one row**, so the line you were reading stays on screen.
+        assert!(doc.navigate(Navigate::ByPages(1)));
+        assert_eq!(doc.view.grid().scroll().row, 19);
+
+        assert!(doc.navigate(Navigate::ByRows(1)));
+        assert_eq!(doc.view.grid().scroll().row, 20);
+
+        assert!(doc.navigate(Navigate::ByPages(-1)));
+        assert_eq!(doc.view.grid().scroll().row, 1);
+
+        // At the top, going up again moves nothing — and says so, which is what stops the window
+        // repainting on a held arrow key.
+        assert!(doc.navigate(Navigate::ByRows(-1)));
+        assert_eq!(doc.view.grid().scroll().row, 0);
+        assert!(
+            !doc.navigate(Navigate::ByRows(-1)),
+            "a no-op move reported movement, so every key would burn a frame"
+        );
+        assert!(!doc.navigate(Navigate::DocStart));
+
+        // The end clamps to the last screenful rather than scrolling into blank space, and arriving
+        // there *is* following — `Grid::is_following` is derived from being at the bottom.
+        assert!(doc.navigate(Navigate::DocEnd));
+        assert!(doc.view.grid().is_following());
+        assert!(!doc.navigate(Navigate::ByPages(1)), "scrolled past the end");
+        let last = doc.view.grid().visible().last().expect("a visible row").row;
+        assert_eq!(last, 4_999, "the last row is not the last line");
+
+        // Scrolling up from the bottom drops follow, which `UI-DESIGN.md` §12 requires.
+        assert!(doc.navigate(Navigate::ByRows(-1)));
+        assert!(!doc.view.grid().is_following());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The horizontal axis, which has its own extremes and its own key bindings.
+    #[test]
+    fn the_horizontal_extremes_are_the_line_extremes() {
+        let path = scratch_log("tailhawk_nav_h_test.log", 200);
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (200, 200));
+
+        assert!(!doc.navigate(Navigate::LineStart), "already at the start");
+        assert!(doc.navigate(Navigate::ByColumns(3)));
+        assert!(doc.navigate(Navigate::LineStart));
+        assert_eq!(doc.view.hgrid().offset_px(), 0.0);
+
+        assert!(doc.navigate(Navigate::LineEnd));
+        assert!(doc.view.hgrid().offset_px() > 0.0, "End went nowhere");
+        assert!(
+            !doc.navigate(Navigate::ByColumns(1)),
+            "scrolled past the end"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

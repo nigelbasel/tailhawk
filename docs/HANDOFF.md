@@ -1,5 +1,44 @@
 # Handoff — resume here
 
+## ✅ It scrolls — wheel and keyboard navigation — 2026-08-07, session 15
+
+`UI-DESIGN.md` §12's navigation map is bound: wheel, `Shift+wheel` and the tilt wheel, arrows,
+`PageUp`/`PageDown`, `Space`/`b`, `Home`/`End` and `Ctrl+Home`/`Ctrl+End`. **Verified against the
+17 MB fixture by posting keys to the real window and reading the pixels back**: 10 pages lands on
+line 410, 4,800 pages on line 196,800 — exactly 41 rows a page each time — and 6,000 pages clamps to
+the last screenful with the sub-row offset visible at the top, which is §6.4 rule 1 doing its job.
+
+**Nothing here computes a scroll position.** §3.1 puts the grid in the core and §6.4 spent two
+experiments arguing that arithmetic, so a message becomes a `Navigate` and `grid.rs`/`hgrid.rs` do
+the rest. Three things in that translation are worth keeping:
+
+- **The wheel scrolls in pixels, not rows.** §6.4 rule 1 carries the remainder into the row index, so
+  a precision touchpad's sub-notch delta moves the view instead of rounding to zero.
+- **Lines-per-notch is read from `SPI_GETWHEELSCROLLLINES` every time**, not cached and not
+  hard-coded to 3 — that setting is what makes the app scroll at the same speed as every other
+  window, and it can change while the app runs.
+- **`navigate` returns whether anything moved**, and only a move invalidates. A held arrow key at the
+  top of the file would otherwise burn a frame per repeat, and a frame here is a full re-fetch and
+  re-shape of the viewport. Control: returning `true` unconditionally fails both navigation tests.
+
+**Follow needed no code.** `Grid::is_following` is *derived* from being at the bottom, so
+"scrolling up auto-pauses follow" and "`Ctrl+End` re-enables it" both fall out of the scroll model.
+It is now `pub` because the shell needs it for §12's `⬤ Following` chip.
+
+`VIRTUAL_KEY` is a newtype, so its constants **cannot appear in a match pattern** — a bare `VK_UP`
+arm binds a variable and matches every key. The bindings compare raw `u16` codes through local
+`const`s for that reason.
+
+### ⚠ Still not done on this axis
+
+- **No smooth or inertial scrolling.** `UI-DESIGN.md` §12 requires `WM_POINTER`/Direct Manipulation
+  and says why — discrete wheel steps are what make a hand-rolled Win32 app feel homemade next to
+  Edge and Terminal. This implements discrete `WM_MOUSEWHEEL` only, and the `CLEANROOM.md` row
+  records that gap deliberately rather than quietly.
+- **No scrollbars**, so there is no drag-to-scroll and no position feedback at all.
+- **The `WM_KEYDOWN` → `Navigate` mapping has no test** — it needs a message pump. Only
+  `Document::navigate`, the half that turns an intent into a movement, is covered.
+
 ## ✅ Tailhawk renders a real log file — 2026-08-07, session 15
 
 **A 17 MB, 200,000-line file opens, indexes, and draws as text in the grid.** That is M3's first
