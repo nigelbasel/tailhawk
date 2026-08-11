@@ -144,7 +144,7 @@ impl ColumnAnchors {
     fn build_with_stride(model: &CellModel, line: &str, stride: usize) -> Self {
         let stride = stride.max(1);
         let mut marks = Vec::with_capacity(line.len() / stride + 1);
-        for (i, c) in model.cells(line).enumerate() {
+        for (i, c) in model.walk(line).enumerate() {
             if i % stride == 0 {
                 // A line past 4 GB cannot be reached: §10.3 caps the rendered extent far below it
                 // and `view.rs` caps the bytes handed to the shaper at 8 KB.
@@ -318,6 +318,89 @@ impl CellModel {
             };
             cell += width;
             placed
+        })
+    }
+
+    /// Whether the ASCII byte at `p` is, on its own, a whole grapheme cluster of width 1.
+    ///
+    /// **A purely local test, and that is what makes the fast walk possible.** Between two ASCII
+    /// characters UAX #29 breaks in every case but one — GB3's `CR × LF` — so a byte whose
+    /// neighbours are both ASCII is its own cluster, and every single-ASCII-character cluster is one
+    /// cell (printable by width, control by [`cluster_width`](Self::cluster_width)'s first rule,
+    /// which fires before the zero-width check and so holds under §13.4's reveal toggle too).
+    ///
+    /// **Both neighbours are checked, and both matter.** The byte *after* could be a combining mark
+    /// that absorbs this one — `a` + `U+0301` is one cluster, not two. The byte *before* could be a
+    /// `Prepend` (GB9b), which absorbs the character that follows it; those are Indic and Arabic
+    /// code points, so a non-ASCII predecessor disqualifies the byte and an ASCII one cannot.
+    fn ascii_singleton(bytes: &[u8], p: usize) -> bool {
+        const CR: u8 = b'\r';
+        const LF: u8 = b'\n';
+        if bytes[p] >= 0x80 {
+            return false;
+        }
+        let before_ok = p == 0 || (bytes[p - 1] < 0x80 && !(bytes[p - 1] == CR && bytes[p] == LF));
+        let after_ok = p + 1 == bytes.len()
+            || (bytes[p + 1] < 0x80 && !(bytes[p] == CR && bytes[p + 1] == LF));
+        before_ok && after_ok
+    }
+
+    /// Every cluster in `line`, the same sequence [`cells`](Self::cells) produces, reached faster.
+    ///
+    /// **This exists because of a measurement, and it replaces nothing semantically.** Building a
+    /// row's [`ColumnAnchors`] is one full walk of the line, and with the viewport scrolled right
+    /// that dominated a frame: 44 ms for 48 rows of 19.4 KB. The cost is `grapheme_indices` plus a
+    /// `unicode-width` lookup **per cluster**, ~19,400 of each per row — and for a log line, all but
+    /// a handful of those clusters are one ASCII byte whose answer is known without asking.
+    ///
+    /// So a byte satisfying [`ascii_singleton`](Self::ascii_singleton) is emitted directly, and
+    /// anything else is handed to real segmentation. The fallback runs from the current position to
+    /// the next byte that *is* a singleton, and both ends of that span are true cluster boundaries —
+    /// the near end by induction, the far end because a singleton is preceded by ASCII — which is
+    /// what makes segmenting the substring in isolation sound. See
+    /// [`cells_from`](Self::cells_from) for the same argument about regional indicators.
+    ///
+    /// `the_fast_walk_and_the_plain_one_agree` is the differential test, and it is the only reason
+    /// to believe any of this: hand-written rules about text in this module have a history of being
+    /// wrong in four ways at once.
+    fn walk<'a>(&'a self, line: &'a str) -> impl Iterator<Item = Cell> + 'a {
+        let bytes = line.as_bytes();
+        let mut p = 0usize;
+        let mut cell = 0usize;
+        // Clusters produced by one fallback segmentation, drained before the scan resumes.
+        let mut pending: std::vec::IntoIter<Cell> = Vec::new().into_iter();
+
+        std::iter::from_fn(move || {
+            if let Some(c) = pending.next() {
+                return Some(c);
+            }
+            if p >= bytes.len() {
+                return None;
+            }
+            if Self::ascii_singleton(bytes, p) {
+                let placed = Cell {
+                    byte: p,
+                    byte_len: 1,
+                    cell,
+                    width: 1,
+                };
+                p += 1;
+                cell += 1;
+                return Some(placed);
+            }
+            // Not a singleton: segment properly up to the next one, which is a known boundary.
+            let mut end = p + 1;
+            while end < bytes.len() && !Self::ascii_singleton(bytes, end) {
+                end += 1;
+            }
+            let mut batch = Vec::new();
+            for c in self.cells_from(&line[..end], p, cell) {
+                cell = c.cell + c.width;
+                batch.push(c);
+            }
+            p = end;
+            pending = batch.into_iter();
+            pending.next()
         })
     }
 
@@ -1018,6 +1101,75 @@ mod tests {
                 model.byte_span_anchored(&line, cell..cell + span.end, &plain),
                 "byte_span at {cell}"
             );
+        }
+    }
+
+    /// **The fast walk must produce the identical sequence, cluster for cluster.**
+    ///
+    /// `CellModel::walk` skips `grapheme_indices` and `unicode-width` for ASCII bytes on a local
+    /// argument about UAX #29. The argument is plausible and this module's history is that plausible
+    /// arguments about text are wrong in several ways at once, so it is checked against `cells` —
+    /// the canonical walk — over fixtures chosen to attack the argument's edges: the `CR LF` pair
+    /// GB3 exempts, a `Prepend` character before ASCII (GB9b), combining marks that absorb the ASCII
+    /// *before* them, ASCII directly abutting wide and zero-width clusters, and regional indicators
+    /// whose pairing depends on where segmentation resumed.
+    #[test]
+    fn the_fast_walk_and_the_plain_one_agree() {
+        let lines: Vec<String> = vec![
+            String::new(),
+            "a".into(),
+            "hello world".into(),
+            "2026-08-11T12:00:00Z INFO Worker[3] batch 41 in 9ms".into(),
+            // GB3: the one ASCII pair that does not break.
+            "a\r\nb".into(),
+            "\r\n".into(),
+            "a\r".into(),
+            "\ra".into(),
+            // GB9b: U+0605 ARABIC NUMBER MARK ABOVE is Prepend, and absorbs the ASCII after it.
+            "x\u{0605}9y".into(),
+            "\u{0605}a".into(),
+            // A combining mark absorbing the ASCII before it.
+            "abc\u{0301}def".into(),
+            "a\u{0301}".into(),
+            // ASCII abutting wide, zero-width and emoji clusters.
+            "ab日本cd".into(),
+            "ab\u{200B}cd".into(),
+            "ab\u{202E}cd".into(),
+            "ab👨‍👩‍👧‍👦cd".into(),
+            "ab👍🏻cd".into(),
+            "ab🇬🇧🇫🇷cd".into(),
+            // Runs long enough to exercise the scan rather than only its edges.
+            format!("— {}", "field=value;".repeat(200)),
+            format!("{}—{}", "x".repeat(300), "y".repeat(300)),
+            "日".repeat(200),
+            format!("a\u{0301}{}", "z".repeat(500)),
+        ];
+
+        // **The two fixtures the argument turns on must actually be doing work.** Both controls on
+        // `ascii_singleton` happened to fail first on `"a\r\nb"`, which would leave GB9b untested
+        // while looking covered. These assert the awkward clusters exist before anything is compared.
+        let m = CellModel::new();
+        assert_eq!(
+            m.cells("a\r\nb").count(),
+            3,
+            "CR LF is not being treated as one cluster, so GB3 is untested here"
+        );
+        assert_eq!(
+            m.cells("x\u{0605}9y").count(),
+            3,
+            "U+0605 is not absorbing the ASCII after it, so GB9b is untested here"
+        );
+
+        for model in [CellModel::new(), CellModel::revealing()] {
+            for line in &lines {
+                let plain: Vec<Cell> = model.cells(line).collect();
+                let fast: Vec<Cell> = model.walk(line).collect();
+                assert_eq!(
+                    fast, plain,
+                    "the fast walk disagrees on {line:?} (reveal={})",
+                    model.reveal_invisibles
+                );
+            }
         }
     }
 

@@ -21,7 +21,31 @@ irreversible; every item is a normal revert.
    correct: it stops shaping being a function of horizontal scroll position.
 3. Adversarial review of both, then documentation and effort figures.
 
-### ⚠ Assumptions a reviewer should challenge
+### ✅ 1. The cluster walk got cheap, and the last measured gap closed
+
+**Every horizontal case is now vsync-bound.** On the 19.4 KB non-ASCII fixture:
+
+| | Before anchors | With anchors | With the fast walk |
+|---|---|---|---|
+| Vertical paging while scrolled right | 76.44 ms | 44.49 ms | **16.12 ms** |
+| Horizontal scrolling at the line end | 76 ms | 15.91 ms | 16.63 ms |
+| Column 0 | 15.88 ms | 16.24 ms | 15.84 ms |
+
+**The mechanism.** Building a row's anchors is one full walk, and `grapheme_indices` plus a
+`unicode-width` lookup **per cluster** is what it cost — ~19,400 of each per row. But for a log line
+almost every cluster is a single ASCII byte whose answer needs no library call: UAX #29 breaks
+between any two ASCII characters except GB3's `CR × LF`, and every single-ASCII-character cluster is
+one cell wide in **both** cell models. So a byte whose neighbours are both ASCII is emitted directly,
+and only the neighbourhoods of non-ASCII characters go through real segmentation.
+
+**Both neighbours are checked and both controls fire.** Dropping the *following* byte's check breaks
+`CR LF`; dropping the *preceding* byte's breaks GB9b, where a `Prepend` character such as `U+0605`
+absorbs the ASCII after it. Both controls happened to fail first on the same fixture, which would
+have left GB9b looking covered while untested — so the test now asserts up front that both awkward
+clusters really are clusters before it compares anything.
+
+`the_fast_walk_and_the_plain_one_agree` checks the fast walk against `cells` — the canonical one —
+over 22 fixtures under both models, chosen to attack the argument rather than confirm it.
 
 - **That making the walk faster is preferable to precomputing at index time.** The alternative is to
   record column information while indexing, which would make deep columns O(1) but costs memory on
@@ -45,7 +69,7 @@ painter, and `view.rs` uses them for both of the lookups it makes per row per fr
 |---|---|---|
 | **Horizontal scrolling at the line end** | 76 ms | **15.91 ms** — vsync-bound |
 | Vertical paging at column 0 | 15.88 ms | **16.24 ms** — unchanged |
-| Vertical paging *while* scrolled right | 76.44 ms | **44.49 ms** |
+| Vertical paging *while* scrolled right | 76.44 ms | **44.49 ms**, then **16.12 ms** once the walk itself got cheaper — see the overnight entry |
 
 **The middle row is the one that nearly went wrong.** A first version built anchors on every fetch,
 which regressed column-0 paging from 16 ms to **39 ms** — because `byte_span`'s early exit stops
