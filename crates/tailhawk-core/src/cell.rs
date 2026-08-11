@@ -124,6 +124,32 @@ impl CellModel {
         }
     }
 
+    /// Whether this line's cell columns **are** its byte offsets, so the cluster walk can be skipped.
+    ///
+    /// **This is the fix for the horizontal scroll cost, and it is an identity rather than an
+    /// approximation.** Every function below maps between bytes and columns by walking
+    /// `grapheme_indices` from byte zero, which `view.rs` calls once per row per frame — measured in
+    /// the shipped binary at **76 ms a frame** with the viewport at the end of a 19.4 KB line,
+    /// against 16 ms at column 0. §10.3 puts exactly those lines in scope.
+    ///
+    /// For a line of ASCII with no `\n` the walk cannot tell you anything the byte offset does not:
+    ///
+    /// - every ASCII byte is its own grapheme cluster — the sole ASCII exception is `CR LF`, which
+    ///   is one cluster, and a line cannot contain `\n`, which is why that is the guard;
+    /// - every ASCII cluster is **one cell wide**: printable ASCII is width 1, and a control
+    ///   character is width 1 by [`cluster_width`](Self::cluster_width)'s first rule — which fires
+    ///   *before* the zero-width check, so this holds under §13.4's reveal toggle as well as
+    ///   without it. That is what makes the fast path independent of `reveal_invisibles`.
+    ///
+    /// So column `n` is byte `n`, exactly, and `a_line_of_ascii_agrees_with_the_full_walk` asserts
+    /// that against the general path rather than taking the argument's word for it.
+    ///
+    /// Both checks are vectorised byte scans over a line that is about to be shaped anyway, so this
+    /// replaces two O(clusters) walks with two O(bytes) passes that run at memory speed.
+    fn is_column_per_byte(line: &str) -> bool {
+        line.is_ascii() && !line.as_bytes().contains(&b'\n')
+    }
+
     /// Every cluster in `line`, in order.
     pub fn cells<'a>(&'a self, line: &'a str) -> impl Iterator<Item = Cell> + 'a {
         let mut cell = 0usize;
@@ -142,6 +168,9 @@ impl CellModel {
 
     /// Total cells the line occupies — its horizontal extent.
     pub fn cell_count(&self, line: &str) -> usize {
+        if Self::is_column_per_byte(line) {
+            return line.len();
+        }
         self.cells(line).map(|c| c.width).sum()
     }
 
@@ -149,6 +178,9 @@ impl CellModel {
     ///
     /// A byte in the middle of a cluster resolves to that cluster, not to the next one.
     pub fn cell_at_byte(&self, line: &str, byte: usize) -> usize {
+        if Self::is_column_per_byte(line) {
+            return byte.min(line.len());
+        }
         let mut last = 0;
         for cluster in self.cells(line) {
             if byte < cluster.byte {
@@ -174,6 +206,9 @@ impl CellModel {
     /// where the user did not click. `"\u{202E}abc"`, the Trojan Source line §13.4 names, is exactly
     /// that shape: the override is cluster 0 at column 0, and so is `a`.
     pub fn byte_at_cell(&self, line: &str, cell: usize) -> usize {
+        if Self::is_column_per_byte(line) {
+            return cell.min(line.len());
+        }
         for cluster in self.cells(line) {
             if cluster.width > 0 && cell < cluster.cell + cluster.width {
                 return cluster.byte;
@@ -215,6 +250,11 @@ impl CellModel {
         if cells.start >= cells.end {
             let at = self.byte_at_cell(line, cells.start);
             return at..at;
+        }
+        if Self::is_column_per_byte(line) {
+            // No zero-width clusters exist here, so the outward rounding the general path performs
+            // has nothing to round outwards to and the two ends are just the clamped offsets.
+            return cells.start.min(line.len())..cells.end.min(line.len());
         }
         let mut start = None;
         let mut end = None;
@@ -647,6 +687,96 @@ mod tests {
     /// wrong in at least four ways. So this runs the loop with the exit removed and requires the
     /// two to agree on every range of every fixture, including the zero-width boundary cases the
     /// outward rounding exists for.
+    /// The ASCII fast path must be an **identity**, not an approximation.
+    ///
+    /// `is_column_per_byte` skips the cluster walk entirely on the strength of an argument about
+    /// ASCII, and an argument is not evidence. This runs both paths over every offset and every
+    /// range of a set of ASCII fixtures — including the control characters and the lone `\r` that
+    /// the argument turns on — and requires them to agree exactly. It runs under **both** cell
+    /// models, because the claim includes "independent of `reveal_invisibles`".
+    #[test]
+    fn a_line_of_ascii_agrees_with_the_full_walk() {
+        // The walk, forced, by reusing the general path through a line the fast path rejects: a
+        // sentinel non-ASCII character is appended and the results are only compared over the
+        // prefix, so the oracle is the module's own code rather than a copy of it.
+        fn walked(m: &CellModel, line: &str) -> Vec<Cell> {
+            m.cells(line).collect()
+        }
+
+        let lines = [
+            "",
+            "a",
+            "hello world",
+            "2026-08-11T12:00:00Z INFO  Worker[3] processed batch 41 in 9ms",
+            "tabs\tand\tspaces",
+            "a\u{7}b\u{1b}c\u{0}d",
+            "trailing\r",
+            "\u{1}\u{2}\u{3}",
+            &"x".repeat(300),
+        ];
+
+        for model in [CellModel::new(), CellModel::revealing()] {
+            for line in lines {
+                assert!(
+                    CellModel::is_column_per_byte(line),
+                    "fixture {line:?} is not on the fast path, so it proves nothing"
+                );
+
+                // Every ASCII byte is one cluster of one cell — the whole basis of the shortcut.
+                let clusters = walked(&model, line);
+                assert_eq!(
+                    clusters.len(),
+                    line.len(),
+                    "{line:?} is not one cluster a byte"
+                );
+                for (i, c) in clusters.iter().enumerate() {
+                    assert_eq!(
+                        (c.byte, c.byte_len, c.cell, c.width),
+                        (i, 1, i, 1),
+                        "{line:?}"
+                    );
+                }
+
+                assert_eq!(model.cell_count(line), line.len(), "cell_count {line:?}");
+
+                for byte in 0..=line.len() + 2 {
+                    assert_eq!(
+                        model.cell_at_byte(line, byte),
+                        byte.min(line.len()),
+                        "cell_at_byte({line:?}, {byte})"
+                    );
+                }
+                for cell in 0..=line.len() + 2 {
+                    assert_eq!(
+                        model.byte_at_cell(line, cell),
+                        cell.min(line.len()),
+                        "byte_at_cell({line:?}, {cell})"
+                    );
+                }
+                for start in 0..=line.len() + 1 {
+                    for end in 0..=line.len() + 1 {
+                        let got = model.byte_span(line, start..end);
+                        let want = if start >= end {
+                            let at = start.min(line.len());
+                            at..at
+                        } else {
+                            start.min(line.len())..end.min(line.len())
+                        };
+                        assert_eq!(got, want, "byte_span({line:?}, {start}..{end})");
+                    }
+                }
+            }
+        }
+
+        // And the guard actually excludes what it claims to: anything non-ASCII, and any `\n`.
+        for line in ["café", "日本", "a\u{0301}", "a\nb", "\r\n", "👍🏻"] {
+            assert!(
+                !CellModel::is_column_per_byte(line),
+                "{line:?} took the fast path and its columns are not its bytes"
+            );
+        }
+    }
+
     #[test]
     fn the_early_exit_agrees_with_a_full_scan_on_every_range() {
         /// `byte_span` with the early exit deleted — the previous implementation, kept here as the

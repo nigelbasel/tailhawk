@@ -1,5 +1,82 @@
 # Handoff — resume here
 
+## ✅ The horizontal scroll cost, measured in the shipped binary and half fixed — 2026-08-11, session 15
+
+The residual layout cost had been an *estimate* since the adversarial review. It is now a
+measurement, taken on the real binary against a 10,000-line corpus of **19.4 KB lines** — §10.3's
+supported inline size, the shape it calls klogg "deadly" on.
+
+| Fixture, viewport at the end of the line | Before | After |
+|---|---|---|
+| 19.4 KB **ASCII** lines | **75.96 ms** | **16.17 ms** — vsync-bound |
+| The same lines with **one non-ASCII character** at the start | 75.96 ms | **76.44 ms** — unchanged |
+| Either, at column 0 | ~16 ms | ~16 ms |
+
+Column 0 was always fine and returning to it always recovers, so the cost tracks the offset exactly
+as predicted. **4.7× over budget at 13 fps, and it is now 60 fps — for ASCII.**
+
+**The fix is an identity, not a heuristic.** For a line of ASCII containing no `\n`, column *n* **is**
+byte *n*: every ASCII byte is its own grapheme cluster (`CR LF` is the only ASCII exception and a
+line cannot hold `\n`), and every ASCII cluster is one cell — printable by width, control by
+`cluster_width`'s first rule, which fires *before* the zero-width check and so holds under §13.4's
+reveal toggle too. `cell_at_byte`, `byte_at_cell`, `byte_span` and `cell_count` return the offset
+directly instead of walking. Two vectorised byte scans replace two O(clusters) walks over a line that
+was about to be shaped anyway.
+
+`a_line_of_ascii_agrees_with_the_full_walk` checks that claim against the general path over every
+offset and every range of nine fixtures — controls, a lone `\r`, tabs — under **both** cell models,
+and asserts the guard rejects `café`, `日本`, `a\u{0301}`, `a\nb`, `\r\n` and `👍🏻`.
+
+### ⚠ **One non-ASCII character disqualifies the whole line**, and that is the open half
+
+An em-dash at the start of a 19.4 KB line costs **76 ms a frame** — the fast path is all-or-nothing
+per line, so a log with a customer name, a `—`, or any UTF-8 JSON in a long record gets nothing from
+it. This is not a rounding error on the fix; it is half the problem still standing, and the dogfood
+corpora are exactly the kind of logs that contain non-ASCII.
+
+The general fix is unchanged from what the review named: **a per-row cluster anchor**, the same shape
+as the line index's anchors, one axis over — sample `(byte, cell)` every K clusters when a row is
+fetched, so a lookup is O(K) instead of O(line). It belongs in `Rows`, next to the decoded text it
+would be built from, and it is **not done**.
+
+## ✅ 50M lines, 5.24 GB — M3's headline done-criterion, measured — 2026-08-11, session 15
+
+A real 5,235,180,551-byte corpus of **50,000,001 lines** was built and opened, with a unique
+`FINAL-LINE-MARKER` on the last line so "did it reach the end" is a fact rather than an impression.
+
+| | Measured | `SPEC.md` §11's budget |
+|---|---|---|
+| Index build | **2.35 s** (2.2 GB/s) | — |
+| Working set after indexing | **43 MB** | line index ~6.3 MB + device 30–60 MB |
+| Working set after scrolling | **77–82 MB** | + atlas 4–16 MB |
+| Page-down, 48-row window | **16.58 ms** | 16.67 ms frame budget |
+| Page-down, 119-row window | **16.74 ms** | " |
+| `Ctrl+End` | lands on `FINAL-LINE-MARKER`, line 50,000,000 | — |
+
+**The frame numbers are vsync, not our cost, and the second row is what proves it.** 16.58 ms is
+suspiciously close to a 60 Hz vblank and `present` uses vsync, so the figure alone proves nothing.
+Widening the window to **119 rows — 2.5× the rows fetched, decoded and shaped per frame — moved it by
+1%**. Work that scales 2.5× for 1% more time is not the thing being measured. The per-frame CPU cost
+is under a vblank at 50M lines and this test cannot resolve it further without disabling vsync.
+
+**Memory lands inside the envelope §11 predicted**, which is worth saying because that table was
+written before any of this existed: 43 MB total against a budget that allots 30–60 MB to the D3D11
+device alone. The sparse index really is ~0.125 B/line.
+
+### ⚠ Three things this does *not* show
+
+- **The index time is a warm-cache number.** The file was written immediately before the run on a
+  machine with 64 GB of RAM, so 5.24 GB was in the page cache. 2.2 GB/s is therefore a floor on the
+  work, not a disk measurement; a genuinely cold open is bounded by the NVMe instead. Indexing is
+  parallel across cores, so it may well be CPU-bound on the newline scan either way — but that is a
+  guess and is not measured.
+- **Horizontal scrolling was never exercised.** The fixture's lines are ~104 characters, so the
+  viewport never left column 0. **The residual layout cost is linear in the *horizontal* offset**,
+  which means this run says nothing about it. Vertical scrolling through 50M lines is fine; scrolling
+  right into a 32 KB line is the untested path and is still an open M3 item.
+- **One encoding, one shape of line.** ASCII-range UTF-8, uniform width, no CJK, no RTL, no
+  combining marks, no 32 KB records.
+
 ## ✅ Per-monitor DPI — M3's second done-criterion — 2026-08-11, session 15
 
 `SPEC.md` §3.1 requires per-monitor-V2, all layout metrics recomputed on `WM_DPICHANGED`, the glyph
@@ -45,7 +122,7 @@ compliance, and it stops being equivalent the moment anything creates a window b
 |---|---|
 | No `f32` accumulation anywhere in scroll state | **Done** — `(u64, f32)`, tested at 10⁸ rows |
 | Drag between 100% and 150% monitors with no drift | **Done** — the mechanism is verified; an actual two-monitor drag has not been performed, and this machine has no scaled monitor to do it on |
-| Scroll a 50M-line file smoothly | **Partial** — scrolling works and is verified to 200k lines; nothing has been run at 50M, and the horizontal layout cost is still linear in the scroll offset |
+| Scroll a 50M-line file smoothly | **Vertically yes** — 50M lines / 5.24 GB, vsync-bound at 119 rows a frame, 43 MB resident, `Ctrl+End` exact. **Horizontally, only for ASCII** — 19.4 KB ASCII lines are vsync-bound; the same lines with one non-ASCII character cost 76 ms a frame |
 | The CJK/RTL/emoji fixture renders correctly | **No** — RTL column placement is unimplemented and disclosed through `Laid::rtl_runs` |
 
 ## ✅ It scrolls — wheel and keyboard navigation — 2026-08-07, session 15
@@ -2376,6 +2453,8 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **A regression guard must assert a ratio, never a duration.** The first cost guard for the text pass asserted "under a second", measured 0.21 s alone, 0.60 s under full-suite load and 2.76–7.49 s in repeats — a flake that also made my "two orders of magnitude of headroom" claim wrong. This machine's ~40% background load is the thing `experiments/g3-d3d11` spent two sessions establishing; a duration threshold encodes the idle machine that never exists. Compare two arms **interleaved** and assert their ratio: `the_layout_cost_does_not_scale_…` runs 240 vs 24 columns five times alternating, compares medians, and its control fires at **12.9x** against a 3.0 threshold — a margin load cannot manufacture. | `crates/tailhawk-core/src/paint.rs` |
 | **D3D11's context is global, and a pass that does not set a state inherits the last one's.** `TextPipeline::draw` binds a dual-source blend state and does not restore it; `draw_background` set none at all. Frame 1 therefore got the default and was correct, and **every frame after it rendered the background pure black** — the background shader emits one output, so blending it against an undefined second source collapses to zero. At RGB(18,20,23) against RGB(0,0,0) this is invisible to the eye, and it was M0 code that had been right for fifteen sessions because nothing else had ever set a blend state. **Found by dogfooding a real file, not by any test.** Every pass must declare the states it depends on. | `crates/tailhawk-core/src/gpu.rs` |
 | **`InvalidateRect` during `WM_PAINT` does nothing** — the handler calls `ValidateRect` after `paint` returns, which clears exactly the region just invalidated. A frame that needs a successor has to raise a flag and let the handler invalidate *after* validating. The symptom is a window that renders its cold first frame and then freezes: with §3.2's rasterise-after-present, that is a full screen of placeholder boxes and no text, which reads as a layout bug rather than a missing repaint. | `crates/tailhawk/src/main.rs` |
+| **The ASCII fast path in `cell.rs` is all-or-nothing per line, and one character decides it.** A single `—` at the start of a 19.4 KB record puts the whole line back on the O(clusters) walk: 16 ms a frame becomes 76 ms. Anyone measuring the horizontal cost must test a **non-ASCII** fixture, because an ASCII one now says everything is fine. The fixtures are `wide.log` and `widenonascii.log` — identical but for the first character. | `crates/tailhawk-core/src/cell.rs` |
+| **A `navigate` that moves nothing shows up as ~0.07 ms a frame, not as a fast frame.** A benchmark that page-downs past the end of its fixture measures the repaint suppression working, not the renderer — a 2,000-line fixture with 60 page-downs of 47 rows exhausts itself a third of the way in and reports absurdly good numbers. Size the fixture to the sweep. | `crates/tailhawk/src/main.rs` |
 | **A correctly-painted window and a dead one are indistinguishable at this palette.** `BACKGROUND` is RGB(18, 20, 23), so an M1 window that is working perfectly looks like an empty frame — the owner reasonably reported seeing nothing. **Do not debug this by looking.** Screenshot the client area and assert the pixels equal `background_rgb8()`; that distinguishes "painting correctly" from "not painting" in one step. | `crates/tailhawk-core/src/lib.rs` |
 
 ---
