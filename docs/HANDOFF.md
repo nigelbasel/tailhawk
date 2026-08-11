@@ -1,5 +1,37 @@
 # Handoff — resume here
 
+## 🌙 Overnight session, 2026-08-11 → 12 — **decisions taken without you, for review**
+
+The owner left the session running and asked for assumptions and decisions to be written down rather
+than presented as finished work. Everything in this block is a judgement call made **without
+confirmation**, and each says what would have to be true for it to be wrong. Read this before the
+entries below it.
+
+**Everything is committed to `master` in small steps, tests green at each.** Nothing here is
+irreversible; every item is a normal revert.
+
+### The plan, and why this order
+
+1. **Make the cluster walk cheap for mostly-ASCII lines.** This is the last *measured* gap: vertical
+   paging while scrolled right costs ~44 ms. Caching anchors by row number — the fix named in the
+   previous entry — **would not have worked**, and noticing that is the first decision of the night:
+   a page-down shows 48 rows never seen before, so there is nothing to hit in a cache. The
+   irreducible cost is one walk per new row, so the walk itself has to get cheaper.
+2. **Cache resolved bidi levels per row.** The smallest honest step toward RTL, and independently
+   correct: it stops shaping being a function of horizontal scroll position.
+3. Adversarial review of both, then documentation and effort figures.
+
+### ⚠ Assumptions a reviewer should challenge
+
+- **That making the walk faster is preferable to precomputing at index time.** The alternative is to
+  record column information while indexing, which would make deep columns O(1) but costs memory on
+  every line of a 50M-line file for a case most files never hit. Rejected on that basis, not
+  measured against.
+- **That RTL's design decision stands as recommended** — logical `Position`, a per-row bidi map used
+  only by paint and hit-test. That was put to the owner and the reply was "go ahead with your
+  recommendations", which was in the context of the 50M run rather than an explicit ruling on RTL.
+  **Step 2 is deliberately chosen to be useful under either answer** and commits to nothing.
+
 ## ✅ Column anchors — the non-ASCII half of the horizontal cost — 2026-08-11, session 15
 
 `ColumnAnchors` is `SPEC.md` §5.3's sparse line index transposed one axis over: sample `(byte, cell)`
