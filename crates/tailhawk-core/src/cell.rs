@@ -363,17 +363,37 @@ impl CellModel {
     /// `the_fast_walk_and_the_plain_one_agree` is the differential test, and it is the only reason
     /// to believe any of this: hand-written rules about text in this module have a history of being
     /// wrong in four ways at once.
-    fn walk<'a>(&'a self, line: &'a str) -> impl Iterator<Item = Cell> + 'a {
+    fn walk<'a>(&'a self, line: &'a str) -> Box<dyn Iterator<Item = Cell> + 'a> {
+        // **Chosen per line, because the fast path is a bet that most clusters are ASCII.**
+        //
+        // When that bet loses it loses twice: an adversarial review measured the fallback on a line
+        // with no ASCII singleton anywhere — all-CJK, or any non-ASCII/ASCII alternation, where
+        // every ASCII byte has a non-ASCII neighbour — at **26% slower than the plain walk**, and
+        // fixing the memory half of that left it still 18% slower, because segmenting one cluster
+        // at a time builds a fresh iterator per cluster where `cells` carries one cursor. There is
+        // no per-byte repair for that; the decision has to be made before starting.
+        //
+        // Counting the non-ASCII bytes is a vectorised scan — ~0.3 ms against a 68 ms walk on 3 MB,
+        // so the probe is free at the scale where the answer matters. A quarter is a threshold
+        // rather than a measurement: a cluster is a singleton only if **both** neighbours are ASCII,
+        // so the singleton count collapses well before the byte count does, and the two shapes this
+        // has to separate — a log line with one `—` in it, and CJK interleaved with ASCII — sit at
+        // opposite ends of it.
+        let bytes = line.as_bytes();
+        let non_ascii = bytes.iter().filter(|b| **b >= 0x80).count();
+        if non_ascii * 4 > bytes.len() {
+            return Box::new(self.cells(line));
+        }
+        Box::new(self.walk_ascii_first(line))
+    }
+
+    /// [`walk`](Self::walk)'s fast path, for a line that is predominantly ASCII.
+    fn walk_ascii_first<'a>(&'a self, line: &'a str) -> impl Iterator<Item = Cell> + 'a {
         let bytes = line.as_bytes();
         let mut p = 0usize;
         let mut cell = 0usize;
-        // Clusters produced by one fallback segmentation, drained before the scan resumes.
-        let mut pending: std::vec::IntoIter<Cell> = Vec::new().into_iter();
 
         std::iter::from_fn(move || {
-            if let Some(c) = pending.next() {
-                return Some(c);
-            }
             if p >= bytes.len() {
                 return None;
             }
@@ -388,19 +408,31 @@ impl CellModel {
                 cell += 1;
                 return Some(placed);
             }
-            // Not a singleton: segment properly up to the next one, which is a known boundary.
-            let mut end = p + 1;
-            while end < bytes.len() && !Self::ascii_singleton(bytes, end) {
-                end += 1;
-            }
-            let mut batch = Vec::new();
-            for c in self.cells_from(&line[..end], p, cell) {
-                cell = c.cell + c.width;
-                batch.push(c);
-            }
-            p = end;
-            pending = batch.into_iter();
-            pending.next()
+            // **One cluster, segmented where it starts** — `p` is always a cluster boundary, so the
+            // first grapheme of `line[p..]` is the right one and nothing before `p` can change it.
+            //
+            // An earlier version segmented ahead to the next singleton and buffered the whole span
+            // into a `Vec`. An adversarial review measured what that cost on a line with no
+            // singleton anywhere — all-CJK, or any non-ASCII/ASCII alternation — where the span is
+            // the entire line: **~10–16× the line's bytes held transiently, and 26% slower than the
+            // plain walk it replaced** (67.2 ms against 53.2 ms on 3 MB). That is a pure regression
+            // on exactly the shape §10.3 names as the one klogg hangs "deadly" on. The batching was
+            // never needed: taking one cluster at a time is O(1) in memory and leaves the fast path
+            // untouched.
+            let cluster = line[p..]
+                .graphemes(true)
+                .next()
+                .expect("p is inside the line");
+            let width = self.cluster_width(cluster);
+            let placed = Cell {
+                byte: p,
+                byte_len: cluster.len(),
+                cell,
+                width,
+            };
+            p += cluster.len();
+            cell += width;
+            Some(placed)
         })
     }
 
@@ -634,35 +666,75 @@ mod tests {
         CellModel::new().cell_count(text)
     }
 
+    /// **Every ASCII character is one cell, in both models — all 128, not a sample.**
+    ///
+    /// This is the load-bearing half of the fast walk's argument: `ascii_singleton` emits width 1
+    /// without consulting `cluster_width` at all, so a single ASCII character measuring anything
+    /// else would make the two walks disagree silently and only for that byte. Printable ASCII is
+    /// obvious; the ones worth enumerating are `NUL`, `DEL` and the C0 controls, which reach width 1
+    /// through `cluster_width`'s **first** rule — and that rule fires before the zero-width branch,
+    /// which is what makes the claim hold under §13.4's reveal toggle too.
+    ///
+    /// Written by an adversarial reviewer as a throwaway probe and kept, because it establishes by
+    /// enumeration what the surrounding argument merely asserts.
     #[test]
-    fn zz_ascii_cluster_width_table() {
+    fn every_ascii_character_is_one_cell_in_both_models() {
         for b in 0u8..=0x7f {
-            let c = b as char;
-            let s = c.to_string();
-            let plain = CellModel::new().cluster_width(&s);
-            let rev = CellModel::revealing().cluster_width(&s);
-            if plain != 1 || rev != 1 {
-                println!(
-                    "ASCII {b:#04x} char_width={:?} str_width={} plain={plain} reveal={rev}",
-                    c.width(),
-                    s.width()
-                );
-            }
+            let s = (b as char).to_string();
+            assert_eq!(
+                (
+                    CellModel::new().cluster_width(&s),
+                    CellModel::revealing().cluster_width(&s)
+                ),
+                (1, 1),
+                "ASCII {b:#04x} is not one cell in both models"
+            );
         }
     }
 
+    /// **The fast walk against the plain one, over every short string a hostile alphabet builds.**
+    ///
+    /// `the_fast_walk_and_the_plain_one_agree` uses fixtures chosen by hand to attack the argument,
+    /// which is only ever as good as the imagination behind them. This enumerates instead: all
+    /// three- and four-character strings over 22 characters picked to break grapheme segmentation —
+    /// `NUL`, `CR`, `LF`, `TAB`, `DEL`, `ESC`, a combining mark, a `Prepend`, ZWSP, ZWJ, VS16, a
+    /// wide CJK character, a regional indicator, an emoji and a skin-tone modifier, Devanagari
+    /// spacing and virama marks, and a fullwidth Latin letter. **244,904 strings against both cell
+    /// models**, in about 1.5 s.
+    ///
+    /// Also written by an adversarial reviewer as a throwaway and kept: it is a stronger check than
+    /// the hand-picked one and costs almost nothing to run.
     #[test]
-    fn zz_brute_force_differential() {
+    fn the_fast_walk_agrees_on_every_short_hostile_combination() {
         let alphabet: Vec<char> = vec![
-            '\u{0}', '\r', '\n', '\t', 'a', ' ', '\u{7f}', '\u{1b}', '\u{e9}', '\u{301}',
-            '\u{605}', '\u{200b}', '\u{200d}', '\u{fe0f}', '日', '\u{1F1EC}', '\u{1F44D}',
-            '\u{1F3FB}', '\u{903}', '\u{94d}', 'क', '\u{ff21}',
+            '\u{0}',
+            '\r',
+            '\n',
+            '\t',
+            'a',
+            ' ',
+            '\u{7f}',
+            '\u{1b}',
+            '\u{e9}',
+            '\u{301}',
+            '\u{605}',
+            '\u{200b}',
+            '\u{200d}',
+            '\u{fe0f}',
+            '日',
+            '\u{1F1EC}',
+            '\u{1F44D}',
+            '\u{1F3FB}',
+            '\u{903}',
+            '\u{94d}',
+            'क',
+            '\u{ff21}',
         ];
         let models = [CellModel::new(), CellModel::revealing()];
         let mut failures: Vec<String> = Vec::new();
         let n = alphabet.len();
 
-        let mut check = |s: &str, failures: &mut Vec<String>| {
+        let check = |s: &str, failures: &mut Vec<String>| {
             for m in &models {
                 let plain: Vec<Cell> = m.cells(s).collect();
                 let fast: Vec<Cell> = m.walk(s).collect();

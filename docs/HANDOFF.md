@@ -55,6 +55,43 @@ and 2.55 s previously, and page-down 17.35 ms against 16.74 ms; **the adversaria
 fifteen agents building concurrently**, so that drift is the machine and not the change. Recorded
 rather than quietly reporting the better earlier figures.
 
+### ⚠ 1b. The review found the fast walk was a **regression** on non-ASCII lines, and it was right
+
+A 12-agent adversarial review returned **one confirmed finding**, and it is the useful kind: the
+verifier measured rather than argued.
+
+The fallback branch buffered every cluster of a span into a `Vec` before yielding any, and on a line
+with **no ASCII singleton anywhere** — all-CJK, or any non-ASCII/ASCII alternation where every ASCII
+byte has a non-ASCII neighbour — that span is the whole line. Measured on 3 MB: ~10–16× the line's
+bytes held transiently, and **26% slower than the plain walk it replaced** (67.2 ms against 53.2 ms).
+A pure regression, time and memory, on exactly the shape §10.3 names as the one klogg hangs "deadly"
+on.
+
+**Fixing the memory half was not enough, which is the part worth knowing.** Dropping the `Vec` and
+segmenting one cluster at a time made it O(1) in memory and *still* 18% slower — building a fresh
+grapheme iterator per cluster costs more than the single cursor `cells` carries. There is no
+per-byte repair; the choice has to be made before the walk starts.
+
+So `walk` now decides **per line**: a vectorised count of non-ASCII bytes, and anything above a
+quarter goes to the plain `cells`. The threshold is a threshold, not a measurement — a cluster is a
+singleton only if *both* neighbours are ASCII, so singletons collapse well before the byte count
+does, and the two shapes it must separate sit at opposite ends of it.
+
+| 3 MB unless noted | `cells()` | `walk()` |
+|---|---|---|
+| all-CJK | 50.9 ms | 53.3 ms — delegates |
+| CJK/ASCII alternating | 48.9 ms | 48.0 ms — delegates |
+| ASCII | 119.7 ms | **9.7 ms** |
+| mostly ASCII | 118.9 ms | **20.9 ms** |
+| **19.4 KB real log line** | 794 µs | **62.7 µs** |
+
+**Two of the reviewer's throwaway probes were kept**, renamed and documented, because they are
+stronger than what they were checking:
+`every_ascii_character_is_one_cell_in_both_models` enumerates all 128 rather than sampling, and
+`the_fast_walk_agrees_on_every_short_hostile_combination` runs **244,904 strings** over a
+segmentation-hostile alphabet against both models. One `git add -A` swept them into an unrelated
+commit while the workflow was still running — a process failure now in the traps table.
+
 ### ⛔ 2. RTL was **not** attempted, and that is the night's main judgement call
 
 The plan above had "cache resolved bidi levels per row" next. On looking at what it is *for* I
