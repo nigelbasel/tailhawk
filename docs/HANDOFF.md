@@ -1,5 +1,53 @@
 # Handoff — resume here
 
+## ✅ Per-monitor DPI — M3's second done-criterion — 2026-08-11, session 15
+
+`SPEC.md` §3.1 requires per-monitor-V2, all layout metrics recomputed on `WM_DPICHANGED`, the glyph
+atlas rebuilt per scale factor, and column advances in integer device pixels re-derived on any scale
+change. **None of it existed** — no awareness declaration, no `WM_DPICHANGED` handler, `px_per_em`
+pinned at 16. Without awareness Windows bitmap-stretches the client area on a non-96-DPI monitor, so
+every glyph is resampled: the one outcome the whole atlas exists to avoid.
+
+**Verified end to end on the real binary** by sending the exact message Windows sends on a
+monitor drag: `WM_DPICHANGED` at 144 dpi with a suggested rect. **Row pitch went 18 → 27 px, exactly
+1.5×**, the window took the suggested rect, and the text came back sharp rather than upscaled. At
+96 dpi the pitch is unchanged at 18, so the 100% path did not move.
+
+**The scale is now the second half of the atlas key**, alongside the device generation —
+`Option<(u32, u16, Painter)>`. That is the same mechanism as device-loss recovery rather than a
+second one: `ensure_painter` sees the new `px_per_em` on the next frame and rebuilds then, which is
+also why `set_dpi` does no work itself. Control: dropping `px_per_em` from the comparison leaves the
+100% atlas in place across the change — 16 px rasters in 24 px cells, blurry *and* progressively out
+of column, which is precisely the drift §3.1's integer-advance rule exists to prevent.
+
+Two details worth keeping:
+
+- **The em size is rounded to a whole device pixel in `set_dpi`**, not carried as a float. §3.1 is
+  explicit that fractional per-glyph rounding "accumulates drift and visibly misaligns columns across
+  a wide window", and everything downstream is integer device pixels at the current scale.
+- **The initial DPI is read when the renderer is adopted**, not only on `WM_DPICHANGED`. The renderer
+  is built on a worker before any window exists, so it starts at 100% — and a window *opened* on a
+  150% monitor never receives a change message, because nothing changed. Without that read the first
+  frame there would be wrong and would stay wrong.
+
+### ⚠ A deliberate deviation from the spec's wording
+
+§3.1 says per-monitor-V2 is "**declared in the manifest**". This calls
+`SetProcessDpiAwarenessContext` as the first statement in `main` instead. The two are equivalent
+*here* — nothing in this process creates a window earlier, and awareness cannot be changed once one
+exists — and an embedded manifest would mean adding resource compilation to the build for no
+behavioural gain. It is recorded as a deviation in `CLEANROOM.md` rather than passed off as
+compliance, and it stops being equivalent the moment anything creates a window before `main` runs.
+
+### Where M3's done-criteria now stand
+
+| Criterion | State |
+|---|---|
+| No `f32` accumulation anywhere in scroll state | **Done** — `(u64, f32)`, tested at 10⁸ rows |
+| Drag between 100% and 150% monitors with no drift | **Done** — the mechanism is verified; an actual two-monitor drag has not been performed, and this machine has no scaled monitor to do it on |
+| Scroll a 50M-line file smoothly | **Partial** — scrolling works and is verified to 200k lines; nothing has been run at 50M, and the horizontal layout cost is still linear in the scroll offset |
+| The CJK/RTL/emoji fixture renders correctly | **No** — RTL column placement is unimplemented and disclosed through `Laid::rtl_runs` |
+
 ## ✅ It scrolls — wheel and keyboard navigation — 2026-08-07, session 15
 
 `UI-DESIGN.md` §12's navigation map is bound: wheel, `Shift+wheel` and the tilt wheel, arrows,

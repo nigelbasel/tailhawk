@@ -110,8 +110,8 @@ pub const fn background_rgb8() -> (u8, u8, u8) {
 /// *look* and not the correctness.
 pub const DEFAULT_FONTS: &[&str] = &["Cascadia Mono", "Consolas", "Courier New", "Segoe UI"];
 
-/// Provisional. §3.1 requires this to be re-derived per monitor from the DPI, which needs the
-/// window's monitor and is the shell's to supply; until then the grid is built at 100%.
+/// The em size at 100%, in device pixels. [`Renderer::set_dpi`] scales it per monitor, so this is
+/// the value at the Win32 unit-DPI baseline of 96 and not a fixed size.
 pub const DEFAULT_PX_PER_EM: u16 = 16;
 
 /// The grid's foreground. Provisional alongside [`BACKGROUND`] — `UI-DESIGN.md` §10 pins no hex.
@@ -132,14 +132,20 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Builds the text resources if the slot is empty or was built for a **different device**, and
-/// hands back whatever is now current.
+/// Builds the text resources if the slot is empty or was built for a **different device or a
+/// different scale**, and hands back whatever is now current.
 ///
-/// The staleness test is a generation comparison rather than a flag, because a flag has to be
-/// remembered at every site that could invalidate it and a comparison cannot be forgotten. The cost
-/// of getting it wrong is not an error: a `Sheet` from a released device draws **nothing**, so a
+/// The staleness test is a comparison rather than a flag, because a flag has to be remembered at
+/// every site that could invalidate it and a comparison cannot be forgotten. The cost of getting the
+/// *device* half wrong is not an error: a `Sheet` from a released device draws **nothing**, so a
 /// renderer that recovered from device loss would return `Ok` for ever while the screen stayed
 /// blank — the outcome `SPEC.md` §3.2's recovery exists to prevent.
+///
+/// **The scale is the second half of the key, and §3.1 requires it.** The atlas holds glyphs
+/// rasterised at one `px_per_em`; §3.2 keys it on `(glyph id, style, dpi scale)` and §3.1 says it is
+/// "rebuilt per scale factor". Dragging a window from a 100% to a 150% monitor without rebuilding
+/// would draw 16 px rasters into 24 px cells — text that is both blurry and out of column, which is
+/// the exact drift §3.1's integer-advance rule exists to prevent.
 ///
 /// Taking the device rather than the `Gpu` is what lets the **in-frame** caller use it: during
 /// `render_frame_with` the `Gpu` is mutably borrowed and cannot lend its device out, but the draw
@@ -150,20 +156,20 @@ fn ensure_painter<'a>(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     generation: u32,
-    slot: &'a mut Option<(u32, paint::Painter)>,
+    slot: &'a mut Option<(u32, u16, paint::Painter)>,
     candidates: &[String],
     px_per_em: u16,
 ) -> Result<&'a mut paint::Painter> {
-    if !matches!(slot, Some((built_for, _)) if *built_for == generation) {
+    if !matches!(slot, Some((g, px, _)) if *g == generation && *px == px_per_em) {
         // Released before the replacement is asked for, so a driver mid-reset is not holding two
         // atlases at once.
         *slot = None;
         let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let mut fresh = paint::Painter::new(device, &names, px_per_em)?;
         fresh.prime(context);
-        *slot = Some((generation, fresh));
+        *slot = Some((generation, px_per_em, fresh));
     }
-    Ok(&mut slot.as_mut().expect("just built").1)
+    Ok(&mut slot.as_mut().expect("just built").2)
 }
 
 /// The renderer the shell drives.
@@ -182,7 +188,10 @@ pub struct Renderer {
     /// produces **nothing**, which is the exact failure §3.2's recovery exists to prevent and the
     /// hardest kind to notice. Storing the generation alongside makes staleness a comparison that
     /// [`ensure_painter`] cannot skip.
-    painter: Option<(u32, paint::Painter)>,
+    ///
+    /// The `u16` is the `px_per_em` it was rasterised at — the second half of the key, per §3.1's
+    /// "the glyph atlas is rebuilt per scale factor".
+    painter: Option<(u32, u16, paint::Painter)>,
     font_candidates: Vec<String>,
     px_per_em: u16,
 }
@@ -201,6 +210,34 @@ impl Renderer {
             font_candidates: DEFAULT_FONTS.iter().map(|s| (*s).to_owned()).collect(),
             px_per_em: DEFAULT_PX_PER_EM,
         })
+    }
+
+    /// Sets the scale from a monitor DPI, and returns whether it changed.
+    ///
+    /// **This is the whole of §3.1's "re-derived on any scale change".** The em size is rounded to a
+    /// whole device pixel here rather than carried as a float, because everything downstream —
+    /// rasterisation, the cell box, the column advance — is integer device pixels at the current
+    /// scale, and §3.1 is explicit that fractional per-glyph rounding "accumulates drift and visibly
+    /// misaligns columns across a wide window".
+    ///
+    /// A changed scale does **not** rebuild anything here. It cannot: the rebuild needs a device,
+    /// and at a `WM_DPICHANGED` the caller is usually about to resize too. [`ensure_painter`] sees
+    /// the new value on the next frame and rebuilds the atlas then, which is also what keeps the
+    /// device-loss and scale-change paths from being two mechanisms.
+    pub fn set_dpi(&mut self, dpi: u32) -> bool {
+        // 96 is the Win32 unit-DPI baseline, so `dpi / 96` is the scale factor.
+        let scaled = (f64::from(DEFAULT_PX_PER_EM) * f64::from(dpi.max(1)) / 96.0).round();
+        // A face is unusable below a pixel or two, and DirectWrite is entitled to refuse absurd
+        // sizes; clamping keeps a hostile or bogus DPI from turning a scale change into an error.
+        let px = scaled.clamp(6.0, 400.0) as u16;
+        let changed = px != self.px_per_em;
+        self.px_per_em = px;
+        changed
+    }
+
+    /// The em size the grid is currently rasterised at, in device pixels.
+    pub fn px_per_em(&self) -> u16 {
+        self.px_per_em
     }
 
     /// The cell the current face measures to, as `(width, height)` in device pixels.
@@ -331,7 +368,7 @@ impl Renderer {
         // present would stall every one of them. Paying it *nowhere* is not the alternative it might
         // look like — the atlas would never fill, so every frame would draw placeholder boxes for
         // ever and `queued` would never fall to zero.
-        if let Some((generation, p)) = painter.as_mut() {
+        if let Some((generation, _, p)) = painter.as_mut() {
             debug_assert_eq!(*generation, gpu.generation());
             let (_, context) = gpu.resources();
             laid.rasterised = p.flush_misses(context)?;
@@ -397,7 +434,7 @@ mod tests {
         assert!(first.quads > 0, "nothing was laid out");
         assert_eq!(r.device_generation(), 1);
         assert_eq!(
-            r.painter.as_ref().map(|(g, _)| *g),
+            r.painter.as_ref().map(|(g, _, _)| *g),
             Some(1),
             "the painter should be keyed to the device that built it"
         );
@@ -409,7 +446,7 @@ mod tests {
 
         assert_eq!(r.device_generation(), 2, "the device was not rebuilt");
         assert_eq!(
-            r.painter.as_ref().map(|(g, _)| *g),
+            r.painter.as_ref().map(|(g, _, _)| *g),
             Some(2),
             "the painter is still keyed to the dead device — its atlas draws nothing and says nothing"
         );
@@ -420,6 +457,55 @@ mod tests {
             after.queued > 0,
             "the recovered frame queued nothing, so the old atlas was probably reused"
         );
+    }
+
+    /// A scale change re-keys the atlas, and the cell grows with it.
+    ///
+    /// §3.1: "the glyph atlas is rebuilt per scale factor" and "column advances are computed in
+    /// integer device pixels at the current scale and **re-derived on any scale change**". Keeping
+    /// the 100% atlas across a drag to a 150% monitor draws 16 px rasters into 24 px cells — blurry
+    /// *and* progressively out of column, which is the drift the integer-advance rule exists to
+    /// prevent. The painter identity is checked directly for the same reason as the device-loss
+    /// test: a stale atlas still draws, so the return value alone cannot tell you.
+    #[cfg(windows)]
+    #[test]
+    fn a_scale_change_rebuilds_the_atlas_and_regrows_the_cell() {
+        let Some((mut r, view)) = renderer_or_skip("a_scale_change_rebuilds_the_atlas") else {
+            return;
+        };
+        let line = |_| Some("the quick brown fox".to_owned());
+
+        assert_eq!(r.px_per_em(), DEFAULT_PX_PER_EM);
+        let at_100 = r.cell().expect("a cell at 100%");
+        r.paint_rows(&view, line).expect("a frame at 100%");
+        assert_eq!(r.painter.as_ref().map(|(_, px, _)| *px), Some(16));
+
+        // 144 dpi is the 150% monitor named in M3's done-criterion.
+        assert!(r.set_dpi(144), "150% should be a scale change");
+        assert_eq!(r.px_per_em(), 24, "16 px at 96 dpi is 24 px at 144");
+
+        let at_150 = r.cell().expect("a cell at 150%");
+        assert!(
+            at_150.0 > at_100.0 && at_150.1 > at_100.1,
+            "the cell did not grow: {at_100:?} then {at_150:?}"
+        );
+        // Integer device pixels, per §3.1 — a fractional advance drifts across a wide window.
+        assert_eq!(at_150.0.fract(), 0.0);
+        assert_eq!(at_150.1.fract(), 0.0);
+
+        r.paint_rows(&view, line).expect("a frame at 150%");
+        assert_eq!(
+            r.painter.as_ref().map(|(_, px, _)| *px),
+            Some(24),
+            "the atlas is still the 100% one, so every glyph is being upscaled into a bigger cell"
+        );
+
+        // Idempotent: the same DPI twice is not a change, so it must not throw the atlas away.
+        assert!(!r.set_dpi(144));
+        // And an absurd DPI is clamped rather than passed to DirectWrite as a face size.
+        assert!(r.set_dpi(1_000_000));
+        assert!(r.px_per_em() <= 400);
+        assert!(r.cell().is_ok(), "a clamped scale still measures");
     }
 
     /// The atlas fills, and it fills *after* the present.

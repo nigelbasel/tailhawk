@@ -27,17 +27,21 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM}
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::MK_SHIFT;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_B, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
     VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer,
-    LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowTextW, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG,
-    SPI_GETWHEELSCROLLLINES, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
-    WINDOW_EX_STYLE, WM_DESTROY, WM_KEYDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE,
-    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    IDC_ARROW, MSG, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_DESTROY, WM_DPICHANGED,
+    WM_KEYDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -208,8 +212,13 @@ impl Shell {
             return;
         };
         match rx.try_recv() {
-            Ok(Ok(renderer)) => {
+            Ok(Ok(mut renderer)) => {
                 self.driver = Some(renderer.driver().name().to_owned());
+                // **The window's monitor, not the system's.** The renderer is built on a worker
+                // before any window exists, so it starts at 100%; a window opened on a 150% monitor
+                // never sees a `WM_DPICHANGED` for it, because nothing changed. Reading the DPI on
+                // adoption is the only thing that makes the *first* frame correct there.
+                renderer.set_dpi(unsafe { GetDpiForWindow(hwnd) });
                 self.renderer = Some(renderer);
                 self.pending = None;
                 self.refresh_title(hwnd);
@@ -341,6 +350,23 @@ impl Shell {
             self.refresh_title(hwnd);
         }
         true
+    }
+
+    /// Takes a new monitor DPI and repaints if the scale actually changed.
+    ///
+    /// **The rebuild is not done here.** `ensure_painter` sees the new `px_per_em` on the next
+    /// frame and replaces the atlas then, which keeps the scale-change and device-loss paths as one
+    /// mechanism rather than two. All this does is record the scale and ask for that frame.
+    fn set_dpi(&mut self, hwnd: HWND, dpi: u32) {
+        let changed = self
+            .renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.set_dpi(dpi));
+        if changed {
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+        }
     }
 
     /// Applies a navigation intent and asks for a frame only if the view moved.
@@ -524,6 +550,34 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
             }
         }
+        WM_DPICHANGED => {
+            // **Both halves are required and they are separate.** `lParam` carries the window rect
+            // Windows wants for the new scale — honouring it is what makes a drag between monitors
+            // land at the right physical size instead of jumping — and the scale itself has to reach
+            // the renderer so the atlas is rebuilt and the cell re-measured (§3.1).
+            let dpi = (wparam.0 & 0xFFFF) as u32;
+            let suggested = lparam.0 as *const RECT;
+            if !suggested.is_null() {
+                let r = unsafe { *suggested };
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.set_dpi(hwnd, dpi);
+                }
+            });
+            LRESULT(0)
+        }
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -533,6 +587,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 }
 
 fn main() -> Result<()> {
+    // **Before anything else, and certainly before any window exists.** `SPEC.md` §3.1 requires
+    // per-monitor-V2; without it Windows bitmap-stretches the client area on a non-96-DPI monitor,
+    // which for a text viewer means every glyph is resampled and blurry — the one thing this whole
+    // atlas exists to avoid. Awareness cannot be changed once a window has been created, so this is
+    // the first statement in the process.
+    //
+    // §3.1 says "declared in the manifest" and this is the API instead: equivalent here because
+    // nothing in this process makes a window earlier, and an embedded manifest would mean adding
+    // resource compilation to the build for no behavioural gain. Recorded as a deviation in
+    // `CLEANROOM.md` rather than passed off as compliance. The result is deliberately ignored — it
+    // fails only if awareness is already set, which is not a reason to refuse to start.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // Device creation starts before the window exists. `experiments/g3-d3d11` measured this
     // ordering as roughly halving time-to-first-pixel, and windows-rs marks the D3D11 interfaces
     // Send, so the renderer crosses the channel directly.
