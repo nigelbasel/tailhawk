@@ -60,11 +60,48 @@ agent time and ~4.8 M output tokens.** That is the number to extrapolate from, a
 multiplier against `PLAN.md` is unknown until a milestone is delivered *complete* rather than to its
 exit criteria.
 
+## 📌 M4 — forecast registered 2026-08-11, **before starting**
+
+Bottom-up, in the same units, so it can be scored rather than remembered generously. Each item is
+sized against a **measured** analogue from the table above rather than from feel.
+
+| Item | Analogue used | Active h | Output tok |
+|---|---|---:|---:|
+| Follow state machine — growth detection, index append, §11.3's per-tick budget | line index, 2026-08-05 | 2.5 | 400 k |
+| Rotation, all three modes, keyed on `FileIdentity` | file source + share modes, 2026-07-31/08-04, **harder** | 3.5 | 550 k |
+| Rolling sets (E30) — a set of files as one stream with scrollback across members | no close analogue; new modelling | 3.0 | 450 k |
+| stdin / pipe ingestion (E16), including the §4.2 spill | line decoder, 2026-08-04 | 2.0 | 300 k |
+| Shell wiring — follow toggle, `⬤ Following` chip, `Rows` cache invalidation | input handling, this session | 1.0 | 150 k |
+| Verification — 50 MB/s × 60 s, a real Serilog rolling fixture, a rotating writer harness | the 50M-line run, this session | 1.5 | 250 k |
+| **Total** | | **13.5** | **2.1 M** |
+
+**This is 3× the naive extrapolation below, and the naive one is wrong.** Scaling the plan's weeks
+linearly gives ~4.5 h, because M0–M3 delivered *exit criteria* in 23 h. M4's criteria are harder to
+satisfy than to implement: "tail through three rotation modes without losing a byte" and "50 MB/s for
+60 s without dropped frames" both need **harnesses that do not exist** — a writer that rotates on
+demand, and a sustained-throughput rig. Roughly a quarter of the estimate is test apparatus.
+
+**Confidence: medium-low.** Named risks, in order:
+
+1. **Rolling sets ripple into the index.** `LineIndex` and `offset_of_line` assume one byte space. A
+   set spanning members either needs a member-aware offset or a virtual concatenation, and that
+   reaches `rows.rs` too. This is the item most likely to double.
+2. **The `Rows` fetch cache is knowingly wrong for following.** Its key is
+   `(first, count, line_count, anchored)`, which cannot see §5.5's copy-truncate — contents changing
+   under a stable line count. I flagged that when I wrote it; M4 must invalidate explicitly.
+3. **50 MB/s may be the first real load on the indexer's append path**, which has only ever been
+   exercised by a batch build.
+4. Corpus A rotates naturally under observation, which is a genuine asset for (1) and an
+   identity-scrubbing hazard for anything written down.
+
+Score this against actuals when M4 lands, and record **why** it was wrong rather than only by how
+much.
+
 ## Forecast, on this evidence
 
 | Milestone | Plan | Naive extrapolation | Confidence |
 |---|---:|---:|---|
-| M4 follow, rotation, stdin | 5 wk | ~4–5 h | Medium — rotation is fiddly and has real corpus risk |
+| M4 follow, rotation, stdin | 5 wk | ~4–5 h — **superseded, too low**; the bottom-up forecast above says **13.5 h** | Medium-low |
 | M5 search, highlight, filter | 10 wk | ~9–10 h | **Low** — regex over 10 GB is a different kind of problem from anything done so far |
 | M6–M9 structure, shell, ship | 41 wk | — | **Very low.** Packaging, signing, accessibility and support have no agent-time analogue in what has been measured |
 
