@@ -60,6 +60,109 @@ pub struct CellModel {
     pub reveal_invisibles: bool,
 }
 
+/// Clusters between sampled anchors. See [`ColumnAnchors`].
+///
+/// 64 to match [`ANCHOR_STRIDE`](crate::index::ANCHOR_STRIDE), because it is the same trade-off one
+/// axis over and there is no reason for the two to disagree. A 32 KB line of two-byte clusters
+/// samples 256 anchors, or 4 KB — against the 32 KB of text it describes.
+pub const COLUMN_ANCHOR_STRIDE: usize = 64;
+
+/// Sampled `(byte, cell)` pairs through one line, so a column lookup does not start from byte zero.
+///
+/// **This is `SPEC.md` §5.3's line index, transposed onto the column axis**, and it is here for the
+/// same reason: the walk it replaces was measured, in the shipped binary, at **76 ms a frame** with
+/// the viewport at the end of a 19.4 KB line containing one non-ASCII character — against a 16.67 ms
+/// budget. `view.rs` asks for a byte span and a starting column once per row per frame, and both
+/// walked `grapheme_indices` from the front of the line.
+///
+/// An anchor is a *hint that is always safe*: every lookup is exact whatever anchors it is given,
+/// including none. [`ColumnAnchors::none`] is a legitimate argument everywhere and only costs speed,
+/// which is what keeps a stale or absent anchor set from ever being a correctness question.
+///
+/// **Not built for a line on the [`is_column_per_byte`](CellModel::is_column_per_byte) fast path**,
+/// because there the mapping is already O(1) and anchors would be pure overhead.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColumnAnchors {
+    /// `(byte, cell)` at cluster 0, `STRIDE`, `2·STRIDE`, … Ascending in both fields, which is what
+    /// makes the binary searches below valid.
+    marks: Vec<(u32, u32)>,
+}
+
+impl ColumnAnchors {
+    /// No anchors — every lookup still exact, just from byte zero.
+    pub const fn none() -> Self {
+        Self { marks: Vec::new() }
+    }
+
+    /// A borrowable empty set, so a caller with nothing to offer can still satisfy a `&ColumnAnchors`
+    /// without allocating or holding one.
+    pub fn none_ref() -> &'static Self {
+        static NONE: ColumnAnchors = ColumnAnchors::none();
+        &NONE
+    }
+
+    /// Samples `line`, or returns [`none`](Self::none) for a line that does not need it.
+    ///
+    /// One walk, done where the row's text is decoded rather than in the frame — which is the whole
+    /// point: `Rows` fetches a row once and paints it many times while the horizontal offset moves.
+    pub fn build(model: &CellModel, line: &str) -> Self {
+        if CellModel::is_column_per_byte(line) || line.len() <= COLUMN_ANCHOR_STRIDE {
+            return Self::none();
+        }
+        Self::build_with_stride(model, line, COLUMN_ANCHOR_STRIDE)
+    }
+
+    /// The sampling itself, with the stride exposed so tests can drive it at 1, 2 and 3 — where
+    /// every cluster is a boundary case and the resume logic is stressed far harder than 64 ever
+    /// stresses it on a short fixture.
+    fn build_with_stride(model: &CellModel, line: &str, stride: usize) -> Self {
+        let stride = stride.max(1);
+        let mut marks = Vec::with_capacity(line.len() / stride + 1);
+        for (i, c) in model.cells(line).enumerate() {
+            if i % stride == 0 {
+                // A line past 4 GB cannot be reached: §10.3 caps the rendered extent far below it
+                // and `view.rs` caps the bytes handed to the shaper at 8 KB.
+                let (Ok(byte), Ok(cell)) = (u32::try_from(c.byte), u32::try_from(c.cell)) else {
+                    break;
+                };
+                marks.push((byte, cell));
+            }
+        }
+        Self { marks }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.marks.is_empty()
+    }
+
+    /// The last anchor at or before `byte`, as `(byte, cell)`.
+    fn before_byte(&self, byte: usize) -> (usize, usize) {
+        let i = self.marks.partition_point(|(b, _)| (*b as usize) <= byte);
+        match i.checked_sub(1) {
+            Some(i) => (self.marks[i].0 as usize, self.marks[i].1 as usize),
+            None => (0, 0),
+        }
+    }
+
+    /// The last anchor at or before `cell`, as `(byte, cell)`.
+    ///
+    /// **`<` on the cell, not `<=`, and the difference is §5.6 rather than an off-by-one.**
+    /// Zero-width clusters occupy no column, so several anchors can share one; `<=` lands on the
+    /// *last* of them and the walk then begins after the ones before it. `an_anchor_never_changes_
+    /// an_answer` catches it on `"\u{202E}abc"` — the Trojan Source line §13.4 names — where
+    /// `byte_span(0..1)` returns `3..4` instead of `0..4` and **silently drops the attacker-supplied
+    /// bidi override from the copied bytes**. That is exactly the loss `byte_span`'s outward
+    /// rounding exists to prevent, reintroduced through a binary search. Starting before every
+    /// anchor at that column keeps them all inside the walk.
+    fn before_cell(&self, cell: usize) -> (usize, usize) {
+        let i = self.marks.partition_point(|(_, c)| (*c as usize) < cell);
+        match i.checked_sub(1) {
+            Some(i) => (self.marks[i].0 as usize, self.marks[i].1 as usize),
+            None => (0, 0),
+        }
+    }
+}
+
 /// One grapheme cluster, placed on the grid.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -146,7 +249,7 @@ impl CellModel {
     ///
     /// Both checks are vectorised byte scans over a line that is about to be shaped anyway, so this
     /// replaces two O(clusters) walks with two O(bytes) passes that run at memory speed.
-    fn is_column_per_byte(line: &str) -> bool {
+    pub fn is_column_per_byte(line: &str) -> bool {
         line.is_ascii() && !line.as_bytes().contains(&b'\n')
     }
 
@@ -166,6 +269,37 @@ impl CellModel {
         })
     }
 
+    /// Every cluster from a known cluster boundary, numbered as if walked from the front.
+    ///
+    /// **Resuming mid-line is sound only because `at_byte` is a true cluster boundary**, and that is
+    /// worth stating because grapheme segmentation is not context-free. UAX #29's regional-indicator
+    /// rules (GB12/GB13) pair flags by counting the run of preceding RIs, so resuming at an arbitrary
+    /// byte could pair `🇦🇧🇨` differently from a full walk. It cannot happen here: an anchor is placed
+    /// *at* a boundary the full walk produced, so every earlier RI has already been consumed into a
+    /// complete cluster and the count restarts exactly as it did. The same holds for GB9b's prepend
+    /// and GB11's ZWJ sequences — a cluster boundary means there is no pending context to carry.
+    fn cells_from<'a>(
+        &'a self,
+        line: &'a str,
+        at_byte: usize,
+        at_cell: usize,
+    ) -> impl Iterator<Item = Cell> + 'a {
+        let mut cell = at_cell;
+        line[at_byte..]
+            .grapheme_indices(true)
+            .map(move |(byte, cluster)| {
+                let width = self.cluster_width(cluster);
+                let placed = Cell {
+                    byte: at_byte + byte,
+                    byte_len: cluster.len(),
+                    cell,
+                    width,
+                };
+                cell += width;
+                placed
+            })
+    }
+
     /// Total cells the line occupies — its horizontal extent.
     pub fn cell_count(&self, line: &str) -> usize {
         if Self::is_column_per_byte(line) {
@@ -178,11 +312,17 @@ impl CellModel {
     ///
     /// A byte in the middle of a cluster resolves to that cluster, not to the next one.
     pub fn cell_at_byte(&self, line: &str, byte: usize) -> usize {
+        self.cell_at_byte_anchored(line, byte, &ColumnAnchors::none())
+    }
+
+    /// [`cell_at_byte`](Self::cell_at_byte), starting from the nearest anchor at or before `byte`.
+    pub fn cell_at_byte_anchored(&self, line: &str, byte: usize, anchors: &ColumnAnchors) -> usize {
         if Self::is_column_per_byte(line) {
             return byte.min(line.len());
         }
-        let mut last = 0;
-        for cluster in self.cells(line) {
+        let (from_byte, from_cell) = anchors.before_byte(byte);
+        let mut last = from_cell;
+        for cluster in self.cells_from(line, from_byte, from_cell) {
             if byte < cluster.byte {
                 return last;
             }
@@ -206,10 +346,16 @@ impl CellModel {
     /// where the user did not click. `"\u{202E}abc"`, the Trojan Source line §13.4 names, is exactly
     /// that shape: the override is cluster 0 at column 0, and so is `a`.
     pub fn byte_at_cell(&self, line: &str, cell: usize) -> usize {
+        self.byte_at_cell_anchored(line, cell, &ColumnAnchors::none())
+    }
+
+    /// [`byte_at_cell`](Self::byte_at_cell), starting from the nearest anchor at or before `cell`.
+    pub fn byte_at_cell_anchored(&self, line: &str, cell: usize, anchors: &ColumnAnchors) -> usize {
         if Self::is_column_per_byte(line) {
             return cell.min(line.len());
         }
-        for cluster in self.cells(line) {
+        let (from_byte, from_cell) = anchors.before_cell(cell);
+        for cluster in self.cells_from(line, from_byte, from_cell) {
             if cluster.width > 0 && cell < cluster.cell + cluster.width {
                 return cluster.byte;
             }
@@ -247,8 +393,21 @@ impl CellModel {
     /// caret's column satisfies *both* ends of a `c..c` range, so a caret would have copied the bidi
     /// override next to it. A caret is not a selection and copies nothing.
     pub fn byte_span(&self, line: &str, cells: core::ops::Range<usize>) -> core::ops::Range<usize> {
+        self.byte_span_anchored(line, cells, &ColumnAnchors::none())
+    }
+
+    /// [`byte_span`](Self::byte_span), starting from the nearest anchor at or before `cells.start`.
+    ///
+    /// **This is the call the frame budget turns on.** `view.rs` makes it once per row per frame,
+    /// and walking from byte zero measured 76 ms a frame at the end of a 19.4 KB line.
+    pub fn byte_span_anchored(
+        &self,
+        line: &str,
+        cells: core::ops::Range<usize>,
+        anchors: &ColumnAnchors,
+    ) -> core::ops::Range<usize> {
         if cells.start >= cells.end {
-            let at = self.byte_at_cell(line, cells.start);
+            let at = self.byte_at_cell_anchored(line, cells.start, anchors);
             return at..at;
         }
         if Self::is_column_per_byte(line) {
@@ -256,9 +415,10 @@ impl CellModel {
             // has nothing to round outwards to and the two ends are just the clamped offsets.
             return cells.start.min(line.len())..cells.end.min(line.len());
         }
+        let (from_byte, from_cell) = anchors.before_cell(cells.start);
         let mut start = None;
         let mut end = None;
-        for cluster in self.cells(line) {
+        for cluster in self.cells_from(line, from_byte, from_cell) {
             // **Stop once the columns are behind us.** Clusters come in increasing column order, so
             // nothing at a column past `cells.end` can widen either bound — and without this the
             // loop walks every cluster in the line whatever the range asked for. That was free
@@ -687,6 +847,122 @@ mod tests {
     /// wrong in at least four ways. So this runs the loop with the exit removed and requires the
     /// two to agree on every range of every fixture, including the zero-width boundary cases the
     /// outward rounding exists for.
+    /// **An anchor must never change an answer, only how fast it is reached.**
+    ///
+    /// The whole safety argument for `ColumnAnchors` is that it is a hint: every lookup is exact
+    /// whatever anchors it is given, including none. That is asserted here rather than argued, by
+    /// running the anchored and unanchored paths against each other over **every** byte offset,
+    /// every column and every column *range* of fixtures chosen to be hostile — zero-width clusters
+    /// that make several anchors share a column, wide clusters, a ZWJ sequence, and regional
+    /// indicators, whose UAX #29 pairing is the one rule that could plausibly break on resume.
+    ///
+    /// Strides of 1, 2 and 3 are used, not 64: on a short fixture 64 produces a single anchor at the
+    /// origin and tests nothing, while stride 1 makes every cluster a resume point.
+    #[test]
+    fn an_anchor_never_changes_an_answer() {
+        let lines = [
+            "hello world",
+            "日本語のログ",
+            "a\u{0301}e\u{0301}i\u{0301}o\u{0301}",
+            "\u{202E}abc\u{202C}def",
+            "x\u{200B}y\u{200B}z",
+            "👨‍👩‍👧‍👦 family",
+            "🇬🇧🇫🇷🇩🇪 flags",
+            "mixed 日本 a\u{0301} \u{200B} 👍🏻 end",
+            "café — naïve — résumé",
+            &"日".repeat(50),
+        ];
+
+        for model in [CellModel::new(), CellModel::revealing()] {
+            for line in lines {
+                let plain = ColumnAnchors::none();
+                for stride in 1..=3 {
+                    let anchors = ColumnAnchors::build_with_stride(&model, line, stride);
+                    assert!(!anchors.is_empty(), "{line:?} produced no anchors");
+
+                    for byte in 0..=line.len() + 1 {
+                        assert_eq!(
+                            model.cell_at_byte_anchored(line, byte, &anchors),
+                            model.cell_at_byte_anchored(line, byte, &plain),
+                            "cell_at_byte({line:?}, {byte}) stride {stride}"
+                        );
+                    }
+                    let cells = model.cell_count(line);
+                    for cell in 0..=cells + 2 {
+                        assert_eq!(
+                            model.byte_at_cell_anchored(line, cell, &anchors),
+                            model.byte_at_cell_anchored(line, cell, &plain),
+                            "byte_at_cell({line:?}, {cell}) stride {stride}"
+                        );
+                    }
+                    for start in 0..=cells + 1 {
+                        for end in 0..=cells + 1 {
+                            assert_eq!(
+                                model.byte_span_anchored(line, start..end, &anchors),
+                                model.byte_span_anchored(line, start..end, &plain),
+                                "byte_span({line:?}, {start}..{end}) stride {stride}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The real stride, on a line the size §10.3 supports, actually samples — and the lookup it
+    /// enables lands on the same bytes as the walk it replaces.
+    #[test]
+    fn a_long_line_is_anchored_and_still_exact() {
+        let model = CellModel::new();
+        // 19.4 KB with a leading non-ASCII character: the shape measured at 76 ms a frame.
+        let line = format!("— {}", "field=value;".repeat(1600));
+        assert!(!CellModel::is_column_per_byte(&line));
+
+        let anchors = ColumnAnchors::build(&model, &line);
+        assert!(
+            anchors.marks.len() > 100,
+            "only {} anchors for a {}-byte line",
+            anchors.marks.len(),
+            line.len()
+        );
+
+        let plain = ColumnAnchors::none();
+        let cells = model.cell_count(&line);
+        for cell in [
+            0,
+            1,
+            63,
+            64,
+            65,
+            1000,
+            cells / 2,
+            cells - 1,
+            cells,
+            cells + 5,
+        ] {
+            assert_eq!(
+                model.byte_at_cell_anchored(&line, cell, &anchors),
+                model.byte_at_cell_anchored(&line, cell, &plain),
+                "byte_at_cell at {cell}"
+            );
+            let span = 0..80;
+            assert_eq!(
+                model.byte_span_anchored(&line, cell..cell + span.end, &anchors),
+                model.byte_span_anchored(&line, cell..cell + span.end, &plain),
+                "byte_span at {cell}"
+            );
+        }
+    }
+
+    /// A short or all-ASCII line is not worth anchoring, and `build` says so.
+    #[test]
+    fn lines_that_gain_nothing_are_not_anchored() {
+        let model = CellModel::new();
+        assert!(ColumnAnchors::build(&model, &"x".repeat(5000)).is_empty());
+        assert!(ColumnAnchors::build(&model, "日本").is_empty());
+        assert!(!ColumnAnchors::build(&model, &"日".repeat(500)).is_empty());
+    }
+
     /// The ASCII fast path must be an **identity**, not an approximation.
     ///
     /// `is_column_per_byte` skips the cluster walk entirely on the strength of an argument about

@@ -36,6 +36,7 @@
 //! facts and this type does not conflate them: a failed read is recorded in [`Rows::last_error`] so
 //! a caller can tell a short file from a broken one, and the frame still draws.
 
+use crate::cell::{CellModel, ColumnAnchors};
 use crate::encoding::Charset;
 use crate::index::LineIndex;
 use crate::indexer::{offset_of_line, ChunkReader};
@@ -58,12 +59,43 @@ const READ_BYTES: usize = 128 * 1024;
 /// frame starts again with the same request and, because the pages are now warm, gets further.
 const FETCH_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Where a painter gets the text of a visible row, and the anchors that make placing it cheap.
+///
+/// **A trait rather than a closure because the two travel together.** The painter needs a row's text
+/// *and* its [`ColumnAnchors`], and a `FnMut(u64) -> Option<String>` can supply neither by reference
+/// — it allocated a `String` per row per frame and had nowhere to put the anchors. Implementing
+/// `row_anchors` is optional: the default is the empty set, which every lookup accepts and which
+/// only costs speed.
+pub trait RowSource {
+    /// The row's text, or `None` for a row not in memory — which draws nothing rather than blocking,
+    /// per §11.3.
+    fn row_text(&self, row: u64) -> Option<&str>;
+
+    fn row_anchors(&self, _row: u64) -> &ColumnAnchors {
+        ColumnAnchors::none_ref()
+    }
+}
+
+impl RowSource for Rows {
+    fn row_text(&self, row: u64) -> Option<&str> {
+        self.line(row)
+    }
+
+    fn row_anchors(&self, row: u64) -> &ColumnAnchors {
+        self.anchors(row)
+    }
+}
+
 /// A window of decoded rows, and the reader and index they came from.
 pub struct Rows {
     charset: Charset,
     /// The row number `lines[0]` holds.
     first: u64,
     lines: Vec<String>,
+    /// Column anchors, one per entry of `lines`. See [`ColumnAnchors`].
+    anchors: Vec<ColumnAnchors>,
+    /// What the last [`fetch`](Rows::fetch) was asked for, so an identical request can be skipped.
+    served: Option<(u64, usize, u64, bool)>,
     last_error: Option<String>,
 }
 
@@ -73,6 +105,8 @@ impl Rows {
             charset,
             first: 0,
             lines: Vec::new(),
+            anchors: Vec::new(),
+            served: None,
             last_error: None,
         }
     }
@@ -88,9 +122,45 @@ impl Rows {
         index: &LineIndex,
         first: u64,
         count: usize,
+        anchored: bool,
     ) -> Result<()> {
+        // **The same rows, again, are already here.** A horizontal scroll changes no row, and
+        // `Document::lay_out` calls this every frame regardless — so without this a frame re-read
+        // and re-decoded the whole viewport to arrive at exactly what it already held: 50 rows of
+        // 19.4 KB is a megabyte of I/O and UTF-8 validation per frame, for nothing.
+        //
+        // **It is also what makes the anchors worth building.** They are built once here and used by
+        // every frame until the row range moves, which is the difference between amortising one walk
+        // per row and paying one per row per frame.
+        //
+        // The index's line count is part of the key: a file that grew has more rows to serve, and a
+        // partial index (R5) that has since advanced can answer a request it previously could not.
+        // What this deliberately does *not* detect is a file whose **contents** changed under a
+        // stable line count — §5.5's copy-truncate. Following is M4 and will need to invalidate this
+        // explicitly rather than rely on the key.
+        // **`anchored` is part of the key, and that is what makes the anchors pay for themselves.**
+        //
+        // Building them is a full walk of every cluster in the row, and at column 0 that is *more*
+        // work than the lookup it replaces: `byte_span`'s early exit stops after the ~150 clusters
+        // the viewport shows, where a build visits all 19,400. Measured, that regressed a
+        // column-0 page-down from 16 ms to 39 ms — a real cost, in the overwhelmingly common case,
+        // to speed up a rarer one.
+        //
+        // So anchors are built only while the view is actually scrolled right. Putting the flag in
+        // the key is what makes the transition work: scrolling off column 0 changes it, which forces
+        // one refetch that builds them, and every frame after that is served from the cache.
+        let want = (first, count, index.line_count(), anchored);
+        if self.served == Some(want) {
+            return Ok(());
+        }
+        // **Cleared here and only re-set on a clean read.** Recording the request up front would
+        // cache a *failed* fetch, so a share that dropped for one frame would keep its truncated
+        // viewport until something else moved.
+        self.served = None;
+
         self.first = first;
         self.lines.clear();
+        self.anchors.clear();
         self.last_error = None;
         if count == 0 {
             return Ok(());
@@ -148,7 +218,31 @@ impl Rows {
                 }
             });
         }
+
+        // **One walk per row, here, instead of one per row per frame** — but only when the caller
+        // says the view is scrolled right, per the note on the cache key above.
+        if anchored {
+            let model = CellModel::new();
+            self.anchors
+                .extend(self.lines.iter().map(|l| ColumnAnchors::build(&model, l)));
+        }
+
+        if self.last_error.is_none() {
+            self.served = Some(want);
+        }
         Ok(())
+    }
+
+    /// A row's column anchors, or an empty set — which every lookup accepts.
+    pub fn anchors(&self, row: u64) -> &ColumnAnchors {
+        let found = row
+            .checked_sub(self.first)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| self.anchors.get(i));
+        match found {
+            Some(a) => a,
+            None => ColumnAnchors::none_ref(),
+        }
     }
 
     /// The text of an absolute row number, or `None` if this window does not hold it.
@@ -213,7 +307,8 @@ mod tests {
         let index = indexed(&text);
         let mut rows = Rows::new(UTF8);
 
-        rows.fetch(&text[..], &index, 4_000, 50).expect("fetch");
+        rows.fetch(&text[..], &index, 4_000, 50, false)
+            .expect("fetch");
 
         assert_eq!(rows.len(), 50);
         assert_eq!(rows.line(4_000), Some("line 4000 — the quick brown fox"));
@@ -233,7 +328,7 @@ mod tests {
         let mut rows = Rows::new(UTF8);
 
         for row in 0..600u64 {
-            rows.fetch(&text[..], &index, row, 1).expect("fetch");
+            rows.fetch(&text[..], &index, row, 1, false).expect("fetch");
             assert_eq!(
                 rows.line(row),
                 Some(format!("line {row} — the quick brown fox").as_str()),
@@ -274,13 +369,15 @@ mod tests {
         let mut rows = Rows::new(UTF8);
 
         // One fetch of a screenful.
-        rows.fetch(&reader, &index, 4_000, 50).expect("batch fetch");
+        rows.fetch(&reader, &index, 4_000, 50, false)
+            .expect("batch fetch");
         assert_eq!(rows.len(), 50);
         let batched = reader.bytes.swap(0, Ordering::Relaxed);
 
         // The same fifty rows, one at a time — what the per-row alternative would do.
         for row in 4_000..4_050u64 {
-            rows.fetch(&reader, &index, row, 1).expect("per-row fetch");
+            rows.fetch(&reader, &index, row, 1, false)
+                .expect("per-row fetch");
         }
         let per_row = reader.bytes.swap(0, Ordering::Relaxed);
 
@@ -292,6 +389,114 @@ mod tests {
         );
     }
 
+    /// **Asking for the same rows again reads nothing — and asking for different ones does.**
+    ///
+    /// `Document::lay_out` calls `fetch` every frame, and a horizontal scroll changes no row, so
+    /// without this a frame re-read and re-decoded a viewport it already held. It is a cache, which
+    /// means the interesting assertions are the ones about it *not* being used: a moved range, a
+    /// changed row count, and a read that failed must all fetch again.
+    #[test]
+    fn the_same_rows_are_not_read_twice_and_different_ones_are() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct Counting {
+            text: Vec<u8>,
+            bytes: AtomicU64,
+        }
+        impl ChunkReader for Counting {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                let n = ChunkReader::read_at(&self.text[..], offset, buf)?;
+                self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+
+        let text = corpus(2_000);
+        let index = indexed(&text);
+        let reader = Counting {
+            text: text.clone(),
+            bytes: AtomicU64::new(0),
+        };
+        let mut rows = Rows::new(UTF8);
+
+        rows.fetch(&reader, &index, 500, 40, false).expect("first");
+        let first = reader.bytes.swap(0, Ordering::Relaxed);
+        assert!(first > 0);
+        assert_eq!(rows.len(), 40);
+
+        // The same window, again: nothing read, and the rows are still there.
+        rows.fetch(&reader, &index, 500, 40, false).expect("repeat");
+        assert_eq!(
+            reader.bytes.swap(0, Ordering::Relaxed),
+            0,
+            "re-read the same rows"
+        );
+        assert_eq!(rows.line(500), Some("line 500 — the quick brown fox"));
+        assert_eq!(rows.len(), 40);
+
+        // One row down is a different window.
+        rows.fetch(&reader, &index, 501, 40, false).expect("moved");
+        assert!(
+            reader.bytes.swap(0, Ordering::Relaxed) > 0,
+            "a moved window was served stale"
+        );
+        assert_eq!(rows.line(501), Some("line 501 — the quick brown fox"));
+
+        // A different count is a different window too.
+        rows.fetch(&reader, &index, 501, 41, false)
+            .expect("resized");
+        assert!(
+            reader.bytes.swap(0, Ordering::Relaxed) > 0,
+            "a resized window was served stale"
+        );
+
+        // **A grown file must not be served from the cache.** The index's line count is in the key
+        // precisely so that a partial index that has advanced, or a file being followed, refetches.
+        let grown = indexed(&corpus(2_500));
+        rows.fetch(&reader, &grown, 501, 41, false).expect("grown");
+        assert!(
+            reader.bytes.swap(0, Ordering::Relaxed) > 0,
+            "a changed line count was served from the cache"
+        );
+    }
+
+    /// A failed read must not be cached, or one bad frame would stick until something else moved.
+    #[test]
+    fn a_failed_fetch_is_retried_rather_than_remembered() {
+        struct Flaky {
+            text: Vec<u8>,
+            fail: std::cell::Cell<bool>,
+        }
+        // `ChunkReader` requires `Sync`; the test is single-threaded and never shares this.
+        unsafe impl Sync for Flaky {}
+        impl ChunkReader for Flaky {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                if self.fail.get() {
+                    return Err(crate::Error("the share went away".into()));
+                }
+                ChunkReader::read_at(&self.text[..], offset, buf)
+            }
+        }
+
+        let text = corpus(500);
+        let index = indexed(&text);
+        let reader = Flaky {
+            text: text.clone(),
+            fail: std::cell::Cell::new(true),
+        };
+        let mut rows = Rows::new(UTF8);
+
+        rows.fetch(&reader, &index, 10, 20, false).expect("fetch");
+        assert!(rows.last_error().is_some());
+        assert!(rows.is_empty());
+
+        // The share comes back. The identical request must be *served*, not skipped.
+        reader.fail.set(false);
+        rows.fetch(&reader, &index, 10, 20, false).expect("retry");
+        assert!(rows.last_error().is_none(), "the failure was remembered");
+        assert_eq!(rows.line(10), Some("line 10 — the quick brown fox"));
+    }
+
     /// §5.6 — the last line of a file with no trailing newline is content, and content is never
     /// discarded silently. Without `decoder.finish` it sits in the decoder and the file looks one
     /// line short.
@@ -301,7 +506,7 @@ mod tests {
         let index = indexed(&text);
         let mut rows = Rows::new(UTF8);
 
-        rows.fetch(&text[..], &index, 0, 10).expect("fetch");
+        rows.fetch(&text[..], &index, 0, 10, false).expect("fetch");
 
         assert_eq!(rows.len(), 3, "the unterminated last line was dropped");
         assert_eq!(rows.line(2), Some("gamma"));
@@ -315,14 +520,15 @@ mod tests {
         let index = indexed(&text);
         let mut rows = Rows::new(UTF8);
 
-        rows.fetch(&text[..], &index, 5, 50).expect("fetch");
+        rows.fetch(&text[..], &index, 5, 50, false).expect("fetch");
         assert_eq!(rows.len(), 5);
         assert_eq!(rows.line(9), Some("line 9 — the quick brown fox"));
         assert_eq!(rows.line(10), None);
         assert!(rows.last_error().is_none(), "end of file is not an error");
 
         // And entirely past the end is empty rather than a failure.
-        rows.fetch(&text[..], &index, 500, 50).expect("fetch");
+        rows.fetch(&text[..], &index, 500, 50, false)
+            .expect("fetch");
         assert!(rows.is_empty());
         assert!(rows.last_error().is_none());
     }
@@ -360,7 +566,7 @@ mod tests {
         };
         let mut rows = Rows::new(UTF8);
 
-        rows.fetch(&reader, &index, 0, 50)
+        rows.fetch(&reader, &index, 0, 50, false)
             .expect("fetch itself does not fail");
 
         assert!(

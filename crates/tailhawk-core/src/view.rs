@@ -26,7 +26,7 @@
 
 use core::ops::Range;
 
-use crate::cell::CellModel;
+use crate::cell::{CellModel, ColumnAnchors};
 use crate::grid::Grid;
 use crate::hgrid::HGrid;
 use crate::selection::Position;
@@ -137,8 +137,20 @@ impl View {
     /// for it — which is the ordinary case for a short line in a horizontally scrolled file, not an
     /// error.
     pub fn slice(&self, line: &str) -> RowSlice {
+        self.slice_anchored(line, &ColumnAnchors::none())
+    }
+
+    /// [`slice`](Self::slice), using a row's prebuilt column anchors.
+    ///
+    /// **This is where the horizontal frame budget is spent.** Both calls below mapped columns to
+    /// bytes by walking the line from byte zero, once per row per frame; at the end of a 19.4 KB
+    /// line that measured 76 ms a frame. The anchors turn each into a binary search plus a bounded
+    /// walk, and passing [`ColumnAnchors::none`] is always correct and only slower.
+    pub fn slice_anchored(&self, line: &str, anchors: &ColumnAnchors) -> RowSlice {
         let visible = self.hgrid.visible_columns();
-        let mut bytes = self.cells.byte_span(line, visible.clone());
+        let mut bytes = self
+            .cells
+            .byte_span_anchored(line, visible.clone(), anchors);
 
         // **A slice is bounded in columns but not in bytes, and one cluster can be the whole line.**
         // `"a" + "\u{0301}".repeat(16000)` is 32 KB — exactly §10.3's supported inline size — and it
@@ -172,7 +184,7 @@ impl View {
         // **Its own column, not the one that was asked for.** `byte_span` rounds outwards, so the
         // first byte may belong to a cluster that starts left of `visible.start`; drawing it at
         // `visible.start` would shift the whole line right by the part that is off screen.
-        let first_column = self.cells.cell_at_byte(line, bytes.start);
+        let first_column = self.cells.cell_at_byte_anchored(line, bytes.start, anchors);
         RowSlice {
             x: self.hgrid.x_of_column(first_column),
             column: first_column,

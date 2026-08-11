@@ -67,7 +67,7 @@ pub use hgrid::{HGrid, MAX_CELL_WIDTH_PX, RENDER_CAP_CELLS};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
 pub use indexer::{build_index, offset_of_line, ChunkReader, IndexOptions};
 pub use lines::LineDecoder;
-pub use rows::Rows;
+pub use rows::{RowSource, Rows};
 pub use selection::{Position, RowEnd, RowSpan, Selection, SelectionMode};
 pub use view::{RowSlice, View};
 
@@ -325,7 +325,7 @@ impl Renderer {
     pub fn paint_rows(
         &mut self,
         view: &view::View,
-        mut line_at: impl FnMut(u64) -> Option<String>,
+        source: &dyn rows::RowSource,
     ) -> Result<paint::Laid> {
         // Disjoint field borrows: the callback needs `painter` mutably while `gpu` is borrowed for
         // the frame. Destructuring is what makes that legal, and it is also what forces the painter
@@ -349,7 +349,7 @@ impl Renderer {
             )?;
 
             p.begin_frame();
-            laid = p.lay_out(view, INK, &mut line_at)?;
+            laid = p.lay_out(view, INK, source)?;
             // The view's own viewport, not the swapchain's. They are the same number when the
             // shell keeps them in step, and taking it from the view keeps `gpu` out of this
             // closure — which is what makes the disjoint borrow above hold.
@@ -393,6 +393,17 @@ impl Renderer {
 mod tests {
     use super::*;
 
+    /// A [`rows::RowSource`] over a plain list, with no anchors.
+    #[cfg(windows)]
+    struct Listed(Vec<String>);
+
+    #[cfg(windows)]
+    impl rows::RowSource for Listed {
+        fn row_text(&self, row: u64) -> Option<&str> {
+            self.0.get(usize::try_from(row).ok()?).map(String::as_str)
+        }
+    }
+
     /// A renderer and a view sized to it, or `None` on a machine with no usable device.
     #[cfg(windows)]
     fn renderer_or_skip(what: &str) -> Option<(Renderer, view::View)> {
@@ -428,9 +439,13 @@ mod tests {
         else {
             return;
         };
-        let line = |row: u64| Some(format!("row {row} — the quick brown fox"));
+        let line = Listed(
+            (0..8)
+                .map(|r| format!("row {r} — the quick brown fox"))
+                .collect(),
+        );
 
-        let first = r.paint_rows(&view, line).expect("the first text frame");
+        let first = r.paint_rows(&view, &line).expect("the first text frame");
         assert!(first.quads > 0, "nothing was laid out");
         assert_eq!(r.device_generation(), 1);
         assert_eq!(
@@ -441,7 +456,7 @@ mod tests {
 
         r.simulate_device_loss();
         let after = r
-            .paint_rows(&view, line)
+            .paint_rows(&view, &line)
             .expect("a text frame across a device loss still presents");
 
         assert_eq!(r.device_generation(), 2, "the device was not rebuilt");
@@ -473,11 +488,11 @@ mod tests {
         let Some((mut r, view)) = renderer_or_skip("a_scale_change_rebuilds_the_atlas") else {
             return;
         };
-        let line = |_| Some("the quick brown fox".to_owned());
+        let line = Listed(vec!["the quick brown fox".to_owned(); 8]);
 
         assert_eq!(r.px_per_em(), DEFAULT_PX_PER_EM);
         let at_100 = r.cell().expect("a cell at 100%");
-        r.paint_rows(&view, line).expect("a frame at 100%");
+        r.paint_rows(&view, &line).expect("a frame at 100%");
         assert_eq!(r.painter.as_ref().map(|(_, px, _)| *px), Some(16));
 
         // 144 dpi is the 150% monitor named in M3's done-criterion.
@@ -493,7 +508,7 @@ mod tests {
         assert_eq!(at_150.0.fract(), 0.0);
         assert_eq!(at_150.1.fract(), 0.0);
 
-        r.paint_rows(&view, line).expect("a frame at 150%");
+        r.paint_rows(&view, &line).expect("a frame at 150%");
         assert_eq!(
             r.painter.as_ref().map(|(_, px, _)| *px),
             Some(24),
@@ -520,9 +535,12 @@ mod tests {
         let Some((mut r, view)) = renderer_or_skip("the_second_frame_is_warm") else {
             return;
         };
-        let line = |_| Some("the quick brown fox jumps over the lazy dog".to_owned());
+        let line = Listed(vec![
+            "the quick brown fox jumps over the lazy dog".to_owned();
+            8
+        ]);
 
-        let cold = r.paint_rows(&view, line).expect("cold frame");
+        let cold = r.paint_rows(&view, &line).expect("cold frame");
         assert!(cold.queued > 0, "a cold atlas queued nothing");
         // **`rasterised` counts glyphs that gained ink, not glyphs that were resolved**, and the
         // difference is the space: `flush_misses` records a blank glyph so it is never asked for
@@ -536,7 +554,7 @@ mod tests {
             cold.queued
         );
 
-        let warm = r.paint_rows(&view, line).expect("warm frame");
+        let warm = r.paint_rows(&view, &line).expect("warm frame");
         assert_eq!(
             warm.queued, 0,
             "the second frame queued {} glyphs, so the first frame's rasterisation was lost",

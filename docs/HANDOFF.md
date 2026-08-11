@@ -1,5 +1,52 @@
 # Handoff — resume here
 
+## ✅ Column anchors — the non-ASCII half of the horizontal cost — 2026-08-11, session 15
+
+`ColumnAnchors` is `SPEC.md` §5.3's sparse line index transposed one axis over: sample `(byte, cell)`
+every 64 clusters when a row is fetched, so a column lookup is a binary search plus a bounded walk
+instead of a walk from byte zero. `Rows` builds them, a new `RowSource` trait carries them to the
+painter, and `view.rs` uses them for both of the lookups it makes per row per frame.
+
+**Measured on the shipped binary, 19.4 KB lines each opening with one non-ASCII character:**
+
+| | Before | After |
+|---|---|---|
+| **Horizontal scrolling at the line end** | 76 ms | **15.91 ms** — vsync-bound |
+| Vertical paging at column 0 | 15.88 ms | **16.24 ms** — unchanged |
+| Vertical paging *while* scrolled right | 76.44 ms | **44.49 ms** |
+
+**The middle row is the one that nearly went wrong.** A first version built anchors on every fetch,
+which regressed column-0 paging from 16 ms to **39 ms** — because `byte_span`'s early exit stops
+after the ~150 clusters the viewport shows, while building anchors visits all 19,400. It was more
+work in the overwhelmingly common case to speed up a rarer one. The fix is that `anchored` is part of
+the fetch cache key: anchors are built only while the view is scrolled right, and changing that flag
+forces the one refetch that builds them.
+
+### ⚠ The third row is still over budget, and the reason is structural
+
+Vertical paging while scrolled right rebuilds every row's anchors, because the rows change. Building
+anchors is **one full cluster walk** — the same order as the lookup it replaces — so this halves the
+cost (two walks become one walk plus two cheap lookups) and cannot remove it. Closing it needs either
+anchors cached **by row number across fetches**, or a cheaper `cluster_width`. Neither is done, and
+2.5× over budget while paging through long non-ASCII lines is the honest current state.
+
+### Two things this turned up
+
+- **`Rows` no longer re-reads a viewport it already holds.** `Document::lay_out` calls `fetch` every
+  frame, and a horizontal scroll changes no row — so every frame was re-reading and re-decoding a
+  megabyte to arrive at what it already had. The cache key is `(first, count, line_count, anchored)`;
+  it deliberately does **not** detect §5.5's copy-truncate, where contents change under a stable line
+  count, and following (M4) will have to invalidate explicitly.
+- **The `lay_out` closure became a trait.** `FnMut(u64) -> Option<String>` could return neither the
+  text by reference nor the anchors at all, so it allocated a `String` per row per frame. `RowSource`
+  returns both by reference and `Rows` implements it.
+
+**The `before_cell` control is worth reading before touching that binary search.** Using `<=` instead
+of `<` makes `byte_span(0..1)` on `"\u{202E}abc"` — §13.4's Trojan Source line — return `3..4`
+instead of `0..4`, **silently dropping the attacker-supplied bidi override from the copied bytes**.
+That is the §5.6 loss `byte_span`'s outward rounding exists to prevent, reintroduced through an
+off-by-one in an index lookup, and `an_anchor_never_changes_an_answer` catches it.
+
 ## ✅ The horizontal scroll cost, measured in the shipped binary and half fixed — 2026-08-11, session 15
 
 The residual layout cost had been an *estimate* since the adversarial review. It is now a

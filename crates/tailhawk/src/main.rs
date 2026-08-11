@@ -137,7 +137,10 @@ impl Document {
         };
         // A read that fails does not fail the frame — §11.3. `Rows` keeps what it got and records
         // why the rest is missing; those rows simply draw nothing.
-        let _ = self.rows.fetch(&self.file, &self.index, first, count);
+        let anchored = self.view.hgrid().visible_columns().start > 0;
+        let _ = self
+            .rows
+            .fetch(&self.file, &self.index, first, count, anchored);
     }
 
     /// Applies one navigation intent. Returns whether anything actually moved.
@@ -315,9 +318,10 @@ impl Shell {
                 Some(doc) => {
                     let cell = renderer.cell()?;
                     doc.lay_out(cell, (w, h));
-                    let rows = &doc.rows;
-                    let laid =
-                        renderer.paint_rows(&doc.view, |row| rows.line(row).map(str::to_owned))?;
+                    // `Rows` is the row source, so the painter reads its text and its column
+                    // anchors by reference — the closure this replaced allocated a `String` per row
+                    // per frame and had nowhere to put the anchors at all.
+                    let laid = renderer.paint_rows(&doc.view, &doc.rows)?;
                     rasterised = laid.rasterised;
                     Ok(())
                 }

@@ -51,7 +51,9 @@
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 
+use crate::cell::ColumnAnchors;
 use crate::glyphs::GlyphCache;
+use crate::rows::RowSource;
 use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline};
 use crate::view::View;
@@ -152,19 +154,14 @@ impl Painter {
     /// line up, and it does not become weaker because the cause is a font engine rather than a
     /// pending read. The row is skipped, [`Laid::failed_rows`] counts it, and the other forty-nine
     /// reach the screen.
-    pub fn lay_out(
-        &mut self,
-        view: &View,
-        tint: [f32; 4],
-        mut line_at: impl FnMut(u64) -> Option<String>,
-    ) -> Result<Laid> {
+    pub fn lay_out(&mut self, view: &View, tint: [f32; 4], source: &dyn RowSource) -> Result<Laid> {
         let mut total = Laid::default();
         let rows: Vec<(u64, f32)> = view.grid().visible().map(|p| (p.row, p.y)).collect();
         for (row, y) in rows {
-            let Some(line) = line_at(row) else {
+            let Some(line) = source.row_text(row) else {
                 continue;
             };
-            match self.lay_out_row(view, &line, y, tint) {
+            match self.lay_out_row(view, line, source.row_anchors(row), y, tint) {
                 Ok(laid) => total.merge(laid),
                 Err(_) => total.failed_rows += 1,
             }
@@ -173,8 +170,15 @@ impl Painter {
     }
 
     /// One row. `y` is the row's top edge, viewport-relative, from [`crate::grid::PlacedRow`].
-    pub fn lay_out_row(&mut self, view: &View, line: &str, y: f32, tint: [f32; 4]) -> Result<Laid> {
-        let slice = view.slice(line);
+    pub fn lay_out_row(
+        &mut self,
+        view: &View,
+        line: &str,
+        anchors: &ColumnAnchors,
+        y: f32,
+        tint: [f32; 4],
+    ) -> Result<Laid> {
+        let slice = view.slice_anchored(line, anchors);
         if slice.bytes.is_empty() {
             return Ok(Laid::default());
         }
@@ -286,6 +290,17 @@ mod tests {
     const EM: u16 = 14;
     const TARGET: u32 = 256;
     const INK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    /// A [`RowSource`] over a plain list, with no anchors — which is the point: the default
+    /// `row_anchors` returns the empty set, so these tests exercise the unanchored path and would
+    /// fail if an empty anchor set ever stopped being a legitimate argument.
+    struct Listed(Vec<String>);
+
+    impl RowSource for Listed {
+        fn row_text(&self, row: u64) -> Option<&str> {
+            self.0.get(usize::try_from(row).ok()?).map(String::as_str)
+        }
+    }
     const PAPER: [f32; 4] = [0.85, 0.85, 0.85, 1.0];
 
     fn painter_or_skip(what: &str) -> Option<(Offscreen, Painter)> {
@@ -335,9 +350,11 @@ mod tests {
         // Frame one: nothing is resident. §3.2 says draw anyway.
         painter.begin_frame();
         let first = painter
-            .lay_out(&view, INK, |row| {
-                lines.get(row as usize).map(|s| s.to_string())
-            })
+            .lay_out(
+                &view,
+                INK,
+                &Listed(lines.iter().map(|s| (*s).to_owned()).collect()),
+            )
             .expect("lay out");
         assert!(
             first.quads > 100,
@@ -360,9 +377,11 @@ mod tests {
 
         painter.begin_frame();
         let second = painter
-            .lay_out(&view, INK, |row| {
-                lines.get(row as usize).map(|s| s.to_string())
-            })
+            .lay_out(
+                &view,
+                INK,
+                &Listed(lines.iter().map(|s| (*s).to_owned()).collect()),
+            )
             .expect("lay out");
         assert_eq!(
             second.queued, 0,
@@ -404,7 +423,9 @@ mod tests {
         let line = "GET /a/b?c=1 200 OK";
 
         painter.begin_frame();
-        painter.lay_out_row(&view, line, 0.0, INK).expect("lay out");
+        painter
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), 0.0, INK)
+            .expect("lay out");
 
         // Rebuild the expected column x for every cluster and require a quad to start there. The
         // cell's own `left` offsets ink within the cell, so the comparison allows it.
@@ -450,7 +471,7 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, &line, 0.0, INK)
+            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), 0.0, INK)
             .expect("lay out");
 
         // Column 0 is the whole `a` + tags cluster. Nothing it emits may reach column 1, where the
@@ -484,7 +505,7 @@ mod tests {
 
         painter.begin_frame();
         let laid = painter
-            .lay_out_row(&view, "ابب logged out", 0.0, INK)
+            .lay_out_row(&view, "ابب logged out", ColumnAnchors::none_ref(), 0.0, INK)
             .expect("lay out");
         assert!(
             laid.rtl_runs > 0,
@@ -524,8 +545,15 @@ mod tests {
         let Some((off, mut painter)) = painter_or_skip("the_layout_cost_does_not_scale") else {
             return;
         };
-        // §10.3's supported inline size, as an ordinary wide record.
-        let line = "abcdefgh 0123456789 ".repeat(32 * 1024 / 20);
+        // §10.3's supported inline size, as an ordinary wide record — **opened with one non-ASCII
+        // character**, which is load-bearing. `CellModel::is_column_per_byte` makes an all-ASCII
+        // line's column lookups O(1), so an ASCII fixture drove both arms of this ratio into the
+        // tens of microseconds, where the ratio is measuring scheduler noise and fails at random
+        // under full-suite load. The property under test — that the column is carried across
+        // clusters rather than re-derived per cluster — only has a cost to measure on a line that
+        // actually walks.
+        let line = format!("— {}", "abcdefgh 0123456789 ".repeat(32 * 1024 / 20));
+        assert!(!crate::cell::CellModel::is_column_per_byte(&line));
         let cell_w = painter.cell_width();
 
         let frame = |painter: &mut Painter, columns: usize| {
@@ -536,7 +564,13 @@ mod tests {
             painter.begin_frame();
             for row in 0..8 {
                 painter
-                    .lay_out_row(&view, &line, row as f32 * painter.row_height(), INK)
+                    .lay_out_row(
+                        &view,
+                        &line,
+                        ColumnAnchors::none_ref(),
+                        row as f32 * painter.row_height(),
+                        INK,
+                    )
                     .expect("lay out");
             }
             assert!(!painter.instances().is_empty(), "nothing was drawn");
@@ -573,7 +607,9 @@ mod tests {
         let view = view_for(&painter, 100, 200);
 
         painter.begin_frame();
-        let laid = painter.lay_out(&view, INK, |_| None).expect("lay out");
+        let laid = painter
+            .lay_out(&view, INK, &Listed(Vec::new()))
+            .expect("lay out");
         assert_eq!(laid, Laid::default());
         assert!(painter.instances().is_empty());
         // Drawing an empty frame is a no-op, not an error.
@@ -592,7 +628,9 @@ mod tests {
 
         view.hgrid_mut().scroll_to_column(4);
         painter.begin_frame();
-        painter.lay_out_row(&view, line, 0.0, INK).expect("lay out");
+        painter
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), 0.0, INK)
+            .expect("lay out");
         let leftmost = painter
             .instances()
             .iter()
@@ -652,16 +690,18 @@ mod tests {
         for (name, line) in &cases {
             painter.begin_frame();
             painter
-                .lay_out_row(&view, line, 0.0, INK)
+                .lay_out_row(&view, line, ColumnAnchors::none_ref(), 0.0, INK)
                 .unwrap_or_else(|e| panic!("{name} failed to shape: {e:?} — see this test's note"));
         }
 
         // And a frame of them reports no failures, which is the contract `lay_out` now owes.
         painter.begin_frame();
         let laid = painter
-            .lay_out(&view, INK, |row| {
-                cases.get(row as usize).map(|(_, line)| line.clone())
-            })
+            .lay_out(
+                &view,
+                INK,
+                &Listed(cases.iter().map(|(_, l)| l.clone()).collect()),
+            )
             .expect("a frame of hostile rows is still a frame");
         assert_eq!(laid.failed_rows, 0);
         assert!(laid.quads > 0);
