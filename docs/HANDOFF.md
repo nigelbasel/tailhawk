@@ -47,6 +47,29 @@ clusters really are clusters before it compares anything.
 `the_fast_walk_and_the_plain_one_agree` checks the fast walk against `cells` — the canonical one —
 over 22 fixtures under both models, chosen to attack the argument rather than confirm it.
 
+### ⛔ 2. RTL was **not** attempted, and that is the night's main judgement call
+
+The plan above had "cache resolved bidi levels per row" next. On looking at what it is *for* I
+stopped, and the reasoning matters more than the outcome:
+
+- Caching levels has **no consumer** until RTL placement exists, so on its own it is code written for
+  a use that has not been decided.
+- Doing the placement as well would be a **partial** implementation. `paint.rs` would put RTL runs in
+  visual columns while `View::position_at` — the hit-test — still returned logical ones, so **clicks
+  would land on the wrong character.** Today every part of the system is consistently logical:
+  visually wrong for RTL, but coherent, and disclosed through `Laid::rtl_runs`. A half-change trades
+  a known, announced gap for a disagreement between what is painted and what is clicked.
+- Fixing *that* is the coordinate-space question put to the owner earlier — is a column a logical or
+  a visual position — and the answer decides work in `selection.rs`, `cell.rs` and `view.rs`. "Go
+  ahead with your recommendations" was said about the 50M run, not about this.
+
+**So RTL is unchanged: unimplemented, disclosed, and the last M3 exit criterion outstanding.** The
+recommendation on the table is also unchanged — logical `Position`, a per-row bidi map used only by
+paint and hit-test, and whole-line level resolution as its first step, because bidi cannot be
+resolved from a horizontal slice.
+
+### ⚠ Assumptions a reviewer should challenge
+
 - **That making the walk faster is preferable to precomputing at index time.** The alternative is to
   record column information while indexing, which would make deep columns O(1) but costs memory on
   every line of a 50M-line file for a case most files never hit. Rejected on that basis, not
