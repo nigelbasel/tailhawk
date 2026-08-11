@@ -75,9 +75,19 @@ pub const COLUMN_ANCHOR_STRIDE: usize = 64;
 /// budget. `view.rs` asks for a byte span and a starting column once per row per frame, and both
 /// walked `grapheme_indices` from the front of the line.
 ///
-/// An anchor is a *hint that is always safe*: every lookup is exact whatever anchors it is given,
-/// including none. [`ColumnAnchors::none`] is a legitimate argument everywhere and only costs speed,
-/// which is what keeps a stale or absent anchor set from ever being a correctness question.
+/// An anchor is a *hint that is always safe*: every lookup is exact whatever anchors it is given —
+/// none, any stride, or a set built for a **different line**. [`ColumnAnchors::none`] is a legitimate
+/// argument everywhere and only costs speed, which is what keeps a stale or absent anchor set from
+/// ever being a correctness question.
+///
+/// **That last clause was earned rather than assumed.** An adversarial review of this change
+/// reproduced two ways it could have been false: slicing from a foreign anchor's byte offset panicked
+/// out of a `pub fn` (`start byte index 384 is out of bounds for string of length 18`), and a foreign
+/// anchor that happened to land on a valid boundary resumed at a wrong column — which for
+/// `byte_span` is silent §5.6 content loss and strictly worse than the crash. Both were refuted as
+/// live bugs, correctly, because `Rows` builds `anchors[i]` from `lines[i]` and `paint.rs` pairs them
+/// in one loop iteration. They are closed anyway, by the `line_len` check below, because a promise
+/// this module makes in writing should be true of the code and not only of its callers.
 ///
 /// **Not built for a line on the [`is_column_per_byte`](CellModel::is_column_per_byte) fast path**,
 /// because there the mapping is already O(1) and anchors would be pure overhead.
@@ -86,12 +96,28 @@ pub struct ColumnAnchors {
     /// `(byte, cell)` at cluster 0, `STRIDE`, `2·STRIDE`, … Ascending in both fields, which is what
     /// makes the binary searches below valid.
     marks: Vec<(u32, u32)>,
+    /// Byte length of the line these were built from.
+    ///
+    /// **The anchors are ignored for a line of any other length**, which is what makes this type's
+    /// promise — a wrong or stale set costs speed, never correctness — true rather than nearly true.
+    /// Without it, anchors from another line either panic on an out-of-range slice or, worse, land
+    /// on a valid boundary of the new line and resume at a **wrong column**: for `byte_span` that is
+    /// §5.6 content loss, silent, and strictly worse than a crash.
+    ///
+    /// It does not prove identity — two different lines of equal length would still match — and it
+    /// is not meant to. `Rows` builds `anchors[i]` from `lines[i]` and `paint.rs` pairs them in one
+    /// loop iteration, so identity is structural; this closes the accidental mismatch that a future
+    /// caller could introduce, at the cost of one `u32`.
+    line_len: u32,
 }
 
 impl ColumnAnchors {
     /// No anchors — every lookup still exact, just from byte zero.
     pub const fn none() -> Self {
-        Self { marks: Vec::new() }
+        Self {
+            marks: Vec::new(),
+            line_len: 0,
+        }
     }
 
     /// A borrowable empty set, so a caller with nothing to offer can still satisfy a `&ColumnAnchors`
@@ -128,11 +154,37 @@ impl ColumnAnchors {
                 marks.push((byte, cell));
             }
         }
-        Self { marks }
+        Self {
+            marks,
+            line_len: u32::try_from(line.len()).unwrap_or(0),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.marks.is_empty()
+    }
+
+    /// Whether these anchors describe this line at all. See the `line_len` field.
+    fn fits(&self, line: &str) -> bool {
+        !self.marks.is_empty() && usize::try_from(self.line_len) == Ok(line.len())
+    }
+
+    /// Where to resume a byte-driven walk: an anchor if these describe `line`, the front otherwise.
+    fn start_for_byte(&self, line: &str, byte: usize) -> (usize, usize) {
+        if self.fits(line) {
+            self.before_byte(byte)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Where to resume a column-driven walk. Same rule.
+    fn start_for_cell(&self, line: &str, cell: usize) -> (usize, usize) {
+        if self.fits(line) {
+            self.before_cell(cell)
+        } else {
+            (0, 0)
+        }
     }
 
     /// The last anchor at or before `byte`, as `(byte, cell)`.
@@ -278,12 +330,27 @@ impl CellModel {
     /// *at* a boundary the full walk produced, so every earlier RI has already been consumed into a
     /// complete cluster and the count restarts exactly as it did. The same holds for GB9b's prepend
     /// and GB11's ZWJ sequences — a cluster boundary means there is no pending context to carry.
+    ///
+    /// **An anchor that does not fit this line is ignored rather than trusted**, and that is what
+    /// makes the promise in [`ColumnAnchors`] literally true instead of nearly true. Slicing
+    /// `line[at_byte..]` with a byte from a *different* line panics — an adversarial review
+    /// reproduced exactly that, `start byte index 384 is out of bounds for string of length 18`,
+    /// through the public `byte_span_anchored`. It is unreachable today because `Rows` builds
+    /// `anchors[i]` from `lines[i]` and `paint.rs` pairs them in one loop iteration, so the review
+    /// refuted it as a live bug — correctly. But "a stale or absent anchor set is never a
+    /// correctness question, only a slower one" is a claim this module makes in writing, and a
+    /// panic out of a `pub fn` is not a slower answer. Falling back to the front of the line is.
     fn cells_from<'a>(
         &'a self,
         line: &'a str,
         at_byte: usize,
         at_cell: usize,
     ) -> impl Iterator<Item = Cell> + 'a {
+        let (at_byte, at_cell) = if at_byte <= line.len() && line.is_char_boundary(at_byte) {
+            (at_byte, at_cell)
+        } else {
+            (0, 0)
+        };
         let mut cell = at_cell;
         line[at_byte..]
             .grapheme_indices(true)
@@ -320,7 +387,7 @@ impl CellModel {
         if Self::is_column_per_byte(line) {
             return byte.min(line.len());
         }
-        let (from_byte, from_cell) = anchors.before_byte(byte);
+        let (from_byte, from_cell) = anchors.start_for_byte(line, byte);
         let mut last = from_cell;
         for cluster in self.cells_from(line, from_byte, from_cell) {
             if byte < cluster.byte {
@@ -354,7 +421,7 @@ impl CellModel {
         if Self::is_column_per_byte(line) {
             return cell.min(line.len());
         }
-        let (from_byte, from_cell) = anchors.before_cell(cell);
+        let (from_byte, from_cell) = anchors.start_for_cell(line, cell);
         for cluster in self.cells_from(line, from_byte, from_cell) {
             if cluster.width > 0 && cell < cluster.cell + cluster.width {
                 return cluster.byte;
@@ -415,7 +482,7 @@ impl CellModel {
             // has nothing to round outwards to and the two ends are just the clamped offsets.
             return cells.start.min(line.len())..cells.end.min(line.len());
         }
-        let (from_byte, from_cell) = anchors.before_cell(cells.start);
+        let (from_byte, from_cell) = anchors.start_for_cell(line, cells.start);
         let mut start = None;
         let mut end = None;
         for cluster in self.cells_from(line, from_byte, from_cell) {
@@ -951,6 +1018,57 @@ mod tests {
                 model.byte_span_anchored(&line, cell..cell + span.end, &plain),
                 "byte_span at {cell}"
             );
+        }
+    }
+
+    /// **Anchors from the wrong line are ignored, not trusted, and never panic.**
+    ///
+    /// An adversarial review of the anchor change reproduced a real panic here —
+    /// `start byte index 384 is out of bounds for string of length 18` — by handing
+    /// `byte_span_anchored` a set built from a longer line, and then correctly refuted it as a live
+    /// bug: `Rows` builds `anchors[i]` from `lines[i]` and `paint.rs` pairs them in a single loop
+    /// iteration, so no caller can mismatch them. It is fixed anyway, because the module promises in
+    /// writing that a stale anchor set costs speed and not correctness, and a panic out of a public
+    /// function is not a slower answer.
+    ///
+    /// The pairing that *is* dangerous is subtler and is the reason this asserts equality rather
+    /// than merely absence of a panic: anchors from a **same-length** line whose clusters fall
+    /// differently land on valid boundaries and would silently resume at a wrong column, which for
+    /// `byte_span` is §5.6 content loss rather than a crash.
+    #[test]
+    fn anchors_from_another_line_are_ignored_rather_than_believed() {
+        let model = CellModel::new();
+        let long = "日本語のログ ".repeat(40);
+        let foreign = ColumnAnchors::build_with_stride(&model, &long, 2);
+        assert!(!foreign.is_empty());
+
+        // Shorter than the anchors' byte offsets, and of a different cluster shape.
+        for line in ["short", "", "日本", "a\u{0301}bc", "\u{202E}abc"] {
+            let plain = ColumnAnchors::none();
+            let cells = model.cell_count(line);
+            for cell in 0..=cells + 2 {
+                assert_eq!(
+                    model.byte_at_cell_anchored(line, cell, &foreign),
+                    model.byte_at_cell_anchored(line, cell, &plain),
+                    "byte_at_cell({line:?}, {cell}) with foreign anchors"
+                );
+            }
+            for start in 0..=cells + 1 {
+                for end in 0..=cells + 1 {
+                    assert_eq!(
+                        model.byte_span_anchored(line, start..end, &foreign),
+                        model.byte_span_anchored(line, start..end, &plain),
+                        "byte_span({line:?}, {start}..{end}) with foreign anchors"
+                    );
+                }
+            }
+            for byte in 0..=line.len() + 1 {
+                assert_eq!(
+                    model.cell_at_byte_anchored(line, byte, &foreign),
+                    model.cell_at_byte_anchored(line, byte, &plain),
+                    "cell_at_byte({line:?}, {byte}) with foreign anchors"
+                );
+            }
         }
     }
 
