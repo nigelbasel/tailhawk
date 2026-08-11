@@ -47,6 +47,14 @@ clusters really are clusters before it compares anything.
 `the_fast_walk_and_the_plain_one_agree` checks the fast walk against `cells` — the canonical one —
 over 22 fixtures under both models, chosen to attack the argument rather than confirm it.
 
+**Re-verified at 50M rather than argued.** The fast walk only runs while anchors are being built, and
+anchors are only built while scrolled right, so the 50M vertical case *cannot* have regressed — which
+is exactly the sort of reasoning this project distrusts. Re-ran it: 5.24 GB, **67 MB resident, 119
+rows a frame at 17.35 ms**, viewport at the true end of the file. Index took 3.32 s against 2.35 s
+and 2.55 s previously, and page-down 17.35 ms against 16.74 ms; **the adversarial review was running
+fifteen agents building concurrently**, so that drift is the machine and not the change. Recorded
+rather than quietly reporting the better earlier figures.
+
 ### ⛔ 2. RTL was **not** attempted, and that is the night's main judgement call
 
 The plan above had "cache resolved bidi levels per row" next. On looking at what it is *for* I

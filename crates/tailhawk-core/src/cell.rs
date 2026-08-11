@@ -635,6 +635,78 @@ mod tests {
     }
 
     #[test]
+    fn zz_ascii_cluster_width_table() {
+        for b in 0u8..=0x7f {
+            let c = b as char;
+            let s = c.to_string();
+            let plain = CellModel::new().cluster_width(&s);
+            let rev = CellModel::revealing().cluster_width(&s);
+            if plain != 1 || rev != 1 {
+                println!(
+                    "ASCII {b:#04x} char_width={:?} str_width={} plain={plain} reveal={rev}",
+                    c.width(),
+                    s.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zz_brute_force_differential() {
+        let alphabet: Vec<char> = vec![
+            '\u{0}', '\r', '\n', '\t', 'a', ' ', '\u{7f}', '\u{1b}', '\u{e9}', '\u{301}',
+            '\u{605}', '\u{200b}', '\u{200d}', '\u{fe0f}', '日', '\u{1F1EC}', '\u{1F44D}',
+            '\u{1F3FB}', '\u{903}', '\u{94d}', 'क', '\u{ff21}',
+        ];
+        let models = [CellModel::new(), CellModel::revealing()];
+        let mut failures: Vec<String> = Vec::new();
+        let n = alphabet.len();
+
+        let mut check = |s: &str, failures: &mut Vec<String>| {
+            for m in &models {
+                let plain: Vec<Cell> = m.cells(s).collect();
+                let fast: Vec<Cell> = m.walk(s).collect();
+                if plain != fast && failures.len() < 40 {
+                    failures.push(format!(
+                        "{:?} reveal={} plain={:?} fast={:?}",
+                        s, m.reveal_invisibles, plain, fast
+                    ));
+                }
+            }
+        };
+
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let mut s = String::new();
+                    s.push(alphabet[i]);
+                    s.push(alphabet[j]);
+                    s.push(alphabet[k]);
+                    check(&s, &mut failures);
+                }
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    for l in 0..n {
+                        let mut s = String::new();
+                        s.push(alphabet[i]);
+                        s.push(alphabet[j]);
+                        s.push(alphabet[k]);
+                        s.push(alphabet[l]);
+                        check(&s, &mut failures);
+                    }
+                }
+            }
+        }
+        for f in &failures {
+            println!("DIFF {f}");
+        }
+        assert!(failures.is_empty(), "{} divergences", failures.len());
+    }
+
+    #[test]
     fn ascii_is_one_cell_each() {
         assert_eq!(width("hello"), 5);
         assert_eq!(width(""), 0);
