@@ -523,6 +523,69 @@ mod tests {
         assert!(r.cell().is_ok(), "a clamped scale still measures");
     }
 
+    /// **The background is still the background on the second frame.**
+    ///
+    /// This is the regression test for the worst bug of the session, and it is worth saying plainly
+    /// why it did not exist at the time. `TextPipeline::draw` binds a dual-source blend state and
+    /// does not restore it; `draw_background` set none at all. So frame 1 inherited D3D11's default
+    /// and was correct, and **every frame after it left the target untouched** — for fifteen
+    /// sessions, in M0 code, invisibly, because on a zeroed back buffer that reads as RGB(0,0,0)
+    /// where RGB(18,20,23) belongs and no eye finds that. It was caught by sampling a screenshot,
+    /// not by any test, and it could not have been: `draw_background` needs a render target, and
+    /// the only way to get one was a swapchain, which needs a window.
+    ///
+    /// **Two frames, and a clear to magenta before each, and both are load-bearing.** The first
+    /// version of this test had a control that did **not** fire: an offscreen target keeps the
+    /// previous frame's pixels, so a background that was never drawn left the *correct* colour
+    /// behind and read as success. A real swapchain does not do that — a fresh flip-model buffer is
+    /// zeroed — so the test was passing for a reason the shipped code does not enjoy. Clearing to a
+    /// colour no pass can produce restores the distinction. The control then fires with the corner
+    /// still **magenta**, which also corrected the diagnosis: the background pass produces
+    /// *nothing*, rather than producing black.
+    #[cfg(windows)]
+    #[test]
+    fn the_background_survives_a_frame_of_text() {
+        let mut r = match Renderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping the_background_survives_a_frame_of_text: no device ({e})");
+                return;
+            }
+        };
+        r.gpu
+            .attach_offscreen(256, 128)
+            .expect("an offscreen target");
+
+        let (cw, rh) = r.cell().expect("the face measures");
+        let mut view = view::View::new(cw, rh);
+        view.set_viewport(256.0, 128.0);
+        view.grid_mut().set_total_rows(4);
+        view.hgrid_mut().set_columns(40);
+        // One short line, so most of the target stays background and the sample is unambiguous.
+        let source = Listed(vec!["hi".to_owned()]);
+
+        let (bg_r, bg_g, bg_b) = background_rgb8();
+        for frame in 1..=2 {
+            // Magenta: a colour no pass here can produce, so "the background was not drawn" is
+            // distinguishable from "the background was drawn correctly". See `clear_offscreen`.
+            r.gpu.clear_offscreen([1.0, 0.0, 1.0, 1.0]);
+            let laid = r.paint_rows(&view, &source).expect("a text frame");
+            assert!(laid.quads > 0, "frame {frame} laid out no text at all");
+            let pixels = r.gpu.read_back().expect("read back");
+
+            // The bottom-right corner: below the single row of text and right of it, so nothing but
+            // background can have been drawn there.
+            let [b, g, red, _] = pixels.at(250, 120);
+            assert_eq!(
+                (red, g, b),
+                (bg_r, bg_g, bg_b),
+                "frame {frame}: the background is {red},{g},{b} and should be \
+                 {bg_r},{bg_g},{bg_b} — a pass that does not set the state it needs has \
+                 inherited one from the text pass"
+            );
+        }
+    }
+
     /// The atlas fills, and it fills *after* the present.
     ///
     /// Without `flush_misses` on this path the cache would never gain a glyph: every frame would

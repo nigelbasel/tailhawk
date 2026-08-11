@@ -164,6 +164,17 @@ pub struct Gpu {
     generation: u32,
     #[cfg(any(test, feature = "test-hooks"))]
     inject_loss: bool,
+    /// A render target standing in for a swapchain, so the **real** frame path can be read back.
+    ///
+    /// [`offscreen::Offscreen`] builds its own device and exists to test `text.rs` and `paint.rs` in
+    /// isolation. It cannot test `Gpu` itself, and that gap had a cost: `draw_background` inherited
+    /// a blend state from the text pass and **stopped drawing anything at all from the second frame
+    /// onward** for fifteen sessions — which on a zeroed back buffer reads as pure black, invisibly
+    /// at this palette — and was found by screenshot rather than by any test. Anything reachable
+    /// only through a swapchain is untestable, and this is the smallest thing that makes it
+    /// reachable.
+    #[cfg(test)]
+    offscreen: Option<(ID3D11Texture2D, ID3D11Texture2D)>,
 }
 
 fn create_device(driver: Driver) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -281,7 +292,53 @@ impl Gpu {
             generation: 1,
             #[cfg(any(test, feature = "test-hooks"))]
             inject_loss: false,
+            #[cfg(test)]
+            offscreen: None,
         })
+    }
+
+    /// Renders to a texture instead of a window, so a frame can be read back pixel for pixel.
+    ///
+    /// Everything after this is the ordinary path: `render_frame_with` draws the background, runs
+    /// the caller's pass and calls `present`, which with no swapchain and no window asks the device
+    /// whether it is still alive — so device-loss classification still works.
+    ///
+    /// **Not a substitute for a window.** It cannot exercise `ResizeBuffers`, flip-model buffer
+    /// rotation, or the DXGI factory staleness that `a_device_lost_with_a_window_attached_comes_
+    /// back_presenting` covers in the shell. Re-attach after a rebuild: the new device cannot use
+    /// the old device's texture.
+    #[cfg(test)]
+    pub fn attach_offscreen(&mut self, width: u32, height: u32) -> Result<()> {
+        let (width, height) = (width.max(1), height.max(1));
+        let (target, staging, rtv) = offscreen::make_target(&self.res.device, width, height)?;
+        self.rtv = Some(rtv);
+        self.offscreen = Some((target, staging));
+        self.size = (width, height);
+        Ok(())
+    }
+
+    /// Fills the offscreen target with a colour, so the next frame starts from a known state.
+    ///
+    /// **Without this the target is indistinguishable from a correct frame.** It keeps the previous
+    /// frame's pixels, so a background that is not drawn *at all* leaves the right colour behind and
+    /// reads as success. A real swapchain does not behave that way — flip-model back buffers start
+    /// undefined, and a fresh one is zeroed, which is why the blend-state bug showed on screen as
+    /// black rather than as a stale-but-correct frame. Clearing to something no pass would ever
+    /// produce restores that distinction.
+    #[cfg(test)]
+    pub fn clear_offscreen(&self, colour: [f32; 4]) {
+        if let Some(rtv) = self.rtv.as_ref() {
+            unsafe { self.res.context.ClearRenderTargetView(rtv, &colour) };
+        }
+    }
+
+    /// The last frame drawn to the offscreen target.
+    #[cfg(test)]
+    pub fn read_back(&self) -> Result<offscreen::Pixels> {
+        let Some((target, staging)) = self.offscreen.as_ref() else {
+            return Err(Error("no offscreen target is attached".into()));
+        };
+        offscreen::read_target(&self.res.context, target, staging, self.size.0, self.size.1)
     }
 
     pub fn driver(&self) -> Driver {
@@ -496,12 +553,19 @@ impl Gpu {
             ctx.UpdateSubresource(&self.res.frame_cb, 0, None, colour.as_ptr().cast(), 0, 0);
             ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
             // **The background is opaque, and it has to say so rather than inherit.** D3D11's
-            // context is global and `TextPipeline::draw` leaves its dual-source blend state bound;
-            // the background's pixel shader emits one output, so blending it against an undefined
-            // second source produced **pure black**. It was invisible until something else set a
-            // blend state: frame 1 got the default and was right, every frame after it was black,
-            // and at this palette (RGB 18,20,23 against 0,0,0) nobody would catch that by looking.
-            // Found by dogfooding the first real file, not by any test.
+            // context is global and `TextPipeline::draw` leaves its dual-source blend state bound.
+            // The background's pixel shader emits one output, so from the second frame on it was
+            // blended against an undefined second source — and the measured effect is that the
+            // background pass **leaves the target untouched**, not that it draws something dark.
+            // `the_background_survives_a_frame_of_text` shows that directly: with this line removed
+            // the target keeps the magenta it was cleared to.
+            //
+            // On screen that read as **pure black**, because a flip-model back buffer starts
+            // undefined and a fresh one is zeroed — so the symptom depends on what was already in
+            // the buffer, which is why an offscreen target that keeps the previous frame looked
+            // *correct* and hid the bug from the first version of that test. Frame 1 was always
+            // right, every frame after it was not, and at this palette (18,20,23 against 0,0,0)
+            // nobody catches that by looking. Found by dogfooding a real file, not by any test.
             ctx.OMSetBlendState(None, None, 0xFFFF_FFFF);
             ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
@@ -667,28 +731,83 @@ pub(crate) mod offscreen {
         }
 
         pub fn read_back(&self) -> Result<Pixels> {
-            unsafe { self.context.CopyResource(&self.staging, &self.target) };
-            let mut mapped = Default::default();
-            unsafe {
-                self.context
-                    .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?
-            };
-            let stride = mapped.RowPitch as usize;
-            let mut data = vec![0u8; stride * self.height as usize];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    mapped.pData.cast::<u8>(),
-                    data.as_mut_ptr(),
-                    data.len(),
-                );
-                self.context.Unmap(&self.staging, 0);
-            }
-            Ok(Pixels {
-                data,
-                width: self.width,
-                stride,
-            })
+            read_target(
+                &self.context,
+                &self.target,
+                &self.staging,
+                self.width,
+                self.height,
+            )
         }
+    }
+
+    /// A render target cannot be mapped, so a readback copies it into a staging texture first.
+    ///
+    /// Free rather than a method because [`Gpu`](super::Gpu) needs it too: its offscreen target
+    /// belongs to **its own** device, and the point of that path is to exercise the real `Gpu`
+    /// rather than a parallel one built alongside it.
+    pub(crate) fn read_target(
+        context: &ID3D11DeviceContext,
+        target: &ID3D11Texture2D,
+        staging: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<Pixels> {
+        unsafe { context.CopyResource(staging, target) };
+        let mut mapped = Default::default();
+        unsafe { context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+        let stride = mapped.RowPitch as usize;
+        let mut data = vec![0u8; stride * height as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(mapped.pData.cast::<u8>(), data.as_mut_ptr(), data.len());
+            context.Unmap(staging, 0);
+        }
+        Ok(Pixels {
+            data,
+            width,
+            stride,
+        })
+    }
+
+    /// A render target, its staging copy and a view, on a device the caller already owns.
+    pub(crate) fn make_target(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(ID3D11Texture2D, ID3D11Texture2D, ID3D11RenderTargetView)> {
+        let mut desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut target = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut target))? };
+        let target = target.expect("target out param is set on success");
+
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging))? };
+
+        let mut rtv = None;
+        unsafe { device.CreateRenderTargetView(&target, None, Some(&mut rtv))? };
+
+        Ok((
+            target,
+            staging.expect("staging out param is set on success"),
+            rtv.expect("rtv out param is set on success"),
+        ))
     }
 }
 
