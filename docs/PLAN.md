@@ -165,6 +165,14 @@ parity, **accessibility**) adds **≈ 28–36 weeks A**, of which accessibility 
   discount; applying it twice is how plans fail.
 - The owner's stated appetite is *full vision, however long it takes*. This plan therefore optimises
   for **a coherent shippable product at each milestone**, not for compressing the total.
+- **⚠ Nothing here was checked against what the work actually cost until session 15, and it should
+  have been from the start.** `EFFORT.md` now records active agent hours, output tokens and commits
+  per session, reconstructed back to day one from the transcripts. The headline: M0–M3's *exit
+  criteria* cost **~23 active hours and ~4.8 M output tokens** against a 25.5 person-week estimate —
+  which is not a 44× speed-up, because the milestones are met to their exit criteria and not as a
+  human would scope them, and because owner time is excluded entirely. Read `EFFORT.md`'s caveats
+  before quoting any ratio from it. **Estimate the next milestone in those units before starting it**;
+  a forecast written afterwards tells you nothing about how wrong the estimates are.
 
 ---
 
