@@ -35,9 +35,17 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-06 | 2.5 | 679 k | 14 | Cell model, glyph pass, shaping, raster |
 | 2026-08-07 | 5.9¹ | 940 k¹ | 11 | Grid, selection, bidi, hgrid, view, text pass |
 | 2026-08-11 | ¹ | ¹ | 5 | Rows, DPI, input, anchors, 50M-line run |
-| **Total** | **~23** | **~4.8 M** | **84** | **M0–M3, 31.6 k lines inserted** |
+| 2026-08-11 night | ¹ | ¹ | 7 | Offscreen test path, ASCII fast walk, review, effort record |
+| **Total** | **~24.5** | **~5.0 M** | **91** | **M0–M3, ~32 k lines inserted** |
 
-¹ 2026-08-07 and 2026-08-11 are one continuous session and the transcript does not separate them.
+¹ 2026-08-07 and 2026-08-11 are **one continuous session**, and the transcript does not separate
+them. Its combined figure is **6.6 active hours and 1.12 M output tokens** across 2,355 turns, which
+is the largest single session by a wide margin and covers most of M3 plus the whole overnight run.
+Splitting it would need per-turn attribution the extraction does not attempt.
+
+**⚠ The overnight portion is agent time with no owner time at all**, which makes it the cleanest
+datapoint in the table for "what does an agent-hour deliver" — and the least representative of how
+the project actually runs, since every other row had a human steering it turn by turn.
 
 ## Estimated against actual
 
