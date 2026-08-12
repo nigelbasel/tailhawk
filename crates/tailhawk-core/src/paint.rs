@@ -46,8 +46,17 @@
 //! Arabic backwards while looking finished is worse than one that admits it. So [`Laid::rtl_runs`]
 //! counts the runs this pass could not place, every caller can see it, and
 //! `an_arabic_row_reports_that_its_runs_are_not_placed` fails the day someone believes the problem
-//! is solved. Doing it properly means deciding whether a *column* is a logical or a visual position
-//! — which reaches into `selection.rs` and `cell.rs`, not just here.
+//! is solved.
+//!
+//! **The design question that blocked it has been answered: a column is a *logical* position**
+//! (`SPEC.md` §3.3, decided session 15). So `cell.rs` and `selection.rs` do not change, and the work
+//! is confined to two places that convert: this module, and `View::position_at`. They must land
+//! **together** — placing runs visually while the hit-test still answers logically puts the caret on
+//! the wrong character, which is worse than today's honest gap.
+//!
+//! The first step is not in this module. Bidi cannot be resolved from a horizontal slice, and
+//! `lay_out_row` shapes `&line[slice.bytes]` — so resolved levels must be computed for the whole
+//! line and carried per row, alongside the column anchors `rows.rs` already builds.
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 

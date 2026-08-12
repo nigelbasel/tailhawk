@@ -245,6 +245,28 @@ adding a leaf backend pair and a shell, not publishing an ABI.
 
 ### 3.3 The cell model — grapheme clusters, not characters
 
+**A cell column is a *logical* position — the Nth grapheme cluster in memory order — and never a
+visual one.** Decided by the owner, session 15, when RTL placement forced the question. The two
+coincide for Latin text and diverge for Arabic and Hebrew, and everything that speaks in columns
+(`Position`, selection, copy, and later search hits and bookmarks) means the logical one.
+
+Three consequences follow and are normative:
+
+- **Copy stays exact.** A logical column range is one contiguous byte span, which is what §5.6
+  requires; a visually contiguous range maps to a *discontiguous* set of byte ranges and could not be
+  copied without reordering or splitting.
+- **Painting and hit-testing convert.** Both use a per-row bidi map derived from resolved levels
+  (UAX #9 rule L2). Neither the cell model nor the selection model knows about it. Because bidi
+  cannot be resolved from a horizontal slice of a line, the renderer must resolve levels for the
+  **whole line** — shaping only the visible slice is valid only while placement is logical.
+- **A selection may be visually discontiguous.** One contiguous logical range crossing a direction
+  boundary draws as several highlight rectangles. That is correct, and the selection renderer takes
+  a list of rectangles per row rather than one span.
+
+**Rectangular (block) selection is the exception**: "the same column band on every row" is inherently
+visual, so it is expressed in visual columns and converted to per-row byte ranges when copied. It
+must not reuse the logical column type.
+
 The naive "one character = one fixed-width cell" assumption breaks on real log content and is
 **rejected**. The cell model is defined as:
 
