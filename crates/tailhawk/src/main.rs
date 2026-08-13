@@ -35,6 +35,7 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
+use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -43,13 +44,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer,
-    LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    IDC_ARROW, MSG, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_DESTROY, WM_DPICHANGED,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetScrollInfo,
+    KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, IDC_ARROW, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
+    SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
+    SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_DESTROY,
+    WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -57,6 +61,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// that does it, and it stops as soon as the device lands.
 const DEVICE_POLL_TIMER: usize = 1;
 const DEVICE_POLL_MS: u32 = 4;
+
+/// Scrollbar units. Fixed rather than the row count, so no file size can overflow `SCROLLINFO`'s
+/// `i32` -- the grid speaks in fractions at both ends and Win32 never sees a row number.
+const SCROLL_RANGE: i32 = 10_000;
 
 thread_local! {
     static STATE: RefCell<Option<Shell>> = const { RefCell::new(None) };
@@ -559,10 +567,44 @@ impl Shell {
         }
     }
 
+    /// Points the scrollbar at where the view actually is.
+    ///
+    /// **The range is a fixed 0..[`SCROLL_RANGE`] rather than the row count**, and that is the whole
+    /// trick: `SCROLLINFO` is `i32`, so a 50M-line file is fine but a large enough one would not be,
+    /// and scaling by row count would put the overflow in the future rather than removing it. The
+    /// grid already speaks in fractions — `thumb_fraction` and `scroll_to_fraction` — so the
+    /// scrollbar is a fraction at both ends and the row count never reaches Win32 at all.
+    fn sync_scrollbar(&self, hwnd: HWND) {
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
+        let grid = doc.view.grid();
+        let total = grid.total_rows();
+        let page = grid.page_rows().max(1);
+        // A file that fits on screen gets a full-width thumb and no travel, which is what
+        // `nPage >= nMax` means to Win32 — it disables the bar rather than showing a false position.
+        let page_units = if total <= page {
+            SCROLL_RANGE
+        } else {
+            ((SCROLL_RANGE as u64 * page) / total).max(1) as i32
+        };
+        let info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL,
+            nMin: 0,
+            nMax: SCROLL_RANGE,
+            nPage: page_units as u32,
+            nPos: (grid.thumb_fraction() * SCROLL_RANGE as f32).round() as i32,
+            nTrackPos: 0,
+        };
+        unsafe { SetScrollInfo(hwnd, SB_VERT, &info, true) };
+    }
+
     /// Applies a navigation intent and asks for a frame only if the view moved.
     fn navigate(&mut self, hwnd: HWND, n: Navigate) {
         let moved = self.document.as_mut().is_some_and(|doc| doc.navigate(n));
         if moved {
+            self.sync_scrollbar(hwnd);
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -641,6 +683,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     .as_mut()
                     .map(|shell| (shell.paint(hwnd), shell.needs_frame))
                     .unwrap_or((false, false))
+            });
+            // **After `paint`, because the layout is what decides the row count and page size.**
+            // `Document::lay_out` sets the viewport and total rows from the window and the index,
+            // so a thumb synced earlier describes the previous frame — visibly wrong on the first
+            // paint after opening a file, and after every resize. It is here rather than inside
+            // `paint` because the renderer is mutably borrowed for the whole of that function.
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow().as_ref() {
+                    shell.sync_scrollbar(hwnd);
+                }
             });
             if painted {
                 // The swapchain owns the pixels, so there is no BeginPaint/EndPaint pair here;
@@ -820,6 +872,64 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             });
             LRESULT(0)
         }
+        WM_VSCROLL => {
+            let code = (wparam.0 & 0xFFFF) as u32;
+            STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let Some(shell) = state.as_mut() else {
+                    return;
+                };
+                let Some(doc) = shell.document.as_mut() else {
+                    return;
+                };
+                const LINEUP: i32 = SB_LINEUP.0;
+                const LINEDOWN: i32 = SB_LINEDOWN.0;
+                const PAGEUP: i32 = SB_PAGEUP.0;
+                const PAGEDOWN: i32 = SB_PAGEDOWN.0;
+                const TOP: i32 = SB_TOP.0;
+                const BOTTOM: i32 = SB_BOTTOM.0;
+                const THUMBTRACK: i32 = SB_THUMBTRACK.0;
+                const THUMBPOSITION: i32 = SB_THUMBPOSITION.0;
+                let moved = match code as i32 {
+                    LINEUP => doc.navigate(Navigate::ByRows(-1)),
+                    LINEDOWN => doc.navigate(Navigate::ByRows(1)),
+                    PAGEUP => doc.navigate(Navigate::ByPages(-1)),
+                    PAGEDOWN => doc.navigate(Navigate::ByPages(1)),
+                    TOP => doc.navigate(Navigate::DocStart),
+                    BOTTOM => doc.navigate(Navigate::DocEnd),
+                    // **`SB_THUMBTRACK`, not only `SB_THUMBPOSITION`.** Handling the position alone
+                    // makes the view jump when the drag ends rather than following the thumb, which
+                    // reads as a broken scrollbar. `nTrackPos` is the live position and is the only
+                    // place it can be read from — `wParam`'s high word is 16-bit and would quantise
+                    // a 50M-line file into 65,536 steps.
+                    THUMBTRACK | THUMBPOSITION => {
+                        let mut info = SCROLLINFO {
+                            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                            fMask: SIF_TRACKPOS,
+                            ..Default::default()
+                        };
+                        unsafe { GetScrollInfo(hwnd, SB_VERT, &mut info) }
+                            .is_ok()
+                            .then(|| {
+                                let before = doc.view.grid().scroll();
+                                doc.view.grid_mut().scroll_to_fraction(
+                                    info.nTrackPos as f32 / SCROLL_RANGE as f32,
+                                );
+                                doc.view.grid().scroll() != before
+                            })
+                            == Some(true)
+                    }
+                    _ => false,
+                };
+                if moved {
+                    shell.sync_scrollbar(hwnd);
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
         WM_DPICHANGED => {
             // **Both halves are required and they are separate.** `lParam` carries the window rect
             // Windows wants for the new scale — honouring it is what makes a drag between monitors
@@ -938,7 +1048,7 @@ fn main() -> Result<()> {
             WINDOW_EX_STYLE::default(),
             class_name,
             windows::core::w!("Tailhawk"),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_VSCROLL,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1280,
