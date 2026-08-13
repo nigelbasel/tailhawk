@@ -204,17 +204,12 @@ mod tests {
             .expect("build");
         let mut f = Follow::after_build(UTF8, &index, start.len() as u64);
         let mut guard = 0;
-        loop {
-            match f
-                .poll(&whole[..], &mut index, whole.len() as u64)
-                .expect("poll")
-            {
-                Poll::Grew { more: true, .. } => {
-                    guard += 1;
-                    assert!(guard < 1000, "poll never reached the end");
-                }
-                _ => break,
-            }
+        while let Poll::Grew { more: true, .. } = f
+            .poll(&whole[..], &mut index, whole.len() as u64)
+            .expect("poll")
+        {
+            guard += 1;
+            assert!(guard < 1000, "poll never reached the end");
         }
         (index, whole)
     }
