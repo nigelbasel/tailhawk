@@ -450,7 +450,7 @@ impl Shell {
                     // `Rows` is the row source, so the painter reads its text and its column
                     // anchors by reference — the closure this replaced allocated a `String` per row
                     // per frame and had nowhere to put the anchors at all.
-                    let laid = renderer.paint_rows(&doc.view, &doc.rows)?;
+                    let laid = renderer.paint_rows(&doc.view, &*doc)?;
                     rasterised = laid.rasterised;
                     Ok(())
                 }
