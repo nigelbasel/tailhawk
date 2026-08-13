@@ -631,6 +631,45 @@ mod tests {
         drop(off);
     }
 
+    /// **A selected range reaches the quads as a different ink.**
+    ///
+    /// The model half of selection was tested and passing while the feature was **invisible on
+    /// screen**, because the shell handed the painter the wrong object and `row_selection` fell back
+    /// to its default `None`. A test that calls `row_selection` directly cannot see that; this one
+    /// goes through `lay_out` and inspects the instances, which is the path that was broken.
+    #[test]
+    fn a_selected_range_is_drawn_in_the_selection_ink() {
+        let Some((_off, mut painter)) = painter_or_skip("a_selected_range_is_drawn") else {
+            return;
+        };
+        let view = view_for(&painter, 4, 200);
+
+        // Rows 0 and 2 carry a selection; row 1 carries none.
+        struct Selected(Vec<String>);
+        impl RowSource for Selected {
+            fn row_text(&self, row: u64) -> Option<&str> {
+                self.0.get(usize::try_from(row).ok()?).map(String::as_str)
+            }
+            fn row_selection(&self, row: u64) -> Option<core::ops::Range<usize>> {
+                (row != 1).then_some(0..4)
+            }
+        }
+        let source = Selected(vec!["aaaaaaaa".to_owned(); 3]);
+
+        painter.begin_frame();
+        painter.lay_out(&view, INK, &source).expect("lay out");
+        let selected = painter
+            .instances()
+            .iter()
+            .filter(|i| i.tint == SELECTION_INK)
+            .count();
+        let plain = painter.instances().iter().filter(|i| i.tint == INK).count();
+
+        assert!(selected > 0, "nothing was drawn in the selection ink");
+        assert!(plain > 0, "every glyph was drawn as selected");
+        assert_eq!(selected, 8, "expected four columns on each of two rows");
+    }
+
     #[test]
     fn a_row_with_no_text_yet_draws_nothing_and_does_not_fail() {
         let Some((off, mut painter)) = painter_or_skip("a_row_with_no_text_yet_draws_nothing")
