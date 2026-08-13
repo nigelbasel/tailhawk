@@ -19,8 +19,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use tailhawk_core::indexer::{build_index, IndexOptions};
 use tailhawk_core::{
-    background_rgb8, Charset, FileSource, LineIndex, LogFile, Renderer, RowEnd, RowSource, Rows,
-    Selection, View, WindowHandle, RENDER_CAP_CELLS,
+    background_rgb8, Charset, FileSource, Follow, LineIndex, LogFile, Poll, Renderer, RowEnd,
+    RowSource, Rows, Selection, View, WindowHandle, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
@@ -62,6 +62,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const DEVICE_POLL_TIMER: usize = 1;
 const DEVICE_POLL_MS: u32 = 4;
 
+/// Polls the file for new bytes. 100 ms is well under what a reader notices and well over what a
+/// `GetFileSizeEx` on an open handle costs, and it keeps tailing off the critical path entirely.
+const FOLLOW_TIMER: usize = 2;
+const FOLLOW_POLL_MS: u32 = 100;
+
 /// Scrollbar units. Fixed rather than the row count, so no file size can overflow `SCROLLINFO`'s
 /// `i32` -- the grid speaks in fractions at both ends and Win32 never sees a row number.
 const SCROLL_RANGE: i32 = 10_000;
@@ -89,6 +94,8 @@ struct Document {
     selection: Option<Selection>,
     /// Whether the left button is down, so `WM_MOUSEMOVE` can tell a drag from a hover.
     dragging: bool,
+    /// Where the index has been scanned to, so a tick only reads what is new.
+    follow: Follow,
 }
 
 impl RowSource for Document {
@@ -141,11 +148,14 @@ impl Document {
             .map_err(|e| describe(&e))?;
 
         let flag = if detection.disagreed { " (mixed?)" } else { "" };
-        let summary = format!(
-            "{name}: {}{flag}, {} lines, {end} bytes",
-            charset.name(),
-            index.line_count()
-        );
+        // Only the fixed part. The counts change while following, so they are formatted per read
+        // rather than frozen at open -- a tail whose title says "1 lines" while sixty scroll past is
+        // worse than no title at all.
+        let summary = format!("{name}: {}{flag}", charset.name());
+
+        // Built before the index moves into the struct, because it reads the index to learn whether
+        // the file ends on a terminator.
+        let follow = Follow::after_build(charset, &index, end);
 
         Ok(Self {
             rows: Rows::new(charset),
@@ -156,6 +166,7 @@ impl Document {
             charset,
             file,
             summary,
+            follow,
             selection: None,
             dragging: false,
         })
@@ -191,6 +202,49 @@ impl Document {
         let _ = self
             .rows
             .fetch(&self.file, &self.index, first, count, anchored);
+    }
+
+    /// The title text, rebuilt from the live counts.
+    fn describe(&self) -> String {
+        format!(
+            "{}, {} lines, {} bytes",
+            self.summary,
+            self.index.line_count(),
+            self.follow.scanned_to()
+        )
+    }
+
+    /// Scans whatever the writer has appended since the last tick.
+    ///
+    /// **`was_following` is read before the index grows, and that ordering is the whole of tailing.**
+    /// `Grid::is_following` is derived from being at the bottom, so once `set_total_rows` has taken
+    /// the new count the old position is no longer the bottom and the answer is always false. Asking
+    /// first is what distinguishes "the user is watching the tail" from "the user scrolled up", and
+    /// getting it the wrong way round would either pin a reader who had scrolled back or fail to
+    /// follow at all.
+    ///
+    /// The `Rows` cache needs no explicit invalidation here: its key carries `index.line_count()`,
+    /// which changes the moment a line is appended. **That is not true of §5.5's copy-truncate**,
+    /// where contents change under a stable count — but that is rotation, which this does not handle.
+    fn poll_follow(&mut self) -> bool {
+        let Ok(len) = self.file.len() else {
+            return false;
+        };
+        let was_following = self.view.grid().is_following();
+        let grew = match self.follow.poll(&self.file, &mut self.index, len) {
+            Ok(Poll::Grew { lines, .. }) => lines > 0,
+            // Truncation or rotation. Not handled yet, and deliberately not guessed at — the file
+            // stays as it was until §5.5's component exists.
+            Ok(Poll::Shrank { .. }) | Ok(Poll::Unchanged) | Err(_) => false,
+        };
+        if !grew {
+            return false;
+        }
+        self.view.grid_mut().set_total_rows(self.index.line_count());
+        if was_following {
+            self.view.grid_mut().scroll_to_bottom();
+        }
+        true
     }
 
     /// Starts, extends or replaces the selection from a click in the client area.
@@ -389,9 +443,13 @@ impl Shell {
         match rx.try_recv() {
             Ok(Ok(document)) => {
                 self.reading = None;
-                self.file = Some(document.summary.clone());
+                self.file = Some(document.describe());
                 self.document = Some(document);
                 self.refresh_title(hwnd);
+                // Tailing starts the moment there is something to tail.
+                unsafe {
+                    SetTimer(hwnd, FOLLOW_TIMER, FOLLOW_POLL_MS, None);
+                }
                 // The file only becomes visible on the next frame, and nothing else will ask for
                 // one — the window is otherwise idle once the device has landed.
                 unsafe {
@@ -675,6 +733,35 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     shell.poll_file(hwnd);
                 }
             });
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == FOLLOW_TIMER => {
+            // **The scan is bounded, so this cannot hold the message loop.** `Follow::poll` stops at
+            // its byte budget and says whether more is waiting; a writer producing faster than the
+            // tick just takes several ticks to catch up, which is §11.3's requirement — the UI stays
+            // responsive, not every append lands in one go.
+            let grew = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .and_then(|shell| shell.document.as_mut())
+                    .is_some_and(Document::poll_follow)
+            });
+            if grew {
+                // The counts moved, so the title is now wrong until it is rebuilt.
+                STATE.with(|s| {
+                    let mut state = s.borrow_mut();
+                    if let Some(shell) = state.as_mut() {
+                        if let Some(doc) = shell.document.as_ref() {
+                            shell.file = Some(doc.describe());
+                        }
+                        shell.refresh_title(hwnd);
+                        shell.sync_scrollbar(hwnd);
+                    }
+                });
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
             LRESULT(0)
         }
         WM_PAINT => {
