@@ -133,6 +133,21 @@ impl Extent {
     /// because a fragment only becomes a complete line once the run is known to be the whole file:
     /// the leading fragment is line 0, and the trailing fragment is the last line, which has no
     /// terminator after it.
+    /// Whether the run's **last bytes** are a line terminator.
+    ///
+    /// Not the same question as [`terminated`](Self::terminated), which asks whether there is a
+    /// terminator anywhere — a run ending mid-line contains plenty. This one is what following
+    /// needs: a terminator at the very end opens a line start that is not yet a line, which
+    /// `build_index` pops and `crate::follow` has to put back the moment more bytes arrive.
+    pub fn ends_on_terminator(self) -> bool {
+        self.terminated && self.tail == 0
+    }
+
+    /// Whether the run contains a terminator at all. A run without one is a single fragment.
+    pub fn terminated(self) -> bool {
+        self.terminated
+    }
+
     pub fn max_line_bytes(self) -> u64 {
         self.max_complete.max(self.head).max(self.tail)
     }

@@ -13,6 +13,7 @@ pub mod atlas;
 pub mod bidi;
 pub mod cell;
 pub mod encoding;
+pub mod follow;
 pub mod grid;
 pub mod hgrid;
 pub mod index;
@@ -62,6 +63,7 @@ pub use atlas::{
 pub use bidi::{reorder, visual_order};
 pub use cell::{Cell, CellModel};
 pub use encoding::{detect, Charset, Confidence, Detection, Sample};
+pub use follow::{Follow, Poll, FOLLOW_BUDGET_BYTES};
 pub use grid::{Grid, PlacedRow, Scroll};
 pub use hgrid::{HGrid, MAX_CELL_WIDTH_PX, RENDER_CAP_CELLS};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
