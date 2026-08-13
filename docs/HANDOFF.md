@@ -1,5 +1,46 @@
 # Handoff — resume here
 
+## ✅ M4 so far — following and rotation — 2026-08-13, session 15
+
+**Tailhawk tails.** It follows a growing file, survives two of §5.5's three rotation modes, and has
+been pointed at its own activity log while that log was being written.
+
+| | |
+|---|---|
+| Following a live writer | 1 line/16 bytes → 61 lines/2047 bytes, view pinned to the bottom |
+| Rename-and-recreate | reattached, then followed generation 2 |
+| Copy-truncate | reattached, then followed generation 3 |
+| Tailing `logs/agent.log` | 48 lines/5717 bytes → 56/6509 while being appended to |
+
+**Ordering is the whole of both features.** `is_following` is derived from being at the bottom, so it
+must be read **before** `set_total_rows` takes the new count — after it, the old position is never
+the bottom and a tail would never pin. Rotation is checked **before** growth, or a replaced file's
+length gets applied to the old file's scan position.
+
+The `Rows` cache needed no explicit invalidation for growth: its key carries `line_count`. It still
+cannot see copy-truncate under a stable count, which is why rotation is detected separately.
+
+### ⚠ The drain is ordered correctly and achieves nothing yet
+
+§5.5 says the old handle is drained to EOF before switching — "this is where naive tools lose the
+last KB" — and it is. **But the drained lines go into an index that `reattach` immediately discards**,
+because in a single-file view the previous file is no longer the document. `rotation.rs`'s test
+proves the bytes are *reachable* through the old handle after the rename; nothing yet keeps them.
+
+The requirement only becomes real with **§5.5b rolling sets**, where the old member stays in the
+scrollback. The drain is kept because it is the correct order and would have to be reinstated
+verbatim — not because "never lose the last KB" is delivered. It is not.
+
+### ⚠ Also outstanding in M4
+
+- **Roll-to-new-name — Serilog's and NLog's *default*.** Invisible to file-side detection: the
+  written-to path never changes identity and never shrinks. `a_roll_to_a_new_name_is_invisible_to_
+  file_side_detection` asserts that rather than leaving it looking covered. Needs §5.5b.
+- **The "file truncated" separator row** §5.5 asks for. A rendering feature, not attempted.
+- **Rolling sets (E30)** and **stdin (E16)** — untouched.
+- **50 MB/s × 60 s** — the throughput criterion has not been run. `FOLLOW_BUDGET_BYTES` is 4 MB a
+  tick at 100 ms, so ~40 MB/s is the ceiling by construction; the criterion may need a shorter tick.
+
 ## 📓 There is an activity log now — `logs/agent.log`
 
 The owner asked to be able to see what is being done while it happens, rather than only in the

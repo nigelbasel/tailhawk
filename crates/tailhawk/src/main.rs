@@ -19,8 +19,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use tailhawk_core::indexer::{build_index, IndexOptions};
 use tailhawk_core::{
-    background_rgb8, Charset, FileSource, Follow, LineIndex, LogFile, Poll, Renderer, RowEnd,
-    RowSource, Rows, Selection, View, WindowHandle, RENDER_CAP_CELLS,
+    background_rgb8, Charset, FileSource, Follow, LineIndex, LogFile, Poll, Renderer, Rotation,
+    RowEnd, RowSource, Rows, Selection, View, Watch, WindowHandle, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
@@ -96,6 +96,8 @@ struct Document {
     dragging: bool,
     /// Where the index has been scanned to, so a tick only reads what is new.
     follow: Follow,
+    /// The path, and the identity of the file we hold, so a roll is noticed. §5.5.
+    watch: Watch,
 }
 
 impl RowSource for Document {
@@ -156,6 +158,7 @@ impl Document {
         // Built before the index moves into the struct, because it reads the index to learn whether
         // the file ends on a terminator.
         let follow = Follow::after_build(charset, &index, end);
+        let watch = Watch::new(path, file.identity().map_err(|e| describe(&e))?);
 
         Ok(Self {
             rows: Rows::new(charset),
@@ -167,6 +170,7 @@ impl Document {
             file,
             summary,
             follow,
+            watch,
             selection: None,
             dragging: false,
         })
@@ -214,6 +218,42 @@ impl Document {
         )
     }
 
+    /// Reattaches to whatever is at the path now, after a rotation.
+    ///
+    /// **The drain happens before this is called, not inside it** — see `poll_follow`. By the time
+    /// control arrives here the old handle has been read to EOF and its lines are in the index we
+    /// are about to throw away, which is the only order that does not lose the last writes before a
+    /// roll (§5.5).
+    ///
+    /// Everything derived from the old file goes at once: the index, the follow position, the row
+    /// window, and the selection — which addressed rows that no longer exist. Keeping any of it
+    /// would be a viewer showing one file's text at another file's offsets.
+    fn reattach(&mut self, file: LogFile) -> bool {
+        let Ok(identity) = file.identity() else {
+            return false;
+        };
+        let Ok(end) = file.len() else {
+            return false;
+        };
+        let Ok(index) = build_index(&file, self.charset, 0, end, &IndexOptions::default()) else {
+            return false;
+        };
+
+        self.follow = Follow::after_build(self.charset, &index, end);
+        self.index = index;
+        self.file = file;
+        self.watch.adopt(identity);
+        self.rows = Rows::new(self.charset);
+        self.selection = None;
+        self.dragging = false;
+
+        self.view.grid_mut().set_total_rows(self.index.line_count());
+        // A tail that rolls should keep tailing. §5.5 wants a separator row here too, which is a
+        // rendering feature and is not done — recorded in `HANDOFF.md` rather than half-drawn.
+        self.view.grid_mut().scroll_to_bottom();
+        true
+    }
+
     /// Scans whatever the writer has appended since the last tick.
     ///
     /// **`was_following` is read before the index grows, and that ordering is the whole of tailing.**
@@ -230,6 +270,45 @@ impl Document {
         let Ok(len) = self.file.len() else {
             return false;
         };
+
+        // **Rotation is checked before growth**, because a file that has been replaced must not have
+        // the new file's length applied to the old file's scan position.
+        //
+        // §5.5 wants the old handle drained to EOF before switching, because a writer that rolls has
+        // usually just written its last lines to the file it is abandoning. That is done below —
+        // and **⚠ it currently achieves nothing, which is stated here rather than left to be
+        // discovered.** The drained lines go into an index that `reattach` immediately throws away,
+        // because in a single-file view the previous file is no longer the document. The requirement
+        // only becomes real with §5.5b's rolling sets, where the old member stays in the scrollback
+        // and those lines remain reachable. The drain is kept because it is the correct *order* and
+        // because removing it would have to be reinstated verbatim; it is not evidence that "never
+        // lose the last KB" is delivered. See `HANDOFF.md`.
+        match self.watch.check(len, self.follow.scanned_to()) {
+            Rotation::Stable => {}
+            Rotation::Missing => {
+                // `tail -F`: keep the handle, keep reading it, wait for the path to come back.
+            }
+            Rotation::Truncated => {
+                if let Ok(file) = self.watch.open_current() {
+                    return self.reattach(file);
+                }
+                return false;
+            }
+            Rotation::Replaced => {
+                let mut guard = 0;
+                while let Ok(Poll::Grew { .. }) = self.follow.poll(&self.file, &mut self.index, len)
+                {
+                    guard += 1;
+                    if guard > 1_000 {
+                        break;
+                    }
+                }
+                if let Ok(file) = self.watch.open_current() {
+                    return self.reattach(file);
+                }
+                return false;
+            }
+        }
         let was_following = self.view.grid().is_following();
         let grew = match self.follow.poll(&self.file, &mut self.index, len) {
             Ok(Poll::Grew { lines, .. }) => lines > 0,
