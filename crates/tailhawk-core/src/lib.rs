@@ -40,6 +40,9 @@ pub mod paint;
 pub mod raster;
 
 #[cfg(windows)]
+pub mod rotation;
+
+#[cfg(windows)]
 pub mod shape;
 
 #[cfg(windows)]
@@ -56,6 +59,9 @@ pub use gpu::Driver;
 
 #[cfg(windows)]
 pub use file::{FileError, FileIdentity, FileSource, LogFile};
+
+#[cfg(windows)]
+pub use rotation::{Rotation, Watch};
 
 pub use atlas::{
     Atlas, FaceId, GlyphId, GlyphKey, Ink, InsertError, Placement, Residency, SlotId, Synthetic,
