@@ -3,3 +3,6 @@
 /target-verify
 /target-verify-static
 *.pdb
+
+# The agent activity log — a running record for the owner to tail, not history.
+logs/

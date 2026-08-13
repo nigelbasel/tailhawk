@@ -1,5 +1,27 @@
 # Handoff — resume here
 
+## 📓 There is an activity log now — `logs/agent.log`
+
+The owner asked to be able to see what is being done while it happens, rather than only in the
+summary afterwards. `tools/agentlog.sh` appends one timestamped line per meaningful action:
+
+```bash
+tools/agentlog.sh INFO edit "cell.rs — hoisted the ASCII singleton test"
+tail -f logs/agent.log        # or open it in Tailhawk
+```
+
+**`logs/` is gitignored.** It is a running record for the owner, not project history — the commit
+messages and this file are where history belongs, and duplicating it would guarantee the two drift.
+
+**The format is deliberately an ordinary log rather than JSON**, because the point of it is to be
+read by *Tailhawk itself* once following lands in M4: ISO-8601 UTC with milliseconds, a level, a
+short action word, and free text. It exercises timestamp parsing, level colouring and long lines on
+content the owner actually cares about — the best dogfood fixture available, and one that cannot
+leak employer or customer identity the way the real corpora do.
+
+**⚠ It only works if it is written to as work happens.** A log filled in retrospectively at the end
+of a session is a summary wearing a timestamp, and is worth less than nothing because it looks live.
+
 ## 🌙 Overnight session, 2026-08-11 → 12 — **decisions taken without you, for review**
 
 The owner left the session running and asked for assumptions and decisions to be written down rather
