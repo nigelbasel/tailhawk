@@ -117,6 +117,15 @@ pub const DEFAULT_PX_PER_EM: u16 = 16;
 /// The grid's foreground. Provisional alongside [`BACKGROUND`] — `UI-DESIGN.md` §10 pins no hex.
 pub const INK: [f32; 4] = [0.878, 0.890, 0.906, 1.0];
 
+/// Selected text, until there is a background pass to highlight it properly.
+///
+/// **⚠ This is a stand-in for a highlight, not a colour choice.** `SPEC.md` §3.2 plans one instanced
+/// draw carrying foreground *and* background per instance, which is how a selection should look;
+/// `Instance` has no background field yet and adding one changes the glyph shader and the offline
+/// `fxc` build. Re-tinting the glyphs needs no new pipeline and consumes exactly the per-row column
+/// range a background pass would, so nothing is thrown away when it arrives.
+pub const SELECTION_INK: [f32; 4] = [0.45, 0.72, 1.0, 1.0];
+
 /// Errors that cross the seam. Deliberately opaque — the shell can report one but cannot act on
 /// the distinction, and `SPEC.md` §3.2 forbids panicking on device loss.
 #[derive(Debug)]

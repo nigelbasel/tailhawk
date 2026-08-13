@@ -74,6 +74,20 @@ pub trait RowSource {
     fn row_anchors(&self, _row: u64) -> &ColumnAnchors {
         ColumnAnchors::none_ref()
     }
+
+    /// The **cell columns** selected on this row, if any.
+    ///
+    /// Columns rather than bytes, because `SPEC.md` §3.3 makes a column the unit a selection is
+    /// expressed in and the painter is already placing clusters by column — converting to bytes here
+    /// would mean converting straight back. `usize::MAX` as the end means "to the end of the line",
+    /// which is what [`RowEnd::ToLineEnd`](crate::selection::RowEnd) means and what a stream
+    /// selection produces for every row but its last.
+    ///
+    /// Defaulted to `None` so a source that knows nothing about selection — every test source, and
+    /// `Rows` itself — is unaffected.
+    fn row_selection(&self, _row: u64) -> Option<core::ops::Range<usize>> {
+        None
+    }
 }
 
 impl RowSource for Rows {

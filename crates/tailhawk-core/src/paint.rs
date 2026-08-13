@@ -67,6 +67,7 @@ use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline};
 use crate::view::View;
 use crate::Result;
+use crate::SELECTION_INK;
 
 /// What one row's layout produced, beyond the quads themselves.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -170,7 +171,8 @@ impl Painter {
             let Some(line) = source.row_text(row) else {
                 continue;
             };
-            match self.lay_out_row(view, line, source.row_anchors(row), y, tint) {
+            let selected = source.row_selection(row);
+            match self.lay_out_row(view, line, source.row_anchors(row), selected, y, tint) {
                 Ok(laid) => total.merge(laid),
                 Err(_) => total.failed_rows += 1,
             }
@@ -184,6 +186,7 @@ impl Painter {
         view: &View,
         line: &str,
         anchors: &ColumnAnchors,
+        selected: Option<core::ops::Range<usize>>,
         y: f32,
         tint: [f32; 4],
     ) -> Result<Laid> {
@@ -226,6 +229,19 @@ impl Painter {
             let at = column;
             column += cells;
 
+            // **A selected cluster is drawn in a different ink, and that is deliberately not a
+            // highlight rectangle.** §3.2 plans one instanced draw carrying foreground *and*
+            // background colour per instance, which is how a selection should eventually look, but
+            // `Instance` has no background field and adding one means changing the glyph shader and
+            // the offline `fxc` build. Re-tinting is the whole of the visual feedback until then:
+            // it needs no new pipeline, and the per-row column range it consumes is the same thing
+            // the eventual background pass will need. Recorded as a gap in `HANDOFF.md` rather than
+            // presented as the finished look.
+            let ink = match &selected {
+                Some(range) if at >= range.start && at < range.end => SELECTION_INK,
+                _ => tint,
+            };
+
             // **After the advance, never before.** A cluster absorbed into a preceding ligature
             // draws nothing of its own but still occupies its cells, and skipping the advance
             // would shift the rest of the row left by one cluster per ligature.
@@ -257,7 +273,7 @@ impl Painter {
                     shaped.glyphs[i],
                     (pen + offset.advance).min(last_x),
                     baseline_y - offset.ascender,
-                    tint,
+                    ink,
                 ) {
                     self.instances.push(quad);
                     laid.quads += 1;
@@ -433,7 +449,7 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), 0.0, INK)
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, 0.0, INK)
             .expect("lay out");
 
         // Rebuild the expected column x for every cluster and require a quad to start there. The
@@ -480,7 +496,7 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), 0.0, INK)
+            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), None, 0.0, INK)
             .expect("lay out");
 
         // Column 0 is the whole `a` + tags cluster. Nothing it emits may reach column 1, where the
@@ -514,7 +530,14 @@ mod tests {
 
         painter.begin_frame();
         let laid = painter
-            .lay_out_row(&view, "ابب logged out", ColumnAnchors::none_ref(), 0.0, INK)
+            .lay_out_row(
+                &view,
+                "ابب logged out",
+                ColumnAnchors::none_ref(),
+                None,
+                0.0,
+                INK,
+            )
             .expect("lay out");
         assert!(
             laid.rtl_runs > 0,
@@ -577,6 +600,7 @@ mod tests {
                         &view,
                         &line,
                         ColumnAnchors::none_ref(),
+                        None,
                         row as f32 * painter.row_height(),
                         INK,
                     )
@@ -638,7 +662,7 @@ mod tests {
         view.hgrid_mut().scroll_to_column(4);
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), 0.0, INK)
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, 0.0, INK)
             .expect("lay out");
         let leftmost = painter
             .instances()
@@ -699,7 +723,7 @@ mod tests {
         for (name, line) in &cases {
             painter.begin_frame();
             painter
-                .lay_out_row(&view, line, ColumnAnchors::none_ref(), 0.0, INK)
+                .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, 0.0, INK)
                 .unwrap_or_else(|e| panic!("{name} failed to shape: {e:?} — see this test's note"));
         }
 

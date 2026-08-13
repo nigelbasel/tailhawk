@@ -19,20 +19,28 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use tailhawk_core::indexer::{build_index, IndexOptions};
 use tailhawk_core::{
-    background_rgb8, Charset, FileSource, LineIndex, LogFile, Renderer, Rows, View, WindowHandle,
-    RENDER_CAP_CELLS,
+    background_rgb8, Charset, FileSource, LineIndex, LogFile, Renderer, RowEnd, RowSource, Rows,
+    Selection, View, WindowHandle, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemServices::MK_SHIFT;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_B, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
-    VK_SPACE, VK_UP,
+    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_C, VK_CONTROL, VK_DOWN,
+    VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer,
@@ -40,8 +48,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     IDC_ARROW, MSG, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_DESTROY, WM_DPICHANGED,
-    WM_KEYDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -66,6 +74,38 @@ struct Document {
     rows: Rows,
     view: View,
     summary: String,
+    /// The current selection, or `None` for "nothing selected".
+    ///
+    /// A caret — an empty selection at a click — is `Some`, not `None`: `Selection::at` exists so a
+    /// click that selects nothing still records **where** the next shift-click extends from.
+    selection: Option<Selection>,
+    /// Whether the left button is down, so `WM_MOUSEMOVE` can tell a drag from a hover.
+    dragging: bool,
+}
+
+impl RowSource for Document {
+    fn row_text(&self, row: u64) -> Option<&str> {
+        self.rows.row_text(row)
+    }
+
+    fn row_anchors(&self, row: u64) -> &tailhawk_core::cell::ColumnAnchors {
+        self.rows.row_anchors(row)
+    }
+
+    /// **The one thing `Rows` cannot answer**, and the reason `Document` is now the painter's source
+    /// rather than `Rows` directly: the selection lives here, the text lives there, and the painter
+    /// needs both for the same row in the same frame.
+    ///
+    /// `usize::MAX` carries [`RowEnd::ToLineEnd`], so the painter can tint to the right edge without
+    /// being told how long the line is.
+    fn row_selection(&self, row: u64) -> Option<std::ops::Range<usize>> {
+        let span = self.selection?.row_span(row)?;
+        let end = match span.end {
+            RowEnd::ToLineEnd => usize::MAX,
+            RowEnd::Cell(cell) => cell,
+        };
+        (span.start_cell < end).then_some(span.start_cell..end)
+    }
 }
 
 impl Document {
@@ -108,6 +148,8 @@ impl Document {
             charset,
             file,
             summary,
+            selection: None,
+            dragging: false,
         })
     }
 
@@ -141,6 +183,78 @@ impl Document {
         let _ = self
             .rows
             .fetch(&self.file, &self.index, first, count, anchored);
+    }
+
+    /// Starts, extends or replaces the selection from a click in the client area.
+    ///
+    /// `x` and `y` are client-relative device pixels, which is what `View::position_at` takes — the
+    /// grid has no other origin, and converting anywhere else is one more place to get the scroll
+    /// offset wrong. A click outside the drawn rows, or right of the widest line, is **not** a
+    /// position and is ignored rather than clamped: inventing one puts the caret where the user did
+    /// not click.
+    fn select(&mut self, x: f32, y: f32, what: Selecting) -> bool {
+        let Some(at) = self.view.position_at(x, y) else {
+            return false;
+        };
+        let before = self.selection;
+        match what {
+            Selecting::Start => {
+                self.selection = Some(Selection::at(at));
+                self.dragging = true;
+            }
+            Selecting::Extend => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.set_focus(at);
+                } else {
+                    self.selection = Some(Selection::at(at));
+                }
+            }
+            Selecting::Word => {
+                // A word needs the row's text, and only the fetched window has it. Falling back to a
+                // caret is honest; guessing a span from a line we cannot see is not.
+                self.selection = Some(match self.rows.line(at.row) {
+                    Some(line) => Selection::word(self.view.cells(), at.row, line, at.cell),
+                    None => Selection::at(at),
+                });
+            }
+            Selecting::Line => self.selection = Some(Selection::line(at.row)),
+        }
+        self.selection != before
+    }
+
+    /// The selected text, exactly as it is in the file.
+    ///
+    /// **§5.6: the bytes are the file's, not a re-rendering of them**, which is why this goes
+    /// through `Selection::byte_range` rather than slicing by column. `byte_range` rounds both ends
+    /// *outwards* to whole clusters, so a zero-width character sitting on the boundary — the bidi
+    /// override of §13.4's Trojan Source line — is copied rather than silently dropped. Slicing by
+    /// column would drop it, and the user would paste something that reads differently from what
+    /// they selected.
+    ///
+    /// Rows are joined with `\n` rather than the file's own terminators, because a selection can
+    /// span rows whose terminators disagree; `RowSpan::line_break` says whether a row's break is
+    /// inside the selection at all.
+    ///
+    /// **⚠ Only rows in the fetched window can be copied.** `Rows` holds one screenful, so a
+    /// selection dragged past it yields the rows it can see. A real limit, recorded in `HANDOFF.md`.
+    fn copy_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for row in sel.first_row()..=sel.last_row() {
+            let Some(line) = self.rows.line(row) else {
+                continue;
+            };
+            if let Some(bytes) = sel.byte_range(self.view.cells(), row, line) {
+                out.push_str(&line[bytes]);
+            }
+            if sel.row_span(row).is_some_and(|s| s.line_break) {
+                out.push('\n');
+            }
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     /// Applies one navigation intent. Returns whether anything actually moved.
@@ -192,6 +306,19 @@ enum Navigate {
     LineEnd,
 }
 
+/// What a mouse event means for the selection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Selecting {
+    /// Left button down: a caret, and the anchor a drag will extend from.
+    Start,
+    /// Dragging, or shift-clicking: move the focus and keep the anchor.
+    Extend,
+    /// Double-click.
+    Word,
+    /// Triple-click.
+    Line,
+}
+
 struct Shell {
     /// `None` until the worker hands the device over. While it is `None` the class background
     /// brush is doing the painting — stage one of the two-stage paint.
@@ -205,6 +332,8 @@ struct Shell {
     document: Option<Document>,
     /// Set by [`Shell::paint`] when the frame rasterised glyphs, and acted on by `WM_PAINT` **after**
     /// it has validated the update region. See the comment in `paint`.
+    /// When and where the last double-click landed, so the next click can be read as a triple.
+    last_double: Option<(u32, f32, f32)>,
     needs_frame: bool,
 }
 
@@ -373,6 +502,63 @@ impl Shell {
         }
     }
 
+    fn is_dragging(&self) -> bool {
+        self.document.as_ref().is_some_and(|d| d.dragging)
+    }
+
+    fn end_drag(&mut self) {
+        if let Some(doc) = self.document.as_mut() {
+            doc.dragging = false;
+        }
+    }
+
+    /// Applies a selection change, and reports whether anything changed so a frame can be skipped.
+    fn select(&mut self, x: f32, y: f32, what: Selecting) -> bool {
+        self.document
+            .as_mut()
+            .is_some_and(|doc| doc.select(x, y, what))
+    }
+
+    /// Puts the selection on the clipboard as `CF_UNICODETEXT`.
+    ///
+    /// **The clipboard takes ownership of the handle when `SetClipboardData` succeeds**, so the
+    /// `GlobalFree` is on the failure path only — freeing after a successful hand-over is a double
+    /// free of memory the system now owns. `CloseClipboard` runs on every path, including the ones
+    /// that fail, because leaving it open locks every other application out of the clipboard.
+    fn copy(&self) -> bool {
+        let Some(text) = self.document.as_ref().and_then(Document::copy_text) else {
+            return false;
+        };
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = std::mem::size_of_val(wide.as_slice());
+
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return false;
+            }
+            let _ = EmptyClipboard();
+            let Ok(handle) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+                let _ = CloseClipboard();
+                return false;
+            };
+            let dst = GlobalLock(handle);
+            if dst.is_null() {
+                let _ = GlobalFree(handle);
+                let _ = CloseClipboard();
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), dst.cast::<u16>(), wide.len());
+            let _ = GlobalUnlock(handle);
+
+            let ok = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(handle.0)).is_ok();
+            if !ok {
+                let _ = GlobalFree(handle);
+            }
+            let _ = CloseClipboard();
+            ok
+        }
+    }
+
     /// Applies a navigation intent and asks for a frame only if the view moved.
     fn navigate(&mut self, hwnd: HWND, n: Navigate) {
         let moved = self.document.as_mut().is_some_and(|doc| doc.navigate(n));
@@ -389,6 +575,12 @@ impl Shell {
             let _ = renderer.resize(w, h);
         }
     }
+}
+
+/// Milliseconds since boot, for the triple-click window. The caller uses `wrapping_sub`, which
+/// is correct across the 49-day rollover.
+fn now_ms() -> u32 {
+    unsafe { GetTickCount() }
 }
 
 /// The user's lines-per-notch setting.
@@ -524,6 +716,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             const B: u16 = VK_B.0;
             const HOME: u16 = VK_HOME.0;
             const END: u16 = VK_END.0;
+            const C: u16 = VK_C.0;
+
+            // `UI-DESIGN.md` §12: Ctrl+C copies the selection raw. Handled before the navigation
+            // map because C is not a navigation key and must not fall through to DefWindowProcW.
+            if ctrl && wparam.0 as u16 == C {
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow().as_ref() {
+                        shell.copy();
+                    }
+                });
+                return LRESULT(0);
+            }
             // `UI-DESIGN.md` §12's navigation map. Everything else in that table needs a feature
             // that does not exist yet, so it is not bound to a no-op here.
             let n = match wparam.0 as u16 {
@@ -553,6 +757,68 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
             }
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MOUSEMOVE | WM_LBUTTONUP => {
+            // Client-relative already, and **signed**: a drag above the window gives a negative y,
+            // which `position_at` rejects rather than clamping to row 0.
+            let x = (lparam.0 & 0xFFFF) as i16 as f32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+            let shift = wparam.0 as u32 & MK_SHIFT.0 != 0;
+            let held = wparam.0 as u32 & MK_LBUTTON.0 != 0;
+
+            STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let Some(shell) = state.as_mut() else {
+                    return;
+                };
+                let moved = match msg {
+                    WM_LBUTTONDOWN => {
+                        // **Capture, so a drag that leaves the window still ends.** Without it the
+                        // button-up goes to whatever is under the pointer and the grid stays stuck
+                        // in dragging for ever.
+                        unsafe { SetCapture(hwnd) };
+                        // **Windows has no triple-click message**, so the third click arrives as an
+                        // ordinary button-down and is recognised here: within the system
+                        // double-click time, and close enough that a click elsewhere is not
+                        // swallowed. Both come from the system, so it matches the user's settings.
+                        let triple = shell.last_double.is_some_and(|(t, dx, dy)| {
+                            now_ms().wrapping_sub(t) <= unsafe { GetDoubleClickTime() }
+                                && (x - dx).abs() < 4.0
+                                && (y - dy).abs() < 4.0
+                        });
+                        let what = if triple {
+                            shell.last_double = None;
+                            Selecting::Line
+                        } else if shift {
+                            Selecting::Extend
+                        } else {
+                            Selecting::Start
+                        };
+                        shell.select(x, y, what)
+                    }
+                    WM_LBUTTONDBLCLK => {
+                        shell.last_double = Some((now_ms(), x, y));
+                        shell.select(x, y, Selecting::Word)
+                    }
+                    WM_MOUSEMOVE if held && shell.is_dragging() => {
+                        shell.select(x, y, Selecting::Extend)
+                    }
+                    WM_LBUTTONUP => {
+                        unsafe {
+                            let _ = ReleaseCapture();
+                        }
+                        shell.end_drag();
+                        false
+                    }
+                    _ => false,
+                };
+                if moved {
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            });
+            LRESULT(0)
         }
         WM_DPICHANGED => {
             // **Both halves are required and they are separate.** `lParam` carries the window rect
@@ -662,6 +928,7 @@ fn main() -> Result<()> {
             document: None,
 
             needs_frame: false,
+            last_double: None,
             file: None,
         });
     });
@@ -700,6 +967,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tailhawk_core::Position;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
 
     /// Creates a real, unshown window to hang a swapchain on. Unshown is deliberate: the test
@@ -857,6 +1125,86 @@ mod tests {
         // Scrolling up from the bottom drops follow, which `UI-DESIGN.md` §12 requires.
         assert!(doc.navigate(Navigate::ByRows(-1)));
         assert!(!doc.view.grid().is_following());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A copy is the file's own bytes, not a re-rendering of them** — `SPEC.md` §5.6.
+    ///
+    /// The clipboard call needs a window station and is not exercised here. What is, is the part
+    /// that decides *what* gets copied, which is where content can be lost silently.
+    ///
+    /// The fixture carries `U+202E` — §13.4's Trojan Source character — and the selection that
+    /// matters is the one whose **boundary lands on it**. A zero-width cluster occupies no column,
+    /// so it shares one with the character after it; `byte_span` rounds outwards precisely so that
+    /// selecting up to that column still copies the override. Selecting the whole row would include
+    /// it trivially and prove nothing, which is what a first version of this test did.
+    #[test]
+    fn copying_a_selection_yields_the_files_own_bytes() {
+        let path = std::env::temp_dir().join("tailhawk_copy_test.log");
+        // Row 1 is `second `, U+202E, `hidden`, U+202C, ` line`. Written as escapes because rustc
+        // rejects a bidi override in source (`text_direction_codepoint_in_literal`) — its own
+        // Trojan Source defence, firing on a test about Trojan Source.
+        std::fs::write(
+            &path,
+            "alpha beta gamma\nsecond \u{202E}hidden\u{202C} line\nthird\n",
+        )
+        .expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        // A whole row, as a triple-click takes it.
+        doc.selection = Some(Selection::line(0));
+        assert_eq!(doc.copy_text().as_deref(), Some("alpha beta gamma\n"));
+
+        // A span inside one row. This row is ASCII, so its columns are its bytes.
+        doc.selection = Some(Selection::stream(Position::new(0, 6), Position::new(0, 10)));
+        assert_eq!(doc.copy_text().as_deref(), Some("beta"));
+
+        // **The boundary case.** `second ` is columns 0..7, and the override sits at column 7 —
+        // the same column as the `h` that follows it, because it is zero-width. Selecting 0..7 must
+        // pull it in, or a copy has silently dropped an attacker-supplied character.
+        doc.selection = Some(Selection::stream(Position::new(1, 0), Position::new(1, 7)));
+        let copied = doc.copy_text().expect("row 1");
+        assert!(
+            copied.contains('\u{202E}'),
+            "the bidi override was laundered out of the copy: {copied:?}"
+        );
+
+        // Two rows: the first carries its line break, the last does not.
+        doc.selection = Some(Selection::stream(Position::new(0, 0), Position::new(1, 6)));
+        assert_eq!(doc.copy_text().as_deref(), Some("alpha beta gamma\nsecond"));
+
+        // A caret copies nothing at all — not an empty string, nothing.
+        doc.selection = Some(Selection::at(Position::new(0, 3)));
+        assert_eq!(doc.copy_text(), None);
+        doc.selection = None;
+        assert_eq!(doc.copy_text(), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The selection reaches the painter as **columns**, per §3.3, and only for the rows it covers.
+    #[test]
+    fn the_painter_is_told_which_columns_are_selected() {
+        let path = std::env::temp_dir().join("tailhawk_rowsel_test.log");
+        std::fs::write(&path, "alpha beta gamma\nsecond line\nthird\n").expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        doc.selection = Some(Selection::stream(Position::new(0, 6), Position::new(1, 6)));
+
+        // Row 0 runs from column 6 to the end of the line; `usize::MAX` is how `ToLineEnd` reaches
+        // the painter, which needs no line length to tint to the right edge.
+        assert_eq!(doc.row_selection(0), Some(6..usize::MAX));
+        assert_eq!(doc.row_selection(1), Some(0..6));
+        // Rows outside the selection are not tinted, and neither is one that is not on screen.
+        assert_eq!(doc.row_selection(2), None);
+        assert_eq!(doc.row_selection(99), None);
+
+        // A caret selects no columns anywhere, so nothing is tinted.
+        doc.selection = Some(Selection::at(Position::new(0, 3)));
+        assert_eq!(doc.row_selection(0), None);
 
         let _ = std::fs::remove_file(&path);
     }
