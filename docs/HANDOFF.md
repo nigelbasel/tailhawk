@@ -115,10 +115,21 @@ resolved from a horizontal slice.
 
 ### ⚠ Assumptions a reviewer should challenge
 
-- **That making the walk faster is preferable to precomputing at index time.** The alternative is to
-  record column information while indexing, which would make deep columns O(1) but costs memory on
-  every line of a 50M-line file for a case most files never hit. Rejected on that basis, not
-  measured against.
+- **That making the walk faster beats precomputing columns at index time — untested, not settled.**
+  The alternative records `(byte, cell)` anchors while indexing, making a deep column O(1) instead of
+  a walk. It was rejected in one sentence — "costs memory on every line of a 50M-line file for a case
+  most files never hit" — and **that sentence was never measured**. It is a plausible argument, which
+  is the category this module's history says to distrust.
+
+  The naive version really is expensive: anchors for all 50M lines would dwarf the 6.3 MB line index.
+  But three cheaper variants were dismissed without being considered, and the third looks close to
+  free: anchor only lines **above a length threshold**; anchor only lines that are **not all-ASCII**,
+  since ASCII columns are already O(1); or build them **lazily on first deep access** and cache.
+
+  **Left alone deliberately, owner's call 2026-08-13.** Every measured case is now vsync-bound —
+  column 0, line end, horizontal scrolling, and 50M vertical — so this would be optimising against a
+  hypothetical. If a real corpus later shows deep-column scrolling hurting (CJK-heavy, or lines well
+  past 19 KB), **the lazy cache is the first thing to try** and is cheap to add then.
 - **That RTL's design decision stands as recommended** — logical `Position`, a per-row bidi map used
   only by paint and hit-test. That was put to the owner and the reply was "go ahead with your
   recommendations", which was in the context of the 50M run rather than an explicit ruling on RTL.
