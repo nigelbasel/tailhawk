@@ -181,6 +181,61 @@ impl Pattern {
         self.backtracking
     }
 
+    /// Every match in one line, with its capture groups.
+    ///
+    /// **For §7.1's highlighting, which needs all of them and not the first.** It lives here rather
+    /// than in `highlight.rs` so §7.4's engine policy — which engine, which caps — stays in one
+    /// place; a highlighter that compiled its own patterns would be a second policy nobody updated.
+    ///
+    /// `on_match` receives the match's byte range within `text` and one entry per capture group,
+    /// `None` where the group did not participate. Ranges are byte offsets in `text`, which for the
+    /// byte engine are the same offsets it matched at.
+    ///
+    /// Stops at §7.4's per-line cap for the backtracking engine, and returns whether it did — a
+    /// caller showing "pattern too slow, truncated" needs the same fact here as a search does.
+    pub fn each_match(
+        &self,
+        text: &str,
+        mut on_match: impl FnMut(core::ops::Range<usize>, &[Option<core::ops::Range<usize>>]),
+    ) -> bool {
+        let mut groups: Vec<Option<core::ops::Range<usize>>> = Vec::new();
+        match &self.engine {
+            Engine::Bytes(re) => {
+                for caps in re.captures_iter(text.as_bytes()) {
+                    let whole = caps.get(0).expect("group 0 always participates");
+                    groups.clear();
+                    groups.extend((1..caps.len()).map(|i| caps.get(i).map(|m| m.start()..m.end())));
+                    on_match(whole.start()..whole.end(), &groups);
+                }
+                false
+            }
+            Engine::Text(re) => {
+                for caps in re.captures_iter(text) {
+                    let whole = caps.get(0).expect("group 0 always participates");
+                    groups.clear();
+                    groups.extend((1..caps.len()).map(|i| caps.get(i).map(|m| m.start()..m.end())));
+                    on_match(whole.start()..whole.end(), &groups);
+                }
+                false
+            }
+            Engine::Fancy(re) => {
+                let (input, truncated) = cap_for_backtracking(text);
+                for caps in re.captures_iter(input) {
+                    // A backtrack limit that fires mid-iteration ends the run. Reporting it as
+                    // truncated is §7.4's "pattern too slow" and is not the same as no match.
+                    let Ok(caps) = caps else {
+                        return true;
+                    };
+                    let whole = caps.get(0).expect("group 0 always participates");
+                    groups.clear();
+                    groups.extend((1..caps.len()).map(|i| caps.get(i).map(|m| m.start()..m.end())));
+                    on_match(whole.start()..whole.end(), &groups);
+                }
+                truncated
+            }
+        }
+    }
+
     /// Finds the first match in one line's bytes.
     ///
     /// Returns the byte range **within the line**, or [`Hit::Truncated`] where §7.4's per-line cap
@@ -206,18 +261,7 @@ impl Pattern {
                 let Some(text) = decoded else {
                     return Hit::None;
                 };
-                // §7.4's hard cap, applied **before** the engine sees the line. Truncating the input
-                // rather than skipping the line means a match in the first 8 KB is still found,
-                // which for a serialised-object line is where the message is.
-                let (input, truncated) = if text.len() > FANCY_LINE_CAP {
-                    let mut cut = FANCY_LINE_CAP;
-                    while cut > 0 && !text.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    (&text[..cut], true)
-                } else {
-                    (text, false)
-                };
+                let (input, truncated) = cap_for_backtracking(text);
                 match re.find(input) {
                     Ok(Some(m)) => Hit::At(m.start()..m.end()),
                     Ok(None) if truncated => Hit::Truncated,
@@ -230,6 +274,23 @@ impl Pattern {
             }
         }
     }
+}
+
+/// §7.4's hard cap, applied **before** the engine sees the line.
+///
+/// Truncating the input rather than skipping the line means a match in the first 8 KB is still
+/// found, which for a serialised-object line is where the message is. The cut is moved back to a
+/// character boundary, because slicing a `&str` anywhere else panics — and a pathological line is
+/// exactly where a multi-byte character is most likely to straddle the cap.
+fn cap_for_backtracking(text: &str) -> (&str, bool) {
+    if text.len() <= FANCY_LINE_CAP {
+        return (text, false);
+    }
+    let mut cut = FANCY_LINE_CAP;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (&text[..cut], true)
 }
 
 /// What a pattern found in one line.

@@ -45,7 +45,8 @@ fn a_full_file_search_streams_its_first_match_long_before_it_finishes() {
     let end = file.len().expect("len");
 
     let began = Instant::now();
-    let index = build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default()).expect("index");
+    let index =
+        build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default()).expect("index");
     let indexed = began.elapsed();
     println!(
         "INDEX  {:.2} GB, {} lines, {:.2}s ({:.0} MB/s)",
@@ -102,7 +103,8 @@ fn a_pathological_lookaround_finishes_and_says_it_truncated() {
     };
     let file = LogFile::open(&path).expect("open");
     let end = file.len().expect("len");
-    let index = build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default()).expect("index");
+    let index =
+        build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default()).expect("index");
 
     let source = r"(?<=WARN )(x+x+)+y";
     let pattern = Pattern::compile(source, Charset::UTF_8, false).expect("compile");

@@ -17,6 +17,7 @@ pub mod filter;
 pub mod follow;
 pub mod grid;
 pub mod hgrid;
+pub mod highlight;
 pub mod index;
 pub mod indexer;
 pub mod lines;
