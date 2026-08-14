@@ -44,6 +44,13 @@ unicode-width = "0.2"
 # Noted here because "Unlicense" appearing in the tree looks like a problem and is not.
 regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
 
+# §7.4's escape hatch: "Log4net and NLog users write `(?<!DEBUG).*Exception` routinely, so
+# rejecting lookaround outright would look broken -- but an unbounded backtracking engine over a
+# 500 KB serialised-object line is the exact hang class klogg is criticised for (#803)." So
+# lookaround and backreferences go to a backtracking engine with an explicit backtrack_limit and a
+# hard per-line input cap, and everything else stays on the linear-time one above. MIT.
+fancy-regex = "0.14"
+
 # The leaf backends are modules here rather than separate crates. `SPEC.md` §3.1 puts them inside
 # the core, and splitting them into crates buys nothing until a second platform exists — at which
 # point the split is a mechanical move, not a redesign.
