@@ -23,6 +23,7 @@ pub mod pattern;
 pub mod record;
 pub mod rows;
 pub mod selection;
+pub mod set;
 pub mod view;
 
 #[cfg(windows)]
