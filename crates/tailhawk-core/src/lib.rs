@@ -44,6 +44,7 @@ pub mod raster;
 pub mod rotation;
 
 #[cfg(windows)]
+pub mod scanner;
 pub mod set;
 
 #[cfg(windows)]

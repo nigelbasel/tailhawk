@@ -689,7 +689,7 @@ mod tests {
 
         // And it follows, because nothing here knows it is not a log file.
         spill.write("third line\n".as_bytes()).expect("append");
-        let polled = set.poll(30);
+        let polled = set.settle();
         assert_eq!(polled.lines_added, 1);
         assert_eq!(set.total_rows(), 3);
     }

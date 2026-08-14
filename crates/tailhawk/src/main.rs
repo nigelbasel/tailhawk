@@ -287,7 +287,7 @@ impl Document {
         let stream_changed = finished_now != self.stream_done;
         self.stream_done = finished_now;
 
-        let polled = self.set.poll(30);
+        let polled = self.set.poll();
         if polled.is_quiet() {
             // The rows did not move, but the title may still be wrong. §4.2's end of stream "is not
             // an app exit", and a window that stops updating without saying why looks like one that

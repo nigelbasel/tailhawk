@@ -64,6 +64,37 @@ pub enum Poll {
     Shrank { was: u64, now: u64 },
 }
 
+/// Where a scan puts the lines it finds.
+///
+/// **A trait so the scan can run somewhere a [`LineIndex`] cannot go.** `SPEC.md` §11.3 wants the
+/// window thread free, and [`crate::scanner`] runs this on a worker — where an index would have to be
+/// shared, and sharing it would put a lock on the per-frame path that `rows.rs` walks. The worker
+/// collects into a `Vec` instead and the window thread folds it in.
+///
+/// The three operations are exactly what the scan needs and no more. `pop_line` is the phantom line:
+/// a terminator as the last bytes opens a line start that is not a line until something follows it,
+/// so the scan takes it back and remembers to re-add it. See the module note.
+pub trait LineSink {
+    fn push_line(&mut self, offset: u64);
+    /// Removes the most recently pushed line. Called only for a line this same scan pushed.
+    fn pop_line(&mut self);
+    fn merge_extent(&mut self, extent: crate::index::Extent);
+}
+
+impl LineSink for LineIndex {
+    fn push_line(&mut self, offset: u64) {
+        LineIndex::push_line(self, offset);
+    }
+
+    fn pop_line(&mut self) {
+        LineIndex::pop_line(self);
+    }
+
+    fn merge_extent(&mut self, extent: crate::index::Extent) {
+        self.set_extent(self.extent().merge(extent));
+    }
+}
+
 /// Tracks how far a file has been indexed, so the next tick can resume exactly where it stopped.
 #[derive(Clone, Debug)]
 pub struct Follow {
@@ -127,10 +158,10 @@ impl Follow {
     /// responsive, not each scan be small. The byte budget stays as the inner step so one read can
     /// never run away; this loops those steps until the file is caught up or the tick has used its
     /// milliseconds.
-    pub fn poll_for<R: ChunkReader + ?Sized>(
+    pub fn poll_for<R: ChunkReader + ?Sized, S: LineSink + ?Sized>(
         &mut self,
         reader: &R,
-        index: &mut LineIndex,
+        index: &mut S,
         len: u64,
         budget_ms: u64,
     ) -> Result<Poll> {
@@ -161,10 +192,10 @@ impl Follow {
     ///
     /// `len` is the file's length now. The caller supplies it because the caller is the one holding a
     /// reason to have asked — a timer tick, a change notification — and asking twice would race.
-    pub fn poll<R: ChunkReader + ?Sized>(
+    pub fn poll<R: ChunkReader + ?Sized, S: LineSink + ?Sized>(
         &mut self,
         reader: &R,
-        index: &mut LineIndex,
+        index: &mut S,
         len: u64,
     ) -> Result<Poll> {
         if len < self.scanned_to {
@@ -224,7 +255,7 @@ impl Follow {
             self.pending_line = true;
         }
 
-        index.set_extent(index.extent().merge(scanner.extent()));
+        index.merge_extent(scanner.extent());
         Ok(Poll::Grew {
             lines: appended,
             more: self.scanned_to < len,

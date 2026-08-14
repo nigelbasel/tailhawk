@@ -41,16 +41,18 @@
 //!   it — see `pattern.rs`, where the name is rejected.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::cell::ColumnAnchors;
 use crate::encoding::Charset;
 use crate::file::{FileSource, LogFile};
-use crate::follow::{Follow, Poll};
+use crate::follow::Follow;
 use crate::index::{Extent, LineIndex};
 use crate::indexer::{build_index, IndexOptions};
 use crate::pattern::RollingSet;
 use crate::rotation::{Rotation, Watch};
 use crate::rows::{RowSource, Rows};
+use crate::scanner::Scanner;
 use crate::{Error, Result};
 
 /// Members indexed when a set is opened. §5.5b's "default 10, configurable".
@@ -79,19 +81,15 @@ pub const EAGER_BYTES: u64 = 512 * 1024 * 1024;
 /// tick, by contrast, is a syscall per tick for a change that happens daily.
 pub const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Passes of the byte budget allowed while draining a member being rolled away.
-///
-/// The drain is unbudgeted by design — §5.5 is explicit that the old handle is read "to EOF" before
-/// the switch, and stopping half way is exactly the lost KB it warns about. This bounds the *loop*
-/// rather than the work, so a reader that somehow never reaches EOF cannot hang the message loop.
-/// At [`FOLLOW_BUDGET_BYTES`](crate::follow::FOLLOW_BUDGET_BYTES) per pass this is 4 GB.
-const DRAIN_PASSES: u32 = 1024;
-
 /// One file of a set, with its own index, decoder state and viewport window.
 pub struct Member {
     name: String,
     path: PathBuf,
-    file: LogFile,
+    /// **Shared, because the scan runs on another thread.** `SPEC.md` §5.2's positional reads are
+    /// what make that sound — every read carries its own offset and nothing moves a shared file
+    /// pointer — and reopening by path instead would risk landing on a different file across a
+    /// rotation. See [`crate::scanner`].
+    file: Arc<LogFile>,
     charset: Charset,
     index: LineIndex,
     rows: Rows,
@@ -169,7 +167,7 @@ impl Member {
         Ok(Self {
             name,
             path: path.to_path_buf(),
-            file,
+            file: Arc::new(file),
             charset,
             index,
             rows: Rows::new(charset),
@@ -203,8 +201,9 @@ pub struct LogSet {
     omitted: usize,
     total_rows: u64,
     last_error: Option<String>,
-    /// Growth of the **live** member only. Every older member is finished and never scanned again.
-    follow: Follow,
+    /// The growth scan for the **live** member, on its own thread. Every older member is finished
+    /// and never scanned again, so there is exactly one worker however many members there are.
+    scanner: Option<Scanner>,
     /// The live member's path and identity, so §5.5's in-place rotations are noticed.
     watch: Watch,
     /// When the directory was last re-listed. See [`LIST_INTERVAL`].
@@ -290,7 +289,6 @@ impl LogSet {
         }
 
         let live = members.last().expect("checked non-empty");
-        let follow = Follow::after_build(live.charset, &live.index, live.scanned_to);
         let watch = Watch::new(
             &live.path,
             live.file
@@ -306,10 +304,11 @@ impl LogSet {
             omitted: eager,
             total_rows: 0,
             last_error,
-            follow,
+            scanner: None,
             watch,
             listed: None,
         };
+        this.reseat_scanner();
         this.renumber();
         Ok(this)
     }
@@ -442,7 +441,7 @@ impl LogSet {
                 continue;
             }
             member.rows.fetch(
-                &member.file,
+                &*member.file,
                 &member.index,
                 lo - member.first_row,
                 (hi - lo) as usize,
@@ -454,9 +453,11 @@ impl LogSet {
 
     /// Advances the set: growth on the live member, and every way it can stop being live.
     ///
-    /// `budget_ms` bounds the *growth* scan only, per §11.3 — a writer producing faster than the
-    /// frame rate must not starve the message loop. The drain that precedes a switch is deliberately
-    /// outside that bound; see [`DRAIN_PASSES`].
+    /// **This does no scanning.** [`crate::scanner`] runs it on a worker; what happens here is
+    /// folding the worker's findings into the index and deciding what the file has become. There is
+    /// no per-tick time budget to set, which is the point — the budget that satisfied §11.3's frame
+    /// rule starved the throughput criterion and the one that met the throughput criterion broke the
+    /// frame rule. The only blocking wait left is the drain before a switch, which §5.5 requires.
     ///
     /// ## The order is the design
     ///
@@ -470,12 +471,13 @@ impl LogSet {
     /// A switch in either 1 or 2 drains the outgoing member to EOF first. §5.5: "This is where naive
     /// tools lose the last KB", and unlike the single-file case those drained lines are now *kept* —
     /// the old member stays in the scrollback, which is what made the drain worth writing.
-    pub fn poll(&mut self, budget_ms: u64) -> Polled {
+    pub fn poll(&mut self) -> Polled {
         let mut polled = Polled::default();
 
         let live_len = self.members.last().and_then(|m| m.file.len().ok());
         if let Some(len) = live_len {
-            match self.watch.check(len, self.follow.scanned_to()) {
+            let scanned_to = self.members.last().map_or(0, |m| m.scanned_to);
+            match self.watch.check(len, scanned_to) {
                 Rotation::Stable => {}
                 // `tail -F`: the path is gone but the handle is not. Keep reading what we hold.
                 Rotation::Missing => {}
@@ -498,59 +500,87 @@ impl LogSet {
             self.reconcile_directory(&mut polled);
         }
 
-        polled.lines_added += self.grow_live(budget_ms);
+        polled.lines_added += self.grow_live();
         self.renumber();
         polled
     }
 
     /// Reads the live member to EOF. Returns the lines that arrived.
+    ///
+    /// **Blocks until the worker is caught up**, which is the one place that is correct: §5.5 wants
+    /// the old handle read to EOF *before* a switch, and a drain that gave up would lose exactly the
+    /// last KB the requirement exists to keep.
     fn drain_live(&mut self) -> u64 {
-        let Some(live) = self.members.last_mut() else {
+        let Self {
+            members, scanner, ..
+        } = self;
+        let (Some(live), Some(scanner)) = (members.last_mut(), scanner.as_mut()) else {
             return 0;
         };
         let Ok(len) = live.file.len() else {
             return 0;
         };
-        let mut lines = 0;
-        for _ in 0..DRAIN_PASSES {
-            match self.follow.poll(&live.file, &mut live.index, len) {
-                Ok(Poll::Grew { lines: n, more }) => {
-                    lines += n;
-                    if !more {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        live.scanned_to = self.follow.scanned_to();
-        lines
+        let collected = scanner.drain(&mut live.index, len);
+        live.scanned_to = collected.applied_to.max(live.scanned_to);
+        collected.lines
     }
 
-    /// Scans whatever the writer has appended since the last tick, under §11.3's time budget.
-    fn grow_live(&mut self, budget_ms: u64) -> u64 {
-        let Some(live) = self.members.last_mut() else {
+    /// Folds in whatever the worker has scanned since the last tick.
+    ///
+    /// **`budget_ms` is gone and that is the point.** The scan no longer runs here — `scanner.rs`
+    /// owns it — so there is no per-tick time budget to set, and §11.3's "the UI never blocks on
+    /// indexing" is met by construction rather than by choosing a number that satisfied neither the
+    /// throughput criterion nor the frame budget.
+    fn grow_live(&mut self) -> u64 {
+        let Self {
+            members, scanner, ..
+        } = self;
+        let (Some(live), Some(scanner)) = (members.last_mut(), scanner.as_mut()) else {
             return 0;
         };
         let Ok(len) = live.file.len() else {
             return 0;
         };
-        let grew = match self
-            .follow
-            .poll_for(&live.file, &mut live.index, len, budget_ms)
-        {
-            Ok(Poll::Grew { lines, .. }) => lines,
-            _ => 0,
+        // Woken first, then collected: the worker starts on the new length while this tick folds in
+        // whatever it produced from the last one. Collecting first would leave the worker idle for
+        // the duration of the fold, which is the wrong way round when the fold is the cheap half.
+        scanner.look(len);
+        let collected = scanner.collect(&mut live.index);
+        live.scanned_to = collected.applied_to.max(live.scanned_to);
+        collected.lines
+    }
+
+    /// [`poll`](Self::poll), then **wait for the worker to catch up**.
+    ///
+    /// `poll` is deliberately asynchronous: it wakes the worker and folds in what is ready, so lines
+    /// written in the last few milliseconds land on the next tick — invisible at 100 ms, and the
+    /// whole reason the scan is off this thread.
+    ///
+    /// This is for the callers that cannot accept that. Tests are the main one: "append a line, then
+    /// assert the row count" is otherwise a race, and a test that sleeps to fix a race is a test that
+    /// will flake on a loaded machine.
+    pub fn settle(&mut self) -> Polled {
+        let mut polled = self.poll();
+        polled.lines_added += self.drain_live();
+        self.renumber();
+        polled
+    }
+
+    /// Points a fresh worker at whichever member is now live.
+    fn reseat_scanner(&mut self) {
+        self.scanner = None;
+        let Some(live) = self.members.last() else {
+            return;
         };
-        live.scanned_to = self.follow.scanned_to();
-        grew
+        let follow = Follow::after_build(live.charset, &live.index, live.scanned_to);
+        self.scanner = Scanner::start(Arc::clone(&live.file), follow).ok();
     }
 
     /// Rebuilds the live member from a path whose contents were replaced in place.
     ///
     /// §5.5's copy-truncate: the identity is unchanged, so this is the *same* member with different
     /// bytes — it keeps its position in the set rather than becoming a new one. Everything derived
-    /// from the old contents goes: the index, the follow position, the row window.
+    /// from the old contents goes: the index, the scan position, the row window.
     fn reseat_live(&mut self) -> bool {
         let Some(live) = self.members.last_mut() else {
             return false;
@@ -561,9 +591,13 @@ impl LogSet {
         let Ok(identity) = fresh.file.identity() else {
             return false;
         };
-        self.follow = Follow::after_build(fresh.charset, &fresh.index, fresh.scanned_to);
         self.watch = Watch::new(&fresh.path, identity);
         *live = fresh;
+        // **The old worker is dropped here, holding the old file's `Arc`.** It cannot leak a delta
+        // into the new index: `reseat_scanner` replaces the whole `Scanner`, and its receiver goes
+        // with it, so anything the old worker had queued is discarded along with the bytes it
+        // described.
+        self.reseat_scanner();
         true
     }
 
@@ -579,9 +613,9 @@ impl LogSet {
         let identity = fresh.file.identity().ok()?;
         let name = fresh.name.clone();
         self.rename_rolled_member();
-        self.follow = Follow::after_build(fresh.charset, &fresh.index, fresh.scanned_to);
         self.watch = Watch::new(&path, identity);
         self.members.push(fresh);
+        self.reseat_scanner();
         Some(name)
     }
 
@@ -696,10 +730,10 @@ impl LogSet {
             return;
         };
         let live = self.members.last().expect("just pushed");
-        self.follow = Follow::after_build(live.charset, &live.index, live.scanned_to);
         if let Ok(identity) = live.file.identity() {
             self.watch = Watch::new(&live.path, identity);
         }
+        self.reseat_scanner();
         polled.rolled_to = Some(name);
     }
 
@@ -1037,7 +1071,7 @@ mod tests {
         assert_eq!(set.total_rows(), 2);
 
         append(&dir, "log_002.txt", &["b2", "b3"]);
-        let polled = set.poll(30);
+        let polled = set.settle();
         assert_eq!(polled.lines_added, 2);
         assert!(polled.rolled_to.is_none());
         assert_eq!(read_all(&mut set), ["a1", "b1", "b2", "b3"]);
@@ -1061,14 +1095,14 @@ mod tests {
         append(&dir, "log_002.txt", &["b2 last words"]);
         write(&dir, "log_003.txt", &["c1"]);
 
-        let polled = set.poll(30);
+        let polled = set.settle();
         assert_eq!(polled.rolled_to.as_deref(), Some("log_003.txt"));
         assert_eq!(set.newest().name(), "log_003.txt");
         assert_eq!(read_all(&mut set), ["a1", "b1", "b2 last words", "c1"]);
 
         // And it keeps following the file it rolled onto.
         append(&dir, "log_003.txt", &["c2"]);
-        set.poll(30);
+        set.settle();
         assert_eq!(
             read_all(&mut set),
             ["a1", "b1", "b2 last words", "c1", "c2"]
@@ -1089,7 +1123,7 @@ mod tests {
         append(&dir, "app.log.1", &["gen1 last words"]);
         write(&dir, "app.log", &["gen2 a"]);
 
-        let polled = set.poll(30);
+        let polled = set.settle();
         assert_eq!(polled.rolled_to.as_deref(), Some("app.log"));
         assert_eq!(set.members().len(), 2);
         assert_eq!(read_all(&mut set), ["gen1 a", "gen1 last words", "gen2 a"]);
@@ -1106,7 +1140,7 @@ mod tests {
 
         std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).expect("rename");
         write(&dir, "app.log", &["gen2"]);
-        set.poll(30);
+        set.settle();
 
         assert_eq!(set.members()[0].name(), "app.log.1");
         assert_eq!(set.members()[0].path(), dir.join("app.log.1"));
@@ -1125,7 +1159,7 @@ mod tests {
         assert_eq!(set.total_rows(), 5);
 
         std::fs::write(dir.join("log_002.txt"), b"fresh\n").expect("truncate");
-        let polled = set.poll(30);
+        let polled = set.settle();
         assert!(polled.reset);
         assert!(polled.rolled_to.is_none());
         assert_eq!(set.members().len(), 2);
@@ -1145,7 +1179,7 @@ mod tests {
 
         std::fs::remove_file(dir.join("log_001.txt")).expect("remove");
         set.rescan();
-        let polled = set.poll(30);
+        let polled = set.settle();
         assert_eq!(polled.retired, ["log_001.txt"]);
         assert_eq!(set.total_rows(), 2);
         assert_eq!(read_all(&mut set), ["b1", "c1"]);
@@ -1162,7 +1196,7 @@ mod tests {
 
         std::fs::remove_file(dir.join("log_002.txt")).expect("remove");
         set.rescan();
-        let polled = set.poll(30);
+        let polled = set.settle();
         assert!(polled.retired.is_empty());
         assert_eq!(set.total_rows(), 2);
         assert_eq!(read_all(&mut set), ["a1", "b1"]);
@@ -1183,7 +1217,7 @@ mod tests {
         );
 
         write(&dir, "log_003.txt", &["c"]);
-        set.poll(30);
+        set.settle();
         assert_eq!(
             set.describe(),
             "3 files — oldest is log_001.txt, newest is log_003.txt"
@@ -1201,7 +1235,7 @@ mod tests {
 
         std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).expect("rename");
         write(&dir, "app.log", &["gen2"]);
-        set.poll(30);
+        set.settle();
         assert_eq!(
             set.describe(),
             "2 files — oldest is app.log.1, newest is app.log"
@@ -1215,7 +1249,7 @@ mod tests {
         let dir = scratch("quiet");
         let anchor = write(&dir, "app.log", &["a"]);
         let mut set = LogSet::open(&anchor).expect("open");
-        set.poll(30);
-        assert!(set.poll(30).is_quiet());
+        set.settle();
+        assert!(set.settle().is_quiet());
     }
 }
