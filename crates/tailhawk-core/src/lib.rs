@@ -47,6 +47,9 @@ pub mod rotation;
 pub mod set;
 
 #[cfg(windows)]
+pub mod stdin;
+
+#[cfg(windows)]
 pub mod shape;
 
 #[cfg(windows)]

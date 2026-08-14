@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use tailhawk_core::set::LogSet;
+use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump};
 use tailhawk_core::{
     background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, RENDER_CAP_CELLS,
 };
@@ -92,6 +93,15 @@ struct Document {
     selection: Option<Selection>,
     /// Whether the left button is down, so `WM_MOUSEMOVE` can tell a drag from a hover.
     dragging: bool,
+    /// The stdin pump, when the source is a pipe — §4.2. Held for its whole life because dropping
+    /// it deletes the spill (§13.2), and the `LogSet` above is reading that file.
+    pump: Option<Pump>,
+    /// Whether the producer had closed its end as of the last tick.
+    ///
+    /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
+    /// end-of-stream changes nothing about the file — so without this the window that has stopped
+    /// growing goes on saying "reading stdin", which is what a hung window looks like.
+    stream_done: bool,
 }
 
 impl RowSource for Document {
@@ -146,6 +156,39 @@ impl Document {
             summary,
             selection: None,
             dragging: false,
+            pump: None,
+            stream_done: false,
+        })
+    }
+
+    /// Opens the standard input stream — `SPEC.md` §4.2.
+    ///
+    /// The pump spills to a temp file and this opens **that file**, so following a pipe is following
+    /// a file and nothing downstream knows the difference. §4.2 asks for exactly that: the spill
+    /// "reuses the same index path as a real file".
+    ///
+    /// **`open_single`, not `open`.** Spill names share a shape, so a rolling-set inference would
+    /// adopt a *concurrent* instance's spill as older history — another user's piped stream spliced
+    /// into this one's scrollback. `set.rs` argues it at `open_single` and `stdin.rs` tests it.
+    ///
+    /// The spill is empty at this point and that is fine: an empty file is a source with no rows,
+    /// and `Follow::after_build` already seeds line 0 for one — the case that had its own bug and
+    /// its own test back when following was written.
+    fn from_pipe() -> std::result::Result<Self, String> {
+        let pump = Pump::start().map_err(|e| format!("stdin: {e}"))?;
+        let set = LogSet::open_single(pump.path()).map_err(|e| format!("stdin: {e}"))?;
+        Ok(Self {
+            view: View::new(1.0, 1.0),
+            set,
+            // §13.2: "The spill location is displayed in source properties, because a user piping
+            // production logs deserves to know where they landed." There are no source properties
+            // yet, so the title carries it — a user piping production logs is told where the bytes
+            // are, in the only place there is to tell them.
+            summary: format!("<stdin> → {}", pump.path().display()),
+            selection: None,
+            dragging: false,
+            pump: Some(pump),
+            stream_done: false,
         })
     }
 
@@ -197,11 +240,19 @@ impl Document {
         } else {
             ""
         };
+        // §4.2: end of stream "is **not** an app exit". Saying so in the title is what stops a
+        // window that has stopped growing looking like a window that has hung.
+        // A pipe is one file by construction, so §5.5b's set description says nothing a user of it
+        // wants — the spill's path is already in `summary`, which is the part §13.2 asks for.
+        let source = match &self.pump {
+            Some(pump) if pump.finished() => " — stream complete".to_string(),
+            Some(_) => " — reading stdin".to_string(),
+            None => format!(" — {}", self.set.describe()),
+        };
         format!(
-            "{}: {}{flag} — {}, {} lines, {} bytes",
+            "{}: {}{flag}{source}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
-            self.set.describe(),
             self.set.total_rows(),
             self.set.bytes()
         )
@@ -221,9 +272,22 @@ impl Document {
     /// single byte-budgeted scan per tick capped throughput at roughly 40 MB/s.
     fn poll_follow(&mut self) -> bool {
         let was_following = self.view.grid().is_following();
+
+        // **Read before the scan, not after.** The pump flushes each read and only then sets its
+        // finished flag, so a `true` seen *here* guarantees every byte is already on disk and the
+        // scan below will pick it up. Asking afterwards could report "stream complete" in the same
+        // tick whose length check ran a moment too early — a title that says the stream is finished
+        // while its last line is missing.
+        let finished_now = self.pump.as_ref().is_some_and(Pump::finished);
+        let stream_changed = finished_now != self.stream_done;
+        self.stream_done = finished_now;
+
         let polled = self.set.poll(30);
         if polled.is_quiet() {
-            return false;
+            // The rows did not move, but the title may still be wrong. §4.2's end of stream "is not
+            // an app exit", and a window that stops updating without saying why looks like one that
+            // has hung.
+            return stream_changed;
         }
 
         // **A selection addresses rows, and these two events move rows out from under it.** A
@@ -1054,6 +1118,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     }
 }
 
+/// Opens a source on a worker thread.
+///
+/// Off the window thread for the same reason the device is: a multi-GB file indexed on the message
+/// loop would undo the two-stage paint `experiments/g3-d3d11` measured at 13.1 ms. It matters more
+/// for a pipe, where the producer decides how long the open takes and may never finish at all.
+fn spawn_open(
+    open: impl FnOnce() -> std::result::Result<Document, String> + Send + 'static,
+) -> Receiver<std::result::Result<Document, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(open());
+    });
+    rx
+}
+
 fn main() -> Result<()> {
     // **Before anything else, and certainly before any window exists.** `SPEC.md` §3.1 requires
     // per-monitor-V2; without it Windows bitmap-stretches the client area on a non-96-DPI monitor,
@@ -1084,13 +1163,20 @@ fn main() -> Result<()> {
     // It reads on a worker for the same reason the device does. A multi-GB file read on the window
     // thread would undo the two-stage paint that `experiments/g3-d3d11` measured at 13.1 ms, and
     // the first log opened this way is meant to be a real one.
-    let reading = std::env::args_os().nth(1).map(|arg| {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(Document::open(std::path::Path::new(&arg)));
-        });
-        rx
-    });
+    // §13.2: spill files are "reaped on next launch if orphaned". Before anything creates one, and
+    // cheap — it lists `%TEMP%` once and only touches names this product produces.
+    let _ = reap_orphans();
+
+    let reading = match std::env::args_os().nth(1) {
+        Some(arg) => Some(spawn_open(move || {
+            Document::open(std::path::Path::new(&arg))
+        })),
+        // **No path, so look at the standard input handle** — §4.2. `FILE_TYPE_CHAR` is an
+        // interactive console and §4.2 says "do not block": reading it would wait for a human to
+        // type, which for a windowed application means a window that never appears.
+        None if stdin_kind().readable() => Some(spawn_open(Document::from_pipe)),
+        None => None,
+    };
 
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let class_name = windows::core::w!("TailhawkMain");

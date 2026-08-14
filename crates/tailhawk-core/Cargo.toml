@@ -51,8 +51,12 @@ features = [
     "Win32_Foundation",
     "Win32_Globalization",
     # CreateFileW and CreateEventW both take a SECURITY_ATTRIBUTES pointer, so their bindings are
-    # gated behind this even though both are passed None here.
+    # gated behind this. Most calls pass None; `SPEC.md` §13.2's spill file does not — it builds a
+    # protected DACL from the calling user's SID, which needs the token and SDDL APIs below.
     "Win32_Security",
+    "Win32_Security_Authorization",
+    # GetStdHandle, for §4.2's `GetFileType(GetStdHandle(STD_INPUT_HANDLE))`.
+    "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",

@@ -247,6 +247,26 @@ impl LogSet {
         Self::open_set(dir, anchor, set)
     }
 
+    /// Opens exactly one file, **without looking at its siblings**.
+    ///
+    /// For a source that is a file by accident rather than by nature — §4.2's stdin spill is the
+    /// case that forced this. Spill names share a shape (`tailhawk-spill-<pid>-<n>.log`), and
+    /// `pattern.rs` matches on the literal skeleton with the numbers taken out, so two *concurrent*
+    /// Tailhawk instances' spills look exactly like two generations of one rolling log. Inferring a
+    /// set there would splice another process's piped stream into this one's scrollback.
+    ///
+    /// The general rule this is an instance of: **inference is for files a user pointed at**, and a
+    /// spill is a file this program made.
+    pub fn open_single(path: &Path) -> Result<Self> {
+        let anchor = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| Error(format!("{} names no file", path.display())))?;
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let set = RollingSet::infer(&anchor, &[]);
+        Self::open_set(dir, anchor, set)
+    }
+
     fn open_set(dir: PathBuf, anchor: String, set: RollingSet) -> Result<Self> {
         let names = set.members().to_vec();
         let anchor_at = names.iter().position(|n| *n == anchor).unwrap_or(0);
