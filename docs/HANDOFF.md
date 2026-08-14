@@ -1,5 +1,59 @@
 # Handoff — resume here
 
+## ✅ M5 so far — off-thread work, the filter language, search — 2026-08-14, session 16
+
+Three of M5's ten items. **Two of M5's three done-criteria already hold**, measured on a real
+10,737,680,200-byte fixture:
+
+| | |
+|---|---|
+| Index | 10.74 GB, 114,230,003 lines, **6.21 s (1728 MB/s)** |
+| Search, linear engine | **first match 0.084 s**, whole pass 9.93 s (1082 MB/s), both canaries |
+| Pathological lookaround | `(?<=WARN )(x+x+)+y` — **finished in 90.8 s**, 1 line truncated |
+| Filters | include + exclude + composing chips, `crates/tailhawk-core/src/filter.rs` |
+
+Run it with `TAILHAWK_BIG_LOG=… cargo test -p tailhawk-core --test search_criterion -- --ignored
+--nocapture`; build the fixture with `scratchpad/bigfixture.ps1`.
+
+**"Streams first match" is asserted as a ratio, not a duration** — the early canary must arrive
+inside half the pass, and arrives inside one per cent. A wall-clock threshold would flake under load
+and need retuning per disk.
+
+**The lookaround half is the one that matters, and the assertion is that it returns at all.** Nested
+quantifiers behind a lookbehind over a 60 KB line is the shape that does not terminate. §7.4's 8 KB
+per-line cap and backtrack limit make it 90 s instead of forever, and the truncated count is what
+stops that being silent. 90 s is not interactive, and that is the backtracking engine's per-line rate
+over 114 M lines rather than the pathological line — which is why §7.3 wants debounce, streaming and
+cancellation, all of which exist.
+
+### Three decisions worth knowing
+
+- **`filter.rs`'s third answer.** §7.2's unknown-field rule is that a predicate naming a field the
+  format does not produce is **unknown, not false**. It excludes a row from an include chip and does
+  *not* exclude it from an exclude chip — one rule, not two: **an unknown never causes an action.**
+  The Kleene table for `and`/`or` is ours, forced by that rule the moment predicates compose.
+- **`search.rs` picks its engine by compiling, not by reading the pattern.** §7.4 names two classes
+  and not the test; a written test for `(?=` misjudges `[(?=]` (a character class) and `\(\?\=`
+  (three literals) in opposite directions.
+- **Chunks are runs of lines, not byte ranges.** That makes §7.4's "snaps chunk boundaries to
+  newlines" free — the index already knows where a line starts — and no match can straddle a chunk,
+  so no overlap and no dedup.
+
+### ⚠ Not done in M5 yet
+
+- **E13, E23, E24, V5, the command bar** — 5 of 10 items untouched. **Nothing is wired to the UI**:
+  the filter language parses and evaluates, search runs, and neither has a key binding.
+- **Multiline search patterns.** §7.4 describes what they need — "overlap ≥ max match length with
+  start-offset dedup" — and it is not implemented. A pattern matching across a terminator will not
+  match, rather than matching wrongly.
+- **Cross-file search** (§7.4, klogg's #2 request, open since 2018) — one source at a time.
+- **`source` as a filter field** parses and always evaluates to unknown, because §6.1 puts `resource`
+  on the pane and `Record` has no source field. Resolves with §8.3's merged view.
+- **The two view modes of §7.3** — split view and in-place hide — need the filter wired to a row
+  space. `set.rs`'s prefix sum is the shape a filtered row space will take.
+
+---
+
 ## ✅ M4's last criterion, and the instrument that was hiding it — 2026-08-14, session 16
 
 **"50 MB/s for 60 s without dropped frames" now holds.** Two runs, 3,000 MB written at 50.0 MB/s,
