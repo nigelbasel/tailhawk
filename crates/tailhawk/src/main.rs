@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use tailhawk_core::set::LogSet;
-use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump};
+use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::{
     background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, RENDER_CAP_CELLS,
 };
@@ -244,9 +244,14 @@ impl Document {
         // window that has stopped growing looking like a window that has hung.
         // A pipe is one file by construction, so §5.5b's set description says nothing a user of it
         // wants — the spill's path is already in `summary`, which is the part §13.2 asks for.
-        let source = match &self.pump {
-            Some(pump) if pump.finished() => " — stream complete".to_string(),
-            Some(_) => " — reading stdin".to_string(),
+        let source = match self.pump.as_ref().map(|p| (p.finished(), p.outcome())) {
+            // **A stream that broke does not look like one that finished**, which is the
+            // distinction `PLAN.md` asks a pipe source to make. A pipe cannot tell a producer that
+            // exited cleanly from one that was killed — both just close the handle — but it can
+            // tell either of those from a read or a spill that failed, and that is what this says.
+            Some((_, Some(StreamEnd::Failed(why)))) => format!(" — stream failed: {why}"),
+            Some((true, _)) => " — stream complete".to_string(),
+            Some((false, _)) => " — reading stdin".to_string(),
             None => format!(" — {}", self.set.describe()),
         };
         format!(
@@ -1168,6 +1173,11 @@ fn main() -> Result<()> {
     let _ = reap_orphans();
 
     let reading = match std::env::args_os().nth(1) {
+        // `-` is the conventional name for the standard input stream, and `PLAN.md`'s M4
+        // done-criterion spells the command out: `docker logs -f svc | tailhawk -`. It is not part
+        // of §12.2's option surface — it is a *path* that by convention names the stream — so
+        // honouring it now is not a guess at the flag design that lands at M8.
+        Some(arg) if arg == "-" => Some(spawn_open(Document::from_pipe)),
         Some(arg) => Some(spawn_open(move || {
             Document::open(std::path::Path::new(&arg))
         })),

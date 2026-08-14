@@ -46,7 +46,7 @@ use std::ffi::c_void;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -249,6 +249,25 @@ impl Drop for Spill {
 
 static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// How a stream stopped.
+///
+/// **`PLAN.md` asks a pipe source to "distinguish *writer finished* from *writer died mid-stream*",
+/// and this is as far as a pipe can answer.** Both look identical at the handle: a producer that
+/// exits cleanly and one that is killed each close their end, and the reader sees the same
+/// `ERROR_BROKEN_PIPE`. The distinction the plan actually wants — `az containerapp logs show
+/// --follow` returning 0 on a replica restart — needs the *process* exit code, which means owning
+/// the child, which is the process-spawn source and not this. Recorded in `HANDOFF.md`.
+///
+/// What is distinguishable is a broken or exhausted pipe from a **read that failed for some other
+/// reason**, and keeping those apart costs nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// EOF, or the producer closed its end. §4.2's "stream complete".
+    Complete,
+    /// The read failed for a reason that is not the ordinary end of a pipe.
+    Failed(String),
+}
+
 /// Copies the standard input handle into a spill, on its own thread.
 ///
 /// §4.2 wants "a background thread with blocking `ReadFile`", and blocking is the point: a pipe has
@@ -259,6 +278,8 @@ pub struct Pump {
     path: PathBuf,
     bytes: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
+    /// Why the stream stopped, once it has. See [`StreamEnd`].
+    ended: Arc<Mutex<Option<StreamEnd>>>,
     /// Kept so the spill outlives the thread and is deleted when the pump is dropped. The thread
     /// holds its own handle to the same file, opened through the same restricted DACL.
     _spill: Spill,
@@ -275,6 +296,7 @@ impl Pump {
         let path = spill.path().to_path_buf();
         let bytes = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
+        let ended: Arc<Mutex<Option<StreamEnd>>> = Arc::new(Mutex::new(None));
 
         let handle = match unsafe { GetStdHandle(STD_INPUT_HANDLE) } {
             Ok(h) if !h.is_invalid() => StdinHandle(h),
@@ -290,9 +312,12 @@ impl Pump {
             .map_err(|e| Error(format!("{}: {e}", path.display())))?;
         let counted = Arc::clone(&bytes);
         let done = Arc::clone(&finished);
+        let ended_by = Arc::clone(&ended);
         std::thread::Builder::new()
             .name("tailhawk-stdin".into())
             .spawn(move || {
+                let ended = ended_by;
+                let mut outcome = StreamEnd::Complete;
                 let mut buf = vec![0u8; READ_BYTES];
                 loop {
                     let mut read = 0u32;
@@ -302,20 +327,29 @@ impl Pump {
                         // §4.2: a 0-byte read is **stream complete**, not an error and not an exit.
                         Ok(()) if read == 0 => break,
                         Ok(()) => {}
-                        Err(_) => {
+                        Err(e) => {
                             // §4.2 names `ERROR_BROKEN_PIPE` as the ordinary end of a pipe — the
-                            // producer closed its end. Anything else is a real failure, and both
-                            // stop the pump; the difference would only matter to a UI that reported
-                            // it, and none does yet.
-                            let _ = unsafe { GetLastError() } == ERROR_BROKEN_PIPE;
+                            // producer closed its end, which is [`StreamEnd::Complete`]. Anything
+                            // else is a failure and is kept as one.
+                            if unsafe { GetLastError() } != ERROR_BROKEN_PIPE {
+                                outcome = StreamEnd::Failed(format!("{e}"));
+                            }
                             break;
                         }
                     }
-                    if writer.write_all(&buf[..read as usize]).is_err() || writer.flush().is_err() {
+                    if let Err(e) = writer
+                        .write_all(&buf[..read as usize])
+                        .and_then(|()| writer.flush())
+                    {
+                        // **The spill failed, not the pipe.** A full disk here loses log content
+                        // silently otherwise: the window would show what arrived and stop, looking
+                        // exactly like a producer that finished.
+                        outcome = StreamEnd::Failed(format!("spill: {e}"));
                         break;
                     }
                     counted.fetch_add(read as u64, Ordering::Relaxed);
                 }
+                *ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
                 done.store(true, Ordering::Release);
             })
             .map_err(|e| Error(format!("stdin pump: {e}")))?;
@@ -324,6 +358,7 @@ impl Pump {
             path,
             bytes,
             finished,
+            ended,
             _spill: spill,
         })
     }
@@ -342,6 +377,11 @@ impl Pump {
     /// Whether the producer has closed its end. §4.2: this is **not** a reason to exit.
     pub fn finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
+    }
+
+    /// Why the stream stopped, or `None` while it is still running. See [`StreamEnd`].
+    pub fn outcome(&self) -> Option<StreamEnd> {
+        self.ended.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 

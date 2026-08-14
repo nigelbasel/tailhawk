@@ -105,6 +105,30 @@ demand, and a sustained-throughput rig. Roughly a quarter of the estimate is tes
 Score this against actuals when M4 lands, and record **why** it was wrong rather than only by how
 much.
 
+### Interim: M4 is feature-complete — 2026-08-14
+
+| Item | Forecast h | Forecast tok | Actual |
+|---|---:|---:|---|
+| Follow state machine | 2.5 | 400 k | done 2026-08-13 |
+| Rotation, three modes | 3.5 | 550 k | done 2026-08-13; the third mode actually landed with E30 |
+| **Rolling sets (E30)** | **3.0** | **450 k** | **~0.6 h wall clock, 4 commits** — see below |
+| **stdin (E16)** | **2.0** | **300 k** | **~0.9 h wall clock, 3 commits** |
+| Shell wiring | 1.0 | 150 k | folded into E30 and E16 rather than separate |
+| Verification | 1.5 | 250 k | the 50 MB/s rig, the rolling-set harness, the pipe harness |
+
+Wall clock is not active-agent hours and is not comparable to the table above — the session-level
+figure comes from the jsonl parse at the end. It is recorded because it is what exists now, and
+because the *ordering* it shows is the interesting part: the two items forecast as hardest were the
+two that went fastest.
+
+**Why E16 was cheap, and it is the same reason as E30.** §4.2 says the spill "reuses the same index
+path as a real file". Taken literally that makes `stdin.rs` a byte-copier — no tailing, indexing,
+decoding or rendering — because the pipe becomes a file and everything already built applies. Both
+items came in low by **declining to build a parallel path**, and in both cases the spec sentence that
+made it possible was already there to be read.
+
+The estimate's implicit model was "a new source kind needs new source machinery". Neither did.
+
 ### Interim: E30 landed, and risk 1 did not happen — 2026-08-14
 
 | | Forecast | Actual |

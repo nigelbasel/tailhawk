@@ -1,5 +1,46 @@
 # Handoff — resume here
 
+## ✅ stdin (E16, §4.2) — 2026-08-14, session 16 — **M4 is feature-complete**
+
+`… | tailhawk` works. Six lines from a live producer rendered as they arrived; closing the
+producer's end left the process running with the title changed to `stream complete`.
+
+**The design is one sentence of §4.2 taken literally.** The stream is "spilled to a temp file … and
+reuses the same index path as a real file", so a pump thread copies the pipe into a file and the
+shell opens **that file** with `LogSet::open_single`. `stdin.rs` therefore contains **no tailing,
+indexing, decoding or rendering code at all** — encoding detection on the piped bytes, the line
+index, following, rotation and the viewport all apply without knowing a pipe was involved.
+
+| §13.2 requirement | Verified |
+|---|---|
+| Restrictive DACL in `%TEMP%` | `Get-Acl` on the live spill: one entry, `OSPREY\nigel=FullControl` |
+| Deleted on clean exit | drop removes it; two tests |
+| Reaped on next launch if orphaned | killed a piping instance, opened a file, the orphan was gone |
+| Location shown to the user | in the title, since there are no source properties yet |
+| End of stream is **not** an app exit (§4.2) | process alive after the producer closed; title says so |
+
+### ⚠ A negative control that did not fire, and what it changed
+
+The DACL test asserted the spill's own descriptor started `D:P`. **Taking the `P` out of the SDDL
+changed nothing** — the file still came back protected, because supplying *any* explicit descriptor
+through `SECURITY_ATTRIBUTES` already stops the parent's inheritable ACEs merging. The assertion held
+while the thing it named was gone.
+
+It now asserts a **difference**: it creates an ordinary file in the same directory, refuses to pass
+if that file's DACL grants nobody else anything (which would make the comparison vacuous), and checks
+the spill grants none of them. Measured here — ordinary `D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;<user>)`,
+spill `D:P(A;;FA;;;<user>)`. Dropping the descriptor argument now fails it on `SY`.
+
+### ⚠ Not done
+
+- **Single-instance forwarding is disabled when stdin is a pipe** (§4.2's implied `--new-window`).
+  There is no single-instance machinery yet, so there is nothing to disable — it lands with it.
+- **A user-facing "keep this spill" action.** `Spill::keep` exists and nothing calls it.
+- `--version` and every other flag: the option surface is §12.2 and M8. A stray argument is still
+  treated as a path, which is what the shipped binary has always done.
+
+---
+
 ## ✅ Rolling sets (E30, §5.5b) — 2026-08-14, session 16
 
 **Tailhawk follows a set of files as one log**, which §5.5b says no incumbent does — Hoo WinTail's
@@ -2796,7 +2837,8 @@ Recorded because each cost real effort to find, and two of them were caught only
 | **A regression guard must assert a ratio, never a duration.** The first cost guard for the text pass asserted "under a second", measured 0.21 s alone, 0.60 s under full-suite load and 2.76–7.49 s in repeats — a flake that also made my "two orders of magnitude of headroom" claim wrong. This machine's ~40% background load is the thing `experiments/g3-d3d11` spent two sessions establishing; a duration threshold encodes the idle machine that never exists. Compare two arms **interleaved** and assert their ratio: `the_layout_cost_does_not_scale_…` runs 240 vs 24 columns five times alternating, compares medians, and its control fires at **12.9x** against a 3.0 threshold — a margin load cannot manufacture. | `crates/tailhawk-core/src/paint.rs` |
 | **D3D11's context is global, and a pass that does not set a state inherits the last one's.** `TextPipeline::draw` binds a dual-source blend state and does not restore it; `draw_background` set none at all. Frame 1 therefore got the default and was correct, and **every frame after it drew nothing at all** — the background shader emits one output, so against an undefined second source the pass leaves the target untouched. On screen that reads as pure black, because a fresh flip-model back buffer is zeroed; the symptom therefore depends on what was already in the buffer, which is exactly how the first version of the regression test came to pass without firing. At RGB(18,20,23) against RGB(0,0,0) it is invisible to the eye, and it was M0 code that had been right for fifteen sessions because nothing else had ever bound a blend state. **Found by dogfooding a real file, not by any test.** Now guarded by `the_background_survives_a_frame_of_text`. Every pass must declare the states it depends on. | `crates/tailhawk-core/src/gpu.rs` |
 | **Verifier agents share the working tree, deliberately — the fix is discipline, not isolation.** Worktree isolation (`isolation: 'worktree'`) would remove the hazard below outright, and was considered and **rejected on cost**: a worktree gets its own `target/`, so eleven verifiers each running `cargo test` against the `windows` crate is eleven cold builds. A 20-minute review would become far worse, to fix something a naming convention fixes for free. **Escalate to worktrees if this bites a second time** — owner's call, 2026-08-12, delegated. | workflows |
-| **`git checkout -- <file>` is not "undo my last edit" — it is "discard everything since the last commit".** Used to back out a one-line probe during a negative control on 2026-08-13, it destroyed an hour of *uncommitted* selection work in the same file: the whole shell half of a feature, because the feature had not been committed yet. The undo that was wanted was reverting the probe alone. **Commit before applying a negative control** — the control is a deliberate temporary break, and there is nothing to lose only if the good state is already saved. Where that is impractical, back the file up first, as the `paint.rs` controls did earlier in the session. | git |
+| **`git checkout -- <file>` is not "undo my last edit" — it is "discard everything since the last commit".** Used to back out a one-line probe during a negative control on 2026-08-13, it destroyed an hour of *uncommitted* selection work in the same file: the whole shell half of a feature, because the feature had not been committed yet. The undo that was wanted was reverting the probe alone. **Commit before applying a negative control** — the control is a deliberate temporary break, and there is nothing to lose only if the good state is already saved. Where that is impractical, back the file up first, as the `paint.rs` controls did earlier in the session. **Hit again on 2026-08-14** in the same shape and for the same reason: a control on the spill DACL fired, the fix for the *test* it exposed was written on top of the still-applied control, and the `checkout` that reverted the control took the fix with it. The rule needs one more clause — **after a control fires, commit the response before reverting the control.** | git |
+| **A negative control that does not fire is a result, and the first move is to measure, not to assume the control was wrong.** Removing the `P` from the spill's SDDL changed nothing, and the tempting readings were "the flag is unnecessary" or "the test is fine anyway". Printing the actual DACL of a spill *and* of an ordinary file in the same directory settled it in one run: the security property is real and is delivered by supplying a descriptor at all, and the test had been asserting something Windows would have produced regardless. **The repair is almost always a differential assertion** — compare against an object that lacks the property, and fail loudly if that comparison turns out vacuous. | `crates/tailhawk-core/src/stdin.rs` |
 | **Never `git add -A` while a review workflow is running.** Verifier agents are told to settle a disagreement by writing a temporary test, running it and deleting it, so the working tree gains and loses files under you for the whole run. On 2026-08-11 a `git add -A` for an unrelated docs change swept up two half-finished probes from a verifier mid-flight and committed them under a commit message about something else. Commit **named paths** while a workflow is in flight, or wait for it. (The probes turned out to be worth keeping — see `every_ascii_character_is_one_cell_in_both_models` — but that was luck, not process.) | workflows |
 | **An offscreen target keeps the previous frame; a swapchain does not.** A read-back test that does not clear first cannot tell "drawn correctly" from "not drawn at all", because last frame's pixels are still there — and a fresh flip-model buffer is zeroed, so the shipped code has no such safety net. The first version of the background regression test passed with its fix removed for exactly this reason. **Clear to a colour no pass can produce** (magenta) before each frame; the control then fires *and* names the mechanism, since a magenta corner says "nothing was drawn" where a black one would have said "drawn wrong". | `crates/tailhawk-core/src/gpu.rs` |
 | **`InvalidateRect` during `WM_PAINT` does nothing** — the handler calls `ValidateRect` after `paint` returns, which clears exactly the region just invalidated. A frame that needs a successor has to raise a flag and let the handler invalidate *after* validating. The symptom is a window that renders its cold first frame and then freezes: with §3.2's rasterise-after-present, that is a full screen of placeholder boxes and no text, which reads as a layout bug rather than a missing repaint. | `crates/tailhawk/src/main.rs` |
