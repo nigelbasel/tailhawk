@@ -17,10 +17,9 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use tailhawk_core::indexer::{build_index, IndexOptions};
+use tailhawk_core::set::LogSet;
 use tailhawk_core::{
-    background_rgb8, Charset, FileSource, Follow, LineIndex, LogFile, Poll, Renderer, Rotation,
-    RowEnd, RowSource, Rows, Selection, View, Watch, WindowHandle, RENDER_CAP_CELLS,
+    background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
@@ -81,10 +80,9 @@ thread_local! {
 /// a multi-GB file would otherwise undo the two-stage paint `experiments/g3-d3d11` measured at
 /// 13.1 ms. Everything here is `Send`, so it crosses the channel whole once it is ready.
 struct Document {
-    file: LogFile,
-    index: LineIndex,
-    charset: Charset,
-    rows: Rows,
+    /// The source, which is **a set of files and not one file** — §5.5b. A log with nothing beside
+    /// it is a set of one, so there is a single path here rather than two.
+    set: LogSet,
     view: View,
     summary: String,
     /// The current selection, or `None` for "nothing selected".
@@ -94,19 +92,15 @@ struct Document {
     selection: Option<Selection>,
     /// Whether the left button is down, so `WM_MOUSEMOVE` can tell a drag from a hover.
     dragging: bool,
-    /// Where the index has been scanned to, so a tick only reads what is new.
-    follow: Follow,
-    /// The path, and the identity of the file we hold, so a roll is noticed. §5.5.
-    watch: Watch,
 }
 
 impl RowSource for Document {
     fn row_text(&self, row: u64) -> Option<&str> {
-        self.rows.row_text(row)
+        self.set.row_text(row)
     }
 
     fn row_anchors(&self, row: u64) -> &tailhawk_core::cell::ColumnAnchors {
-        self.rows.row_anchors(row)
+        self.set.row_anchors(row)
     }
 
     /// **The one thing `Rows` cannot answer**, and the reason `Document` is now the painter's source
@@ -132,45 +126,24 @@ impl Document {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let describe = |e: &dyn std::fmt::Display| format!("{name}: {e}");
 
-        // Opened once and handed on: two handles could land on different files if the log rotates
-        // between them, and the index would then describe bytes the reads no longer return.
-        let source = FileSource::open(path).map_err(|e| describe(&e))?;
-        let detection = *source.detection();
-        let file = source.into_file();
-        let charset = detection.charset;
-        // **The BOM is consumed, not indexed as content.** Indexing from zero would put its bytes
-        // at the start of line 0, which §5.6 says are never rendered — while still leaving every
-        // later byte offset exact, which is why the index starts after it rather than shifting.
-        let start = detection.bom_len as u64;
-        let end = file.len().map_err(|e| describe(&e))?;
+        // **A set, not a file** — §5.5b. `LogSet` infers the members from the siblings, opens each
+        // with its own encoding detection and index, and gives them one row space; a log with
+        // nothing beside it comes back as a set of one, so there is no second path here.
+        let set = LogSet::open(path).map_err(|e| format!("{name}: {e}"))?;
 
-        let index = build_index(&file, charset, start, end, &IndexOptions::default())
-            .map_err(|e| describe(&e))?;
-
-        let flag = if detection.disagreed { " (mixed?)" } else { "" };
-        // Only the fixed part. The counts change while following, so they are formatted per read
-        // rather than frozen at open -- a tail whose title says "1 lines" while sixty scroll past is
-        // worse than no title at all.
-        let summary = format!("{name}: {}{flag}", charset.name());
-
-        // Built before the index moves into the struct, because it reads the index to learn whether
-        // the file ends on a terminator.
-        let follow = Follow::after_build(charset, &index, end);
-        let watch = Watch::new(path, file.identity().map_err(|e| describe(&e))?);
+        // **Only the name is fixed.** Everything else in the title -- the encoding, the membership,
+        // the counts -- can change while the log is being followed, so `describe` formats them per
+        // read. A tail whose title says "1 lines" while sixty scroll past is worse than no title at
+        // all, and after §5.5b's roll the same is true of the file list.
+        let summary = name;
 
         Ok(Self {
-            rows: Rows::new(charset),
             // Metrics arrive with the device; a zero-size view is replaced before the first frame
             // draws, and `View::set_metrics` is what §3.1 requires be driven from the measured face.
             view: View::new(1.0, 1.0),
-            index,
-            charset,
-            file,
+            set,
             summary,
-            follow,
-            watch,
             selection: None,
             dragging: false,
         })
@@ -186,11 +159,13 @@ impl Document {
         let (cell_w, row_h) = cell;
         self.view.set_metrics(cell_w, row_h);
         self.view.set_viewport(size.0 as f32, size.1 as f32);
-        self.view.grid_mut().set_total_rows(self.index.line_count());
+        self.view.grid_mut().set_total_rows(self.set.total_rows());
 
-        let extent = self.index.extent();
+        // Across the whole set, not just the live member: §5.5b's scrollback reaches into files
+        // whose widest line may be wider than anything the current one holds.
+        let extent = self.set.extent();
         let columns = extent
-            .exact_cells(self.charset)
+            .exact_cells(self.set.charset())
             .unwrap_or_else(|| extent.max_line_bytes())
             .min(RENDER_CAP_CELLS as u64);
         self.view.hgrid_mut().set_columns(columns);
@@ -203,127 +178,71 @@ impl Document {
         // A read that fails does not fail the frame — §11.3. `Rows` keeps what it got and records
         // why the rest is missing; those rows simply draw nothing.
         let anchored = self.view.hgrid().visible_columns().start > 0;
-        let _ = self
-            .rows
-            .fetch(&self.file, &self.index, first, count, anchored);
+        let _ = self.set.fetch(first, count, anchored);
     }
 
-    /// The title text, rebuilt from the live counts.
+    /// The title text, rebuilt from the live state — every part of it except the name.
+    ///
+    /// §5.5b requires the inferred set be "shown in the UI for confirmation rather than silently
+    /// assumed", and the title bar is the only UI this has. It names the oldest and newest member so
+    /// the direction can be checked against the folder, rather than asking the user to take the word
+    /// "ascending" on trust.
+    ///
+    /// **Rebuilt rather than cached because a set that rolls is a different set.** Freezing this at
+    /// open put "2 files … newest is `log_002.txt`" in the title of a window showing three, and a
+    /// stale confirmation is worse than none — it invites a check against a list that has moved on.
     fn describe(&self) -> String {
+        let flag = if self.set.newest().disagreed() {
+            " (mixed?)"
+        } else {
+            ""
+        };
         format!(
-            "{}, {} lines, {} bytes",
+            "{}: {}{flag} — {}, {} lines, {} bytes",
             self.summary,
-            self.index.line_count(),
-            self.follow.scanned_to()
+            self.set.charset().name(),
+            self.set.describe(),
+            self.set.total_rows(),
+            self.set.bytes()
         )
     }
 
-    /// Reattaches to whatever is at the path now, after a rotation.
+    /// Advances the source one tick: growth, rotation, rolls and retention, per §5.5 and §5.5b.
     ///
-    /// **The drain happens before this is called, not inside it** — see `poll_follow`. By the time
-    /// control arrives here the old handle has been read to EOF and its lines are in the index we
-    /// are about to throw away, which is the only order that does not lose the last writes before a
-    /// roll (§5.5).
+    /// **`was_following` is read before the row count changes, and that ordering is the whole of
+    /// tailing.** `Grid::is_following` is derived from being at the bottom, so once `set_total_rows`
+    /// has taken the new count the old position is no longer the bottom and the answer is always
+    /// false. Asking first is what distinguishes "the user is watching the tail" from "the user
+    /// scrolled up", and getting it the wrong way round would either pin a reader who had scrolled
+    /// back or fail to follow at all.
     ///
-    /// Everything derived from the old file goes at once: the index, the follow position, the row
-    /// window, and the selection — which addressed rows that no longer exist. Keeping any of it
-    /// would be a viewer showing one file's text at another file's offsets.
-    fn reattach(&mut self, file: LogFile) -> bool {
-        let Ok(identity) = file.identity() else {
-            return false;
-        };
-        let Ok(end) = file.len() else {
-            return false;
-        };
-        let Ok(index) = build_index(&file, self.charset, 0, end, &IndexOptions::default()) else {
-            return false;
-        };
-
-        self.follow = Follow::after_build(self.charset, &index, end);
-        self.index = index;
-        self.file = file;
-        self.watch.adopt(identity);
-        self.rows = Rows::new(self.charset);
-        self.selection = None;
-        self.dragging = false;
-
-        self.view.grid_mut().set_total_rows(self.index.line_count());
-        // A tail that rolls should keep tailing. §5.5 wants a separator row here too, which is a
-        // rendering feature and is not done — recorded in `HANDOFF.md` rather than half-drawn.
-        self.view.grid_mut().scroll_to_bottom();
-        true
-    }
-
-    /// Scans whatever the writer has appended since the last tick.
-    ///
-    /// **`was_following` is read before the index grows, and that ordering is the whole of tailing.**
-    /// `Grid::is_following` is derived from being at the bottom, so once `set_total_rows` has taken
-    /// the new count the old position is no longer the bottom and the answer is always false. Asking
-    /// first is what distinguishes "the user is watching the tail" from "the user scrolled up", and
-    /// getting it the wrong way round would either pin a reader who had scrolled back or fail to
-    /// follow at all.
-    ///
-    /// The `Rows` cache needs no explicit invalidation here: its key carries `index.line_count()`,
-    /// which changes the moment a line is appended. **That is not true of §5.5's copy-truncate**,
-    /// where contents change under a stable count — but that is rotation, which this does not handle.
+    /// Time-bounded rather than byte-bounded — see `Follow::poll_for`. 30 ms of a 100 ms tick leaves
+    /// the message loop 70% idle and is what carries the 50 MB/s of `SPEC.md` §11.3's criterion; a
+    /// single byte-budgeted scan per tick capped throughput at roughly 40 MB/s.
     fn poll_follow(&mut self) -> bool {
-        let Ok(len) = self.file.len() else {
-            return false;
-        };
-
-        // **Rotation is checked before growth**, because a file that has been replaced must not have
-        // the new file's length applied to the old file's scan position.
-        //
-        // §5.5 wants the old handle drained to EOF before switching, because a writer that rolls has
-        // usually just written its last lines to the file it is abandoning. That is done below —
-        // and **⚠ it currently achieves nothing, which is stated here rather than left to be
-        // discovered.** The drained lines go into an index that `reattach` immediately throws away,
-        // because in a single-file view the previous file is no longer the document. The requirement
-        // only becomes real with §5.5b's rolling sets, where the old member stays in the scrollback
-        // and those lines remain reachable. The drain is kept because it is the correct *order* and
-        // because removing it would have to be reinstated verbatim; it is not evidence that "never
-        // lose the last KB" is delivered. See `HANDOFF.md`.
-        match self.watch.check(len, self.follow.scanned_to()) {
-            Rotation::Stable => {}
-            Rotation::Missing => {
-                // `tail -F`: keep the handle, keep reading it, wait for the path to come back.
-            }
-            Rotation::Truncated => {
-                if let Ok(file) = self.watch.open_current() {
-                    return self.reattach(file);
-                }
-                return false;
-            }
-            Rotation::Replaced => {
-                let mut guard = 0;
-                while let Ok(Poll::Grew { .. }) = self.follow.poll(&self.file, &mut self.index, len)
-                {
-                    guard += 1;
-                    if guard > 1_000 {
-                        break;
-                    }
-                }
-                if let Ok(file) = self.watch.open_current() {
-                    return self.reattach(file);
-                }
-                return false;
-            }
-        }
         let was_following = self.view.grid().is_following();
-        // Time-bounded rather than byte-bounded: see `Follow::poll_for`. 8 ms of a 100 ms tick
-        // leaves the message loop 92% idle while removing the ~40 MB/s ceiling a single
-        // byte-budgeted scan imposed.
-        let grew = match self.follow.poll_for(&self.file, &mut self.index, len, 30) {
-            Ok(Poll::Grew { lines, .. }) => lines > 0,
-            // Truncation or rotation. Not handled yet, and deliberately not guessed at — the file
-            // stays as it was until §5.5's component exists.
-            Ok(Poll::Shrank { .. }) | Ok(Poll::Unchanged) | Err(_) => false,
-        };
-        if !grew {
+        let polled = self.set.poll(30);
+        if polled.is_quiet() {
             return false;
         }
-        self.view.grid_mut().set_total_rows(self.index.line_count());
+
+        // **A selection addresses rows, and these two events move rows out from under it.** A
+        // truncated member's rows are different bytes at the same numbers; a retirement renumbers
+        // everything after it. Keeping the selection would tint text the user never chose, and
+        // §5.6's "copy preserves the original bytes" would be copying the wrong file's.
+        //
+        // A *roll* does not clear it: §5.5b appends the new member at the end of the row space, so
+        // every existing row keeps its number, which is the property the prefix sum was chosen for.
+        if polled.reset || !polled.retired.is_empty() {
+            self.selection = None;
+            self.dragging = false;
+        }
+
+        self.view.grid_mut().set_total_rows(self.set.total_rows());
         if was_following {
+            // A tail that rolls keeps tailing. §5.5b wants a separator row at the boundary too,
+            // which is a rendering feature and is not done — `LogSet::locate` reports where one
+            // goes, and `HANDOFF.md` records that nothing draws it.
             self.view.grid_mut().scroll_to_bottom();
         }
         true
@@ -356,7 +275,7 @@ impl Document {
             Selecting::Word => {
                 // A word needs the row's text, and only the fetched window has it. Falling back to a
                 // caret is honest; guessing a span from a line we cannot see is not.
-                self.selection = Some(match self.rows.line(at.row) {
+                self.selection = Some(match self.set.row_text(at.row) {
                     Some(line) => Selection::word(self.view.cells(), at.row, line, at.cell),
                     None => Selection::at(at),
                 });
@@ -388,7 +307,7 @@ impl Document {
         }
         let mut out = String::new();
         for row in sel.first_row()..=sel.last_row() {
-            let Some(line) = self.rows.line(row) else {
+            let Some(line) = self.set.row_text(row) else {
                 continue;
             };
             if let Some(bytes) = sel.byte_range(self.view.cells(), row, line) {
@@ -1370,7 +1289,7 @@ mod tests {
         let mut doc = Document::open(&path).expect("open the fixture");
         // 20 rows of 10 px in a 200 px viewport.
         doc.lay_out((8.0, 10.0), (800, 200));
-        assert_eq!(doc.index.line_count(), 5_000);
+        assert_eq!(doc.set.total_rows(), 5_000);
         assert_eq!(doc.view.grid().scroll().row, 0);
 
         // **A page is a screenful less one row**, so the line you were reading stays on screen.

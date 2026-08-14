@@ -101,6 +101,9 @@ pub struct Member {
     start: u64,
     /// How far this member has been indexed. Only the newest one ever moves.
     scanned_to: u64,
+    /// §5.6: the head and tail samples reached different conclusions about the encoding. The tail
+    /// won, because it is what is live, and the file is flagged rather than silently decided.
+    disagreed: bool,
 }
 
 impl Member {
@@ -143,6 +146,11 @@ impl Member {
         self.start
     }
 
+    /// §5.6: the head and tail samples disagreed about this member's encoding, so it is flagged.
+    pub fn disagreed(&self) -> bool {
+        self.disagreed
+    }
+
     fn open(path: &Path) -> Result<Self> {
         let name = path
             .file_name()
@@ -168,6 +176,7 @@ impl Member {
             first_row: 0,
             start,
             scanned_to: end,
+            disagreed: detection.disagreed,
         })
     }
 }
@@ -311,6 +320,14 @@ impl LogSet {
 
     pub fn total_rows(&self) -> u64 {
         self.total_rows
+    }
+
+    /// Bytes indexed across the whole set.
+    ///
+    /// Across, not just the live member: reporting the live member's alone made the byte count in
+    /// the title *fall* at every roll, which reads as data lost when nothing was.
+    pub fn bytes(&self) -> u64 {
+        self.members.iter().map(|m| m.scanned_to - m.start).sum()
     }
 
     /// How many older members the eager bound left out of the row space.
@@ -566,6 +583,7 @@ impl LogSet {
         let held: Vec<&str> = self.members.iter().map(|m| m.name.as_str()).collect();
         let listing = siblings(&self.dir);
         let set = RollingSet::infer(&self.anchor, &listing);
+        self.set = set.clone();
         let candidates: Vec<String> = set
             .members()
             .iter()
@@ -598,6 +616,10 @@ impl LogSet {
 
         let listing = siblings(&self.dir);
         let set = RollingSet::infer(&self.anchor, &listing);
+        // **Kept, not just consulted.** A log4net set that has rolled once was a `Single` when it
+        // was opened, and `pattern()` reporting that for ever would describe a set that no longer
+        // exists.
+        self.set = set.clone();
         let held: Vec<String> = self.members.iter().map(|m| m.name.clone()).collect();
         let live_name = held.last().cloned().unwrap_or_default();
 
@@ -669,13 +691,31 @@ impl LogSet {
     }
 
     /// One line the UI can show. §5.5b requires the inference be confirmable, not assumed.
+    ///
+    /// **Built from the members actually held, not from the inference made at open.** A set that has
+    /// rolled since is a different set; a title that still names the file it opened with is telling
+    /// the user something that has stopped being true, which is worse than telling them nothing —
+    /// they would be confirming an order against a file list that no longer matches. Caught by
+    /// screenshot rather than by test: nothing here could see that the string was stale.
+    ///
+    /// It names files rather than directions for the same reason [`RollingSet::describe`] does. A
+    /// user can check "oldest is `app.log.2`" against the folder in front of them; nobody checks
+    /// "descending".
     pub fn describe(&self) -> String {
-        let base = self.set.describe();
-        if self.omitted == 0 {
-            base
+        let oldest = self.members[0].name();
+        let newest = self.newest().name();
+        let mut out = if self.members.len() == 1 {
+            format!("1 file — {oldest}")
         } else {
-            format!("{base}; {} older not indexed", self.omitted)
+            format!(
+                "{} files — oldest is {oldest}, newest is {newest}",
+                self.members.len()
+            )
+        };
+        if self.omitted > 0 {
+            out.push_str(&format!("; {} older not indexed", self.omitted));
         }
+        out
     }
 }
 
@@ -931,7 +971,7 @@ mod tests {
         assert_eq!(set.total_rows(), 1);
         set.fetch(0, 1, false).expect("fetch");
         assert_eq!(set.row_text(0), Some("only"));
-        assert_eq!(set.describe(), "1 file — no rolling set found beside it");
+        assert_eq!(set.describe(), "1 file — app.log");
     }
 
     /// The extent drives the horizontal scroll range, and a set whose widest line is in an *older*
@@ -1106,6 +1146,46 @@ mod tests {
         assert!(polled.retired.is_empty());
         assert_eq!(set.total_rows(), 2);
         assert_eq!(read_all(&mut set), ["a1", "b1"]);
+    }
+
+    /// **The defect a screenshot found and no test here could have.** `describe` was built from the
+    /// inference made at open, so a window showing three files went on saying "2 files … newest is
+    /// `log_002.txt`" — a confirmation prompt inviting a check against a list that had moved on.
+    #[test]
+    fn the_description_follows_the_set_across_a_roll() {
+        let dir = scratch("describe-roll");
+        write(&dir, "log_001.txt", &["a"]);
+        let anchor = write(&dir, "log_002.txt", &["b"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+        assert_eq!(
+            set.describe(),
+            "2 files — oldest is log_001.txt, newest is log_002.txt"
+        );
+
+        write(&dir, "log_003.txt", &["c"]);
+        set.poll(30);
+        assert_eq!(
+            set.describe(),
+            "3 files — oldest is log_001.txt, newest is log_003.txt"
+        );
+    }
+
+    /// The same for log4net, where the shape itself changes: a set that was one file when it was
+    /// opened becomes two the moment the writer renames it.
+    #[test]
+    fn a_set_that_was_one_file_says_two_after_the_rename() {
+        let dir = scratch("describe-rename");
+        let anchor = write(&dir, "app.log", &["gen1"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+        assert_eq!(set.describe(), "1 file — app.log");
+
+        std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).expect("rename");
+        write(&dir, "app.log", &["gen2"]);
+        set.poll(30);
+        assert_eq!(
+            set.describe(),
+            "2 files — oldest is app.log.1, newest is app.log"
+        );
     }
 
     /// A quiet tick has to be recognisable, or the shell repaints and re-fetches every 100 ms
