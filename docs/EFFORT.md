@@ -105,6 +105,30 @@ demand, and a sustained-throughput rig. Roughly a quarter of the estimate is tes
 Score this against actuals when M4 lands, and record **why** it was wrong rather than only by how
 much.
 
+### Interim: E30 landed, and risk 1 did not happen — 2026-08-14
+
+| | Forecast | Actual |
+|---|---:|---|
+| Rolling sets (E30) | **3.0 h** | ~0.6 h of wall clock across four commits (10:17 → 10:51), plus the shell wiring the forecast counted separately |
+
+**Risk 1 was named as "the item most likely to double" and it cost less than a quarter.** The
+forecast assumed a set spanning members needs "a member-aware offset or a virtual concatenation, and
+that reaches `rows.rs` too". It needs neither: **one `LineIndex` per member and a prefix sum on top**
+leaves `index.rs`, `indexer.rs` and `rows.rs` untouched, because §5.5b's own ordering rule — members
+oldest-first — puts the growing member last, where growth appends and renumbers nothing.
+
+The lesson is about how the risk was framed, not about optimism. The forecast reasoned from "the
+index assumes one byte space" to "so the index must change". The actual move was to **not** span the
+index at all, and that option was invisible from inside the framing. **A risk stated as a property of
+existing code ("`LineIndex` assumes X") predicts cost only if the new feature has to live inside that
+code.** Worth asking, next time a risk is written down: is this a constraint, or is it a boundary the
+new thing can sit beside?
+
+Two things the forecast did *not* name and that did cost real time: the **stale title** (found by
+screenshot, not by any test — see `HANDOFF.md`), and getting `describe()`, the byte count and the
+encoding flag to survive a roll. All three are "the presentation of state that now changes", which is
+a category the estimate had no line for and which follows mechanically from making anything dynamic.
+
 ## Forecast, on this evidence
 
 | Milestone | Plan | Naive extrapolation | Confidence |

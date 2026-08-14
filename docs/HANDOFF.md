@@ -1,5 +1,78 @@
 # Handoff — resume here
 
+## ✅ Rolling sets (E30, §5.5b) — 2026-08-14, session 16
+
+**Tailhawk follows a set of files as one log**, which §5.5b says no incumbent does — Hoo WinTail's
+folder monitoring opens rolled files as *separate documents*. This is the M4 item the forecast
+flagged as most likely to double, and it did not.
+
+| Verified on screen | |
+|---|---|
+| Serilog-shaped set, opened at `log_002.txt` | all 4 lines of both members, in writing order |
+| Roll onto `log_003.txt` | **`gen2 LAST WORDS written after the roll decision` is in the scrollback** |
+| Still following afterwards | 9 lines across 3 files, view pinned to the tail |
+| log4net rename-and-recreate | **`gen1 LAST WORDS after the rename` sits between gen1 and gen2** |
+| Title after either roll | tracks the set: `3 files — oldest is log_001.txt, newest is log_003.txt` |
+
+### The drain finally does something
+
+The previous entry (below) said the drain was ordered correctly and achieved nothing, because
+`reattach` threw the drained index away. **That is now false, and the two "LAST WORDS" rows above are
+the evidence.** Lines written to a file *after* the writer decided to roll — and, for log4net, after
+the file had already been renamed away — reach the screen. §5.5's "this is where naive tools lose the
+last KB" is delivered rather than merely ordered for.
+
+The roll test is what holds it: `follow` re-seats onto the new member, so anything not drained first
+is not late, it is **gone**. Removing the `drain_live` call fails that test and no other.
+
+### Three files, three rules
+
+- **`pattern.rs`** — members and order from names alone. Two families with different rules, because
+  §5.5b's trap is that date sets count up and log4net's backups count *down*, and "getting this
+  backwards silently presents history in reverse". `members()` is always oldest-first so no caller
+  carries the direction. Numbers compare as **numbers** — an unpadded sequence reads 1, 10, 2 under a
+  byte sort, which is the same silent reversal from the other side.
+- **`set.rs`** — one `LineIndex` per member and a prefix sum on top. A single index across the set
+  would need a synthetic byte space and a translation on every lookup, in the path that runs per
+  frame; the prefix sum is a binary search over a handful of `u64`s, and because members are
+  oldest-first the live one is last, so growth appends and moves nothing.
+- **`main.rs`** — `Document` holds a `LogSet` and nothing else source-shaped. A lone file is a set of
+  one, so there is one path and not two.
+
+### ⚠ What is not done, and is not hidden
+
+- **On-demand backfill.** §5.5b's eager bound (newest 10 members or 512 MB) is enforced; members past
+  it are excluded and counted in the title (`; N older not indexed`), not backfilled as the user
+  scrolls in. One amendment to §5.5b is argued in `set.rs`: **the eager window always contains the
+  file the user opened**, or somebody who double-clicks `log-20260101.txt` in a year-long set gets
+  the December files and not that one.
+- **The event-driven directory watch.** §5.5b wants `FILE_NOTIFY_CHANGE_FILE_NAME`; a re-listing
+  throttled to 1 s stands in, because `ReadDirectoryChangesW` needs a thread the portable half cannot
+  own. A roll is noticed up to a second late — late, not lost, because the drain reads to EOF
+  whenever it happens.
+- **The separator row and the per-member gutter.** `LogSet::locate` returns the member index, the
+  per-member line number and `starts_member`; nothing draws any of it. Rendering feature.
+- **NLog's unpadded mid-name sequence** (`log.1.txt`) is not recognised as a set, and §5.5b's
+  `by-mtime` fallback is never *inferred*. Both are argued at `FIELD_MIN_DIGITS`: `service2.log`
+  beside `service3.log` is two services, and ordering files we cannot identify by a timestamp that a
+  copy rewrites is worse than saying "one file".
+- **Members in a sibling directory** (§5.5b's NLog `archive/` row). One directory listing only.
+- **Archived `.gz`/`.zip` members** stay out until §4.3 exists to read them.
+
+### What the screenshot caught that the tests could not
+
+The title's set description was built from the inference made at open, so a window showing three
+files went on saying "2 files … newest is `log_002.txt`". §5.5b wants the set **shown for
+confirmation**, and a confirmation that has stopped being true is worse than none — it invites a
+check against a list that has moved on. Now built from the members actually held, with two tests.
+Same pass: the encoding-disagreement flag had been dropped in the port, and the byte count reported
+the live member's alone, so it *fell* at every roll and read as data lost.
+
+**This is the fourth time visual verification has found something no test would.** The running tally
+is in the traps section.
+
+---
+
 ## ✅ M4 so far — following and rotation — 2026-08-13, session 15
 
 **Tailhawk tails.** It follows a growing file, survives two of §5.5's three rotation modes, and has
@@ -20,7 +93,11 @@ length gets applied to the old file's scan position.
 The `Rows` cache needed no explicit invalidation for growth: its key carries `line_count`. It still
 cannot see copy-truncate under a stable count, which is why rotation is detected separately.
 
-### ⚠ The drain is ordered correctly and achieves nothing yet
+### ⚠ The drain is ordered correctly and achieves nothing yet — **superseded 2026-08-14**
+
+> Kept as written because it is the record of what was true then. Rolling sets closed it; see the
+> entry above.
+
 
 §5.5 says the old handle is drained to EOF before switching — "this is where naive tools lose the
 last KB" — and it is. **But the drained lines go into an index that `reattach` immediately discards**,
@@ -37,7 +114,7 @@ verbatim — not because "never lose the last KB" is delivered. It is not.
   written-to path never changes identity and never shrinks. `a_roll_to_a_new_name_is_invisible_to_
   file_side_detection` asserts that rather than leaving it looking covered. Needs §5.5b.
 - **The "file truncated" separator row** §5.5 asks for. A rendering feature, not attempted.
-- **Rolling sets (E30)** and **stdin (E16)** — untouched.
+- ~~**Rolling sets (E30)**~~ — done 2026-08-14, see the entry above. **stdin (E16)** — untouched.
 ### 📏 50 MB/s × 60 s — run, and it found a real ceiling
 
 The suspicion in the previous entry was right and worse than stated. One `FOLLOW_BUDGET_BYTES` scan
@@ -2679,6 +2756,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 
 | Trap | Where |
 |---|---|
+| **Look at the window. Four defects so far were invisible to every test in the suite** — (1) placeholder boxes with no text, because nothing requested frame 2 and an `InvalidateRect` inside `paint` is wiped by the `ValidateRect` after it; (2) a pure-black background from frame 2, a blend state left bound by the glyph pass; (3) selection tint never reaching the screen, because the painter was handed `&doc.rows` instead of `&*doc`; (4) the title's set description frozen at the inference made at open, so a window showing three files said two. **The common shape: the data was right and the presentation was not, and a test that asks the data cannot see it.** Screenshot the real window after any change to what is drawn or what the chrome says. | sessions 15–16 |
 | **The index depends on encoding.** Decode *must* precede index — chunk boundaries need code-unit alignment. The first plan drafted them 13 weeks apart and would have thrown away tested work. *(This row also carried "and `0x0A` is a legal DBCS trail byte" until session 15, three rows above the entry refuting it. A reference table is read one row at a time, so each row has to stand alone.)* | `PLAN.md` §4 |
 | **`RESEARCH.md` §5.3 is GPL-contaminated.** The line index must be **re-derived from published docs only**, with `CLEANROOM.md` populated *before* writing code. Do not implement from that section. | `RESEARCH.md` §5.3 |
 | **Serilog and NLog roll to *new filenames* by default.** Neither copy-truncate nor rename-and-recreate describes it. Rolling sets (§5.5b) are v1 for this reason. | `SPEC.md` §5.5b |
