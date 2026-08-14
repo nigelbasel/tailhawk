@@ -37,10 +37,10 @@
 //! is displayed in source properties, because a user piping production logs deserves to know where
 //! they landed."
 //!
-//! All four are here. The DACL is built from the calling user's own SID rather than from an
-//! inheritable placeholder — see [`Spill::create`] — because `%TEMP%` on a shared or domain-joined
-//! machine can carry inherited ACEs granting other principals access, and a protected DACL is the
-//! only way to be sure none of them reach the file.
+//! All four are here. The DACL is built from the calling user's own SID and supplied at creation —
+//! see [`Spill::create`] — because a file created the ordinary way in `%TEMP%` **inherits ACEs for
+//! SYSTEM and BUILTIN\\Administrators**, measured on this machine, and on a shared or domain-joined
+//! one can inherit more.
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -154,11 +154,28 @@ impl Spill {
     /// afterwards, which would leave a window in which the file exists with `%TEMP%`'s inherited
     /// permissions and customer log content already in it.
     ///
-    /// The SDDL is `D:P(A;;FA;;;<user SID>)`. The `P` is the part that matters: it marks the DACL
-    /// **protected**, so ACEs inherited from `%TEMP%` — which on a domain-joined or shared machine
-    /// may name other principals — do not apply. Naming the user's own SID rather than `CO`
-    /// (CREATOR OWNER) is deliberate: `CO` is an inheritance placeholder and means nothing in an
-    /// ACE on a file that will never have children.
+    /// The SDDL is `D:P(A;;FA;;;<user SID>)` — one access-allowed ACE for the calling user and
+    /// nothing else. Naming the user's own SID rather than `CO` (CREATOR OWNER) is deliberate: `CO`
+    /// is an inheritance placeholder and means nothing in an ACE on a file that will never have
+    /// children.
+    ///
+    /// **⚠ The `P` is belt-and-braces, and a negative control is why that is said rather than
+    /// assumed.** Removing it changed nothing: the created file's DACL still reads back as
+    /// `D:P(A;;FA;;;<sid>)`, because supplying an explicit DACL through `SECURITY_ATTRIBUTES`
+    /// already stops the parent's inheritable ACEs being merged. It is kept because it costs one
+    /// character and states the intent — **not** because it is the mechanism, and the doc says so
+    /// rather than leaving a later reader to conclude from a passing test that it was.
+    ///
+    /// What *is* load-bearing is supplying a descriptor at all. Measured, in the same directory:
+    ///
+    /// | | DACL |
+    /// |---|---|
+    /// | An ordinary file in `%TEMP%` | `D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;<user>)` |
+    /// | A spill | `D:P(A;;FA;;;<user>)` |
+    ///
+    /// `a_spill_is_readable_only_by_the_user_who_made_it` asserts that **difference**, not the
+    /// spill's DACL alone — the first version asserted the latter and passed with the flag it
+    /// claimed to test removed.
     ///
     /// `CREATE_NEW` rather than `CREATE_ALWAYS`, so a name collision is an error instead of a
     /// silent truncation of somebody else's spill.
@@ -482,19 +499,15 @@ mod tests {
         assert_eq!(kind.readable(), matches!(kind, Stdin::Pipe | Stdin::Disk));
     }
 
-    /// §13.2's restrictive DACL, read back off the file rather than assumed from the SDDL we passed.
-    #[test]
-    fn a_spill_is_readable_only_by_the_user_who_made_it() {
+    /// The DACL of `path`, read back off the object rather than assumed from what was written.
+    fn dacl_of(path: &Path) -> String {
         use windows::Win32::Security::Authorization::{
             ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
             SE_FILE_OBJECT,
         };
         use windows::Win32::Security::{DACL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION};
 
-        let spill = Spill::create().expect("create a spill");
-        assert!(spill.path().exists());
-
-        let wide_path = wide(spill.path());
+        let wide_path = wide(path);
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         let status = unsafe {
             GetNamedSecurityInfoW(
@@ -508,7 +521,7 @@ mod tests {
                 &mut descriptor,
             )
         };
-        assert!(status.is_ok(), "reading the DACL back: {status:?}");
+        assert!(status.is_ok(), "reading the DACL of {path:?}: {status:?}");
 
         let mut text = PWSTR::null();
         let mut len = 0u32;
@@ -525,26 +538,52 @@ mod tests {
         let sddl = unsafe { text.to_string() }.expect("sddl text");
         unsafe { LocalFree(HLOCAL(text.0 as *mut c_void)) };
         unsafe { LocalFree(HLOCAL(descriptor.0)) };
+        sddl
+    }
+
+    /// §13.2's restrictive DACL — **as a difference from an ordinary file in the same directory**,
+    /// not as a property of the spill alone.
+    ///
+    /// The first version of this test asserted only the spill's own DACL, and a negative control
+    /// showed why that is not enough: removing the `P` from the SDDL changed nothing, because
+    /// supplying any explicit descriptor already blocks inheritance. The assertion held while the
+    /// thing it named was gone — the shape of a test that cannot fail.
+    ///
+    /// The control file is what fixes it. If this machine's `%TEMP%` granted nobody else anything
+    /// the comparison would be vacuous, so the test says so and fails rather than passing on an
+    /// empty premise. Dropping the `SECURITY_ATTRIBUTES` argument entirely now fails it on `SY`.
+    #[test]
+    fn a_spill_is_readable_only_by_the_user_who_made_it() {
+        let spill = Spill::create().expect("create a spill");
+        assert!(spill.path().exists());
+        let sddl = dacl_of(spill.path());
+
+        // An ordinary file, created the ordinary way, in the same directory.
+        let control = std::env::temp_dir().join("tailhawk-dacl-control.txt");
+        let _ = std::fs::remove_file(&control);
+        std::fs::write(&control, b"control").expect("write the control file");
+        let inherited = dacl_of(&control);
+        let _ = std::fs::remove_file(&control);
 
         let sid = current_user_sid().expect("our own sid");
         assert!(
             sddl.contains(&sid),
             "the owner should be granted access: {sddl}"
         );
-        // **`P` is the assertion that matters.** Without a protected DACL the file silently inherits
-        // whatever `%TEMP%` grants, which on a shared or domain-joined machine can include other
-        // principals — and the file would still be created, still be readable by us, and still pass
-        // every other test here while holding customer log content.
+
+        // Well-known principals a spill must not grant: SYSTEM (SY), BUILTIN\Administrators (BA),
+        // Users (BU), Everyone (S-1-1-0), Authenticated Users (S-1-5-11).
+        let others = ["SY)", "BA)", "BU)", "S-1-1-0", "S-1-5-11"];
         assert!(
-            sddl.starts_with("D:P"),
-            "the DACL must be protected against inheritance: {sddl}"
+            others.iter().any(|p| inherited.contains(p)),
+            "this machine's %TEMP% grants nobody else anything, so the comparison proves nothing \
+             — the control file's DACL is {inherited}"
         );
-        // Well-known groups that must not appear: Everyone (S-1-1-0), Authenticated Users
-        // (S-1-5-11), Users (BU), Administrators (BA).
-        for principal in ["S-1-1-0", "S-1-5-11", ";BU)", ";BA)"] {
+        for principal in others {
             assert!(
                 !sddl.contains(principal),
-                "{principal} must not be granted access: {sddl}"
+                "{principal} is granted access to the spill but must not be.\n  spill:    {sddl}\n  \
+                 ordinary: {inherited}"
             );
         }
     }
