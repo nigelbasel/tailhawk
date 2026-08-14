@@ -43,6 +43,18 @@ pub const MODE_COLOUR: u32 = 1;
 /// The greyscale average, which the rasteriser wrote into the mono sheet's alpha channel.
 pub const MODE_MONO_GREY: u32 = 2;
 
+/// **A solid fill — no atlas, no coverage, just `tint`.** `SPEC.md` §7.1's highlight backgrounds and
+/// §11.1's selection.
+///
+/// It needed no new pipeline, no new blend state and no new field on [`Instance`], which is worth
+/// saying because the plan had this costed as the risk most likely to double M5. The dual-source
+/// equation the glyph pass already binds — `dest = c0 + dest * (1 - c1)` — *is* an alpha composite
+/// when the coverage is the same in every channel, and an opaque replace at `a = 1`.
+///
+/// **Ordering is by position in the instance buffer**, which is how these end up underneath: a
+/// background instance is emitted before the glyphs that sit on it.
+pub const MODE_SOLID: u32 = 3;
+
 /// How many glyph quads one buffer holds. A 4K viewport of 8-pixel cells is about 48,000 cells, so
 /// this covers a full screen in one draw; anything larger is drawn in several, never truncated.
 const CAPACITY: u32 = 65_536;
@@ -372,6 +384,78 @@ mod tests {
                 "the quad bled outside its bounds at ({x},{y}): {edge:?}"
             );
         }
+    }
+
+    /// §7.1's highlight background, **in pixels**, and the two things about it that matter.
+    ///
+    /// It samples no atlas — so a solid quad must paint its colour whatever the sheet holds, which
+    /// this proves by leaving the sheet empty. And instances draw in **buffer order**, so a solid
+    /// emitted before a glyph ends up underneath it; that ordering is the entire mechanism by which
+    /// a background is a background, and nothing else enforces it.
+    #[test]
+    fn a_solid_quad_fills_its_rectangle_and_glyphs_land_on_top_of_it() {
+        let Some(off) = offscreen_or_skip("a_solid_quad_fills_its_rectangle") else {
+            return;
+        };
+        let pipeline = TextPipeline::new(off.device()).expect("pipeline");
+        let sheet = Sheet::mono(off.device(), SHEET, SHEET).expect("sheet");
+        assert!(
+            sheet.upload(off.context(), 0, 0, 8, 8, &patch([255, 255, 255, 255])),
+            "a patch inside the sheet must upload"
+        );
+
+        // A red background, then black "ink" over it. Red is chosen because neither the backdrop nor
+        // the ink is red, so a red pixel can only have come from the solid quad.
+        //
+        // **⚠ The read-back is BGRA**, because the render target is `DXGI_FORMAT_B8G8R8A8_UNORM` —
+        // so red arrives at index **2**. Every other pixel test in this file happens to be
+        // channel-agnostic (`all(|c| c > 200)`), so this is the first one that can get it wrong, and
+        // the first version did: it asserted `[0] > 200` and read `[0, 0, 255, 255]`.
+        const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+        const R: usize = 2;
+        const G: usize = 1;
+        const B: usize = 0;
+        off.clear(BACKDROP);
+        pipeline
+            .draw(
+                off.context(),
+                &sheet,
+                (TARGET, TARGET),
+                &[one_quad(MODE_SOLID, RED), one_quad(MODE_MONO_SUBPIXEL, INK)],
+            )
+            .expect("draw");
+        let pixels = off.read_back().expect("read back");
+
+        // Under the glyph the ink won, and the background did not show through it.
+        let inked = pixels.at(8, 8);
+        assert!(
+            inked[0] < 60 && inked[1] < 60 && inked[2] < 60,
+            "the glyph must sit on top of the background, got {inked:?}"
+        );
+
+        // Outside the quads, untouched backdrop — the solid did not bleed.
+        let outside = pixels.at(1, 1);
+        assert!(
+            outside[R] < 60,
+            "the solid quad must not paint outside its rectangle, got {outside:?}"
+        );
+
+        // And a solid on its own, with no glyph over it, is the colour it was given.
+        off.clear(BACKDROP);
+        pipeline
+            .draw(
+                off.context(),
+                &sheet,
+                (TARGET, TARGET),
+                &[one_quad(MODE_SOLID, RED)],
+            )
+            .expect("draw");
+        let pixels = off.read_back().expect("read back");
+        let filled = pixels.at(8, 8);
+        assert!(
+            filled[R] > 200 && filled[G] < 60 && filled[B] < 60,
+            "a solid quad must paint its own colour without sampling the sheet, got {filled:?}"
+        );
     }
 
     /// **The claim in `SPEC.md` §3.2 that this pipeline exists to make good**, and it takes care to

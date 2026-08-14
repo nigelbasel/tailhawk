@@ -72,7 +72,18 @@ struct PSOut {
 
 PSOut ps_main(VSOut i) {
     PSOut o;
-    if (i.mode == 1) {
+    if (i.mode == 3) {
+        // A solid fill, for `SPEC.md` §7.1's highlight backgrounds and §11.1's selection.
+        //
+        // It needs no second pipeline and no second blend state, because the dual-source equation
+        // already expresses it: dest = c0 + dest * (1 - c1), so a coverage of `a` in every channel
+        // gives dest = tint*a + dest*(1-a) -- an ordinary alpha composite, and an opaque replace at
+        // a = 1. Putting these instances *before* the glyphs in the same buffer is what puts them
+        // underneath, since instances draw in buffer order.
+        float a = i.tint.a;
+        o.c0 = float4(i.tint.rgb * a, a);
+        o.c1 = float4(a, a, a, a);
+    } else if (i.mode == 1) {
         // Already premultiplied by the colour rasteriser. dest = t + dest * (1 - a).
         float4 t = colour_atlas.Sample(samp, i.uv);
         o.c0 = float4(t.rgb, t.a);
