@@ -204,6 +204,51 @@ screenshot, not by any test — see `HANDOFF.md`), and getting `describe()`, the
 encoding flag to survive a roll. All three are "the presentation of state that now changes", which is
 a category the estimate had no line for and which follows mechanically from making anything dynamic.
 
+## 📌 M5 — forecast registered 2026-08-14, **before starting**
+
+Same units, same rule: written before the work so it can be scored. Sized against measured analogues
+in the table above, and against what M4 taught — item estimates, not inflated-for-risk ones.
+
+| Item | Analogue used | Active h | Output tok |
+|---|---|---:|---:|
+| **Off-thread work** — a cancellable background pass that streams results to the UI | none; architectural. Also **closes M4's unmet criterion** | 2.5 | 400 k |
+| E26 — filter grammar + parser (§7.2) | `pattern.rs` this session (0.6 h) scaled for a real grammar; `record.rs` | 2.0 | 300 k |
+| E15 — search: parallel chunked, streaming, two-engine policy, caps (§7.4) | the parallel indexer, 2026-08-05 | 3.0 | 450 k |
+| E14 — filter / sub-view, streaming and cancellable (§7.3) | `set.rs`'s row space (0.6 h), plus a *derived* row space and both view modes | 2.5 | 400 k |
+| E13 — highlight rule engine: precedence, span merge, per-frame budget (§7.1) | `cell.rs` column anchors; reaches `paint.rs` | 2.0 | 300 k |
+| E23 — zero-config semantic highlight catalogue | boilerplate-shaped; `record.rs`'s severity tables | 1.5 | 200 k |
+| E24 — ANSI / bidi / reveal-invisibles sanitisation | `bidi.rs` exists; the ANSI parser does not | 1.5 | 200 k |
+| V5 — columns: resize, reorder, hide, per-column filter | `hgrid.rs`; **see risk 2** | 2.5 | 350 k |
+| The command bar | input handling, 2026-08-11; new shell UI | 2.0 | 300 k |
+| Verification — 10 GB search fixture, a pathological lookaround, composing filters | the 50 MB/s rig, this session | 2.0 | 300 k |
+| **Total** | | **21.5** | **3.2 M** |
+
+`PLAN.md` budgets M5 at **10 weeks**, twice M4's five, and this forecast is 2.2× M4's actual — so it
+is roughly in proportion, which is the first time a forecast here has had a delivered milestone to be
+proportional *to*.
+
+**Confidence: low**, and lower than M4's was, for reasons that are about this milestone rather than
+about forecasting:
+
+1. **Highlighting needs a render capability that does not exist.** `Instance` carries no background
+   colour; selection is a foreground re-tint standing in for a highlight, and `SPEC.md` §3.2's plan
+   is one instanced draw carrying both. E13 and E23 both want a real background span, so **the shader
+   and the offline `fxc` build change**. This is the item most likely to double, and unlike M4's
+   named risk it is a capability gap rather than an assumption about existing code.
+2. **V5 columns has no producer.** Columns come from a detected format, and format detection is
+   `PLAN.md`'s E9/E10 in **M6**. Either V5 slips out of M5 or a minimal detector is pulled forward;
+   the plan does not say which, and it is the sort of dependency that is cheapest to name now.
+3. **Off-thread work touches everything.** `Document` lives on the window thread and owns the
+   `LogSet`. A background pass needs its own reader over the same bytes — `LogFile` is `Send + Sync`
+   and reads positionally, which is what makes this possible at all, but the ownership question is
+   real and is the first thing to settle.
+4. **`fancy-regex` is a new dependency** for §7.4's lookaround escape hatch, so it needs a
+   `deny.toml` licence decision before any code assumes it.
+
+Score this when M5 lands, and record **why** — M4's scoring found the risk list was better at naming
+what looked hard than at predicting what would be expensive, and one milestone is not enough to know
+whether that repeats.
+
 ## Forecast, on this evidence
 
 | Milestone | Plan | Naive extrapolation | Confidence |
