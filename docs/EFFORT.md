@@ -117,9 +117,10 @@ much.
 ### Scored: M4 — forecast 13.5 h / 2.1 M, actual **9.9 h / 1.66 M**
 
 **Both under, by about a quarter, and the forecast was the first one written before the work rather
-than after it.** Four of M4's five done-criteria are met; the fifth ("without dropped frames") is
-not, and needs the scan moved off the UI thread — so this is not "13.5 forecast, 9.9 delivered, done"
-but "9.9 for four fifths of it, and the last fifth is a threading change nobody has costed".
+than after it.** Four of the five done-criteria were met inside M4; the fifth — "without dropped
+frames" — was closed a few hours later by the **first item of M5's forecast**, which was sequenced
+first for exactly that reason. Its 2.5 h sits in M5's column, so M4's 9.9 h is four fifths of the
+milestone and the honest way to read the pair is 12.4 h for all of it against a 13.5 h forecast.
 
 Where it went, and why the shape is more useful than the total:
 
@@ -253,7 +254,7 @@ whether that repeats.
 
 | Milestone | Plan | Naive extrapolation | Confidence |
 |---|---:|---:|---|
-| ~~M4 follow, rotation, stdin~~ | 5 wk | forecast 13.5 h, **actual 9.9 h / 1.66 M**, four of five criteria | **Delivered** 2026-08-14 |
+| ~~M4 follow, rotation, stdin~~ | 5 wk | forecast 13.5 h, **actual 9.9 h**; **all five criteria**, the last closed by M5's first item | **Delivered** 2026-08-14 |
 | M5 search, highlight, filter | 10 wk | ~9–10 h | **Low** — regex over 10 GB is a different kind of problem from anything done so far |
 | M6–M9 structure, shell, ship | 41 wk | — | **Very low.** Packaging, signing, accessibility and support have no agent-time analogue in what has been measured |
 

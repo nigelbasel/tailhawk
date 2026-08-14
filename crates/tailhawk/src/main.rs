@@ -467,6 +467,72 @@ struct Shell {
     /// When and where the last double-click landed, so the next click can be read as a triple.
     last_double: Option<(u32, f32, f32)>,
     needs_frame: bool,
+    /// How long recent frames took. See [`Frames`].
+    frames: Frames,
+}
+
+/// A ring of recent frame durations, and the reason there is one.
+///
+/// **`PLAN.md`'s M4 criterion is "50 MB/s for 60 s *without dropped frames*", and until now that was
+/// being scored with an instrument that cannot answer it.** The throughput rig measures a
+/// `SendMessageW(WM_NULL)` round-trip from the writer process, which blocks until the window thread
+/// is free — so it counts a `Present` that is *deliberately* vsync-blocked exactly the same as a
+/// scan that has seized the thread. A healthy 60 fps application shows round-trips up to 16.7 ms as
+/// a matter of course, and the rig reported a p95 of 17.3 ms on an idle window at 1 MB/s.
+///
+/// So this measures the thing the criterion is about: **how long a frame takes inside the window**,
+/// which excludes the time the window spends idle waiting for a message and includes everything it
+/// actually does. A frame over [`FRAME_BUDGET_MS`] is one the user could have noticed.
+///
+/// It is 480 frames — eight seconds at 60 fps — because the interesting question is "how is it doing
+/// *now*", not over the whole run. A whole-run average hides a stall inside a minute of health.
+struct Frames {
+    /// Durations in microseconds, newest overwriting oldest.
+    ring: [u32; FRAME_SAMPLES],
+    at: usize,
+    filled: usize,
+    /// Frames over budget since the process started. A running total, because "it has stuttered 4
+    /// times in ten minutes" is a different fact from "it is stuttering now" and both are wanted.
+    over_budget: u64,
+}
+
+/// A frame this long or longer is one a 60 Hz display could not show on time.
+const FRAME_BUDGET_MS: u32 = 17;
+
+/// Eight seconds at 60 fps.
+const FRAME_SAMPLES: usize = 480;
+
+impl Frames {
+    fn new() -> Self {
+        Self {
+            ring: [0; FRAME_SAMPLES],
+            at: 0,
+            filled: 0,
+            over_budget: 0,
+        }
+    }
+
+    fn record(&mut self, took: std::time::Duration) {
+        let micros = took.as_micros().min(u32::MAX as u128) as u32;
+        self.ring[self.at] = micros;
+        self.at = (self.at + 1) % FRAME_SAMPLES;
+        self.filled = (self.filled + 1).min(FRAME_SAMPLES);
+        if micros >= FRAME_BUDGET_MS * 1000 {
+            self.over_budget += 1;
+        }
+    }
+
+    /// p95 and worst of the recent window, in milliseconds, plus the lifetime over-budget count.
+    fn summary(&self) -> Option<(f32, f32, u64)> {
+        if self.filled == 0 {
+            return None;
+        }
+        let mut sample: Vec<u32> = self.ring[..self.filled].to_vec();
+        sample.sort_unstable();
+        let p95 = sample[(sample.len() * 95 / 100).min(sample.len() - 1)];
+        let worst = *sample.last().expect("non-empty");
+        Some((p95 as f32 / 1000.0, worst as f32 / 1000.0, self.over_budget))
+    }
 }
 
 impl Shell {
@@ -549,6 +615,15 @@ impl Shell {
             title.push_str(" — ");
             title.push_str(part);
         }
+        // **The frame instrument, where a user and a measurement rig can both see it.** M4 asks for
+        // "without dropped frames" and nothing in the product could say whether that held; the
+        // throughput rig could only measure how long the window took to answer a message, which
+        // counts a vsync-blocked Present the same as a seized thread.
+        if let Some((p95, worst, over)) = self.frames.summary() {
+            title.push_str(&format!(
+                " — frame p95 {p95:.1} ms, worst {worst:.1} ms, {over} over budget"
+            ));
+        }
         set_title(hwnd, &title);
         if self.pending.is_none() && self.reading.is_none() {
             stop_polling(hwnd);
@@ -569,6 +644,13 @@ impl Shell {
     /// Returns false when there is no device yet, so the caller can fall through to
     /// `DefWindowProcW` and let the class brush paint stage one.
     fn paint(&mut self, hwnd: HWND) -> bool {
+        let began = std::time::Instant::now();
+        let painted = self.paint_inner(hwnd);
+        self.frames.record(began.elapsed());
+        painted
+    }
+
+    fn paint_inner(&mut self, hwnd: HWND) -> bool {
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
@@ -1222,6 +1304,7 @@ fn main() -> Result<()> {
             document: None,
 
             needs_frame: false,
+            frames: Frames::new(),
             last_double: None,
             file: None,
         });

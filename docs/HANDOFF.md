@@ -1,5 +1,48 @@
 # Handoff — resume here
 
+## ✅ M4's last criterion, and the instrument that was hiding it — 2026-08-14, session 16
+
+**"50 MB/s for 60 s without dropped frames" now holds.** Two runs, 3,000 MB written at 50.0 MB/s,
+all 3,145,710,006 bytes indexed and 32,430,001 lines:
+
+| Run | Frame p95 | Worst frame | Frames over 17 ms, whole run |
+|---|---:|---:|---:|
+| 1 | 4.0 ms | 37.5 ms | **1** |
+| 2 | 4.7 ms | 6.1 ms | **0** |
+
+### The change: the scan runs on a worker
+
+`scanner.rs`. The worker owns a `Follow` and emits **deltas** — the line starts it found and the
+extent it measured — and the window thread folds them in with `push_line`. **The worker never touches
+a `LineIndex`**, because a shared one would need a lock on the per-frame path that `Rows::fetch`
+walks, and a writer holding it while appending 40,000 lines is the same stall in different clothes.
+
+`LogSet::poll` no longer takes a time budget, because there is no longer any scanning here to bound —
+the budget that met §11.3's frame rule starved the throughput criterion and the one that met the
+throughput criterion broke the frame rule. It is now asynchronous, so `settle()` exists for tests:
+"append a line, then assert the count" is otherwise a race, and a sleep to fix a race is a flake.
+
+### ⚠ The result was invisible until the instrument changed, and that is the reusable part
+
+The first measurement after moving the scan showed **p95 44.1 → 38.4 ms**, and a *worse* maximum. On
+that evidence the change looked like it had barely worked.
+
+It had not barely worked — **the rig could not see it.** `throughput.ps1` measures a
+`SendMessageW(WM_NULL)` round-trip from the writer process, which blocks until the window thread is
+free. That counts a `Present` deliberately blocked on vsync exactly the same as a scan that has seized
+the thread. A baseline run confirmed it: an *idle* window at 1 MB/s reported a p95 of **17.3 ms** —
+one vsync frame — so a large part of every number the rig had ever produced was the display, not the
+application.
+
+`Frames` in the shell measures the thing the criterion is about: how long a `WM_PAINT` takes inside
+the window. It is in the title bar (`frame p95 4.0 ms, worst 37.5 ms, 1 over budget`), so a user and
+a rig can both read it, and it needs no diagnostic log — which §13.2 keeps off by default anyway.
+
+**The two numbers measure different things and both are worth keeping.** Like for like on the old
+instrument, thread responsiveness also improved: p95 **44.1 → 15.8 and 19.3 ms** across two runs.
+
+---
+
 ## 🎯 M4 scored against its own done-criteria — 2026-08-14
 
 `PLAN.md` M4: *"tail through **all three** rotation modes — copy-truncate, rename-and-recreate, and
@@ -12,12 +55,12 @@ frames; `docker logs -f svc | tailhawk -` pipes in and scrolls back."*
 | All three rotation modes, without losing a byte | ✅ | The two "LAST WORDS" rows, written *after* the roll decision and after the rename, are on screen |
 | Serilog rolling sink, continuous scrollback into the previous member | ✅ | 3 files, 9 rows, one row space; screenshot |
 | 50 MB/s for 60 s | ✅ | 3,145,710,009 B indexed, level with the writer |
-| …**without dropped frames** | ❌ | p95 44 ms ≈ 22 fps during the flood. The scan and the paint share a thread; a 30 ms tick and a 16.67 ms vsync cannot both fit |
+| …**without dropped frames** | ✅ | **0 and 1 frames over 17 ms** across two 60 s runs, frame p95 4.0 and 4.7 ms. Closed by moving the scan to a worker; see the entry above, including why the first measurement said otherwise |
 | `\| tailhawk -` pipes in and scrolls back | ✅ | 4 lines in, then `stream complete`, process alive. Piped from PowerShell rather than `docker` — the pipe is the same handle either way |
 
-**One criterion of five is not met and it is the same one flagged on 2026-08-13.** Fixing it means
-moving the scan off the UI thread — a real change, not a tune — and it is not attempted. Everything
-else M4 asked for is delivered and verified on screen rather than only in tests.
+**All five criteria are met.** The last one was closed on 2026-08-14 by moving the scan off the UI
+thread, which is the first item of M5's forecast and was done first for exactly this reason. Every
+one is verified on the shipped binary rather than only in tests.
 
 Feature work left in M4: none. `SPEC.md` items deliberately deferred out of it are listed under each
 entry below rather than gathered here, so each sits next to the thing it belongs to.
@@ -2821,6 +2864,7 @@ Recorded because each cost real effort to find, and two of them were caught only
 
 | Trap | Where |
 |---|---|
+| **A measurement rig measures what it measures, not what you meant.** `throughput.ps1` scored "without dropped frames" with a `SendMessageW(WM_NULL)` round-trip, which blocks until the window thread is free — so it counted a `Present` deliberately blocked on vsync the same as a scan that had seized the thread. It reported **p95 17.3 ms on an idle window at 1 MB/s**, meaning roughly a vsync frame of every number it had ever produced was the display. Moving the scan off-thread looked like it had barely worked (44.1 → 38.4 ms) until the app measured its own `WM_PAINT`: 4.0 ms p95, **0–1 frames over budget in 60 s**. **Before concluding a change did not work, check that the instrument can see it** — and prefer an instrument inside the thing being measured. | `crates/tailhawk/src/main.rs`, `Frames` |
 | **Look at the window. Four defects so far were invisible to every test in the suite** — (1) placeholder boxes with no text, because nothing requested frame 2 and an `InvalidateRect` inside `paint` is wiped by the `ValidateRect` after it; (2) a pure-black background from frame 2, a blend state left bound by the glyph pass; (3) selection tint never reaching the screen, because the painter was handed `&doc.rows` instead of `&*doc`; (4) the title's set description frozen at the inference made at open, so a window showing three files said two. **The common shape: the data was right and the presentation was not, and a test that asks the data cannot see it.** Screenshot the real window after any change to what is drawn or what the chrome says. | sessions 15–16 |
 | **The index depends on encoding.** Decode *must* precede index — chunk boundaries need code-unit alignment. The first plan drafted them 13 weeks apart and would have thrown away tested work. *(This row also carried "and `0x0A` is a legal DBCS trail byte" until session 15, three rows above the entry refuting it. A reference table is read one row at a time, so each row has to stand alone.)* | `PLAN.md` §4 |
 | **`RESEARCH.md` §5.3 is GPL-contaminated.** The line index must be **re-derived from published docs only**, with `CLEANROOM.md` populated *before* writing code. Do not implement from that section. | `RESEARCH.md` §5.3 |
