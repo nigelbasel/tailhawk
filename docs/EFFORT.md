@@ -36,7 +36,16 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-07 | 5.9¹ | 940 k¹ | 11 | Grid, selection, bidi, hgrid, view, text pass |
 | 2026-08-11 | ¹ | ¹ | 5 | Rows, DPI, input, anchors, 50M-line run |
 | 2026-08-11 night | ¹ | ¹ | 7 | Offscreen test path, ASCII fast walk, review, effort record |
-| **Total** | **~24.5** | **~5.0 M** | **91** | **M0–M3, ~32 k lines inserted** |
+| 2026-08-13 | ² | ² | 12 | Follow, rotation by identity, scrollbar, selection wiring, activity log |
+| 2026-08-14 | ² | ² | 9 | Time-bounded follow tick + 50 MB/s run, rolling sets (E30), stdin (E16) |
+| **Total** | **~34.4** | **~6.7 M** | **117**³ | **M0–M4** |
+
+³ From `git rev-list --count HEAD`, which is the authority. It exceeds the per-row sum by 3 — the
+early rows were reconstructed by date and two 2026-08-12 commits never got a row at all. The rows are
+left as recorded rather than back-fitted to the total.
+
+² 2026-08-13 and 2026-08-14 are likewise **one continuous session**, measuring **9.9 active hours
+and 1.66 M output tokens** in total — all of M4. It cannot be split by day either.
 
 ¹ 2026-08-07 and 2026-08-11 are **one continuous session**, and the transcript does not separate
 them. Its combined figure is **6.6 active hours and 1.12 M output tokens** across 2,355 turns, which
@@ -105,6 +114,48 @@ demand, and a sustained-throughput rig. Roughly a quarter of the estimate is tes
 Score this against actuals when M4 lands, and record **why** it was wrong rather than only by how
 much.
 
+### Scored: M4 — forecast 13.5 h / 2.1 M, actual **9.9 h / 1.66 M**
+
+**Both under, by about a quarter, and the forecast was the first one written before the work rather
+than after it.** Four of M4's five done-criteria are met; the fifth ("without dropped frames") is
+not, and needs the scan moved off the UI thread — so this is not "13.5 forecast, 9.9 delivered, done"
+but "9.9 for four fifths of it, and the last fifth is a threading change nobody has costed".
+
+Where it went, and why the shape is more useful than the total:
+
+| | Forecast | Comment |
+|---|---:|---|
+| Follow state machine | 2.5 h | About right |
+| Rotation, three modes | 3.5 h | Two modes came in here; the third arrived free with E30 |
+| **Rolling sets (E30)** | **3.0 h** | Named "most likely to double". Cheapest item in the milestone |
+| **stdin (E16)** | **2.0 h** | Also cheap, for the same reason |
+| Shell wiring | 1.0 h | Real, but folded into E30 and E16 rather than separate |
+| Verification | 1.5 h | Understated if anything — three harnesses, and they found three defects |
+
+**The two items forecast as hardest were the two that went fastest, and it was the same cause both
+times: a spec sentence that let a new source sit *beside* the existing machinery instead of inside
+it.** §5.5b orders members oldest-first, so a rolling set is a prefix sum over per-member indices and
+`index.rs` never changes. §4.2 says the spill "reuses the same index path as a real file", so a pipe
+becomes a file and `stdin.rs` is a byte-copier. In both cases the estimate's implicit model was "a
+new source kind needs new source machinery", and in both cases the spec had already said it does not.
+
+**What the forecast missed entirely:** the presentation of state that has started changing. The title
+had to survive a roll, a truncation, a member retirement and an end-of-stream, and the frozen version
+of it was a real defect found by screenshot. Nothing in the estimate had a line for that, and it
+follows mechanically from making anything dynamic — worth a line in the next one.
+
+**Risks 2 and 3 cost nothing, for reasons worth keeping.** Risk 2 — the `Rows` cache keyed on
+`line_count`, blind to copy-truncate — never needed the explicit invalidation it was forecast to
+need: a truncated member is *replaced wholesale* by `reseat_live`, and its `Rows` goes with it, so
+the stale cache cannot survive the event that would have made it wrong. Risk 3 was real but landed
+before the milestone as a separate finding: the append path was fine, and what capped throughput at
+~40 MB/s was one byte-budgeted scan per timer tick — a *scheduling* bound, not an indexing one.
+
+Across all four named risks, none cost what was feared and the two real costs (the throughput ceiling
+and the dynamic title) were unnamed. **The forecast's risk list was better at listing what looked
+hard than at predicting what would be expensive** — which argues for keeping it (it is cheap and it
+is a record) while sizing from the *item* estimates rather than inflating them for named risk.
+
 ### Interim: M4 is feature-complete — 2026-08-14
 
 | Item | Forecast h | Forecast tok | Actual |
@@ -157,7 +208,7 @@ a category the estimate had no line for and which follows mechanically from maki
 
 | Milestone | Plan | Naive extrapolation | Confidence |
 |---|---:|---:|---|
-| M4 follow, rotation, stdin | 5 wk | ~4–5 h — **superseded, too low**; the bottom-up forecast above says **13.5 h** | Medium-low |
+| ~~M4 follow, rotation, stdin~~ | 5 wk | forecast 13.5 h, **actual 9.9 h / 1.66 M**, four of five criteria | **Delivered** 2026-08-14 |
 | M5 search, highlight, filter | 10 wk | ~9–10 h | **Low** — regex over 10 GB is a different kind of problem from anything done so far |
 | M6–M9 structure, shell, ship | 41 wk | — | **Very low.** Packaging, signing, accessibility and support have no agent-time analogue in what has been measured |
 

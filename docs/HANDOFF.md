@@ -1,5 +1,29 @@
 # Handoff — resume here
 
+## 🎯 M4 scored against its own done-criteria — 2026-08-14
+
+`PLAN.md` M4: *"tail through **all three** rotation modes — copy-truncate, rename-and-recreate, and
+roll-to-new-name — without losing a byte; a default-configured Serilog rolling sink is followed
+across a roll with continuous scrollback into the previous member; 50 MB/s for 60 s without dropped
+frames; `docker logs -f svc | tailhawk -` pipes in and scrolls back."*
+
+| Criterion | | Evidence |
+|---|---|---|
+| All three rotation modes, without losing a byte | ✅ | The two "LAST WORDS" rows, written *after* the roll decision and after the rename, are on screen |
+| Serilog rolling sink, continuous scrollback into the previous member | ✅ | 3 files, 9 rows, one row space; screenshot |
+| 50 MB/s for 60 s | ✅ | 3,145,710,009 B indexed, level with the writer |
+| …**without dropped frames** | ❌ | p95 44 ms ≈ 22 fps during the flood. The scan and the paint share a thread; a 30 ms tick and a 16.67 ms vsync cannot both fit |
+| `\| tailhawk -` pipes in and scrolls back | ✅ | 4 lines in, then `stream complete`, process alive. Piped from PowerShell rather than `docker` — the pipe is the same handle either way |
+
+**One criterion of five is not met and it is the same one flagged on 2026-08-13.** Fixing it means
+moving the scan off the UI thread — a real change, not a tune — and it is not attempted. Everything
+else M4 asked for is delivered and verified on screen rather than only in tests.
+
+Feature work left in M4: none. `SPEC.md` items deliberately deferred out of it are listed under each
+entry below rather than gathered here, so each sits next to the thing it belongs to.
+
+---
+
 ## ✅ stdin (E16, §4.2) — 2026-08-14, session 16 — **M4 is feature-complete**
 
 `… | tailhawk` works. Six lines from a live producer rendered as they arrived; closing the
