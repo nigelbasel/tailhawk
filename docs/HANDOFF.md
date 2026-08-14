@@ -38,8 +38,28 @@ verbatim — not because "never lose the last KB" is delivered. It is not.
   file_side_detection` asserts that rather than leaving it looking covered. Needs §5.5b.
 - **The "file truncated" separator row** §5.5 asks for. A rendering feature, not attempted.
 - **Rolling sets (E30)** and **stdin (E16)** — untouched.
-- **50 MB/s × 60 s** — the throughput criterion has not been run. `FOLLOW_BUDGET_BYTES` is 4 MB a
-  tick at 100 ms, so ~40 MB/s is the ceiling by construction; the criterion may need a shorter tick.
+### 📏 50 MB/s × 60 s — run, and it found a real ceiling
+
+The suspicion in the previous entry was right and worse than stated. One `FOLLOW_BUDGET_BYTES` scan
+per 100 ms tick is ~40 MB/s, so **the design could not have met the criterion however fast the
+machine was** — and `Poll::Grew::more` already existed to say "call me again" while nothing did.
+
+`Follow::poll_for` now loops the byte-budgeted steps under a **time** budget, which is the bound
+§11.3 actually asks for: the UI must stay responsive, not each scan be small.
+
+| Tick budget | Written | Indexed | UI p95 | UI max |
+|---|---|---|---|---|
+| 8 ms | 3,000 MB @ 50 MB/s | 2,464 MB — **fell behind** | 47.7 ms | 238.5 ms |
+| **30 ms** | 3,000 MB @ 50 MB/s | **3,145,710,009 B — the whole file** | 44.1 ms | **90.3 ms** |
+
+The worst stall *improved* when the budget grew, because it was no longer perpetually catching up.
+32,430,001 lines indexed.
+
+**⚠ Half the criterion is met and half is not.** "50 MB/s for 60 s" — yes, fully indexed and level
+with the writer. "**without dropped frames**" — **no**: a p95 of 44 ms is about 22 fps during the
+flood, and a 60 fps frame is 16.67 ms. The scan and the paint share one thread, so a 30 ms scan tick
+and a 16.67 ms vsync cannot both fit in a frame. Fixing it properly means moving the scan off the UI
+thread, which is a real change and is not attempted.
 
 ## 📓 There is an activity log now — `logs/agent.log`
 

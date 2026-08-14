@@ -310,7 +310,10 @@ impl Document {
             }
         }
         let was_following = self.view.grid().is_following();
-        let grew = match self.follow.poll(&self.file, &mut self.index, len) {
+        // Time-bounded rather than byte-bounded: see `Follow::poll_for`. 8 ms of a 100 ms tick
+        // leaves the message loop 92% idle while removing the ~40 MB/s ceiling a single
+        // byte-budgeted scan imposed.
+        let grew = match self.follow.poll_for(&self.file, &mut self.index, len, 30) {
             Ok(Poll::Grew { lines, .. }) => lines > 0,
             // Truncation or rotation. Not handled yet, and deliberately not guessed at — the file
             // stays as it was until §5.5's component exists.
