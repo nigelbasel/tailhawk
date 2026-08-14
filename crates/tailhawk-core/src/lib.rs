@@ -19,6 +19,7 @@ pub mod hgrid;
 pub mod index;
 pub mod indexer;
 pub mod lines;
+pub mod pattern;
 pub mod record;
 pub mod rows;
 pub mod selection;
