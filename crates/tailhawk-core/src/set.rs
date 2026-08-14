@@ -45,9 +45,11 @@ use std::path::{Path, PathBuf};
 use crate::cell::ColumnAnchors;
 use crate::encoding::Charset;
 use crate::file::{FileSource, LogFile};
+use crate::follow::{Follow, Poll};
 use crate::index::{Extent, LineIndex};
 use crate::indexer::{build_index, IndexOptions};
 use crate::pattern::RollingSet;
+use crate::rotation::{Rotation, Watch};
 use crate::rows::{RowSource, Rows};
 use crate::{Error, Result};
 
@@ -62,6 +64,28 @@ pub const EAGER_MEMBERS: usize = 10;
 /// deliberately generous because the member count is the bound that will actually bind on a daily
 /// set, and the byte bound is here for the pathological case of ten 10 GB files.
 pub const EAGER_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How often the directory is re-listed looking for a new member.
+///
+/// **⚠ §5.5b asks for something better and this is not it.** "A new member is detected by directory
+/// watch — this is the one case where `FILE_NOTIFY_CHANGE_FILE_NAME` fires reliably (§5.4), so it is
+/// genuinely event-driven rather than polled." A `ReadDirectoryChangesW` watch needs a thread and an
+/// overlapped completion, which is shell machinery this portable module cannot own; a re-listing
+/// stands in until it exists, and the gap is in `HANDOFF.md`.
+///
+/// A second is chosen against what the delay actually costs: a roll that goes unnoticed for up to a
+/// second is a second of tail that arrives late, not lost — the drain reads the old member to EOF
+/// whenever it happens, so no bytes go missing either way. Listing a directory of ten files every
+/// tick, by contrast, is a syscall per tick for a change that happens daily.
+pub const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Passes of the byte budget allowed while draining a member being rolled away.
+///
+/// The drain is unbudgeted by design — §5.5 is explicit that the old handle is read "to EOF" before
+/// the switch, and stopping half way is exactly the lost KB it warns about. This bounds the *loop*
+/// rather than the work, so a reader that somehow never reaches EOF cannot hang the message loop.
+/// At [`FOLLOW_BUDGET_BYTES`](crate::follow::FOLLOW_BUDGET_BYTES) per pass this is 4 GB.
+const DRAIN_PASSES: u32 = 1024;
 
 /// One file of a set, with its own index, decoder state and viewport window.
 pub struct Member {
@@ -170,6 +194,34 @@ pub struct LogSet {
     omitted: usize,
     total_rows: u64,
     last_error: Option<String>,
+    /// Growth of the **live** member only. Every older member is finished and never scanned again.
+    follow: Follow,
+    /// The live member's path and identity, so §5.5's in-place rotations are noticed.
+    watch: Watch,
+    /// When the directory was last re-listed. See [`LIST_INTERVAL`].
+    listed: Option<std::time::Instant>,
+}
+
+/// What one [`LogSet::poll`] found. Several of these can be true in one tick, which is why it is a
+/// record rather than an enum — a roll that also grew the new member is the ordinary case.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Polled {
+    /// Lines appended to the row space, across every member touched.
+    pub lines_added: u64,
+    /// The name of the member now being written to, if the set rolled onto a new one.
+    pub rolled_to: Option<String>,
+    /// **The live member's contents were replaced under us** — §5.5's copy-truncate. Its index was
+    /// rebuilt from zero, so anything addressing its old rows (a selection, a bookmark) is stale.
+    pub reset: bool,
+    /// Members that left the set — §5.5b's retention deletions. Their rows are gone.
+    pub retired: Vec<String>,
+}
+
+impl Polled {
+    /// Nothing happened, so a caller can skip the work a change implies.
+    pub fn is_quiet(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl LogSet {
@@ -208,6 +260,15 @@ impl LogSet {
             })));
         }
 
+        let live = members.last().expect("checked non-empty");
+        let follow = Follow::after_build(live.charset, &live.index, live.scanned_to);
+        let watch = Watch::new(
+            &live.path,
+            live.file
+                .identity()
+                .map_err(|e| Error(format!("{}: {e}", live.name)))?,
+        );
+
         let mut this = Self {
             dir,
             anchor,
@@ -216,6 +277,9 @@ impl LogSet {
             omitted: eager,
             total_rows: 0,
             last_error,
+            follow,
+            watch,
+            listed: None,
         };
         this.renumber();
         Ok(this)
@@ -349,6 +413,259 @@ impl LogSet {
             )?;
         }
         Ok(())
+    }
+
+    /// Advances the set: growth on the live member, and every way it can stop being live.
+    ///
+    /// `budget_ms` bounds the *growth* scan only, per §11.3 — a writer producing faster than the
+    /// frame rate must not starve the message loop. The drain that precedes a switch is deliberately
+    /// outside that bound; see [`DRAIN_PASSES`].
+    ///
+    /// ## The order is the design
+    ///
+    /// 1. **Rotation in place** — §5.5's copy-truncate and rename-and-recreate, asked of the live
+    ///    member's own handle. Tested first because applying a *new* file's length to the *old*
+    ///    file's scan position reads bytes that are not the ones the index describes.
+    /// 2. **A new member in the directory** — §5.5b's roll-to-new-name, which no property of the
+    ///    live file reveals: it "never changes identity and never shrinks".
+    /// 3. **Growth**, of whichever member is live once 1 and 2 have settled.
+    ///
+    /// A switch in either 1 or 2 drains the outgoing member to EOF first. §5.5: "This is where naive
+    /// tools lose the last KB", and unlike the single-file case those drained lines are now *kept* —
+    /// the old member stays in the scrollback, which is what made the drain worth writing.
+    pub fn poll(&mut self, budget_ms: u64) -> Polled {
+        let mut polled = Polled::default();
+
+        let live_len = self.members.last().and_then(|m| m.file.len().ok());
+        if let Some(len) = live_len {
+            match self.watch.check(len, self.follow.scanned_to()) {
+                Rotation::Stable => {}
+                // `tail -F`: the path is gone but the handle is not. Keep reading what we hold.
+                Rotation::Missing => {}
+                Rotation::Truncated => {
+                    polled.reset = self.reseat_live();
+                }
+                Rotation::Replaced => {
+                    // log4net's roll. The file we hold has been renamed out from under the path and
+                    // a new one has taken its place — so the outgoing member is not leaving the set,
+                    // it is becoming its own predecessor.
+                    polled.lines_added += self.drain_live();
+                    if let Some(name) = self.adopt_path_as_new_member() {
+                        polled.rolled_to = Some(name);
+                    }
+                }
+            }
+        }
+
+        if polled.rolled_to.is_none() {
+            self.reconcile_directory(&mut polled);
+        }
+
+        polled.lines_added += self.grow_live(budget_ms);
+        self.renumber();
+        polled
+    }
+
+    /// Reads the live member to EOF. Returns the lines that arrived.
+    fn drain_live(&mut self) -> u64 {
+        let Some(live) = self.members.last_mut() else {
+            return 0;
+        };
+        let Ok(len) = live.file.len() else {
+            return 0;
+        };
+        let mut lines = 0;
+        for _ in 0..DRAIN_PASSES {
+            match self.follow.poll(&live.file, &mut live.index, len) {
+                Ok(Poll::Grew { lines: n, more }) => {
+                    lines += n;
+                    if !more {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        live.scanned_to = self.follow.scanned_to();
+        lines
+    }
+
+    /// Scans whatever the writer has appended since the last tick, under §11.3's time budget.
+    fn grow_live(&mut self, budget_ms: u64) -> u64 {
+        let Some(live) = self.members.last_mut() else {
+            return 0;
+        };
+        let Ok(len) = live.file.len() else {
+            return 0;
+        };
+        let grew = match self
+            .follow
+            .poll_for(&live.file, &mut live.index, len, budget_ms)
+        {
+            Ok(Poll::Grew { lines, .. }) => lines,
+            _ => 0,
+        };
+        live.scanned_to = self.follow.scanned_to();
+        grew
+    }
+
+    /// Rebuilds the live member from a path whose contents were replaced in place.
+    ///
+    /// §5.5's copy-truncate: the identity is unchanged, so this is the *same* member with different
+    /// bytes — it keeps its position in the set rather than becoming a new one. Everything derived
+    /// from the old contents goes: the index, the follow position, the row window.
+    fn reseat_live(&mut self) -> bool {
+        let Some(live) = self.members.last_mut() else {
+            return false;
+        };
+        let Ok(fresh) = Member::open(&live.path) else {
+            return false;
+        };
+        let Ok(identity) = fresh.file.identity() else {
+            return false;
+        };
+        self.follow = Follow::after_build(fresh.charset, &fresh.index, fresh.scanned_to);
+        self.watch = Watch::new(&fresh.path, identity);
+        *live = fresh;
+        true
+    }
+
+    /// Attaches whatever now sits at the watched path as the new live member.
+    ///
+    /// The member we were holding stays where it is in the set — its handle still reads, because
+    /// §5.1's share mode includes `DELETE` and a rename does not invalidate an open handle. Only its
+    /// *name* is now wrong, and [`rename_rolled_member`](Self::rename_rolled_member) repairs that by
+    /// identity rather than by guessing which sibling it became.
+    fn adopt_path_as_new_member(&mut self) -> Option<String> {
+        let path = self.watch.path().to_path_buf();
+        let fresh = Member::open(&path).ok()?;
+        let identity = fresh.file.identity().ok()?;
+        let name = fresh.name.clone();
+        self.rename_rolled_member();
+        self.follow = Follow::after_build(fresh.charset, &fresh.index, fresh.scanned_to);
+        self.watch = Watch::new(&path, identity);
+        self.members.push(fresh);
+        Some(name)
+    }
+
+    /// Finds the new name of the member that was just renamed out from under the watched path.
+    ///
+    /// **By identity, which is the only thing a rename preserves.** §5.5: "detection is keyed on file
+    /// identity, never on the path string." The candidates are the names in the directory that the
+    /// pattern accepts and that no member already holds — for a log4net set that is one file, so this
+    /// costs one open. A member whose new name cannot be established keeps its old one rather than
+    /// being given a guessed one; a wrong name in the gutter is worse than a stale one, because a
+    /// stale one is at least the name the user opened.
+    fn rename_rolled_member(&mut self) {
+        let Some(rolled) = self.members.last() else {
+            return;
+        };
+        let Ok(identity) = rolled.file.identity() else {
+            return;
+        };
+        let held: Vec<&str> = self.members.iter().map(|m| m.name.as_str()).collect();
+        let listing = siblings(&self.dir);
+        let set = RollingSet::infer(&self.anchor, &listing);
+        let candidates: Vec<String> = set
+            .members()
+            .iter()
+            .filter(|n| !held.contains(&n.as_str()))
+            .cloned()
+            .collect();
+        for name in candidates {
+            let path = self.dir.join(&name);
+            let Ok(candidate) = LogFile::open(&path) else {
+                continue;
+            };
+            if candidate.identity().ok() == Some(identity) {
+                let rolled = self.members.last_mut().expect("checked above");
+                rolled.name = name;
+                rolled.path = path;
+                return;
+            }
+        }
+    }
+
+    /// Re-lists the directory and reconciles the set against it. §5.5b's roll-to-new-name and its
+    /// retention deletions are both here, because both are facts about the *directory* and neither
+    /// is visible from any handle we hold.
+    fn reconcile_directory(&mut self, polled: &mut Polled) {
+        let now = std::time::Instant::now();
+        if self.listed.is_some_and(|at| now - at < LIST_INTERVAL) {
+            return;
+        }
+        self.listed = Some(now);
+
+        let listing = siblings(&self.dir);
+        let set = RollingSet::infer(&self.anchor, &listing);
+        let held: Vec<String> = self.members.iter().map(|m| m.name.clone()).collect();
+        let live_name = held.last().cloned().unwrap_or_default();
+
+        // §5.5b: "A member disappearing from the middle or tail of the set removes it from the
+        // scrollback with a marker; it is never an error." Held handles keep reading a deleted file,
+        // so this is a decision to follow the spec rather than a limitation — the alternative is a
+        // scrollback that disagrees with the directory it claims to be showing.
+        //
+        // The live member is exempt: a path that vanished is §5.5's `Missing`, which wants `tail -F`
+        // semantics and not the loss of the tail we are watching.
+        let mut retired = Vec::new();
+        self.members.retain(|m| {
+            let gone = m.name != live_name && !listing.contains(&m.name);
+            if gone {
+                retired.push(m.name.clone());
+            }
+            !gone
+        });
+        polled.retired = retired;
+
+        // **Newer means later in the *set's* order, not later in the alphabet.** Comparing names
+        // directly gets log4net backwards — `app.log.1` sorts after `app.log` by any string rule and
+        // is older than it — which is the reversal §5.5b calls the trap, reached from a third
+        // direction. `pattern.rs` already decided the direction; asking it is the only safe move.
+        let arrivals: Vec<String> = match set.members().iter().position(|n| *n == live_name) {
+            Some(at) => set.members()[at + 1..]
+                .iter()
+                .filter(|n| !held.contains(n))
+                .cloned()
+                .collect(),
+            // The live member is not in the re-inferred set at all — its path was renamed away, or
+            // the directory changed shape under us. Attaching anything on that basis is a guess.
+            None => Vec::new(),
+        };
+        if arrivals.is_empty() {
+            return;
+        }
+
+        // §5.5b: "Drain-then-switch, exactly as for rename rotation: the old member is read to EOF
+        // before the new one is attached, so the last lines before a roll are never lost."
+        polled.lines_added += self.drain_live();
+
+        let mut attached = None;
+        for name in arrivals {
+            match Member::open(&self.dir.join(&name)) {
+                Ok(member) => {
+                    attached = Some(member.name.clone());
+                    self.members.push(member);
+                }
+                Err(e) => self.last_error = Some(e.0),
+            }
+        }
+        let Some(name) = attached else {
+            return;
+        };
+        let live = self.members.last().expect("just pushed");
+        self.follow = Follow::after_build(live.charset, &live.index, live.scanned_to);
+        if let Ok(identity) = live.file.identity() {
+            self.watch = Watch::new(&live.path, identity);
+        }
+        polled.rolled_to = Some(name);
+    }
+
+    /// Forces the next [`poll`](Self::poll) to re-list the directory rather than wait out
+    /// [`LIST_INTERVAL`]. What a "refresh" command drives, and what makes a roll testable without
+    /// sleeping for a second.
+    pub fn rescan(&mut self) {
+        self.listed = None;
     }
 
     /// One line the UI can show. §5.5b requires the inference be confirmable, not assumed.
@@ -632,5 +949,173 @@ mod tests {
         // 37 characters and the terminator, which `Extent` counts — the point here is that the
         // widest line came from the member that is *not* live.
         assert_eq!(set.extent().max_line_bytes(), 38);
+    }
+
+    fn append(dir: &Path, name: &str, lines: &[&str]) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(name))
+            .expect("append");
+        for line in lines {
+            writeln!(file, "{line}").expect("write");
+        }
+    }
+
+    /// Read the whole set, whatever it now is. Fetches first so `row_text` has something to serve.
+    fn read_all(set: &mut LogSet) -> Vec<String> {
+        let total = set.total_rows();
+        set.fetch(0, total as usize, false).expect("fetch");
+        texts(set)
+    }
+
+    #[test]
+    fn the_live_member_grows_and_the_older_ones_do_not_move() {
+        let dir = scratch("growth");
+        write(&dir, "log_001.txt", &["a1"]);
+        let anchor = write(&dir, "log_002.txt", &["b1"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+        assert_eq!(set.total_rows(), 2);
+
+        append(&dir, "log_002.txt", &["b2", "b3"]);
+        let polled = set.poll(30);
+        assert_eq!(polled.lines_added, 2);
+        assert!(polled.rolled_to.is_none());
+        assert_eq!(read_all(&mut set), ["a1", "b1", "b2", "b3"]);
+        assert_eq!(set.members()[0].first_row(), 0);
+    }
+
+    /// §5.5b's roll-to-new-name — Serilog's and NLog's *default*, and the case §5.5 explicitly could
+    /// not detect because the live file "never changes identity and never shrinks".
+    ///
+    /// **The lines written to the old member after the new one appeared are the whole test.** Follow
+    /// re-seats onto the new member, so anything not drained first is never scanned again — not
+    /// delayed, lost. Deleting the `drain_live` call above leaves this the only failing test.
+    #[test]
+    fn a_roll_to_a_new_name_drains_the_old_member_before_switching() {
+        let dir = scratch("roll");
+        write(&dir, "log_001.txt", &["a1"]);
+        let anchor = write(&dir, "log_002.txt", &["b1"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+
+        // The writer's last words before it rolled, then the file it rolled onto.
+        append(&dir, "log_002.txt", &["b2 last words"]);
+        write(&dir, "log_003.txt", &["c1"]);
+
+        let polled = set.poll(30);
+        assert_eq!(polled.rolled_to.as_deref(), Some("log_003.txt"));
+        assert_eq!(set.newest().name(), "log_003.txt");
+        assert_eq!(read_all(&mut set), ["a1", "b1", "b2 last words", "c1"]);
+
+        // And it keeps following the file it rolled onto.
+        append(&dir, "log_003.txt", &["c2"]);
+        set.poll(30);
+        assert_eq!(
+            read_all(&mut set),
+            ["a1", "b1", "b2 last words", "c1", "c2"]
+        );
+    }
+
+    /// log4net's rename-and-recreate, which `rotation.rs` could report and a single-file view could
+    /// only survive by throwing the old file away. Here the renamed file **stays in the scrollback**,
+    /// which is what §5.5's "never lose the last KB" was always for.
+    #[test]
+    fn a_renamed_live_file_becomes_its_own_predecessor() {
+        let dir = scratch("rename");
+        let anchor = write(&dir, "app.log", &["gen1 a"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+        assert_eq!(set.members().len(), 1);
+
+        std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).expect("rename");
+        append(&dir, "app.log.1", &["gen1 last words"]);
+        write(&dir, "app.log", &["gen2 a"]);
+
+        let polled = set.poll(30);
+        assert_eq!(polled.rolled_to.as_deref(), Some("app.log"));
+        assert_eq!(set.members().len(), 2);
+        assert_eq!(read_all(&mut set), ["gen1 a", "gen1 last words", "gen2 a"]);
+    }
+
+    /// §5.5: "detection is keyed on file identity, never on the path string." After a rename the
+    /// member we hold is reachable only through its handle, and the name in the gutter has to be
+    /// repaired from the directory — by identity, because the name is exactly what changed.
+    #[test]
+    fn a_member_renamed_out_from_under_us_learns_its_new_name() {
+        let dir = scratch("renamed-gutter");
+        let anchor = write(&dir, "app.log", &["gen1"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+
+        std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).expect("rename");
+        write(&dir, "app.log", &["gen2"]);
+        set.poll(30);
+
+        assert_eq!(set.members()[0].name(), "app.log.1");
+        assert_eq!(set.members()[0].path(), dir.join("app.log.1"));
+        assert_eq!(set.members()[1].name(), "app.log");
+    }
+
+    /// §5.5's copy-truncate on the live member: same identity, different bytes. It stays the same
+    /// member — it does not become a new generation — and `reset` tells the caller its old rows are
+    /// gone, which is the fact a selection or a bookmark needs.
+    #[test]
+    fn a_truncated_live_member_is_rebuilt_in_place() {
+        let dir = scratch("truncate");
+        write(&dir, "log_001.txt", &["a1"]);
+        let anchor = write(&dir, "log_002.txt", &["b1", "b2", "b3", "b4"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+        assert_eq!(set.total_rows(), 5);
+
+        std::fs::write(dir.join("log_002.txt"), b"fresh\n").expect("truncate");
+        let polled = set.poll(30);
+        assert!(polled.reset);
+        assert!(polled.rolled_to.is_none());
+        assert_eq!(set.members().len(), 2);
+        assert_eq!(read_all(&mut set), ["a1", "fresh"]);
+    }
+
+    /// §5.5b: "Retention deletions are tolerated. A member disappearing from the middle or tail of
+    /// the set removes it from the scrollback with a marker; it is never an error."
+    #[test]
+    fn a_member_deleted_by_retention_leaves_the_scrollback() {
+        let dir = scratch("retired");
+        write(&dir, "log_001.txt", &["a1"]);
+        write(&dir, "log_002.txt", &["b1"]);
+        let anchor = write(&dir, "log_003.txt", &["c1"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+        assert_eq!(set.total_rows(), 3);
+
+        std::fs::remove_file(dir.join("log_001.txt")).expect("remove");
+        set.rescan();
+        let polled = set.poll(30);
+        assert_eq!(polled.retired, ["log_001.txt"]);
+        assert_eq!(set.total_rows(), 2);
+        assert_eq!(read_all(&mut set), ["b1", "c1"]);
+    }
+
+    /// The live member is exempt from retirement. Its path vanishing is §5.5's `Missing`, which wants
+    /// `tail -F` semantics — keep the handle, keep reading — and not the loss of the tail on screen.
+    #[test]
+    fn the_live_member_vanishing_from_the_directory_is_not_a_retirement() {
+        let dir = scratch("missing-live");
+        write(&dir, "log_001.txt", &["a1"]);
+        let anchor = write(&dir, "log_002.txt", &["b1"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+
+        std::fs::remove_file(dir.join("log_002.txt")).expect("remove");
+        set.rescan();
+        let polled = set.poll(30);
+        assert!(polled.retired.is_empty());
+        assert_eq!(set.total_rows(), 2);
+        assert_eq!(read_all(&mut set), ["a1", "b1"]);
+    }
+
+    /// A quiet tick has to be recognisable, or the shell repaints and re-fetches every 100 ms
+    /// against a file nobody is writing to.
+    #[test]
+    fn a_tick_with_nothing_happening_says_so() {
+        let dir = scratch("quiet");
+        let anchor = write(&dir, "app.log", &["a"]);
+        let mut set = LogSet::open(&anchor).expect("open");
+        set.poll(30);
+        assert!(set.poll(30).is_quiet());
     }
 }
