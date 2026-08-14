@@ -31,6 +31,19 @@ chardetng = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
+# `SPEC.md` §7.4 names the engine: "the Rust `regex` crate. Lazy DFA, rare-byte memchr prefilters,
+# Teddy SIMD multi-pattern -- the same tricks klogg imports Hyperscan for, with no Boost/Ragel/C++
+# dependency." §7.2's `/pattern/` predicate is the first caller. Pure Rust, no C toolchain, and
+# MIT OR Apache-2.0 under `deny.toml`.
+#
+# `unicode` is on because a log line is not ASCII and `\w` must mean what a reader expects; `perf`
+# is on because §7.4's whole argument for this crate is the lazy DFA and the prefilters.
+#
+# It pulls in `aho-corasick` and `memchr`, both `Unlicense OR MIT`. `deny.toml` does not allow
+# Unlicense and does not need to: an SPDX `OR` is satisfied by either branch and MIT is allowed.
+# Noted here because "Unlicense" appearing in the tree looks like a problem and is not.
+regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
+
 # The leaf backends are modules here rather than separate crates. `SPEC.md` §3.1 puts them inside
 # the core, and splitting them into crates buys nothing until a second platform exists — at which
 # point the split is a mechanical move, not a redesign.

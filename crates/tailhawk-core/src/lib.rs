@@ -13,6 +13,7 @@ pub mod atlas;
 pub mod bidi;
 pub mod cell;
 pub mod encoding;
+pub mod filter;
 pub mod follow;
 pub mod grid;
 pub mod hgrid;
