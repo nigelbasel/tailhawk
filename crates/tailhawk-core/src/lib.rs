@@ -34,6 +34,10 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 #[cfg(windows)]
 pub mod file;
 
+/// A search on a worker. Windows-only because it holds the file handles [`file`] owns.
+#[cfg(windows)]
+pub mod find;
+
 #[cfg(windows)]
 pub mod glyphs;
 

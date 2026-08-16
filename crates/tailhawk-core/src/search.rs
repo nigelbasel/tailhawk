@@ -372,11 +372,26 @@ pub struct Search {
 
 impl Search {
     pub fn new(pattern: Pattern, charset: Charset, options: SearchOptions) -> Self {
+        Self::sharing(pattern, charset, options, &Cancel::new())
+    }
+
+    /// A search that answers to an existing [`Cancel`].
+    ///
+    /// **A set of rolled files is one log (§5.5b) and must be one search to the user**, but each
+    /// member has its own encoding and so its own compiled pattern — so a pass over a set is several
+    /// `Search`es, and one `Esc` has to stop all of them. Sharing the flag is what makes the one the
+    /// user sees and the several that run agree.
+    pub fn sharing(
+        pattern: Pattern,
+        charset: Charset,
+        options: SearchOptions,
+        cancel: &Cancel,
+    ) -> Self {
         Self {
             pattern,
             charset,
             options,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::clone(&cancel.flag),
             hits: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -527,14 +542,24 @@ impl Search {
 const READ_BYTES: usize = 256 * 1024;
 
 /// Stops a running [`Search`] from another thread.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Cancel {
     flag: Arc<AtomicBool>,
 }
 
 impl Cancel {
+    /// An un-cancelled handle, for a caller that needs one before it has a [`Search`] to take it
+    /// from — a pass over a set of files builds its searches one member at a time.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
     }
 }
 

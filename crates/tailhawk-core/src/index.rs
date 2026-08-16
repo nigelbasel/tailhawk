@@ -187,7 +187,13 @@ struct Segment {
 }
 
 /// Sparse line starts, in append-only fixed-size blocks.
-#[derive(Debug)]
+///
+/// **`Clone` is what lets a worker search a file the window thread is still following.** §5.3 puts
+/// this at ~0.125 bytes a line, so a clone of a 50M-line index is a 6.3 MB memcpy — against a pass
+/// over the gigabytes it describes, that is nothing, and it is the alternative to either a lock on
+/// the per-frame path or a worker that watches the index change under it. `scanner.rs` made the same
+/// call from the other end: the worker there never touches a `LineIndex` at all.
+#[derive(Clone, Debug)]
 pub struct LineIndex {
     stride: u64,
     blocks: Vec<Vec<u64>>,

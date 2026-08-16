@@ -419,6 +419,28 @@ impl LogSet {
         self.newest().charset
     }
 
+    /// The set as a worker can hold it — one [`Excerpt`] per member, oldest first.
+    ///
+    /// **This is a snapshot and it is meant to be.** The handles are shared, so the worker reads the
+    /// same files rather than reopening names that may have rolled; the indexes are *cloned*, so the
+    /// row space the worker reports against cannot move while it works. A search therefore answers
+    /// for the log as it was when it started, which is the only answer a followed file can give
+    /// without either a lock on the per-frame path or line numbers that shift under the result list.
+    ///
+    /// See [`crate::find`], which is the only caller and argues the rest of it.
+    #[cfg(windows)]
+    pub fn snapshot(&self) -> Vec<crate::find::Excerpt> {
+        self.members
+            .iter()
+            .map(|m| crate::find::Excerpt {
+                file: Arc::clone(&m.file),
+                charset: m.charset,
+                index: m.index.clone(),
+                first_row: m.first_row,
+            })
+            .collect()
+    }
+
     /// Fills every member overlapping `[first, first + count)` with its slice of the viewport.
     ///
     /// **The window is split, not the read.** Each member fetches through its own [`Rows`], which
