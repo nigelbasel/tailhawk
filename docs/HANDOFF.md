@@ -1,5 +1,112 @@
 # Handoff — resume here
 
+## ✅ Search is wired to the UI — M5's honest gap, half closed — 2026-08-16, session 17
+
+**`Ctrl+F`, a typed query, `Enter`, `F3`/`Shift+F3`, `Esc`, and every match painted.** The previous
+entry called "four working libraries and not one key binding" the honest gap in M5; this closes the
+search half of it. **6 of M5's 10 items.**
+
+| | |
+|---|---|
+| The pass | `find.rs` — one worker, a snapshot of the set, results streamed on a channel |
+| The paint | `RowSource::row_spans` → `paint.rs`'s background pass → `MODE_SOLID` |
+| The keys | `Ctrl+F` / `Enter` / `F3` / `Shift+F3` / `Esc`, `UI-DESIGN.md` §12 |
+| **10.74 GB, through the worker the UI uses** | **first match 0.062 s, whole pass 4.118 s (2608 MB/s), 2 canaries over 114,230,003 lines** |
+
+### The design decisions, and what forced each
+
+- **A search runs against a snapshot.** The worker gets the file handles *shared* — §5.2's positional
+  reads are what make that sound, and reopening by name across a roll would land on a different file
+  — and the line indexes **cloned**. So a search answers for the log **as it was when it started**,
+  which is the only answer a followed file can give without either a lock on the per-frame path or
+  line numbers that shift under the result list. A clone is ~6.3 MB at 50M lines (§5.3).
+- **One search to the user, several to the engine.** §5.5b makes a rolled set one log with one row
+  space, but members detect their encodings separately (§5.6) and §7.4's engine choice is per
+  charset — a pattern compiled for UTF-8 finds nothing in a UTF-16 member, *silently*. So it is one
+  `Search` per member sharing one `Cancel` and one match budget, and rows are mapped to the set's
+  space where `first_row` is known.
+- **The match list is maintained, never re-sorted.** §7.4's chunks are disjoint runs of lines, so a
+  chunk's matches belong in one contiguous slot: a `partition_point` and a splice. Re-sorting 100,000
+  matches on every 100 ms drain is ~10 ms of window thread against a 16.67 ms budget, spent
+  repeatedly to rebuild an order that was never lost.
+- **The view moves once per search.** Chunks arrive out of order, so an earlier match routinely lands
+  *after* a later one; re-jumping to whichever is now the better answer would drag the window around
+  under a user already reading the result they were given.
+- **Case-insensitive**, because §7.2's `/i` flag has nowhere to be set and the two failures are not
+  symmetric: unwanted hits are visible and correctable, while `error` finding nothing in a log that
+  says `ERROR` reads as a broken feature. `(?-i)` is the escape hatch.
+- **Matches are thrown away by a truncate or a retirement**, not by a roll. A match is a row number
+  plus a byte range inside it; a truncated member's rows are different bytes at the same numbers.
+  Unlike a stale selection, keeping them is a wrong *answer* rather than a wrong tint.
+
+### ⚠ There is no find *bar*, and that is the deviation to know about
+
+`UI-DESIGN.md` §2.1 puts search in a command bar. **V14's widget layer is M7**, so there is no text
+field to put it in: the query is typed into the window and echoed in the title, where §5.5b's set
+description, §4.2's spill path and the frame instrument already live. Recorded in `CLEANROOM.md`.
+Everything below the keystroke is what a real field would drive — only the two `WM_CHAR` arms change.
+
+Also absent: §2.1's `.*` regex toggle (the query is always a regex), §11's scrollbar density marks
+for hits, §7.3's 300 ms debounce (the cancellation half exists and works; the timer is UI), and
+horizontal scrolling to a match that is off to the right — the view moves vertically only.
+
+### ⛔ The on-screen check has NOT been run, and that is the one thing outstanding
+
+This project's rule is that a feature is verified on the shipped binary, and **four of its worst
+defects were invisible to every test and obvious in one screenshot.** That check could not be run
+this session: the agent's shell has **no interactive desktop** — `GetForegroundWindow()` returns 0,
+`SetForegroundWindow` fails, and a client-area capture returns the wallpaper rather than the window.
+Posted `WM_KEYDOWN` cannot stand in, because `Ctrl+F` is read with `GetKeyState`, which posted
+messages do not move.
+
+**`tools/verify-find.ps1` is the harness, and it wants one command on a desktop session:**
+
+```
+pwsh tools/verify-find.ps1
+```
+
+It writes a fixture with a match every 50,000 lines, drives the real window with SendKeys, reads the
+title, counts the two highlight colours in a screenshot of the client area, and prints PASS or the
+reasons. **Until it has run, "the highlight is on screen" is an inference from instance-level and
+pixel-level tests, not an observation.**
+
+### What is tested, and where the tests are
+
+| Claim | Where |
+|---|---|
+| A background covers the span's columns, is emitted **before** the glyphs, and reaches pixels | `paint.rs`, offscreen; controls fire for both ordering and clipping |
+| A search over two members reports one row space; cancelled and capped passes say so | `find.rs` |
+| Chunks out of order still leave the list ordered, and carry the cursor with them | `main.rs` |
+| Stepping starts from the viewport and wraps both ways | `main.rs` |
+| A surrogate pair typed into the query survives being two `WM_CHAR`s | `main.rs` |
+| Search → `row_spans` → the row the painter asks about, on a real file | `main.rs` |
+| Matches do not survive a truncate | `main.rs`, control fires |
+| **10 GB, through `find::start`** | `tests/search_criterion.rs`, `--ignored` |
+
+### ⚠ Two things about the fixture and the tooling
+
+**`scratchpad/bigfixture.ps1` is gone.** The directory was never tracked — it is not even in
+`.gitignore` — and it did not survive the reboot. The fixture itself did:
+`C:\tmp\th-10gb.log`, 10,737,680,200 bytes, `CANARY_ALPHA` at 1%, `CANARY_OMEGA` at 99%, and a 60 KB
+line containing `CANARY_BURIED` at 50%. That description is now in the criterion test's own header so
+it can be rebuilt. **New harnesses go in `tools/`, which is tracked.**
+
+**The 10 GB numbers are much better than session 16's and none of it is this session's doing** —
+index 3.71 s against 6.21 s, the whole pass 3.39 s against 9.93 s, the pathological lookaround 46.9 s
+against 90.8 s. Same fixture, same machine, no change to the engine. The likeliest reason is that
+session 16 measured while an adversarial review was running fifteen agents. Recorded as measured
+rather than claimed as a speed-up.
+
+### 🪤 A trap worth the table: PowerShell round-trips corrupt source files
+
+`Get-Content | … | Set-Content -Encoding utf8` on `paint.rs` produced a file with a **UTF-8 BOM and 58
+mojibake sequences** — Windows PowerShell 5.1 reads with the ANSI codepage and writes UTF-8 with a
+BOM, so every em-dash in the file was double-encoded. It compiled. `git checkout` restored it and the
+edit was redone with the editor. **Source files are edited with the editing tool, never with a shell
+text round-trip**, and the check afterwards is the first three bytes plus a mojibake count.
+
+---
+
 ## ⏸ Paused mid-M5 for a machine restart — 2026-08-14, end of session 16
 
 **Working tree clean, everything committed, `035c61c` is the tip.** Nothing was running; no

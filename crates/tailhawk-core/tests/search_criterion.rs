@@ -4,8 +4,10 @@
 //! > degrades to *pattern too slow, truncated* rather than hanging"
 //!
 //! **Ignored by default and pointed at a fixture by environment variable**, because a 10 GB file is
-//! not something `cargo test` should build or require. Build one with
-//! `scratchpad/bigfixture.ps1`, then:
+//! not something `cargo test` should build or require. The generator that built the current fixture
+//! lived in an untracked `scratchpad/` and **did not survive a reboot**, which is why `tools/` is
+//! now where a harness goes; the fixture it produced is described below and in `HANDOFF.md` in
+//! enough detail to rebuild. Then:
 //!
 //! ```text
 //! TAILHAWK_BIG_LOG=C:\tmp\th-10gb.log cargo test -p tailhawk-core --test search_criterion -- --ignored --nocapture
@@ -16,10 +18,12 @@
 //! first match" a testable claim rather than a hopeful one — a search that only reported at the end
 //! would report both at the same moment.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use tailhawk_core::encoding::Charset;
 use tailhawk_core::file::LogFile;
+use tailhawk_core::find::{self, Excerpt, Outcome, Update};
 use tailhawk_core::indexer::{build_index, IndexOptions};
 use tailhawk_core::search::{Pattern, Search, SearchOptions, FANCY_LINE_CAP};
 
@@ -84,6 +88,84 @@ fn a_full_file_search_streams_its_first_match_long_before_it_finishes() {
     assert!(
         first.as_secs_f64() < whole.as_secs_f64() * 0.5,
         "the first match arrived at {:.3}s of a {:.3}s pass, which is not streaming",
+        first.as_secs_f64(),
+        whole.as_secs_f64()
+    );
+}
+
+/// The same criterion **through the worker the UI actually uses**, which is a different claim.
+///
+/// The test above proves the engine streams. It calls [`Search::run`] directly, on the calling
+/// thread, against an index nothing else is touching — none of which is how the window searches. The
+/// shell hands [`find::start`] a snapshot and drains a channel from a timer, and everything that can
+/// go wrong in *that* — the handles, the cloned index, the row mapping, the outcome — is between the
+/// engine and the screen.
+///
+/// So this measures the same two numbers one layer up, and adds the one the other test cannot make:
+/// that the matches arrive **while the pass is still running**, on a channel, from another thread.
+#[test]
+#[ignore = "needs TAILHAWK_BIG_LOG pointing at a large fixture"]
+fn the_find_worker_streams_matches_from_a_snapshot_of_ten_gigabytes() {
+    let Some(path) = fixture() else {
+        eprintln!("skipped: set TAILHAWK_BIG_LOG");
+        return;
+    };
+    let file = LogFile::open(&path).expect("open");
+    let end = file.len().expect("len");
+    let index =
+        build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default()).expect("index");
+    let lines = index.line_count();
+
+    let excerpt = Excerpt {
+        file: Arc::new(file),
+        charset: Charset::UTF_8,
+        index,
+        first_row: 0,
+    };
+
+    let began = Instant::now();
+    let running = find::start(
+        "CANARY_(ALPHA|OMEGA)",
+        false,
+        vec![excerpt],
+        SearchOptions::default(),
+    )
+    .expect("start");
+
+    let (mut matches, mut first_match_at, mut outcome) = (Vec::new(), None, None);
+    while outcome.is_none() {
+        for update in running.drain() {
+            match update {
+                Update::Chunk(found) => {
+                    if first_match_at.is_none() && !found.matches.is_empty() {
+                        first_match_at = Some(began.elapsed());
+                    }
+                    matches.extend(found.matches);
+                }
+                Update::Finished(done) => outcome = Some(done),
+            }
+        }
+        // The shell drains from a 100 ms timer; this is that, without the timer.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let whole = began.elapsed();
+    let first = first_match_at.expect("something must have matched");
+
+    println!(
+        "WORKER first match {:.3}s, whole pass {:.3}s ({:.0} MB/s), {} matches over {} lines, {:?}",
+        first.as_secs_f64(),
+        whole.as_secs_f64(),
+        end as f64 / 1e6 / whole.as_secs_f64(),
+        matches.len(),
+        lines,
+        outcome.as_ref().expect("an outcome")
+    );
+
+    assert_eq!(outcome, Some(Outcome::Complete));
+    assert_eq!(matches.len(), 2, "both canaries, and nothing else");
+    assert!(
+        first.as_secs_f64() < whole.as_secs_f64() * 0.5,
+        "the first match reached the channel at {:.3}s of a {:.3}s pass, which is not streaming",
         first.as_secs_f64(),
         whole.as_secs_f64()
     );

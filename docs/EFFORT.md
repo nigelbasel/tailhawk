@@ -38,7 +38,13 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-11 night | ¹ | ¹ | 7 | Offscreen test path, ASCII fast walk, review, effort record |
 | 2026-08-13 | ² | ² | 12 | Follow, rotation by identity, scrollbar, selection wiring, activity log |
 | 2026-08-14 | ² | ² | 19 | M4 finished (follow tick, E30, E16, off-thread scan); M5 E26, E15, E13, MODE_SOLID |
-| **Total** | **~35.9** | **~7.0 M** | **127**³ | **M0–M4, plus 4 of M5's 10 items** |
+| 2026-08-16 | 1.2⁴ | 287 k⁴ | 6 | Search wired to the UI: the span pass, `find.rs`, the keys, the 10 GB worker criterion |
+| **Total** | **~37.1** | **~7.3 M** | **133**³ | **M0–M4, plus 6 of M5's 10 items** |
+
+⁴ **Measured while the session was still running**, so it is a floor rather than a total — 710 turns
+between 14:31 and 15:49, by the method above. Recorded now rather than at the end because the last
+row was written at a pause that then lasted two days; a floor in the table beats an exact figure that
+never gets added. It also excludes the on-screen verification, which could not be run here.
 
 ³ From `git rev-list --count HEAD`, which is the authority. It exceeds the per-row sum by 3 — the
 early rows were reconstructed by date and two 2026-08-12 commits never got a row at all. The rows are
