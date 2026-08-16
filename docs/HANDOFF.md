@@ -1,5 +1,43 @@
 # Handoff — resume here
 
+## ⏸ Paused mid-M5 for a machine restart — 2026-08-14, end of session 16
+
+**Working tree clean, everything committed, `035c61c` is the tip.** Nothing was running; no
+background jobs, no stray `tailhawk.exe`, no half-applied negative control.
+
+**Where M5 is: 4 of 10 items.** Off-thread scanning, the filter language (E26), search (E15), the
+highlight rule engine (E13), plus the solid-quad render mode the highlights will need.
+
+**The next thing to do, and it is a choice rather than a queue:**
+
+1. **Wire something to the UI.** This is the honest gap. Four working libraries and **not one key
+   binding** — no search box, no filter chip, nothing calls `Highlighter`. `PLAN.md` calls M5 "first
+   daily-useful milestone" and it is not daily-useful until this happens. The pieces to join are
+   `filter.rs` → a chip row, `search.rs` → a find bar, `highlight.rs` → `paint.rs` (which now has
+   `MODE_SOLID` to draw into), and the command bar §12 wants.
+2. **E23**, the zero-config semantic highlight catalogue — timestamps, GUIDs, IPs, paths,
+   `key=value`. Cheap now that E13 exists and there is somewhere to draw it; it is a catalogue of
+   rules rather than an engine, and §7.1 puts it *beneath* user rules. This is the one that makes a
+   first run look like something rather than like klogg's empty highlighter set.
+3. **E24** (ANSI / bidi / reveal-invisibles) and **V5** (columns) — V5 still has no producer, since
+   columns come from format detection in M6. That dependency is unresolved and is the thing to
+   decide before starting V5, not during.
+
+**To re-run the 10 GB search criterion** the fixture is at `C:\tmp\th-10gb.log` (10,737,680,200
+bytes) and may not survive a reboot — rebuild it with `scratchpad/bigfixture.ps1` if it is gone:
+
+```
+TAILHAWK_BIG_LOG=C:\tmp\th-10gb.log cargo test --release -p tailhawk-core \
+  --test search_criterion -- --ignored --nocapture
+```
+
+The 3 GB throughput logs in `C:\tmp\th-*.log` are scratch and can be deleted.
+
+**Session 16 totals:** 11.4 active hours, 1.94 M output tokens, 19 commits on 2026-08-14 (127 in the
+repo). That covers all of M4 plus these four M5 items.
+
+---
+
 ## ✅ M5 so far — off-thread work, the filter language, search — 2026-08-14, session 16
 
 Three of M5's ten items. **Two of M5's three done-criteria already hold**, measured on a real

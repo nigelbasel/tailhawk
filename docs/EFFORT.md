@@ -37,15 +37,17 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-11 | ¹ | ¹ | 5 | Rows, DPI, input, anchors, 50M-line run |
 | 2026-08-11 night | ¹ | ¹ | 7 | Offscreen test path, ASCII fast walk, review, effort record |
 | 2026-08-13 | ² | ² | 12 | Follow, rotation by identity, scrollbar, selection wiring, activity log |
-| 2026-08-14 | ² | ² | 9 | Time-bounded follow tick + 50 MB/s run, rolling sets (E30), stdin (E16) |
-| **Total** | **~34.4** | **~6.7 M** | **117**³ | **M0–M4** |
+| 2026-08-14 | ² | ² | 19 | M4 finished (follow tick, E30, E16, off-thread scan); M5 E26, E15, E13, MODE_SOLID |
+| **Total** | **~35.9** | **~7.0 M** | **127**³ | **M0–M4, plus 4 of M5's 10 items** |
 
 ³ From `git rev-list --count HEAD`, which is the authority. It exceeds the per-row sum by 3 — the
 early rows were reconstructed by date and two 2026-08-12 commits never got a row at all. The rows are
 left as recorded rather than back-fitted to the total.
 
-² 2026-08-13 and 2026-08-14 are likewise **one continuous session**, measuring **9.9 active hours
-and 1.66 M output tokens** in total — all of M4. It cannot be split by day either.
+² 2026-08-13 and 2026-08-14 are likewise **one continuous session** — session 16, measuring **11.4
+active hours and 1.94 M output tokens** in total. It cannot be split by day either. All of M4 was
+done by the 9.9 h / 1.66 M mark, which is the figure M4 is scored against below; the remaining
+1.5 h / 0.28 M is the four M5 items.
 
 ¹ 2026-08-07 and 2026-08-11 are **one continuous session**, and the transcript does not separate
 them. Its combined figure is **6.6 active hours and 1.12 M output tokens** across 2,355 turns, which
