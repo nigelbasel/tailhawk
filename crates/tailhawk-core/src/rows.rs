@@ -38,6 +38,7 @@
 
 use crate::cell::{CellModel, ColumnAnchors};
 use crate::encoding::Charset;
+use crate::highlight::Span;
 use crate::index::LineIndex;
 use crate::indexer::{offset_of_line, ChunkReader};
 use crate::lines::LineDecoder;
@@ -87,6 +88,25 @@ pub trait RowSource {
     /// `Rows` itself — is unaffected.
     fn row_selection(&self, _row: u64) -> Option<core::ops::Range<usize>> {
         None
+    }
+
+    /// The row's coloured runs, in **byte** offsets within it, sorted and non-overlapping.
+    ///
+    /// Bytes rather than the columns [`row_selection`](Self::row_selection) speaks in, because every
+    /// producer of a span works in bytes: [`Highlighter::line`](crate::highlight::Highlighter::line)
+    /// returns byte ranges and [`Match`](crate::search::Match) carries "byte offsets **within that
+    /// line**, so a highlight does not need the file offset". The painter is walking clusters and
+    /// already holds each one's byte offset, so matching there is a comparison rather than the
+    /// column conversion doing it here would need — and a conversion the painter would immediately
+    /// undo.
+    ///
+    /// **Filled rather than returned**, the same shape and for the same reason as
+    /// `Highlighter::line`: the painter owns one `Vec` for the whole frame instead of allocating per
+    /// row. `out` is cleared by the implementation.
+    ///
+    /// Defaulted to empty, so a source that knows nothing about colour draws exactly as before.
+    fn row_spans(&self, _row: u64, out: &mut Vec<Span>) {
+        out.clear();
     }
 }
 

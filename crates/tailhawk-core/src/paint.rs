@@ -62,9 +62,10 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 
 use crate::cell::ColumnAnchors;
 use crate::glyphs::GlyphCache;
+use crate::highlight::Span;
 use crate::rows::RowSource;
 use crate::shape::Shaper;
-use crate::text::{Instance, TextPipeline};
+use crate::text::{Instance, TextPipeline, MODE_SOLID};
 use crate::view::View;
 use crate::Result;
 use crate::SELECTION_INK;
@@ -118,6 +119,10 @@ pub struct Painter {
     pipeline: TextPipeline,
     px_per_em: u16,
     instances: Vec<Instance>,
+    /// One row's coloured runs, reused for every row of the frame. See
+    /// [`RowSource::row_spans`](crate::rows::RowSource::row_spans) for why it is filled rather than
+    /// returned.
+    spans: Vec<Span>,
 }
 
 impl Painter {
@@ -128,6 +133,7 @@ impl Painter {
             pipeline: TextPipeline::new(device)?,
             px_per_em,
             instances: Vec::new(),
+            spans: Vec::new(),
         })
     }
 
@@ -167,26 +173,37 @@ impl Painter {
     pub fn lay_out(&mut self, view: &View, tint: [f32; 4], source: &dyn RowSource) -> Result<Laid> {
         let mut total = Laid::default();
         let rows: Vec<(u64, f32)> = view.grid().visible().map(|p| (p.row, p.y)).collect();
+        // Taken out and put back so the row loop can hold it mutably while `self` is borrowed for
+        // the layout. One `Vec` for the frame is the point; taking it does not allocate.
+        let mut spans = std::mem::take(&mut self.spans);
         for (row, y) in rows {
             let Some(line) = source.row_text(row) else {
                 continue;
             };
             let selected = source.row_selection(row);
-            match self.lay_out_row(view, line, source.row_anchors(row), selected, y, tint) {
+            source.row_spans(row, &mut spans);
+            match self.lay_out_row(view, line, source.row_anchors(row), selected, &spans, y, tint) {
                 Ok(laid) => total.merge(laid),
                 Err(_) => total.failed_rows += 1,
             }
         }
+        self.spans = spans;
         Ok(total)
     }
 
     /// One row. `y` is the row's top edge, viewport-relative, from [`crate::grid::PlacedRow`].
+    ///
+    /// `spans` are the row's coloured runs in byte offsets, sorted and non-overlapping — what
+    /// [`Highlighter::line`](crate::highlight::Highlighter::line) and a search's matches both
+    /// produce. They are consumed twice: once up front for the backgrounds, and once along the
+    /// cluster walk for the ink.
     pub fn lay_out_row(
         &mut self,
         view: &View,
         line: &str,
         anchors: &ColumnAnchors,
         selected: Option<core::ops::Range<usize>>,
+        spans: &[Span],
         y: f32,
         tint: [f32; 4],
     ) -> Result<Laid> {
@@ -221,6 +238,46 @@ impl Painter {
         let mut column = slice.column;
         let cell_width = view.hgrid().cell_width();
 
+        // **Backgrounds first, because ordering in the instance buffer is what puts them
+        // underneath** — `text.rs` says so at [`MODE_SOLID`], and emitting one after the glyphs it
+        // sits behind paints over them instead.
+        //
+        // **One quad per span, not one per cluster.** A span's column extent comes from two anchored
+        // `cell_at_byte` lookups, which is what `ColumnAnchors` was built for — walking the clusters
+        // to accumulate it would emit a quad per character and pay the walk twice.
+        //
+        // Clipped to the slice, because a span may name bytes off either edge of a horizontally
+        // scrolled viewport — and a whole-line rule (§7.1) always does.
+        let row_height = view.grid().row_height();
+        for span in spans {
+            let Some(bg) = span.bg else {
+                continue;
+            };
+            let from_byte = span.start.max(slice.bytes.start);
+            let to_byte = span.end.min(slice.bytes.end);
+            if from_byte >= to_byte {
+                continue;
+            }
+            let from = view.cells().cell_at_byte_anchored(line, from_byte, anchors);
+            let to = view.cells().cell_at_byte_anchored(line, to_byte, anchors);
+            if to <= from {
+                continue;
+            }
+            self.instances.push(Instance {
+                pos: [view.hgrid().x_of_column(from), y],
+                size: [(to - from) as f32 * cell_width, row_height],
+                tint: bg,
+                mode: MODE_SOLID,
+                ..Instance::default()
+            });
+            laid.quads += 1;
+        }
+
+        // The spans again, this time for the ink. Clusters arrive in logical order and spans are
+        // sorted and non-overlapping, so one forward cursor answers every cluster — no search, and
+        // no dependence on how many spans the row has.
+        let mut span_at = 0usize;
+
         for cluster in &shaped.clusters {
             let start = slice.bytes.start + cluster.span.byte;
             let cells = view
@@ -229,17 +286,26 @@ impl Painter {
             let at = column;
             column += cells;
 
-            // **A selected cluster is drawn in a different ink, and that is deliberately not a
-            // highlight rectangle.** §3.2 plans one instanced draw carrying foreground *and*
-            // background colour per instance, which is how a selection should eventually look, but
-            // `Instance` has no background field and adding one means changing the glyph shader and
-            // the offline `fxc` build. Re-tinting is the whole of the visual feedback until then:
-            // it needs no new pipeline, and the per-row column range it consumes is the same thing
-            // the eventual background pass will need. Recorded as a gap in `HANDOFF.md` rather than
-            // presented as the finished look.
+            // **A selected cluster is still drawn by re-tinting rather than as a filled rectangle,
+            // and that is now a choice rather than a limitation.** The reason it used to give — that
+            // `Instance` has no background field — stopped being true when `MODE_SOLID` landed, and
+            // the background pass above proves a filled selection is available for the asking. It is
+            // not taken here because §11.1's selection colours are not chosen and picking a fill
+            // colour on the way past would decide them. Recorded as a gap in `HANDOFF.md`.
+            //
+            // **A selected cluster keeps the selection's ink even where a span claimed it.**
+            // Selection is the user's live act and highlighting is a standing instruction; a
+            // selection the user cannot see the extent of is the one that has gone wrong.
+            while span_at < spans.len() && spans[span_at].end <= start {
+                span_at += 1;
+            }
+            let claimed = spans
+                .get(span_at)
+                .filter(|span| span.start <= start)
+                .and_then(|span| span.fg);
             let ink = match &selected {
                 Some(range) if at >= range.start && at < range.end => SELECTION_INK,
-                _ => tint,
+                _ => claimed.unwrap_or(tint),
             };
 
             // **After the advance, never before.** A cluster absorbed into a preceding ligature
@@ -449,7 +515,7 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, 0.0, INK)
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
             .expect("lay out");
 
         // Rebuild the expected column x for every cluster and require a quad to start there. The
@@ -496,7 +562,7 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), None, 0.0, INK)
+            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
             .expect("lay out");
 
         // Column 0 is the whole `a` + tags cluster. Nothing it emits may reach column 1, where the
@@ -535,6 +601,7 @@ mod tests {
                 "ابب logged out",
                 ColumnAnchors::none_ref(),
                 None,
+                &[],
                 0.0,
                 INK,
             )
@@ -601,6 +668,7 @@ mod tests {
                         &line,
                         ColumnAnchors::none_ref(),
                         None,
+                        &[],
                         row as f32 * painter.row_height(),
                         INK,
                     )
@@ -670,6 +738,162 @@ mod tests {
         assert_eq!(selected, 8, "expected four columns on each of two rows");
     }
 
+    /// **§7.1's colours, from a span to the quads that draw it.**
+    ///
+    /// Three claims in one test, because they only mean anything together: a background covers the
+    /// span's columns and no others, it is emitted **before** the glyphs it sits behind — buffer
+    /// order is the entire mechanism by which a background is a background — and the foreground
+    /// re-tints exactly the span's clusters.
+    ///
+    /// The ordering claim is the one that would otherwise be untested and is the easiest to break:
+    /// a background appended at the end of the row draws *over* the text, which looks like the
+    /// highlight working until you notice the log line has gone.
+    #[test]
+    fn a_spans_background_is_drawn_under_exactly_its_own_columns() {
+        let Some((off, mut painter)) = painter_or_skip("a_spans_background_is_drawn_under") else {
+            return;
+        };
+        let view = view_for(&painter, 1, 200);
+        let line = "aaaaBBBBaaaa";
+        const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+        const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+        let spans = [Span {
+            start: 4,
+            end: 8,
+            fg: Some(RED),
+            bg: Some(GREEN),
+        }];
+
+        painter.begin_frame();
+        painter
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &spans, 0.0, INK)
+            .expect("lay out");
+
+        let solids: Vec<&Instance> = painter
+            .instances()
+            .iter()
+            .filter(|i| i.mode == MODE_SOLID)
+            .collect();
+        assert_eq!(solids.len(), 1, "one span with a background is one quad");
+        assert!(
+            (solids[0].pos[0] - view.hgrid().x_of_column(4)).abs() < 0.01,
+            "the background starts at {} rather than column 4's x of {}",
+            solids[0].pos[0],
+            view.hgrid().x_of_column(4)
+        );
+        assert!(
+            (solids[0].size[0] - 4.0 * painter.cell_width()).abs() < 0.01,
+            "the background is {} wide rather than four columns",
+            solids[0].size[0]
+        );
+        assert_eq!(solids[0].size[1], painter.row_height());
+        assert_eq!(
+            painter.instances()[0].mode,
+            MODE_SOLID,
+            "the background must be the row's first instance or it draws over the text"
+        );
+
+        let tinted = |want: [f32; 4]| {
+            painter
+                .instances()
+                .iter()
+                .filter(|i| i.mode != MODE_SOLID && i.tint == want)
+                .count()
+        };
+        assert_eq!(tinted(RED), 4, "exactly the span's four clusters re-tint");
+        assert_eq!(tinted(INK), 8, "the rest of the line keeps the plain ink");
+
+        // And it reaches pixels, which no instance assertion can show: a quad of the right colour
+        // in the right place still draws nothing if its mode is wrong.
+        //
+        // **Every green pixel is counted, rather than one being sampled**, because a sampled point
+        // can land on the glyph ink drawn over the background and fail for the one reason the test
+        // is not about. The bounds are the assertion: green inside the span's columns, nowhere else.
+        off.clear(PAPER);
+        painter.draw(off.context(), (TARGET, TARGET)).expect("draw");
+        let pixels = off.read_back().expect("read back");
+        let (mut green, mut leftmost, mut rightmost) = (0u32, TARGET, 0u32);
+        for y in 0..painter.row_height() as u32 {
+            for x in 0..TARGET {
+                let p = pixels.at(x, y);
+                if p[1] > p[0] + 20 && p[1] > p[2] + 20 {
+                    green += 1;
+                    leftmost = leftmost.min(x);
+                    rightmost = rightmost.max(x);
+                }
+            }
+        }
+        assert!(green > 0, "the span's background reached no pixels at all");
+        let (from, to) = (
+            view.hgrid().x_of_column(4) as u32,
+            view.hgrid().x_of_column(8) as u32,
+        );
+        assert!(
+            leftmost >= from && rightmost < to,
+            "the background painted x {leftmost}..={rightmost} against the span's {from}..{to}"
+        );
+    }
+
+    /// A span the horizontal scroll has moved off screen must not drag its background back on.
+    ///
+    /// `byte_span` rounds the visible slice outwards to whole clusters, so clipping the span to the
+    /// slice is what keeps a background inside the viewport — and a whole-line rule (§7.1) names
+    /// bytes off both edges of every scrolled row, so this is the ordinary case rather than an edge
+    /// one.
+    #[test]
+    fn a_background_is_clipped_to_the_visible_slice() {
+        let Some(off) = painter_or_skip("a_background_is_clipped_to_the_visible_slice") else {
+            return;
+        };
+        let (off, mut painter) = off;
+        let mut view = view_for(&painter, 1, 200);
+        let line = "0123456789abcdefghijklmnopqrstuvwxyz";
+        let whole_line = [Span {
+            start: 0,
+            end: line.len(),
+            fg: None,
+            bg: Some([0.0, 1.0, 0.0, 1.0]),
+        }];
+
+        view.hgrid_mut().scroll_to_column(10);
+        painter.begin_frame();
+        painter
+            .lay_out_row(
+                &view,
+                line,
+                ColumnAnchors::none_ref(),
+                None,
+                &whole_line,
+                0.0,
+                INK,
+            )
+            .expect("lay out");
+
+        let solid = painter
+            .instances()
+            .iter()
+            .find(|i| i.mode == MODE_SOLID)
+            .expect("a whole-line background");
+        assert!(
+            solid.pos[0] >= -0.01,
+            "the background starts at {}, left of the viewport",
+            solid.pos[0]
+        );
+        // **One cell of slack on the right, and it is `byte_span`'s outward rounding rather than
+        // laxity.** The slice ends on a whole cluster, so the column straddling the right edge is
+        // drawn — and a background that stopped short of the glyph over it would be the visible
+        // half of the same off-by-one. What is asserted is that it stops *there* and not at the
+        // line's end, which is 36 columns away.
+        let right = solid.pos[0] + solid.size[0];
+        let limit = view.hgrid().viewport_px() + painter.cell_width();
+        assert!(
+            right <= limit + 0.01,
+            "the background reaches x {right} against a {} viewport plus one cell",
+            view.hgrid().viewport_px()
+        );
+        drop(off);
+    }
+
     #[test]
     fn a_row_with_no_text_yet_draws_nothing_and_does_not_fail() {
         let Some((off, mut painter)) = painter_or_skip("a_row_with_no_text_yet_draws_nothing")
@@ -701,7 +925,7 @@ mod tests {
         view.hgrid_mut().scroll_to_column(4);
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, 0.0, INK)
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
             .expect("lay out");
         let leftmost = painter
             .instances()
@@ -762,7 +986,7 @@ mod tests {
         for (name, line) in &cases {
             painter.begin_frame();
             painter
-                .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, 0.0, INK)
+                .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
                 .unwrap_or_else(|e| panic!("{name} failed to shape: {e:?} — see this test's note"));
         }
 
