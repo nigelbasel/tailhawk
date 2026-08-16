@@ -414,7 +414,6 @@ mod tests {
                 max_matches: 100,
                 lines_per_chunk: 100,
                 threads: 1,
-                ..SearchOptions::default()
             },
         )
         .expect("start");

@@ -70,6 +70,35 @@ use crate::view::View;
 use crate::Result;
 use crate::SELECTION_INK;
 
+/// What colours one row, gathered because the three arrive together and mean nothing apart.
+///
+/// The painter needs the plain ink, the columns the selection covers and the byte spans a rule or a
+/// search claimed — and it resolves them against each other per cluster, which is the argument for
+/// them being one thing rather than three parameters that happen to be adjacent.
+/// `Range` is not `Copy` — deliberately, upstream — so neither is this.
+#[derive(Clone, Debug)]
+pub struct Colours<'a> {
+    /// The colour a cluster no span claimed is drawn in.
+    pub tint: [f32; 4],
+    /// The **cell columns** selected on this row. See
+    /// [`RowSource::row_selection`](crate::rows::RowSource::row_selection).
+    pub selected: Option<core::ops::Range<usize>>,
+    /// Coloured runs in **byte** offsets, sorted and non-overlapping — what
+    /// [`Highlighter::line`](crate::highlight::Highlighter::line) and a search's matches produce.
+    pub spans: &'a [Span],
+}
+
+impl Colours<'_> {
+    /// Plain text in `tint`: no selection, no spans.
+    pub fn plain(tint: [f32; 4]) -> Self {
+        Self {
+            tint,
+            selected: None,
+            spans: &[],
+        }
+    }
+}
+
 /// What one row's layout produced, beyond the quads themselves.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Laid {
@@ -180,9 +209,13 @@ impl Painter {
             let Some(line) = source.row_text(row) else {
                 continue;
             };
-            let selected = source.row_selection(row);
             source.row_spans(row, &mut spans);
-            match self.lay_out_row(view, line, source.row_anchors(row), selected, &spans, y, tint) {
+            let colours = Colours {
+                tint,
+                selected: source.row_selection(row),
+                spans: &spans,
+            };
+            match self.lay_out_row(view, line, source.row_anchors(row), colours, y) {
                 Ok(laid) => total.merge(laid),
                 Err(_) => total.failed_rows += 1,
             }
@@ -193,20 +226,21 @@ impl Painter {
 
     /// One row. `y` is the row's top edge, viewport-relative, from [`crate::grid::PlacedRow`].
     ///
-    /// `spans` are the row's coloured runs in byte offsets, sorted and non-overlapping — what
-    /// [`Highlighter::line`](crate::highlight::Highlighter::line) and a search's matches both
-    /// produce. They are consumed twice: once up front for the backgrounds, and once along the
+    /// [`Colours::spans`] are consumed twice: once up front for the backgrounds, and once along the
     /// cluster walk for the ink.
     pub fn lay_out_row(
         &mut self,
         view: &View,
         line: &str,
         anchors: &ColumnAnchors,
-        selected: Option<core::ops::Range<usize>>,
-        spans: &[Span],
+        colours: Colours<'_>,
         y: f32,
-        tint: [f32; 4],
     ) -> Result<Laid> {
+        let Colours {
+            tint,
+            selected,
+            spans,
+        } = colours;
         let slice = view.slice_anchored(line, anchors);
         if slice.bytes.is_empty() {
             return Ok(Laid::default());
@@ -515,7 +549,7 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
             .expect("lay out");
 
         // Rebuild the expected column x for every cluster and require a quad to start there. The
@@ -562,7 +596,7 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
+            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
             .expect("lay out");
 
         // Column 0 is the whole `a` + tags cluster. Nothing it emits may reach column 1, where the
@@ -600,10 +634,8 @@ mod tests {
                 &view,
                 "ابب logged out",
                 ColumnAnchors::none_ref(),
-                None,
-                &[],
+                Colours::plain(INK),
                 0.0,
-                INK,
             )
             .expect("lay out");
         assert!(
@@ -667,10 +699,8 @@ mod tests {
                         &view,
                         &line,
                         ColumnAnchors::none_ref(),
-                        None,
-                        &[],
+                        Colours::plain(INK),
                         row as f32 * painter.row_height(),
-                        INK,
                     )
                     .expect("lay out");
             }
@@ -766,7 +796,16 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &spans, 0.0, INK)
+            .lay_out_row(
+                &view,
+                line,
+                ColumnAnchors::none_ref(),
+                Colours {
+                    spans: &spans,
+                    ..Colours::plain(INK)
+                },
+                0.0,
+            )
             .expect("lay out");
 
         let solids: Vec<&Instance> = painter
@@ -862,10 +901,11 @@ mod tests {
                 &view,
                 line,
                 ColumnAnchors::none_ref(),
-                None,
-                &whole_line,
+                Colours {
+                    spans: &whole_line,
+                    ..Colours::plain(INK)
+                },
                 0.0,
-                INK,
             )
             .expect("lay out");
 
@@ -925,7 +965,7 @@ mod tests {
         view.hgrid_mut().scroll_to_column(4);
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
+            .lay_out_row(&view, line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
             .expect("lay out");
         let leftmost = painter
             .instances()
@@ -986,7 +1026,7 @@ mod tests {
         for (name, line) in &cases {
             painter.begin_frame();
             painter
-                .lay_out_row(&view, line, ColumnAnchors::none_ref(), None, &[], 0.0, INK)
+                .lay_out_row(&view, line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
                 .unwrap_or_else(|e| panic!("{name} failed to shape: {e:?} — see this test's note"));
         }
 
