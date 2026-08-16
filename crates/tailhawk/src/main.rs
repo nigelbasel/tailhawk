@@ -17,10 +17,14 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use tailhawk_core::find::{self, Outcome, Running, Update};
+use tailhawk_core::highlight::Span;
+use tailhawk_core::search::{Match, SearchOptions};
 use tailhawk_core::set::LogSet;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::{
-    background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, RENDER_CAP_CELLS,
+    background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, CURRENT_MATCH_BG,
+    CURRENT_MATCH_INK, MATCH_BG, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
@@ -40,8 +44,9 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_C, VK_CONTROL, VK_DOWN,
-    VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP,
+    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_BACK, VK_C, VK_CONTROL,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetScrollInfo,
@@ -50,10 +55,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, IDC_ARROW, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
     SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
     SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_DESTROY,
-    WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_CHAR,
+    WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -96,6 +101,8 @@ struct Document {
     /// The stdin pump, when the source is a pipe — §4.2. Held for its whole life because dropping
     /// it deletes the spill (§13.2), and the `LogSet` above is reading that file.
     pump: Option<Pump>,
+    /// The find state — the query, its matches, and the pass producing them. See [`Finder`].
+    finder: Finder,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -127,6 +134,13 @@ impl RowSource for Document {
         };
         (span.start_cell < end).then_some(span.start_cell..end)
     }
+
+    /// §7.1's colours over §7.4's results: every match on this row, the current one in its own
+    /// colour. **Visible rows only**, which is what §7.1 requires and what being called from the
+    /// painter's row loop delivers for free.
+    fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
+        self.finder.spans(row, out);
+    }
 }
 
 impl Document {
@@ -156,6 +170,7 @@ impl Document {
             summary,
             selection: None,
             dragging: false,
+            finder: Finder::default(),
             pump: None,
             stream_done: false,
         })
@@ -187,6 +202,7 @@ impl Document {
             summary: format!("<stdin> → {}", pump.path().display()),
             selection: None,
             dragging: false,
+            finder: Finder::default(),
             pump: Some(pump),
             stream_done: false,
         })
@@ -254,8 +270,15 @@ impl Document {
             Some((false, _)) => " — reading stdin".to_string(),
             None => format!(" — {}", self.set.describe()),
         };
+        // **The find state goes first**, because it is the part that changes while the user is
+        // watching and the part a truncated title must not lose. Everything after it is the
+        // document, which is what the window said before there was a search.
+        let find = match self.finder.describe() {
+            Some(text) => format!("{text} — "),
+            None => String::new(),
+        };
         format!(
-            "{}: {}{flag}{source}, {} lines, {} bytes",
+            "{find}{}: {}{flag}{source}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -305,6 +328,16 @@ impl Document {
         if polled.reset || !polled.retired.is_empty() {
             self.selection = None;
             self.dragging = false;
+            // **And the matches, for the same reason and more sharply.** A match is a row number
+            // plus a byte range inside it; a truncated member's rows are different bytes at the
+            // same numbers and a retirement renumbers everything after it. Keeping them would
+            // paint highlight over text that was never matched and send `F3` to the wrong line —
+            // and unlike a stale selection, that is a wrong answer rather than a wrong tint.
+            //
+            // A *roll* does not clear them: §5.5b appends the new member at the end of the row
+            // space, so every existing row keeps its number. The results are still a snapshot and
+            // still do not cover the new bytes, which is what "searched N lines" in the title says.
+            self.finder.clear();
         }
 
         self.view.grid_mut().set_total_rows(self.set.total_rows());
@@ -315,6 +348,72 @@ impl Document {
             self.view.grid_mut().scroll_to_bottom();
         }
         true
+    }
+
+    /// Starts a search for the typed query, over a snapshot of the set.
+    ///
+    /// **The snapshot is taken here and the pass runs on a worker**, because §7.4's own figure for a
+    /// full pass over 10 GB is 9.93 s and §11.3 forbids blocking a frame. See [`tailhawk_core::find`]
+    /// for what the worker is given and why it cannot move under it.
+    fn find(&mut self) {
+        self.finder.clear();
+        if self.finder.query.is_empty() {
+            return;
+        }
+        // Where the user is now, so the first match shown is the next one rather than the first in
+        // the file — see `Finder::first_worth_showing`.
+        self.finder.from_row = self.view.grid().scroll().row;
+        match find::start(
+            &self.finder.query,
+            true,
+            self.set.snapshot(),
+            SearchOptions::default(),
+        ) {
+            Ok(running) => self.finder.running = Some(running),
+            // A pattern the engine refused. It reaches the title rather than a dialog, because the
+            // window is not modal and the user is still looking at what they typed.
+            Err(e) => self.finder.error = Some(e.to_string()),
+        }
+    }
+
+    /// Steps to the next or previous match and puts it on screen. Reports whether it moved.
+    fn find_step(&mut self, forward: bool) -> bool {
+        let Some(row) = self.finder.step(forward) else {
+            return false;
+        };
+        self.show_row(row);
+        true
+    }
+
+    /// Collects what the search worker has reported, showing the first match worth showing.
+    ///
+    /// **The scrolling lives here rather than in the shell**, per §3.1: the shell decides what a
+    /// message means and the document decides what moving means. It is also the only way the join
+    /// is testable — a shell method needs a window, and "did the view follow the match" is exactly
+    /// the assertion that would otherwise be made by hand, once.
+    fn poll_find(&mut self) -> bool {
+        let (changed, show) = self.finder.poll();
+        if let Some(row) = show {
+            self.show_row(row);
+        }
+        changed
+    }
+
+    /// Puts `row` on screen, leaving the view alone if it is already there.
+    ///
+    /// **A match already visible must not move the view.** Stepping through four hits on one screen
+    /// should light each one in turn, not scroll four times — and a match that *is* off screen lands
+    /// a third of a page down rather than on the top edge, so there is context above it.
+    fn show_row(&mut self, row: u64) {
+        let grid = self.view.grid();
+        let first = grid.scroll().row;
+        if row >= first && row < first.saturating_add(grid.page_rows()) {
+            return;
+        }
+        let above = grid.page_rows() / 3;
+        self.view
+            .grid_mut()
+            .scroll_to_row(row.saturating_sub(above));
     }
 
     /// Starts, extends or replaces the selection from a click in the client area.
@@ -436,6 +535,264 @@ enum Navigate {
     DocEnd,
     LineStart,
     LineEnd,
+}
+
+/// The find state — `UI-DESIGN.md` §12's `Ctrl+F`, `F3` and `Shift+F3`.
+///
+/// ## ⚠ There is no find *bar*, and that is a disclosed deviation
+///
+/// `UI-DESIGN.md` §2.1 puts search in a command bar — "a single field … no modal find dialog" — and
+/// there is no field here because there is no **widget layer**: V14 is M7's first item and §12's
+/// text input depends on it. So the query is typed into the window and echoed in the title bar,
+/// which is where every other piece of live state has gone for the same reason (§5.5b's set
+/// description, §4.2's spill path, the frame instrument).
+///
+/// It is recorded in `CLEANROOM.md` as a deviation rather than presented as the design. What it does
+/// **not** do is prejudge the widget layer: everything below the keystroke — the query string, the
+/// match list, the stepping, the spans — is what a real field would drive, and only the two `WM_CHAR`
+/// arms would be deleted.
+///
+/// ## The search is case-insensitive, and that is a decision
+///
+/// §7.2 gives the grammar a `/pattern/i` flag and there is nowhere to set it, so the default is the
+/// whole behaviour. **Insensitive**, because the two failures are not symmetric: a user who typed
+/// `error` and wanted only `error` sees hits they did not want, which is visible and correctable
+/// from the screen, while a user who typed `error` against a log that says `ERROR` sees *nothing*
+/// and concludes the search is broken. `(?-i)` in the pattern is the escape hatch until there is a
+/// toggle.
+#[derive(Default)]
+struct Finder {
+    /// What the user has typed. Kept across searches, so `Ctrl+F` `Enter` repeats the last one.
+    query: String,
+    /// Whether keystrokes are going into the query.
+    typing: bool,
+    /// A high surrogate waiting for its low half. `WM_CHAR` delivers a non-BMP character as two
+    /// messages, and appending each on its own puts two replacement characters in the query.
+    pending_high: Option<u16>,
+    /// **Sorted by `(line, start)` at all times**, which is a property maintained on insertion
+    /// rather than restored by sorting — see [`Finder::absorb`].
+    matches: Vec<Match>,
+    /// Index into [`matches`](Self::matches) of the match `F3` last stepped to.
+    current: Option<usize>,
+    running: Option<Running>,
+    scanned: u64,
+    truncated: u64,
+    outcome: Option<Outcome>,
+    /// A pattern the engine refused. Held rather than shown once, because the window is not modal
+    /// and the user is still looking at what they typed.
+    error: Option<String>,
+    /// The row the search started from, so the first match reported at or after it is the one to
+    /// show. See [`Finder::first_worth_showing`].
+    from_row: u64,
+    /// Whether the view has already been moved for this search.
+    jumped: bool,
+}
+
+impl Finder {
+    /// Forgets the results, keeping the query. Cancels a running pass by dropping it.
+    fn clear(&mut self) {
+        self.running = None;
+        self.matches.clear();
+        self.current = None;
+        self.scanned = 0;
+        self.truncated = 0;
+        self.outcome = None;
+        self.error = None;
+        self.jumped = false;
+    }
+
+    /// Takes one `WM_CHAR` code unit into the query. Returns whether it was wanted.
+    ///
+    /// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
+    /// and pushing each on its own puts two replacement characters into the query — a search for an
+    /// emoji that cannot match one, failing as "not found" rather than as anything a user could act
+    /// on. Logs carry emoji: every one of this project's own commit messages could.
+    fn push_unit(&mut self, unit: u16) -> bool {
+        // Control characters arrive here too — `Ctrl+F` itself is 0x06 and `Enter` is 0x0D — and
+        // every one of them is either handled as a key or is not wanted in a query.
+        if unit < 0x20 || unit == 0x7F {
+            return false;
+        }
+        match (self.pending_high.take(), unit) {
+            (_, high) if (0xD800..0xDC00).contains(&high) => {
+                self.pending_high = Some(high);
+            }
+            (Some(high), low) if (0xDC00..0xE000).contains(&low) => {
+                self.query
+                    .extend(char::decode_utf16([high, low]).map(|c| c.unwrap_or('\u{FFFD}')));
+            }
+            // **A high surrogate whose partner never came becomes U+FFFD rather than being
+            // dropped**, because a character that vanishes as it is typed is indistinguishable from
+            // a keyboard that missed it. `take` above has already removed it, so without this arm
+            // passing it on it would go nowhere at all.
+            (orphan, unit) => self.query.extend(
+                char::decode_utf16(orphan.into_iter().chain([unit]))
+                    .map(|c| c.unwrap_or('\u{FFFD}')),
+            ),
+        }
+        true
+    }
+
+    /// Adds one chunk's matches, keeping the list sorted **without sorting it**.
+    ///
+    /// §7.4 chunks by line and chunks are disjoint runs of lines, so every match in a chunk belongs
+    /// in one contiguous slot of the ordered list — a `partition_point` finds it and a splice puts
+    /// them there. Within a chunk they already arrive in order, because `search_lines` walks lines
+    /// forwards.
+    ///
+    /// **The alternative was sorting after each drain, and it does not fit in a frame.** A 10 GB
+    /// pass streams up to 100,000 matches; re-sorting that on every 100 ms tick is ~10 ms of window
+    /// thread against a 16.67 ms budget, spent repeatedly to re-derive an order that was never lost.
+    fn absorb(&mut self, matches: Vec<Match>) {
+        let Some(first) = matches.first().copied() else {
+            return;
+        };
+        let at = self
+            .matches
+            .partition_point(|m| (m.line, m.start) < (first.line, first.start));
+        // A step that had a match under it keeps pointing at the same one: an insertion before it
+        // shifts its index, and not moving the cursor would silently walk `F3` backwards.
+        if let Some(current) = self.current.as_mut() {
+            if *current >= at {
+                *current += matches.len();
+            }
+        }
+        self.matches.splice(at..at, matches);
+    }
+
+    /// The match a fresh search should scroll to: the first at or after where the user was.
+    ///
+    /// **`F3` from the top of a 10 GB file should not scroll to row 4** if the user is reading row
+    /// 40 million. Wrapping to the start when there is nothing below is the other half of the same
+    /// rule, and it is what every editor does.
+    fn first_worth_showing(&self) -> Option<usize> {
+        let at = self.matches.partition_point(|m| m.line < self.from_row);
+        if at < self.matches.len() {
+            Some(at)
+        } else {
+            (!self.matches.is_empty()).then_some(0)
+        }
+    }
+
+    /// Steps to the next or previous match, wrapping. Returns the row to show.
+    fn step(&mut self, forward: bool) -> Option<u64> {
+        if self.matches.is_empty() {
+            return None;
+        }
+        let next = match (self.current, forward) {
+            (None, _) => self.first_worth_showing()?,
+            (Some(at), true) => (at + 1) % self.matches.len(),
+            (Some(0), false) => self.matches.len() - 1,
+            (Some(at), false) => at - 1,
+        };
+        self.current = Some(next);
+        Some(self.matches[next].line)
+    }
+
+    /// The row's matches as spans. §7.1's colours, over §7.4's results.
+    fn spans(&self, row: u64, out: &mut Vec<Span>) {
+        out.clear();
+        let from = self.matches.partition_point(|m| m.line < row);
+        let current = self.current.unwrap_or(usize::MAX);
+        for (at, m) in self.matches.iter().enumerate().skip(from) {
+            if m.line != row {
+                break;
+            }
+            let (bg, fg) = if at == current {
+                (CURRENT_MATCH_BG, Some(CURRENT_MATCH_INK))
+            } else {
+                (MATCH_BG, None)
+            };
+            out.push(Span {
+                start: m.start,
+                end: m.end,
+                fg,
+                bg: Some(bg),
+            });
+        }
+    }
+
+    /// Collects whatever the worker has reported. Returns the row to scroll to, if this is the
+    /// first news of a match worth showing.
+    ///
+    /// **The view is moved once per search and never again**, however many chunks arrive afterwards.
+    /// Chunks come back out of order (§7.4), so an earlier match routinely lands *after* a later
+    /// one — re-jumping to whichever is now the best answer would drag the window around under a
+    /// user who is already reading the result they were given.
+    fn poll(&mut self) -> (bool, Option<u64>) {
+        let Some(running) = self.running.as_ref() else {
+            return (false, None);
+        };
+        let updates: Vec<Update> = running.drain().collect();
+        if updates.is_empty() {
+            return (false, None);
+        }
+        let mut finished = false;
+        for update in updates {
+            match update {
+                Update::Chunk(found) => {
+                    self.scanned += found.scanned;
+                    self.truncated += found.truncated;
+                    self.absorb(found.matches);
+                }
+                Update::Finished(outcome) => {
+                    self.outcome = Some(outcome);
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            self.running = None;
+        }
+        let show = match (self.jumped, self.first_worth_showing()) {
+            (false, Some(at)) => {
+                self.jumped = true;
+                self.current = Some(at);
+                Some(self.matches[at].line)
+            }
+            _ => None,
+        };
+        (true, show)
+    }
+
+    /// The title's find fragment, or `None` when no search is in play.
+    ///
+    /// Everything §7.4 obliges a search to disclose is here: that a pass is still running, that it
+    /// was capped, that lines were too slow to search, and — the one a user would otherwise read as
+    /// "no matches" — that the pattern did not compile.
+    fn describe(&self) -> Option<String> {
+        if let Some(error) = &self.error {
+            return Some(format!("⌕ {} — {error}", self.query));
+        }
+        if self.typing {
+            return Some(format!("⌕ {}▏", self.query));
+        }
+        if self.query.is_empty() {
+            return None;
+        }
+        let mut text = format!("⌕ {}", self.query);
+        match (self.current, self.matches.len()) {
+            (_, 0) if self.running.is_some() => text.push_str(" — searching…"),
+            (_, 0) => text.push_str(" — no matches"),
+            (Some(at), n) => text.push_str(&format!(" — {} of {n}", at + 1)),
+            (None, n) => text.push_str(&format!(" — {n} matches")),
+        }
+        if self.running.is_some() && !self.matches.is_empty() {
+            text.push_str(&format!(", scanning ({} lines)", self.scanned));
+        }
+        match self.outcome {
+            // §7.4's cap: there are matches that were never reported, so the count is a floor.
+            Some(Outcome::Capped) => text.push_str(" — capped, there are more"),
+            Some(Outcome::Cancelled) => text.push_str(" — cancelled"),
+            Some(Outcome::Failed(ref why)) => text.push_str(&format!(" — read failed: {why}")),
+            _ => {}
+        }
+        if self.truncated > 0 {
+            // §7.4's "pattern too slow, truncated", counted rather than hidden.
+            text.push_str(&format!(", {} lines too slow to search", self.truncated));
+        }
+        Some(text)
+    }
 }
 
 /// What a mouse event means for the selection.
@@ -821,6 +1178,117 @@ impl Shell {
         }
     }
 
+    /// Rebuilds the title from the document's live state.
+    ///
+    /// **The cached string is refreshed from the document rather than edited**, because every part
+    /// of it except the file name can change while the window is open — the counts, the membership,
+    /// the stream state and now the find state. `Document::describe` is the one place that knows the
+    /// current answer, and a title assembled from remembered fragments is how "2 files … newest is
+    /// log_002.txt" survived onto a window showing three.
+    fn retitle(&mut self, hwnd: HWND) {
+        if let Some(doc) = self.document.as_ref() {
+            self.file = Some(doc.describe());
+        }
+        self.refresh_title(hwnd);
+    }
+
+    /// One keystroke, offered to the find state before the navigation map sees it.
+    ///
+    /// Returns whether it was consumed. **Typing does not swallow navigation**: only the characters
+    /// go to the query, so a user can page around while a query is half-typed, which is what a real
+    /// find bar — a focused field beside the grid — would also allow.
+    fn find_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
+        const F: u16 = VK_F.0;
+        const F3: u16 = VK_F3.0;
+        const RETURN: u16 = VK_RETURN.0;
+        const ESCAPE: u16 = VK_ESCAPE.0;
+        const BACK: u16 = VK_BACK.0;
+
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        let typing = doc.finder.typing;
+        let moved = match (key, ctrl, typing) {
+            // §12: `Ctrl+F` is search. The previous query is kept and left selected-in-spirit —
+            // there is no selection to show, so it is kept editable rather than cleared, which is
+            // what makes `Ctrl+F` `Enter` repeat the last search.
+            (F, true, _) => {
+                doc.finder.typing = true;
+                doc.finder.error = None;
+                false
+            }
+            (RETURN, _, true) => {
+                doc.finder.typing = false;
+                doc.find();
+                false
+            }
+            (BACK, _, true) => {
+                doc.finder.query.pop();
+                doc.finder.pending_high = None;
+                false
+            }
+            // **`Esc` unwinds one step at a time**: it leaves the query first and only then throws
+            // the results away. One key that did both would make a mistyped character cost the
+            // search that was still running.
+            (ESCAPE, _, true) => {
+                doc.finder.typing = false;
+                false
+            }
+            (ESCAPE, _, false) => {
+                doc.finder.clear();
+                false
+            }
+            // §12: `F3` / `Shift+F3` step. A step with no results but a query is the search the
+            // user meant — pressing `F3` after `Esc` should look for the thing, not do nothing.
+            (F3, _, _) => {
+                if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
+                    doc.find();
+                    false
+                } else {
+                    doc.find_step(!shift)
+                }
+            }
+            _ => return false,
+        };
+        if moved {
+            self.sync_scrollbar(hwnd);
+        }
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        true
+    }
+
+    /// One typed character, when the find state is taking them.
+    ///
+    /// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
+    /// and pushing each on its own puts two replacement characters into the query — a search for an
+    /// emoji that silently cannot match one.
+    fn find_char(&mut self, hwnd: HWND, unit: u16) -> bool {
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        if !doc.finder.typing || !doc.finder.push_unit(unit) {
+            return false;
+        }
+        self.retitle(hwnd);
+        true
+    }
+
+    /// Collects what the search worker has reported, and repaints if it said anything.
+    fn poll_find(&mut self, hwnd: HWND) {
+        let changed = self.document.as_mut().is_some_and(Document::poll_find);
+        if !changed {
+            return;
+        }
+        self.sync_scrollbar(hwnd);
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
     fn resize(&mut self, hwnd: HWND) {
         if let Some(renderer) = self.renderer.as_mut() {
             let (w, h) = Self::client_size(hwnd);
@@ -903,10 +1371,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 STATE.with(|s| {
                     let mut state = s.borrow_mut();
                     if let Some(shell) = state.as_mut() {
-                        if let Some(doc) = shell.document.as_ref() {
-                            shell.file = Some(doc.describe());
-                        }
-                        shell.refresh_title(hwnd);
+                        shell.retitle(hwnd);
                         shell.sync_scrollbar(hwnd);
                     }
                 });
@@ -914,6 +1379,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
+            // **On the same tick as following, deliberately.** A search is the other thing that
+            // arrives from a worker while the window is idle, and §7.4 wants its results streamed
+            // rather than waited for; a second timer would buy latency the eye cannot see and add
+            // a second thing to stop when the document closes.
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.poll_find(hwnd);
+                }
+            });
             LRESULT(0)
         }
         WM_PAINT => {
@@ -1009,6 +1483,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             const END: u16 = VK_END.0;
             const C: u16 = VK_C.0;
 
+            // **The find state is offered the key first**, because `Esc`, `Enter` and `Backspace`
+            // mean something to it and nothing to the navigation map — and because `F3` must not
+            // fall through to `DefWindowProcW` once there is something for it to do.
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            let consumed = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| shell.find_key(hwnd, wparam.0 as u16, ctrl, shift))
+            });
+            if consumed {
+                return LRESULT(0);
+            }
+
             // `UI-DESIGN.md` §12: Ctrl+C copies the selection raw. Handled before the navigation
             // map because C is not a navigation key and must not fall through to DefWindowProcW.
             if ctrl && wparam.0 as u16 == C {
@@ -1047,6 +1534,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     LRESULT(0)
                 }
                 None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            }
+        }
+        // Typed text, which only exists as a message because `TranslateMessage` produces it from
+        // the key pair. It carries the keyboard layout, the dead keys and the IME's output — which
+        // is why a query is built from `WM_CHAR` and not from virtual-key codes.
+        WM_CHAR => {
+            let consumed = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| shell.find_char(hwnd, wparam.0 as u16))
+            });
+            if consumed {
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MOUSEMOVE | WM_LBUTTONUP => {
@@ -1604,6 +2106,228 @@ mod tests {
             !doc.navigate(Navigate::ByColumns(1)),
             "scrolled past the end"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn hit(line: u64, start: usize) -> Match {
+        Match {
+            line,
+            start,
+            end: start + 5,
+        }
+    }
+
+    /// **The ordered match list is maintained, never rebuilt** — see [`Finder::absorb`].
+    ///
+    /// §7.4 reports chunks out of order, so this feeds them in the worst order it can and asserts
+    /// what a sort would have produced. The second assertion is the one with teeth: an insertion
+    /// *before* the current match must carry the cursor with it, or `F3` silently walks backwards
+    /// through results the user has already seen.
+    #[test]
+    fn chunks_arriving_out_of_order_still_leave_the_matches_in_row_order() {
+        let mut finder = Finder::default();
+        finder.absorb(vec![hit(500, 0), hit(500, 30), hit(700, 0)]);
+        finder.current = Some(0); // the user is standing on row 500's first hit
+        finder.absorb(vec![hit(100, 0), hit(200, 0)]);
+        finder.absorb(vec![hit(9_000, 0)]);
+        finder.absorb(vec![hit(600, 12)]);
+
+        let rows: Vec<u64> = finder.matches.iter().map(|m| m.line).collect();
+        assert_eq!(rows, vec![100, 200, 500, 500, 600, 700, 9_000]);
+        assert_eq!(
+            finder.current,
+            Some(2),
+            "the cursor must still point at row 500's first hit"
+        );
+        assert_eq!(finder.matches[finder.current.unwrap()].line, 500);
+    }
+
+    /// A fresh search shows the next match **from where the user is**, and stepping wraps.
+    #[test]
+    fn stepping_starts_from_the_viewport_and_wraps_at_both_ends() {
+        let mut finder = Finder::default();
+        finder.absorb(vec![hit(10, 0), hit(4_000, 0), hit(4_100, 0)]);
+
+        // Reading around row 4,000 in a big file: the first thing shown is 4,000, not 10.
+        finder.from_row = 3_500;
+        assert_eq!(finder.step(true), Some(4_000));
+        assert_eq!(finder.step(true), Some(4_100));
+        assert_eq!(finder.step(true), Some(10), "forwards must wrap to the top");
+        assert_eq!(
+            finder.step(false),
+            Some(4_100),
+            "backwards must wrap to the bottom"
+        );
+
+        // And with nothing below the viewport, the first step wraps rather than doing nothing.
+        let mut late = Finder {
+            from_row: 9_000,
+            ..Finder::default()
+        };
+        late.absorb(vec![hit(10, 0), hit(20, 0)]);
+        assert_eq!(late.step(true), Some(10));
+
+        assert_eq!(
+            Finder::default().step(true),
+            None,
+            "no matches, no movement"
+        );
+    }
+
+    /// The current match is a different colour from the rest, which is the whole of stepping being
+    /// visible — and only this row's matches are returned.
+    #[test]
+    fn only_this_rows_matches_are_spans_and_the_current_one_stands_out() {
+        let mut finder = Finder::default();
+        finder.absorb(vec![hit(7, 4), hit(7, 40), hit(8, 0)]);
+        finder.current = Some(1);
+
+        let mut spans = Vec::new();
+        finder.spans(7, &mut spans);
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].start, spans[0].end), (4, 9));
+        assert_eq!(spans[0].bg, Some(MATCH_BG));
+        assert_eq!(spans[1].bg, Some(CURRENT_MATCH_BG));
+        assert_eq!(spans[1].fg, Some(CURRENT_MATCH_INK));
+
+        // `out` is reused across rows, so a row with no matches must clear what the last one left.
+        finder.spans(9, &mut spans);
+        assert!(spans.is_empty(), "a row with no matches left spans behind");
+    }
+
+    /// **A non-BMP character typed into the query survives being two `WM_CHAR` messages.**
+    ///
+    /// Pushed separately they become two replacement characters, and the search then fails to find
+    /// the thing that is in the file — as "no matches", which is indistinguishable from the truth.
+    #[test]
+    fn a_surrogate_pair_becomes_one_character_in_the_query() {
+        let mut finder = Finder::default();
+        for unit in "ok 🦅".encode_utf16() {
+            assert!(finder.push_unit(unit));
+        }
+        assert_eq!(finder.query, "ok 🦅");
+
+        // Control codes are keys, not text: `Ctrl+F` arrives here as 0x06 and `Enter` as 0x0D.
+        assert!(!finder.push_unit(0x06));
+        assert!(!finder.push_unit(0x0D));
+        assert_eq!(finder.query, "ok 🦅");
+
+        // A lone high surrogate is not silently dropped — a character that vanishes as it is typed
+        // looks like a keyboard fault.
+        assert!(finder.push_unit(0xD83E));
+        assert!(finder.push_unit(u16::from(b'x')));
+        assert_eq!(finder.query, "ok 🦅\u{FFFD}x");
+    }
+
+    /// Everything §7.4 obliges a search to disclose has to be *sayable*, and the title is the only
+    /// place there is to say it.
+    #[test]
+    fn the_title_names_every_way_a_search_can_end() {
+        let mut finder = Finder {
+            query: "timeout".to_owned(),
+            ..Finder::default()
+        };
+        finder.absorb(vec![hit(4, 0), hit(9, 0)]);
+        finder.current = Some(1);
+        finder.outcome = Some(Outcome::Capped);
+        finder.truncated = 3;
+
+        let text = finder.describe().expect("a query is in play");
+        assert!(text.contains("2 of 2"), "{text}");
+        assert!(text.contains("capped"), "{text}");
+        assert!(text.contains("3 lines too slow"), "{text}");
+
+        // A pattern that would not compile must not read as "searched, found nothing".
+        let refused = Finder {
+            query: "(".to_owned(),
+            error: Some("unclosed group".to_owned()),
+            ..Finder::default()
+        };
+        let text = refused.describe().expect("an error is in play");
+        assert!(text.contains("unclosed group"), "{text}");
+        assert!(!text.contains("no matches"), "{text}");
+
+        // And with no query at all there is nothing to say.
+        assert!(Finder::default().describe().is_none());
+    }
+
+    /// A search over a real file, through the document, ending on screen as spans.
+    ///
+    /// This is the join the unit tests above cannot make: `Document::find` snapshots the set, a
+    /// worker searches it, `Finder::poll` collects the results, and `row_spans` — the method the
+    /// painter calls — returns them for the right rows.
+    #[test]
+    fn a_document_search_reaches_the_rows_the_painter_asks_about() {
+        let path = scratch_log("tailhawk_find_test.log", 400);
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        doc.finder.query = "line 137 ".to_owned();
+        doc.find();
+
+        // The worker is a worker: this is the shell's timer tick, without the timer.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.finder.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_find();
+            std::thread::yield_now();
+        }
+        doc.poll_find();
+
+        assert_eq!(doc.finder.outcome, Some(Outcome::Complete));
+        assert_eq!(
+            doc.finder.matches.len(),
+            1,
+            "\"line 137 \" occurs once in the fixture"
+        );
+        assert_eq!(doc.finder.matches[0].line, 137);
+        assert_eq!(
+            doc.finder.current,
+            Some(0),
+            "the match should have been stepped to as it arrived"
+        );
+
+        // And the painter's question is answered for that row and no other.
+        let mut spans = Vec::new();
+        doc.row_spans(137, &mut spans);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start, 0);
+        doc.row_spans(136, &mut spans);
+        assert!(spans.is_empty());
+
+        // The view moved to it: row 137 is not in the first screenful of 20 rows.
+        assert!(
+            doc.view.grid().scroll().row > 100,
+            "the view did not follow the match, it is at row {}",
+            doc.view.grid().scroll().row
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A rotation that renumbers rows throws the matches away**, because a match is a row number
+    /// and a byte range inside it — both of which a truncate invalidates while the count stays put.
+    #[test]
+    fn matches_do_not_survive_a_source_that_renumbers_its_rows() {
+        let path = scratch_log("tailhawk_find_truncate_test.log", 50);
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.finder.absorb(vec![hit(10, 0)]);
+        doc.finder.current = Some(0);
+
+        // §5.5's copy-truncate: same name, same handle, different bytes from offset zero.
+        std::fs::write(&path, "a totally different first line\n").expect("truncate the fixture");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !doc.finder.matches.is_empty() && std::time::Instant::now() < deadline {
+            doc.poll_follow();
+            std::thread::yield_now();
+        }
+
+        assert!(
+            doc.finder.matches.is_empty(),
+            "matches addressing the old bytes survived the truncate"
+        );
+        assert_eq!(doc.finder.current, None);
 
         let _ = std::fs::remove_file(&path);
     }

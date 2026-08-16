@@ -75,7 +75,8 @@ use crate::SELECTION_INK;
 /// The painter needs the plain ink, the columns the selection covers and the byte spans a rule or a
 /// search claimed — and it resolves them against each other per cluster, which is the argument for
 /// them being one thing rather than three parameters that happen to be adjacent.
-/// `Range` is not `Copy` — deliberately, upstream — so neither is this.
+///
+/// Not `Copy`, because `Range` is not — deliberately, upstream.
 #[derive(Clone, Debug)]
 pub struct Colours<'a> {
     /// The colour a cluster no span claimed is drawn in.
@@ -549,7 +550,13 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
+            .lay_out_row(
+                &view,
+                line,
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
             .expect("lay out");
 
         // Rebuild the expected column x for every cluster and require a quad to start there. The
@@ -596,7 +603,13 @@ mod tests {
 
         painter.begin_frame();
         painter
-            .lay_out_row(&view, &line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
+            .lay_out_row(
+                &view,
+                &line,
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
             .expect("lay out");
 
         // Column 0 is the whole `a` + tags cluster. Nothing it emits may reach column 1, where the
@@ -965,7 +978,13 @@ mod tests {
         view.hgrid_mut().scroll_to_column(4);
         painter.begin_frame();
         painter
-            .lay_out_row(&view, line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
+            .lay_out_row(
+                &view,
+                line,
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
             .expect("lay out");
         let leftmost = painter
             .instances()
@@ -1026,7 +1045,13 @@ mod tests {
         for (name, line) in &cases {
             painter.begin_frame();
             painter
-                .lay_out_row(&view, line, ColumnAnchors::none_ref(), Colours::plain(INK), 0.0)
+                .lay_out_row(
+                    &view,
+                    line,
+                    ColumnAnchors::none_ref(),
+                    Colours::plain(INK),
+                    0.0,
+                )
                 .unwrap_or_else(|e| panic!("{name} failed to shape: {e:?} — see this test's note"));
         }
 

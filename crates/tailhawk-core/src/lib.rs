@@ -142,12 +142,35 @@ pub const INK: [f32; 4] = [0.878, 0.890, 0.906, 1.0];
 
 /// Selected text, until there is a background pass to highlight it properly.
 ///
-/// **⚠ This is a stand-in for a highlight, not a colour choice.** `SPEC.md` §3.2 plans one instanced
-/// draw carrying foreground *and* background per instance, which is how a selection should look;
-/// `Instance` has no background field yet and adding one changes the glyph shader and the offline
-/// `fxc` build. Re-tinting the glyphs needs no new pipeline and consumes exactly the per-row column
-/// range a background pass would, so nothing is thrown away when it arrives.
+/// **⚠ This is a stand-in for a highlight, not a colour choice**, and the reason it used to give —
+/// that `Instance` has no background field — is no longer the reason. `text.rs`'s `MODE_SOLID` and
+/// `paint.rs`'s background pass mean a filled selection is now available for the asking; what is
+/// missing is the decision about what colour it should be, which `UI-DESIGN.md` §10 leaves open
+/// along with the rest of the palette. Re-tinting consumes exactly the per-row column range a fill
+/// would, so nothing is thrown away when that decision is taken.
 pub const SELECTION_INK: [f32; 4] = [0.45, 0.72, 1.0, 1.0];
+
+/// The background behind every match of the running search.
+///
+/// **Muted, because every hit in the file wears it.** A screenful of saturated highlight is a
+/// screenful nobody can read, and §7.4 streams up to 100,000 matches into a file whose lines are
+/// mostly still ordinary text.
+pub const MATCH_BG: [f32; 4] = [0.36, 0.29, 0.06, 1.0];
+
+/// The background behind the **current** match — the one `F3` last stepped to.
+///
+/// **The distinction is the whole of stepping.** Every match looking identical makes `F3` a
+/// scroll with no destination: the view moves and nothing says which of the four hits on screen is
+/// the one it moved to.
+pub const CURRENT_MATCH_BG: [f32; 4] = [0.95, 0.62, 0.16, 1.0];
+
+/// Ink over [`CURRENT_MATCH_BG`], which is bright enough that [`INK`] would not be legible on it.
+///
+/// ⚠ Provisional with the rest of the palette, and **contrast here is a correctness question rather
+/// than a taste one** — `SPEC.md` §14 wants a High Contrast path and a non-colour channel, and
+/// neither exists yet. Two colours a user cannot tell apart is the failure this pairing is one
+/// unverified guess away from.
+pub const CURRENT_MATCH_INK: [f32; 4] = [0.071, 0.078, 0.090, 1.0];
 
 /// Errors that cross the seam. Deliberately opaque — the shell can report one but cannot act on
 /// the distinction, and `SPEC.md` §3.2 forbids panicking on device loss.
