@@ -171,6 +171,10 @@ struct Document {
     /// V5: the column layout for the accepted format, sized on the head sample, or `None` for a
     /// file shown as it is written. See [`tailhawk_core::columns`].
     layout: Option<Layout>,
+    /// The measured column widths, for `reset_columns` after a drag has changed them.
+    column_defaults: Option<Vec<usize>>,
+    /// The column whose right edge is following the mouse, while the button is down.
+    resizing: Option<usize>,
     /// `layout.header()`, built once at open. See [`Document::header_text`].
     header: Option<String>,
     /// The visible rows' presentations under `layout`, rebuilt by `lay_out` each frame — §7.1's
@@ -597,6 +601,8 @@ impl Document {
             unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
+            column_defaults: layout.as_ref().map(|l| l.widths.clone()),
+            resizing: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -651,6 +657,8 @@ impl Document {
             unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
+            column_defaults: layout.as_ref().map(|l| l.widths.clone()),
+            resizing: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -1712,6 +1720,100 @@ impl Document {
         (!out.is_empty()).then_some(out)
     }
 
+    /// The header band's column boundaries, in cells from the row's left edge: the cell after each
+    /// shown column's width, before its gap. `UI-DESIGN.md` §2.1: "real, resizable … columns".
+    fn column_boundaries(&self) -> Vec<(usize, usize)> {
+        let Some(layout) = &self.layout else {
+            return Vec::new();
+        };
+        let mut at = 0usize;
+        let mut out = Vec::new();
+        let last = layout.widths.len().saturating_sub(1);
+        for (i, &w) in layout.widths.iter().enumerate().take(last) {
+            if w == 0 {
+                continue;
+            }
+            at += w;
+            out.push((i, at));
+            at += tailhawk_core::columns::GAP;
+        }
+        out
+    }
+
+    /// Whether `(x, y)` — pane-relative — is on the header band, and if so which column boundary
+    /// is within a cell of it. `Some(None)` is the header away from a boundary.
+    fn header_hit(&self, x: f32, y: f32) -> Option<Option<usize>> {
+        let header = self.view.header_px();
+        let top = self.view.chrome_px();
+        if header <= 0.0 || y < top || y >= top + header {
+            return None;
+        }
+        let cell_w = self.view.hgrid().cell_width().max(1.0);
+        let cell = ((x - self.view.gutter_px()) / cell_w) + self.view.hgrid().visible_columns().start as f32;
+        Some(
+            self.column_boundaries()
+                .into_iter()
+                .find(|(_, at)| (cell - *at as f32).abs() <= 1.0)
+                .map(|(i, _)| i),
+        )
+    }
+
+    /// Starts resizing column `i` from a press at `x`. The width follows the mouse until the
+    /// button goes up; `0` hides the column.
+    fn begin_resize(&mut self, i: usize) {
+        self.resizing = Some(i);
+    }
+
+    /// Sets column `i`'s width so its right edge sits at pane-relative `x`. Reports a change.
+    fn resize_to(&mut self, x: f32) -> bool {
+        let Some(i) = self.resizing else {
+            return false;
+        };
+        let cell_w = self.view.hgrid().cell_width().max(1.0);
+        let cell = ((x - self.view.gutter_px()) / cell_w).round().max(0.0) as usize
+            + self.view.hgrid().visible_columns().start;
+        let start: usize = self
+            .column_boundaries()
+            .into_iter()
+            .take_while(|(c, _)| *c < i)
+            .last()
+            .map_or(0, |(_, at)| at + tailhawk_core::columns::GAP);
+        let width = cell.saturating_sub(start).min(tailhawk_core::columns::MAX_CELLS * 4);
+        self.set_column_width(i, width)
+    }
+
+    fn set_column_width(&mut self, i: usize, width: usize) -> bool {
+        let Some(layout) = self.layout.as_mut() else {
+            return false;
+        };
+        if i + 1 >= layout.widths.len() || layout.widths[i] == width {
+            return false;
+        }
+        layout.widths[i] = width;
+        self.header = Some(layout.header());
+        true
+    }
+
+    fn end_resize(&mut self) {
+        self.resizing = None;
+    }
+
+    /// Every column back to its measured width — the way to see a hidden column again.
+    fn reset_columns(&mut self) -> bool {
+        let Some(defaults) = self.column_defaults.clone() else {
+            return false;
+        };
+        let Some(layout) = self.layout.as_mut() else {
+            return false;
+        };
+        if layout.widths == defaults {
+            return false;
+        }
+        layout.widths = defaults;
+        self.header = Some(layout.header());
+        true
+    }
+
     /// Applies one navigation intent. Returns whether anything actually moved.
     ///
     /// **The return value is what stops the window repainting on every key.** A `PageDown` at the
@@ -2334,6 +2436,7 @@ enum Command {
     FocusOtherPane,
     ToggleTheme,
     EditLastChip,
+    ResetColumns,
     GoToTop,
     FollowTail,
     Copy,
@@ -2373,6 +2476,7 @@ impl Command {
         (Command::FocusOtherPane, "Focus the other pane", "F6"),
         (Command::ToggleTheme, "Switch between the dark and light themes", ""),
         (Command::EditLastChip, "Edit the last filter chip (Ctrl+click a chip edits it)", "Ctrl+Shift+E"),
+        (Command::ResetColumns, "Reset column widths (drag a header boundary to resize; to 0 hides)", ""),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -3671,6 +3775,9 @@ impl Shell {
                 doc.filtering.error = None;
             }
             Command::ClearFilter => doc.clear_filter(),
+            Command::ResetColumns => {
+                doc.reset_columns();
+            }
             Command::EditLastChip => {
                 let last = doc.filtering.chips.chips.len().checked_sub(1);
                 if let Some(i) = last {
@@ -4881,6 +4988,41 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 if msg == WM_LBUTTONDOWN && shell.chrome_click(hwnd, x, y, shift) {
                     return;
                 }
+                // The header band: a press on a column boundary starts a resize, a double-click on
+                // one puts that column back to its measured width, and the band is never a selection.
+                if let Some(doc) = shell.document.as_mut() {
+                    let hit = doc.header_hit(x, y);
+                    let resizing = doc.resizing.is_some();
+                    let changed = match (msg, hit) {
+                        (WM_LBUTTONDOWN, Some(Some(col))) => {
+                            unsafe { SetCapture(hwnd) };
+                            doc.begin_resize(col);
+                            false
+                        }
+                        (WM_LBUTTONDBLCLK, Some(Some(col))) => {
+                            let width = doc.column_defaults.as_ref().and_then(|d| d.get(col).copied());
+                            width.is_some_and(|w| doc.set_column_width(col, w))
+                        }
+                        (WM_MOUSEMOVE, _) if resizing && held => doc.resize_to(x),
+                        (WM_LBUTTONUP, _) if resizing => {
+                            doc.resize_to(x);
+                            doc.end_resize();
+                            unsafe {
+                                let _ = ReleaseCapture();
+                            }
+                            true
+                        }
+                        _ => false,
+                    };
+                    if hit.is_some() || resizing {
+                        if changed {
+                            unsafe {
+                                let _ = InvalidateRect(hwnd, None, false);
+                            }
+                        }
+                        return;
+                    }
+                }
                 let moved = match msg {
                     WM_LBUTTONDOWN => {
                         // **Capture, so a drag that leaves the window still ends.** Without it the
@@ -5303,6 +5445,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
 
     /// Creates a real, unshown window to hang a swapchain on. Unshown is deliberate: the test
@@ -6203,6 +6346,57 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// §2.1's resizable columns: a boundary sits after each shown column; a press on one and a
+    /// drag sets that column's width from the mouse; zero hides it and the boundaries close up;
+    /// reset brings the measured widths back; the header follows every change.
+    #[test]
+    fn column_boundaries_resize_hide_and_reset() {
+        let path = std::env::temp_dir().join("tailhawk_columns_test.log");
+        std::fs::write(
+            &path,
+            "2026-08-17 09:14:03.884 +01:00 [INF] Zenith.Dispatcher Dispatching job 41981\n\
+             2026-08-17 09:14:04.120 +01:00 [ERR] Zenith.Dispatcher Failed\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let layout = doc.layout.clone().expect("Serilog is detected");
+        let defaults = layout.widths.clone();
+        assert!(defaults.len() >= 3);
+        let bounds = doc.column_boundaries();
+        assert_eq!(bounds.len(), defaults.len() - 1, "one boundary per column but the last");
+        assert_eq!(bounds[0], (0, defaults[0]));
+        assert_eq!(bounds[1].1, defaults[0] + GAP + defaults[1]);
+
+        // The header band starts under the chrome; a press near boundary 0's cell hits it.
+        let gutter = doc.view.gutter_px();
+        let header_y = doc.view.chrome_px() + 1.0;
+        let x0 = gutter + defaults[0] as f32 * 8.0;
+        assert_eq!(doc.header_hit(x0, header_y), Some(Some(0)));
+        assert_eq!(doc.header_hit(x0 + 40.0, header_y), Some(None), "the band, no boundary");
+        assert_eq!(doc.header_hit(x0, header_y + 200.0), None, "the grid, not the header");
+
+        // Drag boundary 0 left by five cells.
+        doc.begin_resize(0);
+        assert!(doc.resize_to(x0 - 5.0 * 8.0));
+        doc.end_resize();
+        assert_eq!(doc.layout.as_ref().unwrap().widths[0], defaults[0] - 5);
+        let header = doc.header.clone().unwrap();
+        assert!(header.starts_with("timestamp"));
+        assert!(header.len() < layout.header().len(), "the header shrank with it");
+
+        // To zero: hidden, and the boundary list closes up.
+        assert!(doc.set_column_width(0, 0));
+        assert_eq!(doc.column_boundaries()[0].0, 1, "column 1 is now the first shown");
+        assert!(!doc.header.as_ref().unwrap().starts_with("timestamp"));
+
+        assert!(doc.reset_columns());
+        assert_eq!(doc.layout.as_ref().unwrap().widths, defaults);
+        assert!(!doc.reset_columns(), "nothing to reset twice");
+        assert!(!doc.set_column_width(defaults.len() - 1, 5), "the message column is the rest of the row");
+        std::fs::remove_file(&path).ok();
+    }
+
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
         doc.add_chip(text, polarity);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -6599,6 +6793,10 @@ mod tests {
                         .and_then(|r| r.parse().ok())
                         .unwrap_or(0);
                     doc.selection = Some(Selection::at(Position::new(row, 0)));
+                }
+                "width" => {
+                    let (col, w) = arg.split_once(':').expect("width:<col>:<cells>");
+                    doc.set_column_width(col.parse().expect("col"), w.parse().expect("cells"));
                 }
                 "palette" => {
                     doc.palette.open();
