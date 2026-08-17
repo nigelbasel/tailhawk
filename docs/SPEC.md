@@ -779,6 +779,15 @@ the format's declared set — is the term that kills the classic false positive 
 chip appears: *"Detected: Serilog (file) — also matched log4net. Change ▾"*. **Silent mis-columnising
 is worse than no columnising.**
 
+> **Amended 2026-08-17 (session 18), when the detector was built.** As first written, specificity was
+> a factor of the score *and* the score had to reach 0.75, so every format below 0.75 specificity —
+> generic timestamped text, logfmt, NDJSON, Python, Serilog console, RFC 3164 — could never be
+> accepted. Stage 4 already calls specificity an *ordering*, and that is the reading implemented:
+> the **acceptance threshold applies to the quality terms**
+> (`match_rate × (0.5 + 0.5 × field_validity) × (0.7 + 0.3 × coverage) ≥ 0.75`), and
+> **specificity multiplies in for the ranking and the 15 % margin**, which is where a generic
+> pattern must lose to a specific one. `detect.rs`.
+
 **Stage 4 — Specificity ordering.** RFC 5424 0.95 · NLog 0.90 · MEL Simple 0.90 · Serilog file 0.85 ·
 Apache/nginx 0.85 · log4net 0.80 · MEL Systemd 0.75 · RFC 3164 0.70 · Serilog console 0.65 · Python
 0.60 · NDJSON 0.55 · logfmt 0.45 · CSV/TSV 0.40 · generic timestamped 0.20 · plain text 0.00.

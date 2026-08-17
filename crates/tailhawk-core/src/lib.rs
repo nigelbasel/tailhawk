@@ -13,6 +13,7 @@ pub mod ansi;
 pub mod atlas;
 pub mod bidi;
 pub mod cell;
+pub mod detect;
 pub mod encoding;
 pub mod filter;
 pub mod follow;

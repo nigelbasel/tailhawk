@@ -82,6 +82,20 @@ pub struct Format {
     pub samples: &'static [(&'static str, Option<SeverityBand>)],
 }
 
+impl std::fmt::Debug for Format {
+    /// The id and the specificity — the compiled patterns are pages of state nobody wants.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Format({} {})", self.id, self.specificity)
+    }
+}
+
+impl PartialEq for Format {
+    /// Two formats are the same format if they have the same id; the catalogue holds one of each.
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
 /// A first-line pattern's names, so a caller can ask a format for its columns without a match.
 pub const TS: &str = "ts";
 pub const LEVEL: &str = "level";
