@@ -177,6 +177,8 @@ struct Document {
     column_defaults: Option<Vec<usize>>,
     /// The column whose right edge is following the mouse, while the button is down.
     resizing: Option<usize>,
+    /// The column whose title is being dragged to a new place, while the button is down.
+    moving: Option<usize>,
     /// `layout.header()`, built once at open. See [`Document::header_text`].
     header: Option<String>,
     /// The visible rows' presentations under `layout`, rebuilt by `lay_out` each frame — §7.1's
@@ -638,6 +640,7 @@ impl Document {
             header: layout.as_ref().map(Layout::header),
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
+            moving: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -694,6 +697,7 @@ impl Document {
             header: layout.as_ref().map(Layout::header),
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
+            moving: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -1793,8 +1797,8 @@ impl Document {
         };
         let mut at = 0usize;
         let mut out = Vec::new();
-        let last = layout.widths.len().saturating_sub(1);
-        for (i, &w) in layout.widths.iter().enumerate().take(last) {
+        for &i in layout.shown_order() {
+            let w = layout.widths[i];
             if w == 0 {
                 continue;
             }
@@ -1824,6 +1828,53 @@ impl Document {
         )
     }
 
+    /// The column whose title covers header cell `cell`, in display order — for a drag that
+    /// reorders. `None` in the gap after a column or over the message column.
+    fn column_at_cell(&self, cell: usize) -> Option<usize> {
+        let layout = self.layout.as_ref()?;
+        let mut at = 0usize;
+        for &i in layout.shown_order() {
+            let w = layout.widths[i];
+            if w == 0 {
+                continue;
+            }
+            if cell >= at && cell < at + w {
+                return Some(i);
+            }
+            at += w + tailhawk_core::columns::GAP;
+        }
+        None
+    }
+
+    /// The header cell under pane-relative `x`.
+    fn header_cell(&self, x: f32) -> usize {
+        let cell_w = self.view.hgrid().cell_width().max(1.0);
+        ((x - self.view.gutter_px()) / cell_w).max(0.0) as usize
+            + self.view.hgrid().visible_columns().start
+    }
+
+    /// Drops the column being moved at the display slot under `x`. Reports a change.
+    fn drop_column(&mut self, x: f32) -> bool {
+        let Some(from) = self.moving.take() else {
+            return false;
+        };
+        let cell = self.header_cell(x);
+        let Some(over) = self.column_at_cell(cell) else {
+            return false;
+        };
+        let Some(layout) = self.layout.as_mut() else {
+            return false;
+        };
+        let Some(to) = layout.shown_order().iter().position(|&c| c == over) else {
+            return false;
+        };
+        if !layout.move_column(from, to) {
+            return false;
+        }
+        self.header = Some(layout.header());
+        true
+    }
+
     /// Starts resizing column `i` from a press at `x`. The width follows the mouse until the
     /// button goes up; `0` hides the column.
     fn begin_resize(&mut self, i: usize) {
@@ -1838,12 +1889,12 @@ impl Document {
         let cell_w = self.view.hgrid().cell_width().max(1.0);
         let cell = ((x - self.view.gutter_px()) / cell_w).round().max(0.0) as usize
             + self.view.hgrid().visible_columns().start;
-        let start: usize = self
-            .column_boundaries()
-            .into_iter()
-            .take_while(|(c, _)| *c < i)
-            .last()
-            .map_or(0, |(_, at)| at + tailhawk_core::columns::GAP);
+        let bounds = self.column_boundaries();
+        let start: usize = bounds
+            .iter()
+            .position(|(c, _)| *c == i)
+            .and_then(|p| p.checked_sub(1))
+            .map_or(0, |p| bounds[p].1 + tailhawk_core::columns::GAP);
         let width = cell
             .saturating_sub(start)
             .min(tailhawk_core::columns::MAX_CELLS * 4);
@@ -6100,11 +6151,27 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 if let Some(doc) = shell.document.as_mut() {
                     let hit = doc.header_hit(x, y);
                     let resizing = doc.resizing.is_some();
+                    let moving = doc.moving.is_some();
                     let changed = match (msg, hit) {
                         (WM_LBUTTONDOWN, Some(Some(col))) => {
                             unsafe { SetCapture(hwnd) };
                             doc.begin_resize(col);
                             false
+                        }
+                        (WM_LBUTTONDOWN, Some(None)) => {
+                            // On a title: the column follows the mouse to a new slot.
+                            let cell = doc.header_cell(x);
+                            if let Some(col) = doc.column_at_cell(cell) {
+                                unsafe { SetCapture(hwnd) };
+                                doc.moving = Some(col);
+                            }
+                            false
+                        }
+                        (WM_LBUTTONUP, _) if moving => {
+                            unsafe {
+                                let _ = ReleaseCapture();
+                            }
+                            doc.drop_column(x)
                         }
                         (WM_LBUTTONDBLCLK, Some(Some(col))) => {
                             let width = doc
@@ -6124,7 +6191,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         }
                         _ => false,
                     };
-                    if hit.is_some() || resizing {
+                    if hit.is_some() || resizing || moving {
                         if changed {
                             unsafe {
                                 let _ = InvalidateRect(hwnd, None, false);
@@ -7637,6 +7704,24 @@ mod tests {
 
         assert!(doc.reset_columns());
         assert_eq!(doc.layout.as_ref().unwrap().widths, defaults);
+
+        // Reorder: drag the timestamp title onto the level column.
+        assert_eq!(
+            doc.column_at_cell(2),
+            Some(0),
+            "the first title covers cell 2"
+        );
+        assert_eq!(doc.column_at_cell(defaults[0] + GAP + 1), Some(1));
+        doc.moving = Some(0);
+        let level_x = gutter + (defaults[0] + GAP + 1) as f32 * 8.0;
+        assert!(doc.drop_column(level_x));
+        assert!(
+            doc.header.as_ref().unwrap().starts_with("level"),
+            "{:?}",
+            doc.header
+        );
+        assert_eq!(doc.column_boundaries()[0].0, 1, "level is drawn first now");
+        assert_eq!(doc.column_boundaries()[1].0, 0);
         assert!(!doc.reset_columns(), "nothing to reset twice");
         assert!(
             !doc.set_column_width(defaults.len() - 1, 5),
@@ -8129,6 +8214,12 @@ mod tests {
                     let (specs, failed) = load_rule_specs(&[PathBuf::from(arg)]);
                     assert!(failed.is_empty(), "{failed:?}");
                     rebuild_highlighter_with(&mut doc, &specs);
+                }
+                "order" => {
+                    let (from, to) = arg.split_once(':').expect("order:<from>:<to>");
+                    let layout = doc.layout.as_mut().expect("a layout");
+                    layout.move_column(from.parse().expect("col"), to.parse().expect("slot"));
+                    doc.header = Some(layout.header());
                 }
                 "width" => {
                     let (col, w) = arg.split_once(':').expect("width:<col>:<cells>");
