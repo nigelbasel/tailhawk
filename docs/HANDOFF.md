@@ -25,10 +25,12 @@ click to focus, caret, selection, clipboard, undo, IME; `Ctrl+F` / `Ctrl+L` focu
 chip removes it.
 
 **Tabs:** several files in one window (`Ctrl+O` / drop open a new tab, `Ctrl+Tab` switches, `Ctrl+W`
-closes).
+closes); several paths on the command line open together; a directory or `dir*.log` is watched and
+new files join as tabs. A **status bar** says whether the view is following. **Remembered between
+runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
-**Missing before daily use is comfortable:** no split view, no menus, no chip toggle/edit/reorder,
-no column resize/reorder/hide; no settings or persistence; no
+**Missing before daily use is comfortable:** no split view, no menus, no chip edit/reorder, no
+column resize/reorder/hide; no settings or persistence; no
 user highlight-rules editor or format wizard; no installer or signing.
 
 **After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
@@ -54,9 +56,22 @@ the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
 the find field (the query is always a regex); the disambiguation chip is bar text.
 
 | **V7 tabs** — several documents; `Ctrl+O` / drop open a new one; `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+W`; a strip above the bar when there are two, click to switch; every tab keeps following | `Tabs` in `main.rs` | headless: three tabs, the shown one lighter |
+| **Status bar** — a footer band; the title's text drawn where a user looks (the title keeps it for the harnesses); leads with **`● following`** or **`‖ paused · Ctrl+End to follow`** | `View::set_footer_px`, `draw_chrome` | headless |
+| **Chips toggle** on a click, go on their `×`; a disabled chip is drawn dim | `Chip::enabled`, `Hit::ChipClose` | headless |
+| **E19** — every argument opens as a tab (a file set); a directory or `dir\*.log` is a **watched folder** adopting new files every 2 s; a tab that grew unseen carries a dot | `Watch`, `Tabs::labels` | test |
+| **E28 (M8, brought forward)** — `tailhawk.settings.toml`: window placement, per-file chips and collapse; exe-adjacent → `%APPDATA%\Tailhawk`, merged, first writable, `--stateless` | `settings.rs`, `Shell::save_settings`, `Document::apply_state` | on the binary: run, close, the file is written with the window; reopened, a file's chips come back (test) |
 
-**Next in M7:** chip toggle/edit (a click toggles, not removes); drag-reorder and drag-out-to-split;
-**V13** theming; **E19** watched folders; V10 detail pane; V12 pointer scroll; V15 UIA; E20–E22, E27; V9.
+**⚠ A bug the settings work found, and it was serious:** since the morning's `wndproc` re-entry
+guard (`949c479`), **closing the window did not quit the process** — `DefWindowProcW`'s `WM_CLOSE`
+calls `DestroyWindow`, whose `WM_DESTROY` arrives *nested*, so it went to `DefWindowProcW` and
+`PostQuitMessage` never ran. Every harness `Kill()`s its window, which is why nothing saw it.
+`WM_CLOSE` now saves, destroys and quits itself (`Shell::save_settings`, `handle`). **The guard's
+rule stands: nested messages go to `DefWindowProcW` — so anything that must happen on a nested
+message must be moved to the un-nested one that causes it.**
+
+
+**Next in M7:** drag-reorder and drag-out-to-split; **V13** theming; V10 detail pane; V12 pointer
+scroll; V15 UIA; E20 bookmarks, E21 export/tee, E22 sort, E27 view history; V9 rules editor / wizard.
 
 ---
 
