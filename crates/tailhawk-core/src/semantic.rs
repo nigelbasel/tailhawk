@@ -90,15 +90,15 @@ const SEVERITY_WORDS: [(SeverityBand, &[&str], &[&str]); 5] = [
     (
         SeverityBand::Error,
         &["error", "severe", "critical", "alert", "panic"],
-        &["ERR", "EROR", "CRIT", "DPANIC"],
+        &["ERR", "EROR", "CRIT", "DPANIC", "fail", "crit"],
     ),
     (SeverityBand::Warn, &["warn", "warning"], &["WRN"]),
     (
         SeverityBand::Debug,
         &["debug", "verbose"],
-        &["DBG", "FINE", "FINER", "CONFIG"],
+        &["DBG", "FINE", "FINER", "CONFIG", "dbug"],
     ),
-    (SeverityBand::Trace, &["trace"], &["FINEST", "VRB"]),
+    (SeverityBand::Trace, &["trace"], &["FINEST", "VRB", "trce"]),
 ];
 
 const fn band_colour(band: SeverityBand) -> Colour {

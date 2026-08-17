@@ -51,19 +51,23 @@ impl Layout {
             .iter()
             .map(|name| cells.cell_count(column_title(name)).max(1))
             .collect();
+        // A column no sampled line populated is left out entirely — MEL Simple without its
+        // timestamp option would otherwise reserve eleven blank cells on every row.
+        let mut seen = vec![false; n];
         for line in lines {
             let Some(fields) = format.fields(line) else {
                 continue;
             };
             for (i, field) in fields.iter().enumerate() {
                 if let Some(range) = field {
+                    seen[i] = true;
                     let w = cells.cell_count(&line[range.clone()]);
                     widths[i] = widths[i].max(w);
                 }
             }
         }
-        for w in widths.iter_mut().take(n.saturating_sub(1)) {
-            *w = (*w).min(MAX_CELLS);
+        for (i, w) in widths.iter_mut().enumerate().take(n.saturating_sub(1)) {
+            *w = if seen[i] { (*w).min(MAX_CELLS) } else { 0 };
         }
         if let Some(last) = widths.last_mut() {
             *last = 0;
@@ -82,6 +86,9 @@ impl Layout {
                 text.push_str(name);
                 break;
             }
+            if self.widths[i] == 0 {
+                continue;
+            }
             let take = cut_to_cells(&CellModel::new(), name, self.widths[i]);
             text.push_str(take);
             for _ in CellModel::new().cell_count(take)..self.widths[i] + GAP {
@@ -95,6 +102,7 @@ impl Layout {
     pub fn message_indent(&self) -> usize {
         self.widths[..self.widths.len().saturating_sub(1)]
             .iter()
+            .filter(|&&w| w > 0)
             .map(|w| w + GAP)
             .sum()
     }
@@ -102,6 +110,23 @@ impl Layout {
     /// Cells the padding adds to a row at most, for the horizontal extent.
     pub fn extra_cells(&self) -> usize {
         self.message_indent()
+    }
+
+    /// [`present`](Self::present), with the record's body pulled in from `next` when the format
+    /// keeps its message on the line after the first (MEL Simple, [`Format::body_next_line`]) and
+    /// `next` is that line. §6.4's "assemble correctly", for a view that has collapsed the
+    /// continuation the body would otherwise sit on. The body's segment points at *another* row's
+    /// bytes, so it carries no span: a search hit in the message is on the hidden line.
+    pub fn present_record(&self, raw: &str, next: Option<&str>) -> Presentation {
+        let mut p = self.present(raw);
+        if !self.format.body_next_line || p.continuation {
+            return p;
+        }
+        let Some(body) = next.filter(|n| self.format.is_continuation(n)) else {
+            return p;
+        };
+        p.text.push_str(body.trim_start());
+        p
     }
 
     /// The presentation of one raw line: its fields in columns if it is a first line, indented
@@ -115,6 +140,9 @@ impl Layout {
             Some(fields) => {
                 let last = fields.len().saturating_sub(1);
                 for (i, field) in fields.iter().enumerate() {
+                    if i != last && self.widths[i] == 0 {
+                        continue;
+                    }
                     let start = text.len();
                     let mut used = 0usize;
                     if let Some(range) = field {

@@ -359,7 +359,23 @@ impl Document {
             .iter()
             .filter_map(|&r| self.filtering.file_row(r))
             .collect();
-        if self.filtering.active() {
+        // A format whose message is the next line (MEL Simple) has that line pulled into the
+        // record's row while continuations are collapsed — the assembly §6.4 asks for. That needs
+        // the successors fetched too, one more read per visible row; without collapse the message
+        // is on screen anyway, one row down.
+        let assemble = self
+            .layout
+            .as_ref()
+            .is_some_and(|l| l.format.body_next_line && self.filtering.records_only);
+        if assemble {
+            let mut with_next: Vec<u64> = file_rows
+                .iter()
+                .flat_map(|&r| [r, r + 1])
+                .filter(|&r| r < self.set.total_rows())
+                .collect();
+            with_next.dedup();
+            let _ = self.set.fetch_rows(&with_next, anchored);
+        } else if self.filtering.active() {
             // The visible view rows are survivors from anywhere in the file: a scattered fetch.
             let _ = self.set.fetch_rows(&file_rows, anchored);
         } else {
@@ -371,7 +387,13 @@ impl Document {
         if let Some(layout) = &self.layout {
             for file_row in file_rows {
                 if let Some(raw) = self.set.row_text(file_row) {
-                    self.presented.push((file_row, layout.present(raw)));
+                    let next = if assemble {
+                        self.set.row_text(file_row + 1)
+                    } else {
+                        None
+                    };
+                    self.presented
+                        .push((file_row, layout.present_record(raw, next)));
                 }
             }
         }
@@ -3296,6 +3318,55 @@ mod tests {
             doc.filtering.kept,
             [1, 4],
             "the chip composes with the collapse"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+    /// M6's done-criterion: "MEL Simple two-line records assemble correctly". Collapsed, each record
+    /// is one row with the next line's text in its message column; uncollapsed, the message is the
+    /// row below, indented under the message column.
+    #[test]
+    fn mel_simple_two_line_records_assemble_when_collapsed() {
+        let path = std::env::temp_dir().join("tailhawk_mel_test.log");
+        std::fs::write(
+            &path,
+            "info: Microsoft.Hosting.Lifetime[14]\n      Now listening on: http://localhost:5000\n\
+             fail: Api.Dispatch[0]\n      Failed to dispatch job 41982\n\
+             info: Microsoft.Hosting.Lifetime[0]\n      Application started.\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.detection.accepted.map(|f| f.id), Some("mel-simple"));
+        assert!(doc.header_text().is_some());
+        let row1 = doc.row_text(1).expect("row 1").to_owned();
+        assert!(row1.trim_start().starts_with("Now listening"), "{row1:?}");
+        assert!(
+            row1.starts_with("   "),
+            "indented under the message column: {row1:?}"
+        );
+
+        doc.filtering.records_only = true;
+        doc.filtering.clear_results();
+        doc.refilter();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_filter();
+            std::thread::yield_now();
+        }
+        doc.poll_filter();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.filtering.kept, [0, 2, 4]);
+        let row = doc
+            .row_text(1)
+            .expect("view row 1 is file row 2")
+            .to_owned();
+        assert!(
+            row.starts_with("fail"),
+            "no timestamp column when no line has one: {row:?}"
+        );
+        assert!(
+            row.ends_with("Failed to dispatch job 41982"),
+            "the next line's text is the message: {row:?}"
         );
         let _ = std::fs::remove_file(&path);
     }

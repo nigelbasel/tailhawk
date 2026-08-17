@@ -80,6 +80,18 @@ pub struct Format {
     pub columns: &'static [&'static str],
     /// First lines this format must parse, with the band each carries.
     pub samples: &'static [(&'static str, Option<SeverityBand>)],
+    /// The message is the *next* line, not part of the first — MEL Simple's `info: Logger[0]`
+    /// followed by six spaces and the text. Under §6.4 that line is a continuation; a collapsed
+    /// view assembles it into the record's message column.
+    pub body_next_line: bool,
+}
+
+impl Format {
+    /// Marks the message as living on the line after the first — MEL Simple. See [`Format::body_next_line`].
+    fn with_body_on_next_line(mut self) -> Self {
+        self.body_next_line = true;
+        self
+    }
 }
 
 impl std::fmt::Debug for Format {
@@ -272,6 +284,7 @@ macro_rules! fmt {
             continuation: $cont.map(re),
             columns: $cols,
             samples: $samples,
+            body_next_line: false,
         }
     };
 }
@@ -314,7 +327,7 @@ fn build() -> Vec<Format> {
             &[("info: Microsoft.Hosting.Lifetime[14]", Some(Info)),
               ("fail: Api.Dispatch[0]", Some(Error)),
               ("2026-08-16 09:14:02 warn: Api.Sql[0]", Some(Warn))],
-        ),
+        ).with_body_on_next_line(),
         fmt!(
             "serilog-file", "Serilog (file)", 0.85,
             r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}) \[(?P<level>VRB|DBG|INF|WRN|ERR|FTL)\] (?P<msg>.*)$",
