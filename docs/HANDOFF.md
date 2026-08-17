@@ -29,7 +29,10 @@ by name with its key (type to narrow; a typed number is *go to line*, `Ctrl+G`);
 gutter** shows physical line numbers even under a filter; `Ctrl+D` **bookmarks** a row (amber mark
 in the gutter), `F2` / `Shift+F2` step through them; `Ctrl+Shift+1…9` puts a **colour label** on
 every line containing the selected text, `Ctrl+Shift+0` clears them. Bookmarks and labels are
-remembered per file.
+remembered per file. **`Ctrl+Enter`** opens a **record detail pane** at the bottom (fields, the body
+wrapped, the stack trace under it; JSON pretty-printed on request); **`Alt+←` / `Alt+→`** step back and
+forward through views (filters, collapse, jumps); the palette can **export the visible rows to a
+file** or **tee** them live as the log grows (Hoo WinTail's tee); `Ctrl+Shift+C` copies as TSV.
 
 **Tabs:** several files in one window (`Ctrl+O` / drop open a new tab, `Ctrl+Tab` switches, `Ctrl+W`
 closes); several paths on the command line open together; a directory or `dir*.log` is watched and
@@ -81,13 +84,19 @@ message must be moved to the un-nested one that causes it.**
 | **E20 bookmarks** — `Ctrl+D` toggles on the caret's row (file row, survives a filter), `F2`/`Shift+F2` step and wrap skipping a hidden one that would stall; amber mark in the gutter; persisted | `Document::toggle_bookmark/bookmark_step` | headless + test |
 | **V8 command palette** — `Ctrl+K` (and `Ctrl+G`): every command by name and key, subsequence match ranked by tightness, `Up`/`Down`/`Enter`/`Esc`, click a row; digits → *Go to line N*; `Command` enum is the one dispatch | `palette.rs` (6 tests), `Command`, `Shell::run/palette_key` | headless |
 | **Colour labels** — `Ctrl+Shift+1…9` on a selection: whole-line background on every line containing it, toggles off, `Ctrl+Shift+0` clears; `Pattern::literal`; persisted | `Document::label/toggle_label` | headless + test |
+| **E27 view history** — `Alt+←`/`Alt+→` over (chips, collapse, top row), remembered before every chip change, collapse, go-to-line and bookmark step | `History`, `Document::remember/history_step` | test |
+| **V10 record detail pane** — `Ctrl+Enter`; `detail.rs` composes fields / rule / body (wrapped, hanging indent) / tail into lines; walks back to the record's first line; JSON re-indent (a formatter, not a parser); pane rows fetched with the frame's | `detail.rs` (6 tests), `DetailPane`, `Document::compose_detail` | headless + test |
+| **E21 export + tee** — `export.rs`: a worker pass writing every row or the filter's survivors (moving cursor), progress + outcome, append; the shell's `Tee` runs the current view then each tick's judged growth; Save dialog deferred to `wndproc`; status bar shows the count; `Ctrl+Shift+C` TSV | `export.rs` (2 tests), `Tee`, `Document::poll_tee/copy_tsv` | test |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Next in M7:** drag-reorder and drag-out-to-split; **V13** theming; V10 detail pane; V12 pointer
-scroll; V15 UIA; E21 export/tee, E22 sort, E27 view history; V9 rules editor / wizard.
+**Next in M7:** drag-reorder and drag-out-to-split (split view); **V13** theming; V12 pointer
+scroll; V15 UIA; E22 sort; V9 rules editor / wizard; chip edit/reorder; column resize. **The
+desktop was busy all evening** — everything after the gutter was verified headless; the first free
+desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
+Save dialog.
 
 ---
 
