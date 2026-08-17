@@ -31,6 +31,7 @@ pub mod rows;
 pub mod search;
 pub mod selection;
 pub mod semantic;
+pub mod template;
 pub mod view;
 
 #[cfg(windows)]

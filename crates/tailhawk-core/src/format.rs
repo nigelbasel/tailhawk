@@ -117,6 +117,11 @@ pub const LEVEL: &str = "level";
 pub const MSG: &str = "msg";
 
 impl Format {
+    /// The first-line pattern's source — for a template compiler's tests and a wizard's display.
+    pub fn pattern(&self) -> &str {
+        self.first_line.as_str()
+    }
+
     /// Whether `line` starts a record under this format — §6.4's rule.
     ///
     /// **The one-byte dispatch is `regex`'s own literal prefilter**: every pattern here is
@@ -291,6 +296,54 @@ macro_rules! fmt {
             titles: None,
         }
     };
+}
+
+/// What a compiled template needs to become a [`Format`] — `template.rs` fills one of these.
+pub struct Custom {
+    pub id: String,
+    pub name: String,
+    pub specificity: f32,
+    /// The `^`-anchored first-line pattern with named captures. Compiled here, and a pattern the
+    /// engine refuses is an error, not a panic — this one comes from a user's config.
+    pub pattern: String,
+    pub stamp: Stamp,
+    pub level: Level,
+    pub levels: Vec<String>,
+    pub continuation: Option<String>,
+    pub columns: Vec<String>,
+}
+
+/// A format built at run time — from a template (E11) or a directive — leaked once, for the same
+/// reason [`w3c`] gives.
+pub fn custom(spec: Custom) -> Result<&'static Format, String> {
+    let first_line = Regex::new(&spec.pattern).map_err(|e| e.to_string())?;
+    let continuation = match &spec.continuation {
+        Some(c) => Some(Regex::new(c).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let leak = |s: &str| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) };
+    let leak_all = |v: &[String]| -> &'static [&'static str] {
+        Box::leak(
+            v.iter()
+                .map(|s| leak(s))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    };
+    Ok(Box::leak(Box::new(Format {
+        id: leak(&spec.id),
+        name: leak(&spec.name),
+        specificity: spec.specificity,
+        first_line,
+        stamp: spec.stamp,
+        level: spec.level,
+        levels: leak_all(&spec.levels),
+        continuation,
+        columns: leak_all(&spec.columns),
+        samples: &[],
+        body_next_line: false,
+        titles: None,
+    })))
 }
 
 /// A format for one W3C Extended file, from its `#Fields:` directive — §6.3's short-circuit,

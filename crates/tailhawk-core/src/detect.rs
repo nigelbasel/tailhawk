@@ -145,13 +145,21 @@ pub fn head_lines<R: ChunkReader + ?Sized>(reader: &R, charset: Charset) -> Vec<
     lines
 }
 
-/// Stages 2–4 over a sample of lines.
+/// Stages 2–4 over a sample of lines, against the catalogue alone.
 pub fn detect(lines: &[String]) -> Detection {
+    detect_with(lines, &[])
+}
+
+/// Stages 2–4 over a sample of lines, with `extra` formats — templates compiled from a config
+/// beside the file (E11) — scored alongside the catalogue. They are candidates, not answers: a
+/// stale config still has to match the file to be accepted.
+pub fn detect_with(lines: &[String], extra: &[&'static Format]) -> Detection {
     let self_described = short_circuit(lines);
     let total_bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
 
     let mut candidates: Vec<Candidate> = catalogue()
         .iter()
+        .chain(extra.iter().copied())
         .filter_map(|format| score(format, lines, total_bytes))
         .collect();
     candidates.sort_by(|a, b| {

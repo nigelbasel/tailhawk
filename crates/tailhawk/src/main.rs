@@ -27,6 +27,7 @@ use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
 use tailhawk_core::sieve;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
+use tailhawk_core::template;
 use tailhawk_core::{
     background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, CONTINUATION_INK,
     CURRENT_MATCH_BG, CURRENT_MATCH_INK, MATCH_BG, RENDER_CAP_CELLS,
@@ -244,7 +245,7 @@ impl Document {
         // with its own encoding detection and index, and gives them one row space; a log with
         // nothing beside it comes back as a set of one, so there is no second path here.
         let set = LogSet::open(path).map_err(|e| format!("{name}: {e}"))?;
-        let (detection, layout) = detect_set(&set);
+        let (detection, layout) = detect_set(&set, Some(path));
 
         // **Only the name is fixed.** Everything else in the title -- the encoding, the membership,
         // the counts -- can change while the log is being followed, so `describe` formats them per
@@ -289,7 +290,7 @@ impl Document {
     fn from_pipe() -> std::result::Result<Self, String> {
         let pump = Pump::start().map_err(|e| format!("stdin: {e}"))?;
         let set = LogSet::open_single(pump.path()).map_err(|e| format!("stdin: {e}"))?;
-        let (detection, layout) = detect_set(&set);
+        let (detection, layout) = detect_set(&set, None);
         Ok(Self {
             view: View::new(1.0, 1.0),
             set,
@@ -1105,12 +1106,28 @@ impl Finder {
 
 /// §6.3's detection over the newest member's head. On the worker that opens the file, so the
 /// 150 ms open budget is not the window thread's problem; a set with no members detects nothing.
-fn detect_set(set: &LogSet) -> (Detection, Option<Layout>) {
+/// §6.5's config scan (E11) rides along: templates found in `appsettings*.json`, `nlog.config`
+/// or `log4net.config` beside `path` are compiled and scored with the catalogue. A path of `None`
+/// — a pipe — has nothing beside it.
+fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Option<Layout>) {
     let lines = match set.snapshot().last() {
         Some(newest) => detect::head_lines(&*newest.file, newest.charset),
         None => Vec::new(),
     };
-    let detection = detect::detect(&lines);
+    let templates: Vec<&'static tailhawk_core::format::Format> = path
+        .map(template::scan)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|found| {
+            let origin = found
+                .source
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            template::compile(found.language, &found.template, &origin).ok()
+        })
+        .collect();
+    let detection = detect::detect_with(&lines, &templates);
     let layout = detection
         .accepted
         .map(|format| Layout::from_sample(format, &lines));
@@ -3369,5 +3386,51 @@ mod tests {
             "the next line's text is the message: {row:?}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+    /// E11 end to end: an app's own `outputTemplate` beside its log is compiled and wins detection
+    /// over the catalogue — a shape no built-in knows becomes columns anyway.
+    #[test]
+    fn a_template_beside_the_log_is_compiled_and_detected() {
+        let dir = std::env::temp_dir().join("tailhawk-template-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("appsettings.json"),
+            r#"{"Serilog":{"WriteTo":[{"Name":"File","Args":{"path":"app.log",
+               "outputTemplate":"{Timestamp:HH:mm:ss.fff}|{Level:u}|{SourceContext}|{Message:lj}{NewLine}{Exception}"}}]}}"#,
+        )
+        .expect("config");
+        let log = dir.join("app.log");
+        std::fs::write(
+            &log,
+            "09:14:02.117|INFORMATION|Api.Controller|Started\n\
+             09:14:03.884|ERROR|Api.Dispatch|Failed to dispatch job 41982\n\
+             09:14:04.002|WARNING|Api.Sql|Retry 1/3\n",
+        )
+        .expect("log");
+        let mut doc = Document::open(&log).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        let accepted = doc.detection.accepted.expect("a format");
+        assert_eq!(
+            accepted.id, "template:appsettings.json",
+            "{:?}",
+            doc.detection.candidates
+        );
+        assert!(
+            doc.describe().contains("Serilog (appsettings.json)"),
+            "{}",
+            doc.describe()
+        );
+        assert_eq!(
+            doc.header_text()
+                .map(|h| h.trim_start().starts_with("timestamp")),
+            Some(true)
+        );
+        let row = doc.row_text(1).expect("row 1");
+        assert!(
+            row.contains("ERROR") && row.ends_with("Failed to dispatch job 41982"),
+            "{row:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
