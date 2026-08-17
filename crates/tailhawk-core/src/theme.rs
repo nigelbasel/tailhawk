@@ -382,7 +382,10 @@ mod tests {
             assert!(luminance(*c) > 0.4, "{c:?} is too dark for a black ground");
         }
         for label in light.labels {
-            assert!(luminance(label) > 0.7, "a light label tint keeps dark ink readable");
+            assert!(
+                luminance(label) > 0.7,
+                "a light label tint keeps dark ink readable"
+            );
         }
     }
 

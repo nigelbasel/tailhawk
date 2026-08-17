@@ -4,11 +4,10 @@
 use windows::core::{Result, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{BOOL, RECT};
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory2, IDWriteFontFace, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN,
-    DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_MEASURING_MODE_NATURAL,
-    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXTURE_CLEARTYPE_3x1,
+    DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory, IDWriteFactory2, IDWriteFontFace,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_DEFAULT,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
     DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE,
 };
 
@@ -35,8 +34,7 @@ impl Fonts {
     /// about atlas composition, and hand-picking one face per script keeps the glyph-run
     /// construction direct. Mixed-script fallback is a separate concern (`SPEC.md` §6).
     pub fn new() -> Result<Self> {
-        let factory: IDWriteFactory2 =
-            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let factory: IDWriteFactory2 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         let mut collection = None;
         unsafe { factory.GetSystemFontCollection(&mut collection, false)? };
         let collection = collection.expect("system font collection");
@@ -300,10 +298,7 @@ pub fn raster_colour(
     // Pass 2: composite in premultiplied space, back to front.
     let mut acc = vec![0.0f32; uw * uh * 4];
     for (b, cov, rgba) in &layers {
-        let (lw, lh) = (
-            (b.right - b.left) as usize,
-            (b.bottom - b.top) as usize,
-        );
+        let (lw, lh) = ((b.right - b.left) as usize, (b.bottom - b.top) as usize);
         let (ox, oy) = ((b.left - union.left) as usize, (b.top - union.top) as usize);
         for y in 0..lh {
             for x in 0..lw {

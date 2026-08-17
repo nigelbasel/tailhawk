@@ -451,7 +451,13 @@ impl Renderer {
         view: &view::View,
         source: &dyn rows::RowSource,
     ) -> Result<paint::Laid> {
-        self.paint_panes(&[(view, source, 0.0)], (view.gutter_px() + view.hgrid().viewport_px(), view.height_px()))
+        self.paint_panes(
+            &[(view, source, 0.0)],
+            (
+                view.gutter_px() + view.hgrid().viewport_px(),
+                view.height_px(),
+            ),
+        )
     }
 
     /// Several panes in one frame — a split view. Each `(view, source, y)` is laid out as if it

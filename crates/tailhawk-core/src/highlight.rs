@@ -759,7 +759,9 @@ mod tests {
             Some(RED),
             "a derived rule ignores its fixed foreground"
         );
-        assert!(crate::theme::theme().identifiers.contains(&a[0].fg.expect("coloured")));
+        assert!(crate::theme::theme()
+            .identifiers
+            .contains(&a[0].fg.expect("coloured")));
         assert_eq!(a[0].fg, Some(derived_colour("req-1a2b")));
     }
 

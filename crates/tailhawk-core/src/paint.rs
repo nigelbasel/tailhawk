@@ -66,9 +66,9 @@ use crate::highlight::Span;
 use crate::rows::RowSource;
 use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline, MODE_SOLID};
+use crate::theme::theme;
 use crate::view::View;
 use crate::Result;
-use crate::theme::theme;
 
 /// What colours one row, gathered because the three arrive together and mean nothing apart.
 ///
@@ -231,7 +231,13 @@ impl Painter {
                 if let Some((glyph, ink)) = source.row_glyph(row) {
                     let mut text = [0u8; 4];
                     self.spans = spans;
-                    let _ = self.lay_out_at(view, cell_w, y, glyph.encode_utf8(&mut text), Colours::plain(ink));
+                    let _ = self.lay_out_at(
+                        view,
+                        cell_w,
+                        y,
+                        glyph.encode_utf8(&mut text),
+                        Colours::plain(ink),
+                    );
                     spans = std::mem::take(&mut self.spans);
                 }
                 if let Some(n) = source.row_number(row) {

@@ -246,7 +246,11 @@ mod tests {
         p.field.set_text("tb");
         p.refresh();
         let labels: Vec<_> = p.rows().iter().map(|r| r.label.to_string()).collect();
-        assert_eq!(labels, ["Table of columns", "Toggle bookmark"], "t·a·b vs t·oggle·b");
+        assert_eq!(
+            labels,
+            ["Table of columns", "Toggle bookmark"],
+            "t·a·b vs t·oggle·b"
+        );
         p.field.set_text("tobo");
         p.refresh();
         let labels: Vec<_> = p.rows().iter().map(|r| r.label.to_string()).collect();

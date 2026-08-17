@@ -211,8 +211,8 @@ mod tests {
     fn excerpt(path: &Path, first_row: u64) -> Excerpt {
         let file = LogFile::open(path).expect("open");
         let end = file.len().expect("len");
-        let index = build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default())
-            .expect("index");
+        let index =
+            build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default()).expect("index");
         Excerpt {
             file: Arc::new(file),
             charset: Charset::UTF_8,
@@ -229,7 +229,10 @@ mod tests {
                     return (outcome, written);
                 }
             }
-            assert!(std::time::Instant::now() < deadline, "the export did not finish");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the export did not finish"
+            );
             std::thread::yield_now();
         }
     }
@@ -249,11 +252,22 @@ mod tests {
         assert_eq!(written, 1000);
         let got = std::fs::read_to_string(&out).expect("read");
         assert_eq!(got.lines().count(), 1000);
-        assert!(got.starts_with("line 0\r\nline 1\r\n"), "CRLF, decoded text");
+        assert!(
+            got.starts_with("line 0\r\nline 1\r\n"),
+            "CRLF, decoded text"
+        );
 
         let kept = vec![3, 4, 500, 999];
         let (outcome, written) = finish(
-            &start(vec![excerpt(&log, 0)], Keep::Rows(kept), 0, 1000, &out, false).expect("start"),
+            &start(
+                vec![excerpt(&log, 0)],
+                Keep::Rows(kept),
+                0,
+                1000,
+                &out,
+                false,
+            )
+            .expect("start"),
         );
         assert!(matches!(outcome, Outcome::Complete));
         assert_eq!(written, 4);
@@ -274,7 +288,10 @@ mod tests {
             )
             .expect("start"),
         );
-        assert_eq!(written, 2, "the survivor before the range is not written again");
+        assert_eq!(
+            written, 2,
+            "the survivor before the range is not written again"
+        );
         assert!(std::fs::read_to_string(&out)
             .expect("read")
             .ends_with("line 999\r\nline 991\r\nline 992\r\n"));
@@ -303,7 +320,10 @@ mod tests {
         );
         assert!(matches!(outcome, Outcome::Complete));
         assert_eq!(written, 3);
-        assert_eq!(std::fs::read_to_string(&out).expect("read"), "a1\r\nb0\r\nb1\r\n");
+        assert_eq!(
+            std::fs::read_to_string(&out).expect("read"),
+            "a1\r\nb0\r\nb1\r\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

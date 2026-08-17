@@ -9,9 +9,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS,
     DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
@@ -99,8 +97,7 @@ impl Gpu {
         // CreateDXGIFactory2 rather than adapter.GetParent so the factory is a 1.2+ interface
         // and CreateSwapChainForHwnd is available.
         let _ = adapter;
-        let factory: IDXGIFactory2 =
-            unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
+        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
 
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width.max(1),
@@ -187,7 +184,10 @@ impl Gpu {
             MiscFlags: 0,
         };
         let mut staging = None;
-        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut staging))? };
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut staging))?
+        };
         let staging = staging.expect("staging texture");
         unsafe { self.context.CopyResource(&staging, &back) };
 

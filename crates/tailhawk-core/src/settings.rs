@@ -211,17 +211,13 @@ impl Settings {
                             "chips" => f.chips = array(value),
                             "collapse" => f.collapse = value == "true",
                             "bookmarks" => {
-                                f.bookmarks = array(value)
-                                    .iter()
-                                    .filter_map(|v| v.parse().ok())
-                                    .collect()
+                                f.bookmarks =
+                                    array(value).iter().filter_map(|v| v.parse().ok()).collect()
                             }
                             "labels" => f.labels = array(value),
                             "columns" => {
-                                f.columns = array(value)
-                                    .iter()
-                                    .filter_map(|v| v.parse().ok())
-                                    .collect()
+                                f.columns =
+                                    array(value).iter().filter_map(|v| v.parse().ok()).collect()
                             }
                             _ => {}
                         }

@@ -59,7 +59,14 @@ pub fn compose(detail: &Detail<'_>, width: usize, pretty: bool, cells: &CellMode
         Some(pretty) => {
             let mut first = true;
             for line in pretty.lines() {
-                push_labelled(&mut out, if first { "Body" } else { "" }, line, indent, width, cells);
+                push_labelled(
+                    &mut out,
+                    if first { "Body" } else { "" },
+                    line,
+                    indent,
+                    width,
+                    cells,
+                );
                 first = false;
             }
         }
@@ -229,9 +236,16 @@ mod tests {
         assert!(lines.len() > 3, "wrapped");
         assert!(lines.iter().all(|l| cells.cell_count(l) <= 40), "{lines:?}");
         assert!(lines[1].starts_with("Body  "));
-        assert!(lines[2].starts_with("      x"), "hanging indent: {:?}", lines[2]);
+        assert!(
+            lines[2].starts_with("      x"),
+            "hanging indent: {:?}",
+            lines[2]
+        );
         let joined: String = lines[1..].iter().map(|l| l.trim_start()).collect();
-        assert_eq!(joined.trim_start_matches("Body").trim_start(), "x".repeat(100));
+        assert_eq!(
+            joined.trim_start_matches("Body").trim_start(),
+            "x".repeat(100)
+        );
     }
 
     #[test]
@@ -252,7 +266,11 @@ mod tests {
             "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2,\n    {\n      \"c\": \"x{y}\"\n    }\n  ],\n  \"d\": {},\n  \"e\": \"q\\\"z\"\n}"
         );
         assert_eq!(pretty_json("plain text"), None);
-        assert_eq!(pretty_json("  {\"unterminated\": [1, 2"), Some("{\n  \"unterminated\": [\n    1,\n    2".to_owned()), "as far as it goes");
+        assert_eq!(
+            pretty_json("  {\"unterminated\": [1, 2"),
+            Some("{\n  \"unterminated\": [\n    1,\n    2".to_owned()),
+            "as far as it goes"
+        );
     }
 
     #[test]

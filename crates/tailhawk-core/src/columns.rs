@@ -32,12 +32,26 @@ pub const MAX_CELLS: usize = 48;
 /// Cells between columns.
 pub const GAP: usize = 2;
 
+/// The natural column order, for a layout whose `order` is not usable; long enough for any format.
+const NATURAL: [usize; 32] = {
+    let mut a = [0usize; 32];
+    let mut i = 0;
+    while i < 32 {
+        a[i] = i;
+        i += 1;
+    }
+    a
+};
+
 /// Column widths for one format, measured on a sample.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     pub format: &'static Format,
     /// One per [`Format::columns`]; the last is 0, meaning "the rest of the row".
     pub widths: Vec<usize>,
+    /// The display order of the columns before the last — indices into `widths` — after the user
+    /// has dragged one; the message column stays last. `UI-DESIGN.md` §2.1's reorderable columns.
+    pub order: Vec<usize>,
 }
 
 impl Layout {
@@ -72,7 +86,12 @@ impl Layout {
         if let Some(last) = widths.last_mut() {
             *last = 0;
         }
-        Self { format, widths }
+        let order = (0..n.saturating_sub(1)).collect();
+        Self {
+            format,
+            widths,
+            order,
+        }
     }
 
     /// The header line: each column's name padded to its width, in the row's own cells, so it sits
@@ -80,25 +99,55 @@ impl Layout {
     pub fn header(&self) -> String {
         let mut text = String::new();
         let last = self.widths.len().saturating_sub(1);
-        for (i, name) in self.format.columns.iter().enumerate() {
-            let name = match self.format.titles {
-                Some(titles) => titles.get(i).copied().unwrap_or(name),
-                None => column_title(name),
-            };
-            if i == last {
-                text.push_str(name);
-                break;
-            }
+        let title = |i: usize| match self.format.titles {
+            Some(titles) => titles.get(i).copied().unwrap_or(self.format.columns[i]),
+            None => column_title(self.format.columns[i]),
+        };
+        for &i in self.shown_order() {
             if self.widths[i] == 0 {
                 continue;
             }
+            let name = title(i);
             let take = cut_to_cells(&CellModel::new(), name, self.widths[i]);
             text.push_str(take);
             for _ in CellModel::new().cell_count(take)..self.widths[i] + GAP {
                 text.push(' ');
             }
         }
+        if !self.format.columns.is_empty() {
+            text.push_str(title(last));
+        }
         text
+    }
+
+    /// The columns before the last, in display order — `order` when it names them all, the
+    /// natural order otherwise (a layout built by hand, or an order from an older settings file).
+    pub fn shown_order(&self) -> &[usize] {
+        let n = self.widths.len().saturating_sub(1);
+        if self.order.len() == n && (0..n).all(|i| self.order.contains(&i)) {
+            &self.order
+        } else {
+            &NATURAL[..n.min(NATURAL.len())]
+        }
+    }
+
+    /// Moves column `from` so it is drawn at display position `to` — a header drag. Reports a
+    /// change. The message column cannot move.
+    pub fn move_column(&mut self, from: usize, to: usize) -> bool {
+        let n = self.widths.len().saturating_sub(1);
+        if self.order.len() != n {
+            self.order = (0..n).collect();
+        }
+        let Some(at) = self.order.iter().position(|&c| c == from) else {
+            return false;
+        };
+        let to = to.min(n.saturating_sub(1));
+        if at == to {
+            return false;
+        }
+        let col = self.order.remove(at);
+        self.order.insert(to, col);
+        true
     }
 
     /// The cell at which the message column starts — where a continuation is indented to.
@@ -142,7 +191,14 @@ impl Layout {
         match self.format.fields(raw) {
             Some(fields) => {
                 let last = fields.len().saturating_sub(1);
-                for (i, field) in fields.iter().enumerate() {
+                let order: Vec<usize> = self
+                    .shown_order()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(last))
+                    .collect();
+                for i in order {
+                    let field = &fields[i];
                     if i != last && self.widths[i] == 0 {
                         continue;
                     }

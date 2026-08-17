@@ -344,13 +344,22 @@ name = \"not a rule\"
         let specs = parse(text);
         assert_eq!(specs.len(), 4);
         assert_eq!(specs[0].name, "errors");
-        assert_eq!(specs[0].bg, Some([64.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0]));
+        assert_eq!(
+            specs[0].bg,
+            Some([64.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0])
+        );
         assert!(specs[0].whole_line);
         assert_eq!(specs[1].name, "rule 2", "unnamed rules are numbered");
         assert_eq!(specs[1].pattern, "#hash inside", "a hash in quotes is text");
         assert_eq!(specs[1].fg, Some([1.0, 0.0, 0.0, 1.0]), "#rgb expands");
-        assert!(specs[2].compile().is_err(), "an unclosed group does not compile");
-        assert!(specs[3].compile().is_err(), "a rule with no colour does nothing");
+        assert!(
+            specs[2].compile().is_err(),
+            "an unclosed group does not compile"
+        );
+        assert!(
+            specs[3].compile().is_err(),
+            "a rule with no colour does nothing"
+        );
         assert!(specs[0].compile().is_ok());
     }
 
@@ -376,7 +385,11 @@ name = \"not a rule\"
         assert_eq!(tiers.len(), 2);
         let (rules, failed) = load(&tiers);
         let names: Vec<_> = rules.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["curated", "mine"], "exe-adjacent first, then personal");
+        assert_eq!(
+            names,
+            ["curated", "mine"],
+            "exe-adjacent first, then personal"
+        );
         assert_eq!(failed.len(), 1);
         assert!(failed[0].starts_with("bad:"), "{failed:?}");
         let (none, _) = load(&[dir.join("missing.toml")]);

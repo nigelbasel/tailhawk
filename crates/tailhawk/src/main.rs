@@ -18,13 +18,14 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use tailhawk_core::cell::CellModel;
 use tailhawk_core::columns::{Layout, Presentation};
 use tailhawk_core::detect::{self, Detection};
-use tailhawk_core::filter::{Chip, Chips, Polarity};
-use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::encoding::Charset;
 use tailhawk_core::export;
+use tailhawk_core::filter::{Chip, Chips, Polarity};
+use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::highlight::{Highlighter, Rule, Span};
 use tailhawk_core::paint::{Colours, Painter};
 use tailhawk_core::palette::{Choice, Entry, Palette};
@@ -35,21 +36,19 @@ use tailhawk_core::settings;
 use tailhawk_core::sieve;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::template;
-use tailhawk_core::widget::{Focus, Move, TextField};
 use tailhawk_core::theme::{self, theme, Theme};
+use tailhawk_core::widget::{Focus, Move, TextField};
 use tailhawk_core::{
     Position, Renderer, RowEnd, RowSource, Selection, SeverityBand, View, WindowHandle,
     RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use windows::Win32::Foundation::{
     GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, GetSysColor, InvalidateRect, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
 };
-use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -59,6 +58,7 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -73,27 +73,28 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
-    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G, VK_HOME,
-    VK_I, VK_K, VK_L,
-    VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
-    VK_V,
-    VK_W, VK_X, VK_Y, VK_Z,
+    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G,
+    VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z,
 };
-use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    AllowSetForegroundWindow, PostMessageW, SetClassLongPtrW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP,
-    SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO,
-    SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST,
-    SPI_GETWHEELSCROLLLINES,
-    ASFW_ANY, GCLP_HBRBACKGROUND, SWP_NOACTIVATE, SWP_NOZORDER, WM_APP, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_GETOBJECT, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_SYSKEYDOWN,
+    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClientRect, GetMessageW, GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetClassLongPtrW, SetForegroundWindow, SetTimer,
+    SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, ASFW_ANY,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, IDC_ARROW, MSG, SB_BOTTOM,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
+    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
+    SPI_GETHIGHCONTRAST, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
+    SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT,
+    WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_GETOBJECT, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL,
-    WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -262,7 +263,9 @@ impl RowSource for Document {
 
     fn row_mark(&self, row: u64) -> Option<[f32; 4]> {
         let file_row = self.filtering.file_row(row)?;
-        self.bookmarks.contains(&file_row).then_some(theme().bookmark_mark)
+        self.bookmarks
+            .contains(&file_row)
+            .then_some(theme().bookmark_mark)
     }
 
     fn row_glyph(&self, row: u64) -> Option<(char, [f32; 4])> {
@@ -320,9 +323,17 @@ impl RowSource for Document {
             let mut tx = cell_w * 0.5;
             for (i, label) in labels.iter().enumerate() {
                 let w = cells.cell_count(label) as f32 * cell_w;
-                let bg = if i == *active { theme().tab_active_bg } else { theme().tab_bg };
+                let bg = if i == *active {
+                    theme().tab_active_bg
+                } else {
+                    theme().tab_bg
+                };
                 painter.fill(tx - 2.0, 1.0, w + cell_w * 2.0 + 4.0, strip_h - 2.0, bg);
-                let ink = if i == *active { theme().ink } else { theme().header_ink };
+                let ink = if i == *active {
+                    theme().ink
+                } else {
+                    theme().header_ink
+                };
                 let _ = painter.lay_out_at(view, tx + cell_w, ty, label, Colours::plain(ink));
                 hits.push((tx..tx + w + cell_w * 2.0, Hit::Tab(i)));
                 tx += w + cell_w * 3.0;
@@ -384,7 +395,11 @@ impl RowSource for Document {
                 (_, false) => theme().field_bg,
             };
             painter.fill(x - 2.0, text_y - 2.0, w + close_w + 4.0, row_h + 4.0, bg);
-            let ink = if chip.enabled { theme().ink } else { theme().field_hint };
+            let ink = if chip.enabled {
+                theme().ink
+            } else {
+                theme().field_hint
+            };
             let _ = painter.lay_out_at(view, x, text_y, &label, Colours::plain(ink));
             let _ = painter.lay_out_at(
                 view,
@@ -435,7 +450,8 @@ impl RowSource for Document {
             let w = cells.cell_count(&text) as f32 * cell_w;
             let fx = width - w - cell_w;
             if fx > x + chip_w + cell_w {
-                let _ = painter.lay_out_at(view, fx, text_y, &text, Colours::plain(theme().header_ink));
+                let _ =
+                    painter.lay_out_at(view, fx, text_y, &text, Colours::plain(theme().header_ink));
             }
         }
 
@@ -478,7 +494,13 @@ impl RowSource for Document {
             let avail = ((width - cell_w) / cell_w).max(0.0) as usize;
             let shown = tailhawk_core::widget::fit_from_right(cells, &self.status, avail);
             let ty = fy + ((footer - row_h) / 2.0).floor();
-            let _ = painter.lay_out_at(view, cell_w * 0.5, ty, shown, Colours::plain(theme().header_ink));
+            let _ = painter.lay_out_at(
+                view,
+                cell_w * 0.5,
+                ty,
+                shown,
+                Colours::plain(theme().header_ink),
+            );
         }
 
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
@@ -515,10 +537,22 @@ impl RowSource for Document {
                 let key_cells = cells.cell_count(row.key);
                 let label_avail = (PALETTE_CELLS - 4).saturating_sub(key_cells + 2);
                 let label = tailhawk_core::widget::fit_from_right(cells, &row.label, label_avail);
-                let _ = painter.lay_out_at(view, inner_x + 2.0 * cell_w, y, label, Colours::plain(theme().ink));
+                let _ = painter.lay_out_at(
+                    view,
+                    inner_x + 2.0 * cell_w,
+                    y,
+                    label,
+                    Colours::plain(theme().ink),
+                );
                 if !row.key.is_empty() {
                     let kx = box_x + box_w - (key_cells as f32 + 1.0) * cell_w;
-                    let _ = painter.lay_out_at(view, kx, y, row.key, Colours::plain(theme().field_hint));
+                    let _ = painter.lay_out_at(
+                        view,
+                        kx,
+                        y,
+                        row.key,
+                        Colours::plain(theme().field_hint),
+                    );
                 }
                 hits.push((y..y + row_h, i));
                 y += row_h;
@@ -696,7 +730,8 @@ impl Document {
         self.view.set_chrome_px(strip + Chrome::height(row_h));
         // V10: the detail pane sits above the status bar, a third of the height at most, when open.
         let pane_rows = if self.detail.open {
-            let grid_rows = ((size.1 as f32 - strip - Chrome::height(row_h)) / row_h.max(1.0)) as u64;
+            let grid_rows =
+                ((size.1 as f32 - strip - Chrome::height(row_h)) / row_h.max(1.0)) as u64;
             (grid_rows / 3).clamp(4, DETAIL_MAX_ROWS) as usize
         } else {
             0
@@ -855,7 +890,9 @@ impl Document {
         let mut tail: Vec<&str> = Vec::new();
         let mut next = start + 1;
         while format.is_some() && next < total && next - start < DETAIL_LOOK_AHEAD {
-            let Some(line) = self.set.row_text(next) else { break };
+            let Some(line) = self.set.row_text(next) else {
+                break;
+            };
             if format.is_some_and(|f| f.is_first_line(line)) {
                 break;
             }
@@ -1033,7 +1070,9 @@ impl Document {
                 (Some(e), _, _) => format!("⚠ export failed: {e} — "),
                 (None, true, _) => format!("⇥ tee → {} ({} lines) — ", t.name(), t.written),
                 (None, false, true) => format!("✓ exported {} lines → {} — ", t.written, t.name()),
-                (None, false, false) => format!("⇥ exporting → {} ({} lines) — ", t.name(), t.written),
+                (None, false, false) => {
+                    format!("⇥ exporting → {} ({} lines) — ", t.name(), t.written)
+                }
             },
         };
         let format = match self.detection.describe() {
@@ -1687,7 +1726,14 @@ impl Document {
             export::Keep::All
         };
         let append = tee.covered > 0;
-        match export::start(self.set.snapshot(), keep, tee.covered, total, &tee.path, append) {
+        match export::start(
+            self.set.snapshot(),
+            keep,
+            tee.covered,
+            total,
+            &tee.path,
+            append,
+        ) {
             Ok(running) => tee.running = Some((running, total)),
             Err(e) => {
                 tee.error = Some(e.to_string());
@@ -1708,7 +1754,11 @@ impl Document {
         let format = self.detection.accepted;
         let mut out = String::new();
         for row in sel.first_row()..=sel.last_row() {
-            let Some(raw) = self.filtering.file_row(row).and_then(|f| self.set.row_text(f)) else {
+            let Some(raw) = self
+                .filtering
+                .file_row(row)
+                .and_then(|f| self.set.row_text(f))
+            else {
                 continue;
             };
             match format.and_then(|f| f.fields(raw).map(|r| (f, r))) {
@@ -1764,7 +1814,8 @@ impl Document {
             return None;
         }
         let cell_w = self.view.hgrid().cell_width().max(1.0);
-        let cell = ((x - self.view.gutter_px()) / cell_w) + self.view.hgrid().visible_columns().start as f32;
+        let cell = ((x - self.view.gutter_px()) / cell_w)
+            + self.view.hgrid().visible_columns().start as f32;
         Some(
             self.column_boundaries()
                 .into_iter()
@@ -1793,7 +1844,9 @@ impl Document {
             .take_while(|(c, _)| *c < i)
             .last()
             .map_or(0, |(_, at)| at + tailhawk_core::columns::GAP);
-        let width = cell.saturating_sub(start).min(tailhawk_core::columns::MAX_CELLS * 4);
+        let width = cell
+            .saturating_sub(start)
+            .min(tailhawk_core::columns::MAX_CELLS * 4);
         self.set_column_width(i, width)
     }
 
@@ -2474,27 +2527,75 @@ impl Command {
         (Command::FilterInclude, "Add include filter", "Ctrl+L"),
         (Command::FilterExclude, "Add exclude filter", "Ctrl+Shift+L"),
         (Command::ClearFilter, "Clear filters", "Esc"),
-        (Command::ToggleCollapse, "Toggle records only (collapse continuations)", "Ctrl+E"),
-        (Command::RevealInvisibles, "Toggle reveal invisibles", "Ctrl+I"),
+        (
+            Command::ToggleCollapse,
+            "Toggle records only (collapse continuations)",
+            "Ctrl+E",
+        ),
+        (
+            Command::RevealInvisibles,
+            "Toggle reveal invisibles",
+            "Ctrl+I",
+        ),
         (Command::ToggleBookmark, "Toggle bookmark", "Ctrl+D"),
         (Command::NextBookmark, "Next bookmark", "F2"),
         (Command::PreviousBookmark, "Previous bookmark", "Shift+F2"),
-        (Command::Label(1), "Colour-label lines containing the selection", "Ctrl+Shift+1…9"),
+        (
+            Command::Label(1),
+            "Colour-label lines containing the selection",
+            "Ctrl+Shift+1…9",
+        ),
         (Command::ClearLabels, "Clear colour labels", "Ctrl+Shift+0"),
-        (Command::Back, "Back to the previous view (filter and position)", "Alt+←"),
+        (
+            Command::Back,
+            "Back to the previous view (filter and position)",
+            "Alt+←",
+        ),
         (Command::Forward, "Forward to the next view", "Alt+→"),
-        (Command::ToggleDetail, "Toggle the record detail pane", "Ctrl+Enter"),
-        (Command::TogglePretty, "Detail pane: pretty-print a JSON body", ""),
+        (
+            Command::ToggleDetail,
+            "Toggle the record detail pane",
+            "Ctrl+Enter",
+        ),
+        (
+            Command::TogglePretty,
+            "Detail pane: pretty-print a JSON body",
+            "",
+        ),
         (Command::Export, "Export the visible rows to a file…", ""),
-        (Command::Tee, "Tee: keep writing the visible rows to a file as they arrive…", ""),
+        (
+            Command::Tee,
+            "Tee: keep writing the visible rows to a file as they arrive…",
+            "",
+        ),
         (Command::StopTee, "Stop the tee", ""),
-        (Command::CopyTsv, "Copy selection as TSV with columns", "Ctrl+Shift+C"),
+        (
+            Command::CopyTsv,
+            "Copy selection as TSV with columns",
+            "Ctrl+Shift+C",
+        ),
         (Command::Split, "Split the pane / unsplit", "Ctrl+\\"),
         (Command::FocusOtherPane, "Focus the other pane", "F6"),
-        (Command::ToggleTheme, "Switch between the dark and light themes", ""),
-        (Command::EditLastChip, "Edit the last filter chip (Ctrl+click a chip edits it)", "Ctrl+Shift+E"),
-        (Command::ResetColumns, "Reset column widths (drag a header boundary to resize; to 0 hides)", ""),
-        (Command::OpenRules, "Edit highlight rules (tailhawk.rules.toml)…", ""),
+        (
+            Command::ToggleTheme,
+            "Switch between the dark and light themes",
+            "",
+        ),
+        (
+            Command::EditLastChip,
+            "Edit the last filter chip (Ctrl+click a chip edits it)",
+            "Ctrl+Shift+E",
+        ),
+        (
+            Command::ResetColumns,
+            "Reset column widths (drag a header boundary to resize; to 0 hides)",
+            "",
+        ),
+        (
+            Command::OpenRules,
+            "Edit highlight rules (tailhawk.rules.toml)…",
+            "",
+        ),
         (Command::ReloadRules, "Reload highlight rules", ""),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
@@ -2629,7 +2730,9 @@ impl Tabs {
 
     /// The shown tab's panes, top to bottom.
     fn panes(&self) -> &[Document] {
-        self.tabs.get(self.active).map_or(&[], |t| t.panes.as_slice())
+        self.tabs
+            .get(self.active)
+            .map_or(&[], |t| t.panes.as_slice())
     }
 
     fn panes_mut(&mut self) -> &mut [Document] {
@@ -3159,9 +3262,13 @@ impl Shell {
         } else {
             Some(format!("⚠ rules: {}", self.rules_failed.join("; ")))
         };
-        for part in [self.driver.as_deref(), self.file.as_deref(), rules_note.as_deref()]
-            .into_iter()
-            .flatten()
+        for part in [
+            self.driver.as_deref(),
+            self.file.as_deref(),
+            rules_note.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if !text.is_empty() {
                 text.push_str(" — ");
@@ -3690,7 +3797,11 @@ impl Shell {
                 target
             }
         };
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         unsafe {
             ShellExecuteW(
                 None,
@@ -3806,10 +3917,7 @@ impl Shell {
         if panes.is_empty() {
             return None;
         }
-        let hit = panes
-            .iter()
-            .rposition(|d| y >= d.pane_top)
-            .unwrap_or(0);
+        let hit = panes.iter().rposition(|d| y >= d.pane_top).unwrap_or(0);
         Some((hit, panes[hit].pane_top))
     }
 
@@ -4463,7 +4571,9 @@ impl Welcome {
             lines.push(String::new());
             opens.push(None);
         }
-        lines.push(centre("Tailhawk never phones home: no telemetry, no update ping, no fetch of any kind."));
+        lines.push(centre(
+            "Tailhawk never phones home: no telemetry, no update ping, no fetch of any kind.",
+        ));
         opens.push(None);
         let mut view = View::new(cell_w, row_h);
         view.set_metrics(cell_w, row_h);
@@ -4512,17 +4622,16 @@ mod uia {
         IRawElementProviderSimple_Impl, ISelectionItemProvider, ISelectionItemProvider_Impl,
         IToggleProvider, IToggleProvider_Impl, IValueProvider, IValueProvider_Impl,
         NavigateDirection, NavigateDirection_FirstChild, NavigateDirection_LastChild,
-        NavigateDirection_NextSibling, NavigateDirection_Parent,
-        NavigateDirection_PreviousSibling, ProviderOptions, ProviderOptions_ServerSideProvider,
-        ProviderOptions_UseComThreading, ToggleState, ToggleState_Off, ToggleState_On,
-        UiaHostProviderFromHwnd, UiaRect, UiaReturnRawElementProvider, UiaRootObjectId,
-        UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId,
-        UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_HasKeyboardFocusPropertyId,
-        UIA_InvokePatternId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
-        UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId,
-        UIA_PaneControlTypeId, UIA_SelectionItemPatternId, UIA_StatusBarControlTypeId,
-        UIA_TabItemControlTypeId, UIA_TogglePatternId, UIA_ValuePatternId,
-        UIA_ValueValuePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+        NavigateDirection_NextSibling, NavigateDirection_Parent, NavigateDirection_PreviousSibling,
+        ProviderOptions, ProviderOptions_ServerSideProvider, ProviderOptions_UseComThreading,
+        ToggleState, ToggleState_Off, ToggleState_On, UIA_AutomationIdPropertyId,
+        UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
+        UIA_EditControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId,
+        UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId,
+        UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PaneControlTypeId,
+        UIA_SelectionItemPatternId, UIA_StatusBarControlTypeId, UIA_TabItemControlTypeId,
+        UIA_TogglePatternId, UIA_ValuePatternId, UIA_ValueValuePropertyId, UiaHostProviderFromHwnd,
+        UiaRect, UiaReturnRawElementProvider, UiaRootObjectId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
     };
 
     /// `UiaAppendRuntimeId`: the first element of a fragment's runtime id, per the UIA docs.
@@ -4576,7 +4685,11 @@ mod uia {
     /// Reads the shell without ever waiting for it: a UIA call that lands while the window is
     /// inside its own handler answers "nothing" rather than deadlocking or panicking.
     fn with_shell<T>(f: impl FnOnce(&Shell) -> Option<T>) -> Option<T> {
-        STATE.with(|s| s.try_borrow().ok().and_then(|state| state.as_ref().and_then(f)))
+        STATE.with(|s| {
+            s.try_borrow()
+                .ok()
+                .and_then(|state| state.as_ref().and_then(f))
+        })
     }
 
     fn with_shell_mut<T>(f: impl FnOnce(&mut Shell) -> Option<T>) -> Option<T> {
@@ -4813,9 +4926,7 @@ mod uia {
                 p if p == UIA_HasKeyboardFocusPropertyId => VARIANT::from(self.has_focus()),
                 p if p == UIA_IsEnabledPropertyId => VARIANT::from(true),
                 p if p == UIA_IsControlElementPropertyId => VARIANT::from(true),
-                p if p == UIA_IsContentElementPropertyId => {
-                    VARIANT::from(self.kind != Kind::Root)
-                }
+                p if p == UIA_IsContentElementPropertyId => VARIANT::from(self.kind != Kind::Root),
                 p if p == UIA_ValueValuePropertyId => match self.kind {
                     Kind::Status | Kind::Palette | Kind::Find | Kind::NewChip => {
                         VARIANT::from(self.Value()?.to_string().as_str())
@@ -4840,12 +4951,14 @@ mod uia {
         fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
             let kids = self.siblings();
             match (self.kind, direction) {
-                (Kind::Root, d) if d == NavigateDirection_FirstChild => {
-                    kids.first().map(|k| self.make(*k)).ok_or_else(|| Error::from_hresult(HRESULT(0)))
-                }
-                (Kind::Root, d) if d == NavigateDirection_LastChild => {
-                    kids.last().map(|k| self.make(*k)).ok_or_else(|| Error::from_hresult(HRESULT(0)))
-                }
+                (Kind::Root, d) if d == NavigateDirection_FirstChild => kids
+                    .first()
+                    .map(|k| self.make(*k))
+                    .ok_or_else(|| Error::from_hresult(HRESULT(0))),
+                (Kind::Root, d) if d == NavigateDirection_LastChild => kids
+                    .last()
+                    .map(|k| self.make(*k))
+                    .ok_or_else(|| Error::from_hresult(HRESULT(0))),
                 (Kind::Root, _) => none(),
                 (kind, d) if d == NavigateDirection_Parent => {
                     let _ = kind;
@@ -4922,7 +5035,10 @@ mod uia {
             unsafe {
                 let _ = ClientToScreen(self.hwnd, &mut origin);
             }
-            let (cx, cy) = ((x - f64::from(origin.x)) as f32, (y - f64::from(origin.y)) as f32);
+            let (cx, cy) = (
+                (x - f64::from(origin.x)) as f32,
+                (y - f64::from(origin.y)) as f32,
+            );
             for kind in self.siblings() {
                 let child = Element {
                     hwnd: self.hwnd,
@@ -5150,7 +5266,8 @@ mod single {
         match unsafe { CreateMutexW(None, false, MUTEX) } {
             Ok(_handle) => {
                 // Held for the life of the process: the handle is deliberately leaked.
-                let already = windows::core::Error::from_win32().code() == ERROR_ALREADY_EXISTS.to_hresult();
+                let already =
+                    windows::core::Error::from_win32().code() == ERROR_ALREADY_EXISTS.to_hresult();
                 !already
             }
             Err(_) => true,
@@ -5213,7 +5330,8 @@ mod single {
                         inbox.extend(paths);
                     }
                     unsafe {
-                        let _ = PostMessageW(HWND(hwnd as *mut _), WM_HANDED_OFF, WPARAM(0), LPARAM(0));
+                        let _ =
+                            PostMessageW(HWND(hwnd as *mut _), WM_HANDED_OFF, WPARAM(0), LPARAM(0));
                     }
                 }
             })
@@ -5235,7 +5353,9 @@ mod single {
         for _ in 0..count.min(1024) {
             let Some(len) = u32_at(&mut at) else { break };
             let end = at + (len as usize) * 2;
-            let Some(slice) = bytes.get(at..end) else { break };
+            let Some(slice) = bytes.get(at..end) else {
+                break;
+            };
             let units: Vec<u16> = slice
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -5252,7 +5372,10 @@ mod single {
 
         #[test]
         fn the_wire_format_round_trips_paths() {
-            let paths = vec![PathBuf::from(r"C:\logs\app.log"), PathBuf::from(r"D:\ü\日本.txt")];
+            let paths = vec![
+                PathBuf::from(r"C:\logs\app.log"),
+                PathBuf::from(r"D:\ü\日本.txt"),
+            ];
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(paths.len() as u32).to_le_bytes());
             for path in &paths {
@@ -5263,7 +5386,10 @@ mod single {
                 }
             }
             assert_eq!(decode(&bytes), paths);
-            assert!(decode(&bytes[..7]).is_empty(), "a truncated message yields nothing");
+            assert!(
+                decode(&bytes[..7]).is_empty(),
+                "a truncated message yields nothing"
+            );
             assert_eq!(decode(&[]).len(), 0);
         }
     }
@@ -5746,7 +5872,14 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if key == VK_LEFT.0 || key == VK_RIGHT.0 {
                 let moved = STATE.with(|s| {
                     s.borrow_mut().as_mut().is_some_and(|shell| {
-                        shell.run(hwnd, if key == VK_LEFT.0 { Command::Back } else { Command::Forward })
+                        shell.run(
+                            hwnd,
+                            if key == VK_LEFT.0 {
+                                Command::Back
+                            } else {
+                                Command::Forward
+                            },
+                        )
                     })
                 });
                 if moved {
@@ -5932,10 +6065,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         shell.document.focus_pane(pane);
                     }
                 }
-                let y = y - shell
-                    .document
-                    .as_ref()
-                    .map_or(0.0, |d| d.pane_top);
+                let y = y - shell.document.as_ref().map_or(0.0, |d| d.pane_top);
                 // No document: the welcome surface — a click on a recent file opens it.
                 if shell.document.panes().is_empty() {
                     if msg == WM_LBUTTONDOWN {
@@ -5977,7 +6107,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             false
                         }
                         (WM_LBUTTONDBLCLK, Some(Some(col))) => {
-                            let width = doc.column_defaults.as_ref().and_then(|d| d.get(col).copied());
+                            let width = doc
+                                .column_defaults
+                                .as_ref()
+                                .and_then(|d| d.get(col).copied());
                             width.is_some_and(|w| doc.set_column_width(col, w))
                         }
                         (WM_MOUSEMOVE, _) if resizing && held => doc.resize_to(x),
@@ -6947,7 +7080,12 @@ mod tests {
         assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
         assert_eq!(
             inks[1],
-            (e, e + 5, Some(theme().current_match_ink), Some(theme().current_match_bg))
+            (
+                e,
+                e + 5,
+                Some(theme().current_match_ink),
+                Some(theme().current_match_bg)
+            )
         );
         assert!(
             inks.iter()
@@ -6996,7 +7134,11 @@ mod tests {
         doc.lay_out((8.0, 10.0), (800, 200));
         assert_eq!(doc.row_number(0), Some(1));
         assert_eq!(doc.row_number(119), Some(120));
-        assert_eq!(doc.view.gutter_px(), (3.0 + 3.0) * 8.0, "three digits, a mark, a glyph, a gap");
+        assert_eq!(
+            doc.view.gutter_px(),
+            (3.0 + 3.0) * 8.0,
+            "three digits, a mark, a glyph, a gap"
+        );
 
         // No caret: the top row is current. The file opened at its tail; go to the top first.
         doc.view.grid_mut().scroll_to_row(0);
@@ -7009,7 +7151,10 @@ mod tests {
         assert!(doc.toggle_bookmark());
         doc.selection = Some(Selection::at(Position::new(30, 0)));
         assert!(doc.toggle_bookmark());
-        assert_eq!(doc.bookmarks.iter().copied().collect::<Vec<_>>(), [0, 30, 75]);
+        assert_eq!(
+            doc.bookmarks.iter().copied().collect::<Vec<_>>(),
+            [0, 30, 75]
+        );
 
         // Keep only the rows whose number contains a 7: 7, 17, 27, ..., 70–79, 87, 97, 107, 117.
         filter_for(&mut doc, "7", Polarity::Include);
@@ -7017,23 +7162,42 @@ mod tests {
         assert!(doc.view_rows() < 120);
         assert_eq!(doc.row_number(0), Some(8), "view row 0 is file line 8");
         assert!(doc.bookmarks.contains(&30), "hidden, but not lost");
-        assert_eq!(doc.view.gutter_px(), (3.0 + 3.0) * 8.0, "sized from the file");
+        assert_eq!(
+            doc.view.gutter_px(),
+            (3.0 + 3.0) * 8.0,
+            "sized from the file"
+        );
 
         // Stepping: from the top (file 7) forward lands on 30's survivor slot... which is hidden,
         // so `show_row` shows the next survivor; the caret goes to that view row.
         doc.selection = None;
         assert!(doc.bookmark_step(true));
         let caret = doc.selection.expect("the step placed a caret").focus().row;
-        assert_eq!(doc.filtering.file_row(caret), Some(37), "30 is hidden; its slot is 37");
+        assert_eq!(
+            doc.filtering.file_row(caret),
+            Some(37),
+            "30 is hidden; its slot is 37"
+        );
         assert!(doc.bookmark_step(true));
         let caret = doc.selection.expect("caret").focus().row;
         assert_eq!(doc.filtering.file_row(caret), Some(75));
         assert!(doc.bookmark_step(true), "wraps");
         let caret = doc.selection.expect("caret").focus().row;
-        assert_eq!(doc.filtering.file_row(caret), Some(7), "0 is hidden; its slot is 7");
-        assert!(doc.bookmark_step(false), "backwards: 0 is before 7, but shows at 7 — skipped");
+        assert_eq!(
+            doc.filtering.file_row(caret),
+            Some(7),
+            "0 is hidden; its slot is 7"
+        );
+        assert!(
+            doc.bookmark_step(false),
+            "backwards: 0 is before 7, but shows at 7 — skipped"
+        );
         let caret = doc.selection.expect("caret").focus().row;
-        assert_eq!(doc.filtering.file_row(caret), Some(75), "wrapped to the last");
+        assert_eq!(
+            doc.filtering.file_row(caret),
+            Some(75),
+            "wrapped to the last"
+        );
 
         // Toggling on the caret's row under the filter removes the file-row bookmark.
         assert!(doc.toggle_bookmark());
@@ -7053,25 +7217,49 @@ mod tests {
         let caret = doc.selection.expect("a caret").focus().row;
         assert_eq!(caret, 249, "line 250 is row 249");
         let first = doc.view.grid().scroll().row;
-        assert!(first <= 249 && 249 < first + doc.view.grid().page_rows(), "on screen");
+        assert!(
+            first <= 249 && 249 < first + doc.view.grid().page_rows(),
+            "on screen"
+        );
         doc.go_to_line(0);
-        assert_eq!(doc.selection.expect("caret").focus().row, 0, "0 clamps to the first line");
+        assert_eq!(
+            doc.selection.expect("caret").focus().row,
+            0,
+            "0 clamps to the first line"
+        );
         doc.go_to_line(9_999);
-        assert_eq!(doc.selection.expect("caret").focus().row, 499, "past the end clamps");
+        assert_eq!(
+            doc.selection.expect("caret").focus().row,
+            499,
+            "past the end clamps"
+        );
 
         filter_for(&mut doc, "7", Polarity::Include);
         doc.lay_out((8.0, 10.0), (800, 200));
         doc.go_to_line(1);
         let caret = doc.selection.expect("caret").focus().row;
-        assert_eq!(doc.filtering.file_row(caret), Some(7), "line 1 is hidden; its slot is line 8");
+        assert_eq!(
+            doc.filtering.file_row(caret),
+            Some(7),
+            "line 1 is hidden; its slot is line 8"
+        );
 
-        assert_eq!(Command::from_choice(Choice::GoToLine(12)), Some(Command::GoToLine(12)));
-        assert_eq!(Command::from_choice(Choice::Command(0)), Some(Command::OpenFile));
+        assert_eq!(
+            Command::from_choice(Choice::GoToLine(12)),
+            Some(Command::GoToLine(12))
+        );
+        assert_eq!(
+            Command::from_choice(Choice::Command(0)),
+            Some(Command::OpenFile)
+        );
         assert_eq!(Command::from_choice(Choice::Command(999)), None);
         let entries = Command::entries();
         assert_eq!(entries.len(), Command::LISTED.len());
         assert!(entries.iter().all(|e| !e.label.is_empty()));
-        assert!(entries.iter().filter(|e| e.key.is_empty()).count() < entries.len() / 3, "palette-only commands are the exception");
+        assert!(
+            entries.iter().filter(|e| e.key.is_empty()).count() < entries.len() / 3,
+            "palette-only commands are the exception"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -7091,10 +7279,16 @@ mod tests {
         doc.lay_out((8.0, 10.0), (800, 200));
         let mut spans = Vec::new();
         doc.row_spans(0, &mut spans);
-        assert!(spans.iter().all(|s| s.bg != Some(theme().labels[1])), "no label yet");
+        assert!(
+            spans.iter().all(|s| s.bg != Some(theme().labels[1])),
+            "no label yet"
+        );
 
         // Select `[a.b]` on the first row — cells 29..34 — and label it 2.
-        doc.selection = Some(Selection::stream(Position::new(0, 29), Position::new(0, 34)));
+        doc.selection = Some(Selection::stream(
+            Position::new(0, 29),
+            Position::new(0, 34),
+        ));
         assert_eq!(doc.copy_text().as_deref(), Some("[a.b]"));
         assert!(doc.toggle_label(2));
         assert_eq!(doc.labels, [(2, "[a.b]".to_owned())]);
@@ -7106,10 +7300,17 @@ mod tests {
                 .filter(|s| s.bg == Some(theme().labels[1]))
                 .map(|s| s.end - s.start)
                 .sum();
-            assert_eq!(labelled, line.len(), "row {row}: the whole line carries the label");
+            assert_eq!(
+                labelled,
+                line.len(),
+                "row {row}: the whole line carries the label"
+            );
         }
         doc.row_spans(1, &mut spans);
-        assert!(spans.iter().all(|s| s.bg != Some(theme().labels[1])), "the plain line does not");
+        assert!(
+            spans.iter().all(|s| s.bg != Some(theme().labels[1])),
+            "the plain line does not"
+        );
 
         // A second label on other text stacks; the first toggles off on its own.
         assert!(doc.label(5, "plain"));
@@ -7173,7 +7374,10 @@ mod tests {
 
         assert!(doc.history_step(true));
         doc.go_to_line(5);
-        assert!(!doc.history_step(false), "a new change forgot the forward states");
+        assert!(
+            !doc.history_step(false),
+            "a new change forgot the forward states"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -7200,14 +7404,33 @@ mod tests {
         doc.lay_out((8.0, 10.0), (800, 300));
         let lines = &doc.detail.lines;
         assert_eq!(lines[0], "Record 2");
-        assert!(lines[1].starts_with("timestamp  2026-08-17 09:14:04.120 +01:00"), "{lines:?}");
+        assert!(
+            lines[1].starts_with("timestamp  2026-08-17 09:14:04.120 +01:00"),
+            "{lines:?}"
+        );
         assert!(lines[2].starts_with("level      ERR"), "{lines:?}");
         assert!(lines[3].starts_with('─'));
-        assert!(lines[4].starts_with("Body       Zenith.Dispatcher {\"JobId\""), "{lines:?}");
-        assert!(lines[5].contains("System.InvalidOperationException"), "{lines:?}");
-        assert!(lines[6].contains("at Zenith.Dispatcher.Dispatch"), "{lines:?}");
-        assert_eq!(lines.len(), 7, "the next record is not part of this one: {lines:?}");
-        assert!(doc.view.footer_px() > Chrome::strip_height(10.0), "the pane took its band");
+        assert!(
+            lines[4].starts_with("Body       Zenith.Dispatcher {\"JobId\""),
+            "{lines:?}"
+        );
+        assert!(
+            lines[5].contains("System.InvalidOperationException"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[6].contains("at Zenith.Dispatcher.Dispatch"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            7,
+            "the next record is not part of this one: {lines:?}"
+        );
+        assert!(
+            doc.view.footer_px() > Chrome::strip_height(10.0),
+            "the pane took its band"
+        );
 
         // The last record, on its own row: no tail.
         doc.selection = Some(Selection::at(Position::new(4, 0)));
@@ -7261,7 +7484,11 @@ mod tests {
         let tee = doc.tee.as_ref().expect("done, shown once");
         assert!(tee.done && tee.error.is_none(), "{:?}", tee.error);
         assert_eq!(tee.written, 1);
-        assert!(doc.describe().contains("✓ exported 1 lines"), "{}", doc.describe());
+        assert!(
+            doc.describe().contains("✓ exported 1 lines"),
+            "{}",
+            doc.describe()
+        );
         assert_eq!(std::fs::read_to_string(&out).expect("read"), "ERROR b\r\n");
         doc.poll_tee();
         assert!(doc.tee.is_none(), "let go on the next tick");
@@ -7269,18 +7496,25 @@ mod tests {
         // A live tee: the current view first, then the growth as the filter judges it.
         doc.start_export(out.clone(), true);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while doc.tee.as_ref().is_some_and(|t| t.covered < 3) && std::time::Instant::now() < deadline {
+        while doc.tee.as_ref().is_some_and(|t| t.covered < 3)
+            && std::time::Instant::now() < deadline
+        {
             doc.poll_tee();
             std::thread::yield_now();
         }
         assert_eq!(doc.tee.as_ref().map(|t| t.written), Some(1));
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).expect("append");
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
             writeln!(f, "ERROR d\nINFO e\nERROR f").expect("write");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while doc.tee.as_ref().is_some_and(|t| t.written < 3) && std::time::Instant::now() < deadline {
+        while doc.tee.as_ref().is_some_and(|t| t.written < 3)
+            && std::time::Instant::now() < deadline
+        {
             doc.poll_follow();
             doc.poll_filter();
             doc.poll_tee();
@@ -7289,7 +7523,11 @@ mod tests {
         let tee = doc.tee.as_ref().expect("still teeing");
         assert_eq!(tee.written, 3, "{:?}", tee.error);
         assert_eq!(tee.covered, 6);
-        assert!(doc.describe().contains("⇥ tee → out.txt (3 lines)"), "{}", doc.describe());
+        assert!(
+            doc.describe().contains("⇥ tee → out.txt (3 lines)"),
+            "{}",
+            doc.describe()
+        );
         assert_eq!(
             std::fs::read_to_string(&out).expect("read"),
             "ERROR b\r\nERROR d\r\nERROR f\r\n"
@@ -7327,7 +7565,10 @@ mod tests {
         filter_for(&mut doc, "\"line 2\"", Polarity::Exclude);
         assert_eq!(doc.filtering.chips.chips[1].source, "\"line 2\"");
         assert_eq!(doc.filtering.chips.chips[1].polarity, Polarity::Exclude);
-        assert!(doc.history_step(true), "the edit is a view change: back restores both chips");
+        assert!(
+            doc.history_step(true),
+            "the edit is a view change: back restores both chips"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -7349,7 +7590,11 @@ mod tests {
         let defaults = layout.widths.clone();
         assert!(defaults.len() >= 3);
         let bounds = doc.column_boundaries();
-        assert_eq!(bounds.len(), defaults.len() - 1, "one boundary per column but the last");
+        assert_eq!(
+            bounds.len(),
+            defaults.len() - 1,
+            "one boundary per column but the last"
+        );
         assert_eq!(bounds[0], (0, defaults[0]));
         assert_eq!(bounds[1].1, defaults[0] + GAP + defaults[1]);
 
@@ -7358,8 +7603,16 @@ mod tests {
         let header_y = doc.view.chrome_px() + 1.0;
         let x0 = gutter + defaults[0] as f32 * 8.0;
         assert_eq!(doc.header_hit(x0, header_y), Some(Some(0)));
-        assert_eq!(doc.header_hit(x0 + 40.0, header_y), Some(None), "the band, no boundary");
-        assert_eq!(doc.header_hit(x0, header_y + 200.0), None, "the grid, not the header");
+        assert_eq!(
+            doc.header_hit(x0 + 40.0, header_y),
+            Some(None),
+            "the band, no boundary"
+        );
+        assert_eq!(
+            doc.header_hit(x0, header_y + 200.0),
+            None,
+            "the grid, not the header"
+        );
 
         // Drag boundary 0 left by five cells.
         doc.begin_resize(0);
@@ -7368,17 +7621,27 @@ mod tests {
         assert_eq!(doc.layout.as_ref().unwrap().widths[0], defaults[0] - 5);
         let header = doc.header.clone().unwrap();
         assert!(header.starts_with("timestamp"));
-        assert!(header.len() < layout.header().len(), "the header shrank with it");
+        assert!(
+            header.len() < layout.header().len(),
+            "the header shrank with it"
+        );
 
         // To zero: hidden, and the boundary list closes up.
         assert!(doc.set_column_width(0, 0));
-        assert_eq!(doc.column_boundaries()[0].0, 1, "column 1 is now the first shown");
+        assert_eq!(
+            doc.column_boundaries()[0].0,
+            1,
+            "column 1 is now the first shown"
+        );
         assert!(!doc.header.as_ref().unwrap().starts_with("timestamp"));
 
         assert!(doc.reset_columns());
         assert_eq!(doc.layout.as_ref().unwrap().widths, defaults);
         assert!(!doc.reset_columns(), "nothing to reset twice");
-        assert!(!doc.set_column_width(defaults.len() - 1, 5), "the message column is the rest of the row");
+        assert!(
+            !doc.set_column_width(defaults.len() - 1, 5),
+            "the message column is the rest of the row"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -7401,20 +7664,43 @@ mod tests {
         assert!(failed[0].starts_with("broken:"));
 
         let path = dir.join("in.log");
-        std::fs::write(&path, "2026-08-17 09:14:03.884 +01:00 [INF] Zenith Retrying job 41982 done\n")
-            .expect("write");
+        std::fs::write(
+            &path,
+            "2026-08-17 09:14:03.884 +01:00 [INF] Zenith Retrying job 41982 done\n",
+        )
+        .expect("write");
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
         rebuild_highlighter_with(&mut doc, &specs);
-        let names: Vec<_> = doc.highlighter.set().rules.iter().map(|r| r.name.as_str()).take(3).collect();
-        assert_eq!(names, ["jobs", "retry lines", "severity FATAL"], "user rules first, then the catalogue");
+        let names: Vec<_> = doc
+            .highlighter
+            .set()
+            .rules
+            .iter()
+            .map(|r| r.name.as_str())
+            .take(3)
+            .collect();
+        assert_eq!(
+            names,
+            ["jobs", "retry lines", "severity FATAL"],
+            "user rules first, then the catalogue"
+        );
         let mut spans = Vec::new();
         doc.row_spans(0, &mut spans);
         let green = tailhawk_core::rules::colour("#1e3a2f");
-        assert!(spans.iter().all(|s| s.bg == green), "the whole line is tinted: {spans:?}");
-        assert!(spans.iter().any(|s| s.start == 0 && s.fg.is_some()), "the timestamp keeps its ink over the tint: {spans:?}");
+        assert!(
+            spans.iter().all(|s| s.bg == green),
+            "the whole line is tinted: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.start == 0 && s.fg.is_some()),
+            "the timestamp keeps its ink over the tint: {spans:?}"
+        );
         let amber = tailhawk_core::rules::colour("#ffd166");
-        assert!(spans.iter().any(|s| s.fg == amber && s.bg == green), "the job number is amber on the tint: {spans:?}");
+        assert!(
+            spans.iter().any(|s| s.fg == amber && s.bg == green),
+            "the job number is amber on the tint: {spans:?}"
+        );
 
         // A label goes above the user rules.
         assert!(doc.label(2, "done"));
@@ -7769,14 +8055,26 @@ mod tests {
         let cell = renderer.cell().expect("cell metrics");
         // `TAILHAWK_SHOT_WELCOME=1`: the first-run surface instead of a document.
         if std::env::var_os("TAILHAWK_SHOT_WELCOME").is_some() {
-            let welcome = Welcome::new(cell, (w, h), &[r"C:\logs\app.log".to_owned(), r"C:\logs\other.log".to_owned()]);
-            let pixels = renderer.snapshot(w, h, &welcome.view, &welcome).expect("snapshot");
+            let welcome = Welcome::new(
+                cell,
+                (w, h),
+                &[
+                    r"C:\logs\app.log".to_owned(),
+                    r"C:\logs\other.log".to_owned(),
+                ],
+            );
+            let pixels = renderer
+                .snapshot(w, h, &welcome.view, &welcome)
+                .expect("snapshot");
             write_bmp(std::path::Path::new(&out), &pixels);
             eprintln!("wrote {}", out.to_string_lossy());
             return;
         }
         // `TAILHAWK_SHOT_THEME=light` — set before the document, whose catalogue takes the hues.
-        if let Some(t) = std::env::var("TAILHAWK_SHOT_THEME").ok().and_then(|n| theme::by_name(&n)) {
+        if let Some(t) = std::env::var("TAILHAWK_SHOT_THEME")
+            .ok()
+            .and_then(|n| theme::by_name(&n))
+        {
             theme::set_theme(t);
         }
         let mut doc = Document::open(std::path::Path::new(&file)).expect("open");
@@ -7966,12 +8264,18 @@ mod tests {
         assert!(tabs.split(Document::open(&a).expect("a again")));
         assert_eq!(tabs.panes().len(), 2);
         assert_eq!(tabs.focused_pane(), 1, "the new pane has focus");
-        assert!(!tabs.split(Document::open(&a).expect("a")), "two is the most");
+        assert!(
+            !tabs.split(Document::open(&a).expect("a")),
+            "two is the most"
+        );
         assert_eq!(tabs.len(), 1, "still one tab");
         assert_eq!(tabs.labels().len(), 1);
         tabs.as_mut().expect("focused").bookmarks.insert(3);
         tabs.focus_pane(0);
-        assert!(tabs.as_ref().expect("top").bookmarks.is_empty(), "the panes are separate documents");
+        assert!(
+            tabs.as_ref().expect("top").bookmarks.is_empty(),
+            "the panes are separate documents"
+        );
         tabs.focus_pane(1);
         assert!(tabs.as_ref().expect("bottom").bookmarks.contains(&3));
         assert!(tabs.close_active(), "the tab remains");
@@ -8066,7 +8370,10 @@ mod tests {
         assert_eq!(doc.filtering.kept, again.filtering.kept, "the same view");
         assert_eq!(again.bookmarks.iter().copied().collect::<Vec<_>>(), [3, 17]);
         assert_eq!(again.labels, [(4, "line 2".to_owned())]);
-        assert!(again.highlighter.set().rules[0].name == "Label 4", "the rule came back too");
+        assert!(
+            again.highlighter.set().rules[0].name == "Label 4",
+            "the rule came back too"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
