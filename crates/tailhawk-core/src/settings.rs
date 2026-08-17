@@ -137,6 +137,10 @@ impl Settings {
                 let labels: Vec<String> = f.labels.iter().map(|l| quote(l)).collect();
                 out.push_str(&format!("labels = [{}]\n", labels.join(", ")));
             }
+            if !f.columns.is_empty() {
+                let cols: Vec<String> = f.columns.iter().map(u64::to_string).collect();
+                out.push_str(&format!("columns = [{}]\n", cols.join(", ")));
+            }
         }
         out
     }
