@@ -43,11 +43,12 @@ new files join as tabs. A **status bar** says whether the view is following. **R
 runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
 **Missing before daily use is comfortable:** no menus (the palette is the discovery
-surface), no chip edit/reorder, no column resize/reorder/hide; no user highlight-rules editor or
+surface), no chip reorder (`Ctrl+click` edits one), no column resize/reorder/hide; no user highlight-rules editor or
 format wizard (colour labels are the stand-in); no installer or signing.
 
-**After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
-the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
+**After that:** CLI flags (`-n`, `-f`; `--filter`/`--exclude`/`--theme` exist), RDP-friendly rendering, UI
+Automation, docs and the ship work. In plan terms: the rest of M7 (tab drag, UIA, sort, rules
+editor / format wizard, column resize), then M7b, M8, M9.
 
 ---
 
