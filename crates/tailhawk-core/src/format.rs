@@ -326,6 +326,14 @@ fn build() -> Vec<Format> {
               ("2026-08-16 09:14:03,884 [main] ERROR Api.Dispatch - Failed to dispatch job 41982", Some(Error))],
         ),
         fmt!(
+            "log4net-compact", "log4net (compact)", 0.75,
+            r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) (?P<level>[A-Z]+)\s+(?P<logger>[A-Za-z_][\w.]*)\s+(?P<msg>.*)$",
+            Stamp::Iso, Level::Word, WORD_LEVELS, Some(DOTNET_CONTINUATION),
+            &["ts", "level", "logger", "msg"],
+            &[("2026-08-07 07:50:45,075 INFO  Compiler.Program Template Set Compiler Version 7.0.2277.0", Some(Info)),
+              ("2026-08-07 07:50:46,102 ERROR Design.TemplateSet \tCould not open template", Some(Error))],
+        ),
+        fmt!(
             "rfc3164", "syslog (RFC 3164)", 0.70,
             r"^(?:<(?P<pri>\d{1,3})>)?(?P<ts>[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}) (?P<host>\S+) (?P<app>[^\s:\[]+)(?:\[(?P<procid>\d+)\])?: (?P<msg>.*)$",
             Stamp::Bsd, Level::None, &[], None::<&str>,

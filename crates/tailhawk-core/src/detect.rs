@@ -400,3 +400,40 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod corpus {
+    //! Detection over a real file named by `TAILHAWK_DETECT_FILE` — the dogfood corpus, whose lines
+    //! stay out of the repo. Prints the verdict; asserts nothing but that it ran.
+    //!
+    //! ```text
+    //! TAILHAWK_DETECT_FILE=C:\path\to\app.log cargo test -p tailhawk-core --lib detect::corpus -- --ignored --nocapture
+    //! ```
+    use super::*;
+
+    #[test]
+    #[ignore = "needs TAILHAWK_DETECT_FILE"]
+    fn what_the_detector_makes_of_a_real_file() {
+        let Some(path) = std::env::var_os("TAILHAWK_DETECT_FILE") else {
+            eprintln!("skipped: set TAILHAWK_DETECT_FILE");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read the file");
+        let charset = crate::encoding::detect(&bytes, None, encoding_rs::WINDOWS_1252).charset;
+        let lines = head_lines(&bytes[..], charset);
+        let d = detect(&lines);
+        println!(
+            "{}: {} lines sampled, accepted={:?}, {}",
+            path.to_string_lossy(),
+            d.sampled,
+            d.accepted.map(|f| f.id),
+            d.describe().unwrap_or_else(|| "plain text".into())
+        );
+        for c in &d.candidates {
+            println!(
+                "  {:<16} score {:.3} quality {:.3} match {:.2} valid {:.2} cover {:.2}",
+                c.format.id, c.score, c.quality, c.match_rate, c.field_validity, c.coverage
+            );
+        }
+    }
+}
