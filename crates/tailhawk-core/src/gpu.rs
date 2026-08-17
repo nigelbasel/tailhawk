@@ -173,7 +173,7 @@ pub struct Gpu {
     /// at this palette — and was found by screenshot rather than by any test. Anything reachable
     /// only through a swapchain is untestable, and this is the smallest thing that makes it
     /// reachable.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     offscreen: Option<(ID3D11Texture2D, ID3D11Texture2D)>,
 }
 
@@ -292,7 +292,7 @@ impl Gpu {
             generation: 1,
             #[cfg(any(test, feature = "test-hooks"))]
             inject_loss: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             offscreen: None,
         })
     }
@@ -307,7 +307,7 @@ impl Gpu {
     /// rotation, or the DXGI factory staleness that `a_device_lost_with_a_window_attached_comes_
     /// back_presenting` covers in the shell. Re-attach after a rebuild: the new device cannot use
     /// the old device's texture.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn attach_offscreen(&mut self, width: u32, height: u32) -> Result<()> {
         let (width, height) = (width.max(1), height.max(1));
         let (target, staging, rtv) = offscreen::make_target(&self.res.device, width, height)?;
@@ -325,7 +325,7 @@ impl Gpu {
     /// undefined, and a fresh one is zeroed, which is why the blend-state bug showed on screen as
     /// black rather than as a stale-but-correct frame. Clearing to something no pass would ever
     /// produce restores that distinction.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn clear_offscreen(&self, colour: [f32; 4]) {
         if let Some(rtv) = self.rtv.as_ref() {
             unsafe { self.res.context.ClearRenderTargetView(rtv, &colour) };
@@ -333,7 +333,7 @@ impl Gpu {
     }
 
     /// The last frame drawn to the offscreen target.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn read_back(&self) -> Result<offscreen::Pixels> {
         let Some((target, staging)) = self.offscreen.as_ref() else {
             return Err(Error("no offscreen target is attached".into()));
@@ -609,16 +609,17 @@ impl Gpu {
 /// and assert on the pixels. **Reading the pixels back is the only way to know the blend equation is
 /// doing what `SPEC.md` §3.2 says it does** — every call can succeed while producing the wrong
 /// composite, and a swapchain's back buffer is undefined after a flip-model `Present`.
-/// `cfg(test)` alone, not the `test-hooks` feature: this is only ever used by this crate's own
-/// tests, and under the feature without `cfg(test)` it would be an unreachable public API inside a
-/// private module — which is dead code, not a hook.
-#[cfg(test)]
-pub(crate) mod offscreen {
+/// Under `test-hooks` as well as `cfg(test)`, since 2026-08-17: the shell's headless screenshot
+/// (`Renderer::snapshot`) is the non-test consumer this used to lack, and a harness with no desktop
+/// to capture from is exactly what an offscreen target is for.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod offscreen {
+    #[cfg(test)]
+    use windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT;
     use windows::Win32::Graphics::Direct3D11::{
         ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
         D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-        D3D11_VIEWPORT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -634,6 +635,18 @@ pub(crate) mod offscreen {
     }
 
     impl Pixels {
+        pub fn width(&self) -> u32 {
+            self.width
+        }
+
+        pub fn height(&self) -> u32 {
+            if self.stride == 0 {
+                0
+            } else {
+                (self.data.len() / self.stride) as u32
+            }
+        }
+
         pub fn at(&self, x: u32, y: u32) -> [u8; 4] {
             assert!(x < self.width, "x {x} is outside the target");
             let i = y as usize * self.stride + x as usize * 4;
@@ -646,6 +659,8 @@ pub(crate) mod offscreen {
         }
     }
 
+    /// A self-contained device and target for the painter's own tests — the tests only.
+    #[cfg(test)]
     pub struct Offscreen {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
@@ -656,6 +671,7 @@ pub(crate) mod offscreen {
         height: u32,
     }
 
+    #[cfg(test)]
     impl Offscreen {
         pub fn new(width: u32, height: u32) -> Result<Self> {
             let (device, context) = super::create_device(super::Driver::Hardware)

@@ -96,6 +96,8 @@ pub use bidi::{reorder, visual_order};
 pub use cell::{Cell, CellModel};
 pub use encoding::{detect, Charset, Confidence, Detection, Sample};
 pub use follow::{Follow, Poll, FOLLOW_BUDGET_BYTES};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use gpu::offscreen::Pixels;
 pub use grid::{Grid, PlacedRow, Scroll};
 pub use hgrid::{HGrid, MAX_CELL_WIDTH_PX, RENDER_CAP_CELLS};
 pub use index::{Anchor, LineIndex, LineScanner, ANCHOR_STRIDE};
@@ -402,6 +404,25 @@ impl Renderer {
     /// presenting, per §3.2 and `experiments/g4b-batched-raster`'s 162 ms cold viewport, and nothing
     /// calls it yet — so a cold frame draws placeholder boxes and the next frame draws them again.
     /// Wiring it needs a post-present hook the shell drives; that is the next M3 step, not this one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    /// One frame of `source` rendered to an offscreen target of `width × height` and read back —
+    /// a headless screenshot, for a harness that has no desktop to capture. Two frames are drawn,
+    /// because the first of a cold atlas is placeholders (§3.2) and the misses are flushed between.
+    pub fn snapshot(
+        &mut self,
+        width: u32,
+        height: u32,
+        view: &view::View,
+        source: &dyn rows::RowSource,
+    ) -> Result<gpu::offscreen::Pixels> {
+        self.gpu.attach_offscreen(width, height)?;
+        for _ in 0..2 {
+            self.gpu.clear_offscreen(BACKGROUND);
+            self.paint_rows(view, source)?;
+        }
+        self.gpu.read_back()
+    }
+
     pub fn paint_rows(
         &mut self,
         view: &view::View,

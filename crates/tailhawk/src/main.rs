@@ -55,6 +55,10 @@ use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Input::Ime::{
+    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT,
+    COMPOSITIONFORM, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L,
@@ -70,9 +74,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
     SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER,
     SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_CHAR,
-    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER,
-    WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -222,8 +227,9 @@ impl RowSource for Document {
         painter.fill(0.0, 0.0, width, band, CHROME_BG);
         let mut x = cell_w * 0.5;
 
-        // ⌕ and the find field.
-        let _ = painter.lay_out_at(view, x, text_y, "⌕", Colours::plain(HEADER_INK));
+        // ▸ and the find field. (`UI-DESIGN.md` §2.1's ⌕ is not in Cascadia Mono, and the painter
+        // has one face until fallback lands; a placeholder box is worse than a plain marker.)
+        let _ = painter.lay_out_at(view, x, text_y, "▸", Colours::plain(HEADER_INK));
         x += cell_w * 2.0;
         let find_w = FIND_CELLS as f32 * cell_w;
         let find_focused = self.chrome.focus == Focus::Find;
@@ -2134,6 +2140,115 @@ impl Shell {
         true
     }
 
+    /// An IME message for the focused field. `WM_IME_COMPOSITION` carries the in-progress string
+    /// (`GCS_COMPSTR`, with its cursor at `GCS_CURSORPOS`) or the settled one (`GCS_RESULTSTR`);
+    /// the field shows the first in place and commits the second. Returns whether it was consumed
+    /// — when it is, `DefWindowProcW` must not see the message, or it would turn the result into
+    /// `WM_CHAR`s and the text would arrive twice. Also parks the IME's candidate window at the
+    /// caret, so it opens beside what is being typed rather than at the window's corner.
+    fn ime(&mut self, hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        if doc.chrome.focus == Focus::Grid {
+            return false;
+        }
+        let (find_origin, chip_origin) = doc.chrome.origins.get();
+        let origin = if doc.chrome.focus == Focus::Find {
+            find_origin
+        } else {
+            chip_origin
+        };
+        let cell_w = self.cell_w.max(1.0);
+        let cells = *doc.view.cells();
+        let Some(field) = doc.chrome.focused() else {
+            return false;
+        };
+        let himc = unsafe { ImmGetContext(hwnd) };
+        if himc.is_invalid() {
+            return false;
+        }
+        let read =
+            |what: windows::Win32::UI::Input::Ime::IME_COMPOSITION_STRING| -> Option<String> {
+                let bytes = unsafe { ImmGetCompositionStringW(himc, what, None, 0) };
+                if bytes < 0 {
+                    return None;
+                }
+                let mut buf = vec![0u16; (bytes as usize) / 2];
+                if !buf.is_empty() {
+                    unsafe {
+                        ImmGetCompositionStringW(
+                            himc,
+                            what,
+                            Some(buf.as_mut_ptr().cast()),
+                            bytes as u32,
+                        )
+                    };
+                }
+                Some(String::from_utf16_lossy(&buf))
+            };
+        let flags = lparam.0 as u32;
+        let mut consumed = false;
+        match msg {
+            WM_IME_STARTCOMPOSITION => {
+                field.set_composition("", 0);
+                consumed = true;
+            }
+            WM_IME_COMPOSITION => {
+                if flags & GCS_RESULTSTR.0 != 0 {
+                    if let Some(result) = read(GCS_RESULTSTR) {
+                        field.commit_composition(&result);
+                        consumed = true;
+                    }
+                }
+                if flags & GCS_COMPSTR.0 != 0 {
+                    if let Some(comp) = read(GCS_COMPSTR) {
+                        let cursor =
+                            unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, None, 0) };
+                        let cursor_utf16 = cursor.max(0) as usize;
+                        let caret = comp
+                            .encode_utf16()
+                            .take(cursor_utf16)
+                            .collect::<Vec<u16>>()
+                            .len();
+                        let caret_bytes = String::from_utf16_lossy(
+                            &comp.encode_utf16().take(caret).collect::<Vec<_>>(),
+                        )
+                        .len();
+                        field.set_composition(&comp, caret_bytes);
+                        consumed = true;
+                    }
+                }
+            }
+            WM_IME_ENDCOMPOSITION => {
+                field.clear_composition();
+                consumed = true;
+            }
+            _ => {}
+        }
+        // The candidate window, at the caret.
+        let display = field.display();
+        let (shown, cut) = Chrome::fitted(&cells, &display, FIND_CELLS.max(CHIP_CELLS));
+        let caret_cell = cells.cell_at_byte(
+            shown,
+            field.display_caret().saturating_sub(cut).min(shown.len()),
+        );
+        let form = COMPOSITIONFORM {
+            dwStyle: CFS_POINT,
+            ptCurrentPos: windows::Win32::Foundation::POINT {
+                x: (origin + caret_cell as f32 * cell_w) as i32,
+                y: doc.view.chrome_px() as i32,
+            },
+            ..Default::default()
+        };
+        unsafe {
+            let _ = ImmSetCompositionWindow(himc, &form);
+            let _ = ImmReleaseContext(hwnd, himc);
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        consumed
+    }
+
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
     /// chip is removed. Returns whether the click was the bar's.
     fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, extend: bool) -> bool {
@@ -2394,6 +2509,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION => {
+            let consumed = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| shell.ime(hwnd, msg, lparam))
+            });
+            if consumed {
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_DROPFILES => {
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
@@ -3793,5 +3920,115 @@ mod tests {
             "{row:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A headless screenshot: opens `TAILHAWK_SHOT_FILE`, applies `TAILHAWK_SHOT_KEYS` (a `;`-separated
+    /// script of `chip:<text>`, `xchip:<text>`, `find:<text>`, `focus:find|chip|grid`, `type:<text>`,
+    /// `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
+    /// harness that has no desktop to capture — the offscreen target is the whole point.
+    ///
+    /// ```text
+    /// TAILHAWK_SHOT_FILE=x.log TAILHAWK_SHOT_KEYS="chip:job;focus:find;type:dispatch" TAILHAWK_SHOT_OUT=out.bmp \
+    ///   cargo test --release -p tailhawk headless_screenshot -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs TAILHAWK_SHOT_FILE and TAILHAWK_SHOT_OUT"]
+    fn headless_screenshot() {
+        let (Some(file), Some(out)) = (
+            std::env::var_os("TAILHAWK_SHOT_FILE"),
+            std::env::var_os("TAILHAWK_SHOT_OUT"),
+        ) else {
+            eprintln!("skipped: set TAILHAWK_SHOT_FILE and TAILHAWK_SHOT_OUT");
+            return;
+        };
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipped: no device ({e})");
+                return;
+            }
+        };
+        let (w, h) = (1200u32, 500u32);
+        let cell = renderer.cell().expect("cell metrics");
+        let mut doc = Document::open(std::path::Path::new(&file)).expect("open");
+        doc.lay_out(cell, (w, h));
+        for step in std::env::var("TAILHAWK_SHOT_KEYS")
+            .unwrap_or_default()
+            .split(';')
+            .filter(|s| !s.is_empty())
+        {
+            let (verb, arg) = step.split_once(':').unwrap_or((step, ""));
+            match verb {
+                "chip" => filter_for(&mut doc, arg, Polarity::Include),
+                "xchip" => filter_for(&mut doc, arg, Polarity::Exclude),
+                "find" => {
+                    doc.chrome.find.set_text(arg);
+                    doc.finder.query = arg.to_owned();
+                    doc.find();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while doc.finder.running.is_some() && std::time::Instant::now() < deadline {
+                        doc.poll_find();
+                        std::thread::yield_now();
+                    }
+                    doc.poll_find();
+                }
+                "focus" => {
+                    doc.chrome.focus = match arg {
+                        "find" => Focus::Find,
+                        "chip" => Focus::NewChip,
+                        _ => Focus::Grid,
+                    }
+                }
+                "type" => {
+                    if let Some(f) = doc.chrome.focused() {
+                        f.insert(arg);
+                    }
+                }
+                "collapse" => {
+                    doc.filtering.records_only = true;
+                    doc.filtering.clear_results();
+                    doc.refilter();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+                        doc.poll_filter();
+                        std::thread::yield_now();
+                    }
+                    doc.poll_filter();
+                }
+                other => panic!("unknown step {other:?}"),
+            }
+        }
+        doc.lay_out(cell, (w, h));
+        doc.highlighter.begin_frame();
+        let pixels = renderer.snapshot(w, h, &doc.view, &doc).expect("snapshot");
+        write_bmp(std::path::Path::new(&out), &pixels);
+        eprintln!("wrote {}", out.to_string_lossy());
+    }
+
+    /// A 32-bit BGRA BMP, top-down — no encoder needed, and every viewer opens it.
+    fn write_bmp(path: &std::path::Path, pixels: &tailhawk_core::Pixels) {
+        let (w, h) = (pixels.width(), pixels.height());
+        let mut out = Vec::with_capacity(54 + (w * h * 4) as usize);
+        let size = 54 + w * h * 4;
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&(-(h as i32)).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(w * h * 4).to_le_bytes());
+        for _ in 0..4 {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let [b, g, r, _] = pixels.at(x, y);
+                out.extend_from_slice(&[b, g, r, 255]);
+            }
+        }
+        std::fs::write(path, out).expect("write the bmp");
     }
 }
