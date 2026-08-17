@@ -1,5 +1,80 @@
 # Handoff — resume here
 
+## ✅ A first run is coloured — E23, and the on-screen check that was owed — 2026-08-17, session 18
+
+**Two things closed, both observed on the shipped binary rather than inferred.** Session 17's one
+outstanding item — `verify-find.ps1` had never run, because the agent's shell had no desktop — ran
+this session and passed: `1 of 4` in the title, the current match painted orange on screen. Then
+E23: `semantic.rs`, §7.1's zero-config layer, wired beneath the search's matches and reaching pixels.
+**7 of M5's 10 items.**
+
+| | |
+|---|---|
+| The catalogue | `semantic.rs` — 21 rules, all on the linear engine: severity ramp, timestamps, GUIDs and trace ids (derived colour), URLs, IPv6/IPv4, Windows/UNC/UNIX paths, HTTP status by class and methods, hex, quoted strings, durations, `key=`, numbers |
+| The layering | `Document::row_spans` — matches first, then `Highlighter::beneath` fills around them |
+| Cost, measured | **11.9 µs per 150-byte row in release** (the tripwire test prints it); on the shipped binary **frame p95 2.2 ms over sixty scrolled frames, 0 over budget**, with the catalogue on |
+| The check | `powershell tools/verify-semantic.ps1` — counts each catalogue colour in a client-area capture and reads the frame instrument; **PASS**, screenshot in `%TEMP%` |
+
+### The design decisions, and what forced each
+
+- **Order is precedence, and the catalogue is ordered from the outside in.** `highlight.rs` gives
+  characters to the first rule that claims them, so a timestamp is claimed before the numbers and
+  colon-separated hex inside it, a URL before the path and `key=value` inside it, a GUID before the
+  hex it is made of. Numbers come last: a number is what is left when nothing more specific wanted
+  the digits. Severity words come first of all.
+- **The search's matches sit above the catalogue.** A hit the user asked for that a timestamp
+  colour hides is a broken feature. `Highlighter::beneath` exists for exactly this call: it adds
+  under whatever `out` already holds, under the same first-claim-wins rule.
+- **A colourless rule claims only its groups.** The linear engine has no lookbehind, so a status
+  code is anchored on its context — `status=(\d{3})` — and the context must be *in* the match. Claiming
+  it in no colour would have taken `status` away from the `key=` rule below for nothing.
+- **Severity words are matched in any case when unambiguous and as-written when not.** `error`
+  in prose is still worth the eye; `fine`, `config`, `alert` in prose are not levels. The word list is
+  tested against `Severity::from_level_text` in `record.rs`, which stays the authority.
+- **Derived colours are a hash and nothing else.** §7.1's "same request ID, same colour, in every
+  file" holds because there is no table to be in a different state tomorrow: FNV-1a onto an
+  eight-colour palette. It is on GUIDs and 32-hex ids (W3C trace ids) — the correlation case.
+- **The frame budget dropped from 256 KB to 64 KB on the measurement.** It was "roughly eight
+  full-width lines", chosen before there was a rule set to time; at ~80 ns/byte for 21 rules, 256 KB
+  was ~21 ms of highlighting — over the frame it exists to protect. 64 KB is ~5 ms with the catalogue
+  alone and still four to eight screenfuls of ordinary rows.
+- **`Highlighter::line` takes `&self`.** The painter reaches the source through `&dyn RowSource`, a
+  shared borrow for the frame; the budget and the skipped count are `Cell`s. Two counters were not
+  worth a `RefCell` in every source or `&mut dyn` through the painter.
+
+### ⚠ The instrument reads stale unless something retitles, and p95 is the worst below 20 samples
+
+Two things `verify-semantic.ps1` had to learn, worth knowing before trusting a title-bar number:
+the frame instrument is only re-rendered when the title is (a find keystroke, a follow tick that saw
+growth), so a screenshot after scrolling can show `p95 0.0 ms` from before any frame; and
+`Frames::summary` returns the worst frame as p95 when there are fewer than twenty, so a handful of
+frames read as `p95 19.5 ms` — the cold first one. **The harness scrolls sixty pages and then appends
+a line so a follow tick retitles**, and reads 2.2 ms. Also: the window opens at the **top** of the
+file, so `PgUp` scrolls nothing — that cost one run.
+
+### 🪤 Two more harness traps, fixed in `tools/Screen.ps1`
+
+- **A bare `Alt` sent to our own window puts it in menu mode** and every key after it is swallowed.
+  The `Alt` is the standard release for the foreground lock, but it is only right while some *other*
+  window is in front — `Start-Tailhawk` checks first.
+- **`Add-Content` cannot append to a file Tailhawk is tailing** — PowerShell asks for exclusive
+  access. Tailhawk shares read/write/delete (`file.rs`, `SHARE_ALL`); the harness appends the way a
+  logger does, through a `FileShare.ReadWrite` stream. This is PowerShell, not a Tailhawk defect.
+
+The find harness also gained DPI awareness (the capture was landing on the desktop beside the
+window on a scaled display) and a wait for the foreground it types into.
+
+### Where M5 stands, and the next thing
+
+**7 of 10:** off-thread work, E26, E15, E13, E23, `MODE_SOLID`, verification. **Left:** **E14** —
+the filter sub-view, §7.3, three of the owner's five daily features and the largest remaining
+piece: a `find.rs`-shaped pass streaming surviving row numbers, a derived row space the view maps
+through, growth sieved on the worker as it arrives, `Ctrl+L` / `Ctrl+Shift+L` typed like the find
+query since there is no chip row until M7; **E24** ANSI/bidi/reveal-invisibles; **V5** columns,
+still without a producer until M6's detection. The command bar is M7's widget layer.
+
+---
+
 ## ✅ Search is wired to the UI — M5's honest gap, half closed — 2026-08-16, session 17
 
 **`Ctrl+F`, a typed query, `Enter`, `F3`/`Shift+F3`, `Esc`, and every match painted.** The previous
