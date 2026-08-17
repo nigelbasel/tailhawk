@@ -44,22 +44,28 @@ verification tax is what cost). **M6 forecast registered before starting** (13.8
 | Continuations indented under the message and **dimmed** | `columns.rs`, `row_spans` | a Serilog exception and its frames, grey under their `ERR` line |
 | **Collapse** — `Ctrl+E` hides continuations (records-only row space, composes with chips) | `sieve.rs`, `Filtering` | — |
 | Also this stretch: `Ctrl+O` / drag-drop open, `wndproc` re-entry guard, open-at-tail, `Ctrl+I` reveal marker, ANSI stripping | | `verify-open.ps1` PASS |
+| Column **header** — a band the grid never sees; the painter draws the names in it | `view.rs`, `paint.rs`, `RowSource::header` | `Trace.log`, headed |
+| **MEL Simple assembly** — under `Ctrl+E` the next line's text is the record's message; unpopulated columns dropped | `columns.rs`, `Document::lay_out` | three MEL records as three rows |
+| **W3C Extended** — a `Format` built from `#Fields:` at open, `sc-status` the level, `#` lines never records | `format::w3c`, `detect.rs` | an IIS log under its own header |
+
+**M6's done-criterion, checked:** Serilog, log4net (the owner's real file), NLog (by its samples;
+same mechanism) and IIS W3C **columnise on open with no configuration** ✅; MEL Simple two-line
+records **assemble** (collapsed) ✅; the **build-time cross-matching test** passes ✅.
 
 **Decisions, argued where they live:** rows stay lines and continuations are a derived row space
 (`sieve.rs` records-only); `match_rate` excludes a format's own continuations; **§6.3 amended** —
 acceptance on the quality terms, specificity ranks (`detect.rs`, `SPEC.md`); a whole selected row
-copies raw under columns, a partial one copies what is on screen (`copy_text`).
+copies raw under columns, a partial one copies what is on screen (`copy_text`); the W3C `Format` is
+**leaked once per open** (`format::w3c`) rather than every catalogue format owning its strings.
 
-**⚠ Not yet, and known:** no header row (the grid has no header concept — a `Grid` change); no
-column resize/reorder/hide (M7 widgets); no mid/tail samples (§6.3 stage 1); no runtime re-detect
-(stage 5); the Docker/CRI/XML/OTLP short-circuits; E11 template compiler and E12 pattern DSL (a
-Serilog `outputTemplate` in appsettings does not yet become a format); the disambiguation *chip*
-is title text; MEL Simple's two-line record assembles as first line + continuation (the message
-is the continuation, indented) rather than as one record with the message in the body — the
-done-criterion says "assemble correctly", and that reads as the latter.
+**⚠ Not yet, and known:** column resize/reorder/hide (M7 widgets); mid/tail samples (§6.3 stage 1)
+and runtime re-detect (stage 5); the Docker/CRI/XML/OTLP short-circuits; **E11** template compiler
+and **E12** pattern DSL (a Serilog `outputTemplate` in appsettings does not yet become a format);
+**V9** rules editor / format wizard (needs V14); the disambiguation *chip* is title text; a search
+hit inside a MEL message pulled into its record row is not painted there (it is on the hidden line).
 
-**Next in M6:** a header row; the MEL Simple assembly; E11 (Serilog/NLog/log4net templates from
-config); then score M6.
+**Next in M6:** E11 — Serilog / NLog / log4net templates from a config file or a pasted template
+string, compiled to a `Format`; then score M6.
 
 ---
 
