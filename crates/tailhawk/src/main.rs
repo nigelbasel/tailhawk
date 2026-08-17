@@ -79,7 +79,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_V,
     VK_W, VK_X, VK_Y, VK_Z,
 };
-use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
@@ -2438,6 +2438,8 @@ enum Command {
     ToggleTheme,
     EditLastChip,
     ResetColumns,
+    OpenRules,
+    ReloadRules,
     GoToTop,
     FollowTail,
     Copy,
@@ -2478,6 +2480,8 @@ impl Command {
         (Command::ToggleTheme, "Switch between the dark and light themes", ""),
         (Command::EditLastChip, "Edit the last filter chip (Ctrl+click a chip edits it)", "Ctrl+Shift+E"),
         (Command::ResetColumns, "Reset column widths (drag a header boundary to resize; to 0 hides)", ""),
+        (Command::OpenRules, "Edit highlight rules (tailhawk.rules.toml)…", ""),
+        (Command::ReloadRules, "Reload highlight rules", ""),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2937,6 +2941,12 @@ struct Shell {
     pending_save: Option<bool>,
     /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
     wheel_remaining: f32,
+    /// §7.1's user highlight rules, as written in `tailhawk.rules.toml`, and the tiers they came
+    /// from; compiled into every document's highlighter above the catalogue, below the labels.
+    rule_specs: Vec<tailhawk_core::rules::Spec>,
+    rules_tiers: Vec<PathBuf>,
+    /// The rules that did not compile, by name — shown in the status bar.
+    rules_failed: Vec<String>,
     /// A tab or a chip being dragged to a new place — `UI-DESIGN.md` §2.1 / §5 — from its index.
     dragging_bar: Option<(BarDrag, usize)>,
     /// How long recent frames took. See [`Frames`].
@@ -3070,6 +3080,7 @@ impl Shell {
                         document.apply_state(&state);
                     }
                     self.file = Some(document.describe());
+                    self.rebuild_highlighter(&mut document);
                     self.document.push(document);
                     landed = true;
                 }
@@ -3126,7 +3137,12 @@ impl Shell {
     /// where a measurement rig can read it, and in the status bar, where a user does.**
     fn status_text(&self) -> String {
         let mut text = String::new();
-        for part in [self.driver.as_deref(), self.file.as_deref()]
+        let rules_note = if self.rules_failed.is_empty() {
+            None
+        } else {
+            Some(format!("⚠ rules: {}", self.rules_failed.join("; ")))
+        };
+        for part in [self.driver.as_deref(), self.file.as_deref(), rules_note.as_deref()]
             .into_iter()
             .flatten()
         {
@@ -3586,7 +3602,8 @@ impl Shell {
             self.document.close_active();
         } else if let Some(path) = self.document.as_ref().and_then(|d| d.path.clone()) {
             match Document::open(&path) {
-                Ok(doc) => {
+                Ok(mut doc) => {
+                    self.rebuild_highlighter(&mut doc);
                     self.document.split(doc);
                 }
                 Err(e) => self.file = Some(format!("split: {e}")),
@@ -3596,6 +3613,60 @@ impl Shell {
         self.sync_scrollbar(hwnd);
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
+    /// A document's highlighter from scratch: the catalogue in the theme's hues, the user's rules
+    /// over it, its labels over those. Called when a document arrives, when the theme changes and
+    /// when the rules file is reloaded.
+    fn rebuild_highlighter(&self, doc: &mut Document) {
+        rebuild_highlighter_with(doc, &self.rule_specs);
+    }
+
+    /// Reads the rules file again and rebuilds every document. The failures go to the status bar.
+    fn reload_rules(&mut self, hwnd: HWND) {
+        let (specs, failed) = load_rule_specs(&self.rules_tiers);
+        self.rule_specs = specs;
+        self.rules_failed = failed;
+        let specs = self.rule_specs.clone();
+        for (_, doc) in self.document.all_mut() {
+            rebuild_highlighter_with(doc, &specs);
+        }
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
+    /// Opens the rules file in whatever edits `.toml` here, writing the template first if there is
+    /// no file in any tier — into the last tier, the personal one.
+    fn open_rules_file(&mut self) {
+        let existing = self.rules_tiers.iter().find(|p| p.exists()).cloned();
+        let path = match existing {
+            Some(p) => p,
+            None => {
+                let Some(target) = self.rules_tiers.last().cloned() else {
+                    return;
+                };
+                if let Some(dir) = target.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if std::fs::write(&target, tailhawk_core::rules::template()).is_err() {
+                    return;
+                }
+                target
+            }
+        };
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            ShellExecuteW(
+                None,
+                windows::core::w!("open"),
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                SW_SHOW,
+            );
         }
     }
 
@@ -3614,12 +3685,9 @@ impl Shell {
         };
         theme::set_theme(next);
         self.settings.theme = Some(if next.dark { "dark" } else { "light" }.to_owned());
+        let specs = self.rule_specs.clone();
         for (_, doc) in self.document.all_mut() {
-            doc.highlighter = Highlighter::new(semantic::catalogue());
-            let labels = std::mem::take(&mut doc.labels);
-            for (n, text) in labels {
-                doc.label(n, &text);
-            }
+            rebuild_highlighter_with(doc, &specs);
         }
         let (r, g, b) = next.background_rgb8();
         unsafe {
@@ -3811,6 +3879,14 @@ impl Shell {
                 self.toggle_theme(hwnd);
                 return true;
             }
+            Command::OpenRules => {
+                self.open_rules_file();
+                return true;
+            }
+            Command::ReloadRules => {
+                self.reload_rules(hwnd);
+                return true;
+            }
             Command::FocusOtherPane => {
                 let other = 1 - self.document.focused_pane().min(1);
                 self.document.focus_pane(other);
@@ -3915,6 +3991,8 @@ impl Shell {
             | Command::Split
             | Command::FocusOtherPane
             | Command::ToggleTheme
+            | Command::OpenRules
+            | Command::ReloadRules
             | Command::CloseTab => {}
         }
         self.after_chrome_key(hwnd)
@@ -5084,6 +5162,40 @@ mod single {
     }
 }
 
+/// The user's rules from every tier, and the failures by name.
+fn load_rule_specs(tiers: &[PathBuf]) -> (Vec<tailhawk_core::rules::Spec>, Vec<String>) {
+    let mut specs = Vec::new();
+    let mut failed = Vec::new();
+    for path in tiers {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for spec in tailhawk_core::rules::parse(&text) {
+            match spec.compile() {
+                Ok(_) => specs.push(spec),
+                Err(why) => failed.push(why),
+            }
+        }
+    }
+    (specs, failed)
+}
+
+/// The catalogue, then the user's rules in front of it, then the document's labels in front of
+/// those — the precedence §7.1 gives them, rebuilt from the specs so nothing needs to be cloned.
+fn rebuild_highlighter_with(doc: &mut Document, specs: &[tailhawk_core::rules::Spec]) {
+    let mut set = semantic::catalogue();
+    for spec in specs.iter().rev() {
+        if let Ok(rule) = spec.compile() {
+            set.rules.insert(0, rule);
+        }
+    }
+    doc.highlighter = Highlighter::new(set);
+    let labels = std::mem::take(&mut doc.labels);
+    for (n, text) in labels {
+        doc.label(n, &text);
+    }
+}
+
 /// A Save dialog for E21's export and tee. Modal like [`ask_for_file`], and dispatched the same way.
 fn ask_to_save(hwnd: HWND) -> Option<std::path::PathBuf> {
     let mut file = [0u16; 32_768];
@@ -6088,6 +6200,9 @@ fn main() -> Result<()> {
     let roaming = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
     let settings_tiers = settings::tiers(exe_dir.as_deref(), roaming.as_deref());
     let settings = settings::load(&settings_tiers);
+    // §7.1: the user's highlight rules, from the same tiers.
+    let rules_tiers = tailhawk_core::rules::tiers(exe_dir.as_deref(), roaming.as_deref());
+    let (rule_specs, rules_failed) = load_rule_specs(&rules_tiers);
     let placement = settings.window;
     // V13: the theme — `--theme=dark|light|system` on the command line, else what was saved, else
     // dark; High Contrast overrides all of them with the system's colours (§11.2). Chosen before the
@@ -6142,6 +6257,9 @@ fn main() -> Result<()> {
             pending_save: None,
             wheel_remaining: 0.0,
             dragging_bar: None,
+            rule_specs,
+            rules_tiers,
+            rules_failed,
             frames: Frames::new(),
             last_double: None,
             file: None,
@@ -7147,6 +7265,46 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// §7.1's user rules from a file: compiled above the catalogue and below the labels; a
+    /// background-only rule tints under the ink, so the timestamp keeps its colour on a labelled
+    /// line; a rule that does not compile is named and skipped.
+    #[test]
+    fn user_rules_from_a_file_layer_between_the_catalogue_and_the_labels() {
+        let dir = std::env::temp_dir().join("tailhawk_user_rules_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let rules = dir.join("tailhawk.rules.toml");
+        std::fs::write(
+            &rules,
+            "[[rule]]\nname = \"jobs\"\npattern = \"job \\d+\"\nfg = \"#ffd166\"\n\n[[rule]]\nname = \"retry lines\"\npattern = \"Retrying\"\nbg = \"#1e3a2f\"\nwhole_line = true\n\n[[rule]]\nname = \"broken\"\npattern = \"(\"\nfg = \"#fff\"\n",
+        )
+        .expect("write");
+        let (specs, failed) = load_rule_specs(&[rules.clone()]);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].starts_with("broken:"));
+
+        let path = dir.join("in.log");
+        std::fs::write(&path, "2026-08-17 09:14:03.884 +01:00 [INF] Zenith Retrying job 41982 done\n")
+            .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        rebuild_highlighter_with(&mut doc, &specs);
+        let names: Vec<_> = doc.highlighter.set().rules.iter().map(|r| r.name.as_str()).take(3).collect();
+        assert_eq!(names, ["jobs", "retry lines", "severity FATAL"], "user rules first, then the catalogue");
+        let mut spans = Vec::new();
+        doc.row_spans(0, &mut spans);
+        let green = tailhawk_core::rules::colour("#1e3a2f");
+        assert!(spans.iter().all(|s| s.bg == green), "the whole line is tinted: {spans:?}");
+        assert!(spans.iter().any(|s| s.start == 0 && s.fg.is_some()), "the timestamp keeps its ink over the tint: {spans:?}");
+        let amber = tailhawk_core::rules::colour("#ffd166");
+        assert!(spans.iter().any(|s| s.fg == amber && s.bg == green), "the job number is amber on the tint: {spans:?}");
+
+        // A label goes above the user rules.
+        assert!(doc.label(2, "done"));
+        assert_eq!(doc.highlighter.set().rules[0].name, "Label 2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
         doc.add_chip(text, polarity);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -7543,6 +7701,11 @@ mod tests {
                         .and_then(|r| r.parse().ok())
                         .unwrap_or(0);
                     doc.selection = Some(Selection::at(Position::new(row, 0)));
+                }
+                "rules" => {
+                    let (specs, failed) = load_rule_specs(&[PathBuf::from(arg)]);
+                    assert!(failed.is_empty(), "{failed:?}");
+                    rebuild_highlighter_with(&mut doc, &specs);
                 }
                 "width" => {
                     let (col, w) = arg.split_once(':').expect("width:<col>:<cells>");

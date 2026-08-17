@@ -283,7 +283,40 @@ impl Highlighter {
         }
         self.budget.set(budget - line.len());
 
-        for rule in self.set.rules.iter().filter(|r| r.enabled) {
+        // **Background-only rules go last, and colour under the ink rather than instead of it.**
+        // A whole-line label or a user's "these lines amber" wants the timestamp and level still
+        // coloured on top of it; under plain first-claim-wins the earlier background would take
+        // the foreground too and leave the line flat. So the rules with ink run first, then the
+        // background-only ones fill `bg` where nothing has one yet — precedence among them intact.
+        for rule in self
+            .set
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !(r.fg.is_none() && !r.derived && r.bg.is_some()))
+        {
+            self.apply(rule, line, out);
+        }
+        for rule in self
+            .set
+            .rules
+            .iter()
+            .filter(|r| r.enabled && r.fg.is_none() && !r.derived && r.bg.is_some())
+        {
+            let bg = rule.bg;
+            rule.pattern.each_match(line, |whole, _groups| {
+                let (start, end) = if rule.whole_line {
+                    (0, line.len())
+                } else {
+                    (whole.start, whole.end)
+                };
+                claim_bg(out, start, end, bg);
+            });
+        }
+    }
+
+    /// One rule's claims, in precedence order with the others: groups first, then the match.
+    fn apply(&self, rule: &Rule, line: &str, out: &mut Vec<Span>) {
+        {
             rule.pattern.each_match(line, |whole, groups| {
                 // **Groups first.** Under first-claim-wins that is the whole of "a sub-highlight
                 // sits above its rule"; see the module note.
@@ -351,6 +384,62 @@ impl Highlighter {
 /// be sorted and non-overlapping, which every producer in this crate guarantees.
 pub fn claim_beneath(out: &mut Vec<Span>, span: Span) {
     claim(out, span);
+}
+
+/// Gives `[start, end)` a background **under whatever ink is there**: every existing span in the
+/// range that has no background takes this one (split at the range's edges so nothing outside it
+/// changes), and the gaps become spans of this background alone. Precedence holds — a span that
+/// already has a background keeps it.
+pub fn claim_bg(out: &mut Vec<Span>, start: usize, end: usize, bg: Option<Colour>) {
+    if start >= end || bg.is_none() {
+        return;
+    }
+    let first = out.partition_point(|s| s.end <= start);
+    let mut i = first;
+    while i < out.len() && out[i].start < end {
+        let span = out[i];
+        if span.bg.is_some() {
+            i += 1;
+            continue;
+        }
+        // Split off what lies before the range and after it, so only the inside is tinted.
+        let inside_start = span.start.max(start);
+        let inside_end = span.end.min(end);
+        let mut pieces: Vec<Span> = Vec::with_capacity(3);
+        if span.start < inside_start {
+            pieces.push(Span {
+                end: inside_start,
+                ..span
+            });
+        }
+        pieces.push(Span {
+            start: inside_start,
+            end: inside_end,
+            bg,
+            ..span
+        });
+        if inside_end < span.end {
+            pieces.push(Span {
+                start: inside_end,
+                ..span
+            });
+        }
+        if out.len() + pieces.len() - 1 > MAX_SPANS_PER_LINE {
+            return;
+        }
+        let n = pieces.len();
+        out.splice(i..i + 1, pieces);
+        i += n;
+    }
+    claim(
+        out,
+        Span {
+            start,
+            end,
+            fg: None,
+            bg,
+        },
+    );
 }
 
 fn claim(out: &mut Vec<Span>, span: Span) {
