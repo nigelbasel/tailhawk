@@ -90,7 +90,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETWHEELSCROLLLINES,
     ASFW_ANY, GCLP_HBRBACKGROUND, SWP_NOACTIVATE, SWP_NOZORDER, WM_APP, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_SYSKEYDOWN,
+    WM_DROPFILES, WM_GETOBJECT, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_SYSKEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
     WM_MOUSEWHEEL,
     WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
@@ -4305,6 +4305,639 @@ fn set_title(hwnd: HWND, title: &str) {
 
 /// The system open dialog. Modal on the window thread, which is what it is; the follow tick and
 /// the paint keep running underneath it because it pumps our messages too.
+/// V15 — `UI-DESIGN.md` §13's minimal UIA chrome provider: the window answers `WM_GETOBJECT` with
+/// a fragment root whose children are the controls the bar draws — tabs, the two fields, the
+/// chips, the status bar, the palette's query while it is up — with names, control types,
+/// bounds, focus and the patterns a test drives them by. **The provider reads what the mouse
+/// reads**: `Chrome::hits` and the fields, so it cannot say something the screen does not show.
+///
+/// The grid's text is `[v2]`'s virtualised text provider and is not here.
+mod uia {
+    use super::*;
+    use windows::core::{implement, Error, IUnknown, Result, BSTR, HRESULT, VARIANT};
+    use windows::Win32::Foundation::{BOOL, E_FAIL, POINT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::System::Com::SAFEARRAY;
+    use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayPutElement};
+    use windows::Win32::System::Variant::VT_I4;
+    use windows::Win32::UI::Accessibility::{
+        IInvokeProvider, IInvokeProvider_Impl, IRawElementProviderFragment,
+        IRawElementProviderFragmentRoot, IRawElementProviderFragmentRoot_Impl,
+        IRawElementProviderFragment_Impl, IRawElementProviderSimple,
+        IRawElementProviderSimple_Impl, ISelectionItemProvider, ISelectionItemProvider_Impl,
+        IToggleProvider, IToggleProvider_Impl, IValueProvider, IValueProvider_Impl,
+        NavigateDirection, NavigateDirection_FirstChild, NavigateDirection_LastChild,
+        NavigateDirection_NextSibling, NavigateDirection_Parent,
+        NavigateDirection_PreviousSibling, ProviderOptions, ProviderOptions_ServerSideProvider,
+        ProviderOptions_UseComThreading, ToggleState, ToggleState_Off, ToggleState_On,
+        UiaHostProviderFromHwnd, UiaRect, UiaReturnRawElementProvider, UiaRootObjectId,
+        UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId,
+        UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_HasKeyboardFocusPropertyId,
+        UIA_InvokePatternId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
+        UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId,
+        UIA_PaneControlTypeId, UIA_SelectionItemPatternId, UIA_StatusBarControlTypeId,
+        UIA_TabItemControlTypeId, UIA_TogglePatternId, UIA_ValuePatternId,
+        UIA_ValueValuePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+    };
+
+    /// `UiaAppendRuntimeId`: the first element of a fragment's runtime id, per the UIA docs.
+    const APPEND_RUNTIME_ID: i32 = 3;
+
+    /// Which control an element is.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Kind {
+        Root,
+        Tab(usize),
+        Palette,
+        Find,
+        NewChip,
+        Chip(usize),
+        Status,
+    }
+
+    /// The `WM_GETOBJECT` answer: our root for `UiaRootObjectId`, nothing for anything else.
+    pub fn get_object(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        if lparam.0 as i32 != UiaRootObjectId {
+            return None;
+        }
+        let root: IRawElementProviderSimple = Element {
+            hwnd,
+            kind: Kind::Root,
+        }
+        .into();
+        Some(unsafe { UiaReturnRawElementProvider(hwnd, wparam, lparam, &root) })
+    }
+
+    /// The children of the root in focus order — `UI-DESIGN.md` §13: "tab strip → search → filter →
+    /// grid → status chips". Read from the live shell so it matches the frame.
+    fn children(shell: &Shell) -> Vec<Kind> {
+        let mut out = Vec::new();
+        let Some(doc) = shell.document.as_ref() else {
+            return out;
+        };
+        if doc.palette.is_open() {
+            out.push(Kind::Palette);
+        }
+        if doc.tab_strip.0.len() > 1 {
+            out.extend((0..doc.tab_strip.0.len()).map(Kind::Tab));
+        }
+        out.push(Kind::Find);
+        out.push(Kind::NewChip);
+        out.extend((0..doc.filtering.chips.chips.len()).map(Kind::Chip));
+        out.push(Kind::Status);
+        out
+    }
+
+    /// Reads the shell without ever waiting for it: a UIA call that lands while the window is
+    /// inside its own handler answers "nothing" rather than deadlocking or panicking.
+    fn with_shell<T>(f: impl FnOnce(&Shell) -> Option<T>) -> Option<T> {
+        STATE.with(|s| s.try_borrow().ok().and_then(|state| state.as_ref().and_then(f)))
+    }
+
+    fn with_shell_mut<T>(f: impl FnOnce(&mut Shell) -> Option<T>) -> Option<T> {
+        STATE.with(|s| {
+            s.try_borrow_mut()
+                .ok()
+                .and_then(|mut state| state.as_mut().and_then(f))
+        })
+    }
+
+    #[implement(
+        IRawElementProviderSimple,
+        IRawElementProviderFragment,
+        IRawElementProviderFragmentRoot,
+        IValueProvider,
+        IInvokeProvider,
+        IToggleProvider,
+        ISelectionItemProvider
+    )]
+    struct Element {
+        hwnd: HWND,
+        kind: Kind,
+    }
+
+    impl Element {
+        fn make(&self, kind: Kind) -> IRawElementProviderFragment {
+            Element {
+                hwnd: self.hwnd,
+                kind,
+            }
+            .into()
+        }
+
+        /// The element's name — what a screen reader says and a test finds it by.
+        fn name(&self) -> String {
+            match self.kind {
+                Kind::Root => "Tailhawk".to_owned(),
+                Kind::Palette => "Command palette".to_owned(),
+                Kind::Find => "Search".to_owned(),
+                Kind::NewChip => "Add filter".to_owned(),
+                Kind::Status => "Status".to_owned(),
+                Kind::Tab(i) => with_shell(|s| {
+                    s.document
+                        .as_ref()
+                        .and_then(|d| d.tab_strip.0.get(i).cloned())
+                })
+                .unwrap_or_default(),
+                Kind::Chip(i) => with_shell(|s| {
+                    s.document.as_ref().and_then(|d| {
+                        d.filtering.chips.chips.get(i).map(|c| {
+                            let sign = match c.polarity {
+                                Polarity::Include => "include ",
+                                Polarity::Exclude => "exclude ",
+                            };
+                            format!("{sign}{}", c.source)
+                        })
+                    })
+                })
+                .unwrap_or_default(),
+            }
+        }
+
+        /// A stable id for tests: `find`, `chip-0`, `tab-1`, `status`.
+        fn automation_id(&self) -> String {
+            match self.kind {
+                Kind::Root => "tailhawk".to_owned(),
+                Kind::Palette => "palette".to_owned(),
+                Kind::Find => "find".to_owned(),
+                Kind::NewChip => "new-chip".to_owned(),
+                Kind::Status => "status".to_owned(),
+                Kind::Tab(i) => format!("tab-{i}"),
+                Kind::Chip(i) => format!("chip-{i}"),
+            }
+        }
+
+        fn control_type(&self) -> i32 {
+            match self.kind {
+                Kind::Root => UIA_PaneControlTypeId.0,
+                Kind::Palette | Kind::Find | Kind::NewChip => UIA_EditControlTypeId.0,
+                Kind::Chip(_) => UIA_ButtonControlTypeId.0,
+                Kind::Tab(_) => UIA_TabItemControlTypeId.0,
+                Kind::Status => UIA_StatusBarControlTypeId.0,
+            }
+        }
+
+        fn is_focusable(&self) -> bool {
+            matches!(self.kind, Kind::Palette | Kind::Find | Kind::NewChip)
+        }
+
+        fn has_focus(&self) -> bool {
+            with_shell(|s| {
+                let doc = s.document.as_ref()?;
+                Some(match self.kind {
+                    Kind::Palette => doc.palette.is_open(),
+                    Kind::Find => !doc.palette.is_open() && doc.chrome.focus == Focus::Find,
+                    Kind::NewChip => !doc.palette.is_open() && doc.chrome.focus == Focus::NewChip,
+                    _ => false,
+                })
+            })
+            .unwrap_or(false)
+        }
+
+        /// The element's client-relative rectangle, from what the frame drew.
+        fn client_rect(&self) -> Option<(f32, f32, f32, f32)> {
+            with_shell(|s| {
+                let doc = s.document.as_ref()?;
+                let row_h = s.cell_h.max(1.0);
+                let strip = if doc.tab_strip.0.len() > 1 {
+                    Chrome::strip_height(row_h)
+                } else {
+                    0.0
+                };
+                let bar_h = Chrome::height(row_h);
+                let (w, h) = (
+                    doc.view.gutter_px() + doc.view.hgrid().viewport_px(),
+                    doc.view.height_px(),
+                );
+                let x_range = |wanted: &dyn Fn(&Hit) -> bool| {
+                    doc.chrome
+                        .hits
+                        .borrow()
+                        .iter()
+                        .find(|(_, hit)| wanted(hit))
+                        .map(|(r, _)| r.clone())
+                };
+                Some(match self.kind {
+                    Kind::Root => (0.0, 0.0, w, h),
+                    Kind::Palette => (0.0, strip + bar_h, w, row_h + 8.0),
+                    Kind::Tab(i) => {
+                        let r = x_range(&|hit| *hit == Hit::Tab(i))?;
+                        (r.start, 0.0, r.end - r.start, strip)
+                    }
+                    Kind::Find => {
+                        let r = x_range(&|hit| *hit == Hit::Find)?;
+                        (r.start, strip, r.end - r.start, bar_h)
+                    }
+                    Kind::NewChip => {
+                        let r = x_range(&|hit| *hit == Hit::NewChip)?;
+                        (r.start, strip, r.end - r.start, bar_h)
+                    }
+                    Kind::Chip(i) => {
+                        let r = x_range(&|hit| *hit == Hit::Chip(i))?;
+                        (r.start, strip, r.end - r.start, bar_h)
+                    }
+                    Kind::Status => {
+                        let footer = Chrome::strip_height(row_h);
+                        (0.0, h - footer, w, footer)
+                    }
+                })
+            })
+        }
+
+        fn screen_rect(&self) -> Option<UiaRect> {
+            let (x, y, w, h) = self.client_rect()?;
+            let mut origin = POINT { x: 0, y: 0 };
+            unsafe {
+                let _ = ClientToScreen(self.hwnd, &mut origin);
+            }
+            Some(UiaRect {
+                left: f64::from(origin.x) + f64::from(x),
+                top: f64::from(origin.y) + f64::from(y),
+                width: f64::from(w),
+                height: f64::from(h),
+            })
+        }
+
+        fn runtime_key(&self) -> i32 {
+            match self.kind {
+                Kind::Root => 1,
+                Kind::Palette => 2,
+                Kind::Find => 3,
+                Kind::NewChip => 4,
+                Kind::Status => 5,
+                Kind::Tab(i) => 100 + i as i32,
+                Kind::Chip(i) => 1000 + i as i32,
+            }
+        }
+
+        fn siblings(&self) -> Vec<Kind> {
+            with_shell(|s| Some(children(s))).unwrap_or_default()
+        }
+
+        fn repaint(&self) {
+            unsafe {
+                let _ = InvalidateRect(self.hwnd, None, false);
+            }
+        }
+    }
+
+    /// "Not supported" for a pattern or a navigation: `S_OK` with a null out-parameter, which is
+    /// what UIA expects, produced by an error whose code is `S_OK`.
+    fn none<T>() -> Result<T> {
+        Err(Error::from_hresult(HRESULT(0)))
+    }
+
+    impl IRawElementProviderSimple_Impl for Element_Impl {
+        fn ProviderOptions(&self) -> Result<ProviderOptions> {
+            Ok(ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading)
+        }
+
+        fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
+            let supported = match self.kind {
+                Kind::Palette | Kind::Find | Kind::NewChip | Kind::Status => {
+                    pattern == UIA_ValuePatternId
+                }
+                Kind::Chip(_) => pattern == UIA_InvokePatternId || pattern == UIA_TogglePatternId,
+                Kind::Tab(_) => pattern == UIA_SelectionItemPatternId,
+                Kind::Root => false,
+            };
+            if !supported {
+                return none();
+            }
+            // `cast` is unsafe in this binding because it trusts the identity pointer; ours is
+            // the `implement`-generated one and this is the object it was generated for.
+            let unknown: IUnknown = unsafe {
+                match pattern {
+                    p if p == UIA_ValuePatternId => self.cast::<IValueProvider>()?.into(),
+                    p if p == UIA_InvokePatternId => self.cast::<IInvokeProvider>()?.into(),
+                    p if p == UIA_TogglePatternId => self.cast::<IToggleProvider>()?.into(),
+                    _ => self.cast::<ISelectionItemProvider>()?.into(),
+                }
+            };
+            Ok(unknown)
+        }
+
+        fn GetPropertyValue(&self, property: UIA_PROPERTY_ID) -> Result<VARIANT> {
+            Ok(match property {
+                p if p == UIA_NamePropertyId => VARIANT::from(self.name().as_str()),
+                p if p == UIA_AutomationIdPropertyId => {
+                    VARIANT::from(self.automation_id().as_str())
+                }
+                p if p == UIA_ControlTypePropertyId => VARIANT::from(self.control_type()),
+                p if p == UIA_IsKeyboardFocusablePropertyId => VARIANT::from(self.is_focusable()),
+                p if p == UIA_HasKeyboardFocusPropertyId => VARIANT::from(self.has_focus()),
+                p if p == UIA_IsEnabledPropertyId => VARIANT::from(true),
+                p if p == UIA_IsControlElementPropertyId => VARIANT::from(true),
+                p if p == UIA_IsContentElementPropertyId => {
+                    VARIANT::from(self.kind != Kind::Root)
+                }
+                p if p == UIA_ValueValuePropertyId => match self.kind {
+                    Kind::Status | Kind::Palette | Kind::Find | Kind::NewChip => {
+                        VARIANT::from(self.Value()?.to_string().as_str())
+                    }
+                    _ => VARIANT::default(),
+                },
+                p if p == UIA_BoundingRectanglePropertyId => VARIANT::default(),
+                _ => VARIANT::default(),
+            })
+        }
+
+        fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
+            if self.kind == Kind::Root {
+                unsafe { UiaHostProviderFromHwnd(self.hwnd) }
+            } else {
+                none()
+            }
+        }
+    }
+
+    impl IRawElementProviderFragment_Impl for Element_Impl {
+        fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
+            let kids = self.siblings();
+            match (self.kind, direction) {
+                (Kind::Root, d) if d == NavigateDirection_FirstChild => {
+                    kids.first().map(|k| self.make(*k)).ok_or_else(|| Error::from_hresult(HRESULT(0)))
+                }
+                (Kind::Root, d) if d == NavigateDirection_LastChild => {
+                    kids.last().map(|k| self.make(*k)).ok_or_else(|| Error::from_hresult(HRESULT(0)))
+                }
+                (Kind::Root, _) => none(),
+                (kind, d) if d == NavigateDirection_Parent => {
+                    let _ = kind;
+                    Ok(self.make(Kind::Root))
+                }
+                (kind, d) if d == NavigateDirection_NextSibling => {
+                    let at = kids.iter().position(|k| *k == kind);
+                    at.and_then(|i| kids.get(i + 1))
+                        .map(|k| self.make(*k))
+                        .ok_or_else(|| Error::from_hresult(HRESULT(0)))
+                }
+                (kind, d) if d == NavigateDirection_PreviousSibling => {
+                    let at = kids.iter().position(|k| *k == kind);
+                    at.and_then(|i| i.checked_sub(1))
+                        .and_then(|i| kids.get(i))
+                        .map(|k| self.make(*k))
+                        .ok_or_else(|| Error::from_hresult(HRESULT(0)))
+                }
+                _ => none(),
+            }
+        }
+
+        fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
+            let array = unsafe { SafeArrayCreateVector(VT_I4, 0, 2) };
+            if array.is_null() {
+                return Err(Error::from_hresult(E_FAIL));
+            }
+            let mut ids = [APPEND_RUNTIME_ID, self.runtime_key()];
+            for (i, id) in ids.iter_mut().enumerate() {
+                let index = i as i32;
+                unsafe {
+                    SafeArrayPutElement(array, &index, id as *mut i32 as *const _)?;
+                }
+            }
+            Ok(array)
+        }
+
+        fn BoundingRectangle(&self) -> Result<UiaRect> {
+            Ok(self.screen_rect().unwrap_or_default())
+        }
+
+        fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
+            none()
+        }
+
+        fn SetFocus(&self) -> Result<()> {
+            let kind = self.kind;
+            with_shell_mut(|s| {
+                let doc = s.document.as_mut()?;
+                match kind {
+                    Kind::Find => doc.chrome.focus = Focus::Find,
+                    Kind::NewChip => doc.chrome.focus = Focus::NewChip,
+                    Kind::Palette => doc.palette.open(),
+                    _ => return None,
+                }
+                Some(())
+            });
+            self.repaint();
+            Ok(())
+        }
+
+        fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
+            Ok(Element {
+                hwnd: self.hwnd,
+                kind: Kind::Root,
+            }
+            .into())
+        }
+    }
+
+    impl IRawElementProviderFragmentRoot_Impl for Element_Impl {
+        fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
+            let mut origin = POINT { x: 0, y: 0 };
+            unsafe {
+                let _ = ClientToScreen(self.hwnd, &mut origin);
+            }
+            let (cx, cy) = ((x - f64::from(origin.x)) as f32, (y - f64::from(origin.y)) as f32);
+            for kind in self.siblings() {
+                let child = Element {
+                    hwnd: self.hwnd,
+                    kind,
+                };
+                if let Some((rx, ry, rw, rh)) = child.client_rect() {
+                    if cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh {
+                        return Ok(child.into());
+                    }
+                }
+            }
+            none()
+        }
+
+        fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
+            let focused = with_shell(|s| {
+                let doc = s.document.as_ref()?;
+                Some(if doc.palette.is_open() {
+                    Some(Kind::Palette)
+                } else {
+                    match doc.chrome.focus {
+                        Focus::Find => Some(Kind::Find),
+                        Focus::NewChip => Some(Kind::NewChip),
+                        Focus::Grid => None,
+                    }
+                })
+            })
+            .flatten();
+            match focused {
+                Some(kind) => Ok(self.make(kind)),
+                None => none(),
+            }
+        }
+    }
+
+    impl IValueProvider_Impl for Element_Impl {
+        fn SetValue(&self, value: &PCWSTR) -> Result<()> {
+            let text = unsafe { value.to_string() }.unwrap_or_default();
+            let kind = self.kind;
+            let hwnd = self.hwnd;
+            let applied = with_shell_mut(|s| {
+                let doc = s.document.as_mut()?;
+                match kind {
+                    Kind::Find => {
+                        doc.chrome.find.set_text(&text);
+                        doc.finder.query = text.clone();
+                        doc.find();
+                    }
+                    Kind::NewChip => {
+                        doc.chrome.chip.set_text(&text);
+                        let polarity = doc.chrome.chip_polarity;
+                        doc.add_chip(&text, polarity);
+                        doc.chrome.chip.set_text("");
+                    }
+                    Kind::Palette => {
+                        doc.palette.field.set_text(&text);
+                        doc.palette.refresh();
+                    }
+                    _ => return None,
+                }
+                s.sync_scrollbar(hwnd);
+                s.retitle(hwnd);
+                Some(())
+            });
+            self.repaint();
+            applied.map_or_else(|| Err(Error::from_hresult(E_FAIL)), |()| Ok(()))
+        }
+
+        fn Value(&self) -> Result<BSTR> {
+            let kind = self.kind;
+            let text = with_shell(|s| {
+                let doc = s.document.as_ref()?;
+                Some(match kind {
+                    Kind::Find => doc.chrome.find.text().to_owned(),
+                    Kind::NewChip => doc.chrome.chip.text().to_owned(),
+                    Kind::Palette => doc.palette.field.text().to_owned(),
+                    Kind::Status => doc.status.clone(),
+                    _ => String::new(),
+                })
+            })
+            .unwrap_or_default();
+            Ok(BSTR::from(text))
+        }
+
+        fn IsReadOnly(&self) -> Result<BOOL> {
+            Ok(BOOL::from(self.kind == Kind::Status))
+        }
+    }
+
+    impl IInvokeProvider_Impl for Element_Impl {
+        /// A chip's Invoke is its `×`: the chip goes.
+        fn Invoke(&self) -> Result<()> {
+            let Kind::Chip(i) = self.kind else {
+                return Err(Error::from_hresult(E_FAIL));
+            };
+            let hwnd = self.hwnd;
+            with_shell_mut(|s| {
+                let doc = s.document.as_mut()?;
+                if i < doc.filtering.chips.chips.len() {
+                    doc.remember();
+                    doc.filtering.chips.chips.remove(i);
+                    doc.filtering.clear_results();
+                    doc.refilter();
+                    let rows = doc.view_rows();
+                    doc.view.grid_mut().set_total_rows(rows);
+                }
+                s.sync_scrollbar(hwnd);
+                s.retitle(hwnd);
+                Some(())
+            });
+            self.repaint();
+            Ok(())
+        }
+    }
+
+    impl IToggleProvider_Impl for Element_Impl {
+        /// A chip's Toggle is a click on its body: enabled or not.
+        fn Toggle(&self) -> Result<()> {
+            let Kind::Chip(i) = self.kind else {
+                return Err(Error::from_hresult(E_FAIL));
+            };
+            let hwnd = self.hwnd;
+            with_shell_mut(|s| {
+                let doc = s.document.as_mut()?;
+                if i < doc.filtering.chips.chips.len() {
+                    doc.remember();
+                    let chip = &mut doc.filtering.chips.chips[i];
+                    chip.enabled = !chip.enabled;
+                    doc.filtering.clear_results();
+                    doc.refilter();
+                    let rows = doc.view_rows();
+                    doc.view.grid_mut().set_total_rows(rows);
+                }
+                s.sync_scrollbar(hwnd);
+                s.retitle(hwnd);
+                Some(())
+            });
+            self.repaint();
+            Ok(())
+        }
+
+        fn ToggleState(&self) -> Result<ToggleState> {
+            let Kind::Chip(i) = self.kind else {
+                return Ok(ToggleState_Off);
+            };
+            let on = with_shell(|s| {
+                s.document
+                    .as_ref()
+                    .and_then(|d| d.filtering.chips.chips.get(i).map(|c| c.enabled))
+            })
+            .unwrap_or(false);
+            Ok(if on { ToggleState_On } else { ToggleState_Off })
+        }
+    }
+
+    impl ISelectionItemProvider_Impl for Element_Impl {
+        /// A tab's Select shows it.
+        fn Select(&self) -> Result<()> {
+            let Kind::Tab(i) = self.kind else {
+                return Err(Error::from_hresult(E_FAIL));
+            };
+            let hwnd = self.hwnd;
+            with_shell_mut(|s| {
+                if i < s.document.len() {
+                    s.document.active = i;
+                    s.retitle(hwnd);
+                    s.sync_scrollbar(hwnd);
+                }
+                Some(())
+            });
+            self.repaint();
+            Ok(())
+        }
+
+        fn AddToSelection(&self) -> Result<()> {
+            self.Select()
+        }
+
+        fn RemoveFromSelection(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn IsSelected(&self) -> Result<BOOL> {
+            let Kind::Tab(i) = self.kind else {
+                return Ok(BOOL::from(false));
+            };
+            let selected = with_shell(|s| Some(s.document.active == i)).unwrap_or(false);
+            Ok(BOOL::from(selected))
+        }
+
+        fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
+            Ok(Element {
+                hwnd: self.hwnd,
+                kind: Kind::Root,
+            }
+            .into())
+        }
+    }
+}
+
 /// §12.3's single instance: the mutex that says one is running, the pipe that carries the argv.
 mod single {
     use super::*;
@@ -4697,6 +5330,13 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 }
             });
             LRESULT(0)
+        }
+        // V15: UI Automation asks for the root provider; the answer is ours.
+        WM_GETOBJECT => {
+            if let Some(result) = uia::get_object(hwnd, wparam, lparam) {
+                return result;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         // §12.3: another instance handed its paths over — open each as a tab and come forward.
         m if m == single::WM_HANDED_OFF => {
