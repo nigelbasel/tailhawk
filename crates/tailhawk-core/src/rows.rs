@@ -60,6 +60,13 @@ const READ_BYTES: usize = 128 * 1024;
 /// frame starts again with the same request and, because the pages are now warm, gets further.
 const FETCH_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Bytes read per step while fetching **one scattered row** — see [`Rows::fetch_rows`].
+///
+/// Small, because a scattered fetch reads one row per read and a screenful of them is fifty reads:
+/// at [`READ_BYTES`] that is 6 MB copied to show 6 KB of text. Almost every line fits in the first
+/// step; the loop grows the read for the ones that do not.
+const SCATTER_READ_BYTES: usize = 4 * 1024;
+
 /// Where a painter gets the text of a visible row, and the anchors that make placing it cheap.
 ///
 /// **A trait rather than a closure because the two travel together.** The painter needs a row's text
@@ -121,15 +128,21 @@ impl RowSource for Rows {
 }
 
 /// A window of decoded rows, and the reader and index they came from.
+///
+/// **The window is a list of rows, not a range**, since the filtered view (§7.3): a contiguous
+/// viewport is the common case and fills `rows` as `first..first + n`; a hide-non-matching view asks
+/// for the rows that survived, which are anywhere, through [`fetch_rows`](Rows::fetch_rows). Lookup
+/// is a binary search over at most a screenful either way.
 pub struct Rows {
     charset: Charset,
-    /// The row number `lines[0]` holds.
-    first: u64,
+    /// The row number each entry of `lines` holds, ascending.
+    rows: Vec<u64>,
     lines: Vec<String>,
     /// Column anchors, one per entry of `lines`. See [`ColumnAnchors`].
     anchors: Vec<ColumnAnchors>,
-    /// What the last [`fetch`](Rows::fetch) was asked for, so an identical request can be skipped.
-    served: Option<(u64, usize, u64, bool)>,
+    /// What the last fetch was asked for — the rows, the index's line count, the anchor flag — so
+    /// an identical request can be skipped.
+    served: Option<(Vec<u64>, u64, bool)>,
     last_error: Option<String>,
 }
 
@@ -137,7 +150,7 @@ impl Rows {
     pub fn new(charset: Charset) -> Self {
         Self {
             charset,
-            first: 0,
+            rows: Vec::new(),
             lines: Vec::new(),
             anchors: Vec::new(),
             served: None,
@@ -183,8 +196,8 @@ impl Rows {
         // So anchors are built only while the view is actually scrolled right. Putting the flag in
         // the key is what makes the transition work: scrolling off column 0 changes it, which forces
         // one refetch that builds them, and every frame after that is served from the cache.
-        let want = (first, count, index.line_count(), anchored);
-        if self.served == Some(want) {
+        let wanted: Vec<u64> = (first..first.saturating_add(count as u64)).collect();
+        if self.is_served(&wanted, index, anchored) {
             return Ok(());
         }
         // **Cleared here and only re-set on a clean read.** Recording the request up front would
@@ -192,7 +205,7 @@ impl Rows {
         // viewport until something else moved.
         self.served = None;
 
-        self.first = first;
+        self.rows.clear();
         self.lines.clear();
         self.anchors.clear();
         self.last_error = None;
@@ -253,6 +266,95 @@ impl Rows {
             });
         }
 
+        self.rows
+            .extend((0..self.lines.len() as u64).map(|i| first + i));
+        self.finish_fetch(wanted, index, anchored);
+        Ok(())
+    }
+
+    /// Fills the window with exactly `rows` — **any rows, in ascending order** — one positioned read
+    /// each. This is what a hide-non-matching view (§7.3) asks for: the rows that survived a filter
+    /// are anywhere, and a contiguous window would fetch a screenful to show one line of it.
+    ///
+    /// A row past the index, or one whose read fails, is left out; the others are served, per
+    /// §11.3. Cached by the same key as [`fetch`](Self::fetch), so a frame that shows the same
+    /// filtered rows again reads nothing.
+    pub fn fetch_rows<R: ChunkReader + ?Sized>(
+        &mut self,
+        reader: &R,
+        index: &LineIndex,
+        rows: &[u64],
+        anchored: bool,
+    ) -> Result<()> {
+        debug_assert!(rows.windows(2).all(|w| w[0] < w[1]), "ascending, distinct");
+        let wanted = rows.to_vec();
+        if self.is_served(&wanted, index, anchored) {
+            return Ok(());
+        }
+        self.served = None;
+        self.rows.clear();
+        self.lines.clear();
+        self.anchors.clear();
+        self.last_error = None;
+
+        let mut buf = vec![0u8; SCATTER_READ_BYTES];
+        let mut read_total = 0u64;
+        for &row in rows {
+            if read_total >= FETCH_BUDGET_BYTES {
+                break;
+            }
+            let start = match offset_of_line(reader, self.charset, index, row) {
+                Ok(Some(offset)) => offset,
+                Ok(None) => continue,
+                Err(e) => {
+                    self.last_error = Some(e.0);
+                    break;
+                }
+            };
+            // One line: read in small steps until the decoder gives one up, or the file ends.
+            let mut decoder = LineDecoder::new(self.charset);
+            let mut at = start;
+            let mut line: Option<String> = None;
+            let mut this_row = 0usize;
+            while line.is_none() && this_row < READ_BYTES {
+                let read = match reader.read_at(at, &mut buf) {
+                    Ok(0) => {
+                        decoder.finish(|text| {
+                            line.get_or_insert_with(|| text.to_owned());
+                        });
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.last_error = Some(e.0);
+                        break;
+                    }
+                };
+                at += read as u64;
+                this_row += read;
+                read_total += read as u64;
+                decoder.push(&buf[..read], |text| {
+                    line.get_or_insert_with(|| text.to_owned());
+                });
+            }
+            if self.last_error.is_some() {
+                break;
+            }
+            if let Some(text) = line {
+                self.rows.push(row);
+                self.lines.push(text);
+            }
+        }
+        self.finish_fetch(wanted, index, anchored);
+        Ok(())
+    }
+
+    fn is_served(&self, wanted: &[u64], index: &LineIndex, anchored: bool) -> bool {
+        matches!(&self.served, Some((rows, count, a)) if rows == wanted && *count == index.line_count() && *a == anchored)
+    }
+
+    /// Builds the anchors and records the request as served, for both fetch paths.
+    fn finish_fetch(&mut self, wanted: Vec<u64>, index: &LineIndex, anchored: bool) {
         // **One walk per row, here, instead of one per row per frame** — but only when the caller
         // says the view is scrolled right, per the note on the cache key above.
         if anchored {
@@ -260,19 +362,14 @@ impl Rows {
             self.anchors
                 .extend(self.lines.iter().map(|l| ColumnAnchors::build(&model, l)));
         }
-
         if self.last_error.is_none() {
-            self.served = Some(want);
+            self.served = Some((wanted, index.line_count(), anchored));
         }
-        Ok(())
     }
 
     /// A row's column anchors, or an empty set — which every lookup accepts.
     pub fn anchors(&self, row: u64) -> &ColumnAnchors {
-        let found = row
-            .checked_sub(self.first)
-            .and_then(|i| usize::try_from(i).ok())
-            .and_then(|i| self.anchors.get(i));
+        let found = self.slot(row).and_then(|i| self.anchors.get(i));
         match found {
             Some(a) => a,
             None => ColumnAnchors::none_ref(),
@@ -285,13 +382,17 @@ impl Rows {
     /// deliberately the one a painter can call per row without the painter knowing what a byte
     /// offset is.
     pub fn line(&self, row: u64) -> Option<&str> {
-        let i = row.checked_sub(self.first)?;
-        self.lines.get(usize::try_from(i).ok()?).map(String::as_str)
+        self.lines.get(self.slot(row)?).map(String::as_str)
     }
 
-    /// The row the window starts at.
+    /// Where `row` sits in the window, if it does. A binary search over a screenful.
+    fn slot(&self, row: u64) -> Option<usize> {
+        self.rows.binary_search(&row).ok()
+    }
+
+    /// The lowest row the window holds, or 0 for an empty one.
     pub fn first(&self) -> u64 {
-        self.first
+        self.rows.first().copied().unwrap_or(0)
     }
 
     /// How many rows the window actually holds — fewer than asked for at end of file, after a read
@@ -333,6 +434,72 @@ mod tests {
             out.push_str(&format!("line {i} — the quick brown fox\n"));
         }
         out.into_bytes()
+    }
+
+    /// The filtered view (§7.3) asks for rows that are anywhere; each comes back by its own number,
+    /// nothing in between is read into the window, and the last line without a terminator is a row.
+    #[test]
+    fn scattered_rows_are_served_by_number_and_nothing_between_them() {
+        let mut text = corpus(5_000);
+        text.extend_from_slice(b"last line, no newline");
+        let index = indexed(&text);
+        let mut rows = Rows::new(UTF8);
+
+        rows.fetch_rows(&text[..], &index, &[7, 4_000, 4_999, 5_000], false)
+            .expect("fetch_rows");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.line(7), Some("line 7 — the quick brown fox"));
+        assert_eq!(rows.line(4_000), Some("line 4000 — the quick brown fox"));
+        assert_eq!(rows.line(4_999), Some("line 4999 — the quick brown fox"));
+        assert_eq!(rows.line(5_000), Some("last line, no newline"));
+        assert_eq!(rows.line(8), None, "not asked for, not held");
+        assert_eq!(rows.line(5_001), None, "past the file");
+
+        // The same request again reads nothing: the served key covers the scattered path too.
+        struct Counting<'a>(&'a [u8], std::sync::atomic::AtomicUsize);
+        impl ChunkReader for Counting<'_> {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.0.read_at(offset, buf)
+            }
+        }
+        let counting = Counting(&text, std::sync::atomic::AtomicUsize::new(0));
+        rows.fetch_rows(&counting, &index, &[7, 4_000, 4_999, 5_000], false)
+            .expect("again");
+        assert_eq!(
+            counting.1.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an identical request is served from the window"
+        );
+
+        // A different list is a different window, and a contiguous fetch after it works as before.
+        rows.fetch_rows(&counting, &index, &[1, 2], false)
+            .expect("other");
+        assert!(counting.1.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(rows.line(1), Some("line 1 — the quick brown fox"));
+        assert_eq!(rows.line(7), None);
+        rows.fetch(&text[..], &index, 10, 3, false).expect("fetch");
+        assert_eq!(rows.line(11), Some("line 11 — the quick brown fox"));
+        assert_eq!(rows.line(1), None);
+    }
+
+    /// A scattered fetch of a row far longer than one read step still comes back whole.
+    #[test]
+    fn a_long_scattered_row_is_read_in_steps_until_it_ends() {
+        let mut text = corpus(10);
+        let long = "x".repeat(20 * 1024);
+        text.extend_from_slice(long.as_bytes());
+        text.extend_from_slice(
+            b"
+after
+",
+        );
+        let index = indexed(&text);
+        let mut rows = Rows::new(UTF8);
+        rows.fetch_rows(&text[..], &index, &[10, 11], false)
+            .expect("fetch_rows");
+        assert_eq!(rows.line(10).map(str::len), Some(20 * 1024));
+        assert_eq!(rows.line(11), Some("after"));
     }
 
     #[test]

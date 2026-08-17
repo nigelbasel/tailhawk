@@ -473,6 +473,32 @@ impl LogSet {
         Ok(())
     }
 
+    /// Fills every member holding any of `rows` — set-wide, ascending — with exactly those rows.
+    ///
+    /// The filtered view's fetch (§7.3): the rows that survived are anywhere in the set, so the
+    /// list is split by member the way [`fetch`](Self::fetch) splits a window, and each member
+    /// reads only its own through [`Rows::fetch_rows`]. A member holding none of them is left as it
+    /// was, as in `fetch`.
+    pub fn fetch_rows(&mut self, rows: &[u64], anchored: bool) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for member in &mut self.members {
+            let lines = member.index.line_count();
+            let member_end = member.first_row + lines;
+            let lo = rows.partition_point(|&r| r < member.first_row);
+            let hi = rows.partition_point(|&r| r < member_end);
+            if lo >= hi {
+                continue;
+            }
+            let local: Vec<u64> = rows[lo..hi].iter().map(|r| r - member.first_row).collect();
+            member
+                .rows
+                .fetch_rows(&*member.file, &member.index, &local, anchored)?;
+        }
+        Ok(())
+    }
+
     /// Advances the set: growth on the live member, and every way it can stop being live.
     ///
     /// **This does no scanning.** [`crate::scanner`] runs it on a worker; what happens here is
@@ -889,6 +915,25 @@ mod tests {
             texts(&set),
             ["mon a", "mon b", "tue a", "wed a", "wed b", "wed c"]
         );
+    }
+
+    /// The filtered view's fetch: rows from two members, none contiguous, in one call — and a
+    /// member holding none of them is not touched.
+    #[test]
+    fn scattered_rows_across_members_are_served_from_the_members_that_hold_them() {
+        let dir = scratch("scattered");
+        write(&dir, "log-20260727.txt", &["mon a", "mon b", "mon c"]);
+        write(&dir, "log-20260728.txt", &["tue a", "tue b"]);
+        let anchor = write(&dir, "log-20260729.txt", &["wed a", "wed b", "wed c"]);
+
+        let mut set = LogSet::open(&anchor).expect("open");
+        set.fetch_rows(&[0, 2, 5, 7], false).expect("fetch_rows");
+        assert_eq!(set.row_text(0), Some("mon a"));
+        assert_eq!(set.row_text(2), Some("mon c"));
+        assert_eq!(set.row_text(5), Some("wed a"));
+        assert_eq!(set.row_text(7), Some("wed c"));
+        assert_eq!(set.row_text(1), None, "not asked for");
+        assert_eq!(set.row_text(3), None, "the middle member was not touched");
     }
 
     /// §5.5b's trap, end to end. `app.log.2` is the *oldest* text, and a set that read it as newest
