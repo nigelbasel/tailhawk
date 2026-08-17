@@ -259,13 +259,79 @@ Score this when M5 lands, and record **why** — M4's scoring found the risk lis
 what looked hard than at predicting what would be expensive, and one milestone is not enough to know
 whether that repeats.
 
+### Scored: M5 — forecast 21.5 h / 3.2 M, actual **~5.9 h / ~1.1 M** — 2026-08-17
+
+The four M5 items of 2026-08-14 (1.5 h / 0.28 M), session 17 (1.2 h / 0.29 M) and session 18
+(~3.2 h / ~0.5 M to this point). **Nine of the ten items landed; V5 columns did not, and could not** —
+risk 2 said so before the milestone started: columns have no producer until M6's detection, and V5
+moves into M6 formally below.
+
+**Against the plan's own criteria:** full-file regex search streams its first match on 10 GB
+(0.062 s, whole pass 4.1 s) ✅; a pathological lookaround degrades to "truncated" rather than
+hanging ✅; include + exclude + composing text filters expressible ✅ — and beyond "expressible", the
+filter runs over 10 GB (first survivor 0.117 s, 7.5 s whole) and hides rows on screen. Highlighting
+reaches pixels beneath search matches. Every one of those was **observed on the shipped binary**, not
+inferred.
+
+**Why the forecast was 3.6× high, and it is the same shape as M4:** the risk list named what looked
+hard, not what was expensive. Risk 1 (backgrounds need a shader change) did not happen — `MODE_SOLID`
+was one instance mode. Risk 3 (off-thread ownership) was solved once by `find.rs`'s snapshot and then
+reused twice. Risk 4 (`fancy-regex`) was a `deny.toml` line. **What actually cost time was not on the
+list:** four separate harness traps (DPI virtualisation, a bare `Alt` swallowing keys, `Add-Content`
+against a tailed file, a stale title instrument), a `RefCell` re-entered under a modal dialog, and a
+Windows PowerShell round-trip that mojibake'd a source file. Verification and tooling, not the
+engineering, is where the unforecast hours went — and they were still a small fraction of the
+forecast's engineering hours. Two milestones now say the same thing: **halve the engineering
+estimate and add a fixed verification tax**, roughly 20 % of the total, for the shipped-binary checks
+this project insists on.
+
+**Recorded honestly:** M5's chrome is deviations, not features — no find bar, no chip row, no
+debounce, typed-into-the-window fields — all noted in `CLEANROOM.md`; and E24's SGR colours are
+parsed and not drawn.
+
+## 📌 M6 — forecast registered 2026-08-17, **before starting**
+
+Same units, same rule. Halved engineering against the plan's item weeks, per the two scorings above,
+plus the verification tax.
+
+| Item | Analogue used | Active h | Output tok |
+|---|---|---:|---:|
+| E9 — detection pipeline (§6.1: sample window, self-describing short-circuits, catalogue scoring, resilience) | `pattern.rs` (0.6 h) for the shape; `record.rs` exists; **the 5-stage design is written** | 2.0 | 300 k |
+| E10 — format catalogue: built-ins with self-testing samples (Serilog, log4net, NLog, MEL, IIS W3C, syslog, CLF, JSON lines, logfmt) | `semantic.rs` (1.0 h): boilerplate-shaped, authorship-dominated; each format is a regex/template plus a sample the build tests | 2.0 | 300 k |
+| E11 — template compiler for Serilog / NLog / log4net / Logback output templates, and config scanning | `filter.rs`'s parser (2.0 h) is the analogue for a small grammar; config scanning is file I/O | 2.0 | 300 k |
+| E12 — pattern DSL compiler | E11's cousin | 0.8 | 120 k |
+| E25 — multi-line record assembly + continuation predicates | `lines.rs` carry (0.5 h) scaled; touches the index (records vs lines) — **risk 1** | 1.5 | 250 k |
+| V5 — columns: resize, reorder, hide, per-column filter, now with a producer | `hgrid.rs`; painter draws cells per column; **no widget layer**, so resize/reorder are keys | 2.0 | 300 k |
+| V9 — rules editor + format wizard with live preview | **needs V14 (M7)** — a wizard is a form. Expect the same deviation as the find bar: a typed, title-echoed stand-in, or defer | 1.0 | 150 k |
+| Verification — the four real files of the done-criterion, the cross-matching detector test, `verify-columns.ps1` | ~20 % | 2.5 | 350 k |
+| **Total** | | **13.8** | **2.1 M** |
+
+**Confidence: low-medium.** Higher than M5's was, because the analogues are real now — a parser, a
+catalogue, a worker pass, a painter that takes spans. Lower than it could be for these reasons:
+
+1. **Records versus lines is the structural risk.** Everything today addresses a *line*: the index,
+   the search, the sieve, the row space. E25's multi-line records (a stack trace under its ERROR
+   line) either introduce a second row space — records over lines, the way `kept` sits over file
+   rows — or make the index record-aware. The first is cheaper and consistent with how the filter
+   was done; decide it *first*, before E9, because the record boundary is what the detector emits.
+2. **The catalogue is authorship**, and the done-criterion is "unmodified real-world files": the
+   owner's own Nexus / NDC / JobDispatcher logs are the corpus (`tailhawk-dogfood-corpus` memory),
+   and their formats decide which templates matter. Sample early.
+3. **V9 has no widget layer.** Say so up front rather than discover it at week three.
+4. **The 150 ms open budget** (§6.1's latency rule): detection must not delay first paint. The
+   worker that opens a document is where it runs; the shell must paint from the head sample and
+   re-render if the decision changes.
+
+Score this when M6 lands.
+
 ## Forecast, on this evidence
 
 | Milestone | Plan | Naive extrapolation | Confidence |
 |---|---:|---:|---|
 | ~~M4 follow, rotation, stdin~~ | 5 wk | forecast 13.5 h, **actual 9.9 h**; **all five criteria**, the last closed by M5's first item | **Delivered** 2026-08-14 |
-| M5 search, highlight, filter | 10 wk | ~9–10 h | **Low** — regex over 10 GB is a different kind of problem from anything done so far |
-| M6–M9 structure, shell, ship | 41 wk | — | **Very low.** Packaging, signing, accessibility and support have no agent-time analogue in what has been measured |
+| ~~M5 search, highlight, filter~~ | 10 wk | forecast 21.5 h, **actual ~5.9 h**; 9 of 10 items, V5 moved to M6 with its producer | **Delivered** 2026-08-17 |
+| M6 structure | 10.5 wk | **forecast 13.8 h / 2.1 M** (registered above) | **Low-medium** — records-vs-lines is the structural risk |
+| M7–M9 shell, ship | 30.5 wk | — | **Very low.** Packaging, signing, accessibility and support have no agent-time analogue in what has been measured |
 
 The extrapolation is linear in the plan's own weeks, which assumes the remaining work resembles the
 work done. **M6–M9 does not** — it is packaging, docs, installers and a long support tail, where
