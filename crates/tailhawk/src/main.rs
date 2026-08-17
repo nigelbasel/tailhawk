@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use tailhawk_core::columns::{Layout, Presentation};
 use tailhawk_core::detect::{self, Detection};
 use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
@@ -120,6 +121,12 @@ struct Document {
     /// the candidates if not. Run on the worker that opens the file, from the head sample only;
     /// §6.3's mid and tail samples are not taken yet.
     detection: Detection,
+    /// V5: the column layout for the accepted format, sized on the head sample, or `None` for a
+    /// file shown as it is written. See [`tailhawk_core::columns`].
+    layout: Option<Layout>,
+    /// The visible rows' presentations under `layout`, rebuilt by `lay_out` each frame — §7.1's
+    /// visible-rows rule applied to columns. Keyed by **file** row, ascending.
+    presented: Vec<(u64, Presentation)>,
     /// The first frame goes to the tail. **A tail tool opens at the end** — `SPEC.md` §6.1: "for a
     /// tailing tool the tail is what the user cares about" — and `Grid::is_following` is derived from
     /// being at the bottom, so this is also what makes a freshly opened file follow. Cleared once
@@ -138,14 +145,24 @@ struct Document {
 /// filter's derived row space (§7.3) is what turns it into a file row — here, in one place, so
 /// nothing below this knows whether a filter is on. With no chips the two are the same number.
 impl RowSource for Document {
+    /// Under a column layout the painter draws the row's *presentation* — its fields aligned —
+    /// built for the visible rows in `lay_out`; otherwise the raw line.
     fn row_text(&self, row: u64) -> Option<&str> {
-        self.set.row_text(self.filtering.file_row(row)?)
+        let file_row = self.filtering.file_row(row)?;
+        match self.presentation(file_row) {
+            Some(p) => Some(&p.text),
+            None => self.set.row_text(file_row),
+        }
     }
 
+    /// A presented row has no anchors — they describe the raw line — and every lookup accepts
+    /// none; it costs a walk over one screen row.
     fn row_anchors(&self, row: u64) -> &tailhawk_core::cell::ColumnAnchors {
         match self.filtering.file_row(row) {
-            Some(file_row) => self.set.row_anchors(file_row),
-            None => tailhawk_core::cell::ColumnAnchors::none_ref(),
+            Some(file_row) if self.presentation(file_row).is_none() => {
+                self.set.row_anchors(file_row)
+            }
+            _ => tailhawk_core::cell::ColumnAnchors::none_ref(),
         }
     }
 
@@ -179,8 +196,19 @@ impl RowSource for Document {
             return;
         };
         self.finder.spans(file_row, out);
-        if let Some(line) = self.set.row_text(file_row) {
-            self.highlighter.beneath(line, out);
+        match self.presentation(file_row) {
+            // Matches are byte ranges in the raw line; the presentation carries them to where its
+            // fields put those bytes, then the catalogue colours the text that is on screen.
+            Some(p) => {
+                let raw = std::mem::take(out);
+                p.map(&raw, out);
+                self.highlighter.beneath(&p.text, out);
+            }
+            None => {
+                if let Some(line) = self.set.row_text(file_row) {
+                    self.highlighter.beneath(line, out);
+                }
+            }
         }
     }
 }
@@ -197,7 +225,7 @@ impl Document {
         // with its own encoding detection and index, and gives them one row space; a log with
         // nothing beside it comes back as a set of one, so there is no second path here.
         let set = LogSet::open(path).map_err(|e| format!("{name}: {e}"))?;
-        let detection = detect_set(&set);
+        let (detection, layout) = detect_set(&set);
 
         // **Only the name is fixed.** Everything else in the title -- the encoding, the membership,
         // the counts -- can change while the log is being followed, so `describe` formats them per
@@ -217,6 +245,8 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             detection,
+            layout,
+            presented: Vec::new(),
             open_at_tail: true,
             pump: None,
             stream_done: false,
@@ -239,7 +269,7 @@ impl Document {
     fn from_pipe() -> std::result::Result<Self, String> {
         let pump = Pump::start().map_err(|e| format!("stdin: {e}"))?;
         let set = LogSet::open_single(pump.path()).map_err(|e| format!("stdin: {e}"))?;
-        let detection = detect_set(&set);
+        let (detection, layout) = detect_set(&set);
         Ok(Self {
             view: View::new(1.0, 1.0),
             set,
@@ -254,6 +284,8 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             detection,
+            layout,
+            presented: Vec::new(),
             open_at_tail: true,
             pump: Some(pump),
             stream_done: false,
@@ -282,9 +314,11 @@ impl Document {
         // Across the whole set, not just the live member: §5.5b's scrollback reaches into files
         // whose widest line may be wider than anything the current one holds.
         let extent = self.set.extent();
+        let padding = self.layout.as_ref().map_or(0, Layout::extra_cells) as u64;
         let columns = extent
             .exact_cells(self.set.charset())
             .unwrap_or_else(|| extent.max_line_bytes())
+            .saturating_add(padding)
             .min(RENDER_CAP_CELLS as u64);
         self.view.hgrid_mut().set_columns(columns);
 
@@ -296,16 +330,34 @@ impl Document {
         // A read that fails does not fail the frame — §11.3. `Rows` keeps what it got and records
         // why the rest is missing; those rows simply draw nothing.
         let anchored = self.view.hgrid().visible_columns().start > 0;
+        let file_rows: Vec<u64> = visible
+            .iter()
+            .filter_map(|&r| self.filtering.file_row(r))
+            .collect();
         if self.filtering.active() {
             // The visible view rows are survivors from anywhere in the file: a scattered fetch.
-            let file_rows: Vec<u64> = visible
-                .iter()
-                .filter_map(|&r| self.filtering.file_row(r))
-                .collect();
             let _ = self.set.fetch_rows(&file_rows, anchored);
         } else {
             let _ = self.set.fetch(first, count, anchored);
         }
+        // V5: the visible rows' presentations, rebuilt every frame from the raw text just fetched.
+        // Fifty parses a frame; §7.1's visible-rows rule, applied to columns.
+        self.presented.clear();
+        if let Some(layout) = &self.layout {
+            for file_row in file_rows {
+                if let Some(raw) = self.set.row_text(file_row) {
+                    self.presented.push((file_row, layout.present(raw)));
+                }
+            }
+        }
+    }
+
+    /// The presentation of a file row, if it is one of the visible rows `lay_out` presented.
+    fn presentation(&self, file_row: u64) -> Option<&Presentation> {
+        self.presented
+            .binary_search_by_key(&file_row, |(r, _)| *r)
+            .ok()
+            .map(|i| &self.presented[i].1)
     }
 
     /// Rows in the view's row space: the survivors while a filter is on, the file's rows otherwise.
@@ -687,8 +739,23 @@ impl Document {
             let Some(line) = self.row_text(row) else {
                 continue;
             };
-            if let Some(bytes) = sel.byte_range(self.view.cells(), row, line) {
-                out.push_str(&line[bytes]);
+            // A whole row copies its **raw** bytes even under columns — §12: `Ctrl+C` is raw. A
+            // part of a presented row copies what is on screen, which is the only thing its cell
+            // range names.
+            let whole = sel
+                .row_span(row)
+                .is_some_and(|s| s.start_cell == 0 && s.end == RowEnd::ToLineEnd);
+            let raw = self
+                .filtering
+                .file_row(row)
+                .and_then(|f| self.set.row_text(f));
+            match (whole, raw) {
+                (true, Some(raw)) => out.push_str(raw),
+                _ => {
+                    if let Some(bytes) = sel.byte_range(self.view.cells(), row, line) {
+                        out.push_str(&line[bytes]);
+                    }
+                }
             }
             if sel.row_span(row).is_some_and(|s| s.line_break) {
                 out.push('\n');
@@ -984,11 +1051,16 @@ impl Finder {
 
 /// §6.3's detection over the newest member's head. On the worker that opens the file, so the
 /// 150 ms open budget is not the window thread's problem; a set with no members detects nothing.
-fn detect_set(set: &LogSet) -> Detection {
-    match set.snapshot().last() {
-        Some(newest) => detect::detect(&detect::head_lines(&*newest.file, newest.charset)),
-        None => detect::detect(&[]),
-    }
+fn detect_set(set: &LogSet) -> (Detection, Option<Layout>) {
+    let lines = match set.snapshot().last() {
+        Some(newest) => detect::head_lines(&*newest.file, newest.charset),
+        None => Vec::new(),
+    };
+    let detection = detect::detect(&lines);
+    let layout = detection
+        .accepted
+        .map(|format| Layout::from_sample(format, &lines));
+    (detection, layout)
 }
 
 /// Takes one `WM_CHAR` code unit into a typed field. Returns whether it was wanted.
@@ -2884,7 +2956,10 @@ mod tests {
         doc.row_spans(1, &mut spans);
         let inks: Vec<_> = spans.iter().map(|s| (s.start, s.end, s.fg, s.bg)).collect();
         assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
-        assert_eq!(inks[1], (24, 29, Some(semantic::ERROR), None));
+        // The row is presented in columns (the fixture detects as timestamped text), so the level
+        // sits where the layout put it rather than at its raw offset.
+        let e = doc.row_text(1).expect("row").find("ERROR").expect("level");
+        assert_eq!(inks[1], (e, e + 5, Some(semantic::ERROR), None));
         assert!(spans.iter().all(|s| s.bg.is_none()));
 
         doc.finder.query = "ERROR".to_owned();
@@ -2904,7 +2979,7 @@ mod tests {
         assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
         assert_eq!(
             inks[1],
-            (24, 29, Some(CURRENT_MATCH_INK), Some(CURRENT_MATCH_BG))
+            (e, e + 5, Some(CURRENT_MATCH_INK), Some(CURRENT_MATCH_BG))
         );
         assert!(
             inks.iter()

@@ -150,6 +150,20 @@ impl Format {
         Some(record)
     }
 
+    /// The byte range of each of [`columns`](Self::columns) in a first line, in column order —
+    /// `None` for a column whose capture did not participate, and `None` overall when the line is
+    /// not a first line. What a columnised presentation of the row is built from: byte ranges into
+    /// the raw line, so a search match can be carried across.
+    pub fn fields(&self, line: &str) -> Option<Vec<Option<core::ops::Range<usize>>>> {
+        let caps = self.first_line.captures(line)?;
+        Some(
+            self.columns
+                .iter()
+                .map(|name| caps.name(name).map(|m| m.range()))
+                .collect(),
+        )
+    }
+
     /// The parts of §6.3's `field_validity` a single line can answer: does the timestamp read as
     /// one, and is the level a word this format declares. `None` when the line is not a first
     /// line.
