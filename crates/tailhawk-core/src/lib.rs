@@ -52,6 +52,10 @@ pub mod find;
 #[cfg(windows)]
 pub mod sieve;
 
+/// Export and tee on a worker. Windows-only for the same reason as [`find`].
+#[cfg(windows)]
+pub mod export;
+
 #[cfg(windows)]
 pub mod glyphs;
 

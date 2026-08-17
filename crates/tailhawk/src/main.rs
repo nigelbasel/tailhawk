@@ -15,6 +15,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use tailhawk_core::cell::CellModel;
@@ -23,6 +24,7 @@ use tailhawk_core::detect::{self, Detection};
 use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::encoding::Charset;
+use tailhawk_core::export;
 use tailhawk_core::highlight::{Highlighter, Rule, Span};
 use tailhawk_core::paint::{Colours, Painter};
 use tailhawk_core::palette::{Choice, Entry, Palette};
@@ -53,7 +55,8 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::HiDpi::{
@@ -177,6 +180,8 @@ struct Document {
     history: History,
     /// V10's record detail pane.
     detail: DetailPane,
+    /// E21's export or live tee, while one is in progress.
+    tee: Option<Tee>,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -560,6 +565,7 @@ impl Document {
             labels: Vec::new(),
             history: History::default(),
             detail: DetailPane::default(),
+            tee: None,
             pump: None,
             stream_done: false,
         })
@@ -611,6 +617,7 @@ impl Document {
             labels: Vec::new(),
             history: History::default(),
             detail: DetailPane::default(),
+            tee: None,
             pump: Some(pump),
             stream_done: false,
         })
@@ -941,6 +948,17 @@ impl Document {
         } else {
             ""
         };
+        // E21: an export in flight or a live tee, with its count — the user asked for a file and
+        // this is where they see it filling.
+        let tee = match &self.tee {
+            None => String::new(),
+            Some(t) => match (&t.error, t.live, t.done) {
+                (Some(e), _, _) => format!("⚠ export failed: {e} — "),
+                (None, true, _) => format!("⇥ tee → {} ({} lines) — ", t.name(), t.written),
+                (None, false, true) => format!("✓ exported {} lines → {} — ", t.written, t.name()),
+                (None, false, false) => format!("⇥ exporting → {} ({} lines) — ", t.name(), t.written),
+            },
+        };
         let format = match self.detection.describe() {
             Some(text) => format!(" · {text}"),
             None => String::new(),
@@ -956,7 +974,7 @@ impl Document {
             "‖ paused · Ctrl+End to follow — "
         };
         format!(
-            "{following}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
+            "{following}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -1501,6 +1519,125 @@ impl Document {
         true
     }
 
+    /// E21: starts writing the visible rows to `path` — once, or `live` as the file grows. The
+    /// first leg begins on the next tick, when the filter has judged the rows.
+    fn start_export(&mut self, path: PathBuf, live: bool) {
+        self.tee = Some(Tee::new(path, live));
+        self.poll_tee();
+    }
+
+    fn stop_tee(&mut self) -> bool {
+        self.tee.take().is_some()
+    }
+
+    /// Drives the export or tee: collects a running leg, and starts the next when there is growth
+    /// the filter has judged. Reports whether the status changed.
+    fn poll_tee(&mut self) -> bool {
+        let Some(tee) = self.tee.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some((running, to)) = tee.running.as_ref() {
+            let to = *to;
+            let mut finished = None;
+            for update in running.drain() {
+                match update {
+                    export::Update::Progress { .. } => changed = true,
+                    export::Update::Finished(outcome, written) => {
+                        finished = Some((outcome, written));
+                    }
+                }
+            }
+            if let Some((outcome, written)) = finished {
+                tee.running = None;
+                tee.written += written;
+                tee.covered = to;
+                changed = true;
+                match outcome {
+                    Outcome::Complete | Outcome::Capped => {}
+                    Outcome::Cancelled => tee.error = Some("cancelled".to_owned()),
+                    Outcome::Failed(e) => tee.error = Some(e),
+                }
+                if !tee.live || tee.error.is_some() {
+                    tee.done = true;
+                }
+            }
+        }
+        if tee.done {
+            // Shown by the status bar for the frame it finished in, gone on the next tick.
+            if changed {
+                return true;
+            }
+            self.tee = None;
+            return true;
+        }
+        if tee.running.is_some() {
+            return changed;
+        }
+        let total = self.set.total_rows();
+        if tee.covered >= total {
+            return changed;
+        }
+        let judged = !self.filtering.active()
+            || (self.filtering.running.is_none() && self.filtering.covered >= total);
+        if !judged {
+            return changed;
+        }
+        let keep = if self.filtering.active() {
+            let from = self.filtering.kept.partition_point(|&r| r < tee.covered);
+            export::Keep::Rows(self.filtering.kept[from..].to_vec())
+        } else {
+            export::Keep::All
+        };
+        let append = tee.covered > 0;
+        match export::start(self.set.snapshot(), keep, tee.covered, total, &tee.path, append) {
+            Ok(running) => tee.running = Some((running, total)),
+            Err(e) => {
+                tee.error = Some(e.to_string());
+                tee.done = true;
+            }
+        }
+        true
+    }
+
+    /// `Ctrl+Shift+C` — `UI-DESIGN.md` §12's *copy as TSV with columns*: the selected rows with the
+    /// format's fields tab-separated, the message last; a row the format does not parse, or any
+    /// row without a format, goes raw.
+    fn copy_tsv(&self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let format = self.detection.accepted;
+        let mut out = String::new();
+        for row in sel.first_row()..=sel.last_row() {
+            let Some(raw) = self.filtering.file_row(row).and_then(|f| self.set.row_text(f)) else {
+                continue;
+            };
+            match format.and_then(|f| f.fields(raw).map(|r| (f, r))) {
+                Some((format, ranges)) => {
+                    let mut cells: Vec<&str> = Vec::new();
+                    let mut msg = None;
+                    for (name, range) in format.columns.iter().zip(ranges) {
+                        let value = range.map(|r| &raw[r]).unwrap_or("");
+                        if *name == "msg" {
+                            msg = Some(value);
+                        } else {
+                            cells.push(value);
+                        }
+                    }
+                    if let Some(msg) = msg {
+                        cells.push(msg);
+                    }
+                    out.push_str(&cells.join("\t"));
+                }
+                None => out.push_str(raw),
+            }
+            out.push('\n');
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Applies one navigation intent. Returns whether anything actually moved.
     ///
     /// **The return value is what stops the window repainting on every key.** A `PageDown` at the
@@ -2001,6 +2138,45 @@ struct Chrome {
     palette_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
 }
 
+/// E21 — an export in progress, or a live tee. See [`tailhawk_core::export`]: a tee is the export
+/// started again over the growth, each leg appending, gated on the filter having judged the rows.
+struct Tee {
+    path: PathBuf,
+    /// Keep going as the file grows.
+    live: bool,
+    /// The row the last leg wrote up to (exclusive); the next leg starts here.
+    covered: u64,
+    /// The leg in flight, and the row it will have covered when it finishes.
+    running: Option<(export::Running, u64)>,
+    written: u64,
+    /// The last leg's failure, shown in the status bar; a failed tee stops.
+    error: Option<String>,
+    /// A one-shot export that finished, kept until the next tick shows it and lets it go.
+    done: bool,
+}
+
+impl Tee {
+    fn new(path: PathBuf, live: bool) -> Self {
+        Self {
+            path,
+            live,
+            covered: 0,
+            running: None,
+            written: 0,
+            error: None,
+            done: false,
+        }
+    }
+
+    /// The file's name, for the status bar.
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
 /// V10 — `UI-DESIGN.md` §8's record detail pane, at the bottom above the status bar.
 #[derive(Clone, Debug, Default)]
 struct DetailPane {
@@ -2076,6 +2252,10 @@ enum Command {
     Forward,
     ToggleDetail,
     TogglePretty,
+    Export,
+    Tee,
+    StopTee,
+    CopyTsv,
     GoToTop,
     FollowTail,
     Copy,
@@ -2107,6 +2287,10 @@ impl Command {
         (Command::Forward, "Forward to the next view", "Alt+→"),
         (Command::ToggleDetail, "Toggle the record detail pane", "Ctrl+Enter"),
         (Command::TogglePretty, "Detail pane: pretty-print a JSON body", ""),
+        (Command::Export, "Export the visible rows to a file…", ""),
+        (Command::Tee, "Tee: keep writing the visible rows to a file as they arrive…", ""),
+        (Command::StopTee, "Stop the tee", ""),
+        (Command::CopyTsv, "Copy selection as TSV with columns", "Ctrl+Shift+C"),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2493,6 +2677,9 @@ struct Shell {
     needs_frame: bool,
     /// The palette chose "Open file…": `wndproc` shows the dialog once this borrow is released.
     pending_open: bool,
+    /// The palette chose an export or a tee (`Some(live)`): `wndproc` shows the Save dialog once
+    /// this borrow is released.
+    pending_save: Option<bool>,
     /// How long recent frames took. See [`Frames`].
     frames: Frames,
 }
@@ -3236,6 +3423,18 @@ impl Shell {
             Command::ClearLabels => {
                 doc.clear_labels();
             }
+            Command::Export | Command::Tee => {
+                self.pending_save = Some(command == Command::Tee);
+                return true;
+            }
+            Command::StopTee => {
+                doc.stop_tee();
+            }
+            Command::CopyTsv => {
+                if let Some(text) = doc.copy_tsv() {
+                    set_clipboard(&text);
+                }
+            }
             Command::ToggleDetail => doc.detail.open = !doc.detail.open,
             Command::TogglePretty => doc.detail.pretty = !doc.detail.pretty,
             Command::Back | Command::Forward => {
@@ -3544,9 +3743,13 @@ impl Shell {
         true
     }
 
-    /// Collects what the filter worker has reported, and repaints if the view changed.
+    /// Collects what the filter worker has reported — and the export's, whose legs are gated on
+    /// it — and repaints if the view changed.
     fn poll_filter(&mut self, hwnd: HWND) {
-        let changed = self.document.as_mut().is_some_and(Document::poll_filter);
+        let changed = self
+            .document
+            .as_mut()
+            .is_some_and(|doc| doc.poll_filter() | doc.poll_tee());
         if !changed {
             return;
         }
@@ -3621,6 +3824,32 @@ fn set_title(hwnd: HWND, title: &str) {
 
 /// The system open dialog. Modal on the window thread, which is what it is; the follow tick and
 /// the paint keep running underneath it because it pumps our messages too.
+/// A Save dialog for E21's export and tee. Modal like [`ask_for_file`], and dispatched the same way.
+fn ask_to_save(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut file = [0u16; 32_768];
+    let filter: Vec<u16> = "Text files (*.txt;*.log)\0*.txt;*.log\0All files (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let ext: Vec<u16> = "txt\0".encode_utf16().collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(file.as_mut_ptr()),
+        nMaxFile: file.len() as u32,
+        lpstrDefExt: PCWSTR(ext.as_ptr()),
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY,
+        ..Default::default()
+    };
+    if !unsafe { GetSaveFileNameW(&mut ofn) }.as_bool() {
+        return None;
+    }
+    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &file[..len],
+    )))
+}
+
 fn ask_for_file(hwnd: HWND) -> Option<std::path::PathBuf> {
     let mut file = [0u16; 32_768];
     let filter: Vec<u16> = "Log files (*.log;*.txt)\0*.log;*.txt\0All files (*.*)\0*.*\0\0"
@@ -3988,16 +4217,40 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 }
                 return LRESULT(0);
             }
+            // Likewise the palette's export and tee: the Save dialog outside the borrow.
+            let save = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .and_then(|shell| shell.pending_save.take())
+            });
+            if let Some(live) = save {
+                if let Some(path) = ask_to_save(hwnd) {
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            if let Some(doc) = shell.document.as_mut() {
+                                doc.start_export(path, live);
+                            }
+                            shell.retitle(hwnd);
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
             if consumed {
                 return LRESULT(0);
             }
 
-            // `UI-DESIGN.md` §12: Ctrl+C copies the selection raw. Handled before the navigation
-            // map because C is not a navigation key and must not fall through to DefWindowProcW.
+            // `UI-DESIGN.md` §12: Ctrl+C copies the selection raw, Ctrl+Shift+C as TSV with columns.
+            // Handled before the navigation map because C is not a navigation key and must not
+            // fall through to DefWindowProcW.
             if ctrl && wparam.0 as u16 == C {
                 STATE.with(|s| {
-                    if let Some(shell) = s.borrow().as_ref() {
-                        shell.copy();
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        if shift {
+                            shell.run(hwnd, Command::CopyTsv);
+                        } else {
+                            shell.copy();
+                        }
                     }
                 });
                 return LRESULT(0);
@@ -4372,6 +4625,7 @@ fn main() -> Result<()> {
 
             needs_frame: false,
             pending_open: false,
+            pending_save: None,
             frames: Frames::new(),
             last_double: None,
             file: None,
@@ -5061,7 +5315,7 @@ mod tests {
         let entries = Command::entries();
         assert_eq!(entries.len(), Command::LISTED.len());
         assert!(entries.iter().all(|e| !e.label.is_empty()));
-        assert!(entries.iter().filter(|e| e.key.is_empty()).count() <= 1, "palette-only commands are the exception");
+        assert!(entries.iter().filter(|e| e.key.is_empty()).count() <= 4, "palette-only commands are the exception");
         std::fs::remove_file(&path).ok();
     }
 
@@ -5225,6 +5479,68 @@ mod tests {
         assert!(lines.iter().any(|l| l.trim() == "]"), "{lines:?}");
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&json).ok();
+    }
+
+    /// E21 end to end: an export writes the filtered view; a live tee writes it and then keeps
+    /// appending the survivors of each tick's growth, never a row the filter has not judged.
+    #[test]
+    fn an_export_writes_the_filtered_view_and_a_tee_keeps_appending_growth() {
+        let dir = std::env::temp_dir().join("tailhawk_tee_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("in.log");
+        let out = dir.join("out.txt");
+        std::fs::write(&path, "INFO a\nERROR b\nINFO c\n").expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        filter_for(&mut doc, "error", Polarity::Include);
+        assert_eq!(doc.filtering.kept, [1]);
+
+        // One-shot export of the survivors.
+        doc.start_export(out.clone(), false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.tee.as_ref().is_some_and(|t| !t.done) && std::time::Instant::now() < deadline {
+            doc.poll_tee();
+            std::thread::yield_now();
+        }
+        let tee = doc.tee.as_ref().expect("done, shown once");
+        assert!(tee.done && tee.error.is_none(), "{:?}", tee.error);
+        assert_eq!(tee.written, 1);
+        assert!(doc.describe().contains("✓ exported 1 lines"), "{}", doc.describe());
+        assert_eq!(std::fs::read_to_string(&out).expect("read"), "ERROR b\r\n");
+        doc.poll_tee();
+        assert!(doc.tee.is_none(), "let go on the next tick");
+
+        // A live tee: the current view first, then the growth as the filter judges it.
+        doc.start_export(out.clone(), true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.tee.as_ref().is_some_and(|t| t.covered < 3) && std::time::Instant::now() < deadline {
+            doc.poll_tee();
+            std::thread::yield_now();
+        }
+        assert_eq!(doc.tee.as_ref().map(|t| t.written), Some(1));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).expect("append");
+            writeln!(f, "ERROR d\nINFO e\nERROR f").expect("write");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.tee.as_ref().is_some_and(|t| t.written < 3) && std::time::Instant::now() < deadline {
+            doc.poll_follow();
+            doc.poll_filter();
+            doc.poll_tee();
+            std::thread::yield_now();
+        }
+        let tee = doc.tee.as_ref().expect("still teeing");
+        assert_eq!(tee.written, 3, "{:?}", tee.error);
+        assert_eq!(tee.covered, 6);
+        assert!(doc.describe().contains("⇥ tee → out.txt (3 lines)"), "{}", doc.describe());
+        assert_eq!(
+            std::fs::read_to_string(&out).expect("read"),
+            "ERROR b\r\nERROR d\r\nERROR f\r\n"
+        );
+        assert!(doc.stop_tee());
+        assert!(!doc.stop_tee());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
