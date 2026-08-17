@@ -80,7 +80,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+    WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_SYSKEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
@@ -173,6 +173,8 @@ struct Document {
     /// The ad-hoc colour labels in force — `(n, text)` — mirrored as rules at the front of the
     /// highlighter's set. Kept here so they can be listed and saved.
     labels: Vec<(u8, String)>,
+    /// E27's back/forward through views.
+    history: History,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -528,6 +530,7 @@ impl Document {
             bookmarks: Default::default(),
             palette: Palette::new(Command::entries()),
             labels: Vec::new(),
+            history: History::default(),
             pump: None,
             stream_done: false,
         })
@@ -577,6 +580,7 @@ impl Document {
             bookmarks: Default::default(),
             palette: Palette::new(Command::entries()),
             labels: Vec::new(),
+            history: History::default(),
             pump: Some(pump),
             stream_done: false,
         })
@@ -935,6 +939,70 @@ impl Document {
         }
     }
 
+    /// The view as it is now, for the history.
+    fn view_state(&self) -> ViewState {
+        ViewState {
+            chips: self.filtering.chips.clone(),
+            records_only: self.filtering.records_only,
+            row: self.view.grid().scroll().row,
+        }
+    }
+
+    /// Remembers the current view before it changes: the next `Alt+←` comes back here. A change
+    /// that leaves the view as it was is not remembered twice.
+    fn remember(&mut self) {
+        let now = self.view_state();
+        if self.history.back.last() == Some(&now) {
+            return;
+        }
+        self.history.back.push(now);
+        if self.history.back.len() > HISTORY_DEPTH {
+            self.history.back.remove(0);
+        }
+        self.history.forward.clear();
+    }
+
+    /// `Alt+←` / `Alt+→`. Reports whether there was somewhere to go.
+    fn history_step(&mut self, back: bool) -> bool {
+        let now = self.view_state();
+        let target = if back {
+            self.history.back.pop()
+        } else {
+            self.history.forward.pop()
+        };
+        let Some(state) = target else {
+            return false;
+        };
+        let other = if back {
+            &mut self.history.forward
+        } else {
+            &mut self.history.back
+        };
+        other.push(now);
+        if other.len() > HISTORY_DEPTH {
+            other.remove(0);
+        }
+        self.apply_view_state(state);
+        true
+    }
+
+    /// Puts a remembered view back: the chips and the collapse (with a pass if they changed), then
+    /// the row.
+    fn apply_view_state(&mut self, state: ViewState) {
+        let filter_changed = self.filtering.chips != state.chips
+            || self.filtering.records_only != state.records_only;
+        if filter_changed {
+            self.filtering.chips = state.chips;
+            self.filtering.records_only = state.records_only;
+            self.filtering.error = None;
+            self.filtering.clear_results();
+            self.refilter();
+            let rows = self.view_rows();
+            self.view.grid_mut().set_total_rows(rows);
+        }
+        self.view.grid_mut().scroll_to_row(state.row);
+    }
+
     /// Adds a chip and starts the pass over. A chip that does not parse is held in the title, as a
     /// bad pattern is; the chips already there stand.
     fn add_chip(&mut self, text: &str, polarity: Polarity) {
@@ -943,6 +1011,7 @@ impl Document {
         }
         match Chip::parse(text, polarity) {
             Ok(chip) => {
+                self.remember();
                 self.filtering.error = None;
                 self.filtering.chips.chips.push(chip);
                 self.filtering.clear_results();
@@ -954,6 +1023,10 @@ impl Document {
 
     /// Drops every chip and the survivors with them: the unfiltered view.
     fn clear_filter(&mut self) {
+        if !self.filtering.active() {
+            return;
+        }
+        self.remember();
         self.filtering.chips.chips.clear();
         self.filtering.error = None;
         self.filtering.clear_results();
@@ -1130,6 +1203,7 @@ impl Document {
         let Some(&file_row) = target else {
             return false;
         };
+        self.remember();
         let view_row = self.filtering.view_row(file_row);
         self.selection = Some(Selection::at(Position {
             row: view_row,
@@ -1146,6 +1220,7 @@ impl Document {
         if total == 0 {
             return;
         }
+        self.remember();
         let file_row = line.saturating_sub(1).min(total - 1);
         let view_row = self.filtering.view_row(file_row);
         self.selection = Some(Selection::at(Position {
@@ -1799,6 +1874,27 @@ struct Chrome {
     palette_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
 }
 
+/// E27 — `UI-DESIGN.md` §12's `Alt+←` / `Alt+→`: "back / forward through view states (nerdlog's
+/// idea — filter and position history)". A view state is the chips, the collapse and the top row;
+/// one is remembered before every change to the chips or the collapse and before every jump
+/// (go to line, a bookmark step), so `Alt+←` undoes the *view*, never the file.
+#[derive(Clone, Debug, Default)]
+struct History {
+    back: Vec<ViewState>,
+    forward: Vec<ViewState>,
+}
+
+/// One remembered way of looking at the file.
+#[derive(Clone, Debug, PartialEq)]
+struct ViewState {
+    chips: Chips,
+    records_only: bool,
+    row: u64,
+}
+
+/// The most states kept in either direction.
+const HISTORY_DEPTH: usize = 64;
+
 /// Every command the shell has, by name — what the palette lists and what the keys dispatch, so a
 /// binding and a palette entry cannot disagree about what a name does.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1819,6 +1915,8 @@ enum Command {
     GoToLine(u64),
     Label(u8),
     ClearLabels,
+    Back,
+    Forward,
     GoToTop,
     FollowTail,
     Copy,
@@ -1846,6 +1944,8 @@ impl Command {
         (Command::PreviousBookmark, "Previous bookmark", "Shift+F2"),
         (Command::Label(1), "Colour-label lines containing the selection", "Ctrl+Shift+1…9"),
         (Command::ClearLabels, "Clear colour labels", "Ctrl+Shift+0"),
+        (Command::Back, "Back to the previous view (filter and position)", "Alt+←"),
+        (Command::Forward, "Forward to the next view", "Alt+→"),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2708,6 +2808,7 @@ impl Shell {
             if doc.detection.accepted.is_none() {
                 return true;
             }
+            doc.remember();
             doc.filtering.records_only = !doc.filtering.records_only;
             doc.filtering.clear_results();
             doc.refilter();
@@ -2938,6 +3039,7 @@ impl Shell {
             Command::ClearFilter => doc.clear_filter(),
             Command::ToggleCollapse => {
                 if doc.detection.accepted.is_some() {
+                    doc.remember();
                     doc.filtering.records_only = !doc.filtering.records_only;
                     doc.filtering.clear_results();
                     doc.refilter();
@@ -2961,6 +3063,11 @@ impl Shell {
             }
             Command::ClearLabels => {
                 doc.clear_labels();
+            }
+            Command::Back | Command::Forward => {
+                if !doc.history_step(command == Command::Back) {
+                    return false;
+                }
             }
             Command::OpenFile
             | Command::Copy
@@ -3209,7 +3316,9 @@ impl Shell {
         match hit {
             Some(Hit::Tab(_)) => {}
             Some(Hit::Chip(i)) => {
-                if let Some(chip) = doc.filtering.chips.chips.get_mut(i) {
+                if i < doc.filtering.chips.chips.len() {
+                    doc.remember();
+                    let chip = &mut doc.filtering.chips.chips[i];
                     chip.enabled = !chip.enabled;
                     doc.filtering.clear_results();
                     doc.refilter();
@@ -3221,6 +3330,7 @@ impl Shell {
             }
             Some(Hit::ChipClose(i)) => {
                 if i < doc.filtering.chips.chips.len() {
+                    doc.remember();
                     doc.filtering.chips.chips.remove(i);
                     doc.filtering.clear_results();
                     doc.refilter();
@@ -3627,6 +3737,22 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 }
             });
             LRESULT(0)
+        }
+        // `Alt+←` / `Alt+→` — E27's back / forward through view states. An `Alt` chord arrives as a
+        // system key; anything else with `Alt` stays the system's (the window menu, `Alt+F4`).
+        WM_SYSKEYDOWN => {
+            let key = wparam.0 as u16;
+            if key == VK_LEFT.0 || key == VK_RIGHT.0 {
+                let moved = STATE.with(|s| {
+                    s.borrow_mut().as_mut().is_some_and(|shell| {
+                        shell.run(hwnd, if key == VK_LEFT.0 { Command::Back } else { Command::Forward })
+                    })
+                });
+                if moved {
+                    return LRESULT(0);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KEYDOWN => {
             let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
@@ -4817,6 +4943,52 @@ mod tests {
 
         assert!(!doc.label(0, "x"), "no label 0");
         assert!(!doc.label(10, "x"), "no label 10");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// E27: a chip, a collapse and a jump each leave the view they replaced on the back stack;
+    /// `Alt+←` restores it — the chips and the top row — and `Alt+→` redoes; a fresh change after
+    /// going back forgets the forward states.
+    #[test]
+    fn the_view_history_steps_back_through_filters_and_jumps() {
+        let path = scratch_log("tailhawk_history_test.log", 300);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.view.grid_mut().scroll_to_row(0);
+        assert!(!doc.history_step(true), "nothing behind yet");
+
+        doc.go_to_line(200);
+        let at_200 = doc.view.grid().scroll().row;
+        assert!(at_200 > 100);
+        filter_for(&mut doc, "7", Polarity::Include);
+        assert!(doc.filtering.active());
+        let survivors = doc.view_rows();
+
+        assert!(doc.history_step(true), "back: the filter goes");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_filter();
+        }
+        assert!(!doc.filtering.active(), "the unfiltered view is back");
+        assert_eq!(doc.view.grid().scroll().row, at_200, "at line 200 still");
+        assert!(doc.history_step(true), "back: the jump goes");
+        assert_eq!(doc.view.grid().scroll().row, 0);
+        assert!(!doc.history_step(true), "that was the first view");
+
+        assert!(doc.history_step(false), "forward: the jump");
+        assert_eq!(doc.view.grid().scroll().row, at_200);
+        assert!(doc.history_step(false), "forward: the filter");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_filter();
+        }
+        assert!(doc.filtering.active());
+        assert_eq!(doc.view_rows(), survivors);
+        assert!(!doc.history_step(false), "nothing further forward");
+
+        assert!(doc.history_step(true));
+        doc.go_to_line(5);
+        assert!(!doc.history_step(false), "a new change forgot the forward states");
         std::fs::remove_file(&path).ok();
     }
 
