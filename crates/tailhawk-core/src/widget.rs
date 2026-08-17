@@ -424,6 +424,22 @@ pub fn fit_from_left<'a>(
     (&text[start..], start)
 }
 
+/// The head of `text` that fits in `width` cells, on a cluster boundary — a status line cut from
+/// the right, where the least-changing part is.
+pub fn fit_from_right<'a>(cells: &crate::cell::CellModel, text: &'a str, width: usize) -> &'a str {
+    if cells.cell_count(text) <= width {
+        return text;
+    }
+    let mut end = 0;
+    for (i, g) in text.grapheme_indices(true) {
+        if cells.cell_count(&text[..i + g.len()]) > width {
+            break;
+        }
+        end = i + g.len();
+    }
+    &text[..end]
+}
+
 /// Which surface has the keyboard. The grid is the default; a field takes it while it is edited.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Focus {

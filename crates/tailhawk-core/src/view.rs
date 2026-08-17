@@ -83,6 +83,8 @@ pub struct View {
     /// The command bar's band, above the header — V14's chrome: the find field, the chip row.
     /// Same rule as the header; the two add up to [`View::top_inset`].
     chrome_px: f32,
+    /// The status bar's band, at the bottom. The grid gets the height above it.
+    footer_px: f32,
     /// The whole viewport height, so a header change can re-derive the grid's share.
     height_px: f32,
 }
@@ -98,6 +100,7 @@ impl View {
             cells: CellModel::new(),
             header_px: 0.0,
             chrome_px: 0.0,
+            footer_px: 0.0,
             height_px: 0.0,
         }
     }
@@ -106,14 +109,30 @@ impl View {
     pub fn set_header_px(&mut self, header_px: f32) {
         self.header_px = header_px.max(0.0);
         self.grid
-            .set_viewport_px((self.height_px - self.top_inset()).max(0.0));
+            .set_viewport_px((self.height_px - self.top_inset() - self.footer_px).max(0.0));
     }
 
     /// The command bar's height, above the header. See [`View::chrome_px`].
     pub fn set_chrome_px(&mut self, chrome_px: f32) {
         self.chrome_px = chrome_px.max(0.0);
         self.grid
-            .set_viewport_px((self.height_px - self.top_inset()).max(0.0));
+            .set_viewport_px((self.height_px - self.top_inset() - self.footer_px).max(0.0));
+    }
+
+    /// The status bar's height, at the bottom. It is drawn in `height_px - footer_px..height_px`.
+    pub fn set_footer_px(&mut self, footer_px: f32) {
+        self.footer_px = footer_px.max(0.0);
+        self.grid
+            .set_viewport_px((self.height_px - self.top_inset() - self.footer_px).max(0.0));
+    }
+
+    pub fn footer_px(&self) -> f32 {
+        self.footer_px
+    }
+
+    /// The whole viewport height, bands included.
+    pub fn height_px(&self) -> f32 {
+        self.height_px
     }
 
     /// The column header's height. It is drawn in `chrome_px..chrome_px + header_px`.
@@ -161,7 +180,7 @@ impl View {
         self.hgrid.set_viewport_px(width_px);
         self.height_px = height_px;
         self.grid
-            .set_viewport_px((height_px - self.top_inset()).max(0.0));
+            .set_viewport_px((height_px - self.top_inset() - self.footer_px).max(0.0));
     }
 
     /// A DPI or font-size change, both axes at once.

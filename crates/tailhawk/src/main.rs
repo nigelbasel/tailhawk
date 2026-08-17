@@ -132,6 +132,9 @@ struct Document {
     /// The tab strip's labels and which is this document — set by the shell before each frame,
     /// because a document knows nothing of the others. Empty or one label: no strip.
     tab_strip: (Vec<String>, usize),
+    /// The status bar's text — the title's status, set by the shell before each frame so the
+    /// document can draw it in the footer band. The title keeps it too: the harnesses read it there.
+    status: String,
     /// What §6.3's detector made of the newest member's head — the format, if one was accepted,
     /// the candidates if not. Run on the worker that opens the file, from the head sample only;
     /// §6.3's mid and tail samples are not taken yet.
@@ -210,7 +213,7 @@ impl RowSource for Document {
         self.header_text()
     }
 
-    /// The command bar: `⌕ [find] ▼ [+chip] [−chip] [add filter…]     · format`.
+    /// The command bar: `▸ [find] ▼ [+chip] [−chip] [add filter…]     · format`.
     ///
     /// Everything is placed in cells so it lines up with the rows. Fields are filled rectangles
     /// with their text over them; the focused one carries a caret and, while an IME composes, a
@@ -251,7 +254,7 @@ impl RowSource for Document {
         let text_y = strip + ((band - strip - row_h) / 2.0).floor();
         let mut x = cell_w * 0.5;
 
-        // ▸ and the find field. (`UI-DESIGN.md` §2.1's ⌕ is not in Cascadia Mono, and the painter
+        // ▸ and the find field. (`UI-DESIGN.md` §2.1's ▸ is not in Cascadia Mono, and the painter
         // has one face until fallback lands; a placeholder box is worse than a plain marker.)
         let _ = painter.lay_out_at(view, x, text_y, "▸", Colours::plain(HEADER_INK));
         x += cell_w * 2.0;
@@ -355,6 +358,18 @@ impl RowSource for Document {
                 let _ = painter.lay_out_at(view, fx, text_y, &text, Colours::plain(HEADER_INK));
             }
         }
+
+        // The status bar, at the bottom: what the title says, where a user looks. Cut from the
+        // right if it is longer than the window; the front is the part that changes.
+        let footer = view.footer_px();
+        if footer > 0.0 && !self.status.is_empty() {
+            let fy = view.height_px() - footer;
+            painter.fill(0.0, fy, width, footer, CHROME_BG);
+            let avail = ((width - cell_w) / cell_w).max(0.0) as usize;
+            let shown = tailhawk_core::widget::fit_from_right(cells, &self.status, avail);
+            let ty = fy + ((footer - row_h) / 2.0).floor();
+            let _ = painter.lay_out_at(view, cell_w * 0.5, ty, shown, Colours::plain(HEADER_INK));
+        }
     }
 
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
@@ -427,6 +442,7 @@ impl Document {
             filtering: Filtering::default(),
             chrome: Chrome::default(),
             tab_strip: (Vec::new(), 0),
+            status: String::new(),
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -469,6 +485,7 @@ impl Document {
             filtering: Filtering::default(),
             chrome: Chrome::default(),
             tab_strip: (Vec::new(), 0),
+            status: String::new(),
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -497,6 +514,7 @@ impl Document {
             0.0
         };
         self.view.set_chrome_px(strip + Chrome::height(row_h));
+        self.view.set_footer_px(Chrome::strip_height(row_h));
         self.view
             .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
@@ -1224,12 +1242,12 @@ impl Finder {
     /// "no matches" — that the pattern did not compile.
     fn describe(&self) -> Option<String> {
         if let Some(error) = &self.error {
-            return Some(format!("⌕ {} — {error}", self.query));
+            return Some(format!("▸ {} — {error}", self.query));
         }
         if self.query.is_empty() {
             return None;
         }
-        let mut text = format!("⌕ {}", self.query);
+        let mut text = format!("▸ {}", self.query);
         match (self.current, self.matches.len()) {
             (_, 0) if self.running.is_some() => text.push_str(" — searching…"),
             (_, 0) => text.push_str(" — no matches"),
@@ -1812,24 +1830,38 @@ impl Shell {
         }
     }
 
-    fn refresh_title(&self, hwnd: HWND) {
-        let mut title = String::from("Tailhawk");
+    /// The status: the driver, the document's description, the frame instrument. **In the title,
+    /// where a measurement rig can read it, and in the status bar, where a user does.**
+    fn status_text(&self) -> String {
+        let mut text = String::new();
         for part in [self.driver.as_deref(), self.file.as_deref()]
             .into_iter()
             .flatten()
         {
-            title.push_str(" — ");
-            title.push_str(part);
+            if !text.is_empty() {
+                text.push_str(" — ");
+            }
+            text.push_str(part);
         }
         // **The frame instrument, where a user and a measurement rig can both see it.** M4 asks for
         // "without dropped frames" and nothing in the product could say whether that held; the
         // throughput rig could only measure how long the window took to answer a message, which
         // counts a vsync-blocked Present the same as a seized thread.
         if let Some((p95, worst, over)) = self.frames.summary() {
-            title.push_str(&format!(
+            text.push_str(&format!(
                 " — frame p95 {p95:.1} ms, worst {worst:.1} ms, {over} over budget"
             ));
         }
+        text
+    }
+
+    fn refresh_title(&self, hwnd: HWND) {
+        let status = self.status_text();
+        let title = if status.is_empty() {
+            String::from("Tailhawk")
+        } else {
+            format!("Tailhawk — {status}")
+        };
         set_title(hwnd, &title);
         if self.pending.is_none() && self.reading.is_none() {
             stop_polling(hwnd);
@@ -1857,13 +1889,14 @@ impl Shell {
     }
 
     fn paint_inner(&mut self, hwnd: HWND) -> bool {
+        // The strip and the status are the shell's knowledge, handed to the document that draws them.
+        let strip = (self.document.labels(), self.document.active);
+        let status = self.status_text();
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
         let (w, h) = Self::client_size(hwnd);
         let mut rasterised = 0;
-        // The strip is the shell's knowledge handed to the document that draws it.
-        let strip = (self.document.labels(), self.document.active);
         let drawn = renderer
             .attach(WindowHandle(hwnd.0 as isize), w, h)
             .and_then(|()| match self.document.as_mut() {
@@ -1875,6 +1908,7 @@ impl Shell {
                     self.cell_w = cell.0;
                     self.cell_h = cell.1;
                     doc.tab_strip = strip;
+                    doc.status = status;
                     doc.lay_out(cell, (w, h));
                     // The highlighter's frame budget starts here, alongside the painter's own
                     // `begin_frame` inside `paint_rows` — one frame, one budget, §11.3.
@@ -3350,8 +3384,15 @@ mod tests {
     fn navigating_moves_by_the_amounts_the_key_map_promises() {
         let path = scratch_log("tailhawk_nav_test.log", 5_000);
         let mut doc = Document::open(&path).expect("open the fixture");
-        // 20 rows of 10 px in a 200 px grid — plus the command bar's band above it.
-        doc.lay_out((8.0, 10.0), (800, 200 + Chrome::height(10.0) as u32));
+        // 20 rows of 10 px in a 200 px grid — plus the command bar's band above and the status
+        // bar's below.
+        doc.lay_out(
+            (8.0, 10.0),
+            (
+                800,
+                200 + Chrome::height(10.0) as u32 + Chrome::strip_height(10.0) as u32,
+            ),
+        );
         assert_eq!(doc.set.total_rows(), 5_000);
         // A tail tool opens at the tail, following.
         assert_eq!(doc.view.grid().scroll().row, 4_980);
@@ -3858,7 +3899,7 @@ mod tests {
         assert!(doc.view.grid().is_following());
         assert_eq!(doc.row_text(299), Some("INFO line 299 fine"));
         assert_eq!(doc.row_text(298), Some("INFO line 298 fine"));
-        assert!(doc.describe().starts_with("⌕ "), "{}", doc.describe());
+        assert!(doc.describe().starts_with("▸ "), "{}", doc.describe());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -4175,6 +4216,7 @@ mod tests {
                 other => panic!("unknown step {other:?}"),
             }
         }
+        doc.status = format!("hardware — {}", doc.describe());
         doc.lay_out(cell, (w, h));
         doc.highlighter.begin_frame();
         let pixels = renderer.snapshot(w, h, &doc.view, &doc).expect("snapshot");
