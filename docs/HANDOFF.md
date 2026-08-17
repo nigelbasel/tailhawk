@@ -114,6 +114,8 @@ message must be moved to the un-nested one that causes it.**
 | **Column widths saved per file** (`columns = [...]`) | `FileState.columns` | test |
 | **Column reorder** — drag a header title onto another column; `Layout::order` (message last) drives header, presentation, boundaries | `Layout::move_column/shown_order`, `Document::drop_column` | headless (`order:0:1`) + test |
 | **Pushed to origin** (172 commits since M4) — CI's `cargo fmt --check` failed once on the day's work; formatted and pushed again | `.github/workflows/ci.yml` | CI |
+| **`--column-pattern=` / `--columns=none`** — a §6.5 DSL pattern taken as the format (not scored); detection off | `CLI_FORMATS`, `detect_set` | real binary: `pattern (command line)` in the title |
+| CI: the stdin spill DACL test accepts SDDL's `LA` alias for the built-in Administrator (the runner) | `stdin.rs` test | CI |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks

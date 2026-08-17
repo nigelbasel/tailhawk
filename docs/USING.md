@@ -15,6 +15,8 @@ type app.log | tailhawk -              # a pipe
 tailhawk -n 100 -f app.log             # tail's flags are accepted and mean the same
 tailhawk --filter=error --exclude=heartbeat app.log
 tailhawk --theme=light app.log         # dark | light | system
+tailhawk --column-pattern="<ts> [<thread>] <level> <logger> - <message>" app.log   # your own columns
+tailhawk --columns=none app.log        # no detection, plain lines
 tailhawk --stateless app.log           # remember nothing
 tailhawk --new-instance app.log        # a second window rather than a tab in the running one
 ```
