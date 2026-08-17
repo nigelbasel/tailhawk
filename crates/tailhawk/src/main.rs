@@ -62,8 +62,8 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L,
-    VK_LEFT, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP, VK_V, VK_X,
-    VK_Y, VK_Z,
+    VK_LEFT, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
+    VK_W, VK_X, VK_Y, VK_Z,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -129,6 +129,9 @@ struct Document {
     filtering: Filtering,
     /// The command bar: the find field, the chip row, the focus. See [`Chrome`].
     chrome: Chrome,
+    /// The tab strip's labels and which is this document — set by the shell before each frame,
+    /// because a document knows nothing of the others. Empty or one label: no strip.
+    tab_strip: (Vec<String>, usize),
     /// What §6.3's detector made of the newest member's head — the format, if one was accepted,
     /// the candidates if not. Run on the worker that opens the file, from the head sample only;
     /// §6.3's mid and tail samples are not taken yet.
@@ -218,13 +221,34 @@ impl RowSource for Document {
         let cell_w = painter.cell_width();
         let row_h = painter.row_height();
         let band = view.chrome_px();
-        let text_y = ((band - row_h) / 2.0).floor();
         let width = view.hgrid().viewport_px();
         let cells = view.cells();
         let mut hits = self.chrome.hits.borrow_mut();
         hits.clear();
 
         painter.fill(0.0, 0.0, width, band, CHROME_BG);
+
+        // The tab strip, when there is more than one tab: each file's name on its own fill, the
+        // shown one lighter, and a click on one shows it (`Hit::Tab`). Above the bar.
+        let (labels, active) = &self.tab_strip;
+        let strip = if labels.len() > 1 {
+            let strip_h = Chrome::strip_height(row_h);
+            let ty = ((strip_h - row_h) / 2.0).floor();
+            let mut tx = cell_w * 0.5;
+            for (i, label) in labels.iter().enumerate() {
+                let w = cells.cell_count(label) as f32 * cell_w;
+                let bg = if i == *active { TAB_ACTIVE_BG } else { TAB_BG };
+                painter.fill(tx - 2.0, 1.0, w + cell_w * 2.0 + 4.0, strip_h - 2.0, bg);
+                let ink = if i == *active { INK } else { HEADER_INK };
+                let _ = painter.lay_out_at(view, tx + cell_w, ty, label, Colours::plain(ink));
+                hits.push((tx..tx + w + cell_w * 2.0, Hit::Tab(i)));
+                tx += w + cell_w * 3.0;
+            }
+            strip_h
+        } else {
+            0.0
+        };
+        let text_y = strip + ((band - strip - row_h) / 2.0).floor();
         let mut x = cell_w * 0.5;
 
         // ▸ and the find field. (`UI-DESIGN.md` §2.1's ⌕ is not in Cascadia Mono, and the painter
@@ -390,6 +414,7 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             chrome: Chrome::default(),
+            tab_strip: (Vec::new(), 0),
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -431,6 +456,7 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             chrome: Chrome::default(),
+            tab_strip: (Vec::new(), 0),
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -451,9 +477,14 @@ impl Document {
         let (cell_w, row_h) = cell;
         self.view.set_metrics(cell_w, row_h);
         self.view.set_viewport(size.0 as f32, size.1 as f32);
-        // The command bar always; one row of header when there are columns. Set after the viewport,
-        // which is what both are subtracted from.
-        self.view.set_chrome_px(Chrome::height(row_h));
+        // The command bar always, the tab strip when there is more than one tab; one row of header
+        // when there are columns. Set after the viewport, which is what all three are subtracted from.
+        let strip = if self.tab_strip.0.len() > 1 {
+            Chrome::strip_height(row_h)
+        } else {
+            0.0
+        };
+        self.view.set_chrome_px(strip + Chrome::height(row_h));
         self.view
             .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
@@ -1405,6 +1436,7 @@ enum Hit {
     Find,
     NewChip,
     Chip(usize),
+    Tab(usize),
 }
 
 /// The bar's geometry, in cells. The find field is wide enough for a real query; the new-chip
@@ -1443,10 +1475,74 @@ impl Chrome {
         (row_h + 8.0).round()
     }
 
+    /// The tab strip's height, when it is drawn.
+    fn strip_height(row_h: f32) -> f32 {
+        (row_h + 4.0).round()
+    }
+
     /// The text of a field as it fits its width: cut from the left so the caret end is always on
     /// screen. Returns the text to draw and the byte offset the cut removed.
     fn fitted<'a>(cells: &CellModel, text: &'a str, width: usize) -> (&'a str, usize) {
         tailhawk_core::widget::fit_from_left(cells, text, width)
+    }
+}
+
+/// The open documents and which one is shown — V7's tabs, without the strip's chrome yet.
+///
+/// `as_ref` / `as_mut` answer for the **active** document, which is what every handler means by
+/// "the document"; the rest keep following in the background so switching to one is not a jump.
+#[derive(Default)]
+struct Tabs {
+    docs: Vec<Document>,
+    active: usize,
+}
+
+impl Tabs {
+    fn as_ref(&self) -> Option<&Document> {
+        self.docs.get(self.active)
+    }
+
+    fn as_mut(&mut self) -> Option<&mut Document> {
+        self.docs.get_mut(self.active)
+    }
+
+    /// Adds a document and makes it the shown one.
+    fn push(&mut self, doc: Document) {
+        self.docs.push(doc);
+        self.active = self.docs.len() - 1;
+    }
+
+    /// Closes the shown document. Returns whether any remain.
+    fn close_active(&mut self) -> bool {
+        if self.docs.is_empty() {
+            return false;
+        }
+        self.docs.remove(self.active);
+        if self.active >= self.docs.len() && !self.docs.is_empty() {
+            self.active = self.docs.len() - 1;
+        }
+        !self.docs.is_empty()
+    }
+
+    fn cycle(&mut self, forward: bool) {
+        let n = self.docs.len();
+        if n < 2 {
+            return;
+        }
+        self.active = if forward {
+            (self.active + 1) % n
+        } else {
+            (self.active + n - 1) % n
+        };
+    }
+
+    fn len(&self) -> usize {
+        self.docs.len()
+    }
+
+    /// The tab strip's labels — each document's file name — and which is active, for drawing.
+    fn labels(&self) -> Vec<String> {
+        self.docs.iter().map(|d| d.summary.clone()).collect()
     }
 }
 
@@ -1460,6 +1556,8 @@ const FIELD_SELECTION_BG: [f32; 4] = [0.20, 0.36, 0.60, 1.0];
 const CARET: [f32; 4] = [0.88, 0.89, 0.91, 1.0];
 const CHIP_INCLUDE_BG: [f32; 4] = [0.14, 0.26, 0.20, 1.0];
 const CHIP_EXCLUDE_BG: [f32; 4] = [0.30, 0.16, 0.16, 1.0];
+const TAB_BG: [f32; 4] = [0.13, 0.14, 0.17, 1.0];
+const TAB_ACTIVE_BG: [f32; 4] = [0.20, 0.22, 0.26, 1.0];
 
 /// One field: its text (cut from the left to fit), a hint when empty and unfocused, the selection
 /// as a background span, the caret as a two-pixel fill, and a mark under an IME composition.
@@ -1542,8 +1640,9 @@ enum Selecting {
 }
 
 struct Shell {
-    /// The measured cell width, for the command bar's hit-test. Zero until the first frame.
+    /// The measured cell size, for the command bar's hit-test. Zero until the first frame.
     cell_w: f32,
+    cell_h: f32,
     /// `None` until the worker hands the device over. While it is `None` the class background
     /// brush is doing the painting — stage one of the two-stage paint.
     renderer: Option<Renderer>,
@@ -1553,7 +1652,7 @@ struct Shell {
     driver: Option<String>,
     reading: Option<Receiver<std::result::Result<Document, String>>>,
     file: Option<String>,
-    document: Option<Document>,
+    document: Tabs,
     /// Set by [`Shell::paint`] when the frame rasterised glyphs, and acted on by `WM_PAINT` **after**
     /// it has validated the update region. See the comment in `paint`.
     /// When and where the last double-click landed, so the next click can be read as a triple.
@@ -1672,7 +1771,7 @@ impl Shell {
             Ok(Ok(document)) => {
                 self.reading = None;
                 self.file = Some(document.describe());
-                self.document = Some(document);
+                self.document.push(document);
                 self.refresh_title(hwnd);
                 // Tailing starts the moment there is something to tail.
                 unsafe {
@@ -1748,6 +1847,8 @@ impl Shell {
         };
         let (w, h) = Self::client_size(hwnd);
         let mut rasterised = 0;
+        // The strip is the shell's knowledge handed to the document that draws it.
+        let strip = (self.document.labels(), self.document.active);
         let drawn = renderer
             .attach(WindowHandle(hwnd.0 as isize), w, h)
             .and_then(|()| match self.document.as_mut() {
@@ -1757,6 +1858,8 @@ impl Shell {
                 Some(doc) => {
                     let cell = renderer.cell()?;
                     self.cell_w = cell.0;
+                    self.cell_h = cell.1;
+                    doc.tab_strip = strip;
                     doc.lay_out(cell, (w, h));
                     // The highlighter's frame budget starts here, alongside the painter's own
                     // `begin_frame` inside `paint_rows` — one frame, one budget, §11.3.
@@ -1918,6 +2021,26 @@ impl Shell {
         if !ctrl {
             return false;
         }
+        // §12: `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle the tabs, `Ctrl+W` closes the shown one. A last
+        // tab closed leaves the window open and empty, as a browser would not but a viewer should:
+        // the next `Ctrl+O` or drop fills it.
+        if key == VK_TAB.0 || key == VK_W.0 {
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            if key == VK_TAB.0 {
+                self.document.cycle(!shift);
+            } else {
+                self.document.close_active();
+                if self.document.len() == 0 {
+                    self.file = None;
+                }
+            }
+            self.retitle(hwnd);
+            self.sync_scrollbar(hwnd);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return true;
+        }
         // `Ctrl+O` is not here: the dialog pumps messages and `wndproc` would re-enter `STATE`
         // while this borrow is held. It is dispatched before the borrow, in `wndproc`.
         let Some(doc) = self.document.as_mut() else {
@@ -1959,7 +2082,6 @@ impl Shell {
     /// at start-up, and the title says "opening" until it lands — a large file takes seconds to
     /// index and a window that went blank without a word would look hung.
     fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
-        self.document = None;
         self.file = Some(format!("opening {}…", path.display()));
         self.reading = Some(spawn_open(move || Document::open(&path)));
         self.refresh_title(hwnd);
@@ -2264,16 +2386,31 @@ impl Shell {
             }
             return false;
         }
+        // The strip is the top band; a click there is a tab, and only a tab.
+        let in_strip = doc.tab_strip.0.len() > 1 && y < Chrome::strip_height(self.cell_h.max(1.0));
         let hit = doc
             .chrome
             .hits
             .borrow()
             .iter()
-            .find(|(range, _)| range.contains(&x))
+            .find(|(range, hit)| range.contains(&x) && matches!(hit, Hit::Tab(_)) == in_strip)
             .map(|(_, hit)| *hit);
         let (find_origin, chip_origin) = doc.chrome.origins.get();
         let cell_w = self.cell_w.max(1.0);
+        if let Some(Hit::Tab(i)) = hit {
+            self.document.active = i.min(self.document.len().saturating_sub(1));
+            self.retitle(hwnd);
+            self.sync_scrollbar(hwnd);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return true;
+        }
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
         match hit {
+            Some(Hit::Tab(_)) => {}
             Some(Hit::Chip(i)) => {
                 if i < doc.filtering.chips.chips.len() {
                     doc.filtering.chips.chips.remove(i);
@@ -2543,11 +2680,20 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // its byte budget and says whether more is waiting; a writer producing faster than the
             // tick just takes several ticks to catch up, which is §11.3's requirement — the UI stays
             // responsive, not every append lands in one go.
+            // Every tab follows, so switching to one is not a jump; only the shown one repaints.
             let grew = STATE.with(|s| {
-                s.borrow_mut()
-                    .as_mut()
-                    .and_then(|shell| shell.document.as_mut())
-                    .is_some_and(Document::poll_follow)
+                let mut state = s.borrow_mut();
+                let Some(shell) = state.as_mut() else {
+                    return false;
+                };
+                let active = shell.document.active;
+                let mut shown_grew = false;
+                for (i, doc) in shell.document.docs.iter_mut().enumerate() {
+                    if doc.poll_follow() && i == active {
+                        shown_grew = true;
+                    }
+                }
+                shown_grew
             });
             if grew {
                 // The counts moved, so the title is now wrong until it is rebuilt.
@@ -3005,12 +3151,13 @@ fn main() -> Result<()> {
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
             cell_w: 0.0,
+            cell_h: 0.0,
             renderer: None,
             pending: Some(rx),
             driver: None,
             reading,
 
-            document: None,
+            document: Tabs::default(),
 
             needs_frame: false,
             frames: Frames::new(),
@@ -4030,5 +4177,31 @@ mod tests {
             }
         }
         std::fs::write(path, out).expect("write the bmp");
+    }
+    /// V7's model: the shown tab is what every handler means by the document; cycling wraps; closing
+    /// the last leaves an empty shell rather than a dangling index.
+    #[test]
+    fn tabs_show_one_document_cycle_and_close_safely() {
+        let a = scratch_log("tailhawk_tabs_a.log", 10);
+        let b = scratch_log("tailhawk_tabs_b.log", 20);
+        let mut tabs = Tabs::default();
+        assert!(tabs.as_ref().is_none());
+        tabs.push(Document::open(&a).expect("a"));
+        tabs.push(Document::open(&b).expect("b"));
+        assert_eq!(tabs.active, 1, "a new tab is shown");
+        assert_eq!(tabs.as_ref().map(|d| d.set.total_rows()), Some(20));
+        tabs.cycle(true);
+        assert_eq!(tabs.active, 0);
+        tabs.cycle(false);
+        assert_eq!(tabs.active, 1);
+        assert_eq!(tabs.labels().len(), 2);
+        assert!(tabs.close_active());
+        assert_eq!(tabs.active, 0);
+        assert_eq!(tabs.as_ref().map(|d| d.set.total_rows()), Some(10));
+        assert!(!tabs.close_active());
+        assert!(tabs.as_ref().is_none());
+        assert!(!tabs.close_active(), "closing nothing is not an error");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }
