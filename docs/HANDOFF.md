@@ -6,7 +6,7 @@
 outstanding item — `verify-find.ps1` had never run, because the agent's shell had no desktop — ran
 this session and passed: `1 of 4` in the title, the current match painted orange on screen. Then
 E23: `semantic.rs`, §7.1's zero-config layer, wired beneath the search's matches and reaching pixels.
-Then the library half of E14, measured on 10 GB. **7 of M5's 10 items, and half of the eighth.**
+Then E14 in full — the pass measured on 10 GB, the filtered view on screen. **8 of M5's 10 items.**
 
 | | |
 |---|---|
@@ -84,37 +84,37 @@ the consumer needs "the *k*-th survivor" and a sorted `Vec<u64>` maintained by s
 same worker over a range**, never on the window thread, because §11.3 governs a follow tick as much
 as a frame.
 
-### ⛔ The next thing, precisely: the derived row space in the shell
+### ✅ E14, the shell half — the filter is on screen. **8 of M5's 10 items.**
 
-`sieve.rs` is a library and nothing calls it. What the shell needs, in the order to build it:
+Continued in the same session after the user said to. `Filtering` in `main.rs` is §7.3's
+**in-place hide**, and `tools/verify-filter.ps1` typed a chip into the shipped binary: **`▼ +error ·
+4000 of 200000` in the title, and only the ERROR rows on screen** (screenshot in `%TEMP%`).
 
-1. ~~**A scattered fetch.**~~ **Done, `e092679`.** `Rows` holds a row *list* (`line(row)` is a
-   binary search over a screenful), `Rows::fetch_rows(reader, index, &[u64], anchored)` does one
-   `offset_of_line` and one small stepped read per row, and `LogSet::fetch_rows(&[u64], anchored)`
-   splits by member as `fetch` does. Cached by the same key, so a frame showing the same filtered
-   rows reads nothing. **Not yet measured on the frame instrument** — that happens when step 2 calls
-   it. If fifty `offset_of_line` walks a viewport move turn out slow, have the sieve carry byte
-   offsets alongside rows (16 bytes a survivor); do not guess.
-2. **`Filtering` in `Document`**, alongside `Finder`: the `Chips`, the running `sieve::Running`, the
-   sorted `kept: Vec<u64>` maintained by `partition_point` + splice as `Finder::absorb` does, the
-   scanned count and outcome for the title. `lay_out` sets the grid's total to `kept.len()` when
-   chips exist and fetches `kept[visible]`; `row_text` / `row_anchors` / `row_spans` map view row →
-   `kept[row]` first. **Matches are real rows** — `finder.spans(kept[row], …)`, and `find_step`'s
-   `show_row` must land on the *view* row (`kept.partition_point`), skipping hidden matches or not
-   (decide, and say which; hiding a match the user stepped to is the surprising choice).
-3. **Growth.** In `poll_follow`, when the total grows from `a` to `b` and chips exist,
-   `sieve::start(chips, snapshot, a, b, …)` — a second `Running`, or a queue of ranges — and splice
-   what it returns. A truncate or retirement drops `kept` and re-runs over everything, as it drops
-   the matches. Following stays following: "at the bottom" is now the bottom of `kept`.
-4. **Keys**, per `UI-DESIGN.md` §12: `Ctrl+L` types an *include* chip into the window as `Ctrl+F`
-   types the query, `Ctrl+Shift+L` an *exclude*, `Enter` adds it and starts the pass, `Esc` clears the
-   chips. The title shows them — `▼ +timeout −DEBUG · 1,204 of 20,000 · scanning 62%` — as the find
-   fragment does. Record the "no chip row until M7" deviation in `CLEANROOM.md` as the find bar's was.
-5. **`tools/verify-filter.ps1`** on `Screen.ps1`: type a chip, count the rows on screen (every row
-   should carry the include's colour or text), read the title's count. Then §7.3's *split view* mode
-   is a second pane and belongs with M7's panes; **in-place hide is the mode to ship in M5**.
+| | |
+|---|---|
+| The row space | While chips exist the grid counts `kept.len()`, view row *k* is file row `kept[k]`, and `impl RowSource for Document` maps **every** row the painter, the selection and the clipboard name — one place, so nothing below it knows a filter is on |
+| The fetch | `Rows::fetch_rows` / `LogSet::fetch_rows` — one `offset_of_line` and one small stepped read per visible survivor, cached by the same key as a contiguous window |
+| Growth | `Filtering::covered`: `poll_follow` calls `refilter`, which sieves `[covered, total)` on the worker when no pass is running; `poll_filter` chains the next when one finishes. A truncate or retirement drops `kept` and starts over on the new bytes, as it drops the matches |
+| Matches | Stay **file rows**; `show_row` maps to the view row, and a hidden match lands on the next survivor so `F3` keeps moving through the file |
+| Keys | `Ctrl+L` include chip, `Ctrl+Shift+L` exclude, `Enter` adds it and starts the pass, `Backspace`, `Esc` unwinds — the finder first, then the chips. `Ctrl+F` and `Ctrl+L` close each other's half-typed field. The surrogate-joining is one function now, `push_typed_unit` |
+| Tests | `a_filtered_document_shows_only_the_rows_that_survive` (include, exclude composing, a match stepping into view space, clear); `a_chip_that_does_not_parse_is_reported_and_the_view_stands`; `a_filter_follows_growth_and_survives_a_truncate_by_starting_over` |
 
-After E14: **E24** ANSI/bidi/reveal-invisibles; **V5** columns, still without a producer until M6's
+**Following stays following through a filter**, and it bit the first test: a view at the bottom of
+six survivors is "at the bottom", so clearing the chips keeps it at the bottom of three hundred rows.
+That is what a tail should do; the test now asserts it. `poll_filter` re-pins the bottom as chunks
+land for the same reason `poll_follow` does.
+
+**Absent, and recorded in `CLEANROOM.md`:** the chip row (per-chip toggle, reorder, edit — M7's
+widgets), §7.3's 300 ms debounce (the pass starts on `Enter`), and the **split view** (a second
+pane; M7). `verify-filter.ps1`'s title regex was fixed after the run shown above and has not been
+re-run since — the desktop was in use; the pixel counts and the count in the title were right on that
+run.
+
+**⚠ Not measured:** the frame instrument with a filter on. The scattered fetch is fifty
+`offset_of_line` walks per viewport move; if `frame p95` says so, have the sieve carry byte offsets
+alongside rows. `verify-filter.ps1` prints the title, so the number is there to read next run.
+
+**Next:** **E24** ANSI/bidi/reveal-invisibles; **V5** columns, still without a producer until M6's
 detection. The command bar is M7's widget layer.
 
 ---
