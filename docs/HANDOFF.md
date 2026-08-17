@@ -33,13 +33,15 @@ remembered per file. **`Ctrl+Enter`** opens a **record detail pane** at the bott
 wrapped, the stack trace under it; JSON pretty-printed on request); **`Alt+←` / `Alt+→`** step back and
 forward through views (filters, collapse, jumps); the palette can **export the visible rows to a
 file** or **tee** them live as the log grows (Hoo WinTail's tee); `Ctrl+Shift+C` copies as TSV.
+**`Ctrl+\` splits** the pane: the full stream above, a second pane on the same file below with its own
+filter (klogg's filtered pane), `F6` swaps focus.
 
 **Tabs:** several files in one window (`Ctrl+O` / drop open a new tab, `Ctrl+Tab` switches, `Ctrl+W`
 closes); several paths on the command line open together; a directory or `dir*.log` is watched and
 new files join as tabs. A **status bar** says whether the view is following. **Remembered between
 runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
-**Missing before daily use is comfortable:** no split view, no menus (the palette is the discovery
+**Missing before daily use is comfortable:** no menus (the palette is the discovery
 surface), no chip edit/reorder, no column resize/reorder/hide; no user highlight-rules editor or
 format wizard (colour labels are the stand-in); no installer or signing.
 
@@ -87,6 +89,8 @@ message must be moved to the un-nested one that causes it.**
 | **E27 view history** — `Alt+←`/`Alt+→` over (chips, collapse, top row), remembered before every chip change, collapse, go-to-line and bookmark step | `History`, `Document::remember/history_step` | test |
 | **V10 record detail pane** — `Ctrl+Enter`; `detail.rs` composes fields / rule / body (wrapped, hanging indent) / tail into lines; walks back to the record's first line; JSON re-indent (a formatter, not a parser); pane rows fetched with the frame's | `detail.rs` (6 tests), `DetailPane`, `Document::compose_detail` | headless + test |
 | **E21 export + tee** — `export.rs`: a worker pass writing every row or the filter's survivors (moving cursor), progress + outcome, append; the shell's `Tee` runs the current view then each tick's judged growth; Save dialog deferred to `wndproc`; status bar shows the count; `Ctrl+Shift+C` TSV | `export.rs` (2 tests), `Tee`, `Document::poll_tee/copy_tsv` | test |
+| **Split view** — `Ctrl+\` / `F6`; a tab is one or two panes, each a whole `Document` on the same path (a second handle + index — said in `CLEANROOM.md`); `Renderer::paint_panes` lays each out and shifts its instances down; mouse routed by pane, keyboard to the focused pane; top pane has the strip, bottom the status bar | `Tab`, `Tabs::split/focus_pane`, `pane_tops`, `Painter::mark/shift` | headless (`TAILHAWK_SHOT_SPLIT=ERR`) + test |
+| ⚠ **Fixed: the gutter stretched every frame** — `paint_rows` gave the shader the horizontal grid's width (client minus gutter) as the pixel scale for two commits; the whole client width now | `lib.rs` | headless, compared |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
