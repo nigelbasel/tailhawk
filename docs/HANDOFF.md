@@ -50,6 +50,9 @@ resize or hide; widths are not yet saved per file); no user highlight-rules edit
 format wizard UI (`tailhawk.rules.toml` holds user highlight rules — the palette opens it; colour labels
 are the quick form); no installer or signing.
 
+**How to use it:** `docs/USING.md` — one page: running, every key, the filter grammar, the rules
+file, export/tee, what is remembered.
+
 **After that:** RDP-friendly rendering (M7b), the last of M8 (i18n externalisation), docs, installer and
 signing (M9). In plan terms: the rest of M7 (sort, rules editor / format wizard, column reorder), then
 M7b, M8, M9. **`tools/verify-uia.ps1` is the automated interaction test** — it drives the shipped binary
@@ -57,7 +60,7 @@ through UI Automation and needs no free desktop.
 
 ---
 
-## 🚧 M7 in progress — the widget layer, the command bar — 2026-08-17, session 18 (continued)
+## ✅ M7 delivered less E22 and V9's editor UI — 2026-08-17/18, session 18 (scored in `EFFORT.md`)
 
 **M6 scored and closed** (`EFFORT.md`; V9 moved here). **M7 forecast registered before starting**
 (19.8 h / 3.0 M; V14 named as the new shape and the risk).
