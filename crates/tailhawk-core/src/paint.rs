@@ -228,6 +228,12 @@ impl Painter {
                     });
                     total.quads += 1;
                 }
+                if let Some((glyph, ink)) = source.row_glyph(row) {
+                    let mut text = [0u8; 4];
+                    self.spans = spans;
+                    let _ = self.lay_out_at(view, cell_w, y, glyph.encode_utf8(&mut text), Colours::plain(ink));
+                    spans = std::mem::take(&mut self.spans);
+                }
                 if let Some(n) = source.row_number(row) {
                     let text = n.to_string();
                     let width = ((gutter / cell_w) as usize).saturating_sub(1);

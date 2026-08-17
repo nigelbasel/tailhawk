@@ -134,6 +134,13 @@ pub trait RowSource {
         None
     }
 
+    /// `UI-DESIGN.md` §11.2's severity glyph — the **redundant non-colour channel** beside the line
+    /// number: `■` fatal, `▲` error, `△` warning, `·` debug and trace, nothing for info or no
+    /// severity. With its ink. Default: none.
+    fn row_glyph(&self, _row: u64) -> Option<(char, [f32; 4])> {
+        None
+    }
+
     /// Draws the source's command bar into `View::chrome_px`'s band, with the painter's
     /// [`fill`](crate::paint::Painter::fill) and [`lay_out_at`](crate::paint::Painter::lay_out_at).
     /// Called once per frame before the rows, only when the band has height. Default: nothing.

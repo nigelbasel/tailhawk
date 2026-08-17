@@ -38,7 +38,8 @@ use tailhawk_core::template;
 use tailhawk_core::widget::{Focus, Move, TextField};
 use tailhawk_core::theme::{self, theme, Theme};
 use tailhawk_core::{
-    Position, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, RENDER_CAP_CELLS,
+    Position, Renderer, RowEnd, RowSource, Selection, SeverityBand, View, WindowHandle,
+    RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -257,6 +258,22 @@ impl RowSource for Document {
     fn row_mark(&self, row: u64) -> Option<[f32; 4]> {
         let file_row = self.filtering.file_row(row)?;
         self.bookmarks.contains(&file_row).then_some(theme().bookmark_mark)
+    }
+
+    fn row_glyph(&self, row: u64) -> Option<(char, [f32; 4])> {
+        let format = self.detection.accepted?;
+        let file_row = self.filtering.file_row(row)?;
+        let raw = self.set.row_text(file_row)?;
+        let severity = format.parse(raw)?.severity_number?;
+        let t = theme();
+        Some(match severity.band() {
+            SeverityBand::Fatal => ('■', t.semantic.fatal),
+            SeverityBand::Error => ('▲', t.semantic.error),
+            SeverityBand::Warn => ('△', t.semantic.warn),
+            SeverityBand::Info => return None,
+            SeverityBand::Debug => ('·', t.semantic.debug),
+            SeverityBand::Trace => ('·', t.semantic.trace),
+        })
     }
 
     /// §7.1's colours: the search's matches on top, the semantic catalogue beneath. **Visible rows
@@ -691,7 +708,7 @@ impl Document {
             // and a cell after. Sized from the file rather than the view, so it does not jump
             // when a filter is applied.
             let digits = self.set.total_rows().max(1).ilog10() as f32 + 1.0;
-            self.view.set_gutter_px((digits + 2.0) * cell_w);
+            self.view.set_gutter_px((digits + 3.0) * cell_w);
             self.view.grid_mut().set_total_rows(rows);
             if self.open_at_tail && rows > 0 {
                 self.view.grid_mut().scroll_to_bottom();
@@ -5851,7 +5868,7 @@ mod tests {
         doc.lay_out((8.0, 10.0), (800, 200));
         assert_eq!(doc.row_number(0), Some(1));
         assert_eq!(doc.row_number(119), Some(120));
-        assert_eq!(doc.view.gutter_px(), (3.0 + 2.0) * 8.0, "three digits, a mark, a gap");
+        assert_eq!(doc.view.gutter_px(), (3.0 + 3.0) * 8.0, "three digits, a mark, a glyph, a gap");
 
         // No caret: the top row is current. The file opened at its tail; go to the top first.
         doc.view.grid_mut().scroll_to_row(0);
@@ -5872,7 +5889,7 @@ mod tests {
         assert!(doc.view_rows() < 120);
         assert_eq!(doc.row_number(0), Some(8), "view row 0 is file line 8");
         assert!(doc.bookmarks.contains(&30), "hidden, but not lost");
-        assert_eq!(doc.view.gutter_px(), (3.0 + 2.0) * 8.0, "sized from the file");
+        assert_eq!(doc.view.gutter_px(), (3.0 + 3.0) * 8.0, "sized from the file");
 
         // Stepping: from the top (file 7) forward lands on 30's survivor slot... which is hidden,
         // so `show_row` shows the next survivor; the caret goes to that view row.
