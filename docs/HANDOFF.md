@@ -34,7 +34,8 @@ wrapped, the stack trace under it; JSON pretty-printed on request); **`Alt+←` 
 forward through views (filters, collapse, jumps); the palette can **export the visible rows to a
 file** or **tee** them live as the log grows (Hoo WinTail's tee); `Ctrl+Shift+C` copies as TSV.
 **`Ctrl+\` splits** the pane: the full stream above, a second pane on the same file below with its own
-filter (klogg's filtered pane), `F6` swaps focus.
+filter (klogg's filtered pane), `F6` swaps focus. **Dark and light themes** (`--theme=dark|light|system`,
+or switch from the palette); High Contrast respected.
 
 **Tabs:** several files in one window (`Ctrl+O` / drop open a new tab, `Ctrl+Tab` switches, `Ctrl+W`
 closes); several paths on the command line open together; a directory or `dir*.log` is watched and
@@ -91,12 +92,13 @@ message must be moved to the un-nested one that causes it.**
 | **E21 export + tee** — `export.rs`: a worker pass writing every row or the filter's survivors (moving cursor), progress + outcome, append; the shell's `Tee` runs the current view then each tick's judged growth; Save dialog deferred to `wndproc`; status bar shows the count; `Ctrl+Shift+C` TSV | `export.rs` (2 tests), `Tee`, `Document::poll_tee/copy_tsv` | test |
 | **Split view** — `Ctrl+\` / `F6`; a tab is one or two panes, each a whole `Document` on the same path (a second handle + index — said in `CLEANROOM.md`); `Renderer::paint_panes` lays each out and shifts its instances down; mouse routed by pane, keyboard to the focused pane; top pane has the strip, bottom the status bar | `Tab`, `Tabs::split/focus_pane`, `pane_tops`, `Painter::mark/shift` | headless (`TAILHAWK_SHOT_SPLIT=ERR`) + test |
 | ⚠ **Fixed: the gutter stretched every frame** — `paint_rows` gave the shader the horizontal grid's width (client minus gutter) as the pixel scale for two commits; the whole client width now | `lib.rs` | headless, compared |
+| **V13 theming** — `theme.rs`: one `Theme` (dark / light / High Contrast from `GetSysColor`) in a process-wide slot read per frame by the painter, highlighter, semantic catalogue and shell; `--theme=dark|light|system` (registry `AppsUseLightTheme`), saved under `[appearance]`; palette command switches at runtime (catalogues rebuilt, labels re-added, class brush replaced); HC suppresses rules with a status chip | `theme.rs` (4 tests), `resolve_theme`, `Shell::toggle_theme` | headless (`TAILHAWK_SHOT_THEME=light`) |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Next in M7:** tab drag-reorder; **V13** theming; V12 pointer
+**Next in M7:** tab drag-reorder; V12 pointer
 scroll; V15 UIA; E22 sort; V9 rules editor / wizard; chip edit/reorder; column resize. **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
