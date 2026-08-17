@@ -45,7 +45,7 @@ new files join as tabs. A **status bar** says whether the view is following. **R
 runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
 **Missing before daily use is comfortable:** no menus (the palette is the discovery
-surface), no column reorder (drag a header boundary to resize or hide); no user highlight-rules editor or
+surface); columns resize, hide and reorder by header drag; no user highlight-rules editor or
 format wizard UI (`tailhawk.rules.toml` holds user highlight rules — the palette opens it; colour labels
 are the quick form); no installer or signing.
 
@@ -112,12 +112,14 @@ message must be moved to the un-nested one that causes it.**
 | **User highlight rules** (V9's rules; the file is the editor) — `tailhawk.rules.toml` in the tiers: `[[rule]]` name/pattern/fg/bg/whole_line/enabled/case; layered catalogue → rules → labels; broken rules named in the status bar; palette *Edit highlight rules…* / *Reload*; **backgrounds now tint under the ink** (`claim_bg`), so labels and tints keep timestamp/level colours | `rules.rs` (4 tests), `rebuild_highlighter_with`, `highlight::claim_bg` | headless (`rules:<file>`) + test |
 | **First-run surface** — no file: welcome, drop-or-`Ctrl+O`, recent files (click opens), the §13.2 claim; `Welcome` is a `RowSource` | `Welcome`, `paint_inner` | headless (`TAILHAWK_SHOT_WELCOME=1`) |
 | **Column widths saved per file** (`columns = [...]`) | `FileState.columns` | test |
+| **Column reorder** — drag a header title onto another column; `Layout::order` (message last) drives header, presentation, boundaries | `Layout::move_column/shown_order`, `Document::drop_column` | headless (`order:0:1`) + test |
+| **Pushed to origin** (172 commits since M4) — CI's `cargo fmt --check` failed once on the day's work; formatted and pushed again | `.github/workflows/ci.yml` | CI |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Left of M7:** E22 sort/top-N; V9's rules *editor* and format wizard UI (the rules file works); column reorder; Mica; `WM_POINTER` inertia (a wheel notch is eased now). **The
+**Left of M7:** E22 sort/top-N; V9's rules *editor* and format wizard UI (the rules file works); Mica; `WM_POINTER` inertia (a wheel notch is eased now). **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
 Save dialog.
