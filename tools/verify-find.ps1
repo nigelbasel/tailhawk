@@ -75,10 +75,13 @@ try {
     if ($proc.HasExited) { $failures += 'the process exited' }
     if ($failures) {
         $failures | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }
-        exit 1
+        $failed = $true
+    } else {
+        Write-Host 'PASS' -ForegroundColor Green
     }
-    Write-Host 'PASS' -ForegroundColor Green
 }
 finally {
+    # An `exit` inside the try would skip this block and leak the window; the exit code waits.
     if (-not $KeepWindow -and -not $proc.HasExited) { $proc.Kill() }
 }
+if ($failed) { exit 1 }

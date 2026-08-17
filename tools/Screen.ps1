@@ -88,13 +88,19 @@ function Start-Tailhawk([string]$Log) {
     # is sent only while some *other* window is in front, because an Alt delivered to our own
     # window puts it into menu mode and every key after it is swallowed.
     $wsh = New-Object -ComObject WScript.Shell
-    $null = Wait-For {
-        if ([Shot]::GetForegroundWindow() -eq $hwnd) { return $true }
-        $wsh.SendKeys('%')
-        $wsh.AppActivate($proc.Id) | Out-Null
-        Start-Sleep -Milliseconds 100
-        [Shot]::GetForegroundWindow() -eq $hwnd
-    } 'the window to take the foreground' 10
+    try {
+        $null = Wait-For {
+            if ([Shot]::GetForegroundWindow() -eq $hwnd) { return $true }
+            $wsh.SendKeys('%')
+            $wsh.AppActivate($proc.Id) | Out-Null
+            Start-Sleep -Milliseconds 100
+            [Shot]::GetForegroundWindow() -eq $hwnd
+        } 'the window to take the foreground (is someone using the desktop?)' 10
+    } catch {
+        # The caller has no handle yet, so this is the only place that can close the window.
+        if (-not $proc.HasExited) { $proc.Kill() }
+        throw
+    }
     Start-Sleep -Milliseconds 400
     $proc
 }
