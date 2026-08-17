@@ -48,9 +48,10 @@ surface), no column reorder (drag a header boundary to
 resize or hide; widths are not yet saved per file); no user highlight-rules editor or
 format wizard (colour labels are the stand-in); no installer or signing.
 
-**After that:** CLI flags (`-n`, `-f`; `--filter`/`--exclude`/`--theme` exist), RDP-friendly rendering, UI
-Automation, docs and the ship work. In plan terms: the rest of M7 (tab drag, UIA, sort, rules
-editor / format wizard, column resize), then M7b, M8, M9.
+**After that:** RDP-friendly rendering (M7b), the last of M8 (i18n externalisation), docs, installer and
+signing (M9). In plan terms: the rest of M7 (sort, rules editor / format wizard, column reorder), then
+M7b, M8, M9. **`tools/verify-uia.ps1` is the automated interaction test** — it drives the shipped binary
+through UI Automation and needs no free desktop.
 
 ---
 
@@ -103,12 +104,13 @@ message must be moved to the un-nested one that causes it.**
 | **Severity glyph** in the gutter (`■ ▲ △ ·`) — §11.2's non-colour channel | `RowSource::row_glyph` | headless |
 | **Column resize / hide** — drag a header boundary (within a cell), zero hides, double-click resets one, palette *Reset column widths* resets all; header follows | `Document::column_boundaries/header_hit/resize_to`, `column_defaults` | headless (`width:0:10;width:1:0`) + test |
 | **Drag-reorder** — tabs and chips move by drag along the bar; middle-click closes a tab | `BarDrag`, `Shell::drop_bar_drag/tab_at`, `WM_MBUTTONDOWN` | not seen (desktop busy) |
+| **V15 UIA chrome provider** — `WM_GETOBJECT` → fragment root; children from `Chrome::hits`: tabs (TabItem/SelectionItem), fields (Edit/Value — SetValue searches / adds a chip), chips (Button/Toggle/Invoke), status (StatusBar/Value), palette query; names, ids (`find`, `chip-0`, `tab-1`, `status`), types, screen bounds, focus | `mod uia` | **`tools/verify-uia.ps1` on the real binary — 11 checks pass, needs no foreground** |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Next in M7:** V15 UIA; E22 sort; V9 rules editor / wizard; column reorder + saved widths; `WM_POINTER` inertia (a wheel notch is eased now). **The
+**Next in M7:** E22 sort; V9 rules editor / wizard; column reorder + saved widths; `WM_POINTER` inertia (a wheel notch is eased now). **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
 Save dialog.
