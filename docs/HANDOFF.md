@@ -45,8 +45,7 @@ new files join as tabs. A **status bar** says whether the view is following. **R
 runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
 **Missing before daily use is comfortable:** no menus (the palette is the discovery
-surface), no column reorder (drag a header boundary to
-resize or hide; widths are not yet saved per file); no user highlight-rules editor or
+surface), no column reorder (drag a header boundary to resize or hide); no user highlight-rules editor or
 format wizard UI (`tailhawk.rules.toml` holds user highlight rules — the palette opens it; colour labels
 are the quick form); no installer or signing.
 
@@ -111,12 +110,14 @@ message must be moved to the un-nested one that causes it.**
 | **Drag-reorder** — tabs and chips move by drag along the bar; middle-click closes a tab | `BarDrag`, `Shell::drop_bar_drag/tab_at`, `WM_MBUTTONDOWN` | not seen (desktop busy) |
 | **V15 UIA chrome provider** — `WM_GETOBJECT` → fragment root; children from `Chrome::hits`: tabs (TabItem/SelectionItem), fields (Edit/Value — SetValue searches / adds a chip), chips (Button/Toggle/Invoke), status (StatusBar/Value), palette query; names, ids (`find`, `chip-0`, `tab-1`, `status`), types, screen bounds, focus | `mod uia` | **`tools/verify-uia.ps1` on the real binary — 11 checks pass, needs no foreground** |
 | **User highlight rules** (V9's rules; the file is the editor) — `tailhawk.rules.toml` in the tiers: `[[rule]]` name/pattern/fg/bg/whole_line/enabled/case; layered catalogue → rules → labels; broken rules named in the status bar; palette *Edit highlight rules…* / *Reload*; **backgrounds now tint under the ink** (`claim_bg`), so labels and tints keep timestamp/level colours | `rules.rs` (4 tests), `rebuild_highlighter_with`, `highlight::claim_bg` | headless (`rules:<file>`) + test |
+| **First-run surface** — no file: welcome, drop-or-`Ctrl+O`, recent files (click opens), the §13.2 claim; `Welcome` is a `RowSource` | `Welcome`, `paint_inner` | headless (`TAILHAWK_SHOT_WELCOME=1`) |
+| **Column widths saved per file** (`columns = [...]`) | `FileState.columns` | test |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Next in M7:** E22 sort; V9's rules *editor* and format wizard UI (the rules file works); column reorder + saved widths; `WM_POINTER` inertia (a wheel notch is eased now). **The
+**Left of M7:** E22 sort/top-N; V9's rules *editor* and format wizard UI (the rules file works); column reorder; Mica; `WM_POINTER` inertia (a wheel notch is eased now). **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
 Save dialog.
