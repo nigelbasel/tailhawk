@@ -44,7 +44,8 @@ new files join as tabs. A **status bar** says whether the view is following. **R
 runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
 **Missing before daily use is comfortable:** no menus (the palette is the discovery
-surface), no chip reorder (`Ctrl+click` edits one), no column resize/reorder/hide; no user highlight-rules editor or
+surface), no chip reorder (`Ctrl+click` edits one), no column reorder (drag a header boundary to
+resize or hide; widths are not yet saved per file); no user highlight-rules editor or
 format wizard (colour labels are the stand-in); no installer or signing.
 
 **After that:** CLI flags (`-n`, `-f`; `--filter`/`--exclude`/`--theme` exist), RDP-friendly rendering, UI
@@ -100,13 +101,14 @@ message must be moved to the un-nested one that causes it.**
 | **E17** `tail` flags accepted (`-n N -f -F -c -q -v`, `-n100`) | `main` | — |
 | **E18 single instance** — per-session mutex, named pipe `\.\pipe\Tailhawk-instance` (length-prefixed UTF-16 paths), exit 3, receiver opens tabs + `SetForegroundWindow`; `--new-instance` opts out | `mod single` (1 test) | **two real processes**: second exited 3 in 144 ms, its file appeared in the first's title |
 | **Severity glyph** in the gutter (`■ ▲ △ ·`) — §11.2's non-colour channel | `RowSource::row_glyph` | headless |
+| **Column resize / hide** — drag a header boundary (within a cell), zero hides, double-click resets one, palette *Reset column widths* resets all; header follows | `Document::column_boundaries/header_hit/resize_to`, `column_defaults` | headless (`width:0:10;width:1:0`) + test |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
 **Next in M7:** tab drag-reorder; V15 UIA; E22 sort; V9 rules editor / wizard; chip reorder;
-column resize/reorder/hide; `WM_POINTER` inertia (a wheel notch is eased now). **The
+column reorder + saved widths; `WM_POINTER` inertia (a wheel notch is eased now). **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
 Save dialog.
