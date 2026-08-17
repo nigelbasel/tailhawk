@@ -126,7 +126,7 @@ pub struct Laid {
 }
 
 impl Laid {
-    fn merge(&mut self, other: Laid) {
+    pub fn merge(&mut self, other: Laid) {
         self.quads += other.quads;
         self.queued += other.queued;
         self.rtl_runs += other.rtl_runs;
@@ -531,6 +531,20 @@ impl Painter {
     }
 
     /// Draws the frame. The render target and viewport must already be set.
+    /// How many instances the frame holds so far — the start of a pane, for [`Painter::shift`].
+    pub fn mark(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Moves every instance laid out since `from` by `(dx, dy)`: a pane drawn at an offset.
+    pub fn shift(&mut self, from: usize, dx: f32, dy: f32) {
+        let from = from.min(self.instances.len());
+        for instance in &mut self.instances[from..] {
+            instance.pos[0] += dx;
+            instance.pos[1] += dy;
+        }
+    }
+
     pub fn draw(&self, context: &ID3D11DeviceContext, viewport: (u32, u32)) -> Result<()> {
         self.pipeline
             .draw(context, self.cache.sheet(), viewport, &self.instances)

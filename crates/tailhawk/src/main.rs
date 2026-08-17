@@ -68,9 +68,10 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
-    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_G, VK_HOME,
+    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G, VK_HOME,
     VK_I, VK_K, VK_L,
-    VK_LEFT, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
+    VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VK_V,
     VK_W, VK_X, VK_Y, VK_Z,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
@@ -182,6 +183,10 @@ struct Document {
     detail: DetailPane,
     /// E21's export or live tee, while one is in progress.
     tee: Option<Tee>,
+    /// Whether this pane draws the status bar — the bottom pane of a split does, the top does not.
+    show_footer: bool,
+    /// Where this pane's top edge is in the client, so a click can be made pane-relative.
+    pane_top: f32,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -400,7 +405,11 @@ impl RowSource for Document {
 
         // V10: the detail pane, above the status bar. The first line is the record's title; the
         // rest its fields, body and tail; a pane too short for them says how many are left.
-        let strip = Chrome::strip_height(row_h);
+        let strip = if self.show_footer {
+            Chrome::strip_height(row_h)
+        } else {
+            0.0
+        };
         if self.detail.open && self.detail.rows > 0 && !self.detail.lines.is_empty() {
             let pane_h = DetailPane::height(self.detail.rows, row_h);
             let top = view.height_px() - strip - pane_h;
@@ -566,6 +575,8 @@ impl Document {
             history: History::default(),
             detail: DetailPane::default(),
             tee: None,
+            show_footer: true,
+            pane_top: 0.0,
             pump: None,
             stream_done: false,
         })
@@ -618,6 +629,8 @@ impl Document {
             history: History::default(),
             detail: DetailPane::default(),
             tee: None,
+            show_footer: true,
+            pane_top: 0.0,
             pump: Some(pump),
             stream_done: false,
         })
@@ -649,9 +662,13 @@ impl Document {
             0
         };
         self.detail.rows = pane_rows;
-        self.view.set_footer_px(
-            Chrome::strip_height(row_h) + DetailPane::height(pane_rows, row_h),
-        );
+        let footer = if self.show_footer {
+            Chrome::strip_height(row_h)
+        } else {
+            0.0
+        };
+        self.view
+            .set_footer_px(footer + DetailPane::height(pane_rows, row_h));
         self.view
             .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
@@ -2256,6 +2273,8 @@ enum Command {
     Tee,
     StopTee,
     CopyTsv,
+    Split,
+    FocusOtherPane,
     GoToTop,
     FollowTail,
     Copy,
@@ -2291,6 +2310,8 @@ impl Command {
         (Command::Tee, "Tee: keep writing the visible rows to a file as they arrive…", ""),
         (Command::StopTee, "Stop the tee", ""),
         (Command::CopyTsv, "Copy selection as TSV with columns", "Ctrl+Shift+C"),
+        (Command::Split, "Split the pane / unsplit", "Ctrl+\\"),
+        (Command::FocusOtherPane, "Focus the other pane", "F6"),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2383,39 +2404,113 @@ impl Chrome {
 /// "the document"; the rest keep following in the background so switching to one is not a jump.
 #[derive(Default)]
 struct Tabs {
-    docs: Vec<Document>,
+    tabs: Vec<Tab>,
     active: usize,
+}
+
+/// One tab: a pane, or two stacked — `SPEC.md` §7.3's split view, `UI-DESIGN.md` §3. Each pane
+/// is a whole [`Document`] on the same path (see `CLEANROOM.md`, 2026-08-17: a second handle and
+/// index rather than two views over one document); the keyboard goes to the focused one.
+struct Tab {
+    panes: Vec<Document>,
+    focused: usize,
+}
+
+impl Tab {
+    fn one(doc: Document) -> Self {
+        Self {
+            panes: vec![doc],
+            focused: 0,
+        }
+    }
 }
 
 impl Tabs {
     fn as_ref(&self) -> Option<&Document> {
-        self.docs.get(self.active)
+        let tab = self.tabs.get(self.active)?;
+        tab.panes.get(tab.focused)
     }
 
     fn as_mut(&mut self) -> Option<&mut Document> {
-        self.docs.get_mut(self.active)
+        let tab = self.tabs.get_mut(self.active)?;
+        tab.panes.get_mut(tab.focused)
     }
 
-    /// Adds a document and makes it the shown one.
+    /// The shown tab's panes, top to bottom.
+    fn panes(&self) -> &[Document] {
+        self.tabs.get(self.active).map_or(&[], |t| t.panes.as_slice())
+    }
+
+    fn panes_mut(&mut self) -> &mut [Document] {
+        self.tabs
+            .get_mut(self.active)
+            .map_or(&mut [], |t| t.panes.as_mut_slice())
+    }
+
+    /// Which of the shown tab's panes has the keyboard.
+    fn focused_pane(&self) -> usize {
+        self.tabs.get(self.active).map_or(0, |t| t.focused)
+    }
+
+    fn focus_pane(&mut self, pane: usize) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.focused = pane.min(tab.panes.len().saturating_sub(1));
+        }
+    }
+
+    /// Every document, in every tab.
+    fn all(&self) -> impl Iterator<Item = &Document> {
+        self.tabs.iter().flat_map(|t| t.panes.iter())
+    }
+
+    fn all_mut(&mut self) -> impl Iterator<Item = (usize, &mut Document)> {
+        self.tabs
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(i, t)| t.panes.iter_mut().map(move |d| (i, d)))
+    }
+
+    /// Adds a document as a new tab and makes it the shown one.
     fn push(&mut self, doc: Document) {
-        self.docs.push(doc);
-        self.active = self.docs.len() - 1;
+        self.tabs.push(Tab::one(doc));
+        self.active = self.tabs.len() - 1;
     }
 
-    /// Closes the shown document. Returns whether any remain.
-    fn close_active(&mut self) -> bool {
-        if self.docs.is_empty() {
+    /// Adds a second pane under the shown tab's, and focuses it. A tab already split is left as
+    /// it is.
+    fn split(&mut self, doc: Document) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        if tab.panes.len() >= 2 {
             return false;
         }
-        self.docs.remove(self.active);
-        if self.active >= self.docs.len() && !self.docs.is_empty() {
-            self.active = self.docs.len() - 1;
+        tab.panes.push(doc);
+        tab.focused = tab.panes.len() - 1;
+        true
+    }
+
+    /// Closes the focused pane; a tab with no panes left goes with it. Returns whether any tabs
+    /// remain.
+    fn close_active(&mut self) -> bool {
+        if self.tabs.is_empty() {
+            return false;
         }
-        !self.docs.is_empty()
+        let tab = &mut self.tabs[self.active];
+        if tab.panes.len() > 1 {
+            tab.panes.remove(tab.focused);
+            tab.focused = tab.focused.min(tab.panes.len() - 1);
+            return true;
+        }
+        self.tabs.remove(self.active);
+        if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+            self.active = self.tabs.len() - 1;
+        }
+        !self.tabs.is_empty()
     }
 
     fn cycle(&mut self, forward: bool) {
-        let n = self.docs.len();
+        let n = self.tabs.len();
         if n < 2 {
             return;
         }
@@ -2427,20 +2522,23 @@ impl Tabs {
     }
 
     fn len(&self) -> usize {
-        self.docs.len()
+        self.tabs.len()
     }
 
-    /// The tab strip's labels — each document's file name, with §8.1's dot when it grew unseen —
+    /// The tab strip's labels — each tab's file name, with §8.1's dot when it grew unseen —
     /// and which is active, for drawing. Asking clears the shown tab's dot: it is being seen.
     fn labels(&mut self) -> Vec<String> {
         let active = self.active;
-        if let Some(doc) = self.docs.get_mut(active) {
-            doc.unseen = false;
+        if let Some(tab) = self.tabs.get_mut(active) {
+            for doc in &mut tab.panes {
+                doc.unseen = false;
+            }
         }
-        self.docs
+        self.tabs
             .iter()
-            .map(|d| {
-                if d.unseen {
+            .map(|t| {
+                let d = &t.panes[0];
+                if t.panes.iter().any(|d| d.unseen) {
                     format!("● {}", d.summary)
                 } else {
                     d.summary.clone()
@@ -2448,6 +2546,20 @@ impl Tabs {
             })
             .collect()
     }
+}
+
+/// Where each of `n` stacked panes starts and how tall it is, in a client `height` px tall. Two
+/// panes split the height evenly; the top pane rounds down.
+fn pane_tops(height: f32, n: usize) -> Vec<(f32, f32)> {
+    let n = n.max(1);
+    let each = (height / n as f32).floor();
+    (0..n)
+        .map(|i| {
+            let top = each * i as f32;
+            let h = if i + 1 == n { height - top } else { each };
+            (top, h)
+        })
+        .collect()
 }
 
 /// A watched folder — §8.1: "a directory plus a glob; new matching files are adopted as they
@@ -2855,7 +2967,7 @@ impl Shell {
                 maximized: placement.showCmd == SW_SHOWMAXIMIZED.0 as u32,
             });
         }
-        for doc in &self.document.docs {
+        for doc in self.document.all() {
             if let Some(state) = doc.file_state() {
                 self.settings.set_file(state);
             }
@@ -2930,31 +3042,53 @@ impl Shell {
         };
         let (w, h) = Self::client_size(hwnd);
         let mut rasterised = 0;
+        let pane_count = self.document.panes().len();
         let drawn = renderer
             .attach(WindowHandle(hwnd.0 as isize), w, h)
-            .and_then(|()| match self.document.as_mut() {
+            .and_then(|()| {
+                if pane_count == 0 {
+                    // No file yet: the background, which is all M1 ever drew.
+                    return renderer.paint();
+                }
                 // **The metrics come from the measured face every frame, not once.** §3.1 requires
                 // integer cell advances re-derived at the current scale, and a DPI change between
                 // frames is exactly the case a cached cell would get wrong.
-                Some(doc) => {
-                    let cell = renderer.cell()?;
-                    self.cell_w = cell.0;
-                    self.cell_h = cell.1;
-                    doc.tab_strip = strip;
-                    doc.status = status;
-                    doc.lay_out(cell, (w, h));
+                let cell = renderer.cell()?;
+                self.cell_w = cell.0;
+                self.cell_h = cell.1;
+                // The panes stack: the first carries the tab strip, the last the status bar.
+                let tops = pane_tops(h as f32, pane_count);
+                let panes = self.document.panes_mut();
+                for (i, doc) in panes.iter_mut().enumerate() {
+                    let (top, height) = tops[i];
+                    doc.tab_strip = if i == 0 {
+                        strip.clone()
+                    } else {
+                        (Vec::new(), 0)
+                    };
+                    doc.show_footer = i + 1 == pane_count;
+                    doc.status = if doc.show_footer {
+                        status.clone()
+                    } else {
+                        String::new()
+                    };
+                    doc.pane_top = top;
+                    doc.lay_out(cell, (w, height as u32));
                     // The highlighter's frame budget starts here, alongside the painter's own
-                    // `begin_frame` inside `paint_rows` — one frame, one budget, §11.3.
+                    // `begin_frame` inside `paint_panes` — one frame, one budget, §11.3.
                     doc.highlighter.begin_frame();
-                    // `Rows` is the row source, so the painter reads its text and its column
-                    // anchors by reference — the closure this replaced allocated a `String` per row
-                    // per frame and had nowhere to put the anchors at all.
-                    let laid = renderer.paint_rows(&doc.view, &*doc)?;
-                    rasterised = laid.rasterised;
-                    Ok(())
                 }
-                // No file yet: the background, which is all M1 ever drew.
-                None => renderer.paint(),
+                // `Rows` is the row source, so the painter reads its text and its column anchors
+                // by reference — the closure this replaced allocated a `String` per row per frame
+                // and had nowhere to put the anchors at all.
+                let refs: Vec<(&View, &dyn RowSource, f32)> = panes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, doc)| (&doc.view, doc as &dyn RowSource, tops[i].0))
+                    .collect();
+                let laid = renderer.paint_panes(&refs, (w as f32, h as f32))?;
+                rasterised = laid.rasterised;
+                Ok(())
             });
         // **Rasterising is a reason to draw again, and the request cannot be made from in here.**
         // §3.2 puts glyph rasterisation *after* the present, so the first frame on a cold atlas
@@ -3106,6 +3240,12 @@ impl Shell {
         // §12: `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle the tabs, `Ctrl+W` closes the shown one. A last
         // tab closed leaves the window open and empty, as a browser would not but a viewer should:
         // the next `Ctrl+O` or drop fills it.
+        // `UI-DESIGN.md` §12: `Ctrl+` splits the pane — a second document on the same path under
+        // this one, with its own filter — and unsplits a split one.
+        if key == VK_OEM_5.0 {
+            self.toggle_split(hwnd);
+            return true;
+        }
         if key == VK_TAB.0 || key == VK_W.0 {
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             if key == VK_TAB.0 {
@@ -3289,6 +3429,40 @@ impl Shell {
         true
     }
 
+    /// `Ctrl+`: a split tab loses its focused pane; an unsplit one gains a second pane on the same
+    /// path — opened again, with its own follow and filter — under the first, and focus goes to it.
+    fn toggle_split(&mut self, hwnd: HWND) {
+        if self.document.panes().len() >= 2 {
+            self.document.close_active();
+        } else if let Some(path) = self.document.as_ref().and_then(|d| d.path.clone()) {
+            match Document::open(&path) {
+                Ok(doc) => {
+                    self.document.split(doc);
+                }
+                Err(e) => self.file = Some(format!("split: {e}")),
+            }
+        }
+        self.retitle(hwnd);
+        self.sync_scrollbar(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
+    /// Which pane a client `y` falls in, and that pane's top — for routing a click. `None` with no
+    /// document.
+    fn pane_at(&self, y: f32) -> Option<(usize, f32)> {
+        let panes = self.document.panes();
+        if panes.is_empty() {
+            return None;
+        }
+        let hit = panes
+            .iter()
+            .rposition(|d| y >= d.pane_top)
+            .unwrap_or(0);
+        Some((hit, panes[hit].pane_top))
+    }
+
     /// What every handled chrome key ends with: the scrollbar, the title and a repaint.
     fn after_chrome_key(&mut self, hwnd: HWND) -> bool {
         self.sync_scrollbar(hwnd);
@@ -3359,6 +3533,14 @@ impl Shell {
             }
             Command::NextTab | Command::PreviousTab => {
                 self.document.cycle(command == Command::NextTab);
+            }
+            Command::Split => {
+                self.toggle_split(hwnd);
+                return true;
+            }
+            Command::FocusOtherPane => {
+                let other = 1 - self.document.focused_pane().min(1);
+                self.document.focus_pane(other);
             }
             Command::CloseTab => {
                 self.document.close_active();
@@ -3448,6 +3630,8 @@ impl Shell {
             | Command::FollowTail
             | Command::NextTab
             | Command::PreviousTab
+            | Command::Split
+            | Command::FocusOtherPane
             | Command::CloseTab => {}
         }
         self.after_chrome_key(hwnd)
@@ -3459,6 +3643,10 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
+        if key == VK_F6.0 {
+            // `F6`: the other pane of a split (a provisional binding, like `Ctrl+E`).
+            return self.run(hwnd, Command::FocusOtherPane);
+        }
         let moved = if key == VK_F2.0 {
             // E20: `F2` / `Shift+F2` step the bookmarks — provisional, like `Ctrl+E`.
             doc.bookmark_step(!shift)
@@ -3746,10 +3934,10 @@ impl Shell {
     /// Collects what the filter worker has reported — and the export's, whose legs are gated on
     /// it — and repaints if the view changed.
     fn poll_filter(&mut self, hwnd: HWND) {
-        let changed = self
-            .document
-            .as_mut()
-            .is_some_and(|doc| doc.poll_filter() | doc.poll_tee());
+        let mut changed = false;
+        for doc in self.document.panes_mut() {
+            changed |= doc.poll_filter() | doc.poll_tee();
+        }
         if !changed {
             return;
         }
@@ -3762,7 +3950,10 @@ impl Shell {
 
     /// Collects what the search worker has reported, and repaints if it said anything.
     fn poll_find(&mut self, hwnd: HWND) {
-        let changed = self.document.as_mut().is_some_and(Document::poll_find);
+        let mut changed = false;
+        for doc in self.document.panes_mut() {
+            changed |= doc.poll_find();
+        }
         if !changed {
             return;
         }
@@ -4011,7 +4202,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 };
                 let active = shell.document.active;
                 let mut shown_grew = false;
-                for (i, doc) in shell.document.docs.iter_mut().enumerate() {
+                for (i, doc) in shell.document.all_mut() {
                     if doc.poll_follow() {
                         if i == active {
                             shown_grew = true;
@@ -4313,6 +4504,17 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return;
                 };
+                // A split: a press focuses the pane under it, and every coordinate from here on is
+                // relative to the focused pane's top — a drag stays with the pane it started in.
+                if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+                    if let Some((pane, _)) = shell.pane_at(y) {
+                        shell.document.focus_pane(pane);
+                    }
+                }
+                let y = y - shell
+                    .document
+                    .as_ref()
+                    .map_or(0.0, |d| d.pane_top);
                 // The command bar first: a click in it is a field taking focus or a chip going,
                 // never a selection.
                 if msg == WM_LBUTTONDOWN && shell.chrome_click(hwnd, x, y, shift) {
@@ -5966,9 +6168,37 @@ mod tests {
             }
         }
         doc.status = format!("hardware — {}", doc.describe());
-        doc.lay_out(cell, (w, h));
-        doc.highlighter.begin_frame();
-        let pixels = renderer.snapshot(w, h, &doc.view, &doc).expect("snapshot");
+        // `TAILHAWK_SHOT_SPLIT=<chip>`: a second pane under the first, filtered by the chip.
+        let pixels = match std::env::var("TAILHAWK_SHOT_SPLIT") {
+            Ok(chip) => {
+                let mut lower = Document::open(std::path::Path::new(&file)).expect("open");
+                lower.lay_out(cell, (w, h / 2));
+                if !chip.is_empty() {
+                    filter_for(&mut lower, &chip, Polarity::Include);
+                }
+                doc.show_footer = false;
+                doc.lay_out(cell, (w, h / 2));
+                lower.pane_top = (h / 2) as f32;
+                lower.lay_out(cell, (w, h - h / 2));
+                doc.highlighter.begin_frame();
+                lower.highlighter.begin_frame();
+                renderer
+                    .snapshot_panes(
+                        w,
+                        h,
+                        &[
+                            (&doc.view, &doc as &dyn RowSource, 0.0),
+                            (&lower.view, &lower as &dyn RowSource, (h / 2) as f32),
+                        ],
+                    )
+                    .expect("snapshot")
+            }
+            Err(_) => {
+                doc.lay_out(cell, (w, h));
+                doc.highlighter.begin_frame();
+                renderer.snapshot(w, h, &doc.view, &doc).expect("snapshot")
+            }
+        };
         write_bmp(std::path::Path::new(&out), &pixels);
         eprintln!("wrote {}", out.to_string_lossy());
     }
@@ -6026,6 +6256,36 @@ mod tests {
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
+    /// The split: a second pane joins the shown tab and takes focus; the keyboard's document is the
+    /// focused pane; the panes stack by `pane_tops`; closing the focused pane keeps the tab; a tab
+    /// is one label whichever pane grew.
+    #[test]
+    fn a_split_tab_holds_two_panes_and_the_focused_one_is_the_document() {
+        let a = scratch_log("tailhawk_split_a.log", 10);
+        let mut tabs = Tabs::default();
+        tabs.push(Document::open(&a).expect("a"));
+        assert_eq!(tabs.panes().len(), 1);
+        assert!(tabs.split(Document::open(&a).expect("a again")));
+        assert_eq!(tabs.panes().len(), 2);
+        assert_eq!(tabs.focused_pane(), 1, "the new pane has focus");
+        assert!(!tabs.split(Document::open(&a).expect("a")), "two is the most");
+        assert_eq!(tabs.len(), 1, "still one tab");
+        assert_eq!(tabs.labels().len(), 1);
+        tabs.as_mut().expect("focused").bookmarks.insert(3);
+        tabs.focus_pane(0);
+        assert!(tabs.as_ref().expect("top").bookmarks.is_empty(), "the panes are separate documents");
+        tabs.focus_pane(1);
+        assert!(tabs.as_ref().expect("bottom").bookmarks.contains(&3));
+        assert!(tabs.close_active(), "the tab remains");
+        assert_eq!(tabs.panes().len(), 1);
+        assert_eq!(tabs.focused_pane(), 0);
+        assert!(!tabs.close_active(), "and now it is gone");
+
+        assert_eq!(pane_tops(500.0, 1), [(0.0, 500.0)]);
+        assert_eq!(pane_tops(501.0, 2), [(0.0, 250.0), (250.0, 251.0)]);
+        let _ = std::fs::remove_file(&a);
+    }
+
     /// §8.1's watched folder: a directory plus a glob; what matches now is opened, what appears
     /// later is adopted, and nothing is adopted twice.
     #[test]

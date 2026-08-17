@@ -425,10 +425,21 @@ impl Renderer {
         view: &view::View,
         source: &dyn rows::RowSource,
     ) -> Result<gpu::offscreen::Pixels> {
+        self.snapshot_panes(width, height, &[(view, source, 0.0)])
+    }
+
+    /// [`Renderer::snapshot`] for a split: several panes at their offsets.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn snapshot_panes(
+        &mut self,
+        width: u32,
+        height: u32,
+        panes: &[(&view::View, &dyn rows::RowSource, f32)],
+    ) -> Result<gpu::offscreen::Pixels> {
         self.gpu.attach_offscreen(width, height)?;
         for _ in 0..2 {
             self.gpu.clear_offscreen(BACKGROUND);
-            self.paint_rows(view, source)?;
+            self.paint_panes(panes, (width as f32, height as f32))?;
         }
         self.gpu.read_back()
     }
@@ -437,6 +448,18 @@ impl Renderer {
         &mut self,
         view: &view::View,
         source: &dyn rows::RowSource,
+    ) -> Result<paint::Laid> {
+        self.paint_panes(&[(view, source, 0.0)], (view.gutter_px() + view.hgrid().viewport_px(), view.height_px()))
+    }
+
+    /// Several panes in one frame — a split view. Each `(view, source, y)` is laid out as if it
+    /// were the whole client and then moved down by `y`; `client` is the client size the shader
+    /// maps pixels by. Panes are drawn in order, so a later pane's bands cover an earlier pane's
+    /// last partial row.
+    pub fn paint_panes(
+        &mut self,
+        panes: &[(&view::View, &dyn rows::RowSource, f32)],
+        client: (f32, f32),
     ) -> Result<paint::Laid> {
         // Disjoint field borrows: the callback needs `painter` mutably while `gpu` is borrowed for
         // the frame. Destructuring is what makes that legal, and it is also what forces the painter
@@ -460,20 +483,20 @@ impl Renderer {
             )?;
 
             p.begin_frame();
-            laid = p.lay_out(view, INK, source)?;
-            // The view's own viewport, not the swapchain's. They are the same number when the
-            // shell keeps them in step, and taking it from the view keeps `gpu` out of this
-            // closure — which is what makes the disjoint borrow above hold.
-            // The whole client width: the gutter and the horizontal grid's share of it. The shader
-            // maps pixels to clip space by this number, so a width short of the gutter would draw
-            // every frame stretched by the gutter's share — which it did, for two commits.
+            laid = paint::Laid::default();
+            for (view, source, y) in panes {
+                let from = p.mark();
+                laid.merge(p.lay_out(view, INK, *source)?);
+                p.shift(from, 0.0, *y);
+            }
+            // The whole client, gutter included, taken from the caller rather than the swapchain
+            // so `gpu` stays out of this closure — which is what makes the disjoint borrow above
+            // hold. The shader maps pixels to clip space by this number, so a width short of the
+            // gutter would draw every frame stretched by the gutter's share — which it did, for
+            // two commits.
             p.draw(
                 context,
-                (
-                    (view.gutter_px() + view.hgrid().viewport_px()).max(1.0) as u32,
-                    (view.grid().viewport_px() + view.top_inset() + view.footer_px()).max(1.0)
-                        as u32,
-                ),
+                (client.0.max(1.0) as u32, client.1.max(1.0) as u32),
             )
         })?;
 
