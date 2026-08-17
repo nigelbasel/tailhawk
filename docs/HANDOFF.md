@@ -13,14 +13,53 @@ URLs, paths, durations, ids); `Ctrl+F` regex search with `F3`/`Shift+F3`, stream
 `Ctrl+L` / `Ctrl+Shift+L` include/exclude filters hiding non-matching rows, kept current as the file
 grows; select and copy; ANSI escapes stripped; `Ctrl+I` reveals invisibles.
 
+**Also today (M6, in progress):** the format is **detected on open** and named in the title (Serilog,
+log4net, NLog, MEL, syslog, CLF, Python, JSON lines, logfmt, timestamped text; W3C recognised); a
+detected file is shown in **aligned columns**; stack traces sit indented and dimmed under their
+record and `Ctrl+E` **collapses** them; field filters (`level >= Warning`) work through the format.
+
 **Missing before daily use is comfortable:** UI chrome — the query and chips are typed into the window
 and shown in the title, so no find bar, no chip row (toggle/edit/reorder a filter), no tabs, no split
-view, no menus; no settings or persistence; no user highlight-rules editor; **no columns / format
-detection** (a Serilog or IIS line is coloured, not parsed — field filters like `level >= Warning`
-evaluate to *unknown*); no installer or signing.
+view, no menus, **no column header** and no column resize/reorder/hide; no settings or persistence; no
+user highlight-rules editor; no format from a Serilog/NLog config template yet; no installer or
+signing.
 
 **After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
 the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
+
+---
+
+## 🚧 M6 in progress — detection, columns, continuations — 2026-08-17, session 18 (continued)
+
+Same session, after the owner said not to stop between items. **M5 scored and closed** (`EFFORT.md`:
+forecast 21.5 h, actual ~5.9 h; the same shape as M4 — the risk list named what looked hard, the
+verification tax is what cost). **M6 forecast registered before starting** (13.8 h / 2.1 M).
+
+| Landed | Where | Seen on the shipped binary |
+|---|---|---|
+| Format catalogue — 14 built-ins with samples, the cross-matching build test | `format.rs` | — |
+| Detection — head sample, `#Fields:` short-circuit, scored match, acceptance | `detect.rs` | title: `· log4net (compact) 100%` on the owner's `Trace.log`; `· Serilog (file) 100%` on a fixture |
+| Field chips through the format — `level >= Warning` keeps warnings and errors | `sieve.rs` | — |
+| **Columns** — fields padded into place per visible row, matches carried across, raw copy of a whole row | `columns.rs`, `Document::lay_out` | `Trace.log`: timestamp · level · logger · message aligned |
+| Continuations indented under the message and **dimmed** | `columns.rs`, `row_spans` | a Serilog exception and its frames, grey under their `ERR` line |
+| **Collapse** — `Ctrl+E` hides continuations (records-only row space, composes with chips) | `sieve.rs`, `Filtering` | — |
+| Also this stretch: `Ctrl+O` / drag-drop open, `wndproc` re-entry guard, open-at-tail, `Ctrl+I` reveal marker, ANSI stripping | | `verify-open.ps1` PASS |
+
+**Decisions, argued where they live:** rows stay lines and continuations are a derived row space
+(`sieve.rs` records-only); `match_rate` excludes a format's own continuations; **§6.3 amended** —
+acceptance on the quality terms, specificity ranks (`detect.rs`, `SPEC.md`); a whole selected row
+copies raw under columns, a partial one copies what is on screen (`copy_text`).
+
+**⚠ Not yet, and known:** no header row (the grid has no header concept — a `Grid` change); no
+column resize/reorder/hide (M7 widgets); no mid/tail samples (§6.3 stage 1); no runtime re-detect
+(stage 5); the Docker/CRI/XML/OTLP short-circuits; E11 template compiler and E12 pattern DSL (a
+Serilog `outputTemplate` in appsettings does not yet become a format); the disambiguation *chip*
+is title text; MEL Simple's two-line record assembles as first line + continuation (the message
+is the continuation, indented) rather than as one record with the message in the body — the
+done-criterion says "assemble correctly", and that reads as the latter.
+
+**Next in M6:** a header row; the MEL Simple assembly; E11 (Serilog/NLog/log4net templates from
+config); then score M6.
 
 ---
 
