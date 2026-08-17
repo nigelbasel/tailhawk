@@ -217,3 +217,87 @@ fn a_pathological_lookaround_finishes_and_says_it_truncated() {
         "the 60 KB line must be reported as truncated rather than silently skipped"
     );
 }
+
+/// §7.3, measured: "every filter change is a full-file pass" that streams. Two include chips and
+/// one exclude over the same 10 GB — `CANARY` kept, `BURIED` dropped — so the survivors are the two
+/// canaries and the pass has to decode and evaluate every line rather than scan bytes for a
+/// literal, which is what makes its speed a different number from the search's.
+#[test]
+#[ignore = "needs TAILHAWK_BIG_LOG pointing at a large fixture"]
+fn the_filter_worker_streams_survivors_from_a_snapshot_of_ten_gigabytes() {
+    use tailhawk_core::filter::{Chip, Chips, Polarity};
+    use tailhawk_core::sieve;
+
+    let Some(path) = fixture() else {
+        eprintln!("skipped: set TAILHAWK_BIG_LOG");
+        return;
+    };
+    let file = LogFile::open(&path).expect("open");
+    let end = file.len().expect("len");
+    let index =
+        build_index(&file, Charset::UTF_8, 0, end, &IndexOptions::default()).expect("index");
+    let lines = index.line_count();
+    let excerpt = Excerpt {
+        file: Arc::new(file),
+        charset: Charset::UTF_8,
+        index,
+        first_row: 0,
+    };
+
+    let chips = Chips {
+        chips: vec![
+            Chip::parse("canary", Polarity::Include).expect("chip"),
+            Chip::parse("/CANARY_[A-Z]+/", Polarity::Include).expect("chip"),
+            Chip::parse("buried", Polarity::Exclude).expect("chip"),
+        ],
+    };
+
+    let began = Instant::now();
+    let running =
+        sieve::start(chips, vec![excerpt], 0, lines, SearchOptions::default()).expect("start");
+
+    let (mut rows, mut first_at, mut outcome, mut scanned) = (Vec::new(), None, None, 0u64);
+    while outcome.is_none() {
+        for update in running.drain() {
+            match update {
+                sieve::Update::Chunk(kept) => {
+                    if first_at.is_none() && !kept.rows.is_empty() {
+                        first_at = Some(began.elapsed());
+                    }
+                    scanned += kept.scanned;
+                    rows.extend(kept.rows);
+                }
+                sieve::Update::Finished(done) => outcome = Some(done),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let whole = began.elapsed();
+    let first = first_at.expect("something must have survived");
+    rows.sort_unstable();
+
+    println!(
+        "FILTER first survivor {:.3}s, whole pass {:.3}s ({:.0} MB/s), {} survivors, {} of {} lines scanned, {:?}",
+        first.as_secs_f64(),
+        whole.as_secs_f64(),
+        end as f64 / 1e6 / whole.as_secs_f64(),
+        rows.len(),
+        scanned,
+        lines,
+        outcome.as_ref().expect("an outcome")
+    );
+
+    assert_eq!(outcome, Some(Outcome::Complete));
+    assert_eq!(scanned, lines, "every line is examined");
+    assert_eq!(
+        rows.len(),
+        2,
+        "both canaries survive and the buried one is excluded"
+    );
+    assert!(
+        first.as_secs_f64() < whole.as_secs_f64() * 0.5,
+        "the first survivor reached the channel at {:.3}s of a {:.3}s pass, which is not streaming",
+        first.as_secs_f64(),
+        whole.as_secs_f64()
+    );
+}

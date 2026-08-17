@@ -215,10 +215,16 @@ impl Value {
 #[derive(Clone, Debug)]
 pub enum Predicate {
     /// `bare_text` and `quoted` alike — §7.2: "case-insensitive substring over the whole record".
-    /// The needle is stored folded so evaluation does not refold it per row.
+    ///
+    /// **`finder` is a case-insensitive literal search compiled once**, because §7.3 runs a chip
+    /// over every line of the file: the first version lower-cased the whole row per evaluation, an
+    /// allocation and a full-row fold per line per chip, which is the cost of the whole pass. A
+    /// literal under `(?i)` is a fixed-string search that touches no memory but the row. `folded`
+    /// stays as the identity two chips are compared by.
     Text {
         folded: String,
         source: String,
+        finder: regex::Regex,
     },
     Regex {
         source: String,
@@ -297,9 +303,7 @@ impl Predicate {
             // §7.2: "case-insensitive substring **over the whole record**", so this searches `raw`
             // rather than `body` — a user filtering for a correlation id does not care which field a
             // parser happened to put it in, and an unparsed line has only `raw` anyway.
-            Predicate::Text { folded, .. } => {
-                Truth::of(record.raw.to_lowercase().contains(folded.as_str()))
-            }
+            Predicate::Text { finder, .. } => Truth::of(finder.is_match(&record.raw)),
             Predicate::Regex { re, .. } => Truth::of(re.is_match(&record.raw)),
             Predicate::Compare { field, op, value } => compare(record, field, *op, value),
             Predicate::In { field, values } => values
@@ -927,6 +931,10 @@ fn text_predicate(text: &str) -> Predicate {
     Predicate::Text {
         folded: text.to_lowercase(),
         source: text.to_string(),
+        finder: regex::RegexBuilder::new(&regex::escape(text))
+            .case_insensitive(true)
+            .build()
+            .expect("an escaped literal always compiles"),
     }
 }
 

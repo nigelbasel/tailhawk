@@ -39,6 +39,10 @@ pub mod file;
 #[cfg(windows)]
 pub mod find;
 
+/// The filter pass on a worker. Windows-only for the same reason as [`find`].
+#[cfg(windows)]
+pub mod sieve;
+
 #[cfg(windows)]
 pub mod glyphs;
 

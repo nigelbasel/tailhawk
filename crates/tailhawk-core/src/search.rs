@@ -414,72 +414,33 @@ impl Search {
         &self,
         reader: &R,
         index: &LineIndex,
-        mut on_chunk: impl FnMut(&Found) + Send,
+        on_chunk: impl FnMut(&Found) + Send,
     ) -> Result<Found> {
-        let total = index.line_count();
-        let chunks: Vec<(u64, u64)> = (0..total)
-            .step_by(self.options.lines_per_chunk.max(1) as usize)
-            .map(|from| {
-                (
-                    from,
-                    from.saturating_add(self.options.lines_per_chunk).min(total),
-                )
-            })
-            .collect();
-        if chunks.is_empty() {
-            return Ok(Found::default());
-        }
-
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let threads = self.options.threads.clamp(1, chunks.len());
-        let reporter = std::sync::Mutex::new(&mut on_chunk);
+        let chunks = run_chunked(
+            index.line_count(),
+            self.options.lines_per_chunk,
+            self.options.threads,
+            &self.cancel,
+            || self.hits.load(Ordering::Relaxed) >= self.options.max_matches as u64,
+            |from, to| {
+                let chunk = self.search_lines(reader, index, from, to)?;
+                self.hits
+                    .fetch_add(chunk.matches.len() as u64, Ordering::Relaxed);
+                Ok(chunk)
+            },
+            on_chunk,
+        )?;
         let mut found = Found::default();
-
-        std::thread::scope(|scope| -> Result<()> {
-            let mut workers = Vec::with_capacity(threads);
-            for _ in 0..threads {
-                let (next, chunks, reporter) = (&next, &chunks, &reporter);
-                workers.push(scope.spawn(move || -> Result<Found> {
-                    let mut mine = Found::default();
-                    loop {
-                        if self.cancel.load(Ordering::Relaxed)
-                            || self.hits.load(Ordering::Relaxed) >= self.options.max_matches as u64
-                        {
-                            return Ok(mine);
-                        }
-                        let nth = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(from, to)) = chunks.get(nth) else {
-                            return Ok(mine);
-                        };
-                        let chunk = self.search_lines(reader, index, from, to)?;
-                        self.hits
-                            .fetch_add(chunk.matches.len() as u64, Ordering::Relaxed);
-                        // Reported before it is merged, so a caller sees a chunk the moment its
-                        // worker finishes rather than when every worker has.
-                        if let Ok(mut report) = reporter.lock() {
-                            report(&chunk);
-                        }
-                        mine.absorb(chunk);
-                    }
-                }));
-            }
-            for worker in workers {
-                let mine = worker
-                    .join()
-                    .map_err(|_| Error("a search worker panicked".into()))??;
-                found.absorb(mine);
-            }
-            Ok(())
-        })?;
-
+        for chunk in chunks {
+            found.absorb(chunk);
+        }
         // Workers finish out of order; a result list does not get to.
         found.matches.sort_by_key(|m| (m.line, m.start));
         found.matches.truncate(self.options.max_matches);
         Ok(found)
     }
 
-    /// Searches lines `[from, to)`. One `offset_of_line` and then a forward walk, which is the same
-    /// reasoning `rows.rs` records: a run of consecutive lines is contiguous on disk.
+    /// Searches lines `[from, to)`.
     fn search_lines<R: ChunkReader + ?Sized>(
         &self,
         reader: &R,
@@ -488,33 +449,17 @@ impl Search {
         to: u64,
     ) -> Result<Found> {
         let mut found = Found::default();
-        let Some(start) = offset_of_line(reader, self.charset, index, from)? else {
-            return Ok(found);
-        };
         // Text engines need the decoded line; the byte engine does not, and building one anyway
         // would pay §7.4's decode cost on the path that exists to avoid it.
         let wants_text = !matches!(self.pattern.engine, Engine::Bytes(_));
-
-        let mut decoder = LineDecoder::new(self.charset);
-        let mut buf = vec![0u8; READ_BYTES];
-        let mut at = start;
-        let mut line = from;
-
-        'reading: while line < to {
-            if self.cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let read = reader.read_at(at, &mut buf)?;
-            if read == 0 {
-                break;
-            }
-            at += read as u64;
-            let mut stop = false;
-            decoder.push(&buf[..read], |text| {
-                if stop || line >= to {
-                    stop = true;
-                    return;
-                }
+        each_line(
+            reader,
+            self.charset,
+            index,
+            from,
+            to,
+            &self.cancel,
+            |line, text| {
                 match self
                     .pattern
                     .find(text.as_bytes(), wants_text.then_some(text))
@@ -528,18 +473,134 @@ impl Search {
                     Hit::None => {}
                 }
                 found.scanned += 1;
-                line += 1;
-            });
-            if stop {
-                break 'reading;
-            }
-        }
+            },
+        )?;
         Ok(found)
     }
 }
 
 /// Bytes read per pass while searching. One comfortable read, matching `rows.rs`.
 const READ_BYTES: usize = 256 * 1024;
+
+/// Runs `work` over the lines `[0, total)` in chunks of `lines_per_chunk`, on `threads` workers,
+/// reporting each chunk's result the moment its worker finishes and returning all of them.
+///
+/// **This is §7.4's pass, and the filter (§7.3) is the same pass with different work**, so it lives
+/// here once: the chunking, the work-stealing counter, the cancel check between chunks, and the
+/// rule that a chunk is reported before it is merged. `stop` is the caller's own reason to end
+/// early — a search's match cap; a filter has none — asked alongside the cancel flag.
+///
+/// Chunks complete **out of order**; `on_chunk` sees them as they finish, and the returned `Vec`
+/// is in completion order too. A caller that needs file order sorts by what its chunks carry.
+pub(crate) fn run_chunked<C: Send>(
+    total: u64,
+    lines_per_chunk: u64,
+    threads: usize,
+    cancel: &AtomicBool,
+    stop: impl Fn() -> bool + Sync,
+    work: impl Fn(u64, u64) -> Result<C> + Sync,
+    mut on_chunk: impl FnMut(&C) + Send,
+) -> Result<Vec<C>> {
+    let chunks: Vec<(u64, u64)> = (0..total)
+        .step_by(lines_per_chunk.max(1) as usize)
+        .map(|from| (from, from.saturating_add(lines_per_chunk).min(total)))
+        .collect();
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = threads.clamp(1, chunks.len());
+    let reporter = std::sync::Mutex::new(&mut on_chunk);
+    let mut all = Vec::with_capacity(chunks.len());
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let (next, chunks, reporter, stop, work) = (&next, &chunks, &reporter, &stop, &work);
+            workers.push(scope.spawn(move || -> Result<Vec<C>> {
+                let mut mine = Vec::new();
+                loop {
+                    if cancel.load(Ordering::Relaxed) || stop() {
+                        return Ok(mine);
+                    }
+                    let nth = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(from, to)) = chunks.get(nth) else {
+                        return Ok(mine);
+                    };
+                    let chunk = work(from, to)?;
+                    // Reported before it is kept, so a caller sees a chunk the moment its worker
+                    // finishes rather than when every worker has.
+                    if let Ok(mut report) = reporter.lock() {
+                        report(&chunk);
+                    }
+                    mine.push(chunk);
+                }
+            }));
+        }
+        for worker in workers {
+            let mine = worker
+                .join()
+                .map_err(|_| Error("a pass worker panicked".into()))??;
+            all.extend(mine);
+        }
+        Ok(())
+    })?;
+    Ok(all)
+}
+
+/// Walks the decoded lines `[from, to)`, calling `on_line` with each line's number and text.
+///
+/// One `offset_of_line` and then a forward read, which is the same reasoning `rows.rs` records: a
+/// run of consecutive lines is contiguous on disk. Stops early when `cancel` is raised — checked
+/// before every read — and returns `Ok` either way; a caller that cares asks the flag.
+///
+/// **The last line of a file with no trailing terminator is delivered.** The decoder holds it until
+/// told there is no more input, and a pass that forgot to say so silently skipped it — a match on
+/// the very line a writer is in the middle of.
+pub(crate) fn each_line<R: ChunkReader + ?Sized>(
+    reader: &R,
+    charset: Charset,
+    index: &LineIndex,
+    from: u64,
+    to: u64,
+    cancel: &AtomicBool,
+    mut on_line: impl FnMut(u64, &str),
+) -> Result<()> {
+    let Some(start) = offset_of_line(reader, charset, index, from)? else {
+        return Ok(());
+    };
+    let mut decoder = LineDecoder::new(charset);
+    let mut buf = vec![0u8; READ_BYTES];
+    let mut at = start;
+    let mut line = from;
+
+    while line < to {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let read = reader.read_at(at, &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        at += read as u64;
+        decoder.push(&buf[..read], |text| {
+            if line < to {
+                on_line(line, text);
+                line += 1;
+            }
+        });
+    }
+    if line < to {
+        decoder.finish(|text| {
+            if line < to {
+                on_line(line, text);
+                line += 1;
+            }
+        });
+    }
+    Ok(())
+}
 
 /// Stops a running [`Search`] from another thread.
 #[derive(Clone, Default)]
@@ -560,6 +621,11 @@ impl Cancel {
 
     pub fn cancelled(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
+    }
+
+    /// The flag itself, for a pass that checks it between reads. See [`each_line`].
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.flag
     }
 }
 
@@ -589,6 +655,16 @@ mod tests {
         Search::new(p, UTF8, SearchOptions::default())
             .run(&bytes[..], &index, |_| {})
             .expect("run")
+    }
+
+    /// The line a writer is in the middle of — no terminator yet — is a line the index counts and
+    /// a line the search must reach. `each_line` finishes the decoder for exactly this row.
+    #[test]
+    fn the_unterminated_last_line_is_searched() {
+        let found = search("beta", "alpha\nbeta");
+        assert_eq!(found.scanned, 2);
+        assert_eq!(found.matches.len(), 1, "{found:?}");
+        assert_eq!(found.matches[0].line, 1);
     }
 
     #[test]
