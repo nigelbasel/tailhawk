@@ -88,14 +88,13 @@ as a frame.
 
 `sieve.rs` is a library and nothing calls it. What the shell needs, in the order to build it:
 
-1. **A scattered fetch.** `Rows` serves a contiguous window keyed by `(first, count, …)`; a
-   hide-non-matching view shows rows `kept[k..k+n]`, which are anywhere. Give `Rows` a row *list*
-   (`Vec<u64>`, sorted; contiguous fetch fills it as `first..first+n`; `line(row)` becomes a binary
-   search) and a `fetch_rows(reader, index, &[u64], anchored)` that does one `offset_of_line` and one
-   read per row; then `LogSet::fetch_rows(&[u64], anchored)` splitting by member the way `fetch` does.
-   Fifty rows a frame, only when the viewport moves — the cache key still applies. **If that is slow,
-   have the sieve carry byte offsets alongside rows** (16 bytes a survivor) so the fetch skips the
-   index walk; do not guess, measure with the frame instrument.
+1. ~~**A scattered fetch.**~~ **Done, `e092679`.** `Rows` holds a row *list* (`line(row)` is a
+   binary search over a screenful), `Rows::fetch_rows(reader, index, &[u64], anchored)` does one
+   `offset_of_line` and one small stepped read per row, and `LogSet::fetch_rows(&[u64], anchored)`
+   splits by member as `fetch` does. Cached by the same key, so a frame showing the same filtered
+   rows reads nothing. **Not yet measured on the frame instrument** — that happens when step 2 calls
+   it. If fifty `offset_of_line` walks a viewport move turn out slow, have the sieve carry byte
+   offsets alongside rows (16 bytes a survivor); do not guess.
 2. **`Filtering` in `Document`**, alongside `Finder`: the `Chips`, the running `sieve::Running`, the
    sorted `kept: Vec<u64>` maintained by `partition_point` + splice as `Finder::absorb` does, the
    scanned count and outcome for the title. `lay_out` sets the grid's total to `kept.len()` when
