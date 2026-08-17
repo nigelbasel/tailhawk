@@ -464,10 +464,13 @@ impl Renderer {
             // The view's own viewport, not the swapchain's. They are the same number when the
             // shell keeps them in step, and taking it from the view keeps `gpu` out of this
             // closure — which is what makes the disjoint borrow above hold.
+            // The whole client width: the gutter and the horizontal grid's share of it. The shader
+            // maps pixels to clip space by this number, so a width short of the gutter would draw
+            // every frame stretched by the gutter's share — which it did, for two commits.
             p.draw(
                 context,
                 (
-                    view.hgrid().viewport_px().max(1.0) as u32,
+                    (view.gutter_px() + view.hgrid().viewport_px()).max(1.0) as u32,
                     (view.grid().viewport_px() + view.top_inset() + view.footer_px()).max(1.0)
                         as u32,
                 ),
