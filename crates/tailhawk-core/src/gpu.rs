@@ -640,11 +640,7 @@ pub mod offscreen {
         }
 
         pub fn height(&self) -> u32 {
-            if self.stride == 0 {
-                0
-            } else {
-                (self.data.len() / self.stride) as u32
-            }
+            self.data.len().checked_div(self.stride).unwrap_or(0) as u32
         }
 
         pub fn at(&self, x: u32, y: u32) -> [u8; 4] {

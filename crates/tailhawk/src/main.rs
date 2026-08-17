@@ -24,6 +24,7 @@ use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::highlight::{Highlighter, Span};
 use tailhawk_core::paint::{Colours, Painter};
+use tailhawk_core::palette::{Choice, Entry, Palette};
 use tailhawk_core::search::{Match, SearchOptions};
 use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
@@ -63,8 +64,8 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
-    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_HOME, VK_I,
-    VK_L,
+    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_G, VK_HOME,
+    VK_I, VK_K, VK_L,
     VK_LEFT, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
     VK_W, VK_X, VK_Y, VK_Z,
 };
@@ -165,6 +166,9 @@ struct Document {
     /// bookmark, and clearing the filter shows it again. Toggled by `Ctrl+D` on the caret's row (or
     /// the top row with no caret); `F2` / `Shift+F2` step through them; the gutter marks them.
     bookmarks: std::collections::BTreeSet<u64>,
+    /// `Ctrl+K`'s command palette — `UI-DESIGN.md` §9. Per document, so a tab switch keeps its
+    /// query; every one lists the same commands.
+    palette: Palette,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -392,6 +396,50 @@ impl RowSource for Document {
             let ty = fy + ((footer - row_h) / 2.0).floor();
             let _ = painter.lay_out_at(view, cell_w * 0.5, ty, shown, Colours::plain(HEADER_INK));
         }
+
+        // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
+        // query on its first line, then the rows, the selected one filled. Rows are remembered by
+        // their y for the click.
+        self.chrome.palette_hits.borrow_mut().clear();
+        if self.palette.is_open() {
+            let box_x = view.gutter_px() + cell_w;
+            let box_w = (PALETTE_CELLS as f32 * cell_w).min(width - box_x - cell_w);
+            let rows = self.palette.rows();
+            let box_h = row_h * (rows.len() + 1) as f32 + 8.0;
+            let box_y = band;
+            painter.fill(box_x, box_y, box_w, box_h, PALETTE_BG);
+            let inner_x = box_x + cell_w;
+            let mut y = box_y + 4.0;
+            let _ = painter.lay_out_at(view, inner_x, y, "▸", Colours::plain(FIELD_HINT));
+            draw_field(
+                painter,
+                view,
+                cells,
+                &self.palette.field,
+                true,
+                inner_x + 2.0 * cell_w,
+                y,
+                PALETTE_CELLS - 4,
+                "type a command, or a line number",
+            );
+            y += row_h;
+            let mut hits = self.chrome.palette_hits.borrow_mut();
+            for (i, row) in rows.iter().enumerate() {
+                if row.selected {
+                    painter.fill(box_x, y, box_w, row_h, PALETTE_SELECTED_BG);
+                }
+                let key_cells = cells.cell_count(row.key);
+                let label_avail = (PALETTE_CELLS - 4).saturating_sub(key_cells + 2);
+                let label = tailhawk_core::widget::fit_from_right(cells, &row.label, label_avail);
+                let _ = painter.lay_out_at(view, inner_x + 2.0 * cell_w, y, label, Colours::plain(INK));
+                if !row.key.is_empty() {
+                    let kx = box_x + box_w - (key_cells as f32 + 1.0) * cell_w;
+                    let _ = painter.lay_out_at(view, kx, y, row.key, Colours::plain(FIELD_HINT));
+                }
+                hits.push((y..y + row_h, i));
+                y += row_h;
+            }
+        }
     }
 
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
@@ -474,6 +522,7 @@ impl Document {
             presented: Vec::new(),
             open_at_tail: true,
             bookmarks: Default::default(),
+            palette: Palette::new(Command::entries()),
             pump: None,
             stream_done: false,
         })
@@ -521,6 +570,7 @@ impl Document {
             presented: Vec::new(),
             open_at_tail: true,
             bookmarks: Default::default(),
+            palette: Palette::new(Command::entries()),
             pump: Some(pump),
             stream_done: false,
         })
@@ -1067,6 +1117,22 @@ impl Document {
         true
     }
 
+    /// `Go to line N`: a one-based **physical** line, shown a third of the way down with the caret
+    /// on it. Under a filter a hidden line lands on the survivor after it, as a match does.
+    fn go_to_line(&mut self, line: u64) {
+        let total = self.set.total_rows();
+        if total == 0 {
+            return;
+        }
+        let file_row = line.saturating_sub(1).min(total - 1);
+        let view_row = self.filtering.view_row(file_row);
+        self.selection = Some(Selection::at(Position {
+            row: view_row,
+            cell: 0,
+        }));
+        self.show_row(file_row);
+    }
+
     /// Starts, extends or replaces the selection from a click in the client area.
     ///
     /// `x` and `y` are client-relative device pixels, which is what `View::position_at` takes — the
@@ -1452,6 +1518,48 @@ fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Optio
     (detection, layout)
 }
 
+/// The editing keys every one-line field answers to — caret moves (`Ctrl` by word, `Shift`
+/// extends), `Home`/`End`, `Backspace`, `Delete`, `Ctrl+A/Z/Y/X/C/V` through the clipboard.
+/// Reports whether the key was one of them.
+fn field_edit(field: &mut TextField, key: u16, ctrl: bool, shift: bool) -> bool {
+    match key {
+        k if k == VK_LEFT.0 => {
+            field.move_caret(if ctrl { Move::WordLeft } else { Move::Left }, shift)
+        }
+        k if k == VK_RIGHT.0 => {
+            field.move_caret(if ctrl { Move::WordRight } else { Move::Right }, shift)
+        }
+        k if k == VK_HOME.0 => field.move_caret(Move::Home, shift),
+        k if k == VK_END.0 => field.move_caret(Move::End, shift),
+        k if k == VK_BACK.0 => field.backspace(),
+        k if k == VK_DELETE.0 => field.delete(),
+        k if ctrl && k == VK_A.0 => field.select_all(),
+        k if ctrl && k == VK_Z.0 => {
+            field.undo();
+        }
+        k if ctrl && k == VK_Y.0 => {
+            field.redo();
+        }
+        k if ctrl && k == VK_X.0 => {
+            if let Some(cut) = field.cut() {
+                set_clipboard(&cut);
+            }
+        }
+        k if ctrl && k == VK_C.0 => {
+            if let Some(sel) = field.selected_text() {
+                set_clipboard(sel);
+            }
+        }
+        k if ctrl && k == VK_V.0 => {
+            if let Some(text) = clipboard_text() {
+                field.paste(&text);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Takes one `WM_CHAR` code unit into a typed field. Returns whether it was wanted.
 ///
 /// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
@@ -1608,6 +1716,76 @@ struct Chrome {
     hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, Hit)>>,
     /// The x each field's text starts at, for placing a caret from a click.
     origins: std::cell::Cell<(f32, f32)>,
+    /// The palette's rows by their y, for a click on one.
+    palette_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
+}
+
+/// Every command the shell has, by name — what the palette lists and what the keys dispatch, so a
+/// binding and a palette entry cannot disagree about what a name does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Command {
+    OpenFile,
+    Find,
+    FindNext,
+    FindPrevious,
+    ClearSearch,
+    FilterInclude,
+    FilterExclude,
+    ClearFilter,
+    ToggleCollapse,
+    RevealInvisibles,
+    ToggleBookmark,
+    NextBookmark,
+    PreviousBookmark,
+    GoToLine(u64),
+    GoToTop,
+    FollowTail,
+    Copy,
+    NextTab,
+    PreviousTab,
+    CloseTab,
+}
+
+impl Command {
+    /// The palette's list: label and key, in the order a user learns them. `GoToLine` is not here
+    /// — the palette makes one from a typed number.
+    const LISTED: &'static [(Command, &'static str, &'static str)] = &[
+        (Command::OpenFile, "Open file…", "Ctrl+O"),
+        (Command::Find, "Search", "Ctrl+F"),
+        (Command::FindNext, "Next match", "F3"),
+        (Command::FindPrevious, "Previous match", "Shift+F3"),
+        (Command::ClearSearch, "Clear search", "Esc"),
+        (Command::FilterInclude, "Add include filter", "Ctrl+L"),
+        (Command::FilterExclude, "Add exclude filter", "Ctrl+Shift+L"),
+        (Command::ClearFilter, "Clear filters", "Esc"),
+        (Command::ToggleCollapse, "Toggle records only (collapse continuations)", "Ctrl+E"),
+        (Command::RevealInvisibles, "Toggle reveal invisibles", "Ctrl+I"),
+        (Command::ToggleBookmark, "Toggle bookmark", "Ctrl+D"),
+        (Command::NextBookmark, "Next bookmark", "F2"),
+        (Command::PreviousBookmark, "Previous bookmark", "Shift+F2"),
+        (Command::GoToTop, "Go to top", "Ctrl+Home"),
+        (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
+        (Command::Copy, "Copy selection", "Ctrl+C"),
+        (Command::NextTab, "Next tab", "Ctrl+Tab"),
+        (Command::PreviousTab, "Previous tab", "Ctrl+Shift+Tab"),
+        (Command::CloseTab, "Close tab", "Ctrl+W"),
+    ];
+
+    fn entries() -> Vec<Entry> {
+        Self::LISTED
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label, key))| Entry::new(i, label, key))
+            .collect()
+    }
+
+    /// The command a palette choice names.
+    fn from_choice(choice: Choice) -> Option<Command> {
+        match choice {
+            Choice::GoToLine(n) => Some(Command::GoToLine(n)),
+            Choice::Command(id) => Self::LISTED.get(id).map(|(c, _, _)| *c),
+        }
+    }
 }
 
 /// What a click on the bar landed on.
@@ -1638,6 +1816,7 @@ impl Default for Chrome {
             pending_high: None,
             hits: std::cell::RefCell::new(Vec::new()),
             origins: std::cell::Cell::new((0.0, 0.0)),
+            palette_hits: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -1832,6 +2011,10 @@ const FIELD_SELECTION_BG: [f32; 4] = [0.20, 0.36, 0.60, 1.0];
 const CARET: [f32; 4] = [0.88, 0.89, 0.91, 1.0];
 const CHIP_INCLUDE_BG: [f32; 4] = [0.14, 0.26, 0.20, 1.0];
 const CHIP_EXCLUDE_BG: [f32; 4] = [0.30, 0.16, 0.16, 1.0];
+const PALETTE_BG: [f32; 4] = [0.16, 0.17, 0.21, 1.0];
+const PALETTE_SELECTED_BG: [f32; 4] = [0.24, 0.30, 0.42, 1.0];
+/// The palette box's width, in cells.
+const PALETTE_CELLS: usize = 64;
 /// The gutter mark on a bookmarked row.
 const BOOKMARK_MARK: [f32; 4] = [0.85, 0.65, 0.20, 1.0];
 const TAB_BG: [f32; 4] = [0.13, 0.14, 0.17, 1.0];
@@ -1950,6 +2133,8 @@ struct Shell {
     /// When and where the last double-click landed, so the next click can be read as a triple.
     last_double: Option<(u32, f32, f32)>,
     needs_frame: bool,
+    /// The palette chose "Open file…": `wndproc` shows the dialog once this borrow is released.
+    pending_open: bool,
     /// How long recent frames took. See [`Frames`].
     frames: Frames,
 }
@@ -2497,38 +2682,10 @@ impl Shell {
                     let Some(field) = doc.chrome.focused() else {
                         return false;
                     };
+                    if field_edit(field, key, ctrl, shift) {
+                        return self.after_chrome_key(hwnd);
+                    }
                     match key {
-                        k if k == VK_LEFT.0 => {
-                            field.move_caret(if ctrl { Move::WordLeft } else { Move::Left }, shift)
-                        }
-                        k if k == VK_RIGHT.0 => field
-                            .move_caret(if ctrl { Move::WordRight } else { Move::Right }, shift),
-                        k if k == VK_HOME.0 => field.move_caret(Move::Home, shift),
-                        k if k == VK_END.0 => field.move_caret(Move::End, shift),
-                        k if k == VK_BACK.0 => field.backspace(),
-                        k if k == VK_DELETE.0 => field.delete(),
-                        k if ctrl && k == VK_A.0 => field.select_all(),
-                        k if ctrl && k == VK_Z.0 => {
-                            field.undo();
-                        }
-                        k if ctrl && k == VK_Y.0 => {
-                            field.redo();
-                        }
-                        k if ctrl && k == VK_X.0 => {
-                            if let Some(cut) = field.cut() {
-                                set_clipboard(&cut);
-                            }
-                        }
-                        k if ctrl && k == VK_C.0 => {
-                            if let Some(sel) = field.selected_text() {
-                                set_clipboard(sel);
-                            }
-                        }
-                        k if ctrl && k == VK_V.0 => {
-                            if let Some(text) = clipboard_text() {
-                                field.paste(&text);
-                            }
-                        }
                         k if k == VK_ESCAPE.0 => doc.chrome.focus = Focus::Grid,
                         k if k == VK_RETURN.0 => match focus {
                             Focus::Find => {
@@ -2558,6 +2715,144 @@ impl Shell {
             let _ = InvalidateRect(hwnd, None, false);
         }
         true
+    }
+
+    /// What every handled chrome key ends with: the scrollbar, the title and a repaint.
+    fn after_chrome_key(&mut self, hwnd: HWND) -> bool {
+        self.sync_scrollbar(hwnd);
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        true
+    }
+
+    /// The palette's keys, offered before anything else while it is open: `Ctrl+K` opens and
+    /// closes it (`Ctrl+G` opens it too — a typed number is "go to line"), `Up`/`Down` move,
+    /// `Enter` runs the selection, `Esc` closes, and the editing keys are the query field's.
+    fn palette_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        if ctrl && (key == VK_K.0 || key == VK_G.0) {
+            if doc.palette.is_open() && key == VK_K.0 {
+                doc.palette.close();
+            } else {
+                doc.palette.open();
+                doc.chrome.focus = Focus::Grid;
+            }
+            return self.after_chrome_key(hwnd);
+        }
+        if !doc.palette.is_open() {
+            return false;
+        }
+        match key {
+            k if k == VK_ESCAPE.0 => doc.palette.close(),
+            k if k == VK_UP.0 => doc.palette.move_selection(-1),
+            k if k == VK_DOWN.0 => doc.palette.move_selection(1),
+            k if k == VK_RETURN.0 => {
+                let choice = doc.palette.choice();
+                doc.palette.close();
+                if let Some(command) = choice.and_then(Command::from_choice) {
+                    self.run(hwnd, command);
+                }
+            }
+            k if field_edit(&mut doc.palette.field, k, ctrl, shift) => doc.palette.refresh(),
+            // Every other key is swallowed: the palette is modal while it is up.
+            _ => {}
+        }
+        self.after_chrome_key(hwnd)
+    }
+
+    /// Runs a command by name — the palette's `Enter`, and what a binding could dispatch through.
+    /// `OpenFile` is deferred to `wndproc`, which must not be inside this borrow when the dialog
+    /// pumps messages. Reports whether the command applied.
+    fn run(&mut self, hwnd: HWND, command: Command) -> bool {
+        match command {
+            Command::OpenFile => {
+                self.pending_open = true;
+                return true;
+            }
+            Command::Copy => {
+                self.copy();
+                return true;
+            }
+            Command::GoToTop => {
+                self.navigate(hwnd, Navigate::DocStart);
+                return true;
+            }
+            Command::FollowTail => {
+                self.navigate(hwnd, Navigate::DocEnd);
+                return true;
+            }
+            Command::NextTab | Command::PreviousTab => {
+                self.document.cycle(command == Command::NextTab);
+            }
+            Command::CloseTab => {
+                self.document.close_active();
+                if self.document.len() == 0 {
+                    self.file = None;
+                }
+            }
+            _ => {}
+        }
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        match command {
+            Command::Find => {
+                doc.chrome.focus = Focus::Find;
+                doc.chrome.find.select_all();
+                doc.finder.error = None;
+            }
+            Command::FindNext | Command::FindPrevious => {
+                if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
+                    doc.finder.query = doc.chrome.find.text().to_owned();
+                    doc.find();
+                } else {
+                    doc.find_step(command == Command::FindNext);
+                }
+            }
+            Command::ClearSearch => doc.finder.clear(),
+            Command::FilterInclude | Command::FilterExclude => {
+                doc.chrome.focus = Focus::NewChip;
+                doc.chrome.chip_polarity = if command == Command::FilterInclude {
+                    Polarity::Include
+                } else {
+                    Polarity::Exclude
+                };
+                doc.filtering.error = None;
+            }
+            Command::ClearFilter => doc.clear_filter(),
+            Command::ToggleCollapse => {
+                if doc.detection.accepted.is_some() {
+                    doc.filtering.records_only = !doc.filtering.records_only;
+                    doc.filtering.clear_results();
+                    doc.refilter();
+                    let rows = doc.view_rows();
+                    doc.view.grid_mut().set_total_rows(rows);
+                }
+            }
+            Command::RevealInvisibles => {
+                let cells = doc.view.cells_mut();
+                cells.reveal_invisibles = !cells.reveal_invisibles;
+            }
+            Command::ToggleBookmark => {
+                doc.toggle_bookmark();
+            }
+            Command::NextBookmark | Command::PreviousBookmark => {
+                doc.bookmark_step(command == Command::NextBookmark);
+            }
+            Command::GoToLine(n) => doc.go_to_line(n),
+            Command::OpenFile
+            | Command::Copy
+            | Command::GoToTop
+            | Command::FollowTail
+            | Command::NextTab
+            | Command::PreviousTab
+            | Command::CloseTab => {}
+        }
+        self.after_chrome_key(hwnd)
     }
 
     /// The keys that act on results rather than fields, in whichever focus: `F3` / `Shift+F3` step
@@ -2608,14 +2903,17 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        if doc.chrome.focus == Focus::Grid {
+        if doc.chrome.focus == Focus::Grid && !doc.palette.is_open() {
             return false;
         }
         let mut text = String::new();
         if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
             return false;
         }
-        if let Some(field) = doc.chrome.focused() {
+        if doc.palette.is_open() {
+            doc.palette.field.insert(&text);
+            doc.palette.refresh();
+        } else if let Some(field) = doc.chrome.focused() {
             field.insert(&text);
         }
         unsafe {
@@ -2739,6 +3037,25 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
+        if doc.palette.is_open() {
+            // A click on a row runs it; anywhere else closes the palette and goes no further.
+            let hit = doc
+                .chrome
+                .palette_hits
+                .borrow()
+                .iter()
+                .find(|(range, _)| range.contains(&y))
+                .map(|(_, row)| *row);
+            let command = hit.and_then(|row| {
+                doc.palette.select(row);
+                doc.palette.choice().and_then(Command::from_choice)
+            });
+            doc.palette.close();
+            if let Some(command) = command {
+                self.run(hwnd, command);
+            }
+            return self.after_chrome_key(hwnd);
+        }
         if y >= doc.view.chrome_px() {
             if doc.chrome.focus != Focus::Grid {
                 doc.chrome.focus = Focus::Grid;
@@ -3231,11 +3548,28 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
-                    shell.view_key(hwnd, wparam.0 as u16, ctrl)
+                    shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
+                        || shell.view_key(hwnd, wparam.0 as u16, ctrl)
                         || shell.chrome_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.find_key(hwnd, wparam.0 as u16, ctrl, shift)
                 })
             });
+            // The palette's "Open file…" runs here, outside the borrow, for the reason `Ctrl+O` does.
+            let open = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| std::mem::take(&mut shell.pending_open))
+            });
+            if open {
+                if let Some(path) = ask_for_file(hwnd) {
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            shell.open_path(hwnd, path);
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
             if consumed {
                 return LRESULT(0);
             }
@@ -3619,6 +3953,7 @@ fn main() -> Result<()> {
             document: Tabs::default(),
 
             needs_frame: false,
+            pending_open: false,
             frames: Frames::new(),
             last_double: None,
             file: None,
@@ -4278,6 +4613,39 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// The palette's two kinds of choice reach the document: a listed command by its id, and a
+    /// typed number as a physical line — one-based, clamped, shown with the caret on it, and
+    /// under a filter landing on the survivor after a hidden line.
+    #[test]
+    fn go_to_line_is_physical_one_based_and_clamped() {
+        let path = scratch_log("tailhawk_goto_test.log", 500);
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.go_to_line(250);
+        let caret = doc.selection.expect("a caret").focus().row;
+        assert_eq!(caret, 249, "line 250 is row 249");
+        let first = doc.view.grid().scroll().row;
+        assert!(first <= 249 && 249 < first + doc.view.grid().page_rows(), "on screen");
+        doc.go_to_line(0);
+        assert_eq!(doc.selection.expect("caret").focus().row, 0, "0 clamps to the first line");
+        doc.go_to_line(9_999);
+        assert_eq!(doc.selection.expect("caret").focus().row, 499, "past the end clamps");
+
+        filter_for(&mut doc, "7", Polarity::Include);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.go_to_line(1);
+        let caret = doc.selection.expect("caret").focus().row;
+        assert_eq!(doc.filtering.file_row(caret), Some(7), "line 1 is hidden; its slot is line 8");
+
+        assert_eq!(Command::from_choice(Choice::GoToLine(12)), Some(Command::GoToLine(12)));
+        assert_eq!(Command::from_choice(Choice::Command(0)), Some(Command::OpenFile));
+        assert_eq!(Command::from_choice(Choice::Command(999)), None);
+        let entries = Command::entries();
+        assert_eq!(entries.len(), Command::LISTED.len());
+        assert!(entries.iter().all(|e| !e.label.is_empty() && !e.key.is_empty()));
+        std::fs::remove_file(&path).ok();
+    }
+
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
         doc.add_chip(text, polarity);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4597,7 +4965,7 @@ mod tests {
     }
     /// A headless screenshot: opens `TAILHAWK_SHOT_FILE`, applies `TAILHAWK_SHOT_KEYS` (a `;`-separated
     /// script of `chip:<text>`, `xchip:<text>`, `find:<text>`, `focus:find|chip|grid`, `type:<text>`,
-    /// `bookmark:<view row>`, `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
+    /// `bookmark:<view row>`, `palette:<query>`, `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
     /// harness that has no desktop to capture — the offscreen target is the whole point.
     ///
     /// ```text
@@ -4661,6 +5029,11 @@ mod tests {
                     let names: Vec<String> = arg.split(',').map(str::to_owned).collect();
                     let active = names.len().saturating_sub(1);
                     doc.tab_strip = (names, active);
+                }
+                "palette" => {
+                    doc.palette.open();
+                    doc.palette.field.insert(arg);
+                    doc.palette.refresh();
                 }
                 "bookmark" => {
                     let row: u64 = arg.parse().expect("a row number");
