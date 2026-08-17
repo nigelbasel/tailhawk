@@ -92,16 +92,7 @@ pub type Colour = [f32; 4];
 /// reads as "probably". All are legible on `BACKGROUND` and none is the severity ramp's red, amber
 /// or magenta, so an identifier never impersonates an error. Provisional with the rest of the
 /// palette (`UI-DESIGN.md` §11.2 pins no hex).
-pub const IDENTIFIER_PALETTE: [Colour; 8] = [
-    [0.55, 0.78, 0.98, 1.0],
-    [0.62, 0.86, 0.66, 1.0],
-    [0.86, 0.72, 0.98, 1.0],
-    [0.55, 0.88, 0.86, 1.0],
-    [0.92, 0.80, 0.55, 1.0],
-    [0.98, 0.68, 0.78, 1.0],
-    [0.72, 0.80, 0.98, 1.0],
-    [0.80, 0.90, 0.55, 1.0],
-];
+pub const IDENTIFIER_PALETTE: [Colour; 8] = crate::theme::Theme::dark().identifiers;
 
 /// The colour a derived rule gives `text`. Same text, same colour, everywhere and always.
 ///
@@ -114,7 +105,8 @@ pub fn derived_colour(text: &str) -> Colour {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    IDENTIFIER_PALETTE[(hash % IDENTIFIER_PALETTE.len() as u64) as usize]
+    let palette = crate::theme::theme().identifiers;
+    palette[(hash % palette.len() as u64) as usize]
 }
 
 /// One highlight rule. §7.1's unit.
@@ -678,7 +670,7 @@ mod tests {
             Some(RED),
             "a derived rule ignores its fixed foreground"
         );
-        assert!(IDENTIFIER_PALETTE.contains(&a[0].fg.expect("coloured")));
+        assert!(crate::theme::theme().identifiers.contains(&a[0].fg.expect("coloured")));
         assert_eq!(a[0].fg, Some(derived_colour("req-1a2b")));
     }
 

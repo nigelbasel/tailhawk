@@ -15,6 +15,7 @@
 //!
 //! ## What is kept
 //!
+//! - `[appearance]` — `theme`: `dark`, `light` or `system`, when chosen.
 //! - `[window]` — `x`, `y`, `width`, `height`, `maximized`: where the window was.
 //! - `[[file]]` — `path`, `chips` (each `+text` or `-text`), `collapse`, `bookmarks` (file rows),
 //!   `labels` (each `n:text`): what a file was being
@@ -55,6 +56,8 @@ pub struct FileState {
 pub struct Settings {
     pub window: Option<Window>,
     pub files: Vec<FileState>,
+    /// V13: `dark`, `light` or `system`, when the user chose one.
+    pub theme: Option<String>,
 }
 
 impl Settings {
@@ -90,6 +93,9 @@ impl Settings {
         if over.window.is_some() {
             self.window = over.window;
         }
+        if over.theme.is_some() {
+            self.theme = over.theme;
+        }
         for f in over.files {
             self.set_file(f);
         }
@@ -100,6 +106,9 @@ impl Settings {
     pub fn to_toml(&self) -> String {
         let mut out =
             String::from("# Tailhawk settings — SPEC.md §12.4. Rewritten whole; edits survive.\n");
+        if let Some(theme) = &self.theme {
+            out.push_str(&format!("\n[appearance]\ntheme = {}\n", quote(theme)));
+        }
         if let Some(w) = &self.window {
             out.push_str("\n[window]\n");
             out.push_str(&format!(
@@ -160,11 +169,13 @@ impl Settings {
             }
             if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                 flush_file(&mut file, &mut settings);
-                section = if header.trim() == "window" {
-                    have_window = true;
-                    Section::Window
-                } else {
-                    Section::Other
+                section = match header.trim() {
+                    "window" => {
+                        have_window = true;
+                        Section::Window
+                    }
+                    "appearance" => Section::Appearance,
+                    _ => Section::Other,
                 };
                 continue;
             }
@@ -173,6 +184,11 @@ impl Settings {
             };
             let (key, value) = (key.trim(), value.trim());
             match section {
+                Section::Appearance => {
+                    if key == "theme" {
+                        settings.theme = Some(unquote(value));
+                    }
+                }
                 Section::Window => match key {
                     "x" => window.x = value.parse().unwrap_or(0),
                     "y" => window.y = value.parse().unwrap_or(0),
@@ -213,6 +229,7 @@ impl Settings {
 enum Section {
     None,
     Window,
+    Appearance,
     File,
     Other,
 }
@@ -372,6 +389,7 @@ mod tests {
                 maximized: false,
             }),
             files: Vec::new(),
+            theme: Some("light".to_owned()),
         };
         s.set_file(FileState {
             path: r"C:\logs\app.log".to_owned(),

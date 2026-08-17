@@ -101,14 +101,14 @@ const SEVERITY_WORDS: [(SeverityBand, &[&str], &[&str]); 5] = [
     (SeverityBand::Trace, &["trace"], &["FINEST", "VRB", "trce"]),
 ];
 
-const fn band_colour(band: SeverityBand) -> Colour {
+fn band_colour(t: &crate::theme::Theme, band: SeverityBand) -> Colour {
     match band {
-        SeverityBand::Fatal => FATAL,
-        SeverityBand::Error => ERROR,
-        SeverityBand::Warn => WARN,
-        SeverityBand::Debug => DEBUG,
-        SeverityBand::Trace => TRACE,
-        SeverityBand::Info => crate::INK,
+        SeverityBand::Fatal => t.semantic.fatal,
+        SeverityBand::Error => t.semantic.error,
+        SeverityBand::Warn => t.semantic.warn,
+        SeverityBand::Debug => t.semantic.debug,
+        SeverityBand::Trace => t.semantic.trace,
+        SeverityBand::Info => t.ink,
     }
 }
 
@@ -125,6 +125,12 @@ const WIN: &str = r#"[^\\/:*?"<>|\s]"#;
 /// falls back to §7.4's backtracker, because a catalogue that runs on every visible row of every
 /// frame cannot afford one that might.
 pub fn catalogue() -> RuleSet {
+    catalogue_for(&crate::theme::theme())
+}
+
+/// The catalogue in a given theme's hues — the caller that switches themes rebuilds with this.
+pub fn catalogue_for(t: &crate::theme::Theme) -> RuleSet {
+    let c = t.semantic;
     let mut set = RuleSet::new(NAME);
     for (band, any_case, as_written) in SEVERITY_WORDS {
         set = set.with(
@@ -132,10 +138,10 @@ pub fn catalogue() -> RuleSet {
                 &format!("severity {}", band.name()),
                 &severity_pattern(any_case, as_written),
             )
-            .fg(band_colour(band)),
+            .fg(band_colour(t, band)),
         );
     }
-    set.with(rule("timestamp", &timestamp_pattern()).fg(TIMESTAMP))
+    set.with(rule("timestamp", &timestamp_pattern()).fg(c.timestamp))
         .with(
             rule(
                 "identifier",
@@ -148,42 +154,42 @@ pub fn catalogue() -> RuleSet {
                 "url",
                 r#"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s"'<>()\[\]{}]*[^\s"'<>()\[\]{}.,;:!?]"#,
             )
-            .fg(URL),
+            .fg(c.url),
         )
-        .with(rule("ipv6", &ipv6_pattern()).group(1, IP))
-        .with(rule("ipv4", &format!(r"\b{OCTET}(?:\.{OCTET}){{3}}(?::\d{{1,5}})?\b")).fg(IP))
-        .with(rule("windows path", &format!(r"\b[A-Za-z]:\\(?:{WIN}+\\)*{WIN}*")).fg(PATH))
-        .with(rule("unc path", &format!(r"\\\\{WIN}+(?:\\{WIN}+)*")).fg(PATH))
-        .with(rule("unix path", r#"(?:^|[\s"'=(\[,])(/(?:[\w.\-~+@%]+/?)+)"#).group(1, PATH))
+        .with(rule("ipv6", &ipv6_pattern()).group(1, c.ip))
+        .with(rule("ipv4", &format!(r"\b{OCTET}(?:\.{OCTET}){{3}}(?::\d{{1,5}})?\b")).fg(c.ip))
+        .with(rule("windows path", &format!(r"\b[A-Za-z]:\\(?:{WIN}+\\)*{WIN}*")).fg(c.path))
+        .with(rule("unc path", &format!(r"\\\\{WIN}+(?:\\{WIN}+)*")).fg(c.path))
+        .with(rule("unix path", r#"(?:^|[\s"'=(\[,])(/(?:[\w.\-~+@%]+/?)+)"#).group(1, c.path))
         .with(
             rule(
                 "http status",
                 r#"(?:HTTP/\d(?:\.\d)?"? +|\b[Ss]tatus(?:[ _-]?[Cc]ode)?[=:]? *|(?:^| )- )(?:(2\d\d)|(3\d\d)|(4\d\d)|(5\d\d))\b"#,
             )
-            .group(1, HTTP_OK)
-            .group(2, URL)
-            .group(3, WARN)
-            .group(4, ERROR),
+            .group(1, c.http_ok)
+            .group(2, c.url)
+            .group(3, c.warn)
+            .group(4, c.error),
         )
         .with(
             rule(
                 "http method",
                 r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|CONNECT|TRACE)\b",
             )
-            .fg(HTTP_METHOD),
+            .fg(c.http_method),
         )
-        .with(rule("hex", r"\b0[xX][0-9a-fA-F]+\b").fg(HEX))
-        .with(rule("quoted", r#""(?:[^"\\\r\n]|\\.)*""#).fg(QUOTED))
-        .with(rule("quoted", r"(?:^|[^\w])('(?:[^'\\\r\n]|\\.)*')").group(1, QUOTED))
+        .with(rule("hex", r"\b0[xX][0-9a-fA-F]+\b").fg(c.hex))
+        .with(rule("quoted", r#""(?:[^"\\\r\n]|\\.)*""#).fg(c.quoted))
+        .with(rule("quoted", r"(?:^|[^\w])('(?:[^'\\\r\n]|\\.)*')").group(1, c.quoted))
         .with(
             rule(
                 "duration",
                 r"\b\d+(?:[.,]\d+)?\s?(?:ns|µs|us|ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)\b",
             )
-            .fg(DURATION),
+            .fg(c.duration),
         )
-        .with(rule("key", r"\b([A-Za-z_][\w.\-]*)=").group(1, KEY))
-        .with(rule("number", r"\b\d+(?:\.\d+)?\b").fg(NUMBER))
+        .with(rule("key", r"\b([A-Za-z_][\w.\-]*)=").group(1, c.key))
+        .with(rule("number", r"\b\d+(?:\.\d+)?\b").fg(c.number))
 }
 
 /// The catalogue is a set of constants and a test compiles every one; a failure here is an edit
@@ -308,7 +314,7 @@ mod tests {
                 assert_eq!(severity.band(), band, "{word:?}");
                 assert_eq!(
                     colour_of(&format!("x {word} y"), word),
-                    Some(band_colour(band))
+                    Some(band_colour(&crate::theme::theme(), band))
                 );
             }
         }

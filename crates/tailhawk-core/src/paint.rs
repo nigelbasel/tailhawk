@@ -68,7 +68,7 @@ use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline, MODE_SOLID};
 use crate::view::View;
 use crate::Result;
-use crate::{GUTTER_INK, HEADER_BG, HEADER_INK, REVEAL_MARK, SELECTION_INK};
+use crate::theme::theme;
 
 /// What colours one row, gathered because the three arrive together and mean nothing apart.
 ///
@@ -212,6 +212,7 @@ impl Painter {
         // Taken out and put back so the row loop can hold it mutably while `self` is borrowed for
         // the layout. One `Vec` for the frame is the point; taking it does not allocate.
         let mut spans = std::mem::take(&mut self.spans);
+        let t = theme();
         let gutter = view.gutter_px();
         let cell_w = self.cell_width();
         for (row, y) in rows {
@@ -232,7 +233,7 @@ impl Painter {
                     let width = ((gutter / cell_w) as usize).saturating_sub(1);
                     let x = (width.saturating_sub(text.len())) as f32 * cell_w;
                     self.spans = spans;
-                    let _ = self.lay_out_at(view, x, y, &text, Colours::plain(GUTTER_INK));
+                    let _ = self.lay_out_at(view, x, y, &text, Colours::plain(t.gutter_ink));
                     spans = std::mem::take(&mut self.spans);
                 }
             }
@@ -267,7 +268,7 @@ impl Painter {
             self.instances.push(Instance {
                 pos: [0.0, chrome],
                 size: [view.gutter_px() + view.hgrid().viewport_px(), header_px],
-                tint: HEADER_BG,
+                tint: t.header_bg,
                 mode: MODE_SOLID,
                 ..Instance::default()
             });
@@ -278,7 +279,7 @@ impl Painter {
                 view,
                 header,
                 ColumnAnchors::none_ref(),
-                Colours::plain(HEADER_INK),
+                Colours::plain(t.header_ink),
                 chrome,
             ) {
                 Ok(laid) => total.merge(laid),
@@ -316,6 +317,7 @@ impl Painter {
             selected,
             spans,
         } = colours;
+        let t = theme();
         let slice = view.slice_anchored(line, anchors);
         if slice.bytes.is_empty() {
             return Ok(Laid::default());
@@ -413,7 +415,7 @@ impl Painter {
                 .filter(|span| span.start <= start)
                 .and_then(|span| span.fg);
             let ink = match &selected {
-                Some(range) if at >= range.start && at < range.end => SELECTION_INK,
+                Some(range) if at >= range.start && at < range.end => t.selection_ink,
                 _ => claimed.unwrap_or(tint),
             };
 
@@ -431,7 +433,7 @@ impl Painter {
                 self.instances.push(Instance {
                     pos: [view.hgrid().x_of_column(at) + inset, y + row_height * 0.3],
                     size: [cell_width - 2.0 * inset, row_height * 0.4],
-                    tint: REVEAL_MARK,
+                    tint: t.reveal_mark,
                     mode: MODE_SOLID,
                     ..Instance::default()
                 });
@@ -562,6 +564,7 @@ impl Painter {
 mod tests {
     use super::*;
     use crate::gpu::offscreen::Offscreen;
+    use crate::theme::Theme;
 
     const CANDIDATES: &[&str] = &["Cascadia Mono", "Consolas", "Courier New", "Segoe UI"];
     const EM: u16 = 14;
@@ -923,7 +926,7 @@ mod tests {
         let selected = painter
             .instances()
             .iter()
-            .filter(|i| i.tint == SELECTION_INK)
+            .filter(|i| i.tint == Theme::dark().selection_ink)
             .count();
         let plain = painter.instances().iter().filter(|i| i.tint == INK).count();
 
@@ -990,7 +993,7 @@ mod tests {
             .filter(|i| i.mode == MODE_SOLID)
             .collect();
         assert_eq!(solids.len(), 1, "on: one marker");
-        assert_eq!(solids[0].tint, REVEAL_MARK);
+        assert_eq!(solids[0].tint, Theme::dark().reveal_mark);
         let col2 = view.hgrid().x_of_column(2);
         assert!(
             solids[0].pos[0] > col2

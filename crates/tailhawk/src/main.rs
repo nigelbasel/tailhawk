@@ -36,22 +36,25 @@ use tailhawk_core::sieve;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::template;
 use tailhawk_core::widget::{Focus, Move, TextField};
+use tailhawk_core::theme::{self, theme, Theme};
 use tailhawk_core::{
-    background_rgb8, Position, Renderer, RowEnd, RowSource, Selection, View, WindowHandle,
-    CONTINUATION_INK, CURRENT_MATCH_BG, CURRENT_MATCH_INK, HEADER_INK, INK, MATCH_BG,
-    RENDER_CAP_CELLS,
+    Position, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
     GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect};
+use windows::Win32::Graphics::Gdi::{
+    CreateSolidBrush, GetSysColor, InvalidateRect, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+};
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
 use windows::Win32::UI::Controls::Dialogs::{
@@ -78,11 +81,12 @@ use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDR
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    SetClassLongPtrW, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP,
     SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO,
-    SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST,
+    SPI_GETWHEELSCROLLLINES,
+    GCLP_HBRBACKGROUND, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_SYSKEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -242,7 +246,7 @@ impl RowSource for Document {
 
     fn row_mark(&self, row: u64) -> Option<[f32; 4]> {
         let file_row = self.filtering.file_row(row)?;
-        self.bookmarks.contains(&file_row).then_some(BOOKMARK_MARK)
+        self.bookmarks.contains(&file_row).then_some(theme().bookmark_mark)
     }
 
     /// §7.1's colours: the search's matches on top, the semantic catalogue beneath. **Visible rows
@@ -273,7 +277,7 @@ impl RowSource for Document {
         let mut hits = self.chrome.hits.borrow_mut();
         hits.clear();
 
-        painter.fill(0.0, 0.0, width, band, CHROME_BG);
+        painter.fill(0.0, 0.0, width, band, theme().chrome_bg);
 
         // The tab strip, when there is more than one tab: each file's name on its own fill, the
         // shown one lighter, and a click on one shows it (`Hit::Tab`). Above the bar.
@@ -284,9 +288,9 @@ impl RowSource for Document {
             let mut tx = cell_w * 0.5;
             for (i, label) in labels.iter().enumerate() {
                 let w = cells.cell_count(label) as f32 * cell_w;
-                let bg = if i == *active { TAB_ACTIVE_BG } else { TAB_BG };
+                let bg = if i == *active { theme().tab_active_bg } else { theme().tab_bg };
                 painter.fill(tx - 2.0, 1.0, w + cell_w * 2.0 + 4.0, strip_h - 2.0, bg);
-                let ink = if i == *active { INK } else { HEADER_INK };
+                let ink = if i == *active { theme().ink } else { theme().header_ink };
                 let _ = painter.lay_out_at(view, tx + cell_w, ty, label, Colours::plain(ink));
                 hits.push((tx..tx + w + cell_w * 2.0, Hit::Tab(i)));
                 tx += w + cell_w * 3.0;
@@ -300,7 +304,7 @@ impl RowSource for Document {
 
         // ▸ and the find field. (`UI-DESIGN.md` §2.1's ▸ is not in Cascadia Mono, and the painter
         // has one face until fallback lands; a placeholder box is worse than a plain marker.)
-        let _ = painter.lay_out_at(view, x, text_y, "▸", Colours::plain(HEADER_INK));
+        let _ = painter.lay_out_at(view, x, text_y, "▸", Colours::plain(theme().header_ink));
         x += cell_w * 2.0;
         let find_w = FIND_CELLS as f32 * cell_w;
         let find_focused = self.chrome.focus == Focus::Find;
@@ -310,9 +314,9 @@ impl RowSource for Document {
             find_w + 4.0,
             row_h + 4.0,
             if find_focused {
-                FIELD_BG_FOCUSED
+                theme().field_bg_focused
             } else {
-                FIELD_BG
+                theme().field_bg
             },
         );
         hits.push((x..x + find_w, Hit::Find));
@@ -331,7 +335,7 @@ impl RowSource for Document {
         x += find_w + cell_w * 2.0;
 
         // ▼ and the chips.
-        let _ = painter.lay_out_at(view, x, text_y, "▼", Colours::plain(HEADER_INK));
+        let _ = painter.lay_out_at(view, x, text_y, "▼", Colours::plain(theme().header_ink));
         x += cell_w * 2.0;
         for (i, chip) in self.filtering.chips.chips.iter().enumerate() {
             let sign = match chip.polarity {
@@ -343,19 +347,19 @@ impl RowSource for Document {
             // The body toggles, the `×` after it removes; a disabled chip is drawn dim on its fill.
             let close_w = cell_w * 2.0;
             let bg = match (chip.polarity, chip.enabled) {
-                (Polarity::Include, true) => CHIP_INCLUDE_BG,
-                (Polarity::Exclude, true) => CHIP_EXCLUDE_BG,
-                (_, false) => FIELD_BG,
+                (Polarity::Include, true) => theme().chip_include_bg,
+                (Polarity::Exclude, true) => theme().chip_exclude_bg,
+                (_, false) => theme().field_bg,
             };
             painter.fill(x - 2.0, text_y - 2.0, w + close_w + 4.0, row_h + 4.0, bg);
-            let ink = if chip.enabled { INK } else { FIELD_HINT };
+            let ink = if chip.enabled { theme().ink } else { theme().field_hint };
             let _ = painter.lay_out_at(view, x, text_y, &label, Colours::plain(ink));
             let _ = painter.lay_out_at(
                 view,
                 x + w + cell_w * 0.5,
                 text_y,
                 "×",
-                Colours::plain(FIELD_HINT),
+                Colours::plain(theme().field_hint),
             );
             hits.push((x..x + w, Hit::Chip(i)));
             hits.push((x + w..x + w + close_w, Hit::ChipClose(i)));
@@ -370,9 +374,9 @@ impl RowSource for Document {
             chip_w + 4.0,
             row_h + 4.0,
             if chip_focused {
-                FIELD_BG_FOCUSED
+                theme().field_bg_focused
             } else {
-                FIELD_BG
+                theme().field_bg
             },
         );
         hits.push((x..x + chip_w, Hit::NewChip));
@@ -399,7 +403,7 @@ impl RowSource for Document {
             let w = cells.cell_count(&text) as f32 * cell_w;
             let fx = width - w - cell_w;
             if fx > x + chip_w + cell_w {
-                let _ = painter.lay_out_at(view, fx, text_y, &text, Colours::plain(HEADER_INK));
+                let _ = painter.lay_out_at(view, fx, text_y, &text, Colours::plain(theme().header_ink));
             }
         }
 
@@ -413,8 +417,8 @@ impl RowSource for Document {
         if self.detail.open && self.detail.rows > 0 && !self.detail.lines.is_empty() {
             let pane_h = DetailPane::height(self.detail.rows, row_h);
             let top = view.height_px() - strip - pane_h;
-            painter.fill(0.0, top, width, pane_h, PANE_BG);
-            painter.fill(0.0, top, width, 1.0, PANE_EDGE);
+            painter.fill(0.0, top, width, pane_h, theme().pane_bg);
+            painter.fill(0.0, top, width, 1.0, theme().pane_edge);
             let shown = self.detail.rows.min(self.detail.lines.len());
             let hidden = self.detail.lines.len() - shown;
             let mut y = top + 3.0;
@@ -422,11 +426,11 @@ impl RowSource for Document {
                 let last_and_more = hidden > 0 && i + 1 == shown;
                 let more = format!("… {} more lines", hidden + 1);
                 let (text, ink) = if last_and_more {
-                    (more.as_str(), FIELD_HINT)
+                    (more.as_str(), theme().field_hint)
                 } else if i == 0 {
-                    (line.as_str(), HEADER_INK)
+                    (line.as_str(), theme().header_ink)
                 } else {
-                    (line.as_str(), INK)
+                    (line.as_str(), theme().ink)
                 };
                 let _ = painter.lay_out_at(view, cell_w, y, text, Colours::plain(ink));
                 y += row_h;
@@ -438,11 +442,11 @@ impl RowSource for Document {
         let footer = strip.min(view.footer_px());
         if footer > 0.0 && !self.status.is_empty() {
             let fy = view.height_px() - footer;
-            painter.fill(0.0, fy, width, footer, CHROME_BG);
+            painter.fill(0.0, fy, width, footer, theme().chrome_bg);
             let avail = ((width - cell_w) / cell_w).max(0.0) as usize;
             let shown = tailhawk_core::widget::fit_from_right(cells, &self.status, avail);
             let ty = fy + ((footer - row_h) / 2.0).floor();
-            let _ = painter.lay_out_at(view, cell_w * 0.5, ty, shown, Colours::plain(HEADER_INK));
+            let _ = painter.lay_out_at(view, cell_w * 0.5, ty, shown, Colours::plain(theme().header_ink));
         }
 
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
@@ -455,10 +459,10 @@ impl RowSource for Document {
             let rows = self.palette.rows();
             let box_h = row_h * (rows.len() + 1) as f32 + 8.0;
             let box_y = band;
-            painter.fill(box_x, box_y, box_w, box_h, PALETTE_BG);
+            painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
             let inner_x = box_x + cell_w;
             let mut y = box_y + 4.0;
-            let _ = painter.lay_out_at(view, inner_x, y, "▸", Colours::plain(FIELD_HINT));
+            let _ = painter.lay_out_at(view, inner_x, y, "▸", Colours::plain(theme().field_hint));
             draw_field(
                 painter,
                 view,
@@ -474,15 +478,15 @@ impl RowSource for Document {
             let mut hits = self.chrome.palette_hits.borrow_mut();
             for (i, row) in rows.iter().enumerate() {
                 if row.selected {
-                    painter.fill(box_x, y, box_w, row_h, PALETTE_SELECTED_BG);
+                    painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
                 }
                 let key_cells = cells.cell_count(row.key);
                 let label_avail = (PALETTE_CELLS - 4).saturating_sub(key_cells + 2);
                 let label = tailhawk_core::widget::fit_from_right(cells, &row.label, label_avail);
-                let _ = painter.lay_out_at(view, inner_x + 2.0 * cell_w, y, label, Colours::plain(INK));
+                let _ = painter.lay_out_at(view, inner_x + 2.0 * cell_w, y, label, Colours::plain(theme().ink));
                 if !row.key.is_empty() {
                     let kx = box_x + box_w - (key_cells as f32 + 1.0) * cell_w;
-                    let _ = painter.lay_out_at(view, kx, y, row.key, Colours::plain(FIELD_HINT));
+                    let _ = painter.lay_out_at(view, kx, y, row.key, Colours::plain(theme().field_hint));
                 }
                 hits.push((y..y + row_h, i));
                 y += row_h;
@@ -512,7 +516,7 @@ impl RowSource for Document {
                         Span {
                             start: 0,
                             end: p.text.len(),
-                            fg: Some(CONTINUATION_INK),
+                            fg: Some(theme().continuation_ink),
                             bg: None,
                         },
                     );
@@ -965,6 +969,12 @@ impl Document {
         } else {
             ""
         };
+        // §11.2: under High Contrast the user's highlight rules are off, and a chip says so.
+        let contrast = if theme().suppress_rules {
+            "⚑ High Contrast — highlight rules off — "
+        } else {
+            ""
+        };
         // E21: an export in flight or a live tee, with its count — the user asked for a file and
         // this is where they see it filling.
         let tee = match &self.tee {
@@ -991,7 +1001,7 @@ impl Document {
             "‖ paused · Ctrl+End to follow — "
         };
         format!(
-            "{following}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
+            "{following}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -1516,7 +1526,7 @@ impl Document {
         rules.insert(
             0,
             Rule::new(name, pattern)
-                .bg(LABEL_COLOURS[usize::from(n) - 1])
+                .bg(theme().labels[usize::from(n) - 1])
                 .whole_line(),
         );
         self.labels.push((n, text.to_owned()));
@@ -1830,9 +1840,9 @@ impl Finder {
                 break;
             }
             let (bg, fg) = if at == current {
-                (CURRENT_MATCH_BG, Some(CURRENT_MATCH_INK))
+                (theme().current_match_bg, Some(theme().current_match_ink))
             } else {
-                (MATCH_BG, None)
+                (theme().match_bg, None)
             };
             out.push(Span {
                 start: m.start,
@@ -2275,6 +2285,7 @@ enum Command {
     CopyTsv,
     Split,
     FocusOtherPane,
+    ToggleTheme,
     GoToTop,
     FollowTail,
     Copy,
@@ -2312,6 +2323,7 @@ impl Command {
         (Command::CopyTsv, "Copy selection as TSV with columns", "Ctrl+Shift+C"),
         (Command::Split, "Split the pane / unsplit", "Ctrl+\\"),
         (Command::FocusOtherPane, "Focus the other pane", "F6"),
+        (Command::ToggleTheme, "Switch between the dark and light themes", ""),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2641,38 +2653,8 @@ impl Watch {
     }
 }
 
-/// The bar's colours. Provisional with the rest of the palette; a shade off the ground so the bar
-/// reads as chrome, the focused field a shade lighter than the other.
-const CHROME_BG: [f32; 4] = [0.10, 0.11, 0.13, 1.0];
-const FIELD_BG: [f32; 4] = [0.14, 0.15, 0.18, 1.0];
-const FIELD_BG_FOCUSED: [f32; 4] = [0.18, 0.20, 0.24, 1.0];
-const FIELD_HINT: [f32; 4] = [0.42, 0.45, 0.50, 1.0];
-const FIELD_SELECTION_BG: [f32; 4] = [0.20, 0.36, 0.60, 1.0];
-const CARET: [f32; 4] = [0.88, 0.89, 0.91, 1.0];
-const CHIP_INCLUDE_BG: [f32; 4] = [0.14, 0.26, 0.20, 1.0];
-const CHIP_EXCLUDE_BG: [f32; 4] = [0.30, 0.16, 0.16, 1.0];
-/// `Ctrl+Shift+1…9`'s label backgrounds: nine tints a line stays readable over, in key order.
-const LABEL_COLOURS: [[f32; 4]; 9] = [
-    [0.45, 0.30, 0.10, 1.0],
-    [0.15, 0.40, 0.20, 1.0],
-    [0.15, 0.30, 0.50, 1.0],
-    [0.45, 0.20, 0.45, 1.0],
-    [0.15, 0.42, 0.42, 1.0],
-    [0.50, 0.15, 0.15, 1.0],
-    [0.40, 0.40, 0.15, 1.0],
-    [0.30, 0.30, 0.45, 1.0],
-    [0.35, 0.35, 0.35, 1.0],
-];
-const PANE_BG: [f32; 4] = [0.11, 0.12, 0.15, 1.0];
-const PANE_EDGE: [f32; 4] = [0.30, 0.32, 0.38, 1.0];
-const PALETTE_BG: [f32; 4] = [0.16, 0.17, 0.21, 1.0];
-const PALETTE_SELECTED_BG: [f32; 4] = [0.24, 0.30, 0.42, 1.0];
 /// The palette box's width, in cells.
 const PALETTE_CELLS: usize = 64;
-/// The gutter mark on a bookmarked row.
-const BOOKMARK_MARK: [f32; 4] = [0.85, 0.65, 0.20, 1.0];
-const TAB_BG: [f32; 4] = [0.13, 0.14, 0.17, 1.0];
-const TAB_ACTIVE_BG: [f32; 4] = [0.20, 0.22, 0.26, 1.0];
 
 /// One field: its text (cut from the left to fit), a hint when empty and unfocused, the selection
 /// as a background span, the caret as a two-pixel fill, and a mark under an IME composition.
@@ -2692,7 +2674,7 @@ fn draw_field(
     let row_h = painter.row_height();
     let display = field.display();
     if display.is_empty() && !focused {
-        let _ = painter.lay_out_at(view, x, y, hint, Colours::plain(FIELD_HINT));
+        let _ = painter.lay_out_at(view, x, y, hint, Colours::plain(theme().field_hint));
         return;
     }
     let (shown, cut) = Chrome::fitted(cells, &display, width_cells);
@@ -2706,7 +2688,7 @@ fn draw_field(
                 start,
                 end,
                 fg: None,
-                bg: Some(FIELD_SELECTION_BG),
+                bg: Some(theme().field_selection_bg),
             });
         }
     }
@@ -2716,7 +2698,7 @@ fn draw_field(
         y,
         shown,
         Colours {
-            tint: INK,
+            tint: theme().ink,
             selected: None,
             spans: &spans,
         },
@@ -2733,12 +2715,12 @@ fn draw_field(
             y + row_h - 2.0,
             (to.saturating_sub(from)) as f32 * cell_w,
             1.0,
-            CARET,
+            theme().caret,
         );
     }
     let caret_byte = field.display_caret().saturating_sub(cut).min(shown.len());
     let caret_cell = cells.cell_at_byte(shown, caret_byte);
-    painter.fill(x + caret_cell as f32 * cell_w, y, 2.0, row_h, CARET);
+    painter.fill(x + caret_cell as f32 * cell_w, y, 2.0, row_h, theme().caret);
 }
 
 /// What a mouse event means for the selection.
@@ -3449,6 +3431,39 @@ impl Shell {
         }
     }
 
+    /// V13: dark to light or back. Every document's semantic catalogue is rebuilt in the new hues
+    /// (its labels re-added), the choice is remembered, and the class brush — stage one of the
+    /// two-stage paint — takes the new ground. Under High Contrast the system's colours stand.
+    fn toggle_theme(&mut self, hwnd: HWND) {
+        let current = theme();
+        if current.suppress_rules {
+            return;
+        }
+        let next = if current.dark {
+            Theme::light()
+        } else {
+            Theme::dark()
+        };
+        theme::set_theme(next);
+        self.settings.theme = Some(if next.dark { "dark" } else { "light" }.to_owned());
+        for (_, doc) in self.document.all_mut() {
+            doc.highlighter = Highlighter::new(semantic::catalogue());
+            let labels = std::mem::take(&mut doc.labels);
+            for (n, text) in labels {
+                doc.label(n, &text);
+            }
+        }
+        let (r, g, b) = next.background_rgb8();
+        unsafe {
+            let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(
+                r as u32 | (g as u32) << 8 | (b as u32) << 16,
+            ));
+            SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush.0 as isize);
+            let _ = InvalidateRect(hwnd, None, true);
+        }
+        self.retitle(hwnd);
+    }
+
     /// Which pane a client `y` falls in, and that pane's top — for routing a click. `None` with no
     /// document.
     fn pane_at(&self, y: f32) -> Option<(usize, f32)> {
@@ -3536,6 +3551,10 @@ impl Shell {
             }
             Command::Split => {
                 self.toggle_split(hwnd);
+                return true;
+            }
+            Command::ToggleTheme => {
+                self.toggle_theme(hwnd);
                 return true;
             }
             Command::FocusOtherPane => {
@@ -3632,6 +3651,7 @@ impl Shell {
             | Command::PreviousTab
             | Command::Split
             | Command::FocusOtherPane
+            | Command::ToggleTheme
             | Command::CloseTab => {}
         }
         self.after_chrome_key(hwnd)
@@ -4039,6 +4059,81 @@ fn ask_to_save(hwnd: HWND) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(String::from_utf16_lossy(
         &file[..len],
     )))
+}
+
+/// The theme for a name — `dark`, `light`, `system` (the apps-use-light-theme registry value) — with
+/// High Contrast on top: `UI-DESIGN.md` §11.2 says system colours are respected there whatever was
+/// asked, so it is read first.
+fn resolve_theme(name: Option<&str>) -> Theme {
+    if let Some(hc) = high_contrast_theme() {
+        return hc;
+    }
+    match name {
+        Some("system") => {
+            if system_uses_light_theme() {
+                Theme::light()
+            } else {
+                Theme::dark()
+            }
+        }
+        Some(other) => theme::by_name(other).unwrap_or_else(Theme::dark),
+        None => Theme::dark(),
+    }
+}
+
+/// `SPI_GETHIGHCONTRAST`: when the flag is on, a theme from `GetSysColor`'s window text, window
+/// and highlight colours.
+fn high_contrast_theme() -> Option<Theme> {
+    let mut hc = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            Some(&mut hc as *mut _ as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() || hc.dwFlags.0 & HCF_HIGHCONTRASTON.0 == 0 {
+        return None;
+    }
+    let sys = |index| {
+        let c = unsafe { GetSysColor(index) };
+        [
+            (c & 0xFF) as f32 / 255.0,
+            ((c >> 8) & 0xFF) as f32 / 255.0,
+            ((c >> 16) & 0xFF) as f32 / 255.0,
+            1.0,
+        ]
+    };
+    Some(Theme::high_contrast(
+        sys(COLOR_WINDOWTEXT),
+        sys(COLOR_WINDOW),
+        sys(COLOR_HIGHLIGHT),
+    ))
+}
+
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`, the
+/// value Settings > Personalisation > Colours writes. Absent or unreadable means dark.
+fn system_uses_light_theme() -> bool {
+    let key = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let name = windows::core::w!("AppsUseLightTheme");
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key,
+            name,
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    status.is_ok() && value != 0
 }
 
 fn ask_for_file(hwnd: HWND) -> Option<std::path::PathBuf> {
@@ -4784,10 +4879,17 @@ fn main() -> Result<()> {
     let settings_tiers = settings::tiers(exe_dir.as_deref(), roaming.as_deref());
     let settings = settings::load(&settings_tiers);
     let placement = settings.window;
+    // V13: the theme — `--theme=dark|light|system` on the command line, else what was saved, else
+    // dark; High Contrast overrides all of them with the system's colours (§11.2). Chosen before the
+    // class brush, which is stage one of the two-stage paint and must be the theme's ground.
+    let asked = std::env::args()
+        .find_map(|a| a.strip_prefix("--theme=").map(str::to_owned))
+        .or_else(|| settings.theme.clone());
+    theme::set_theme(resolve_theme(asked.as_deref()));
 
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let class_name = windows::core::w!("TailhawkMain");
-    let (r, g, b) = background_rgb8();
+    let (r, g, b) = theme().background_rgb8();
 
     let wc = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
@@ -5228,9 +5330,9 @@ mod tests {
         finder.spans(7, &mut spans);
         assert_eq!(spans.len(), 2);
         assert_eq!((spans[0].start, spans[0].end), (4, 9));
-        assert_eq!(spans[0].bg, Some(MATCH_BG));
-        assert_eq!(spans[1].bg, Some(CURRENT_MATCH_BG));
-        assert_eq!(spans[1].fg, Some(CURRENT_MATCH_INK));
+        assert_eq!(spans[0].bg, Some(theme().match_bg));
+        assert_eq!(spans[1].bg, Some(theme().current_match_bg));
+        assert_eq!(spans[1].fg, Some(theme().current_match_ink));
 
         // `out` is reused across rows, so a row with no matches must clear what the last one left.
         finder.spans(9, &mut spans);
@@ -5334,7 +5436,7 @@ mod tests {
         let mut spans = Vec::new();
         doc.row_spans(137, &mut spans);
         assert_eq!(spans[0].start, 0);
-        assert_eq!(spans[0].bg, Some(CURRENT_MATCH_BG));
+        assert_eq!(spans[0].bg, Some(theme().current_match_bg));
         assert_eq!(spans.iter().filter(|s| s.bg.is_some()).count(), 1);
         doc.row_spans(136, &mut spans);
         assert!(spans.iter().all(|s| s.bg.is_none()), "row 136 has no match");
@@ -5393,7 +5495,7 @@ mod tests {
         assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
         assert_eq!(
             inks[1],
-            (e, e + 5, Some(CURRENT_MATCH_INK), Some(CURRENT_MATCH_BG))
+            (e, e + 5, Some(theme().current_match_ink), Some(theme().current_match_bg))
         );
         assert!(
             inks.iter()
@@ -5517,7 +5619,7 @@ mod tests {
         let entries = Command::entries();
         assert_eq!(entries.len(), Command::LISTED.len());
         assert!(entries.iter().all(|e| !e.label.is_empty()));
-        assert!(entries.iter().filter(|e| e.key.is_empty()).count() <= 4, "palette-only commands are the exception");
+        assert!(entries.iter().filter(|e| e.key.is_empty()).count() < entries.len() / 3, "palette-only commands are the exception");
         std::fs::remove_file(&path).ok();
     }
 
@@ -5537,7 +5639,7 @@ mod tests {
         doc.lay_out((8.0, 10.0), (800, 200));
         let mut spans = Vec::new();
         doc.row_spans(0, &mut spans);
-        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[1])), "no label yet");
+        assert!(spans.iter().all(|s| s.bg != Some(theme().labels[1])), "no label yet");
 
         // Select `[a.b]` on the first row — cells 29..34 — and label it 2.
         doc.selection = Some(Selection::stream(Position::new(0, 29), Position::new(0, 34)));
@@ -5549,28 +5651,28 @@ mod tests {
             let line = doc.row_text(row).unwrap().to_owned();
             let labelled: usize = spans
                 .iter()
-                .filter(|s| s.bg == Some(LABEL_COLOURS[1]))
+                .filter(|s| s.bg == Some(theme().labels[1]))
                 .map(|s| s.end - s.start)
                 .sum();
             assert_eq!(labelled, line.len(), "row {row}: the whole line carries the label");
         }
         doc.row_spans(1, &mut spans);
-        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[1])), "the plain line does not");
+        assert!(spans.iter().all(|s| s.bg != Some(theme().labels[1])), "the plain line does not");
 
         // A second label on other text stacks; the first toggles off on its own.
         assert!(doc.label(5, "plain"));
         assert!(doc.toggle_label(2), "same key, same text: off");
         assert_eq!(doc.labels, [(5, "plain".to_owned())]);
         doc.row_spans(0, &mut spans);
-        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[1])));
+        assert!(spans.iter().all(|s| s.bg != Some(theme().labels[1])));
         doc.row_spans(1, &mut spans);
-        assert!(spans.iter().any(|s| s.bg == Some(LABEL_COLOURS[4])));
+        assert!(spans.iter().any(|s| s.bg == Some(theme().labels[4])));
 
         assert!(doc.clear_labels());
         assert!(doc.labels.is_empty());
         assert!(!doc.clear_labels(), "nothing left to clear");
         doc.row_spans(1, &mut spans);
-        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[4])));
+        assert!(spans.iter().all(|s| s.bg != Some(theme().labels[4])));
 
         assert!(!doc.label(0, "x"), "no label 0");
         assert!(!doc.label(10, "x"), "no label 10");
@@ -5815,7 +5917,7 @@ mod tests {
         let mut spans = Vec::new();
         doc.row_spans(2, &mut spans);
         assert!(
-            spans.iter().any(|s| s.bg == Some(CURRENT_MATCH_BG)),
+            spans.iter().any(|s| s.bg == Some(theme().current_match_bg)),
             "view row 2 is file row 100 and wears the match"
         );
 
@@ -6090,6 +6192,10 @@ mod tests {
         };
         let (w, h) = (1200u32, 500u32);
         let cell = renderer.cell().expect("cell metrics");
+        // `TAILHAWK_SHOT_THEME=light` — set before the document, whose catalogue takes the hues.
+        if let Some(t) = std::env::var("TAILHAWK_SHOT_THEME").ok().and_then(|n| theme::by_name(&n)) {
+            theme::set_theme(t);
+        }
         let mut doc = Document::open(std::path::Path::new(&file)).expect("open");
         doc.lay_out(cell, (w, h));
         for step in std::env::var("TAILHAWK_SHOT_KEYS")

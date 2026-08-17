@@ -35,6 +35,7 @@ pub mod selection;
 pub mod semantic;
 pub mod settings;
 pub mod template;
+pub mod theme;
 pub mod view;
 pub mod widget;
 
@@ -393,7 +394,7 @@ impl Renderer {
     /// `SPEC.md` §3.2 forbids panicking on device-removed; an `Err` here means the device could
     /// not be rebuilt after several attempts, not that the process should end.
     pub fn paint(&mut self) -> Result<()> {
-        self.gpu.render_frame(BACKGROUND)
+        self.gpu.render_frame(theme::theme().background)
     }
 
     /// Draws one frame of text over the background and presents it.
@@ -438,7 +439,7 @@ impl Renderer {
     ) -> Result<gpu::offscreen::Pixels> {
         self.gpu.attach_offscreen(width, height)?;
         for _ in 0..2 {
-            self.gpu.clear_offscreen(BACKGROUND);
+            self.gpu.clear_offscreen(theme::theme().background);
             self.paint_panes(panes, (width as f32, height as f32))?;
         }
         self.gpu.read_back()
@@ -472,7 +473,8 @@ impl Renderer {
         } = self;
         let mut laid = paint::Laid::default();
 
-        gpu.render_frame_with(BACKGROUND, &mut |device, context, generation| {
+        let t = theme::theme();
+        gpu.render_frame_with(t.background, &mut |device, context, generation| {
             let p = ensure_painter(
                 device,
                 context,
@@ -486,7 +488,7 @@ impl Renderer {
             laid = paint::Laid::default();
             for (view, source, y) in panes {
                 let from = p.mark();
-                laid.merge(p.lay_out(view, INK, *source)?);
+                laid.merge(p.lay_out(view, t.ink, *source)?);
                 p.shift(from, 0.0, *y);
             }
             // The whole client, gutter included, taken from the caller rather than the swapchain
