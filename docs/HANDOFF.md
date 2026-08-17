@@ -92,7 +92,7 @@ message must be moved to the un-nested one that causes it.**
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Next in M7:** drag-reorder and drag-out-to-split (split view); **V13** theming; V12 pointer
+**Next in M7:** tab drag-reorder; **V13** theming; V12 pointer
 scroll; V15 UIA; E22 sort; V9 rules editor / wizard; chip edit/reorder; column resize. **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
