@@ -14,6 +14,7 @@ pub mod atlas;
 pub mod bidi;
 pub mod cell;
 pub mod columns;
+pub mod detail;
 pub mod detect;
 pub mod encoding;
 pub mod filter;

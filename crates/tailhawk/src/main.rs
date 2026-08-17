@@ -175,6 +175,8 @@ struct Document {
     labels: Vec<(u8, String)>,
     /// E27's back/forward through views.
     history: History,
+    /// V10's record detail pane.
+    detail: DetailPane,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -391,9 +393,35 @@ impl RowSource for Document {
             }
         }
 
+        // V10: the detail pane, above the status bar. The first line is the record's title; the
+        // rest its fields, body and tail; a pane too short for them says how many are left.
+        let strip = Chrome::strip_height(row_h);
+        if self.detail.open && self.detail.rows > 0 && !self.detail.lines.is_empty() {
+            let pane_h = DetailPane::height(self.detail.rows, row_h);
+            let top = view.height_px() - strip - pane_h;
+            painter.fill(0.0, top, width, pane_h, PANE_BG);
+            painter.fill(0.0, top, width, 1.0, PANE_EDGE);
+            let shown = self.detail.rows.min(self.detail.lines.len());
+            let hidden = self.detail.lines.len() - shown;
+            let mut y = top + 3.0;
+            for (i, line) in self.detail.lines.iter().take(shown).enumerate() {
+                let last_and_more = hidden > 0 && i + 1 == shown;
+                let more = format!("… {} more lines", hidden + 1);
+                let (text, ink) = if last_and_more {
+                    (more.as_str(), FIELD_HINT)
+                } else if i == 0 {
+                    (line.as_str(), HEADER_INK)
+                } else {
+                    (line.as_str(), INK)
+                };
+                let _ = painter.lay_out_at(view, cell_w, y, text, Colours::plain(ink));
+                y += row_h;
+            }
+        }
+
         // The status bar, at the bottom: what the title says, where a user looks. Cut from the
         // right if it is longer than the window; the front is the part that changes.
-        let footer = view.footer_px();
+        let footer = strip.min(view.footer_px());
         if footer > 0.0 && !self.status.is_empty() {
             let fy = view.height_px() - footer;
             painter.fill(0.0, fy, width, footer, CHROME_BG);
@@ -531,6 +559,7 @@ impl Document {
             palette: Palette::new(Command::entries()),
             labels: Vec::new(),
             history: History::default(),
+            detail: DetailPane::default(),
             pump: None,
             stream_done: false,
         })
@@ -581,6 +610,7 @@ impl Document {
             palette: Palette::new(Command::entries()),
             labels: Vec::new(),
             history: History::default(),
+            detail: DetailPane::default(),
             pump: Some(pump),
             stream_done: false,
         })
@@ -604,7 +634,17 @@ impl Document {
             0.0
         };
         self.view.set_chrome_px(strip + Chrome::height(row_h));
-        self.view.set_footer_px(Chrome::strip_height(row_h));
+        // V10: the detail pane sits above the status bar, a third of the height at most, when open.
+        let pane_rows = if self.detail.open {
+            let grid_rows = ((size.1 as f32 - strip - Chrome::height(row_h)) / row_h.max(1.0)) as u64;
+            (grid_rows / 3).clamp(4, DETAIL_MAX_ROWS) as usize
+        } else {
+            0
+        };
+        self.detail.rows = pane_rows;
+        self.view.set_footer_px(
+            Chrome::strip_height(row_h) + DetailPane::height(pane_rows, row_h),
+        );
         self.view
             .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
@@ -652,14 +692,30 @@ impl Document {
             .layout
             .as_ref()
             .is_some_and(|l| l.format.body_next_line && self.filtering.records_only);
-        if assemble {
-            let mut with_next: Vec<u64> = file_rows
+        // V10: the detail pane's record and the lines around it are fetched with the frame's rows —
+        // the window holds one row list, so they must be in the same list.
+        let detail_rows: Vec<u64> = if self.detail.open {
+            let total = self.set.total_rows();
+            self.current_row()
+                .and_then(|r| self.filtering.file_row(r))
+                .map(|r| {
+                    (r.saturating_sub(DETAIL_LOOK_BACK)..(r + DETAIL_LOOK_AHEAD).min(total))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if assemble || !detail_rows.is_empty() {
+            let mut wanted: Vec<u64> = file_rows
                 .iter()
-                .flat_map(|&r| [r, r + 1])
+                .flat_map(|&r| if assemble { vec![r, r + 1] } else { vec![r] })
+                .chain(detail_rows)
                 .filter(|&r| r < self.set.total_rows())
                 .collect();
-            with_next.dedup();
-            let _ = self.set.fetch_rows(&with_next, anchored);
+            wanted.sort_unstable();
+            wanted.dedup();
+            let _ = self.set.fetch_rows(&wanted, anchored);
         } else if self.filtering.active() {
             // The visible view rows are survivors from anywhere in the file: a scattered fetch.
             let _ = self.set.fetch_rows(&file_rows, anchored);
@@ -682,6 +738,77 @@ impl Document {
                 }
             }
         }
+        // V10: the pane's lines, from the rows just fetched.
+        if self.detail.open {
+            let width = ((size.0 as f32 - 2.0 * cell_w) / cell_w.max(1.0)).max(8.0) as usize;
+            self.detail.lines = self.compose_detail(width);
+        } else {
+            self.detail.lines.clear();
+        }
+    }
+
+    /// `UI-DESIGN.md` §8's record for the current row: with a format, the record's first line
+    /// (walking back over continuations), its fields by the format's titles, its message as the
+    /// body and the continuation lines under it; without one, the line itself. Only rows the frame
+    /// fetched are in reach, which is what `lay_out` arranged.
+    fn compose_detail(&self, width: usize) -> Vec<String> {
+        let Some(row) = self.current_row().and_then(|r| self.filtering.file_row(r)) else {
+            return Vec::new();
+        };
+        let total = self.set.total_rows();
+        let format = self.detection.accepted;
+        let mut start = row;
+        if let Some(format) = format {
+            while start > 0
+                && row - start < DETAIL_LOOK_BACK
+                && self
+                    .set
+                    .row_text(start)
+                    .is_some_and(|l| !format.is_first_line(l))
+            {
+                start -= 1;
+            }
+        }
+        let Some(first) = self.set.row_text(start) else {
+            return vec![format!("Record {} — not read yet", start + 1)];
+        };
+        let mut fields: Vec<(&str, &str)> = Vec::new();
+        let mut body: &str = first;
+        if let Some(format) = format {
+            if let Some(ranges) = format.fields(first) {
+                let titles = format.titles.unwrap_or(format.columns);
+                for ((name, title), range) in format.columns.iter().zip(titles).zip(ranges) {
+                    let Some(range) = range else { continue };
+                    if *name == "msg" {
+                        body = &first[range];
+                    } else {
+                        fields.push((tailhawk_core::columns::column_title(title), &first[range]));
+                    }
+                }
+            }
+        }
+        // Without a format there are no records, so no continuation lines: the line is the record.
+        let mut tail: Vec<&str> = Vec::new();
+        let mut next = start + 1;
+        while format.is_some() && next < total && next - start < DETAIL_LOOK_AHEAD {
+            let Some(line) = self.set.row_text(next) else { break };
+            if format.is_some_and(|f| f.is_first_line(line)) {
+                break;
+            }
+            tail.push(line);
+            next += 1;
+        }
+        // MEL Simple's message is the line after the first: it is the body, not a continuation.
+        if format.is_some_and(|f| f.body_next_line) && !tail.is_empty() {
+            body = tail.remove(0).trim_start();
+        }
+        let detail = tailhawk_core::detail::Detail {
+            line: start + 1,
+            fields,
+            body,
+            tail,
+        };
+        tailhawk_core::detail::compose(&detail, width, self.detail.pretty, self.view.cells())
     }
 
     /// V5's column header, when there is a layout — `RowSource::header`, drawn in the band the
@@ -1874,6 +2001,36 @@ struct Chrome {
     palette_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
 }
 
+/// V10 — `UI-DESIGN.md` §8's record detail pane, at the bottom above the status bar.
+#[derive(Clone, Debug, Default)]
+struct DetailPane {
+    open: bool,
+    /// §8's *Pretty*: a JSON body re-indented.
+    pretty: bool,
+    /// The lines composed for this frame, top to bottom.
+    lines: Vec<String>,
+    /// How many rows the pane has this frame.
+    rows: usize,
+}
+
+impl DetailPane {
+    /// The pane's height for `rows` rows: the rows and a little air, or nothing when closed.
+    fn height(rows: usize, row_h: f32) -> f32 {
+        if rows == 0 {
+            0.0
+        } else {
+            (rows as f32 * row_h + 6.0).round()
+        }
+    }
+}
+
+/// The most rows the detail pane takes.
+const DETAIL_MAX_ROWS: u64 = 16;
+/// How far back from the current row the pane looks for its record's first line, and how far
+/// forward for its continuation lines — bounded because both are reads per frame.
+const DETAIL_LOOK_BACK: u64 = 8;
+const DETAIL_LOOK_AHEAD: u64 = 48;
+
 /// E27 — `UI-DESIGN.md` §12's `Alt+←` / `Alt+→`: "back / forward through view states (nerdlog's
 /// idea — filter and position history)". A view state is the chips, the collapse and the top row;
 /// one is remembered before every change to the chips or the collapse and before every jump
@@ -1917,6 +2074,8 @@ enum Command {
     ClearLabels,
     Back,
     Forward,
+    ToggleDetail,
+    TogglePretty,
     GoToTop,
     FollowTail,
     Copy,
@@ -1946,6 +2105,8 @@ impl Command {
         (Command::ClearLabels, "Clear colour labels", "Ctrl+Shift+0"),
         (Command::Back, "Back to the previous view (filter and position)", "Alt+←"),
         (Command::Forward, "Forward to the next view", "Alt+→"),
+        (Command::ToggleDetail, "Toggle the record detail pane", "Ctrl+Enter"),
+        (Command::TogglePretty, "Detail pane: pretty-print a JSON body", ""),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2206,6 +2367,8 @@ const LABEL_COLOURS: [[f32; 4]; 9] = [
     [0.30, 0.30, 0.45, 1.0],
     [0.35, 0.35, 0.35, 1.0],
 ];
+const PANE_BG: [f32; 4] = [0.11, 0.12, 0.15, 1.0];
+const PANE_EDGE: [f32; 4] = [0.30, 0.32, 0.38, 1.0];
 const PALETTE_BG: [f32; 4] = [0.16, 0.17, 0.21, 1.0];
 const PALETTE_SELECTED_BG: [f32; 4] = [0.24, 0.30, 0.42, 1.0];
 /// The palette box's width, in cells.
@@ -2793,6 +2956,15 @@ impl Shell {
             }
             return true;
         }
+        if key == VK_RETURN.0 {
+            // V10: `Ctrl+Enter` opens and closes the record detail pane — `UI-DESIGN.md` §12.
+            doc.detail.open = !doc.detail.open;
+            self.sync_scrollbar(hwnd);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return true;
+        }
         if key == VK_D.0 {
             // E20: a bookmark on the current row, or off it. `UI-DESIGN.md` §12's binding.
             if doc.toggle_bookmark() {
@@ -3064,6 +3236,8 @@ impl Shell {
             Command::ClearLabels => {
                 doc.clear_labels();
             }
+            Command::ToggleDetail => doc.detail.open = !doc.detail.open,
+            Command::TogglePretty => doc.detail.pretty = !doc.detail.pretty,
             Command::Back | Command::Forward => {
                 if !doc.history_step(command == Command::Back) {
                     return false;
@@ -4886,7 +5060,8 @@ mod tests {
         assert_eq!(Command::from_choice(Choice::Command(999)), None);
         let entries = Command::entries();
         assert_eq!(entries.len(), Command::LISTED.len());
-        assert!(entries.iter().all(|e| !e.label.is_empty() && !e.key.is_empty()));
+        assert!(entries.iter().all(|e| !e.label.is_empty()));
+        assert!(entries.iter().filter(|e| e.key.is_empty()).count() <= 1, "palette-only commands are the exception");
         std::fs::remove_file(&path).ok();
     }
 
@@ -4990,6 +5165,66 @@ mod tests {
         doc.go_to_line(5);
         assert!(!doc.history_step(false), "a new change forgot the forward states");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// V10 on a detected file: the pane for a continuation row walks back to its record, names the
+    /// fields by their column titles, takes the message as the body and the stack trace as the
+    /// tail; a plain-text file shows the line alone; a JSON body is re-indented when asked.
+    #[test]
+    fn the_detail_pane_composes_the_record_under_the_caret() {
+        let path = std::env::temp_dir().join("tailhawk_detail_test.log");
+        std::fs::write(
+            &path,
+            "2026-08-17 09:14:03.884 +01:00 [INF] Zenith.Dispatcher Dispatching job 41981\n\
+             2026-08-17 09:14:04.120 +01:00 [ERR] Zenith.Dispatcher {\"JobId\":41982,\"Queue\":\"jobs\"}\n\
+             System.InvalidOperationException: Queue 'jobs' is not registered\n   \
+             at Zenith.Dispatcher.Dispatch(Job job)\n\
+             2026-08-17 09:14:05.002 +01:00 [WRN] Zenith.Worker Retrying job 41982\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        assert!(doc.detection.accepted.is_some(), "Serilog is detected");
+        doc.detail.open = true;
+        // The caret on the stack frame, a continuation of record 2.
+        doc.selection = Some(Selection::at(Position::new(3, 0)));
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let lines = &doc.detail.lines;
+        assert_eq!(lines[0], "Record 2");
+        assert!(lines[1].starts_with("timestamp  2026-08-17 09:14:04.120 +01:00"), "{lines:?}");
+        assert!(lines[2].starts_with("level      ERR"), "{lines:?}");
+        assert!(lines[3].starts_with('─'));
+        assert!(lines[4].starts_with("Body       Zenith.Dispatcher {\"JobId\""), "{lines:?}");
+        assert!(lines[5].contains("System.InvalidOperationException"), "{lines:?}");
+        assert!(lines[6].contains("at Zenith.Dispatcher.Dispatch"), "{lines:?}");
+        assert_eq!(lines.len(), 7, "the next record is not part of this one: {lines:?}");
+        assert!(doc.view.footer_px() > Chrome::strip_height(10.0), "the pane took its band");
+
+        // The last record, on its own row: no tail.
+        doc.selection = Some(Selection::at(Position::new(4, 0)));
+        doc.lay_out((8.0, 10.0), (800, 300));
+        assert_eq!(doc.detail.lines[0], "Record 5");
+        assert_eq!(doc.detail.lines.len(), 5);
+
+        doc.detail.open = false;
+        doc.lay_out((8.0, 10.0), (800, 300));
+        assert!(doc.detail.lines.is_empty());
+        assert_eq!(doc.view.footer_px(), Chrome::strip_height(10.0));
+
+        // A pretty JSON body: the file's second record with only JSON after the logger... the
+        // composer takes the message column whole, so this file's body is `Zenith.Dispatcher {...}`
+        // and stays raw; a body that *is* JSON is re-indented.
+        let json = std::env::temp_dir().join("tailhawk_detail_json_test.log");
+        std::fs::write(&json, "{\"a\":1,\"b\":[1,2]}\n{\"a\":2}\n").expect("write");
+        let mut jd = Document::open(&json).expect("open");
+        jd.detail.open = true;
+        jd.detail.pretty = true;
+        jd.selection = Some(Selection::at(Position::new(0, 0)));
+        jd.lay_out((8.0, 10.0), (800, 300));
+        let lines = &jd.detail.lines;
+        assert!(lines.iter().any(|l| l.trim() == "\"a\": 1,"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.trim() == "]"), "{lines:?}");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&json).ok();
     }
 
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
@@ -5311,7 +5546,7 @@ mod tests {
     }
     /// A headless screenshot: opens `TAILHAWK_SHOT_FILE`, applies `TAILHAWK_SHOT_KEYS` (a `;`-separated
     /// script of `chip:<text>`, `xchip:<text>`, `find:<text>`, `focus:find|chip|grid`, `type:<text>`,
-    /// `bookmark:<view row>`, `palette:<query>`, `label:<n>:<text>`, `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
+    /// `bookmark:<view row>`, `palette:<query>`, `label:<n>:<text>`, `detail[:pretty]` (row from `TAILHAWK_SHOT_ROW`), `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
     /// harness that has no desktop to capture — the offscreen target is the whole point.
     ///
     /// ```text
@@ -5375,6 +5610,15 @@ mod tests {
                     let names: Vec<String> = arg.split(',').map(str::to_owned).collect();
                     let active = names.len().saturating_sub(1);
                     doc.tab_strip = (names, active);
+                }
+                "detail" => {
+                    doc.detail.open = true;
+                    doc.detail.pretty = arg == "pretty";
+                    let row: u64 = std::env::var("TAILHAWK_SHOT_ROW")
+                        .ok()
+                        .and_then(|r| r.parse().ok())
+                        .unwrap_or(0);
+                    doc.selection = Some(Selection::at(Position::new(row, 0)));
                 }
                 "palette" => {
                     doc.palette.open();

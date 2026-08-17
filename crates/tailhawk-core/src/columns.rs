@@ -195,7 +195,7 @@ impl Layout {
 
 /// A column's title from its capture name: the three the format model understands get their
 /// long names, anything else is shown as written.
-fn column_title(name: &str) -> &str {
+pub fn column_title(name: &str) -> &str {
     match name {
         "ts" => "timestamp",
         "level" => "level",
