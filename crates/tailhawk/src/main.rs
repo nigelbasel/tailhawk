@@ -4917,8 +4917,30 @@ fn main() -> Result<()> {
     // §7.2: `--filter=EXPR` and `--exclude=EXPR` are repeatable; each occurrence creates one chip,
     // applied to every file this command opens. `--stateless` is §12.4's and is read above.
     let mut initial_chips: Vec<String> = Vec::new();
+    // E17: `tail`'s flags are accepted so `tailhawk -n 100 -f app.log` behaves — a viewer already
+    // opens at the tail and follows, so `-f`, `-F` and `-c` change nothing, and `-n N` is the
+    // number of lines to show, which the window's height decides here. `-n`'s value is skipped.
+    let mut skip_value = false;
     for arg in std::env::args_os().skip(1) {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
         if let Some(text) = arg.to_str() {
+            match text {
+                "-f" | "-F" | "-q" | "--quiet" | "--silent" | "-v" | "--verbose" => continue,
+                "-n" | "-c" | "-s" | "--sleep-interval" | "--pid" => {
+                    skip_value = true;
+                    continue;
+                }
+                _ => {}
+            }
+            if text.len() > 2
+                && (text.starts_with("-n") || text.starts_with("-c"))
+                && text[2..].chars().all(|c| c.is_ascii_digit() || c == '+')
+            {
+                continue;
+            }
             if let Some(expr) = text.strip_prefix("--filter=") {
                 initial_chips.push(format!("+{expr}"));
                 continue;
