@@ -258,14 +258,14 @@ impl Severity {
                 .to_ascii_lowercase()
                 .as_str()
             {
-                "trace" | "finest" | "vrb" | "v" => 1,
-                "debug" | "dbg" | "finer" | "verbose" | "d" => 5,
+                "trace" | "trce" | "finest" | "vrb" | "v" => 1,
+                "debug" | "dbg" | "dbug" | "finer" | "verbose" | "d" => 5,
                 "fine" => 6,
                 "config" => 7,
                 "info" | "inf" | "information" | "informational" | "i" => 9,
                 "notice" => 10,
                 "warn" | "warning" | "wrn" | "w" => 13,
-                "error" | "err" | "eror" | "severe" | "e" => 17,
+                "error" | "err" | "eror" | "fail" | "severe" | "e" => 17,
                 "critical" | "crit" | "dpanic" => 18,
                 "alert" | "panic" => 19,
                 "fatal" | "ftl" | "emerg" | "emergency" | "f" => 21,

@@ -16,6 +16,7 @@ pub mod cell;
 pub mod encoding;
 pub mod filter;
 pub mod follow;
+pub mod format;
 pub mod grid;
 pub mod hgrid;
 pub mod highlight;

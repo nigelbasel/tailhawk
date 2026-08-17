@@ -981,7 +981,7 @@ fn build_regex(token: &Token) -> Result<Predicate, ParseError> {
 /// `record.rs` carries no date library on purpose. Accepting only the shape above means no ambiguity
 /// about what `2026-08` or `14/08/2026` mean — both are rejected and fall through to text, which is
 /// the same answer §7.2 gives any other unrecognised token.
-fn parse_instant(token: &str) -> Option<Timestamp> {
+pub(crate) fn parse_instant(token: &str) -> Option<Timestamp> {
     let bytes = token.as_bytes();
     if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;
