@@ -76,6 +76,12 @@ pub struct View {
     grid: Grid,
     hgrid: HGrid,
     cells: CellModel,
+    /// A band at the top of the viewport that is not rows — the column header, when a format has
+    /// columns. The grid never sees it: it gets the height below the band, every placed row is
+    /// drawn `header_px` lower, and a hit-test subtracts it first. Zero for a plain file.
+    header_px: f32,
+    /// The whole viewport height, so a header change can re-derive the grid's share.
+    height_px: f32,
 }
 
 impl View {
@@ -87,7 +93,22 @@ impl View {
             grid: Grid::new(row_height),
             hgrid: HGrid::new(cell_width),
             cells: CellModel::new(),
+            header_px: 0.0,
+            height_px: 0.0,
         }
+    }
+
+    /// The header band's height: one row for a column header, zero for none. See [`View::header_px`].
+    pub fn set_header_px(&mut self, header_px: f32) {
+        self.header_px = header_px.max(0.0);
+        self.grid
+            .set_viewport_px((self.height_px - self.header_px).max(0.0));
+    }
+
+    /// Where the rows start. A painter adds this to every [`PlacedRow`](crate::grid::PlacedRow)'s
+    /// `y`; the header itself is drawn in `0..header_px`.
+    pub fn header_px(&self) -> f32 {
+        self.header_px
     }
 
     pub fn grid(&self) -> &Grid {
@@ -117,7 +138,9 @@ impl View {
     /// The body's size in device pixels — the gutter and line-number column already subtracted.
     pub fn set_viewport(&mut self, width_px: f32, height_px: f32) {
         self.hgrid.set_viewport_px(width_px);
-        self.grid.set_viewport_px(height_px);
+        self.height_px = height_px;
+        self.grid
+            .set_viewport_px((height_px - self.header_px).max(0.0));
     }
 
     /// A DPI or font-size change, both axes at once.
@@ -199,7 +222,8 @@ impl View {
     /// and clamping it to one here would silently invent a selection endpoint the user did not
     /// point at. A drag that leaves the viewport is the input loop's autoscroll, not this.
     pub fn position_at(&self, x: f32, y: f32) -> Option<Position> {
-        let row = self.grid.row_at_y(y)?;
+        // The header is not a row: a click in it is nowhere.
+        let row = self.grid.row_at_y(y - self.header_px)?;
         let cell = self.hgrid.column_at_x(x)?;
         Some(Position::new(row, cell))
     }

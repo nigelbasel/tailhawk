@@ -190,6 +190,11 @@ pub const REVEAL_MARK: [f32; 4] = [0.85, 0.65, 0.25, 1.0];
 /// "rendered dimmed and indented". A step under [`INK`], not a colour of its own.
 pub const CONTINUATION_INK: [f32; 4] = [0.56, 0.59, 0.64, 1.0];
 
+/// The column header band and its text — a shade above the ground, the names in the muted ink, so
+/// the header reads as chrome and never as a log line. Provisional with the palette.
+pub const HEADER_BG: [f32; 4] = [0.11, 0.12, 0.14, 1.0];
+pub const HEADER_INK: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
+
 /// Errors that cross the seam. Deliberately opaque — the shell can report one but cannot act on
 /// the distinction, and `SPEC.md` §3.2 forbids panicking on device loss.
 #[derive(Debug)]
@@ -430,7 +435,7 @@ impl Renderer {
                 context,
                 (
                     view.hgrid().viewport_px().max(1.0) as u32,
-                    view.grid().viewport_px().max(1.0) as u32,
+                    (view.grid().viewport_px() + view.header_px()).max(1.0) as u32,
                 ),
             )
         })?;

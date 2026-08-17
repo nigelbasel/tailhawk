@@ -115,6 +115,12 @@ pub trait RowSource {
     fn row_spans(&self, _row: u64, out: &mut Vec<Span>) {
         out.clear();
     }
+
+    /// The column header, when the source has columns — drawn in the band `View::header_px` reserves,
+    /// in the same cells as the rows so it lines up with them. `None` means no band.
+    fn header(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl RowSource for Rows {

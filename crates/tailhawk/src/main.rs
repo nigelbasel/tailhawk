@@ -124,6 +124,8 @@ struct Document {
     /// V5: the column layout for the accepted format, sized on the head sample, or `None` for a
     /// file shown as it is written. See [`tailhawk_core::columns`].
     layout: Option<Layout>,
+    /// `layout.header()`, built once at open. See [`Document::header_text`].
+    header: Option<String>,
     /// The visible rows' presentations under `layout`, rebuilt by `lay_out` each frame — §7.1's
     /// visible-rows rule applied to columns. Keyed by **file** row, ascending.
     presented: Vec<(u64, Presentation)>,
@@ -189,6 +191,10 @@ impl RowSource for Document {
     /// colour, and the catalogue fills in around them — `Highlighter::beneath` exists for this
     /// call. A row whose text is not in memory yet gets the matches and nothing else, which is
     /// also what it gets drawn as.
+    fn header(&self) -> Option<&str> {
+        self.header_text()
+    }
+
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
         // Matches are file rows — the search snapshots the file, not the view.
         let Some(file_row) = self.filtering.file_row(row) else {
@@ -258,6 +264,7 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             detection,
+            header: layout.as_ref().map(Layout::header),
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -297,6 +304,7 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             detection,
+            header: layout.as_ref().map(Layout::header),
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -315,6 +323,10 @@ impl Document {
         let (cell_w, row_h) = cell;
         self.view.set_metrics(cell_w, row_h);
         self.view.set_viewport(size.0 as f32, size.1 as f32);
+        // One row of header when there are columns; none otherwise. Set after the viewport, which
+        // is what the header is subtracted from.
+        self.view
+            .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
             let rows = self.view_rows();
             self.view.grid_mut().set_total_rows(rows);
@@ -363,6 +375,12 @@ impl Document {
                 }
             }
         }
+    }
+
+    /// V5's column header, when there is a layout — `RowSource::header`, drawn in the band the
+    /// view reserves. Cached because the painter asks every frame and the answer never changes.
+    fn header_text(&self) -> Option<&str> {
+        self.header.as_deref()
     }
 
     /// The presentation of a file row, if it is one of the visible rows `lay_out` presented.

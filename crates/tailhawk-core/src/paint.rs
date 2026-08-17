@@ -68,7 +68,7 @@ use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline, MODE_SOLID};
 use crate::view::View;
 use crate::Result;
-use crate::{REVEAL_MARK, SELECTION_INK};
+use crate::{HEADER_BG, HEADER_INK, REVEAL_MARK, SELECTION_INK};
 
 /// What colours one row, gathered because the three arrive together and mean nothing apart.
 ///
@@ -202,10 +202,38 @@ impl Painter {
     /// reach the screen.
     pub fn lay_out(&mut self, view: &View, tint: [f32; 4], source: &dyn RowSource) -> Result<Laid> {
         let mut total = Laid::default();
-        let rows: Vec<(u64, f32)> = view.grid().visible().map(|p| (p.row, p.y)).collect();
+        let header_px = view.header_px();
+        let rows: Vec<(u64, f32)> = view
+            .grid()
+            .visible()
+            .map(|p| (p.row, p.y + header_px))
+            .collect();
         // Taken out and put back so the row loop can hold it mutably while `self` is borrowed for
         // the layout. One `Vec` for the frame is the point; taking it does not allocate.
         let mut spans = std::mem::take(&mut self.spans);
+        // The header band, when there is one: a filled strip and the column names in it. Laid out
+        // like a row, in the same cells, so it lines up with what is under it.
+        if let Some(header) = source.header().filter(|_| header_px > 0.0) {
+            self.instances.push(Instance {
+                pos: [0.0, 0.0],
+                size: [view.hgrid().viewport_px(), header_px],
+                tint: HEADER_BG,
+                mode: MODE_SOLID,
+                ..Instance::default()
+            });
+            total.quads += 1;
+            spans.clear();
+            match self.lay_out_row(
+                view,
+                header,
+                ColumnAnchors::none_ref(),
+                Colours::plain(HEADER_INK),
+                0.0,
+            ) {
+                Ok(laid) => total.merge(laid),
+                Err(_) => total.failed_rows += 1,
+            }
+        }
         for (row, y) in rows {
             let Some(line) = source.row_text(row) else {
                 continue;
