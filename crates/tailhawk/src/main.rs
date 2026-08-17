@@ -7278,7 +7278,7 @@ mod tests {
             "[[rule]]\nname = \"jobs\"\npattern = \"job \\d+\"\nfg = \"#ffd166\"\n\n[[rule]]\nname = \"retry lines\"\npattern = \"Retrying\"\nbg = \"#1e3a2f\"\nwhole_line = true\n\n[[rule]]\nname = \"broken\"\npattern = \"(\"\nfg = \"#fff\"\n",
         )
         .expect("write");
-        let (specs, failed) = load_rule_specs(&[rules.clone()]);
+        let (specs, failed) = load_rule_specs(std::slice::from_ref(&rules));
         assert_eq!(specs.len(), 2);
         assert_eq!(failed.len(), 1);
         assert!(failed[0].starts_with("broken:"));
