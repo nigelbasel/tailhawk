@@ -1254,7 +1254,7 @@ impl Document {
         if text.is_empty() || text.contains(['\r', '\n']) {
             return false;
         }
-        self.label(n, &text.to_owned())
+        self.label(n, text)
     }
 
     /// Label *n* on `text`, or off it if it is already on. The selection-free half of
