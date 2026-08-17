@@ -6,7 +6,7 @@
 outstanding item — `verify-find.ps1` had never run, because the agent's shell had no desktop — ran
 this session and passed: `1 of 4` in the title, the current match painted orange on screen. Then
 E23: `semantic.rs`, §7.1's zero-config layer, wired beneath the search's matches and reaching pixels.
-Then E14 in full — the pass measured on 10 GB, the filtered view on screen. **8 of M5's 10 items.**
+Then E14 in full — the pass measured on 10 GB, the filtered view on screen — and E24's ANSI half. **8 of M5's 10 items, and half of the ninth.**
 
 | | |
 |---|---|
@@ -114,8 +114,36 @@ run.
 `offset_of_line` walks per viewport move; if `frame p95` says so, have the sieve carry byte offsets
 alongside rows. `verify-filter.ps1` prints the title, so the number is there to read next run.
 
-**Next:** **E24** ANSI/bidi/reveal-invisibles; **V5** columns, still without a producer until M6's
-detection. The command bar is M7's widget layer.
+### ✅ E24, the ANSI half — escapes stripped at decode; SGR parsed, not drawn
+
+`ansi.rs` (`bd35f5b`), CLEANROOM entry filed first. **9 of M5's 10 items are at least half done.**
+
+| | |
+|---|---|
+| Recognised, per ECMA-48 | CSI (`ESC [` … final `0x40–0x7E`), OSC / DCS / SOS / PM / APC through ST or BEL, two-byte `ESC x` for `0x30–0x7E`, three-byte charset designations. **Removed whole, never interpreted** — OSC 8, OSC 52 and titles are the ones §13.4 names |
+| Where | `LineDecoder` — the one path the viewport, the search and the filter read through, so a match's offsets are offsets in the text the painter draws. `a_match_across_a_stripped_escape_reports_offsets_in_the_stripped_text` says so |
+| SGR | `Stripped::spans` carries fg/bg (16-colour palette, ours and provisional; 256-colour cube; truecolor; bold brightens). **Nothing paints them yet** — §13.4 makes rendering a toggle and there is no setting to hold one (§12 is M8) |
+| A bug the property test found | `arbitrary_bytes_decode_the_same_however_they_are_chunked` panicked on a charset designation swallowing half a UTF-8 character; a designation now takes only an ASCII final byte |
+
+**⚠ E24 is not finished, and here is exactly what is left:**
+
+- **Reveal invisibles** — `CellModel::reveal_invisibles` gives a revealed zero-width character a
+  cell (since M3) and its module note records the gap: an invisible absorbed into a preceding cluster
+  (`a` + ZWJ, tag characters, variation selectors) is not revealed. **Missing entirely:** a visible
+  *marker glyph* in that cell (today a revealed cell is empty), a way to switch it on (no key in
+  §12; the command palette is M7), and `General_Category` data to tell `Cf` from a combining mark.
+  The marker belongs in `shape.rs` as a glyph substitution — the byte offsets must not move.
+- **Bidi isolation** — §13.4's "each line's bidi context is isolated" holds **by construction**:
+  every row is shaped on its own (`Painter::lay_out_row` → `shape.rs`), so a U+202E cannot reach the
+  next line. Not separately tested; the honest place for a test is `shape.rs`, with the shaper.
+- **§5.6's lone `ESC`** — removed rather than shown as a control glyph; the module note argues why
+  §13.4 wins there. Revisit when reveal mode can show it.
+
+**⚠ `logs/agent.log` had no entries from 2026-08-14 until the owner asked.** Sessions 17 and 18
+did not write to it. Backfilled from commit timestamps, labelled as such; the rule is now in agent
+memory (`tailhawk-activity-log`). Log as you work, not at the end.
+
+**Next:** finish E24's reveal-invisibles marker and toggle; **V5** columns, still without a producer until M6's detection. The command bar is M7's widget layer.
 
 ---
 
