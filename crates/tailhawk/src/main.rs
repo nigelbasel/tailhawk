@@ -1855,6 +1855,9 @@ struct Shell {
     /// appear (§8.1). Scanned on the follow tick, every [`WATCH_EVERY_TICKS`].
     watching: Vec<Watch>,
     ticks: u64,
+    /// `--filter=` / `--exclude=` from the command line, as `+text` / `-text`, applied to every
+    /// file that lands (§7.2). Remembered state for the file goes on top.
+    initial_chips: Vec<String>,
     file: Option<String>,
     document: Tabs,
     /// Set by [`Shell::paint`] when the frame rasterised glyphs, and acted on by `WM_PAINT` **after**
@@ -1975,6 +1978,13 @@ impl Shell {
                 Ok(Ok(mut document)) => {
                     self.reading.remove(i);
                     // §12.4: the file's remembered view, before it is first drawn.
+                    if !self.initial_chips.is_empty() {
+                        document.apply_state(&settings::FileState {
+                            path: String::new(),
+                            chips: self.initial_chips.clone(),
+                            collapse: false,
+                        });
+                    }
                     let key = document
                         .path
                         .as_ref()
@@ -3421,7 +3431,23 @@ fn main() -> Result<()> {
     let mut reading = Vec::new();
     let mut watching = Vec::new();
     let mut any_arg = false;
+    // §7.2: `--filter=EXPR` and `--exclude=EXPR` are repeatable; each occurrence creates one chip,
+    // applied to every file this command opens. `--stateless` is §12.4's and is read above.
+    let mut initial_chips: Vec<String> = Vec::new();
     for arg in std::env::args_os().skip(1) {
+        if let Some(text) = arg.to_str() {
+            if let Some(expr) = text.strip_prefix("--filter=") {
+                initial_chips.push(format!("+{expr}"));
+                continue;
+            }
+            if let Some(expr) = text.strip_prefix("--exclude=") {
+                initial_chips.push(format!("-{expr}"));
+                continue;
+            }
+            if text.starts_with("--") {
+                continue;
+            }
+        }
         any_arg = true;
         if arg == "-" {
             reading.push(spawn_open(Document::from_pipe));
@@ -3492,6 +3518,7 @@ fn main() -> Result<()> {
             reading,
             watching,
             ticks: 0,
+            initial_chips,
             document: Tabs::default(),
 
             needs_frame: false,
