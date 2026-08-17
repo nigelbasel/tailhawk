@@ -17,11 +17,13 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::highlight::{Highlighter, Span};
 use tailhawk_core::search::{Match, SearchOptions};
 use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
+use tailhawk_core::sieve;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::{
     background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, CURRENT_MATCH_BG,
@@ -46,7 +48,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_BACK, VK_C, VK_CONTROL,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_L, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
     VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -107,6 +109,8 @@ struct Document {
     /// §7.1's zero-config semantic layer, applied to visible rows beneath the search's matches.
     /// Built with the document, on the worker, because it compiles twenty regexes.
     highlighter: Highlighter,
+    /// The filter state and the derived row space it makes — §7.3. See [`Filtering`].
+    filtering: Filtering,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -115,13 +119,19 @@ struct Document {
     stream_done: bool,
 }
 
+/// **Every row the painter, the selection and the clipboard name is a *view* row**, and the
+/// filter's derived row space (§7.3) is what turns it into a file row — here, in one place, so
+/// nothing below this knows whether a filter is on. With no chips the two are the same number.
 impl RowSource for Document {
     fn row_text(&self, row: u64) -> Option<&str> {
-        self.set.row_text(row)
+        self.set.row_text(self.filtering.file_row(row)?)
     }
 
     fn row_anchors(&self, row: u64) -> &tailhawk_core::cell::ColumnAnchors {
-        self.set.row_anchors(row)
+        match self.filtering.file_row(row) {
+            Some(file_row) => self.set.row_anchors(file_row),
+            None => tailhawk_core::cell::ColumnAnchors::none_ref(),
+        }
     }
 
     /// **The one thing `Rows` cannot answer**, and the reason `Document` is now the painter's source
@@ -148,8 +158,13 @@ impl RowSource for Document {
     /// call. A row whose text is not in memory yet gets the matches and nothing else, which is
     /// also what it gets drawn as.
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
-        self.finder.spans(row, out);
-        if let Some(line) = self.set.row_text(row) {
+        // Matches are file rows — the search snapshots the file, not the view.
+        let Some(file_row) = self.filtering.file_row(row) else {
+            out.clear();
+            return;
+        };
+        self.finder.spans(file_row, out);
+        if let Some(line) = self.set.row_text(file_row) {
             self.highlighter.beneath(line, out);
         }
     }
@@ -184,6 +199,7 @@ impl Document {
             dragging: false,
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
+            filtering: Filtering::default(),
             pump: None,
             stream_done: false,
         })
@@ -217,6 +233,7 @@ impl Document {
             dragging: false,
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
+            filtering: Filtering::default(),
             pump: Some(pump),
             stream_done: false,
         })
@@ -232,7 +249,10 @@ impl Document {
         let (cell_w, row_h) = cell;
         self.view.set_metrics(cell_w, row_h);
         self.view.set_viewport(size.0 as f32, size.1 as f32);
-        self.view.grid_mut().set_total_rows(self.set.total_rows());
+        {
+            let rows = self.view_rows();
+            self.view.grid_mut().set_total_rows(rows);
+        }
 
         // Across the whole set, not just the live member: §5.5b's scrollback reaches into files
         // whose widest line may be wider than anything the current one holds.
@@ -251,7 +271,25 @@ impl Document {
         // A read that fails does not fail the frame — §11.3. `Rows` keeps what it got and records
         // why the rest is missing; those rows simply draw nothing.
         let anchored = self.view.hgrid().visible_columns().start > 0;
-        let _ = self.set.fetch(first, count, anchored);
+        if self.filtering.active() {
+            // The visible view rows are survivors from anywhere in the file: a scattered fetch.
+            let file_rows: Vec<u64> = visible
+                .iter()
+                .filter_map(|&r| self.filtering.file_row(r))
+                .collect();
+            let _ = self.set.fetch_rows(&file_rows, anchored);
+        } else {
+            let _ = self.set.fetch(first, count, anchored);
+        }
+    }
+
+    /// Rows in the view's row space: the survivors while a filter is on, the file's rows otherwise.
+    fn view_rows(&self) -> u64 {
+        if self.filtering.active() {
+            self.filtering.kept.len() as u64
+        } else {
+            self.set.total_rows()
+        }
     }
 
     /// The title text, rebuilt from the live state — every part of it except the name.
@@ -291,8 +329,12 @@ impl Document {
             Some(text) => format!("{text} — "),
             None => String::new(),
         };
+        let filter = match self.filtering.describe(self.set.total_rows()) {
+            Some(text) => format!("{text} — "),
+            None => String::new(),
+        };
         format!(
-            "{find}{}: {}{flag}{source}, {} lines, {} bytes",
+            "{find}{filter}{}: {}{flag}{source}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -352,9 +394,18 @@ impl Document {
             // space, so every existing row keeps its number. The results are still a snapshot and
             // still do not cover the new bytes, which is what "searched N lines" in the title says.
             self.finder.clear();
+            // And the survivors: a filtered view over renumbered rows would show the wrong lines.
+            // The chips stay, and the pass restarts over what the file now is.
+            self.filtering.clear_results();
+            self.refilter();
         }
 
-        self.view.grid_mut().set_total_rows(self.set.total_rows());
+        // Growth is sieved on the worker as it arrives — see `Filtering::covered`.
+        self.refilter();
+        {
+            let rows = self.view_rows();
+            self.view.grid_mut().set_total_rows(rows);
+        }
         if was_following {
             // A tail that rolls keeps tailing. §5.5b wants a separator row at the boundary too,
             // which is a rendering feature and is not done — `LogSet::locate` reports where one
@@ -376,7 +427,10 @@ impl Document {
         }
         // Where the user is now, so the first match shown is the next one rather than the first in
         // the file — see `Finder::first_worth_showing`.
-        self.finder.from_row = self.view.grid().scroll().row;
+        self.finder.from_row = self
+            .filtering
+            .file_row(self.view.grid().scroll().row)
+            .unwrap_or(0);
         match find::start(
             &self.finder.query,
             true,
@@ -388,6 +442,108 @@ impl Document {
             // window is not modal and the user is still looking at what they typed.
             Err(e) => self.finder.error = Some(e.to_string()),
         }
+    }
+
+    /// Adds the chip being typed and starts the pass over. A chip that does not parse is held in
+    /// the title, as a bad pattern is; the chips already there stand.
+    fn add_chip(&mut self) {
+        let Some((polarity, text)) = self.filtering.typing.take() else {
+            return;
+        };
+        self.filtering.pending_high = None;
+        if text.trim().is_empty() {
+            return;
+        }
+        match Chip::parse(&text, polarity) {
+            Ok(chip) => {
+                self.filtering.error = None;
+                self.filtering.chips.chips.push(chip);
+                self.filtering.clear_results();
+                self.refilter();
+            }
+            Err(e) => self.filtering.error = Some(format!("{text}: {e}")),
+        }
+    }
+
+    /// Drops every chip and the survivors with them: the unfiltered view.
+    fn clear_filter(&mut self) {
+        self.filtering.chips.chips.clear();
+        self.filtering.error = None;
+        self.filtering.clear_results();
+        {
+            let rows = self.view_rows();
+            self.view.grid_mut().set_total_rows(rows);
+        }
+    }
+
+    /// Starts a pass over whatever rows no pass has covered yet — all of them after a chip
+    /// changes, only the growth after a follow tick. **Never on the window thread**: §7.3 says a
+    /// filter change is a full-file pass, and §11.3 says a frame is not the place for one.
+    fn refilter(&mut self) {
+        if !self.filtering.active() || self.filtering.running.is_some() {
+            return;
+        }
+        let total = self.set.total_rows();
+        let from = self.filtering.covered;
+        if from >= total {
+            return;
+        }
+        match sieve::start(
+            self.filtering.chips.clone(),
+            self.set.snapshot(),
+            from,
+            total,
+            SearchOptions::default(),
+        ) {
+            Ok(running) => {
+                self.filtering.running = Some(running);
+                self.filtering.covered = total;
+                self.filtering.outcome = None;
+            }
+            Err(e) => self.filtering.error = Some(e.to_string()),
+        }
+    }
+
+    /// Collects what the filter worker has reported. Reports whether the view changed.
+    ///
+    /// **Following stays following.** The pass streams survivors out of order, so the bottom of
+    /// the view moves as chunks land; a reader who was at the bottom is kept there, exactly as
+    /// `poll_follow` keeps them there when the file grows.
+    fn poll_filter(&mut self) -> bool {
+        let Some(running) = self.filtering.running.as_ref() else {
+            return false;
+        };
+        let updates: Vec<sieve::Update> = running.drain().collect();
+        if updates.is_empty() {
+            return false;
+        }
+        let was_following = self.view.grid().is_following();
+        let mut finished = false;
+        for update in updates {
+            match update {
+                sieve::Update::Chunk(kept) => {
+                    self.filtering.scanned += kept.scanned;
+                    self.filtering.absorb(kept.rows);
+                }
+                sieve::Update::Finished(outcome) => {
+                    self.filtering.outcome = Some(outcome);
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            self.filtering.running = None;
+            // Growth that arrived while the pass ran is the next pass.
+            self.refilter();
+        }
+        {
+            let rows = self.view_rows();
+            self.view.grid_mut().set_total_rows(rows);
+        }
+        if was_following {
+            self.view.grid_mut().scroll_to_bottom();
+        }
+        true
     }
 
     /// Steps to the next or previous match and puts it on screen. Reports whether it moved.
@@ -419,6 +575,10 @@ impl Document {
     /// should light each one in turn, not scroll four times — and a match that *is* off screen lands
     /// a third of a page down rather than on the top edge, so there is context above it.
     fn show_row(&mut self, row: u64) {
+        // A file row; the view scrolls in its own row space. A hidden match lands on the next
+        // survivor, which keeps `F3` moving through the file rather than stalling on a row that
+        // is not there to be shown.
+        let row = self.filtering.view_row(row);
         let grid = self.view.grid();
         let first = grid.scroll().row;
         if row >= first && row < first.saturating_add(grid.page_rows()) {
@@ -457,7 +617,7 @@ impl Document {
             Selecting::Word => {
                 // A word needs the row's text, and only the fetched window has it. Falling back to a
                 // caret is honest; guessing a span from a line we cannot see is not.
-                self.selection = Some(match self.set.row_text(at.row) {
+                self.selection = Some(match self.row_text(at.row) {
                     Some(line) => Selection::word(self.view.cells(), at.row, line, at.cell),
                     None => Selection::at(at),
                 });
@@ -489,7 +649,7 @@ impl Document {
         }
         let mut out = String::new();
         for row in sel.first_row()..=sel.last_row() {
-            let Some(line) = self.set.row_text(row) else {
+            let Some(line) = self.row_text(row) else {
                 continue;
             };
             if let Some(bytes) = sel.byte_range(self.view.cells(), row, line) {
@@ -622,29 +782,7 @@ impl Finder {
     /// emoji that cannot match one, failing as "not found" rather than as anything a user could act
     /// on. Logs carry emoji: every one of this project's own commit messages could.
     fn push_unit(&mut self, unit: u16) -> bool {
-        // Control characters arrive here too — `Ctrl+F` itself is 0x06 and `Enter` is 0x0D — and
-        // every one of them is either handled as a key or is not wanted in a query.
-        if unit < 0x20 || unit == 0x7F {
-            return false;
-        }
-        match (self.pending_high.take(), unit) {
-            (_, high) if (0xD800..0xDC00).contains(&high) => {
-                self.pending_high = Some(high);
-            }
-            (Some(high), low) if (0xDC00..0xE000).contains(&low) => {
-                self.query
-                    .extend(char::decode_utf16([high, low]).map(|c| c.unwrap_or('\u{FFFD}')));
-            }
-            // **A high surrogate whose partner never came becomes U+FFFD rather than being
-            // dropped**, because a character that vanishes as it is typed is indistinguishable from
-            // a keyboard that missed it. `take` above has already removed it, so without this arm
-            // passing it on it would go nowhere at all.
-            (orphan, unit) => self.query.extend(
-                char::decode_utf16(orphan.into_iter().chain([unit]))
-                    .map(|c| c.unwrap_or('\u{FFFD}')),
-            ),
-        }
-        true
+        push_typed_unit(&mut self.query, &mut self.pending_high, unit)
     }
 
     /// Adds one chunk's matches, keeping the list sorted **without sorting it**.
@@ -804,6 +942,147 @@ impl Finder {
         if self.truncated > 0 {
             // §7.4's "pattern too slow, truncated", counted rather than hidden.
             text.push_str(&format!(", {} lines too slow to search", self.truncated));
+        }
+        Some(text)
+    }
+}
+
+/// Takes one `WM_CHAR` code unit into a typed field. Returns whether it was wanted.
+///
+/// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
+/// and pushing each on its own puts two replacement characters into the text — a search for an
+/// emoji that cannot match one, failing as "not found" rather than as anything a user could act
+/// on. Logs carry emoji: every one of this project's own commit messages could. Shared by the find
+/// query and the filter chip, which are the two things typed into the window until M7's fields.
+fn push_typed_unit(text: &mut String, pending_high: &mut Option<u16>, unit: u16) -> bool {
+    // Control characters arrive here too — `Ctrl+F` itself is 0x06 and `Enter` is 0x0D — and
+    // every one of them is either handled as a key or is not wanted in a query.
+    if unit < 0x20 || unit == 0x7F {
+        return false;
+    }
+    match (pending_high.take(), unit) {
+        (_, high) if (0xD800..0xDC00).contains(&high) => {
+            *pending_high = Some(high);
+        }
+        (Some(high), low) if (0xDC00..0xE000).contains(&low) => {
+            text.extend(char::decode_utf16([high, low]).map(|c| c.unwrap_or('\u{FFFD}')));
+        }
+        // **A high surrogate whose partner never came becomes U+FFFD rather than being
+        // dropped**, because a character that vanishes as it is typed is indistinguishable from
+        // a keyboard that missed it. `take` above has already removed it, so without this arm
+        // passing it on it would go nowhere at all.
+        (orphan, unit) => text.extend(
+            char::decode_utf16(orphan.into_iter().chain([unit])).map(|c| c.unwrap_or('\u{FFFD}')),
+        ),
+    }
+    true
+}
+
+/// The filter state — §7.3's in-place hide, driven the way [`Finder`] is until M7's chip row.
+///
+/// **This is the derived row space.** When `chips` is non-empty the grid counts `kept.len()` rows,
+/// view row *k* is file row `kept[k]`, and everything the painter asks for is mapped through it.
+/// `kept` is filled by [`tailhawk_core::sieve`] on a worker and maintained sorted **without
+/// sorting**, exactly as [`Finder::absorb`] maintains the match list and for the same reason.
+///
+/// A chip is typed into the window — `Ctrl+L` for an include, `Ctrl+Shift+L` for an exclude,
+/// `Enter` to add it — because V14's text field is M7; the title shows the chips as it shows the
+/// query. There is no chip *editing*: `Esc` clears them all, which is the affordance one key can
+/// honestly give.
+#[derive(Default)]
+struct Filtering {
+    chips: Chips,
+    /// A chip being typed, and its polarity, or `None` when keystrokes are not going here.
+    typing: Option<(Polarity, String)>,
+    pending_high: Option<u16>,
+    /// The file rows that survive, ascending — the view's row space while `chips` is non-empty.
+    kept: Vec<u64>,
+    running: Option<sieve::Running>,
+    /// File rows `[0, covered)` have been given to a pass; anything past it is growth still to
+    /// sieve, and [`Document::poll_filter`] starts the next pass over it when the current one ends.
+    covered: u64,
+    scanned: u64,
+    outcome: Option<Outcome>,
+    /// A chip that did not parse. Held, like the finder's, because the window is not modal.
+    error: Option<String>,
+}
+
+impl Filtering {
+    fn active(&self) -> bool {
+        !self.chips.chips.is_empty()
+    }
+
+    /// Forgets the survivors and stops the pass, keeping the chips — what a truncate needs.
+    fn clear_results(&mut self) {
+        self.running = None;
+        self.kept.clear();
+        self.covered = 0;
+        self.scanned = 0;
+        self.outcome = None;
+    }
+
+    /// The view row a file row lands on: its own slot if it survived, otherwise the slot of the
+    /// next survivor — which is where a hidden match, stepped to, puts the view.
+    fn view_row(&self, file_row: u64) -> u64 {
+        if !self.active() {
+            return file_row;
+        }
+        self.kept.partition_point(|&r| r < file_row) as u64
+    }
+
+    fn file_row(&self, view_row: u64) -> Option<u64> {
+        if !self.active() {
+            return Some(view_row);
+        }
+        self.kept.get(usize::try_from(view_row).ok()?).copied()
+    }
+
+    /// Adds one chunk's survivors, in their slot, without sorting the list.
+    fn absorb(&mut self, rows: Vec<u64>) {
+        let Some(&first) = rows.first() else {
+            return;
+        };
+        let at = self.kept.partition_point(|&r| r < first);
+        self.kept.splice(at..at, rows);
+    }
+
+    /// The title's filter fragment, or `None` when no filter is in play.
+    fn describe(&self, total_rows: u64) -> Option<String> {
+        if let Some(error) = &self.error {
+            return Some(format!("▼ {error}"));
+        }
+        let mut text = String::new();
+        for chip in &self.chips.chips {
+            let sign = match chip.polarity {
+                Polarity::Include => '+',
+                Polarity::Exclude => '−',
+            };
+            text.push_str(&format!(" {sign}{}", chip.source));
+        }
+        if let Some((polarity, typed)) = &self.typing {
+            let sign = match polarity {
+                Polarity::Include => '+',
+                Polarity::Exclude => '−',
+            };
+            text.push_str(&format!(" {sign}{typed}▏"));
+        }
+        if text.is_empty() {
+            return None;
+        }
+        let mut text = format!("▼{text}");
+        if self.active() {
+            text.push_str(&format!(" · {} of {total_rows}", self.kept.len()));
+            if self.running.is_some() {
+                let pct = (self.scanned * 100)
+                    .checked_div(total_rows)
+                    .map_or(100, |p| p.min(100));
+                text.push_str(&format!(" · scanning {pct}%"));
+            }
+            match self.outcome {
+                Some(Outcome::Cancelled) => text.push_str(" · cancelled"),
+                Some(Outcome::Failed(ref why)) => text.push_str(&format!(" · failed: {why}")),
+                _ => {}
+            }
         }
         Some(text)
     }
@@ -1232,6 +1511,7 @@ impl Shell {
             (F, true, _) => {
                 doc.finder.typing = true;
                 doc.finder.error = None;
+                doc.filtering.typing = None;
                 false
             }
             (RETURN, _, true) => {
@@ -1277,7 +1557,65 @@ impl Shell {
         true
     }
 
-    /// One typed character, when the find state is taking them.
+    /// One keystroke, offered to the filter state before the find state and the navigation map.
+    ///
+    /// `UI-DESIGN.md` §12: `Ctrl+L` focuses the filter. Here it starts an *include* chip and
+    /// `Ctrl+Shift+L` an *exclude*, because §7.2's chips carry their polarity and there is no chip
+    /// row to pick it from until M7. `Enter` adds the chip and starts the pass; `Esc` while typing
+    /// abandons the chip, and `Esc` otherwise — when nothing else claims it — clears every chip.
+    /// The find state gets `Esc` first when it has something to unwind, so the two typed fields
+    /// unwind in the order they were opened.
+    fn filter_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
+        const L: u16 = VK_L.0;
+        const RETURN: u16 = VK_RETURN.0;
+        const ESCAPE: u16 = VK_ESCAPE.0;
+        const BACK: u16 = VK_BACK.0;
+
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        let typing = doc.filtering.typing.is_some();
+        match (key, ctrl, typing) {
+            (L, true, _) => {
+                let polarity = if shift {
+                    Polarity::Exclude
+                } else {
+                    Polarity::Include
+                };
+                doc.filtering.typing = Some((polarity, String::new()));
+                doc.filtering.error = None;
+                doc.finder.typing = false;
+            }
+            (RETURN, _, true) => doc.add_chip(),
+            (BACK, _, true) => {
+                if let Some((_, text)) = doc.filtering.typing.as_mut() {
+                    text.pop();
+                }
+                doc.filtering.pending_high = None;
+            }
+            (ESCAPE, _, true) => {
+                doc.filtering.typing = None;
+                doc.filtering.pending_high = None;
+            }
+            (ESCAPE, _, false)
+                if doc.filtering.active()
+                    && !doc.finder.typing
+                    && doc.finder.matches.is_empty()
+                    && doc.finder.running.is_none() =>
+            {
+                doc.clear_filter();
+            }
+            _ => return false,
+        }
+        self.sync_scrollbar(hwnd);
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        true
+    }
+
+    /// One typed character, when the find or the filter state is taking them.
     ///
     /// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
     /// and pushing each on its own puts two replacement characters into the query — a search for an
@@ -1286,11 +1624,28 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        if !doc.finder.typing || !doc.finder.push_unit(unit) {
+        let wanted = match doc.filtering.typing.as_mut() {
+            Some((_, text)) => push_typed_unit(text, &mut doc.filtering.pending_high, unit),
+            None => doc.finder.typing && doc.finder.push_unit(unit),
+        };
+        if !wanted {
             return false;
         }
         self.retitle(hwnd);
         true
+    }
+
+    /// Collects what the filter worker has reported, and repaints if the view changed.
+    fn poll_filter(&mut self, hwnd: HWND) {
+        let changed = self.document.as_mut().is_some_and(Document::poll_filter);
+        if !changed {
+            return;
+        }
+        self.sync_scrollbar(hwnd);
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
     }
 
     /// Collects what the search worker has reported, and repaints if it said anything.
@@ -1403,6 +1758,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.poll_find(hwnd);
+                    shell.poll_filter(hwnd);
                 }
             });
             LRESULT(0)
@@ -1505,9 +1861,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // fall through to `DefWindowProcW` once there is something for it to do.
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
-                s.borrow_mut()
-                    .as_mut()
-                    .is_some_and(|shell| shell.find_key(hwnd, wparam.0 as u16, ctrl, shift))
+                s.borrow_mut().as_mut().is_some_and(|shell| {
+                    shell.filter_key(hwnd, wparam.0 as u16, ctrl, shift)
+                        || shell.find_key(hwnd, wparam.0 as u16, ctrl, shift)
+                })
             });
             if consumed {
                 return LRESULT(0);
@@ -2400,6 +2757,152 @@ mod tests {
         );
         assert_eq!(doc.finder.current, None);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Adds a chip the way the keys do and waits for the worker, as the timer would.
+    fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
+        doc.filtering.typing = Some((polarity, text.to_owned()));
+        doc.add_chip();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_filter();
+            std::thread::yield_now();
+        }
+        doc.poll_filter();
+    }
+
+    /// §7.3's in-place hide, end to end on a real file: the grid counts survivors, view row *k*
+    /// reads as file row `kept[k]`, an exclude composes with the include, and clearing the chips
+    /// gives the whole file back.
+    #[test]
+    fn a_filtered_document_shows_only_the_rows_that_survive() {
+        let path = std::env::temp_dir().join("tailhawk_filter_test.log");
+        let text: String = (0..300)
+            .map(|i| {
+                if i % 50 == 0 {
+                    format!("ERROR line {i} failed\n")
+                } else if i % 50 == 25 {
+                    format!("ERROR line {i} retrying\n")
+                } else {
+                    format!("INFO line {i} fine\n")
+                }
+            })
+            .collect();
+        std::fs::write(&path, text).expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        filter_for(&mut doc, "error", Polarity::Include);
+        assert_eq!(doc.filtering.outcome, Some(Outcome::Complete));
+        assert_eq!(doc.filtering.kept.len(), 12, "six failed, six retrying");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.view.grid().total_rows(), 12);
+        assert_eq!(doc.row_text(0), Some("ERROR line 0 failed"));
+        assert_eq!(doc.row_text(1), Some("ERROR line 25 retrying"));
+        assert_eq!(doc.row_text(11), Some("ERROR line 275 retrying"));
+        assert_eq!(doc.row_text(12), None, "past the survivors");
+        assert!(
+            doc.describe().contains("▼ +error · 12 of 300"),
+            "{}",
+            doc.describe()
+        );
+
+        filter_for(&mut doc, "retrying", Polarity::Exclude);
+        assert_eq!(doc.filtering.kept.len(), 6);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.row_text(1), Some("ERROR line 50 failed"));
+        assert!(
+            doc.describe().contains("▼ +error −retrying · 6 of 300"),
+            "{}",
+            doc.describe()
+        );
+
+        // A search's matches are file rows; stepping to one lands on its view row.
+        doc.finder.query = "line 100".to_owned();
+        doc.find();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.finder.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_find();
+            std::thread::yield_now();
+        }
+        doc.poll_find();
+        assert_eq!(doc.finder.matches.len(), 1);
+        assert_eq!(doc.finder.matches[0].line, 100, "a file row");
+        let mut spans = Vec::new();
+        doc.row_spans(2, &mut spans);
+        assert!(
+            spans.iter().any(|s| s.bg == Some(CURRENT_MATCH_BG)),
+            "view row 2 is file row 100 and wears the match"
+        );
+
+        doc.clear_filter();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.view.grid().total_rows(), 300);
+        // A view at the bottom of six rows is following, and stays following into three hundred.
+        assert!(doc.view.grid().is_following());
+        assert_eq!(doc.row_text(299), Some("INFO line 299 fine"));
+        assert_eq!(doc.row_text(298), Some("INFO line 298 fine"));
+        assert!(doc.describe().starts_with("⌕ "), "{}", doc.describe());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A chip that does not parse is held in the title and changes nothing else.
+    #[test]
+    fn a_chip_that_does_not_parse_is_reported_and_the_view_stands() {
+        let path = scratch_log("tailhawk_filter_bad_chip.log", 20);
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        filter_for(&mut doc, "/[unclosed/", Polarity::Include);
+        assert!(!doc.filtering.active());
+        assert!(doc.filtering.error.is_some());
+        assert!(
+            doc.describe().starts_with("▼ /[unclosed/"),
+            "{}",
+            doc.describe()
+        );
+        assert_eq!(doc.view.grid().total_rows(), 20);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Lines appended after the pass are sieved too, and a truncate throws the survivors away and
+    /// starts over against what the file now is.
+    #[test]
+    fn a_filter_follows_growth_and_survives_a_truncate_by_starting_over() {
+        let path = std::env::temp_dir().join("tailhawk_filter_growth.log");
+        std::fs::write(&path, "INFO a\nERROR b\nINFO c\n").expect("write");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        filter_for(&mut doc, "error", Polarity::Include);
+        assert_eq!(doc.filtering.kept, [1]);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            writeln!(f, "ERROR d\nINFO e\nERROR f").expect("write");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.kept.len() < 3 && std::time::Instant::now() < deadline {
+            doc.poll_follow();
+            doc.poll_filter();
+            std::thread::yield_now();
+        }
+        assert_eq!(doc.filtering.kept, [1, 3, 5], "growth was sieved");
+        assert_eq!(doc.filtering.covered, 6);
+
+        // §5.5's copy-truncate: the rows are different bytes at the same numbers.
+        std::fs::write(&path, "ERROR only\n").expect("truncate");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.kept != [0] && std::time::Instant::now() < deadline {
+            doc.poll_follow();
+            doc.poll_filter();
+            std::thread::yield_now();
+        }
+        assert_eq!(doc.filtering.kept, [0], "started over on the new bytes");
         let _ = std::fs::remove_file(&path);
     }
 }
