@@ -28,6 +28,23 @@ pub struct LineDecoder {
     /// Byte-order-mark bytes still to be swallowed. The BOM is consumed and never rendered, but it
     /// keeps its offsets in the index so byte offsets stay exact (§5.6).
     skip: usize,
+    /// Scratch for a line that carried ANSI escapes — §13.4, see [`crate::ansi`]. Reused, so a
+    /// coloured log does not allocate per line either.
+    stripped: crate::ansi::Stripped,
+}
+
+/// Hands one complete line on, with its ANSI escapes removed — §13.4.
+///
+/// **This is the one place every reader of a line passes through** — the viewport, the search, the
+/// filter — which is what makes stripping here rather than at display correct: a match's byte
+/// offsets and the painted row describe the same text. A line with no `ESC` costs a byte scan.
+fn emit(stripped: &mut crate::ansi::Stripped, line: &str, on_line: &mut impl FnMut(&str)) {
+    if crate::ansi::has_escapes(line) {
+        crate::ansi::strip(line, stripped);
+        on_line(&stripped.text);
+    } else {
+        on_line(line);
+    }
 }
 
 impl LineDecoder {
@@ -39,6 +56,7 @@ impl LineDecoder {
             pending: String::new(),
             pending_cr: false,
             skip: detection.bom_len,
+            stripped: crate::ansi::Stripped::default(),
         }
     }
 
@@ -51,6 +69,7 @@ impl LineDecoder {
             pending: String::new(),
             pending_cr: false,
             skip: 0,
+            stripped: crate::ansi::Stripped::default(),
         }
     }
 
@@ -88,7 +107,7 @@ impl LineDecoder {
         self.scratch = scratch;
 
         if last && !self.pending.is_empty() {
-            on_line(&self.pending);
+            emit(&mut self.stripped, &self.pending, &mut on_line);
             self.pending.clear();
         }
     }
@@ -114,10 +133,10 @@ impl LineDecoder {
             let (line, from_terminator) = rest.split_at(at);
 
             if self.pending.is_empty() {
-                on_line(line);
+                emit(&mut self.stripped, line, on_line);
             } else {
                 self.pending.push_str(line);
-                on_line(&self.pending);
+                emit(&mut self.stripped, &self.pending, on_line);
                 self.pending.clear();
             }
 
@@ -275,6 +294,24 @@ mod tests {
 
     fn all_at_once(charset: Charset, bytes: &[u8]) -> Vec<String> {
         collect(charset, bytes, bytes.len().max(1))
+    }
+
+    /// §13.4: escapes are removed from every emitted line, however the reads fall — including an
+    /// escape split across two reads, which is a line the decoder was already holding as pending —
+    /// and in a UTF-16 file, where the escape is two-byte code units before it is anything else.
+    #[test]
+    fn ansi_escapes_are_removed_from_every_line_however_the_reads_fall() {
+        let text = "\x1b[32minfo\x1b[0m: ok\n\x1b[31mfail\x1b[0m: no\nplain\nlast \x1b[1mbold";
+        let want = ["info: ok", "fail: no", "plain", "last bold"];
+        for chunk in [1, 2, 3, 5, 7, 64] {
+            assert_eq!(
+                collect(Charset::UTF_8, text.as_bytes(), chunk),
+                want,
+                "chunk {chunk}"
+            );
+        }
+        let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(all_at_once(Charset::UTF_16LE, &utf16), want);
     }
 
     /// The property M1 exists to guarantee: **where the reads happen cannot change the lines**.

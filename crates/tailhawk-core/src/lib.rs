@@ -9,6 +9,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod ansi;
 pub mod atlas;
 pub mod bidi;
 pub mod cell;

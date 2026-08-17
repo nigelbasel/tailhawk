@@ -657,6 +657,22 @@ mod tests {
             .expect("run")
     }
 
+    /// §13.4: escapes are stripped at decode, so a pattern that spans one — `fail: no` written as
+    /// `ESC[31m fail ESC[0m : no` — matches, and its offsets are in the text the painter draws.
+    #[test]
+    fn a_match_across_a_stripped_escape_reports_offsets_in_the_stripped_text() {
+        let found = search("fail: no", "ok\n\x1b[31mfail\x1b[0m: no\n");
+        assert_eq!(found.matches.len(), 1, "{found:?}");
+        assert_eq!(
+            (
+                found.matches[0].line,
+                found.matches[0].start,
+                found.matches[0].end
+            ),
+            (1, 0, 8)
+        );
+    }
+
     /// The line a writer is in the middle of — no terminator yet — is a line the index counts and
     /// a line the search must reach. `each_line` finishes the decoder for exactly this row.
     #[test]
