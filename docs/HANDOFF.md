@@ -20,13 +20,38 @@ indented and dimmed under their record and `Ctrl+E` **collapses** them (MEL two-
 assemble); field filters (`level >= Warning`) work through the format; a Serilog/NLog/log4net
 template in the app's own config beside the log is compiled and used.
 
-**Missing before daily use is comfortable:** UI chrome — the query and chips are typed into the window
-and shown in the title, so no find bar, no chip row (toggle/edit/reorder a filter), no tabs, no split
-view, no menus, **no column header** and no column resize/reorder/hide; no settings or persistence; no
+**Chrome (M7, begun today):** a real **find field** and a **filter chip row** at the top of the window —
+click to focus, caret, selection, clipboard, undo, IME; `Ctrl+F` / `Ctrl+L` focus them; a click on a
+chip removes it.
+
+**Missing before daily use is comfortable:** no tabs (one file per window), no split view, no menus,
+no chip toggle/edit/reorder, no column resize/reorder/hide; no settings or persistence; no
 user highlight-rules editor or format wizard; no installer or signing.
 
 **After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
 the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
+
+---
+
+## 🚧 M7 in progress — the widget layer, the command bar — 2026-08-17, session 18 (continued)
+
+**M6 scored and closed** (`EFFORT.md`; V9 moved here). **M7 forecast registered before starting**
+(19.8 h / 3.0 M; V14 named as the new shape and the risk).
+
+| Landed | Where | Seen |
+|---|---|---|
+| **V14** text field model — caret on grapheme boundaries, selection, word moves, cut/copy/paste via the caller, undo runs, IME composition span; a focus model | `widget.rs`, 6 tests | — |
+| A **chrome band** above the header; painter `fill` and `lay_out_at`; `RowSource::draw_chrome` | `view.rs`, `paint.rs`, `rows.rs` | — |
+| **The command bar**: `▸ [find field] ▼ [+chip] [−chip] [+ filter…]  · format` — real fields, focus, caret, selection as a span, click-to-place, click-a-chip-to-remove; the typed-into-the-title stand-ins are gone | `Chrome` in `main.rs` | **headless screenshot** — find field with caret, green `+job` chip, hint field, `Serilog (file) 100%` at the right, columns beneath |
+| **IME** — `WM_IME_*` into the focused field, candidate window at the caret, result consumed once | `Shell::ime` | not exercised (no IME on this desktop) |
+| **`Renderer::snapshot`** — a frame rendered offscreen and read back; `headless_screenshot` writes a BMP after a scripted set of chips/query/focus. **The desktop was in use and could not be captured; this is what saw the bar.** | `lib.rs`, `main.rs` test | `TAILHAWK_SHOT_FILE=… TAILHAWK_SHOT_KEYS="chip:job;focus:find;type:dispatch" TAILHAWK_SHOT_OUT=out.bmp cargo test --release -p tailhawk headless_screenshot -- --ignored` |
+
+**Deviations, recorded:** `⌕` is not in Cascadia Mono and the painter has one face, so the marker is
+`▸`; a click on a chip *removes* it — §5's toggle, reorder and edit are not there; no `.*` toggle on
+the find field (the query is always a regex); the disambiguation chip is bar text.
+
+**Next in M7:** **V7** tabs (several documents, `Ctrl+Tab`, `Ctrl+W`); chip toggle/edit; **V13**
+theming; **E19** watched folders; V10 detail pane; V12 pointer scroll; V15 UIA; E20–E22, E27; V9.
 
 ---
 
