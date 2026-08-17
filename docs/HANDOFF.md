@@ -24,14 +24,21 @@ template in the app's own config beside the log is compiled and used.
 click to focus, caret, selection, clipboard, undo, IME; `Ctrl+F` / `Ctrl+L` focus them; a click on a
 chip removes it.
 
+**Finding your way (added later on 2026-08-17):** `Ctrl+K` opens a **command palette** listing every command
+by name with its key (type to narrow; a typed number is *go to line*, `Ctrl+G`); a **line-number
+gutter** shows physical line numbers even under a filter; `Ctrl+D` **bookmarks** a row (amber mark
+in the gutter), `F2` / `Shift+F2` step through them; `Ctrl+Shift+1…9` puts a **colour label** on
+every line containing the selected text, `Ctrl+Shift+0` clears them. Bookmarks and labels are
+remembered per file.
+
 **Tabs:** several files in one window (`Ctrl+O` / drop open a new tab, `Ctrl+Tab` switches, `Ctrl+W`
 closes); several paths on the command line open together; a directory or `dir*.log` is watched and
 new files join as tabs. A **status bar** says whether the view is following. **Remembered between
 runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
-**Missing before daily use is comfortable:** no split view, no menus, no chip edit/reorder, no
-column resize/reorder/hide; no settings or persistence; no
-user highlight-rules editor or format wizard; no installer or signing.
+**Missing before daily use is comfortable:** no split view, no menus (the palette is the discovery
+surface), no chip edit/reorder, no column resize/reorder/hide; no user highlight-rules editor or
+format wizard (colour labels are the stand-in); no installer or signing.
 
 **After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
 the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
@@ -70,8 +77,17 @@ rule stands: nested messages go to `DefWindowProcW` — so anything that must ha
 message must be moved to the un-nested one that causes it.**
 
 
+| **Line-number gutter** — physical numbers (§6.4), sized from the file; rows and header shifted right; hit-test subtracts it. Bands now painted *over* the rows, which fixed a partial top row drawn across the bar at the tail | `View::set_gutter_px`, `paint.rs`, `RowSource::row_number/row_mark` | headless |
+| **E20 bookmarks** — `Ctrl+D` toggles on the caret's row (file row, survives a filter), `F2`/`Shift+F2` step and wrap skipping a hidden one that would stall; amber mark in the gutter; persisted | `Document::toggle_bookmark/bookmark_step` | headless + test |
+| **V8 command palette** — `Ctrl+K` (and `Ctrl+G`): every command by name and key, subsequence match ranked by tightness, `Up`/`Down`/`Enter`/`Esc`, click a row; digits → *Go to line N*; `Command` enum is the one dispatch | `palette.rs` (6 tests), `Command`, `Shell::run/palette_key` | headless |
+| **Colour labels** — `Ctrl+Shift+1…9` on a selection: whole-line background on every line containing it, toggles off, `Ctrl+Shift+0` clears; `Pattern::literal`; persisted | `Document::label/toggle_label` | headless + test |
+
+**Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
+colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
+are unbound.
+
 **Next in M7:** drag-reorder and drag-out-to-split; **V13** theming; V10 detail pane; V12 pointer
-scroll; V15 UIA; E20 bookmarks, E21 export/tee, E22 sort, E27 view history; V9 rules editor / wizard.
+scroll; V15 UIA; E21 export/tee, E22 sort, E27 view history; V9 rules editor / wizard.
 
 ---
 
