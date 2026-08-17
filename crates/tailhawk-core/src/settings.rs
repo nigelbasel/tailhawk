@@ -16,7 +16,8 @@
 //! ## What is kept
 //!
 //! - `[window]` — `x`, `y`, `width`, `height`, `maximized`: where the window was.
-//! - `[[file]]` — `path`, `chips` (each `+text` or `-text`), `collapse`: what a file was being
+//! - `[[file]]` — `path`, `chips` (each `+text` or `-text`), `collapse`, `bookmarks` (file rows),
+//!   `labels` (each `n:text`): what a file was being
 //!   looked at through, so opening it again shows the same view. Keyed by **path**; §12.4 says
 //!   file identity, which survives a rename where a path does not, and that upgrade is recorded
 //!   rather than done.
@@ -43,6 +44,10 @@ pub struct FileState {
     /// Chip texts with their polarity as the first character: `+error`, `-retry`.
     pub chips: Vec<String>,
     pub collapse: bool,
+    /// E20's bookmarks, as physical (zero-based) file rows.
+    pub bookmarks: Vec<u64>,
+    /// The colour labels, each `n:text` — the digit key and the literal it marks.
+    pub labels: Vec<String>,
 }
 
 /// Everything persisted.
@@ -65,7 +70,11 @@ impl Settings {
     pub fn set_file(&mut self, state: FileState) {
         self.files
             .retain(|f| !f.path.eq_ignore_ascii_case(&state.path));
-        if !state.chips.is_empty() || state.collapse {
+        if !state.chips.is_empty()
+            || state.collapse
+            || !state.bookmarks.is_empty()
+            || !state.labels.is_empty()
+        {
             self.files.push(state);
         }
         // Keep the newest 200: a settings file is not a history.
@@ -107,6 +116,14 @@ impl Settings {
             }
             if f.collapse {
                 out.push_str("collapse = true\n");
+            }
+            if !f.bookmarks.is_empty() {
+                let rows: Vec<String> = f.bookmarks.iter().map(u64::to_string).collect();
+                out.push_str(&format!("bookmarks = [{}]\n", rows.join(", ")));
+            }
+            if !f.labels.is_empty() {
+                let labels: Vec<String> = f.labels.iter().map(|l| quote(l)).collect();
+                out.push_str(&format!("labels = [{}]\n", labels.join(", ")));
             }
         }
         out
@@ -170,6 +187,13 @@ impl Settings {
                             "path" => f.path = unquote(value),
                             "chips" => f.chips = array(value),
                             "collapse" => f.collapse = value == "true",
+                            "bookmarks" => {
+                                f.bookmarks = array(value)
+                                    .iter()
+                                    .filter_map(|v| v.parse().ok())
+                                    .collect()
+                            }
+                            "labels" => f.labels = array(value),
                             _ => {}
                         }
                     }
@@ -353,11 +377,15 @@ mod tests {
             path: r"C:\logs\app.log".to_owned(),
             chips: vec!["+error".to_owned(), "-retry \"quoted\"".to_owned()],
             collapse: true,
+            bookmarks: vec![0, 42, 1_000_000],
+            labels: vec!["1:Exception".to_owned(), "9:a \"quoted\" one".to_owned()],
         });
         s.set_file(FileState {
             path: r"C:\logs\other.log".to_owned(),
             chips: vec!["+job".to_owned()],
             collapse: false,
+            bookmarks: Vec::new(),
+            labels: Vec::new(),
         });
         s
     }
@@ -382,12 +410,16 @@ mod tests {
             path: r"C:\logs\app.log".to_owned(),
             chips: Vec::new(),
             collapse: false,
+            bookmarks: Vec::new(),
+            labels: Vec::new(),
         });
         assert!(s.file(r"C:\logs\app.log").is_none());
         s.set_file(FileState {
             path: r"c:\LOGS\other.log".to_owned(),
             chips: vec!["+x".to_owned()],
             collapse: false,
+            bookmarks: Vec::new(),
+            labels: Vec::new(),
         });
         assert_eq!(s.files.len(), 1, "case-insensitive path replaces");
         assert_eq!(s.file(r"C:\logs\other.log").unwrap().chips, ["+x"]);
@@ -427,6 +459,8 @@ mod tests {
             path: "a.log".into(),
             chips: vec!["+a".into()],
             collapse: false,
+            bookmarks: Vec::new(),
+            labels: Vec::new(),
         });
         std::fs::create_dir_all(tiers[1].parent().unwrap()).unwrap();
         std::fs::write(&tiers[1], personal.to_toml()).unwrap();
@@ -438,11 +472,15 @@ mod tests {
             path: "a.log".into(),
             chips: vec!["+curated".into()],
             collapse: true,
+            bookmarks: Vec::new(),
+            labels: Vec::new(),
         });
         curated.set_file(FileState {
             path: "b.log".into(),
             chips: vec!["+b".into()],
             collapse: false,
+            bookmarks: Vec::new(),
+            labels: Vec::new(),
         });
         std::fs::write(&tiers[0], curated.to_toml()).unwrap();
         let merged = load(&tiers);

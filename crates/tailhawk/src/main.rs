@@ -22,10 +22,11 @@ use tailhawk_core::columns::{Layout, Presentation};
 use tailhawk_core::detect::{self, Detection};
 use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
-use tailhawk_core::highlight::{Highlighter, Span};
+use tailhawk_core::encoding::Charset;
+use tailhawk_core::highlight::{Highlighter, Rule, Span};
 use tailhawk_core::paint::{Colours, Painter};
 use tailhawk_core::palette::{Choice, Entry, Palette};
-use tailhawk_core::search::{Match, SearchOptions};
+use tailhawk_core::search::{Match, Pattern, SearchOptions};
 use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
 use tailhawk_core::settings;
@@ -169,6 +170,9 @@ struct Document {
     /// `Ctrl+K`'s command palette — `UI-DESIGN.md` §9. Per document, so a tab switch keeps its
     /// query; every one lists the same commands.
     palette: Palette,
+    /// The ad-hoc colour labels in force — `(n, text)` — mirrored as rules at the front of the
+    /// highlighter's set. Kept here so they can be listed and saved.
+    labels: Vec<(u8, String)>,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -523,6 +527,7 @@ impl Document {
             open_at_tail: true,
             bookmarks: Default::default(),
             palette: Palette::new(Command::entries()),
+            labels: Vec::new(),
             pump: None,
             stream_done: false,
         })
@@ -571,6 +576,7 @@ impl Document {
             open_at_tail: true,
             bookmarks: Default::default(),
             palette: Palette::new(Command::entries()),
+            labels: Vec::new(),
             pump: Some(pump),
             stream_done: false,
         })
@@ -709,6 +715,12 @@ impl Document {
             path,
             chips,
             collapse: self.filtering.records_only,
+            bookmarks: self.bookmarks.iter().copied().collect(),
+            labels: self
+                .labels
+                .iter()
+                .map(|(n, text)| format!("{n}:{text}"))
+                .collect(),
         })
     }
 
@@ -727,6 +739,16 @@ impl Document {
         }
         self.filtering.records_only = state.collapse && self.detection.accepted.is_some();
         self.filtering.error = None;
+        self.bookmarks.extend(state.bookmarks.iter().copied());
+        for label in &state.labels {
+            if let Some((n, text)) = label.split_once(':') {
+                if let Ok(n) = n.parse::<u8>() {
+                    if !self.labels.iter().any(|(k, t)| *k == n && t == text) {
+                        self.label(n, text);
+                    }
+                }
+            }
+        }
         if self.filtering.active() {
             self.filtering.clear_results();
             self.refilter();
@@ -1218,6 +1240,63 @@ impl Document {
             }
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// `Ctrl+Shift+1…9` — `UI-DESIGN.md` §12's ad-hoc colour label on the selection: every line
+    /// containing the selected text takes label *n*'s background, above the catalogue and below a
+    /// search's matches. The same key on the same text takes the label off again. A selection that
+    /// spans lines, or none, does nothing. Reports whether a label changed.
+    fn toggle_label(&mut self, n: u8) -> bool {
+        let Some(text) = self.copy_text() else {
+            return false;
+        };
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.is_empty() || text.contains(['\r', '\n']) {
+            return false;
+        }
+        self.label(n, &text.to_owned())
+    }
+
+    /// Label *n* on `text`, or off it if it is already on. The selection-free half of
+    /// [`Document::toggle_label`].
+    fn label(&mut self, n: u8, text: &str) -> bool {
+        if !(1..=9).contains(&n) {
+            return false;
+        }
+        let name = format!("Label {n}");
+        let rules = &mut self.highlighter.set_mut().rules;
+        if let Some(at) = rules
+            .iter()
+            .position(|r| r.name == name && r.pattern.source() == Pattern::escape(text))
+        {
+            rules.remove(at);
+            self.labels.retain(|(k, t)| !(*k == n && t == text));
+            return true;
+        }
+        let Ok(pattern) = Pattern::literal(text, Charset::UTF_8, false) else {
+            return false;
+        };
+        rules.insert(
+            0,
+            Rule::new(name, pattern)
+                .bg(LABEL_COLOURS[usize::from(n) - 1])
+                .whole_line(),
+        );
+        self.labels.push((n, text.to_owned()));
+        true
+    }
+
+    /// `Ctrl+Shift+0`: every label off.
+    fn clear_labels(&mut self) -> bool {
+        if self.labels.is_empty() {
+            return false;
+        }
+        self.labels.clear();
+        self.highlighter
+            .set_mut()
+            .rules
+            .retain(|r| !r.name.starts_with("Label "));
+        true
     }
 
     /// Applies one navigation intent. Returns whether anything actually moved.
@@ -1738,6 +1817,8 @@ enum Command {
     NextBookmark,
     PreviousBookmark,
     GoToLine(u64),
+    Label(u8),
+    ClearLabels,
     GoToTop,
     FollowTail,
     Copy,
@@ -1763,6 +1844,8 @@ impl Command {
         (Command::ToggleBookmark, "Toggle bookmark", "Ctrl+D"),
         (Command::NextBookmark, "Next bookmark", "F2"),
         (Command::PreviousBookmark, "Previous bookmark", "Shift+F2"),
+        (Command::Label(1), "Colour-label lines containing the selection", "Ctrl+Shift+1…9"),
+        (Command::ClearLabels, "Clear colour labels", "Ctrl+Shift+0"),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2011,6 +2094,18 @@ const FIELD_SELECTION_BG: [f32; 4] = [0.20, 0.36, 0.60, 1.0];
 const CARET: [f32; 4] = [0.88, 0.89, 0.91, 1.0];
 const CHIP_INCLUDE_BG: [f32; 4] = [0.14, 0.26, 0.20, 1.0];
 const CHIP_EXCLUDE_BG: [f32; 4] = [0.30, 0.16, 0.16, 1.0];
+/// `Ctrl+Shift+1…9`'s label backgrounds: nine tints a line stays readable over, in key order.
+const LABEL_COLOURS: [[f32; 4]; 9] = [
+    [0.45, 0.30, 0.10, 1.0],
+    [0.15, 0.40, 0.20, 1.0],
+    [0.15, 0.30, 0.50, 1.0],
+    [0.45, 0.20, 0.45, 1.0],
+    [0.15, 0.42, 0.42, 1.0],
+    [0.50, 0.15, 0.15, 1.0],
+    [0.40, 0.40, 0.15, 1.0],
+    [0.30, 0.30, 0.45, 1.0],
+    [0.35, 0.35, 0.35, 1.0],
+];
 const PALETTE_BG: [f32; 4] = [0.16, 0.17, 0.21, 1.0];
 const PALETTE_SELECTED_BG: [f32; 4] = [0.24, 0.30, 0.42, 1.0];
 /// The palette box's width, in cells.
@@ -2253,6 +2348,8 @@ impl Shell {
                             path: String::new(),
                             chips: self.initial_chips.clone(),
                             collapse: false,
+                            bookmarks: Vec::new(),
+                            labels: Vec::new(),
                         });
                     }
                     let key = document
@@ -2581,6 +2678,21 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
+        // `UI-DESIGN.md` §12: `Ctrl+Shift+1…9` puts a colour label on the selection, `Ctrl+Shift+0`
+        // takes them all off. The digit row only — a numpad digit with `Ctrl` is a navigation key.
+        if (0x30..=0x39).contains(&key) && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 {
+            let changed = if key == 0x30 {
+                doc.clear_labels()
+            } else {
+                doc.toggle_label((key - 0x30) as u8)
+            };
+            if changed {
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            return true;
+        }
         if key == VK_D.0 {
             // E20: a bookmark on the current row, or off it. `UI-DESIGN.md` §12's binding.
             if doc.toggle_bookmark() {
@@ -2844,6 +2956,12 @@ impl Shell {
                 doc.bookmark_step(command == Command::NextBookmark);
             }
             Command::GoToLine(n) => doc.go_to_line(n),
+            Command::Label(n) => {
+                doc.toggle_label(n);
+            }
+            Command::ClearLabels => {
+                doc.clear_labels();
+            }
             Command::OpenFile
             | Command::Copy
             | Command::GoToTop
@@ -4646,6 +4764,62 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// `Ctrl+Shift+n` on a selection: the lines containing the text take label *n*'s background
+    /// across their whole width, above the catalogue; the same key on the same text takes it off;
+    /// `Ctrl+Shift+0` clears them all. The label is a literal — regex metacharacters in the
+    /// selection are matched as themselves.
+    #[test]
+    fn a_colour_label_marks_every_line_containing_the_selection() {
+        let path = std::env::temp_dir().join("tailhawk_label_test.log");
+        std::fs::write(
+            &path,
+            "2024-01-01 12:00:00 INFO job [a.b] started\nplain line\n2024-01-01 12:00:01 INFO job [a.b] done\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        let mut spans = Vec::new();
+        doc.row_spans(0, &mut spans);
+        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[1])), "no label yet");
+
+        // Select `[a.b]` on the first row — cells 29..34 — and label it 2.
+        doc.selection = Some(Selection::stream(Position::new(0, 29), Position::new(0, 34)));
+        assert_eq!(doc.copy_text().as_deref(), Some("[a.b]"));
+        assert!(doc.toggle_label(2));
+        assert_eq!(doc.labels, [(2, "[a.b]".to_owned())]);
+        for row in [0, 2] {
+            doc.row_spans(row, &mut spans);
+            let line = doc.row_text(row).unwrap().to_owned();
+            let labelled: usize = spans
+                .iter()
+                .filter(|s| s.bg == Some(LABEL_COLOURS[1]))
+                .map(|s| s.end - s.start)
+                .sum();
+            assert_eq!(labelled, line.len(), "row {row}: the whole line carries the label");
+        }
+        doc.row_spans(1, &mut spans);
+        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[1])), "the plain line does not");
+
+        // A second label on other text stacks; the first toggles off on its own.
+        assert!(doc.label(5, "plain"));
+        assert!(doc.toggle_label(2), "same key, same text: off");
+        assert_eq!(doc.labels, [(5, "plain".to_owned())]);
+        doc.row_spans(0, &mut spans);
+        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[1])));
+        doc.row_spans(1, &mut spans);
+        assert!(spans.iter().any(|s| s.bg == Some(LABEL_COLOURS[4])));
+
+        assert!(doc.clear_labels());
+        assert!(doc.labels.is_empty());
+        assert!(!doc.clear_labels(), "nothing left to clear");
+        doc.row_spans(1, &mut spans);
+        assert!(spans.iter().all(|s| s.bg != Some(LABEL_COLOURS[4])));
+
+        assert!(!doc.label(0, "x"), "no label 0");
+        assert!(!doc.label(10, "x"), "no label 10");
+        std::fs::remove_file(&path).ok();
+    }
+
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
         doc.add_chip(text, polarity);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4965,7 +5139,7 @@ mod tests {
     }
     /// A headless screenshot: opens `TAILHAWK_SHOT_FILE`, applies `TAILHAWK_SHOT_KEYS` (a `;`-separated
     /// script of `chip:<text>`, `xchip:<text>`, `find:<text>`, `focus:find|chip|grid`, `type:<text>`,
-    /// `bookmark:<view row>`, `palette:<query>`, `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
+    /// `bookmark:<view row>`, `palette:<query>`, `label:<n>:<text>`, `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
     /// harness that has no desktop to capture — the offscreen target is the whole point.
     ///
     /// ```text
@@ -5034,6 +5208,10 @@ mod tests {
                     doc.palette.open();
                     doc.palette.field.insert(arg);
                     doc.palette.refresh();
+                }
+                "label" => {
+                    let (n, text) = arg.split_once(':').expect("label:<n>:<text>");
+                    doc.label(n.parse().expect("a digit"), text);
                 }
                 "bookmark" => {
                     let row: u64 = arg.parse().expect("a row number");
@@ -5156,7 +5334,7 @@ mod tests {
     /// §12.4's per-file state: what a document is looked at through survives a round trip through
     /// the settings and comes back on the next open.
     #[test]
-    fn a_files_chips_and_collapse_are_remembered_and_restored() {
+    fn a_files_chips_collapse_bookmarks_and_labels_are_remembered_and_restored() {
         let path = scratch_log("tailhawk_settings_test.log", 40);
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
@@ -5167,9 +5345,13 @@ mod tests {
         );
         filter_for(&mut doc, "record", Polarity::Include);
         filter_for(&mut doc, "\"line 12\"", Polarity::Exclude);
+        doc.bookmarks.extend([3, 17]);
+        assert!(doc.label(4, "line 2"));
         let state = doc.file_state().expect("chips to remember");
         assert_eq!(state.chips, ["+record", "-\"line 12\""]);
         assert!(!state.collapse);
+        assert_eq!(state.bookmarks, [3, 17]);
+        assert_eq!(state.labels, ["4:line 2"]);
 
         let mut settings = settings::Settings::default();
         settings.set_file(state);
@@ -5192,6 +5374,9 @@ mod tests {
         assert_eq!(again.filtering.chips.chips.len(), 2);
         assert_eq!(again.filtering.chips.chips[1].polarity, Polarity::Exclude);
         assert_eq!(doc.filtering.kept, again.filtering.kept, "the same view");
+        assert_eq!(again.bookmarks.iter().copied().collect::<Vec<_>>(), [3, 17]);
+        assert_eq!(again.labels, [(4, "line 2".to_owned())]);
+        assert!(again.highlighter.set().rules[0].name == "Label 4", "the rule came back too");
         let _ = std::fs::remove_file(&path);
     }
 }

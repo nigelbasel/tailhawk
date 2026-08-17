@@ -172,6 +172,17 @@ impl Pattern {
         })
     }
 
+    /// A pattern that matches `text` literally — the text with every metacharacter escaped, which
+    /// [`Pattern::source`] then reports, so a literal round-trips through the source like any other.
+    pub fn literal(text: &str, charset: Charset, case_insensitive: bool) -> Result<Self> {
+        Self::compile(&regex::escape(text), charset, case_insensitive)
+    }
+
+    /// The escaped form [`Pattern::literal`] compiles, for a caller matching sources.
+    pub fn escape(text: &str) -> String {
+        regex::escape(text)
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
