@@ -4,6 +4,32 @@
 ahead or behind" has been unanswerable. This file closes that, and is meant to be **appended to at
 the end of every session** — one row, four numbers.
 
+
+### Scored: M7 — forecast 19.8 h / 3.0 M, actual **~7 h / ~1.3 M**, E22 and V9's editor UI outstanding — 2026-08-18
+
+The same day as the forecast, one long session. **Landed:** V14 (fields, focus, IME), V8 (bar, chips
+with toggle/edit/drag, **palette**), V7 (tabs, drag-reorder, middle-click close, **split view**), V10
+(detail pane, JSON re-indent), V12-lite (eased wheel; no `WM_POINTER`), V13 (dark/light/High
+Contrast, `--theme`), **V15** (UIA chrome provider + `tools/verify-uia.ps1`, which passes on the
+shipped binary without a free desktop), E19, E20 (+ severity glyphs), E21 (export + live tee, TSV),
+E27; and from M8, E17, E18, E28. **Not landed:** E22 sort/top-N; V9's rules *editor* and format
+wizard as UI — the rules file (`tailhawk.rules.toml`) and the config import stand in; column
+reorder and saved widths; Mica.
+
+**~2.8× high, and the shape held.** V14 — the new shape — cost about 1.5 h, not 4: a text field is
+a well-known thing, and the caret model was `selection.rs`. Everything after it was the reuse
+pattern (each item 20–60 min). The forecast's verification line (3.5 h) was mostly not spent on the
+desktop — it was busy all evening — but on the headless snapshot path and the UIA harness, which
+between them cost ~1 h and are now the standing verification for the chrome. **The one thing this
+scoring adds to the record:** a session that does not stop between items lands about three items
+an hour of this size; the earlier scorings' hours were dominated by the stops.
+
+Two defects the work found, worth the record: **the gutter stretched every frame** for two commits
+(the shader was told the grid's width without the gutter — seen only because a headless shot was
+compared with the previous one); and **a whole-line background flattened every rule under it**
+(the highlighter's claim took the ink with the background) — fixed with `claim_bg`, which tints
+under the ink.
+
 ## What the numbers mean, and what they do not
 
 **Active hours** is the sum of gaps between consecutive transcript messages, **capped at 5 minutes**.
@@ -39,8 +65,8 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-13 | ² | ² | 12 | Follow, rotation by identity, scrollbar, selection wiring, activity log |
 | 2026-08-14 | ² | ² | 19 | M4 finished (follow tick, E30, E16, off-thread scan); M5 E26, E15, E13, MODE_SOLID |
 | 2026-08-16 | 1.2⁴ | 287 k⁴ | 6 | Search wired to the UI: the span pass, `find.rs`, the keys, the 10 GB worker criterion |
-| 2026-08-17 | 10.5⁴ | 2.0 M⁴ | 84 | The find harness run at last; E23; E14; E24; open-at-tail, Ctrl+O + drop, the wndproc guard; M5 scored; **M6 delivered less V9**; M6 scored, M7 begun — **V14** text field + focus, the **command bar** on real fields, IME, headless snapshot, **tabs**, status bar, chips toggle, E19 watched folders, E28 settings, `--filter/--exclude`; then the **gutter + E20 bookmarks**, **V8 command palette**, colour labels, **E27 history**, **V10 detail pane**, **E21 export/tee** + TSV copy; **split view**, **V13 theming**, E17/E18, glyphs, smooth wheel, chip edit, column resize |
-| **Total** | **~47.6** | **~9.4 M** | **217**³ | **M0–M6, plus most of M7 (V14, V7 tabs + split, V8 palette, V10, V13, E19–E21, E27) and M8's E17, E18, E28** |
+| 2026-08-17 | 12.5⁴ | 2.4 M⁴ | 96 | The find harness run at last; E23; E14; E24; open-at-tail, Ctrl+O + drop, the wndproc guard; M5 scored; **M6 delivered less V9**; M6 scored, M7 begun — **V14** text field + focus, the **command bar** on real fields, IME, headless snapshot, **tabs**, status bar, chips toggle, E19 watched folders, E28 settings, `--filter/--exclude`; then the **gutter + E20 bookmarks**, **V8 command palette**, colour labels, **E27 history**, **V10 detail pane**, **E21 export/tee** + TSV copy; **split view**, **V13 theming**, E17/E18, glyphs, smooth wheel, chip edit, column resize, drag-reorder, **V15 UIA + verify-uia.ps1**, user rules file; **M7 scored** |
+| **Total** | **~49.6** | **~9.8 M** | **229**³ | **M0–M7 (less E22, V9's editor UI), plus M8's E17, E18, E28** |
 
 ⁴ **Measured while the session was still running**, so it is a floor rather than a total — 710 turns
 between 14:31 and 15:49, by the method above. Recorded now rather than at the end because the last
