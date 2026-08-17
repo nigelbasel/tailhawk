@@ -122,6 +122,18 @@ pub trait RowSource {
         None
     }
 
+    /// The number shown in the gutter for a view row — §6.4: "line numbers shown to the user are
+    /// **physical** line numbers", so a filtered or collapsed view still says which line of the
+    /// file this is. `None` draws nothing there. Default: the row plus one.
+    fn row_number(&self, row: u64) -> Option<u64> {
+        Some(row + 1)
+    }
+
+    /// A mark in the gutter for this row — a bookmark's colour. Default: none.
+    fn row_mark(&self, _row: u64) -> Option<[f32; 4]> {
+        None
+    }
+
     /// Draws the source's command bar into `View::chrome_px`'s band, with the painter's
     /// [`fill`](crate::paint::Painter::fill) and [`lay_out_at`](crate::paint::Painter::lay_out_at).
     /// Called once per frame before the rows, only when the band has height. Default: nothing.

@@ -68,7 +68,7 @@ use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline, MODE_SOLID};
 use crate::view::View;
 use crate::Result;
-use crate::{HEADER_BG, HEADER_INK, REVEAL_MARK, SELECTION_INK};
+use crate::{GUTTER_INK, HEADER_BG, HEADER_INK, REVEAL_MARK, SELECTION_INK};
 
 /// What colours one row, gathered because the three arrive together and mean nothing apart.
 ///
@@ -212,26 +212,68 @@ impl Painter {
         // Taken out and put back so the row loop can hold it mutably while `self` is borrowed for
         // the layout. One `Vec` for the frame is the point; taking it does not allocate.
         let mut spans = std::mem::take(&mut self.spans);
-        // The command bar, if the source draws one — V14. First, so its fills sit under its text
-        // and nothing else sits under them.
-        if view.chrome_px() > 0.0 {
-            self.spans = spans;
-            source.draw_chrome(self, view);
-            spans = std::mem::take(&mut self.spans);
+        let gutter = view.gutter_px();
+        let cell_w = self.cell_width();
+        for (row, y) in rows {
+            // The gutter: a mark and the physical line number, right-aligned, in a quieter ink.
+            if gutter > 0.0 {
+                if let Some(colour) = source.row_mark(row) {
+                    self.instances.push(Instance {
+                        pos: [0.0, y],
+                        size: [cell_w * 0.5, view.grid().row_height()],
+                        tint: colour,
+                        mode: MODE_SOLID,
+                        ..Instance::default()
+                    });
+                    total.quads += 1;
+                }
+                if let Some(n) = source.row_number(row) {
+                    let text = n.to_string();
+                    let width = ((gutter / cell_w) as usize).saturating_sub(1);
+                    let x = (width.saturating_sub(text.len())) as f32 * cell_w;
+                    self.spans = spans;
+                    let _ = self.lay_out_at(view, x, y, &text, Colours::plain(GUTTER_INK));
+                    spans = std::mem::take(&mut self.spans);
+                }
+            }
+            let Some(line) = source.row_text(row) else {
+                continue;
+            };
+            source.row_spans(row, &mut spans);
+            let colours = Colours {
+                tint,
+                selected: source.row_selection(row),
+                spans: &spans,
+            };
+            let from = self.instances.len();
+            match self.lay_out_row(view, line, source.row_anchors(row), colours, y) {
+                Ok(laid) => total.merge(laid),
+                Err(_) => total.failed_rows += 1,
+            }
+            // Rows start right of the gutter. Moved after the layout rather than threaded through
+            // it — every x in `lay_out_row` is a column's, and the gutter is not a column.
+            if gutter > 0.0 {
+                for instance in &mut self.instances[from..] {
+                    instance.pos[0] += gutter;
+                }
+            }
         }
         // The header band, when there is one: a filled strip and the column names in it. Laid out
-        // like a row, in the same cells, so it lines up with what is under it.
+        // like a row, in the same cells, so it lines up with what is under it. **After the rows**: a
+        // row scrolled partly under the bands is covered by their fills rather than drawn over
+        // them — the rows are not clipped to the grid's band, and this order is what does it.
         if let Some(header) = source.header().filter(|_| header_px > 0.0) {
             let chrome = view.chrome_px();
             self.instances.push(Instance {
                 pos: [0.0, chrome],
-                size: [view.hgrid().viewport_px(), header_px],
+                size: [view.gutter_px() + view.hgrid().viewport_px(), header_px],
                 tint: HEADER_BG,
                 mode: MODE_SOLID,
                 ..Instance::default()
             });
             total.quads += 1;
             spans.clear();
+            let from = self.instances.len();
             match self.lay_out_row(
                 view,
                 header,
@@ -242,21 +284,16 @@ impl Painter {
                 Ok(laid) => total.merge(laid),
                 Err(_) => total.failed_rows += 1,
             }
-        }
-        for (row, y) in rows {
-            let Some(line) = source.row_text(row) else {
-                continue;
-            };
-            source.row_spans(row, &mut spans);
-            let colours = Colours {
-                tint,
-                selected: source.row_selection(row),
-                spans: &spans,
-            };
-            match self.lay_out_row(view, line, source.row_anchors(row), colours, y) {
-                Ok(laid) => total.merge(laid),
-                Err(_) => total.failed_rows += 1,
+            for instance in &mut self.instances[from..] {
+                instance.pos[0] += view.gutter_px();
             }
+        }
+        // The command bar, if the source draws one — V14. Last, so its fills sit over whatever a
+        // partial top row put under them, and its text over its fills.
+        if view.chrome_px() > 0.0 {
+            self.spans = spans;
+            source.draw_chrome(self, view);
+            spans = std::mem::take(&mut self.spans);
         }
         self.spans = spans;
         Ok(total)

@@ -200,6 +200,9 @@ pub const CONTINUATION_INK: [f32; 4] = [0.56, 0.59, 0.64, 1.0];
 pub const HEADER_BG: [f32; 4] = [0.11, 0.12, 0.14, 1.0];
 pub const HEADER_INK: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
 
+/// The gutter's line numbers: quieter than the header, present on every row.
+pub const GUTTER_INK: [f32; 4] = [0.40, 0.44, 0.50, 1.0];
+
 /// Errors that cross the seam. Deliberately opaque — the shell can report one but cannot act on
 /// the distinction, and `SPEC.md` §3.2 forbids panicking on device loss.
 #[derive(Debug)]

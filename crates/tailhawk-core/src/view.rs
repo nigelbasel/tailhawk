@@ -85,6 +85,11 @@ pub struct View {
     chrome_px: f32,
     /// The status bar's band, at the bottom. The grid gets the height above it.
     footer_px: f32,
+    /// The gutter — line numbers and bookmark marks — at the left. The horizontal grid gets the
+    /// width right of it, every drawn row is moved right by it, and a hit-test subtracts it first.
+    gutter_px: f32,
+    /// The whole viewport width, so a gutter change can re-derive the horizontal grid's share.
+    width_px: f32,
     /// The whole viewport height, so a header change can re-derive the grid's share.
     height_px: f32,
 }
@@ -101,6 +106,8 @@ impl View {
             header_px: 0.0,
             chrome_px: 0.0,
             footer_px: 0.0,
+            gutter_px: 0.0,
+            width_px: 0.0,
             height_px: 0.0,
         }
     }
@@ -128,6 +135,17 @@ impl View {
 
     pub fn footer_px(&self) -> f32 {
         self.footer_px
+    }
+
+    /// The gutter's width, at the left. Rows are drawn from here; the header too.
+    pub fn set_gutter_px(&mut self, gutter_px: f32) {
+        self.gutter_px = gutter_px.max(0.0);
+        self.hgrid
+            .set_viewport_px((self.width_px - self.gutter_px).max(0.0));
+    }
+
+    pub fn gutter_px(&self) -> f32 {
+        self.gutter_px
     }
 
     /// The whole viewport height, bands included.
@@ -177,7 +195,9 @@ impl View {
 
     /// The body's size in device pixels — the gutter and line-number column already subtracted.
     pub fn set_viewport(&mut self, width_px: f32, height_px: f32) {
-        self.hgrid.set_viewport_px(width_px);
+        self.width_px = width_px;
+        self.hgrid
+            .set_viewport_px((width_px - self.gutter_px).max(0.0));
         self.height_px = height_px;
         self.grid
             .set_viewport_px((height_px - self.top_inset() - self.footer_px).max(0.0));
@@ -262,9 +282,10 @@ impl View {
     /// and clamping it to one here would silently invent a selection endpoint the user did not
     /// point at. A drag that leaves the viewport is the input loop's autoscroll, not this.
     pub fn position_at(&self, x: f32, y: f32) -> Option<Position> {
-        // The chrome and the header are not rows: a click in them is nowhere here.
+        // The chrome and the header are not rows, and the gutter is not a column: a click there is
+        // nowhere here.
         let row = self.grid.row_at_y(y - self.top_inset())?;
-        let cell = self.hgrid.column_at_x(x)?;
+        let cell = self.hgrid.column_at_x(x - self.gutter_px)?;
         Some(Position::new(row, cell))
     }
 }
@@ -436,6 +457,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The gutter is not a column: a click in it is nowhere, and a click right of it lands on the
+    /// column the same distance right of the gutter's edge — the rows are drawn from there.
+    #[test]
+    fn the_gutter_is_subtracted_from_a_click_and_from_the_horizontal_viewport() {
+        let mut v = view(3, 10, 800.0, 400.0);
+        v.set_gutter_px(4.0 * CELL_W);
+        assert_eq!(v.hgrid().viewport_px(), 800.0 - 4.0 * CELL_W);
+        assert_eq!(v.position_at(CELL_W, 0.0), None, "in the gutter");
+        assert_eq!(
+            v.position_at(4.0 * CELL_W + CELL_W / 2.0, 0.0),
+            Some(Position::new(0, 0)),
+            "just right of the gutter is the first cell"
+        );
+        v.set_viewport(1000.0, 400.0);
+        assert_eq!(
+            v.hgrid().viewport_px(),
+            1000.0 - 4.0 * CELL_W,
+            "a resize keeps the gutter's share out of the horizontal grid"
+        );
     }
 
     #[test]

@@ -33,8 +33,9 @@ use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::template;
 use tailhawk_core::widget::{Focus, Move, TextField};
 use tailhawk_core::{
-    background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, CONTINUATION_INK,
-    CURRENT_MATCH_BG, CURRENT_MATCH_INK, HEADER_INK, INK, MATCH_BG, RENDER_CAP_CELLS,
+    background_rgb8, Position, Renderer, RowEnd, RowSource, Selection, View, WindowHandle,
+    CONTINUATION_INK, CURRENT_MATCH_BG, CURRENT_MATCH_INK, HEADER_INK, INK, MATCH_BG,
+    RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
@@ -62,7 +63,8 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L,
+    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_HOME, VK_I,
+    VK_L,
     VK_LEFT, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
     VK_W, VK_X, VK_Y, VK_Z,
 };
@@ -159,6 +161,10 @@ struct Document {
     /// `lay_out` has real metrics to scroll with; the view is built with placeholder metrics and
     /// replaced before the first frame draws.
     open_at_tail: bool,
+    /// E20's bookmarks, as **file** rows — a filter that hides a bookmarked row does not lose the
+    /// bookmark, and clearing the filter shows it again. Toggled by `Ctrl+D` on the caret's row (or
+    /// the top row with no caret); `F2` / `Shift+F2` step through them; the gutter marks them.
+    bookmarks: std::collections::BTreeSet<u64>,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -205,6 +211,16 @@ impl RowSource for Document {
             RowEnd::Cell(cell) => cell,
         };
         (span.start_cell < end).then_some(span.start_cell..end)
+    }
+
+    /// §6.4: the number in the gutter is the **physical** line — the file row, not the view row.
+    fn row_number(&self, row: u64) -> Option<u64> {
+        self.filtering.file_row(row).map(|r| r + 1)
+    }
+
+    fn row_mark(&self, row: u64) -> Option<[f32; 4]> {
+        let file_row = self.filtering.file_row(row)?;
+        self.bookmarks.contains(&file_row).then_some(BOOKMARK_MARK)
     }
 
     /// §7.1's colours: the search's matches on top, the semantic catalogue beneath. **Visible rows
@@ -457,6 +473,7 @@ impl Document {
             layout,
             presented: Vec::new(),
             open_at_tail: true,
+            bookmarks: Default::default(),
             pump: None,
             stream_done: false,
         })
@@ -503,6 +520,7 @@ impl Document {
             layout,
             presented: Vec::new(),
             open_at_tail: true,
+            bookmarks: Default::default(),
             pump: Some(pump),
             stream_done: false,
         })
@@ -531,6 +549,11 @@ impl Document {
             .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
             let rows = self.view_rows();
+            // The gutter: room for the widest physical line number, a mark's half-cell before it
+            // and a cell after. Sized from the file rather than the view, so it does not jump
+            // when a filter is applied.
+            let digits = self.set.total_rows().max(1).ilog10() as f32 + 1.0;
+            self.view.set_gutter_px((digits + 2.0) * cell_w);
             self.view.grid_mut().set_total_rows(rows);
             if self.open_at_tail && rows > 0 {
                 self.view.grid_mut().scroll_to_bottom();
@@ -982,6 +1005,66 @@ impl Document {
         self.view
             .grid_mut()
             .scroll_to_row(row.saturating_sub(above));
+    }
+
+    /// The row a row-wise command acts on: the caret's or the selection's focus row when there is
+    /// one, else the top row on screen. In **view** rows.
+    fn current_row(&self) -> Option<u64> {
+        if let Some(selection) = self.selection {
+            return Some(selection.focus().row);
+        }
+        let first = self.view.grid().scroll().row;
+        (first < self.view_rows()).then_some(first)
+    }
+
+    /// `Ctrl+D`: a bookmark on the current row, or off it. Kept as a file row.
+    fn toggle_bookmark(&mut self) -> bool {
+        let Some(file_row) = self.current_row().and_then(|r| self.filtering.file_row(r)) else {
+            return false;
+        };
+        if !self.bookmarks.remove(&file_row) {
+            self.bookmarks.insert(file_row);
+        }
+        true
+    }
+
+    /// `F2` / `Shift+F2`: the next bookmark after the current row, or the previous one before it,
+    /// wrapping at the ends. Puts it on screen and moves the caret to it. Reports whether it moved.
+    ///
+    /// **A hidden bookmark shows as the survivor after it**, so under a filter two bookmarks can
+    /// share one view row; a step skips any that would land where the caret already is, or it
+    /// would stall there.
+    fn bookmark_step(&mut self, forward: bool) -> bool {
+        if self.bookmarks.is_empty() {
+            return false;
+        }
+        let current = self.current_row();
+        let from = current
+            .and_then(|r| self.filtering.file_row(r))
+            .unwrap_or(0);
+        let lands_elsewhere = |&&b: &&u64| Some(self.filtering.view_row(b)) != current;
+        let target = if forward {
+            self.bookmarks
+                .range(from + 1..)
+                .chain(self.bookmarks.iter())
+                .find(lands_elsewhere)
+        } else {
+            self.bookmarks
+                .range(..from)
+                .rev()
+                .chain(self.bookmarks.iter().rev())
+                .find(lands_elsewhere)
+        };
+        let Some(&file_row) = target else {
+            return false;
+        };
+        let view_row = self.filtering.view_row(file_row);
+        self.selection = Some(Selection::at(Position {
+            row: view_row,
+            cell: 0,
+        }));
+        self.show_row(file_row);
+        true
     }
 
     /// Starts, extends or replaces the selection from a click in the client area.
@@ -1749,6 +1832,8 @@ const FIELD_SELECTION_BG: [f32; 4] = [0.20, 0.36, 0.60, 1.0];
 const CARET: [f32; 4] = [0.88, 0.89, 0.91, 1.0];
 const CHIP_INCLUDE_BG: [f32; 4] = [0.14, 0.26, 0.20, 1.0];
 const CHIP_EXCLUDE_BG: [f32; 4] = [0.30, 0.16, 0.16, 1.0];
+/// The gutter mark on a bookmarked row.
+const BOOKMARK_MARK: [f32; 4] = [0.85, 0.65, 0.20, 1.0];
 const TAB_BG: [f32; 4] = [0.13, 0.14, 0.17, 1.0];
 const TAB_ACTIVE_BG: [f32; 4] = [0.20, 0.22, 0.26, 1.0];
 
@@ -2311,6 +2396,15 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
+        if key == VK_D.0 {
+            // E20: a bookmark on the current row, or off it. `UI-DESIGN.md` §12's binding.
+            if doc.toggle_bookmark() {
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            return true;
+        }
         if key == VK_E.0 {
             // §6.4's collapse, as a toggle: only with a format, since only a format knows what a
             // first line is. Provisional binding, like `Ctrl+I`.
@@ -2472,7 +2566,10 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        let moved = if key == VK_F3.0 {
+        let moved = if key == VK_F2.0 {
+            // E20: `F2` / `Shift+F2` step the bookmarks — provisional, like `Ctrl+E`.
+            doc.bookmark_step(!shift)
+        } else if key == VK_F3.0 {
             // A step with no results but a query is the search the user meant — pressing `F3` after
             // `Esc` should look for the thing, not do nothing.
             if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
@@ -3571,7 +3668,6 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tailhawk_core::Position;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
 
     /// Creates a real, unshown window to hang a swapchain on. Unshown is deliberate: the test
@@ -4127,6 +4223,61 @@ mod tests {
     }
 
     /// Adds a chip the way the keys do and waits for the worker, as the timer would.
+    /// E20 on a filtered file: a bookmark is a **file** row, so the gutter numbers stay physical
+    /// under a filter, a bookmark set on a hidden row survives the filter, `F2` steps in file
+    /// order and wraps, and the gutter is sized from the file, not the survivors.
+    #[test]
+    fn bookmarks_are_file_rows_and_the_gutter_numbers_are_physical() {
+        let path = scratch_log("tailhawk_bookmark_test.log", 120);
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.row_number(0), Some(1));
+        assert_eq!(doc.row_number(119), Some(120));
+        assert_eq!(doc.view.gutter_px(), (3.0 + 2.0) * 8.0, "three digits, a mark, a gap");
+
+        // No caret: the top row is current. The file opened at its tail; go to the top first.
+        doc.view.grid_mut().scroll_to_row(0);
+        assert!(doc.toggle_bookmark());
+        assert!(doc.bookmarks.contains(&0));
+        assert!(doc.row_mark(0).is_some());
+        assert!(doc.row_mark(1).is_none());
+        // With a caret: its row.
+        doc.selection = Some(Selection::at(Position::new(75, 0)));
+        assert!(doc.toggle_bookmark());
+        doc.selection = Some(Selection::at(Position::new(30, 0)));
+        assert!(doc.toggle_bookmark());
+        assert_eq!(doc.bookmarks.iter().copied().collect::<Vec<_>>(), [0, 30, 75]);
+
+        // Keep only the rows whose number contains a 7: 7, 17, 27, ..., 70–79, 87, 97, 107, 117.
+        filter_for(&mut doc, "7", Polarity::Include);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(doc.view_rows() < 120);
+        assert_eq!(doc.row_number(0), Some(8), "view row 0 is file line 8");
+        assert!(doc.bookmarks.contains(&30), "hidden, but not lost");
+        assert_eq!(doc.view.gutter_px(), (3.0 + 2.0) * 8.0, "sized from the file");
+
+        // Stepping: from the top (file 7) forward lands on 30's survivor slot... which is hidden,
+        // so `show_row` shows the next survivor; the caret goes to that view row.
+        doc.selection = None;
+        assert!(doc.bookmark_step(true));
+        let caret = doc.selection.expect("the step placed a caret").focus().row;
+        assert_eq!(doc.filtering.file_row(caret), Some(37), "30 is hidden; its slot is 37");
+        assert!(doc.bookmark_step(true));
+        let caret = doc.selection.expect("caret").focus().row;
+        assert_eq!(doc.filtering.file_row(caret), Some(75));
+        assert!(doc.bookmark_step(true), "wraps");
+        let caret = doc.selection.expect("caret").focus().row;
+        assert_eq!(doc.filtering.file_row(caret), Some(7), "0 is hidden; its slot is 7");
+        assert!(doc.bookmark_step(false), "backwards: 0 is before 7, but shows at 7 — skipped");
+        let caret = doc.selection.expect("caret").focus().row;
+        assert_eq!(doc.filtering.file_row(caret), Some(75), "wrapped to the last");
+
+        // Toggling on the caret's row under the filter removes the file-row bookmark.
+        assert!(doc.toggle_bookmark());
+        assert!(!doc.bookmarks.contains(&75));
+        std::fs::remove_file(&path).ok();
+    }
+
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
         doc.add_chip(text, polarity);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4446,7 +4597,7 @@ mod tests {
     }
     /// A headless screenshot: opens `TAILHAWK_SHOT_FILE`, applies `TAILHAWK_SHOT_KEYS` (a `;`-separated
     /// script of `chip:<text>`, `xchip:<text>`, `find:<text>`, `focus:find|chip|grid`, `type:<text>`,
-    /// `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
+    /// `bookmark:<view row>`, `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
     /// harness that has no desktop to capture — the offscreen target is the whole point.
     ///
     /// ```text
@@ -4510,6 +4661,12 @@ mod tests {
                     let names: Vec<String> = arg.split(',').map(str::to_owned).collect();
                     let active = names.len().saturating_sub(1);
                     doc.tab_strip = (names, active);
+                }
+                "bookmark" => {
+                    let row: u64 = arg.parse().expect("a row number");
+                    doc.selection = Some(Selection::at(Position::new(row, 0)));
+                    doc.toggle_bookmark();
+                    doc.selection = None;
                 }
                 "collapse" => {
                     doc.filtering.records_only = true;
