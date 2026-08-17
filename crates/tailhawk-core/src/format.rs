@@ -84,6 +84,9 @@ pub struct Format {
     /// followed by six spaces and the text. Under §6.4 that line is a continuation; a collapsed
     /// view assembles it into the record's message column.
     pub body_next_line: bool,
+    /// Column titles, when they differ from the capture names — W3C's `cs(User-Agent)` cannot be a
+    /// capture name. Parallel to [`columns`](Self::columns); `None` means the names are the titles.
+    pub titles: Option<&'static [&'static str]>,
 }
 
 impl Format {
@@ -285,8 +288,86 @@ macro_rules! fmt {
             columns: $cols,
             samples: $samples,
             body_next_line: false,
+            titles: None,
         }
     };
+}
+
+/// A format for one W3C Extended file, from its `#Fields:` directive — §6.3's short-circuit,
+/// "take columns verbatim". Fields are whitespace-separated; `sc-status` is the level; a `#`
+/// directive line is not a record.
+///
+/// **Leaked, deliberately.** The catalogue is `'static` and everything downstream holds a
+/// `&'static Format`; a W3C format is one per opened file and a few hundred bytes, and a
+/// `Box::leak` is the honest cost of not making every format own its strings for the one that
+/// is not a constant. Recorded in `HANDOFF.md`.
+pub fn w3c(fields: &[String]) -> &'static Format {
+    let names: Vec<String> = fields
+        .iter()
+        .map(|f| {
+            if f == "sc-status" {
+                LEVEL.to_owned()
+            } else {
+                let mut name: String = f
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                if name.starts_with(|c: char| c.is_ascii_digit()) {
+                    name.insert(0, 'f');
+                }
+                name
+            }
+        })
+        .collect();
+    let mut pattern = String::from("^");
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            pattern.push(' ');
+        }
+        // The first field cannot start with `#`: a directive line has enough tokens to match.
+        if i == 0 {
+            pattern.push_str(&format!(r"(?P<{name}>[^#\s]\S*)"));
+        } else if i + 1 == names.len() {
+            pattern.push_str(&format!("(?P<{name}>.*)"));
+        } else {
+            pattern.push_str(&format!(r"(?P<{name}>\S+)"));
+        }
+    }
+    pattern.push('$');
+    let leak = |s: &str| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) };
+    let columns: &'static [&'static str] = Box::leak(
+        names
+            .iter()
+            .map(|n| leak(n))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let titles: &'static [&'static str] = Box::leak(
+        fields
+            .iter()
+            .map(|f| leak(f))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let has_status = names.iter().any(|n| n == LEVEL);
+    Box::leak(Box::new(Format {
+        id: "w3c",
+        name: "W3C Extended",
+        specificity: 1.0,
+        first_line: re(&pattern),
+        stamp: Stamp::None,
+        level: if has_status {
+            Level::HttpStatus
+        } else {
+            Level::None
+        },
+        levels: &[],
+        continuation: Some(re("^#")),
+        columns,
+        samples: &[],
+        body_next_line: false,
+        titles: Some(titles),
+    }))
 }
 
 /// The built-in catalogue, in §6.3's specificity order. Built once.

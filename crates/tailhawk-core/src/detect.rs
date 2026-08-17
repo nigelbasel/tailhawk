@@ -166,8 +166,9 @@ pub fn detect(lines: &[String]) -> Detection {
             })
     });
 
-    let accepted = match self_described {
-        Some(SelfDescribed::W3c { .. }) => None,
+    let accepted = match &self_described {
+        // Self-describing wins over scoring: the file said what its columns are.
+        Some(SelfDescribed::W3c { fields }) => Some(crate::format::w3c(fields)),
         None => match (candidates.first(), candidates.get(1)) {
             (Some(best), _) if best.quality < ACCEPT_SCORE => None,
             (Some(best), Some(second)) if best.score < second.score * ACCEPT_MARGIN => None,
@@ -241,6 +242,7 @@ fn score(format: &'static Format, lines: &[String], total_bytes: usize) -> Optio
 mod tests {
     use super::*;
     use crate::format::by_id;
+    use crate::record::SeverityBand;
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_owned).collect()
@@ -327,7 +329,20 @@ mod tests {
                 .to_vec()
             })
         );
-        assert_eq!(d.accepted, None);
+        let w3c = d.accepted.expect("a format built from the directive");
+        assert_eq!(w3c.id, "w3c");
+        let r = w3c
+            .parse("2026-08-16 09:14:02 10.0.0.1 GET /api/contacts 200")
+            .expect("row");
+        assert_eq!(
+            r.severity_number.map(|s| s.band()),
+            Some(SeverityBand::Info)
+        );
+        assert_eq!(w3c.titles.map(|t| t[2]), Some("s-ip"));
+        assert!(
+            w3c.is_continuation("#Software: x"),
+            "directives are not records"
+        );
         assert_eq!(d.describe().as_deref(), Some("W3C Extended (6 fields)"));
     }
 

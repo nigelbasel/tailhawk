@@ -81,7 +81,10 @@ impl Layout {
         let mut text = String::new();
         let last = self.widths.len().saturating_sub(1);
         for (i, name) in self.format.columns.iter().enumerate() {
-            let name = column_title(name);
+            let name = match self.format.titles {
+                Some(titles) => titles.get(i).copied().unwrap_or(name),
+                None => column_title(name),
+            };
             if i == last {
                 text.push_str(name);
                 break;
