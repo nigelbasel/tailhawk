@@ -35,6 +35,8 @@ using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 
 public static class Shot {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
@@ -70,6 +72,10 @@ public static class Shot {
 }
 '@ -ReferencedAssemblies System.Drawing
 
+# Without this the host is DPI-virtualised on a scaled display: GetClientRect and CopyFromScreen
+# disagree about which pixels are the window's, and the capture lands on the desktop beside it.
+[void][Shot]::SetProcessDPIAware()
+
 function Wait-For([scriptblock]$Condition, [string]$What, [int]$Seconds = 30) {
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
@@ -97,7 +103,10 @@ try {
     Write-Host "opened: $($proc.MainWindowTitle)"
 
     $wsh = New-Object -ComObject WScript.Shell
-    if (-not $wsh.AppActivate($proc.Id)) { throw 'could not bring the window to the foreground' }
+    # AppActivate's return value says the request was made, not that it was honoured; the keys go
+    # to whichever window is foreground when they are sent, so wait for that to be ours.
+    # A bare Alt releases the foreground lock that otherwise keeps a busy user's window on top.
+    Wait-For { $wsh.SendKeys('%'); $wsh.AppActivate($proc.Id) | Out-Null; [Shot]::GetForegroundWindow() -eq $hwnd } 'the window to take the foreground' 10
     Start-Sleep -Milliseconds 400
 
     $wsh.SendKeys('^f')
