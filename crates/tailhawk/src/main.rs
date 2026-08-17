@@ -4130,6 +4130,11 @@ mod tests {
                         f.insert(arg);
                     }
                 }
+                "tabs" => {
+                    let names: Vec<String> = arg.split(',').map(str::to_owned).collect();
+                    let active = names.len().saturating_sub(1);
+                    doc.tab_strip = (names, active);
+                }
                 "collapse" => {
                     doc.filtering.records_only = true;
                     doc.filtering.clear_results();
