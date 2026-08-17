@@ -29,7 +29,8 @@ by name with its key (type to narrow; a typed number is *go to line*, `Ctrl+G`);
 gutter** shows physical line numbers even under a filter; `Ctrl+D` **bookmarks** a row (amber mark
 in the gutter), `F2` / `Shift+F2` step through them; `Ctrl+Shift+1…9` puts a **colour label** on
 every line containing the selected text, `Ctrl+Shift+0` clears them. Bookmarks and labels are
-remembered per file. **`Ctrl+Enter`** opens a **record detail pane** at the bottom (fields, the body
+remembered per file; **your own highlight rules** live in `tailhawk.rules.toml` (palette: *Edit highlight
+rules…*), regex + colours, applied to every file. **`Ctrl+Enter`** opens a **record detail pane** at the bottom (fields, the body
 wrapped, the stack trace under it; JSON pretty-printed on request); **`Alt+←` / `Alt+→`** step back and
 forward through views (filters, collapse, jumps); the palette can **export the visible rows to a
 file** or **tee** them live as the log grows (Hoo WinTail's tee); `Ctrl+Shift+C` copies as TSV.
@@ -46,7 +47,8 @@ runs:** the window's place, and each file's chips and collapse (`tailhawk.settin
 **Missing before daily use is comfortable:** no menus (the palette is the discovery
 surface), no column reorder (drag a header boundary to
 resize or hide; widths are not yet saved per file); no user highlight-rules editor or
-format wizard (colour labels are the stand-in); no installer or signing.
+format wizard UI (`tailhawk.rules.toml` holds user highlight rules — the palette opens it; colour labels
+are the quick form); no installer or signing.
 
 **After that:** RDP-friendly rendering (M7b), the last of M8 (i18n externalisation), docs, installer and
 signing (M9). In plan terms: the rest of M7 (sort, rules editor / format wizard, column reorder), then
@@ -105,12 +107,13 @@ message must be moved to the un-nested one that causes it.**
 | **Column resize / hide** — drag a header boundary (within a cell), zero hides, double-click resets one, palette *Reset column widths* resets all; header follows | `Document::column_boundaries/header_hit/resize_to`, `column_defaults` | headless (`width:0:10;width:1:0`) + test |
 | **Drag-reorder** — tabs and chips move by drag along the bar; middle-click closes a tab | `BarDrag`, `Shell::drop_bar_drag/tab_at`, `WM_MBUTTONDOWN` | not seen (desktop busy) |
 | **V15 UIA chrome provider** — `WM_GETOBJECT` → fragment root; children from `Chrome::hits`: tabs (TabItem/SelectionItem), fields (Edit/Value — SetValue searches / adds a chip), chips (Button/Toggle/Invoke), status (StatusBar/Value), palette query; names, ids (`find`, `chip-0`, `tab-1`, `status`), types, screen bounds, focus | `mod uia` | **`tools/verify-uia.ps1` on the real binary — 11 checks pass, needs no foreground** |
+| **User highlight rules** (V9's rules; the file is the editor) — `tailhawk.rules.toml` in the tiers: `[[rule]]` name/pattern/fg/bg/whole_line/enabled/case; layered catalogue → rules → labels; broken rules named in the status bar; palette *Edit highlight rules…* / *Reload*; **backgrounds now tint under the ink** (`claim_bg`), so labels and tints keep timestamp/level colours | `rules.rs` (4 tests), `rebuild_highlighter_with`, `highlight::claim_bg` | headless (`rules:<file>`) + test |
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Next in M7:** E22 sort; V9 rules editor / wizard; column reorder + saved widths; `WM_POINTER` inertia (a wheel notch is eased now). **The
+**Next in M7:** E22 sort; V9's rules *editor* and format wizard UI (the rules file works); column reorder + saved widths; `WM_POINTER` inertia (a wheel notch is eased now). **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
 Save dialog.
