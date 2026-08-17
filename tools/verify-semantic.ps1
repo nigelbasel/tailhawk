@@ -43,7 +43,7 @@ try {
     # first one. Then a line appended to the log: the title, and the instrument in it, is only
     # re-rendered when something changes, and a follow tick that sees growth is the change a tail
     # is for.
-    1..60 | ForEach-Object { $wsh.SendKeys('{PGDN}'); Start-Sleep -Milliseconds 40 }
+    1..60 | ForEach-Object { $wsh.SendKeys('{PGUP}'); Start-Sleep -Milliseconds 40 }
     # Appended the way a logger appends -- a shared-write handle -- because `Add-Content` asks for
     # exclusive access to the file the window is tailing, which is the one thing a tail forbids.
     $fs = [System.IO.File]::Open($Log, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)

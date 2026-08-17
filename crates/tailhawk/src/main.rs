@@ -111,6 +111,12 @@ struct Document {
     highlighter: Highlighter,
     /// The filter state and the derived row space it makes — §7.3. See [`Filtering`].
     filtering: Filtering,
+    /// The first frame goes to the tail. **A tail tool opens at the end** — `SPEC.md` §6.1: "for a
+    /// tailing tool the tail is what the user cares about" — and `Grid::is_following` is derived from
+    /// being at the bottom, so this is also what makes a freshly opened file follow. Cleared once
+    /// `lay_out` has real metrics to scroll with; the view is built with placeholder metrics and
+    /// replaced before the first frame draws.
+    open_at_tail: bool,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -200,6 +206,7 @@ impl Document {
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
+            open_at_tail: true,
             pump: None,
             stream_done: false,
         })
@@ -234,6 +241,7 @@ impl Document {
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
+            open_at_tail: true,
             pump: Some(pump),
             stream_done: false,
         })
@@ -252,6 +260,10 @@ impl Document {
         {
             let rows = self.view_rows();
             self.view.grid_mut().set_total_rows(rows);
+            if self.open_at_tail && rows > 0 {
+                self.view.grid_mut().scroll_to_bottom();
+                self.open_at_tail = false;
+            }
         }
 
         // Across the whole set, not just the live member: §5.5b's scrollback reaches into files
@@ -2370,6 +2382,10 @@ mod tests {
         // 20 rows of 10 px in a 200 px viewport.
         doc.lay_out((8.0, 10.0), (800, 200));
         assert_eq!(doc.set.total_rows(), 5_000);
+        // A tail tool opens at the tail, following.
+        assert_eq!(doc.view.grid().scroll().row, 4_980);
+        assert!(doc.view.grid().is_following());
+        assert!(doc.navigate(Navigate::DocStart));
         assert_eq!(doc.view.grid().scroll().row, 0);
 
         // **A page is a screenful less one row**, so the line you were reading stays on screen.
