@@ -42,7 +42,12 @@ pub const SPECIFICITY: f32 = 0.92;
 pub enum Language {
     Serilog,
     NLog,
+    /// log4net's `PatternLayout` — and Logback's pattern, which is the same language with `%msg`,
+    /// `%n` and Java's `SSS` for milliseconds.
     Log4net,
+    /// §6.5's pattern DSL: `<ts> [<thread>] <level> <logger> - <message>`, `<_>` discards. Not a
+    /// regex — a token is a word, a timestamp, a level or the rest of the line, and nothing else.
+    Dsl,
 }
 
 /// A template found in a config file, before compilation.
@@ -63,11 +68,13 @@ pub fn compile(
         Language::Serilog => serilog(template)?,
         Language::NLog => nlog(template)?,
         Language::Log4net => log4net(template)?,
+        Language::Dsl => dsl(template)?,
     };
     let what = match language {
         Language::Serilog => "Serilog",
         Language::NLog => "NLog",
         Language::Log4net => "log4net",
+        Language::Dsl => "pattern",
     };
     custom(Custom {
         id: format!("template:{origin}"),
@@ -245,7 +252,7 @@ fn dotnet_date(format: &str) -> String {
             ('M', n) if n >= 4 => Some(r"[A-Z][a-z]+"),
             ('M', 3) => Some(r"[A-Z][a-z]{2}"),
             ('M', _) | ('d', _) | ('H', _) | ('h', _) | ('m', _) | ('s', _) => Some(r"\d{1,2}"),
-            ('f', n) | ('F', n) => {
+            ('f', n) | ('F', n) | ('S', n) => {
                 out.push_str(&format!(r"\d{{{n}}}"));
                 i += run;
                 continue;
@@ -494,6 +501,43 @@ fn log4net(pattern: &str) -> Result<Compiled, String> {
     b.finish(Some(DOTNET_CONTINUATION))
 }
 
+/// §6.5's DSL: `<name>` tokens between literals. `<ts>` is any timestamp the semantic catalogue
+/// would recognise, `<level>` a level word, `<message>` / `<msg>` the rest of the line, `<_>` a
+/// discarded word, anything else a named word.
+fn dsl(pattern: &str) -> Result<Compiled, String> {
+    let mut b = Build::new();
+    let mut rest = pattern;
+    while let Some(open) = rest.find('<') {
+        b.literal(&rest[..open]);
+        let Some(close) = rest[open..].find('>') else {
+            return Err("unclosed < in pattern".into());
+        };
+        let name = rest[open + 1..open + close].trim();
+        rest = &rest[open + close + 1..];
+        match name {
+            "ts" | "timestamp" | "date" | "time" => {
+                b.stamp = Stamp::Iso;
+                b.capture(TS, TIMESTAMP_SHAPE);
+            }
+            "level" | "severity" => {
+                b.level = Level::Word;
+                b.capture(LEVEL, "[A-Za-z]+");
+            }
+            "message" | "msg" | "body" => b.capture(MSG, ".*"),
+            "_" => {
+                b.settle();
+                b.pattern.push_str(r"\S+");
+            }
+            other => b.open_capture(other),
+        }
+    }
+    b.literal(rest);
+    b.finish(Some(DOTNET_CONTINUATION))
+}
+
+/// The timestamps a `<ts>` token accepts — the shapes `semantic.rs` colours, less the slash dates.
+const TIMESTAMP_SHAPE: &str = r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)?|\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?|[A-Z][a-z]{2} [ 0-3]?\d \d{2}:\d{2}:\d{2}";
+
 /// Finds templates in config files beside `log` and up to three directories above it.
 pub fn scan(log: &Path) -> Vec<Found> {
     let mut found = Vec::new();
@@ -690,5 +734,41 @@ mod tests {
     #[test]
     fn a_template_naming_nothing_useful_is_refused() {
         assert!(compile(Language::Serilog, "{Properties}", "x").is_err());
+    }
+    /// §6.5's DSL, and Logback through the log4net compiler.
+    #[test]
+    fn the_pattern_dsl_and_a_logback_pattern_compile() {
+        let f = compile(
+            Language::Dsl,
+            "<ts> [<thread>] <level> <logger> - <message>",
+            "x",
+        )
+        .expect("compile");
+        let r = f
+            .parse("2026-08-16 09:14:03,884 [main] ERROR Api.Dispatch - Failed")
+            .expect("parse");
+        assert!(r.is_error());
+        assert_eq!(r.body, "Failed");
+        assert_eq!(r.attributes[0].0, "thread");
+        let f = compile(Language::Dsl, "<ts> <_> <level>: <message>", "x").expect("compile");
+        let r = f.parse("09:14:03 host01 WARN: slow").expect("parse");
+        assert_eq!(r.body, "slow");
+        assert_eq!(
+            f.columns,
+            ["ts", "level", "msg"],
+            "a discard is not a column"
+        );
+
+        let f = compile(
+            Language::Log4net,
+            "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n",
+            "logback.xml",
+        )
+        .expect("compile");
+        let r = f
+            .parse("09:14:03.884 [main] ERROR c.e.Api.Dispatch - Failed")
+            .expect("parse");
+        assert!(r.is_error());
+        assert_eq!(r.body, "Failed");
     }
 }
