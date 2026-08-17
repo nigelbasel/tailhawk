@@ -1,5 +1,29 @@
 # Handoff — resume here
 
+## 🧭 What the app can do, in plain terms — kept current, read this first
+
+*(2026-08-17.)* **Windows only** — `SPEC.md` §2.1 scopes v1 to Windows 10 1809+ x64; the shell is
+Win32 and the renderer is D3D11 + DirectWrite. **Linux and macOS are not on the plan.** The core is
+portable Rust, but each other platform needs a new shell *and* a new renderer.
+
+**Works today:** open a file from the command line, `Ctrl+O`, or drag-and-drop; opens at the tail and
+follows growth, rotation, truncation and rolled sets as one log; tails a pipe (`… | tailhawk -`); any
+encoding, 10 GB / 100M+ lines at 60 fps; zero-config colouring (timestamps, levels, numbers, IPs,
+URLs, paths, durations, ids); `Ctrl+F` regex search with `F3`/`Shift+F3`, streaming on huge files;
+`Ctrl+L` / `Ctrl+Shift+L` include/exclude filters hiding non-matching rows, kept current as the file
+grows; select and copy; ANSI escapes stripped; `Ctrl+I` reveals invisibles.
+
+**Missing before daily use is comfortable:** UI chrome — the query and chips are typed into the window
+and shown in the title, so no find bar, no chip row (toggle/edit/reorder a filter), no tabs, no split
+view, no menus; no settings or persistence; no user highlight-rules editor; **no columns / format
+detection** (a Serilog or IIS line is coloured, not parsed — field filters like `level >= Warning`
+evaluate to *unknown*); no installer or signing.
+
+**After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
+the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
+
+---
+
 ## ✅ A first run is coloured — E23, and the on-screen check that was owed — 2026-08-17, session 18
 
 **Two things closed, both observed on the shipped binary rather than inferred.** Session 17's one

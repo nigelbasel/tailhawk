@@ -42,15 +42,19 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_BACK, VK_C, VK_CONTROL,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L, VK_LEFT, VK_NEXT, VK_O, VK_PRIOR,
     VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetScrollInfo,
     KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos,
@@ -59,9 +63,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
     SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER,
     SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_CHAR,
-    WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER,
+    WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -1379,6 +1383,10 @@ impl Shell {
     /// frame and replaces the atlas then, which keeps the scale-change and device-loss paths as one
     /// mechanism rather than two. All this does is record the scale and ask for that frame.
     fn set_dpi(&mut self, hwnd: HWND, dpi: u32) {
+        // The `SetWindowPos` that precedes this sends a `WM_SIZE` **nested** inside the
+        // `WM_DPICHANGED` handler, and `wndproc` drops nested messages (see its note). So the
+        // swap chain is resized here, from the client size the window now has.
+        self.resize(hwnd);
         let changed = self
             .renderer
             .as_mut()
@@ -1574,11 +1582,19 @@ impl Shell {
         true
     }
 
-    /// View toggles. `Ctrl+I` is §13.4's **reveal invisibles** — a key of our choosing, because
-    /// `UI-DESIGN.md` §12 gives the toggle no binding and the command palette that would carry it
-    /// is M7. Recorded as provisional in `CLEANROOM.md`.
+    /// View toggles and the open command.
+    ///
+    /// `Ctrl+O` is §12's open file — brought forward from M7's shell because a file that can only
+    /// be opened from a command line is not a tool the owner can reach for. `Ctrl+I` is §13.4's
+    /// **reveal invisibles** — a key of our choosing, because §12 gives the toggle no binding and
+    /// the command palette that would carry it is M7. Recorded as provisional in `CLEANROOM.md`.
     fn view_key(&mut self, hwnd: HWND, key: u16, ctrl: bool) -> bool {
-        if !(ctrl && key == VK_I.0) {
+        if !ctrl {
+            return false;
+        }
+        // `Ctrl+O` is not here: the dialog pumps messages and `wndproc` would re-enter `STATE`
+        // while this borrow is held. It is dispatched before the borrow, in `wndproc`.
+        if key != VK_I.0 {
             return false;
         }
         let Some(doc) = self.document.as_mut() else {
@@ -1591,6 +1607,33 @@ impl Shell {
             let _ = InvalidateRect(hwnd, None, false);
         }
         true
+    }
+
+    /// Opens `path` in this window, replacing what is shown. The read runs on a worker as it does
+    /// at start-up, and the title says "opening" until it lands — a large file takes seconds to
+    /// index and a window that went blank without a word would look hung.
+    fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
+        self.document = None;
+        self.file = Some(format!("opening {}…", path.display()));
+        self.reading = Some(spawn_open(move || Document::open(&path)));
+        self.refresh_title(hwnd);
+        unsafe {
+            SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
+    /// A file dropped on the window: the first of them is opened. §12's drop target — brought
+    /// forward with `Ctrl+O`, for the same reason.
+    fn dropped(&mut self, hwnd: HWND, drop: HDROP) {
+        let mut buf = [0u16; 32_768];
+        let len = unsafe { DragQueryFileW(drop, 0, Some(&mut buf)) } as usize;
+        unsafe { DragFinish(drop) };
+        if len == 0 {
+            return;
+        }
+        let path = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len]));
+        self.open_path(hwnd, path);
     }
 
     /// One keystroke, offered to the filter state before the find state and the navigation map.
@@ -1746,14 +1789,72 @@ fn set_title(hwnd: HWND, title: &str) {
     }
 }
 
+/// The system open dialog. Modal on the window thread, which is what it is; the follow tick and
+/// the paint keep running underneath it because it pumps our messages too.
+fn ask_for_file(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut file = [0u16; 32_768];
+    let filter: Vec<u16> = "Log files (*.log;*.txt)\0*.log;*.txt\0All files (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(file.as_mut_ptr()),
+        nMaxFile: file.len() as u32,
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY,
+        ..Default::default()
+    };
+    if !unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+        return None;
+    }
+    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &file[..len],
+    )))
+}
+
 fn stop_polling(hwnd: HWND) {
     unsafe {
         let _ = KillTimer(hwnd, DEVICE_POLL_TIMER);
     }
 }
 
+thread_local! {
+    /// Whether `wndproc` is already on the stack. See [`wndproc`].
+    static IN_WNDPROC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The window procedure, guarded against **re-entry**.
+///
+/// Every handler below borrows `STATE` mutably for its duration. Windows re-enters this function
+/// synchronously whenever a handler makes a call that pumps or sends messages — a modal dialog
+/// (`GetOpenFileNameW`), `SetWindowTextW`, `SetWindowPos`, `SetScrollInfo` — and a re-entered
+/// handler that borrows again is a `RefCell` panic and an aborted process. **That happened**, on
+/// the first wiring of `Ctrl+O`, and only a run of the binary found it. So the rule is enforced
+/// here rather than remembered per handler: a message that arrives while one is being handled goes
+/// straight to `DefWindowProcW`. Nothing this window handles needs to be handled *nested* — a
+/// nested `WM_PAINT` under a dialog is the class brush for a moment, a nested `WM_TIMER` is the
+/// next tick's — and anything that did would today be the crash this prevents.
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if IN_WNDPROC.with(|flag| flag.replace(true)) {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    let result = handle(hwnd, msg, wparam, lparam);
+    IN_WNDPROC.with(|flag| flag.set(false));
+    result
+}
+
+fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_DROPFILES => {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.dropped(hwnd, HDROP(wparam.0 as *mut core::ffi::c_void));
+                }
+            });
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == DEVICE_POLL_TIMER => {
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
@@ -1891,6 +1992,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             const HOME: u16 = VK_HOME.0;
             const END: u16 = VK_END.0;
             const C: u16 = VK_C.0;
+
+            // **`Ctrl+O` before anything borrows `STATE`.** `GetOpenFileNameW` is modal and pumps
+            // this window's messages, so `wndproc` re-enters while it is up; a borrow held across
+            // it is a `RefCell` panic and an aborted process — which is exactly what the first
+            // wiring did.
+            if ctrl && wparam.0 as u16 == VK_O.0 {
+                if let Some(path) = ask_for_file(hwnd) {
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            shell.open_path(hwnd, path);
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
 
             // **The find state is offered the key first**, because `Esc`, `Enter` and `Backspace`
             // mean something to it and nothing to the navigation map — and because `F3` must not
@@ -2240,6 +2356,8 @@ fn main() -> Result<()> {
         )?
     };
     unsafe {
+        // §12's drop target: a file dropped on the window opens in it.
+        DragAcceptFiles(hwnd, true);
         SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
     }

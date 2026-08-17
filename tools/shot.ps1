@@ -22,7 +22,10 @@ try {
     Start-Sleep -Milliseconds $SettleMs
     $proc.Refresh()
     Write-Host "title: $($proc.MainWindowTitle)"
-    $bmp = [Shot]::Client($proc.MainWindowHandle)
+    # A modal dialog (Ctrl+O) becomes the process's main window and reports no handle for a moment;
+    # the foreground window is then the thing worth looking at.
+    $target = if ($proc.MainWindowHandle -ne 0) { $proc.MainWindowHandle } else { [Shot]::GetForegroundWindow() }
+    $bmp = [Shot]::Client($target)
     $bmp.Save($Shot, [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
     Write-Host "screenshot: $Shot"
