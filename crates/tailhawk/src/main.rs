@@ -91,7 +91,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, GCLP_HBRBACKGROUND, SWP_NOACTIVATE, SWP_NOZORDER, WM_APP, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_SYSKEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL,
     WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
@@ -2502,6 +2503,13 @@ impl Command {
     }
 }
 
+/// What is being dragged along the bar to reorder it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BarDrag {
+    Tab,
+    Chip,
+}
+
 /// What a click on the bar landed on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Hit {
@@ -2929,6 +2937,8 @@ struct Shell {
     pending_save: Option<bool>,
     /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
     wheel_remaining: f32,
+    /// A tab or a chip being dragged to a new place — `UI-DESIGN.md` §2.1 / §5 — from its index.
+    dragging_bar: Option<(BarDrag, usize)>,
     /// How long recent frames took. See [`Frames`].
     frames: Frames,
 }
@@ -3622,6 +3632,72 @@ impl Shell {
         self.retitle(hwnd);
     }
 
+    /// The tab under `(x, y)`, if the point is in the strip — `UI-DESIGN.md` §2.1's middle-click.
+    fn tab_at(&self, x: f32, y: f32) -> Option<usize> {
+        let doc = self.document.as_ref()?;
+        if doc.tab_strip.0.len() < 2 || y >= Chrome::strip_height(self.cell_h.max(1.0)) {
+            return None;
+        }
+        doc.chrome
+            .hits
+            .borrow()
+            .iter()
+            .find_map(|(range, hit)| match hit {
+                Hit::Tab(i) if range.contains(&x) => Some(*i),
+                _ => None,
+            })
+    }
+
+    /// Ends a bar drag at `x`: the tab or chip is moved to the slot under the pointer, if it is
+    /// over another of its kind. Reports whether the order changed.
+    fn drop_bar_drag(&mut self, x: f32) -> bool {
+        let Some((kind, from)) = self.dragging_bar.take() else {
+            return false;
+        };
+        let Some(doc) = self.document.as_ref() else {
+            return false;
+        };
+        let target = doc
+            .chrome
+            .hits
+            .borrow()
+            .iter()
+            .find_map(|(range, hit)| match (kind, hit) {
+                (BarDrag::Tab, Hit::Tab(i)) if range.contains(&x) => Some(*i),
+                (BarDrag::Chip, Hit::Chip(i) | Hit::ChipClose(i)) if range.contains(&x) => Some(*i),
+                _ => None,
+            });
+        let Some(to) = target else {
+            return false;
+        };
+        if to == from {
+            return false;
+        }
+        match kind {
+            BarDrag::Tab => {
+                if from < self.document.tabs.len() && to < self.document.tabs.len() {
+                    let tab = self.document.tabs.remove(from);
+                    self.document.tabs.insert(to, tab);
+                    self.document.active = to;
+                    return true;
+                }
+            }
+            BarDrag::Chip => {
+                if let Some(doc) = self.document.as_mut() {
+                    let chips = &mut doc.filtering.chips.chips;
+                    if from < chips.len() && to < chips.len() {
+                        let mut chip = chips.remove(from);
+                        // The press that began the drag toggled it; a drag is a move, not a toggle.
+                        chip.enabled = !chip.enabled;
+                        chips.insert(to, chip);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Which pane a client `y` falls in, and that pane's top — for routing a click. `None` with no
     /// document.
     fn pane_at(&self, y: f32) -> Option<(usize, f32)> {
@@ -4070,6 +4146,8 @@ impl Shell {
         let (find_origin, chip_origin) = doc.chrome.origins.get();
         let cell_w = self.cell_w.max(1.0);
         if let Some(Hit::Tab(i)) = hit {
+            self.dragging_bar = Some((BarDrag::Tab, i));
+            unsafe { SetCapture(hwnd) };
             self.document.active = i.min(self.document.len().saturating_sub(1));
             self.retitle(hwnd);
             self.sync_scrollbar(hwnd);
@@ -4088,6 +4166,8 @@ impl Shell {
             }
             Some(Hit::Chip(i)) => {
                 if i < doc.filtering.chips.chips.len() {
+                    self.dragging_bar = Some((BarDrag::Chip, i));
+                    unsafe { SetCapture(hwnd) };
                     doc.remember();
                     let chip = &mut doc.filtering.chips.chips[i];
                     chip.enabled = !chip.enabled;
@@ -4959,6 +5039,20 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
+        // §2.1: middle-click closes the tab under the pointer.
+        WM_MBUTTONDOWN => {
+            let x = (lparam.0 & 0xFFFF) as i16 as f32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    if let Some(i) = shell.tab_at(x, y) {
+                        shell.document.active = i;
+                        shell.run(hwnd, Command::CloseTab);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MOUSEMOVE | WM_LBUTTONUP => {
             // Client-relative already, and **signed**: a drag above the window gives a negative y,
             // which `position_at` rejects rather than clamping to row 0.
@@ -4983,6 +5077,21 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     .document
                     .as_ref()
                     .map_or(0.0, |d| d.pane_top);
+                // A tab or a chip being dragged along the bar lands where the button goes up.
+                if shell.dragging_bar.is_some() {
+                    if msg == WM_LBUTTONUP {
+                        unsafe {
+                            let _ = ReleaseCapture();
+                        }
+                        if shell.drop_bar_drag(x) {
+                            shell.retitle(hwnd);
+                        }
+                        unsafe {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    return;
+                }
                 // The command bar first: a click in it is a field taking focus or a chip going,
                 // never a selection.
                 if msg == WM_LBUTTONDOWN && shell.chrome_click(hwnd, x, y, shift) {
@@ -5392,6 +5501,7 @@ fn main() -> Result<()> {
             pending_open: false,
             pending_save: None,
             wheel_remaining: 0.0,
+            dragging_bar: None,
             frames: Frames::new(),
             last_double: None,
             file: None,
