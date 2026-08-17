@@ -121,6 +121,12 @@ pub trait RowSource {
     fn header(&self) -> Option<&str> {
         None
     }
+
+    /// Draws the source's command bar into `View::chrome_px`'s band, with the painter's
+    /// [`fill`](crate::paint::Painter::fill) and [`lay_out_at`](crate::paint::Painter::lay_out_at).
+    /// Called once per frame before the rows, only when the band has height. Default: nothing.
+    #[cfg(windows)]
+    fn draw_chrome(&self, _painter: &mut crate::paint::Painter, _view: &crate::view::View) {}
 }
 
 impl RowSource for Rows {

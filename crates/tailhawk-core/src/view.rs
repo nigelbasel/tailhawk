@@ -78,8 +78,11 @@ pub struct View {
     cells: CellModel,
     /// A band at the top of the viewport that is not rows — the column header, when a format has
     /// columns. The grid never sees it: it gets the height below the band, every placed row is
-    /// drawn `header_px` lower, and a hit-test subtracts it first. Zero for a plain file.
+    /// drawn lower by the whole inset, and a hit-test subtracts it first. Zero for a plain file.
     header_px: f32,
+    /// The command bar's band, above the header — V14's chrome: the find field, the chip row.
+    /// Same rule as the header; the two add up to [`View::top_inset`].
+    chrome_px: f32,
     /// The whole viewport height, so a header change can re-derive the grid's share.
     height_px: f32,
 }
@@ -94,6 +97,7 @@ impl View {
             hgrid: HGrid::new(cell_width),
             cells: CellModel::new(),
             header_px: 0.0,
+            chrome_px: 0.0,
             height_px: 0.0,
         }
     }
@@ -102,13 +106,30 @@ impl View {
     pub fn set_header_px(&mut self, header_px: f32) {
         self.header_px = header_px.max(0.0);
         self.grid
-            .set_viewport_px((self.height_px - self.header_px).max(0.0));
+            .set_viewport_px((self.height_px - self.top_inset()).max(0.0));
     }
 
-    /// Where the rows start. A painter adds this to every [`PlacedRow`](crate::grid::PlacedRow)'s
-    /// `y`; the header itself is drawn in `0..header_px`.
+    /// The command bar's height, above the header. See [`View::chrome_px`].
+    pub fn set_chrome_px(&mut self, chrome_px: f32) {
+        self.chrome_px = chrome_px.max(0.0);
+        self.grid
+            .set_viewport_px((self.height_px - self.top_inset()).max(0.0));
+    }
+
+    /// The column header's height. It is drawn in `chrome_px..chrome_px + header_px`.
     pub fn header_px(&self) -> f32 {
         self.header_px
+    }
+
+    /// The command bar's height. It is drawn in `0..chrome_px`.
+    pub fn chrome_px(&self) -> f32 {
+        self.chrome_px
+    }
+
+    /// Where the rows start: the chrome and the header together. A painter adds this to every
+    /// [`PlacedRow`](crate::grid::PlacedRow)'s `y`.
+    pub fn top_inset(&self) -> f32 {
+        self.chrome_px + self.header_px
     }
 
     pub fn grid(&self) -> &Grid {
@@ -140,7 +161,7 @@ impl View {
         self.hgrid.set_viewport_px(width_px);
         self.height_px = height_px;
         self.grid
-            .set_viewport_px((height_px - self.header_px).max(0.0));
+            .set_viewport_px((height_px - self.top_inset()).max(0.0));
     }
 
     /// A DPI or font-size change, both axes at once.
@@ -222,8 +243,8 @@ impl View {
     /// and clamping it to one here would silently invent a selection endpoint the user did not
     /// point at. A drag that leaves the viewport is the input loop's autoscroll, not this.
     pub fn position_at(&self, x: f32, y: f32) -> Option<Position> {
-        // The header is not a row: a click in it is nowhere.
-        let row = self.grid.row_at_y(y - self.header_px)?;
+        // The chrome and the header are not rows: a click in them is nowhere here.
+        let row = self.grid.row_at_y(y - self.top_inset())?;
         let cell = self.hgrid.column_at_x(x)?;
         Some(Position::new(row, cell))
     }

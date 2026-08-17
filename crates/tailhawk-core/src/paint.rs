@@ -202,20 +202,29 @@ impl Painter {
     /// reach the screen.
     pub fn lay_out(&mut self, view: &View, tint: [f32; 4], source: &dyn RowSource) -> Result<Laid> {
         let mut total = Laid::default();
+        let inset = view.top_inset();
         let header_px = view.header_px();
         let rows: Vec<(u64, f32)> = view
             .grid()
             .visible()
-            .map(|p| (p.row, p.y + header_px))
+            .map(|p| (p.row, p.y + inset))
             .collect();
         // Taken out and put back so the row loop can hold it mutably while `self` is borrowed for
         // the layout. One `Vec` for the frame is the point; taking it does not allocate.
         let mut spans = std::mem::take(&mut self.spans);
+        // The command bar, if the source draws one — V14. First, so its fills sit under its text
+        // and nothing else sits under them.
+        if view.chrome_px() > 0.0 {
+            self.spans = spans;
+            source.draw_chrome(self, view);
+            spans = std::mem::take(&mut self.spans);
+        }
         // The header band, when there is one: a filled strip and the column names in it. Laid out
         // like a row, in the same cells, so it lines up with what is under it.
         if let Some(header) = source.header().filter(|_| header_px > 0.0) {
+            let chrome = view.chrome_px();
             self.instances.push(Instance {
-                pos: [0.0, 0.0],
+                pos: [0.0, chrome],
                 size: [view.hgrid().viewport_px(), header_px],
                 tint: HEADER_BG,
                 mode: MODE_SOLID,
@@ -228,7 +237,7 @@ impl Painter {
                 header,
                 ColumnAnchors::none_ref(),
                 Colours::plain(HEADER_INK),
-                0.0,
+                chrome,
             ) {
                 Ok(laid) => total.merge(laid),
                 Err(_) => total.failed_rows += 1,
@@ -430,6 +439,51 @@ impl Painter {
                 // at its own column — see the module note on why the cell grid wins.
                 pen = (pen + shaped.advances[i]).min(last_x);
             }
+        }
+        Ok(laid)
+    }
+
+    /// A filled rectangle in `tint`, in viewport pixels — the chrome's backgrounds, a caret, a
+    /// mark under a composition.
+    pub fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, tint: [f32; 4]) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        self.instances.push(Instance {
+            pos: [x, y],
+            size: [w, h],
+            tint,
+            mode: MODE_SOLID,
+            ..Instance::default()
+        });
+    }
+
+    /// One line of text at an arbitrary origin, in the row grid's cells — chrome text: a field's
+    /// contents, a chip, a label. Laid out exactly as a row is (same shaper, same cell model, same
+    /// spans and selection) against a private unscrolled view, then moved to `x`. Returns what a
+    /// row would; the caller's `Colours` decide the ink, and a span with a background is how a
+    /// field draws its selection.
+    pub fn lay_out_at(
+        &mut self,
+        view: &View,
+        x: f32,
+        y: f32,
+        text: &str,
+        colours: Colours<'_>,
+    ) -> Result<Laid> {
+        let mut own = View::new(self.cell_width(), self.row_height());
+        *own.cells_mut() = *view.cells();
+        let cells = view.cells().cell_count(text) as u64 + 1;
+        own.hgrid_mut().set_columns(cells);
+        own.set_viewport(
+            cells as f32 * self.cell_width() + 1.0,
+            self.row_height() * 2.0,
+        );
+        own.grid_mut().set_total_rows(1);
+        let from = self.instances.len();
+        let laid = self.lay_out_row(&own, text, ColumnAnchors::none_ref(), colours, y)?;
+        for instance in &mut self.instances[from..] {
+            instance.pos[0] += x;
         }
         Ok(laid)
     }

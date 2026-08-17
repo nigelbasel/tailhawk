@@ -17,20 +17,23 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use tailhawk_core::cell::CellModel;
 use tailhawk_core::columns::{Layout, Presentation};
 use tailhawk_core::detect::{self, Detection};
 use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::highlight::{Highlighter, Span};
+use tailhawk_core::paint::{Colours, Painter};
 use tailhawk_core::search::{Match, SearchOptions};
 use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
 use tailhawk_core::sieve;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::template;
+use tailhawk_core::widget::{Focus, Move, TextField};
 use tailhawk_core::{
     background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, CONTINUATION_INK,
-    CURRENT_MATCH_BG, CURRENT_MATCH_INK, MATCH_BG, RENDER_CAP_CELLS,
+    CURRENT_MATCH_BG, CURRENT_MATCH_INK, HEADER_INK, INK, MATCH_BG, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
@@ -38,7 +41,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -53,9 +56,10 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_BACK, VK_C, VK_CONTROL,
-    VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L, VK_LEFT, VK_NEXT, VK_O,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L,
+    VK_LEFT, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP, VK_V, VK_X,
+    VK_Y, VK_Z,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -118,6 +122,8 @@ struct Document {
     highlighter: Highlighter,
     /// The filter state and the derived row space it makes — §7.3. See [`Filtering`].
     filtering: Filtering,
+    /// The command bar: the find field, the chip row, the focus. See [`Chrome`].
+    chrome: Chrome,
     /// What §6.3's detector made of the newest member's head — the format, if one was accepted,
     /// the candidates if not. Run on the worker that opens the file, from the head sample only;
     /// §6.3's mid and tail samples are not taken yet.
@@ -196,6 +202,119 @@ impl RowSource for Document {
         self.header_text()
     }
 
+    /// The command bar: `⌕ [find] ▼ [+chip] [−chip] [add filter…]     · format`.
+    ///
+    /// Everything is placed in cells so it lines up with the rows. Fields are filled rectangles
+    /// with their text over them; the focused one carries a caret and, while an IME composes, a
+    /// mark under the composition. Chips are their text on a chip fill; a click on one removes it
+    /// (`UI-DESIGN.md` §5's toggle and reorder are not here yet, and this is the honest first
+    /// affordance). What was drawn where is remembered for the click.
+    fn draw_chrome(&self, painter: &mut Painter, view: &View) {
+        let cell_w = painter.cell_width();
+        let row_h = painter.row_height();
+        let band = view.chrome_px();
+        let text_y = ((band - row_h) / 2.0).floor();
+        let width = view.hgrid().viewport_px();
+        let cells = view.cells();
+        let mut hits = self.chrome.hits.borrow_mut();
+        hits.clear();
+
+        painter.fill(0.0, 0.0, width, band, CHROME_BG);
+        let mut x = cell_w * 0.5;
+
+        // ⌕ and the find field.
+        let _ = painter.lay_out_at(view, x, text_y, "⌕", Colours::plain(HEADER_INK));
+        x += cell_w * 2.0;
+        let find_w = FIND_CELLS as f32 * cell_w;
+        let find_focused = self.chrome.focus == Focus::Find;
+        painter.fill(
+            x - 2.0,
+            text_y - 2.0,
+            find_w + 4.0,
+            row_h + 4.0,
+            if find_focused {
+                FIELD_BG_FOCUSED
+            } else {
+                FIELD_BG
+            },
+        );
+        hits.push((x..x + find_w, Hit::Find));
+        let find_origin = x;
+        draw_field(
+            painter,
+            view,
+            cells,
+            &self.chrome.find,
+            find_focused,
+            x,
+            text_y,
+            FIND_CELLS,
+            "search (Ctrl+F)",
+        );
+        x += find_w + cell_w * 2.0;
+
+        // ▼ and the chips.
+        let _ = painter.lay_out_at(view, x, text_y, "▼", Colours::plain(HEADER_INK));
+        x += cell_w * 2.0;
+        for (i, chip) in self.filtering.chips.chips.iter().enumerate() {
+            let sign = match chip.polarity {
+                Polarity::Include => "+",
+                Polarity::Exclude => "−",
+            };
+            let label = format!("{sign}{}", chip.source);
+            let w = cells.cell_count(&label) as f32 * cell_w;
+            let bg = match chip.polarity {
+                Polarity::Include => CHIP_INCLUDE_BG,
+                Polarity::Exclude => CHIP_EXCLUDE_BG,
+            };
+            painter.fill(x - 2.0, text_y - 2.0, w + 4.0, row_h + 4.0, bg);
+            let _ = painter.lay_out_at(view, x, text_y, &label, Colours::plain(INK));
+            hits.push((x..x + w, Hit::Chip(i)));
+            x += w + cell_w * 1.5;
+        }
+        // The new-chip field.
+        let chip_w = CHIP_CELLS as f32 * cell_w;
+        let chip_focused = self.chrome.focus == Focus::NewChip;
+        painter.fill(
+            x - 2.0,
+            text_y - 2.0,
+            chip_w + 4.0,
+            row_h + 4.0,
+            if chip_focused {
+                FIELD_BG_FOCUSED
+            } else {
+                FIELD_BG
+            },
+        );
+        hits.push((x..x + chip_w, Hit::NewChip));
+        let chip_origin = x;
+        let hint = match self.chrome.chip_polarity {
+            Polarity::Include => "+ filter (Ctrl+L)",
+            Polarity::Exclude => "− exclude (Ctrl+Shift+L)",
+        };
+        draw_field(
+            painter,
+            view,
+            cells,
+            &self.chrome.chip,
+            chip_focused,
+            x,
+            text_y,
+            CHIP_CELLS,
+            hint,
+        );
+        self.chrome.origins.set((find_origin, chip_origin));
+
+        // The format, at the right edge — §6.5's chip, as text for now.
+        if let Some(text) = self.detection.describe() {
+            let w = cells.cell_count(&text) as f32 * cell_w;
+            let fx = width - w - cell_w;
+            if fx > x + chip_w + cell_w {
+                let _ = painter.lay_out_at(view, fx, text_y, &text, Colours::plain(HEADER_INK));
+            }
+        }
+    }
+
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
         // Matches are file rows — the search snapshots the file, not the view.
         let Some(file_row) = self.filtering.file_row(row) else {
@@ -264,6 +383,7 @@ impl Document {
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
+            chrome: Chrome::default(),
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -304,6 +424,7 @@ impl Document {
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
+            chrome: Chrome::default(),
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -324,8 +445,9 @@ impl Document {
         let (cell_w, row_h) = cell;
         self.view.set_metrics(cell_w, row_h);
         self.view.set_viewport(size.0 as f32, size.1 as f32);
-        // One row of header when there are columns; none otherwise. Set after the viewport, which
-        // is what the header is subtracted from.
+        // The command bar always; one row of header when there are columns. Set after the viewport,
+        // which is what both are subtracted from.
+        self.view.set_chrome_px(Chrome::height(row_h));
         self.view
             .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
@@ -584,17 +706,13 @@ impl Document {
         }
     }
 
-    /// Adds the chip being typed and starts the pass over. A chip that does not parse is held in
-    /// the title, as a bad pattern is; the chips already there stand.
-    fn add_chip(&mut self) {
-        let Some((polarity, text)) = self.filtering.typing.take() else {
-            return;
-        };
-        self.filtering.pending_high = None;
+    /// Adds a chip and starts the pass over. A chip that does not parse is held in the title, as a
+    /// bad pattern is; the chips already there stand.
+    fn add_chip(&mut self, text: &str, polarity: Polarity) {
         if text.trim().is_empty() {
             return;
         }
-        match Chip::parse(&text, polarity) {
+        match Chip::parse(text, polarity) {
             Ok(chip) => {
                 self.filtering.error = None;
                 self.filtering.chips.chips.push(chip);
@@ -893,13 +1011,9 @@ enum Navigate {
 /// toggle.
 #[derive(Default)]
 struct Finder {
-    /// What the user has typed. Kept across searches, so `Ctrl+F` `Enter` repeats the last one.
+    /// The query the current results are for — what the find field held when `Enter` was pressed.
+    /// The field itself lives in [`Chrome`]; this is what the title and the pass use.
     query: String,
-    /// Whether keystrokes are going into the query.
-    typing: bool,
-    /// A high surrogate waiting for its low half. `WM_CHAR` delivers a non-BMP character as two
-    /// messages, and appending each on its own puts two replacement characters in the query.
-    pending_high: Option<u16>,
     /// **Sorted by `(line, start)` at all times**, which is a property maintained on insertion
     /// rather than restored by sorting — see [`Finder::absorb`].
     matches: Vec<Match>,
@@ -930,16 +1044,6 @@ impl Finder {
         self.outcome = None;
         self.error = None;
         self.jumped = false;
-    }
-
-    /// Takes one `WM_CHAR` code unit into the query. Returns whether it was wanted.
-    ///
-    /// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
-    /// and pushing each on its own puts two replacement characters into the query — a search for an
-    /// emoji that cannot match one, failing as "not found" rather than as anything a user could act
-    /// on. Logs carry emoji: every one of this project's own commit messages could.
-    fn push_unit(&mut self, unit: u16) -> bool {
-        push_typed_unit(&mut self.query, &mut self.pending_high, unit)
     }
 
     /// Adds one chunk's matches, keeping the list sorted **without sorting it**.
@@ -1073,9 +1177,6 @@ impl Finder {
         if let Some(error) = &self.error {
             return Some(format!("⌕ {} — {error}", self.query));
         }
-        if self.typing {
-            return Some(format!("⌕ {}▏", self.query));
-        }
         if self.query.is_empty() {
             return None;
         }
@@ -1182,9 +1283,6 @@ struct Filtering {
     /// §6.4's collapse: only first lines are rows, continuations hidden. A row space like the
     /// chips', sieved by the same pass, so the two compose. Meaningless without a format.
     records_only: bool,
-    /// A chip being typed, and its polarity, or `None` when keystrokes are not going here.
-    typing: Option<(Polarity, String)>,
-    pending_high: Option<u16>,
     /// The file rows that survive, ascending — the view's row space while `chips` is non-empty.
     kept: Vec<u64>,
     running: Option<sieve::Running>,
@@ -1252,13 +1350,6 @@ impl Filtering {
             };
             text.push_str(&format!(" {sign}{}", chip.source));
         }
-        if let Some((polarity, typed)) = &self.typing {
-            let sign = match polarity {
-                Polarity::Include => '+',
-                Polarity::Exclude => '−',
-            };
-            text.push_str(&format!(" {sign}{typed}▏"));
-        }
         if text.is_empty() {
             return None;
         }
@@ -1281,6 +1372,156 @@ impl Filtering {
     }
 }
 
+/// The command bar — V14 on V8's surface: the find field, the chip row and the new-chip field,
+/// drawn by the painter in the band the view reserves above the header. `UI-DESIGN.md` §2.1.
+///
+/// The fields are [`TextField`]s; the keyboard goes to whichever [`Focus`] names, and to the grid
+/// otherwise. What the bar shows is laid out in **cells** of the row grid — same shaper, same
+/// cell model — so its text lines up with the columns beneath and a click resolves to a cell.
+struct Chrome {
+    find: TextField,
+    chip: TextField,
+    /// The polarity the next chip will have — `Ctrl+L` include, `Ctrl+Shift+L` exclude.
+    chip_polarity: Polarity,
+    focus: Focus,
+    /// A high surrogate waiting for its low half, for `WM_CHAR` into whichever field has focus.
+    pending_high: Option<u16>,
+    /// What was drawn where, in viewport x pixels, so a click can be resolved. Filled by
+    /// `draw_chrome` each frame; a `RefCell` because drawing takes `&self`.
+    hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, Hit)>>,
+    /// The x each field's text starts at, for placing a caret from a click.
+    origins: std::cell::Cell<(f32, f32)>,
+}
+
+/// What a click on the bar landed on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Hit {
+    Find,
+    NewChip,
+    Chip(usize),
+}
+
+/// The bar's geometry, in cells. The find field is wide enough for a real query; the new-chip
+/// field for a chip. Both scroll nothing — a query longer than the field is a rare event and the
+/// caret stays visible because the text is cut from the *left* when it overflows.
+const FIND_CELLS: usize = 36;
+const CHIP_CELLS: usize = 24;
+
+impl Default for Chrome {
+    fn default() -> Self {
+        Self {
+            find: TextField::default(),
+            chip: TextField::default(),
+            chip_polarity: Polarity::Include,
+            focus: Focus::Grid,
+            pending_high: None,
+            hits: std::cell::RefCell::new(Vec::new()),
+            origins: std::cell::Cell::new((0.0, 0.0)),
+        }
+    }
+}
+
+impl Chrome {
+    /// The field that has the keyboard, if one does.
+    fn focused(&mut self) -> Option<&mut TextField> {
+        match self.focus {
+            Focus::Find => Some(&mut self.find),
+            Focus::NewChip => Some(&mut self.chip),
+            Focus::Grid => None,
+        }
+    }
+
+    /// The bar's height for a row height: the row plus a little air, so the fields read as
+    /// fields and not as a first row.
+    fn height(row_h: f32) -> f32 {
+        (row_h + 8.0).round()
+    }
+
+    /// The text of a field as it fits its width: cut from the left so the caret end is always on
+    /// screen. Returns the text to draw and the byte offset the cut removed.
+    fn fitted<'a>(cells: &CellModel, text: &'a str, width: usize) -> (&'a str, usize) {
+        tailhawk_core::widget::fit_from_left(cells, text, width)
+    }
+}
+
+/// The bar's colours. Provisional with the rest of the palette; a shade off the ground so the bar
+/// reads as chrome, the focused field a shade lighter than the other.
+const CHROME_BG: [f32; 4] = [0.10, 0.11, 0.13, 1.0];
+const FIELD_BG: [f32; 4] = [0.14, 0.15, 0.18, 1.0];
+const FIELD_BG_FOCUSED: [f32; 4] = [0.18, 0.20, 0.24, 1.0];
+const FIELD_HINT: [f32; 4] = [0.42, 0.45, 0.50, 1.0];
+const FIELD_SELECTION_BG: [f32; 4] = [0.20, 0.36, 0.60, 1.0];
+const CARET: [f32; 4] = [0.88, 0.89, 0.91, 1.0];
+const CHIP_INCLUDE_BG: [f32; 4] = [0.14, 0.26, 0.20, 1.0];
+const CHIP_EXCLUDE_BG: [f32; 4] = [0.30, 0.16, 0.16, 1.0];
+
+/// One field: its text (cut from the left to fit), a hint when empty and unfocused, the selection
+/// as a background span, the caret as a two-pixel fill, and a mark under an IME composition.
+#[allow(clippy::too_many_arguments)]
+fn draw_field(
+    painter: &mut Painter,
+    view: &View,
+    cells: &CellModel,
+    field: &TextField,
+    focused: bool,
+    x: f32,
+    y: f32,
+    width_cells: usize,
+    hint: &str,
+) {
+    let cell_w = painter.cell_width();
+    let row_h = painter.row_height();
+    let display = field.display();
+    if display.is_empty() && !focused {
+        let _ = painter.lay_out_at(view, x, y, hint, Colours::plain(FIELD_HINT));
+        return;
+    }
+    let (shown, cut) = Chrome::fitted(cells, &display, width_cells);
+    // The selection, as a span with a background — the painter's own way of filling behind text.
+    let mut spans = Vec::new();
+    if let Some(sel) = field.selection() {
+        let start = sel.start.saturating_sub(cut);
+        let end = sel.end.saturating_sub(cut);
+        if start < end && end <= shown.len() {
+            spans.push(Span {
+                start,
+                end,
+                fg: None,
+                bg: Some(FIELD_SELECTION_BG),
+            });
+        }
+    }
+    let _ = painter.lay_out_at(
+        view,
+        x,
+        y,
+        shown,
+        Colours {
+            tint: INK,
+            selected: None,
+            spans: &spans,
+        },
+    );
+    if !focused {
+        return;
+    }
+    // The composition's mark: a thin line under it.
+    if let Some(comp) = field.display_composition() {
+        let from = cells.cell_at_byte(shown, comp.start.saturating_sub(cut).min(shown.len()));
+        let to = cells.cell_at_byte(shown, comp.end.saturating_sub(cut).min(shown.len()));
+        painter.fill(
+            x + from as f32 * cell_w,
+            y + row_h - 2.0,
+            (to.saturating_sub(from)) as f32 * cell_w,
+            1.0,
+            CARET,
+        );
+    }
+    let caret_byte = field.display_caret().saturating_sub(cut).min(shown.len());
+    let caret_cell = cells.cell_at_byte(shown, caret_byte);
+    painter.fill(x + caret_cell as f32 * cell_w, y, 2.0, row_h, CARET);
+}
+
 /// What a mouse event means for the selection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Selecting {
@@ -1295,6 +1536,8 @@ enum Selecting {
 }
 
 struct Shell {
+    /// The measured cell width, for the command bar's hit-test. Zero until the first frame.
+    cell_w: f32,
     /// `None` until the worker hands the device over. While it is `None` the class background
     /// brush is doing the painting — stage one of the two-stage paint.
     renderer: Option<Renderer>,
@@ -1507,6 +1750,7 @@ impl Shell {
                 // frames is exactly the case a cached cell would get wrong.
                 Some(doc) => {
                     let cell = renderer.cell()?;
+                    self.cell_w = cell.0;
                     doc.lay_out(cell, (w, h));
                     // The highlighter's frame budget starts here, alongside the painter's own
                     // `begin_frame` inside `paint_rows` — one frame, one budget, §11.3.
@@ -1597,34 +1841,7 @@ impl Shell {
         let Some(text) = self.document.as_ref().and_then(Document::copy_text) else {
             return false;
         };
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let bytes = std::mem::size_of_val(wide.as_slice());
-
-        unsafe {
-            if OpenClipboard(None).is_err() {
-                return false;
-            }
-            let _ = EmptyClipboard();
-            let Ok(handle) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
-                let _ = CloseClipboard();
-                return false;
-            };
-            let dst = GlobalLock(handle);
-            if dst.is_null() {
-                let _ = GlobalFree(handle);
-                let _ = CloseClipboard();
-                return false;
-            }
-            std::ptr::copy_nonoverlapping(wide.as_ptr(), dst.cast::<u16>(), wide.len());
-            let _ = GlobalUnlock(handle);
-
-            let ok = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(handle.0)).is_ok();
-            if !ok {
-                let _ = GlobalFree(handle);
-            }
-            let _ = CloseClipboard();
-            ok
-        }
+        set_clipboard(&text)
     }
 
     /// Points the scrollbar at where the view actually is.
@@ -1683,75 +1900,6 @@ impl Shell {
             self.file = Some(doc.describe());
         }
         self.refresh_title(hwnd);
-    }
-
-    /// One keystroke, offered to the find state before the navigation map sees it.
-    ///
-    /// Returns whether it was consumed. **Typing does not swallow navigation**: only the characters
-    /// go to the query, so a user can page around while a query is half-typed, which is what a real
-    /// find bar — a focused field beside the grid — would also allow.
-    fn find_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
-        const F: u16 = VK_F.0;
-        const F3: u16 = VK_F3.0;
-        const RETURN: u16 = VK_RETURN.0;
-        const ESCAPE: u16 = VK_ESCAPE.0;
-        const BACK: u16 = VK_BACK.0;
-
-        let Some(doc) = self.document.as_mut() else {
-            return false;
-        };
-        let typing = doc.finder.typing;
-        let moved = match (key, ctrl, typing) {
-            // §12: `Ctrl+F` is search. The previous query is kept and left selected-in-spirit —
-            // there is no selection to show, so it is kept editable rather than cleared, which is
-            // what makes `Ctrl+F` `Enter` repeat the last search.
-            (F, true, _) => {
-                doc.finder.typing = true;
-                doc.finder.error = None;
-                doc.filtering.typing = None;
-                false
-            }
-            (RETURN, _, true) => {
-                doc.finder.typing = false;
-                doc.find();
-                false
-            }
-            (BACK, _, true) => {
-                doc.finder.query.pop();
-                doc.finder.pending_high = None;
-                false
-            }
-            // **`Esc` unwinds one step at a time**: it leaves the query first and only then throws
-            // the results away. One key that did both would make a mistyped character cost the
-            // search that was still running.
-            (ESCAPE, _, true) => {
-                doc.finder.typing = false;
-                false
-            }
-            (ESCAPE, _, false) => {
-                doc.finder.clear();
-                false
-            }
-            // §12: `F3` / `Shift+F3` step. A step with no results but a query is the search the
-            // user meant — pressing `F3` after `Esc` should look for the thing, not do nothing.
-            (F3, _, _) => {
-                if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
-                    doc.find();
-                    false
-                } else {
-                    doc.find_step(!shift)
-                }
-            }
-            _ => return false,
-        };
-        if moved {
-            self.sync_scrollbar(hwnd);
-        }
-        self.retitle(hwnd);
-        unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        true
     }
 
     /// View toggles and the open command.
@@ -1828,55 +1976,94 @@ impl Shell {
         self.open_path(hwnd, path);
     }
 
-    /// One keystroke, offered to the filter state before the find state and the navigation map.
+    /// One keystroke, offered to the command bar before anything else.
     ///
-    /// `UI-DESIGN.md` §12: `Ctrl+L` focuses the filter. Here it starts an *include* chip and
-    /// `Ctrl+Shift+L` an *exclude*, because §7.2's chips carry their polarity and there is no chip
-    /// row to pick it from until M7. `Enter` adds the chip and starts the pass; `Esc` while typing
-    /// abandons the chip, and `Esc` otherwise — when nothing else claims it — clears every chip.
-    /// The find state gets `Esc` first when it has something to unwind, so the two typed fields
-    /// unwind in the order they were opened.
-    fn filter_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
-        const L: u16 = VK_L.0;
-        const RETURN: u16 = VK_RETURN.0;
-        const ESCAPE: u16 = VK_ESCAPE.0;
-        const BACK: u16 = VK_BACK.0;
-
+    /// `Ctrl+F` focuses the find field with its text selected, `Ctrl+L` / `Ctrl+Shift+L` the new-chip
+    /// field for an include / an exclude — `UI-DESIGN.md` §12. While a field has focus the editing
+    /// keys are its: caret moves (`Ctrl` by word, `Shift` extends), `Home`/`End`, `Backspace`,
+    /// `Delete`, `Ctrl+A/Z/Y/X/C/V`, `Enter` to act, `Esc` to hand the keyboard back to the grid.
+    /// **Everything else falls through** — `PageDown` still pages the grid with a query half-typed,
+    /// which is what a field beside a grid should allow — and `F3` steps whether or not the field
+    /// has focus.
+    fn chrome_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        let typing = doc.filtering.typing.is_some();
-        match (key, ctrl, typing) {
-            (L, true, _) => {
-                let polarity = if shift {
-                    Polarity::Exclude
-                } else {
-                    Polarity::Include
-                };
-                doc.filtering.typing = Some((polarity, String::new()));
-                doc.filtering.error = None;
-                doc.finder.typing = false;
-            }
-            (RETURN, _, true) => doc.add_chip(),
-            (BACK, _, true) => {
-                if let Some((_, text)) = doc.filtering.typing.as_mut() {
-                    text.pop();
+        let handled = if ctrl && key == VK_F.0 {
+            doc.chrome.focus = Focus::Find;
+            doc.chrome.find.select_all();
+            doc.finder.error = None;
+            true
+        } else if ctrl && key == VK_L.0 {
+            doc.chrome.focus = Focus::NewChip;
+            doc.chrome.chip_polarity = if shift {
+                Polarity::Exclude
+            } else {
+                Polarity::Include
+            };
+            doc.filtering.error = None;
+            true
+        } else {
+            match doc.chrome.focus {
+                Focus::Grid => false,
+                focus => {
+                    let Some(field) = doc.chrome.focused() else {
+                        return false;
+                    };
+                    match key {
+                        k if k == VK_LEFT.0 => {
+                            field.move_caret(if ctrl { Move::WordLeft } else { Move::Left }, shift)
+                        }
+                        k if k == VK_RIGHT.0 => field
+                            .move_caret(if ctrl { Move::WordRight } else { Move::Right }, shift),
+                        k if k == VK_HOME.0 => field.move_caret(Move::Home, shift),
+                        k if k == VK_END.0 => field.move_caret(Move::End, shift),
+                        k if k == VK_BACK.0 => field.backspace(),
+                        k if k == VK_DELETE.0 => field.delete(),
+                        k if ctrl && k == VK_A.0 => field.select_all(),
+                        k if ctrl && k == VK_Z.0 => {
+                            field.undo();
+                        }
+                        k if ctrl && k == VK_Y.0 => {
+                            field.redo();
+                        }
+                        k if ctrl && k == VK_X.0 => {
+                            if let Some(cut) = field.cut() {
+                                set_clipboard(&cut);
+                            }
+                        }
+                        k if ctrl && k == VK_C.0 => {
+                            if let Some(sel) = field.selected_text() {
+                                set_clipboard(sel);
+                            }
+                        }
+                        k if ctrl && k == VK_V.0 => {
+                            if let Some(text) = clipboard_text() {
+                                field.paste(&text);
+                            }
+                        }
+                        k if k == VK_ESCAPE.0 => doc.chrome.focus = Focus::Grid,
+                        k if k == VK_RETURN.0 => match focus {
+                            Focus::Find => {
+                                doc.finder.query = doc.chrome.find.text().to_owned();
+                                doc.find();
+                            }
+                            Focus::NewChip => {
+                                let text = doc.chrome.chip.text().to_owned();
+                                let polarity = doc.chrome.chip_polarity;
+                                doc.add_chip(&text, polarity);
+                                doc.chrome.chip.set_text("");
+                            }
+                            Focus::Grid => {}
+                        },
+                        _ => return false,
+                    }
+                    true
                 }
-                doc.filtering.pending_high = None;
             }
-            (ESCAPE, _, true) => {
-                doc.filtering.typing = None;
-                doc.filtering.pending_high = None;
-            }
-            (ESCAPE, _, false)
-                if doc.filtering.active()
-                    && !doc.finder.typing
-                    && doc.finder.matches.is_empty()
-                    && doc.finder.running.is_none() =>
-            {
-                doc.clear_filter();
-            }
-            _ => return false,
+        };
+        if !handled {
+            return false;
         }
         self.sync_scrollbar(hwnd);
         self.retitle(hwnd);
@@ -1886,23 +2073,130 @@ impl Shell {
         true
     }
 
-    /// One typed character, when the find or the filter state is taking them.
-    ///
-    /// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
-    /// and pushing each on its own puts two replacement characters into the query — a search for an
-    /// emoji that silently cannot match one.
+    /// The keys that act on results rather than fields, in whichever focus: `F3` / `Shift+F3` step
+    /// the search; `Esc` with the grid focused unwinds — the finder's results first, then the chips.
+    fn find_key(&mut self, hwnd: HWND, key: u16, _ctrl: bool, shift: bool) -> bool {
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        let moved = if key == VK_F3.0 {
+            // A step with no results but a query is the search the user meant — pressing `F3` after
+            // `Esc` should look for the thing, not do nothing.
+            if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
+                doc.finder.query = doc.chrome.find.text().to_owned();
+                doc.find();
+                false
+            } else {
+                doc.find_step(!shift)
+            }
+        } else if key == VK_ESCAPE.0 && doc.chrome.focus == Focus::Grid {
+            if !doc.finder.matches.is_empty() || doc.finder.running.is_some() {
+                doc.finder.clear();
+            } else if doc.filtering.active() {
+                doc.clear_filter();
+            } else {
+                return false;
+            }
+            false
+        } else {
+            return false;
+        };
+        if moved {
+            self.sync_scrollbar(hwnd);
+        }
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        true
+    }
+
+    /// One typed character, into whichever field has focus. **Surrogate pairs are joined here**:
+    /// `WM_CHAR` delivers a non-BMP character as two messages, and inserting each on its own puts
+    /// two replacement characters into the field.
     fn find_char(&mut self, hwnd: HWND, unit: u16) -> bool {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        let wanted = match doc.filtering.typing.as_mut() {
-            Some((_, text)) => push_typed_unit(text, &mut doc.filtering.pending_high, unit),
-            None => doc.finder.typing && doc.finder.push_unit(unit),
-        };
-        if !wanted {
+        if doc.chrome.focus == Focus::Grid {
             return false;
         }
+        let mut text = String::new();
+        if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
+            return false;
+        }
+        if let Some(field) = doc.chrome.focused() {
+            field.insert(&text);
+        }
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        true
+    }
+
+    /// A click in the command bar: a field takes focus and the caret lands where the click was; a
+    /// chip is removed. Returns whether the click was the bar's.
+    fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, extend: bool) -> bool {
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        if y >= doc.view.chrome_px() {
+            if doc.chrome.focus != Focus::Grid {
+                doc.chrome.focus = Focus::Grid;
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            return false;
+        }
+        let hit = doc
+            .chrome
+            .hits
+            .borrow()
+            .iter()
+            .find(|(range, _)| range.contains(&x))
+            .map(|(_, hit)| *hit);
+        let (find_origin, chip_origin) = doc.chrome.origins.get();
+        let cell_w = self.cell_w.max(1.0);
+        match hit {
+            Some(Hit::Chip(i)) => {
+                if i < doc.filtering.chips.chips.len() {
+                    doc.filtering.chips.chips.remove(i);
+                    doc.filtering.clear_results();
+                    doc.refilter();
+                    {
+                        let rows = doc.view_rows();
+                        doc.view.grid_mut().set_total_rows(rows);
+                    }
+                }
+            }
+            Some(hit @ (Hit::Find | Hit::NewChip)) => {
+                let (origin, focus) = match hit {
+                    Hit::Find => (find_origin, Focus::Find),
+                    _ => (chip_origin, Focus::NewChip),
+                };
+                doc.chrome.focus = focus;
+                let width = if hit == Hit::Find {
+                    FIND_CELLS
+                } else {
+                    CHIP_CELLS
+                };
+                let cells = *doc.view.cells();
+                if let Some(field) = doc.chrome.focused() {
+                    let display = field.display();
+                    let (shown, cut) = Chrome::fitted(&cells, &display, width);
+                    let cell = ((x - origin) / cell_w).max(0.0).round() as usize;
+                    let byte = cells.byte_at_cell(shown, cell) + cut;
+                    field.place(byte, extend);
+                }
+            }
+            None => doc.chrome.focus = Focus::Grid,
+        }
+        self.sync_scrollbar(hwnd);
         self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
         true
     }
 
@@ -2004,6 +2298,67 @@ fn ask_for_file(hwnd: HWND) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(String::from_utf16_lossy(
         &file[..len],
     )))
+}
+
+/// Puts `text` on the clipboard as `CF_UNICODETEXT`.
+///
+/// `GlobalFree` is on the failure path only — freeing after a successful hand-over is a double
+/// free of memory the system now owns. `CloseClipboard` runs on every path, including the ones
+/// that fail, because leaving it open locks every other application out of the clipboard.
+fn set_clipboard(text: &str) -> bool {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = std::mem::size_of_val(wide.as_slice());
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return false;
+        }
+        let _ = EmptyClipboard();
+        let Ok(handle) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+            let _ = CloseClipboard();
+            return false;
+        };
+        let dst = GlobalLock(handle);
+        if dst.is_null() {
+            let _ = GlobalFree(handle);
+            let _ = CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst.cast::<u16>(), wide.len());
+        let _ = GlobalUnlock(handle);
+
+        let ok = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(handle.0)).is_ok();
+        if !ok {
+            let _ = GlobalFree(handle);
+        }
+        let _ = CloseClipboard();
+        ok
+    }
+}
+
+/// The clipboard's text, if it holds any — for a field's paste. Line breaks are folded to spaces:
+/// a one-line field has nowhere to put them.
+fn clipboard_text() -> Option<String> {
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let text = GetClipboardData(CF_UNICODETEXT.0 as u32)
+            .ok()
+            .and_then(|handle| {
+                let global = windows::Win32::Foundation::HGLOBAL(handle.0);
+                let ptr = GlobalLock(global).cast::<u16>();
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                let _ = GlobalUnlock(global);
+                Some(text)
+            });
+        let _ = CloseClipboard();
+        text.map(|t| t.replace(['\r', '\n'], " "))
+    }
 }
 
 fn stop_polling(hwnd: HWND) {
@@ -2207,7 +2562,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
                     shell.view_key(hwnd, wparam.0 as u16, ctrl)
-                        || shell.filter_key(hwnd, wparam.0 as u16, ctrl, shift)
+                        || shell.chrome_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.find_key(hwnd, wparam.0 as u16, ctrl, shift)
                 })
             });
@@ -2283,6 +2638,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return;
                 };
+                // The command bar first: a click in it is a field taking focus or a chip going,
+                // never a selection.
+                if msg == WM_LBUTTONDOWN && shell.chrome_click(hwnd, x, y, shift) {
+                    return;
+                }
                 let moved = match msg {
                     WM_LBUTTONDOWN => {
                         // **Capture, so a drag that leaves the window still ends.** Without it the
@@ -2517,6 +2877,7 @@ fn main() -> Result<()> {
 
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
+            cell_w: 0.0,
             renderer: None,
             pending: Some(rx),
             driver: None,
@@ -2689,8 +3050,8 @@ mod tests {
     fn navigating_moves_by_the_amounts_the_key_map_promises() {
         let path = scratch_log("tailhawk_nav_test.log", 5_000);
         let mut doc = Document::open(&path).expect("open the fixture");
-        // 20 rows of 10 px in a 200 px viewport.
-        doc.lay_out((8.0, 10.0), (800, 200));
+        // 20 rows of 10 px in a 200 px grid — plus the command bar's band above it.
+        doc.lay_out((8.0, 10.0), (800, 200 + Chrome::height(10.0) as u32));
         assert_eq!(doc.set.total_rows(), 5_000);
         // A tail tool opens at the tail, following.
         assert_eq!(doc.view.grid().scroll().row, 4_980);
@@ -2927,22 +3288,23 @@ mod tests {
     /// the thing that is in the file — as "no matches", which is indistinguishable from the truth.
     #[test]
     fn a_surrogate_pair_becomes_one_character_in_the_query() {
-        let mut finder = Finder::default();
+        let mut query = String::new();
+        let mut pending = None;
         for unit in "ok 🦅".encode_utf16() {
-            assert!(finder.push_unit(unit));
+            assert!(push_typed_unit(&mut query, &mut pending, unit));
         }
-        assert_eq!(finder.query, "ok 🦅");
+        assert_eq!(query, "ok 🦅");
 
         // Control codes are keys, not text: `Ctrl+F` arrives here as 0x06 and `Enter` as 0x0D.
-        assert!(!finder.push_unit(0x06));
-        assert!(!finder.push_unit(0x0D));
-        assert_eq!(finder.query, "ok 🦅");
+        assert!(!push_typed_unit(&mut query, &mut pending, 0x06));
+        assert!(!push_typed_unit(&mut query, &mut pending, 0x0D));
+        assert_eq!(query, "ok 🦅");
 
         // A lone high surrogate is not silently dropped — a character that vanishes as it is typed
         // looks like a keyboard fault.
-        assert!(finder.push_unit(0xD83E));
-        assert!(finder.push_unit(u16::from(b'x')));
-        assert_eq!(finder.query, "ok 🦅\u{FFFD}x");
+        assert!(push_typed_unit(&mut query, &mut pending, 0xD83E));
+        assert!(push_typed_unit(&mut query, &mut pending, u16::from(b'x')));
+        assert_eq!(query, "ok 🦅\u{FFFD}x");
     }
 
     /// Everything §7.4 obliges a search to disclose has to be *sayable*, and the title is the only
@@ -3116,8 +3478,7 @@ mod tests {
 
     /// Adds a chip the way the keys do and waits for the worker, as the timer would.
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
-        doc.filtering.typing = Some((polarity, text.to_owned()));
-        doc.add_chip();
+        doc.add_chip(text, polarity);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
             doc.poll_filter();

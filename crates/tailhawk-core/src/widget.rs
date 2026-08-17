@@ -404,6 +404,26 @@ impl TextField {
     }
 }
 
+/// The tail of `text` that fits in `width` cells, on a cluster boundary, and how many bytes were cut
+/// from the front. A one-line field cuts from the left so its caret end stays on screen.
+pub fn fit_from_left<'a>(
+    cells: &crate::cell::CellModel,
+    text: &'a str,
+    width: usize,
+) -> (&'a str, usize) {
+    if cells.cell_count(text) <= width {
+        return (text, 0);
+    }
+    let mut start = text.len();
+    for (i, _) in text.grapheme_indices(true) {
+        if cells.cell_count(&text[i..]) <= width {
+            start = i;
+            break;
+        }
+    }
+    (&text[start..], start)
+}
+
 /// Which surface has the keyboard. The grid is the default; a field takes it while it is edited.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Focus {

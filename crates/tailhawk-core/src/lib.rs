@@ -437,7 +437,7 @@ impl Renderer {
                 context,
                 (
                     view.hgrid().viewport_px().max(1.0) as u32,
-                    (view.grid().viewport_px() + view.header_px()).max(1.0) as u32,
+                    (view.grid().viewport_px() + view.top_inset()).max(1.0) as u32,
                 ),
             )
         })?;
