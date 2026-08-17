@@ -39,8 +39,8 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-13 | ² | ² | 12 | Follow, rotation by identity, scrollbar, selection wiring, activity log |
 | 2026-08-14 | ² | ² | 19 | M4 finished (follow tick, E30, E16, off-thread scan); M5 E26, E15, E13, MODE_SOLID |
 | 2026-08-16 | 1.2⁴ | 287 k⁴ | 6 | Search wired to the UI: the span pass, `find.rs`, the keys, the 10 GB worker criterion |
-| 2026-08-17 | 3.9⁴ | 715 k⁴ | 30 | The find harness run at last; E23; E14 in full; E24; open-at-tail, Ctrl+O + drop, the wndproc guard; M5 scored; M6 begun — catalogue, detection, field chips, columns, dimmed + collapsible continuations |
-| **Total** | **~41.0** | **~8.1 M** | **163**³ | **M0–M5, plus the first half of M6** |
+| 2026-08-17 | 4.8⁴ | 847 k⁴ | 45 | The find harness run at last; E23; E14; E24; open-at-tail, Ctrl+O + drop, the wndproc guard; M5 scored; **M6 delivered less V9** — catalogue, detection, field chips, columns + header, continuations dimmed/collapsed/assembled, W3C, templates from config, the DSL |
+| **Total** | **~41.9** | **~8.2 M** | **178**³ | **M0–M6 (V9 outstanding)** |
 
 ⁴ **Measured while the session was still running**, so it is a floor rather than a total — 710 turns
 between 14:31 and 15:49, by the method above. Recorded now rather than at the end because the last
@@ -324,14 +324,64 @@ catalogue, a worker pass, a painter that takes spans. Lower than it could be for
 
 Score this when M6 lands.
 
+### Scored: M6 — forecast 13.8 h / 2.1 M, actual **~1.8 h / ~0.3 M**, V9 outstanding — 2026-08-17
+
+Same session as the forecast, a few hours later. **E9, E10, E11, E12, E25 and V5 landed and every
+line of the done-criterion is met** — Serilog, log4net (the owner's real file), NLog and IIS W3C
+columnise on open, MEL Simple two-line records assemble under collapse, the cross-matching build
+test passes. **V9** (rules editor + format wizard) is not started: it is a form, and forms are V14.
+
+**7.7× high, and the reason is not the same as M4's and M5's.** Those two over-forecast because
+verification cost what engineering did not. This one over-forecast because **the analogues were
+already the work**: E9's scoring is a fold over `Format::validity`; E10 is a table; E11's three
+compilers share one builder; E25 and V5 are `kept`'s row space and `Highlighter::beneath` again;
+the header is a `View` inset. Every M6 item was "the shape from M5, with different work in the
+middle", and a shape that exists costs a fraction of a shape being found. **Halve again for a
+milestone whose shapes exist; keep the verification tax; expect the *first* item of a milestone
+that needs a new shape (V14 in M7) to cost what the whole of M6 did.**
+
+Two things worth the record: **§6.3 contradicted itself** (specificity inside a score that had to
+reach 0.75 — six formats could never be accepted) and was amended when the detector was built; and
+the owner's own log detects as a log4net layout no built-in knew until it was added — the catalogue
+is authorship and the corpus decides what to author.
+
+## 📌 M7 — forecast registered 2026-08-17, **before starting**
+
+Same units, same rule. **This is the milestone the shortcut runs out on**: every field, chip, tab
+and dialog so far has been typed into the window and echoed in the title, and V14 — a text-input
+layer with caret, selection, clipboard, undo and IME — is a shape this codebase does not have.
+Everything after it is that shape reused.
+
+| Item | Analogue used | Active h | Output tok |
+|---|---|---:|---:|
+| **V14** widget & text-input layer — a focus model, a text field (caret, selection, clipboard, undo, IME composition), buttons/chips/labels, tooltips, context menus, hit-testing, drawn by the same painter | none that fits: `selection.rs` for the caret model, `paint.rs` for drawing; IME is Win32 (`WM_IME_*`) — **the new shape** | 4.0 | 600 k |
+| **V8** command bar: the find field, the chip row (add/edit/toggle/reorder/remove), the format chip with its dropdown, the palette (`Ctrl+K`), dialogs | V14 reused; every action already exists behind a key | 2.0 | 300 k |
+| **V7** window chrome: tab strip (several documents), drag-reorder, drag-out-to-split, Mica where available | `Shell` holds one `Document`; a `Vec` and an active index; the split is a second `View` over a second `Document` | 2.5 | 400 k |
+| **V10** record detail pane, long-line handling, JSON pretty-print | a second painter viewport; `record.rs` | 1.0 | 150 k |
+| **V12** `WM_POINTER` smooth/inertial scroll | `grid.rs`'s `(u64, f32)` scroll is built for sub-row deltas | 0.8 | 120 k |
+| **V13** theming: dark/light, High Contrast suppression | every colour is a `lib.rs` const today; a `Theme` struct and two tables | 0.8 | 120 k |
+| **V15** minimal UIA provider for the chrome | Win32 `IRawElementProviderSimple`; the harnesses become tests | 1.5 | 250 k |
+| **E19** file sets + watched folders, **E20** bookmarks, **E21** export/copy + tee, **E22** sort/top-N, **E27** view-state history | `set.rs`, `sieve.rs`, `find.rs` shapes | 2.5 | 400 k |
+| **V9** (from M6) rules editor + format wizard, on V14 | `highlight.rs`, `template.rs` exist; the wizard is a form | 1.2 | 200 k |
+| Verification — a harness per surface, on the shipped binary; the frame instrument with chrome on | ~20 % | 3.5 | 500 k |
+| **Total** | | **19.8** | **3.0 M** |
+
+**Confidence: low**, for a reason the two scorings above make specific: this is the first milestone
+since M3 whose first item is a **new shape**, and the record says new shapes cost what whole
+milestones of reused ones do. V14 is where the estimate is most likely to be *under*, not over.
+The rest is the reuse pattern and is more likely over than under.
+
+Score this when M7 lands — and score V14 on its own when it does, since it decides the rest.
+
 ## Forecast, on this evidence
 
 | Milestone | Plan | Naive extrapolation | Confidence |
 |---|---:|---:|---|
 | ~~M4 follow, rotation, stdin~~ | 5 wk | forecast 13.5 h, **actual 9.9 h**; **all five criteria**, the last closed by M5's first item | **Delivered** 2026-08-14 |
 | ~~M5 search, highlight, filter~~ | 10 wk | forecast 21.5 h, **actual ~5.9 h**; 9 of 10 items, V5 moved to M6 with its producer | **Delivered** 2026-08-17 |
-| M6 structure | 10.5 wk | **forecast 13.8 h / 2.1 M** (registered above) | **Low-medium** — records-vs-lines is the structural risk |
-| M7–M9 shell, ship | 30.5 wk | — | **Very low.** Packaging, signing, accessibility and support have no agent-time analogue in what has been measured |
+| ~~M6 structure~~ | 10.5 wk | forecast 13.8 h, **actual ~1.8 h**; every done-criterion line met, V9 to M7 with V14 | **Delivered** 2026-08-17 |
+| M7 shell | 16 wk | **forecast 19.8 h / 3.0 M** (registered above) | **Low** — V14 is a new shape |
+| M7b–M9 RDP, CLI, ship | 14.5 wk | — | **Very low.** Packaging, signing, accessibility and support have no agent-time analogue in what has been measured |
 
 The extrapolation is linear in the plan's own weeks, which assumes the remaining work resembles the
 work done. **M6–M9 does not** — it is packaging, docs, installers and a long support tail, where

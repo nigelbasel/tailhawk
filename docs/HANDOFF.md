@@ -13,23 +13,24 @@ URLs, paths, durations, ids); `Ctrl+F` regex search with `F3`/`Shift+F3`, stream
 `Ctrl+L` / `Ctrl+Shift+L` include/exclude filters hiding non-matching rows, kept current as the file
 grows; select and copy; ANSI escapes stripped; `Ctrl+I` reveals invisibles.
 
-**Also today (M6, in progress):** the format is **detected on open** and named in the title (Serilog,
-log4net, NLog, MEL, syslog, CLF, Python, JSON lines, logfmt, timestamped text; W3C recognised); a
-detected file is shown in **aligned columns**; stack traces sit indented and dimmed under their
-record and `Ctrl+E` **collapses** them; field filters (`level >= Warning`) work through the format.
+**Structure (M6, done today):** the format is **detected on open** and named in the title (Serilog,
+log4net, NLog, MEL, syslog, CLF, Python, JSON lines, logfmt, timestamped text, and IIS W3C from its
+own `#Fields:`); a detected file is shown in **aligned columns under a header**; stack traces sit
+indented and dimmed under their record and `Ctrl+E` **collapses** them (MEL two-line records
+assemble); field filters (`level >= Warning`) work through the format; a Serilog/NLog/log4net
+template in the app's own config beside the log is compiled and used.
 
 **Missing before daily use is comfortable:** UI chrome — the query and chips are typed into the window
 and shown in the title, so no find bar, no chip row (toggle/edit/reorder a filter), no tabs, no split
 view, no menus, **no column header** and no column resize/reorder/hide; no settings or persistence; no
-user highlight-rules editor; no format from a Serilog/NLog config template yet; no installer or
-signing.
+user highlight-rules editor or format wizard; no installer or signing.
 
 **After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
 the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
 
 ---
 
-## 🚧 M6 in progress — detection, columns, continuations — 2026-08-17, session 18 (continued)
+## ✅ M6 delivered (V9 to M7) — detection, columns, continuations, templates — 2026-08-17, session 18
 
 Same session, after the owner said not to stop between items. **M5 scored and closed** (`EFFORT.md`:
 forecast 21.5 h, actual ~5.9 h; the same shape as M4 — the risk list named what looked hard, the
@@ -64,8 +65,13 @@ and **E12** pattern DSL (a Serilog `outputTemplate` in appsettings does not yet 
 **V9** rules editor / format wizard (needs V14); the disambiguation *chip* is title text; a search
 hit inside a MEL message pulled into its record row is not painted there (it is on the hidden line).
 
-**Next in M6:** E11 — Serilog / NLog / log4net templates from a config file or a pasted template
-string, compiled to a `Format`; then score M6.
+| **E11** — Serilog / NLog / log4net (and Logback) templates compiled to a `Format`; **found beside the log** in `appsettings*.json` / `nlog.config` / `log4net.config` and scored with the catalogue | `template.rs`, `detect_with` | a Serilog log with a shape no built-in knows, columnised because its `appsettings.json` said so (test) |
+| **E12** — the `<ts> [<thread>] <level> <logger> - <message>` DSL, same builder | `template.rs` | — |
+
+**M6 scored** (`EFFORT.md`): forecast 13.8 h, actual ~1.8 h — the shapes existed. **V9** (rules
+editor + format wizard) moves to M7 with V14, which it needs. **Next: M7, starting with V14 — the
+widget and text-input layer — the first new shape since M3, and the thing every typed-into-the-title
+field has been waiting for.**
 
 ---
 
