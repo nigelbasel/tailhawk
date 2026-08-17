@@ -27,6 +27,7 @@ use tailhawk_core::paint::{Colours, Painter};
 use tailhawk_core::search::{Match, SearchOptions};
 use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
+use tailhawk_core::settings;
 use tailhawk_core::sieve;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::template;
@@ -67,17 +68,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetScrollInfo,
-    KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos,
-    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, IDC_ARROW, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
-    SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
-    SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOW_EX_STYLE, WM_CHAR,
-    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
+    GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
+    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP,
+    SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO,
+    SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -129,6 +130,8 @@ struct Document {
     filtering: Filtering,
     /// The command bar: the find field, the chip row, the focus. See [`Chrome`].
     chrome: Chrome,
+    /// The path this was opened from — the key for §12.4's per-file state. `None` for a pipe.
+    path: Option<std::path::PathBuf>,
     /// The tab strip's labels and which is this document — set by the shell before each frame,
     /// because a document knows nothing of the others. Empty or one label: no strip.
     tab_strip: (Vec<String>, usize),
@@ -425,6 +428,7 @@ impl Document {
         // nothing beside it comes back as a set of one, so there is no second path here.
         let set = LogSet::open(path).map_err(|e| format!("{name}: {e}"))?;
         let (detection, layout) = detect_set(&set, Some(path));
+        let opened_from = Some(path.to_path_buf());
 
         // **Only the name is fixed.** Everything else in the title -- the encoding, the membership,
         // the counts -- can change while the log is being followed, so `describe` formats them per
@@ -444,6 +448,7 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             chrome: Chrome::default(),
+            path: opened_from,
             tab_strip: (Vec::new(), 0),
             status: String::new(),
             unseen: false,
@@ -474,6 +479,7 @@ impl Document {
         let pump = Pump::start().map_err(|e| format!("stdin: {e}"))?;
         let set = LogSet::open_single(pump.path()).map_err(|e| format!("stdin: {e}"))?;
         let (detection, layout) = detect_set(&set, None);
+        let opened_from = None;
         Ok(Self {
             view: View::new(1.0, 1.0),
             set,
@@ -488,6 +494,7 @@ impl Document {
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
             chrome: Chrome::default(),
+            path: opened_from,
             tab_strip: (Vec::new(), 0),
             status: String::new(),
             unseen: false,
@@ -606,6 +613,51 @@ impl Document {
             .binary_search_by_key(&file_row, |(r, _)| *r)
             .ok()
             .map(|i| &self.presented[i].1)
+    }
+
+    /// How this file is being looked at, for §12.4's per-file state — `None` for a pipe, which has
+    /// no path to key by. Chips carry their polarity as a leading `+` or `-`.
+    fn file_state(&self) -> Option<settings::FileState> {
+        let path = self.path.as_ref()?.to_string_lossy().into_owned();
+        let chips = self
+            .filtering
+            .chips
+            .chips
+            .iter()
+            .map(|c| {
+                let sign = match c.polarity {
+                    Polarity::Include => '+',
+                    Polarity::Exclude => '-',
+                };
+                format!("{sign}{}", c.source)
+            })
+            .collect();
+        Some(settings::FileState {
+            path,
+            chips,
+            collapse: self.filtering.records_only,
+        })
+    }
+
+    /// Restores a remembered view: the chips and the collapse, then one pass. A chip that no
+    /// longer parses is dropped quietly — the file is being opened, not edited.
+    fn apply_state(&mut self, state: &settings::FileState) {
+        for chip in &state.chips {
+            let (polarity, text) = match chip.chars().next() {
+                Some('-') => (Polarity::Exclude, &chip[1..]),
+                Some('+') => (Polarity::Include, &chip[1..]),
+                _ => (Polarity::Include, chip.as_str()),
+            };
+            if let Ok(chip) = Chip::parse(text, polarity) {
+                self.filtering.chips.chips.push(chip);
+            }
+        }
+        self.filtering.records_only = state.collapse && self.detection.accepted.is_some();
+        self.filtering.error = None;
+        if self.filtering.active() {
+            self.filtering.clear_results();
+            self.refilter();
+        }
     }
 
     /// Rows in the view's row space: the survivors while a filter is on, the file's rows otherwise.
@@ -1784,6 +1836,11 @@ struct Shell {
     /// The measured cell size, for the command bar's hit-test. Zero until the first frame.
     cell_w: f32,
     cell_h: f32,
+    /// §12.4's persisted state, its tiers, and whether writes are suppressed. Loaded at start;
+    /// written on close and when a tab closes.
+    settings: settings::Settings,
+    settings_tiers: Vec<std::path::PathBuf>,
+    stateless: bool,
     /// `None` until the worker hands the device over. While it is `None` the class background
     /// brush is doing the painting — stage one of the two-stage paint.
     renderer: Option<Renderer>,
@@ -1915,8 +1972,17 @@ impl Shell {
         let mut i = 0;
         while i < self.reading.len() {
             match self.reading[i].try_recv() {
-                Ok(Ok(document)) => {
+                Ok(Ok(mut document)) => {
                     self.reading.remove(i);
+                    // §12.4: the file's remembered view, before it is first drawn.
+                    let key = document
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned());
+                    let remembered = key.and_then(|k| self.settings.file(&k).cloned());
+                    if let Some(state) = remembered {
+                        document.apply_state(&state);
+                    }
                     self.file = Some(document.describe());
                     self.document.push(document);
                     landed = true;
@@ -1944,6 +2010,30 @@ impl Shell {
             SetTimer(hwnd, FOLLOW_TIMER, FOLLOW_POLL_MS, None);
             let _ = InvalidateRect(hwnd, None, false);
         }
+    }
+
+    /// Writes §12.4's state: where the window is, and how each open file is being looked at.
+    fn save_settings(&mut self, hwnd: HWND) {
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_ok() {
+            let r = placement.rcNormalPosition;
+            self.settings.window = Some(settings::Window {
+                x: r.left,
+                y: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+                maximized: placement.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+            });
+        }
+        for doc in &self.document.docs {
+            if let Some(state) = doc.file_state() {
+                self.settings.set_file(state);
+            }
+        }
+        settings::save(&self.settings_tiers, &self.settings, self.stateless);
     }
 
     /// The status: the driver, the document's description, the frame instrument. **In the title,
@@ -3251,6 +3341,23 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             });
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // §12.4: the window and every open file's view, written whole to the first writable
+            // tier — the last thing this window does. **Here and not in `WM_DESTROY`**: the default
+            // `WM_CLOSE` handling calls `DestroyWindow`, whose `WM_DESTROY` arrives *nested* and
+            // so goes to `DefWindowProcW` under the re-entry guard — a save there never ran, and
+            // neither did the quit. Both are done here, before the window goes.
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.save_settings(hwnd);
+                }
+            });
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+                PostQuitMessage(0);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -3337,6 +3444,17 @@ fn main() -> Result<()> {
         reading.push(spawn_open(Document::from_pipe));
     }
 
+    // §12.4: the settings tiers — exe-adjacent, then %APPDATA%Tailhawk — read and merged now,
+    // written on close. `--stateless` suppresses the writes and nothing else.
+    let stateless = std::env::args_os().any(|a| a == "--stateless");
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let roaming = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    let settings_tiers = settings::tiers(exe_dir.as_deref(), roaming.as_deref());
+    let settings = settings::load(&settings_tiers);
+    let placement = settings.window;
+
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let class_name = windows::core::w!("TailhawkMain");
     let (r, g, b) = background_rgb8();
@@ -3365,6 +3483,9 @@ fn main() -> Result<()> {
         *s.borrow_mut() = Some(Shell {
             cell_w: 0.0,
             cell_h: 0.0,
+            settings,
+            settings_tiers,
+            stateless,
             renderer: None,
             pending: Some(rx),
             driver: None,
@@ -3386,10 +3507,10 @@ fn main() -> Result<()> {
             class_name,
             windows::core::w!("Tailhawk"),
             WS_OVERLAPPEDWINDOW | WS_VSCROLL,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1280,
-            800,
+            placement.map_or(CW_USEDEFAULT, |w| w.x),
+            placement.map_or(CW_USEDEFAULT, |w| w.y),
+            placement.map_or(1280, |w| w.width.max(320)),
+            placement.map_or(800, |w| w.height.max(200)),
             None,
             None,
             instance,
@@ -3400,7 +3521,14 @@ fn main() -> Result<()> {
         // §12's drop target: a file dropped on the window opens in it.
         DragAcceptFiles(hwnd, true);
         SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(
+            hwnd,
+            if placement.is_some_and(|w| w.maximized) {
+                SW_SHOWMAXIMIZED
+            } else {
+                SW_SHOW
+            },
+        );
     }
 
     let mut msg = MSG::default();
@@ -4467,5 +4595,46 @@ mod tests {
             "a plain file is not"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// §12.4's per-file state: what a document is looked at through survives a round trip through
+    /// the settings and comes back on the next open.
+    #[test]
+    fn a_files_chips_and_collapse_are_remembered_and_restored() {
+        let path = scratch_log("tailhawk_settings_test.log", 40);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(
+            doc.file_state()
+                .is_some_and(|s| s.chips.is_empty() && !s.collapse),
+            "nothing to remember yet"
+        );
+        filter_for(&mut doc, "line 1", Polarity::Include);
+        filter_for(&mut doc, "line 12", Polarity::Exclude);
+        let state = doc.file_state().expect("chips to remember");
+        assert_eq!(state.chips, ["+line 1", "-line 12"]);
+        assert!(!state.collapse);
+
+        let mut settings = settings::Settings::default();
+        settings.set_file(state);
+        let text = settings.to_toml();
+        let back = settings::Settings::from_toml(&text);
+        let remembered = back
+            .file(&path.to_string_lossy())
+            .expect("the file is in the settings")
+            .clone();
+
+        let mut again = Document::open(&path).expect("open again");
+        again.lay_out((8.0, 10.0), (800, 200));
+        again.apply_state(&remembered);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while again.filtering.running.is_some() && std::time::Instant::now() < deadline {
+            again.poll_filter();
+            std::thread::yield_now();
+        }
+        again.poll_filter();
+        assert_eq!(again.filtering.chips.chips.len(), 2);
+        assert_eq!(again.filtering.chips.chips[1].polarity, Polarity::Exclude);
+        assert_eq!(doc.filtering.kept, again.filtering.kept, "the same view");
+        let _ = std::fs::remove_file(&path);
     }
 }

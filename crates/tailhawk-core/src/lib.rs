@@ -31,6 +31,7 @@ pub mod rows;
 pub mod search;
 pub mod selection;
 pub mod semantic;
+pub mod settings;
 pub mod template;
 pub mod view;
 pub mod widget;
