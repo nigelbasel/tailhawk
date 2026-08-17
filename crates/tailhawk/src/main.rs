@@ -104,6 +104,15 @@ const DEVICE_POLL_MS: u32 = 4;
 const FOLLOW_TIMER: usize = 2;
 const FOLLOW_POLL_MS: u32 = 100;
 
+/// V12: a wheel notch is animated rather than jumped — the remaining distance is eased over a few
+/// frames on this timer, which runs only while there is distance left. `UI-DESIGN.md` §12 asks for
+/// `WM_POINTER` or Direct Manipulation; this is the same feel from the wheel messages already
+/// arriving, and a precision touchpad's small deltas pass through it unchanged.
+const SMOOTH_TIMER: usize = 3;
+const SMOOTH_MS: u32 = 15;
+/// The share of the remaining distance moved per tick.
+const SMOOTH_EASE: f32 = 0.35;
+
 /// Scrollbar units. Fixed rather than the row count, so no file size can overflow `SCROLLINFO`'s
 /// `i32` -- the grid speaks in fractions at both ends and Win32 never sees a row number.
 const SCROLL_RANGE: i32 = 10_000;
@@ -1191,6 +1200,26 @@ impl Document {
             }
             Err(e) => self.filtering.error = Some(format!("{text}: {e}")),
         }
+    }
+
+    /// Takes chip `i` out of the row and into the new-chip field for editing, its polarity kept,
+    /// with the field focused — `UI-DESIGN.md` §5's "editable as text". The pass restarts without
+    /// it; `Enter` in the field puts the edited chip back.
+    fn edit_chip(&mut self, i: usize) {
+        if i >= self.filtering.chips.chips.len() {
+            return;
+        }
+        self.remember();
+        let chip = self.filtering.chips.chips.remove(i);
+        self.chrome.chip.set_text(&chip.source);
+        self.chrome.chip.select_all();
+        self.chrome.chip_polarity = chip.polarity;
+        self.chrome.focus = Focus::NewChip;
+        self.filtering.error = None;
+        self.filtering.clear_results();
+        self.refilter();
+        let rows = self.view_rows();
+        self.view.grid_mut().set_total_rows(rows);
     }
 
     /// Drops every chip and the survivors with them: the unfiltered view.
@@ -2286,6 +2315,7 @@ enum Command {
     Split,
     FocusOtherPane,
     ToggleTheme,
+    EditLastChip,
     GoToTop,
     FollowTail,
     Copy,
@@ -2324,6 +2354,7 @@ impl Command {
         (Command::Split, "Split the pane / unsplit", "Ctrl+\\"),
         (Command::FocusOtherPane, "Focus the other pane", "F6"),
         (Command::ToggleTheme, "Switch between the dark and light themes", ""),
+        (Command::EditLastChip, "Edit the last filter chip (Ctrl+click a chip edits it)", "Ctrl+Shift+E"),
         (Command::GoToTop, "Go to top", "Ctrl+Home"),
         (Command::FollowTail, "Jump to tail and follow", "Ctrl+End"),
         (Command::Copy, "Copy selection", "Ctrl+C"),
@@ -2774,6 +2805,8 @@ struct Shell {
     /// The palette chose an export or a tee (`Some(live)`): `wndproc` shows the Save dialog once
     /// this borrow is released.
     pending_save: Option<bool>,
+    /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
+    wheel_remaining: f32,
     /// How long recent frames took. See [`Frames`].
     frames: Frames,
 }
@@ -3283,6 +3316,9 @@ impl Shell {
             }
             return true;
         }
+        if key == VK_E.0 && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 {
+            return self.run(hwnd, Command::EditLastChip);
+        }
         if key == VK_E.0 {
             // §6.4's collapse, as a toggle: only with a format, since only a format knows what a
             // first line is. Provisional binding, like `Ctrl+I`.
@@ -3478,6 +3514,26 @@ impl Shell {
         Some((hit, panes[hit].pane_top))
     }
 
+    /// One tick of the wheel's easing: a share of what is left, never less than a pixel, and the
+    /// timer stops when it is spent.
+    fn smooth_step(&mut self, hwnd: HWND) {
+        let remaining = self.wheel_remaining;
+        if remaining.abs() < 0.5 {
+            self.wheel_remaining = 0.0;
+            unsafe {
+                let _ = KillTimer(hwnd, SMOOTH_TIMER);
+            }
+            return;
+        }
+        let step = if remaining.abs() <= 1.0 {
+            remaining
+        } else {
+            (remaining * SMOOTH_EASE).abs().max(1.0).copysign(remaining)
+        };
+        self.wheel_remaining -= step;
+        self.navigate(hwnd, Navigate::ByPixels(step));
+    }
+
     /// What every handled chrome key ends with: the scrollbar, the title and a repaint.
     fn after_chrome_key(&mut self, hwnd: HWND) -> bool {
         self.sync_scrollbar(hwnd);
@@ -3597,6 +3653,12 @@ impl Shell {
                 doc.filtering.error = None;
             }
             Command::ClearFilter => doc.clear_filter(),
+            Command::EditLastChip => {
+                let last = doc.filtering.chips.chips.len().checked_sub(1);
+                if let Some(i) = last {
+                    doc.edit_chip(i);
+                }
+            }
             Command::ToggleCollapse => {
                 if doc.detection.accepted.is_some() {
                     doc.remember();
@@ -3896,6 +3958,9 @@ impl Shell {
         };
         match hit {
             Some(Hit::Tab(_)) => {}
+            Some(Hit::Chip(i)) if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
+                doc.edit_chip(i);
+            }
             Some(Hit::Chip(i)) => {
                 if i < doc.filtering.chips.chips.len() {
                     doc.remember();
@@ -4282,6 +4347,14 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             });
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == SMOOTH_TIMER => {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.smooth_step(hwnd);
+                }
+            });
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == FOLLOW_TIMER => {
             // **The scan is bounded, so this cannot hold the message loop.** `Follow::poll` stops at
             // its byte budget and says whether more is waiting; a writer producing faster than the
@@ -4422,7 +4495,18 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             };
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
-                    shell.navigate(hwnd, n);
+                    match n {
+                        // A vertical notch is eased over a few frames — V12. Anything under a
+                        // quarter of a notch is a touchpad's own smoothing and moves at once.
+                        Navigate::ByPixels(px) if delta.abs() >= 0.25 => {
+                            shell.wheel_remaining += px;
+                            unsafe {
+                                SetTimer(hwnd, SMOOTH_TIMER, SMOOTH_MS, None);
+                            }
+                            shell.smooth_step(hwnd);
+                        }
+                        n => shell.navigate(hwnd, n),
+                    }
                 }
             });
             LRESULT(0)
@@ -4930,6 +5014,7 @@ fn main() -> Result<()> {
             needs_frame: false,
             pending_open: false,
             pending_save: None,
+            wheel_remaining: 0.0,
             frames: Frames::new(),
             last_double: None,
             file: None,
@@ -5845,6 +5930,38 @@ mod tests {
         assert!(doc.stop_tee());
         assert!(!doc.stop_tee());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5's "editable as text": editing a chip takes it out of the row and into the field with its
+    /// text and polarity, the view is refiltered without it, and `Enter` puts the edit back.
+    #[test]
+    fn a_chip_can_be_taken_into_the_field_and_put_back_edited() {
+        let path = scratch_log("tailhawk_editchip_test.log", 100);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        filter_for(&mut doc, "record", Polarity::Include);
+        filter_for(&mut doc, "\"line 1\"", Polarity::Exclude);
+        assert_eq!(doc.filtering.chips.chips.len(), 2);
+        let with_two = doc.view_rows();
+
+        doc.edit_chip(1);
+        assert_eq!(doc.filtering.chips.chips.len(), 1, "taken out of the row");
+        assert_eq!(doc.chrome.chip.text(), "\"line 1\"");
+        assert_eq!(doc.chrome.chip_polarity, Polarity::Exclude);
+        assert_eq!(doc.chrome.focus, Focus::NewChip);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_filter();
+        }
+        assert!(doc.view_rows() > with_two, "the exclude no longer applies");
+
+        // The edit: exclude `line 2` instead, as `Enter` in the field would.
+        doc.chrome.chip.set_text("\"line 2\"");
+        filter_for(&mut doc, "\"line 2\"", Polarity::Exclude);
+        assert_eq!(doc.filtering.chips.chips[1].source, "\"line 2\"");
+        assert_eq!(doc.filtering.chips.chips[1].polarity, Polarity::Exclude);
+        assert!(doc.history_step(true), "the edit is a view change: back restores both chips");
+        std::fs::remove_file(&path).ok();
     }
 
     fn filter_for(doc: &mut Document, text: &str, polarity: Polarity) {
