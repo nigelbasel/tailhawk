@@ -85,6 +85,7 @@ impl Layout {
         let cells = CellModel::new();
         let mut text = String::with_capacity(raw.len() + self.extra_cells());
         let mut segments = Vec::new();
+        let mut continuation = false;
         match self.format.fields(raw) {
             Some(fields) => {
                 let last = fields.len().saturating_sub(1);
@@ -115,6 +116,7 @@ impl Layout {
                 }
             }
             None => {
+                continuation = true;
                 let indent = self.message_indent();
                 for _ in 0..indent {
                     text.push(' ');
@@ -127,7 +129,11 @@ impl Layout {
                 });
             }
         }
-        Presentation { text, segments }
+        Presentation {
+            text,
+            continuation,
+            segments,
+        }
     }
 }
 
@@ -162,6 +168,8 @@ pub struct Segment {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Presentation {
     pub text: String,
+    /// Whether this row is a continuation — not a first line — and so drawn dimmed (§6.4).
+    pub continuation: bool,
     /// Ascending by `at`; the raw ranges are disjoint but need not be ascending — a format may
     /// present its columns in another order than the line writes them.
     pub segments: Vec<Segment>,

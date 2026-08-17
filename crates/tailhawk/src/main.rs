@@ -28,8 +28,8 @@ use tailhawk_core::set::LogSet;
 use tailhawk_core::sieve;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::{
-    background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, CURRENT_MATCH_BG,
-    CURRENT_MATCH_INK, MATCH_BG, RENDER_CAP_CELLS,
+    background_rgb8, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, CONTINUATION_INK,
+    CURRENT_MATCH_BG, CURRENT_MATCH_INK, MATCH_BG, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
@@ -203,6 +203,19 @@ impl RowSource for Document {
                 let raw = std::mem::take(out);
                 p.map(&raw, out);
                 self.highlighter.beneath(&p.text, out);
+                // §6.4: a continuation is "rendered dimmed and indented". Indented by the
+                // presentation; dimmed here, beneath everything a rule or a match claimed.
+                if p.continuation {
+                    tailhawk_core::highlight::claim_beneath(
+                        out,
+                        Span {
+                            start: 0,
+                            end: p.text.len(),
+                            fg: Some(CONTINUATION_INK),
+                            bg: None,
+                        },
+                    );
+                }
             }
             None => {
                 if let Some(line) = self.set.row_text(file_row) {

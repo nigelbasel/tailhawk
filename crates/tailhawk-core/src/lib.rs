@@ -186,6 +186,10 @@ pub const CURRENT_MATCH_INK: [f32; 4] = [0.071, 0.078, 0.090, 1.0];
 /// Provisional with the rest of the palette.
 pub const REVEAL_MARK: [f32; 4] = [0.85, 0.65, 0.25, 1.0];
 
+/// The ink of a continuation line — a stack-trace frame under its record's first line, §6.4:
+/// "rendered dimmed and indented". A step under [`INK`], not a colour of its own.
+pub const CONTINUATION_INK: [f32; 4] = [0.56, 0.59, 0.64, 1.0];
+
 /// Errors that cross the seam. Deliberately opaque — the shell can report one but cannot act on
 /// the distinction, and `SPEC.md` §3.2 forbids panicking on device loss.
 #[derive(Debug)]

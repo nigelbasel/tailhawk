@@ -354,6 +354,13 @@ impl Highlighter {
 /// Sorted, the overlapping run is a `partition_point` plus a walk over just the spans that actually
 /// overlap. Insertion memmoves, but a memmove of a few thousand 40-byte spans is not what a frame's
 /// time goes on, and [`MAX_SPANS_PER_LINE`] bounds it anyway.
+/// Adds `span` beneath everything `out` already holds — the public face of [`claim`], for a
+/// caller layering its own colour under a row's spans (a dimmed continuation, §6.4). `out` must
+/// be sorted and non-overlapping, which every producer in this crate guarantees.
+pub fn claim_beneath(out: &mut Vec<Span>, span: Span) {
+    claim(out, span);
+}
+
 fn claim(out: &mut Vec<Span>, span: Span) {
     if span.start >= span.end || out.len() >= MAX_SPANS_PER_LINE {
         return;
