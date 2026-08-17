@@ -662,8 +662,18 @@ impl Document {
             Some(text) => format!(" · {text}"),
             None => String::new(),
         };
+        // §12: scrolling up pauses following, and the affordance to resume must be visible — the
+        // "single most-wanted behaviour in every tail tool", and getting it wrong is very visible.
+        // A pipe that has finished is not paused, it is done.
+        let following = if self.stream_done {
+            ""
+        } else if self.view.grid().is_following() {
+            "● following — "
+        } else {
+            "‖ paused · Ctrl+End to follow — "
+        };
         format!(
-            "{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
+            "{following}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -3899,7 +3909,7 @@ mod tests {
         assert!(doc.view.grid().is_following());
         assert_eq!(doc.row_text(299), Some("INFO line 299 fine"));
         assert_eq!(doc.row_text(298), Some("INFO line 298 fine"));
-        assert!(doc.describe().starts_with("▸ "), "{}", doc.describe());
+        assert!(doc.describe().contains("▸ "), "{}", doc.describe());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -3914,7 +3924,7 @@ mod tests {
         assert!(!doc.filtering.active());
         assert!(doc.filtering.error.is_some());
         assert!(
-            doc.describe().starts_with("▼ /[unclosed/"),
+            doc.describe().contains("▼ /[unclosed/"),
             "{}",
             doc.describe()
         );
