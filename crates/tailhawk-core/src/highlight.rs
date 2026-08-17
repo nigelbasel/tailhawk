@@ -37,16 +37,24 @@
 //! its list sorted so an insertion is a binary search rather than a scan. See both for the
 //! measurement that forced them.
 //!
+//! ## Derived colours
+//!
+//! §7.1: "stable derived colours for recurring identifiers — the same request ID is the same colour
+//! everywhere, in every file." A [`Rule`] with [`Rule::derived`] set takes its foreground from the
+//! **text it matched** rather than from a fixed colour: the text is hashed and the hash picks from
+//! [`IDENTIFIER_PALETTE`]. Nothing is remembered between lines, frames or files, which is what makes
+//! it stable — there is no table to be in a different state tomorrow.
+//!
 //! ## What is not here
 //!
-//! - **The zero-config semantic layer** of §7.1 — timestamps, GUIDs, IPs, paths, `key=value`. That
-//!   is E23, it sits *beneath* user rules, and it is a catalogue rather than an engine.
-//! - **Stable derived colours for recurring identifiers** ("the same request ID is the same colour
-//!   everywhere"). §7.1 wants it; it needs a hash-to-palette and a palette, and it belongs with E23.
+//! - **The zero-config semantic layer** of §7.1 is `semantic.rs` — a catalogue of rules for this
+//!   engine, sitting *beneath* user rules.
 //! - **Glob and format binding.** [`RuleSet::bound_to`] carries the string so a set can be
 //!   round-tripped, and nothing matches on it yet — format detection is M6.
 //! - **Import and export.** The types are plain data and derive what a serialiser would need, but no
 //!   file format is chosen; picking one now would be picking it without the settings model (§12).
+
+use core::cell::Cell;
 
 use crate::search::Pattern;
 
@@ -54,9 +62,15 @@ use crate::search::Pattern;
 ///
 /// **A frame budget, not a correctness bound.** §10.3's 32 KB lines times a screenful is far more
 /// regex work than a 16.67 ms frame holds, and the failure this prevents is a *late* frame rather
-/// than a wrong one. 256 KB is roughly eight full-width 32 KB lines, or a screenful of ordinary
-/// ones several times over.
-pub const FRAME_BUDGET_BYTES: usize = 256 * 1024;
+/// than a wrong one.
+///
+/// **Sized from a measurement, on 2026-08-17.** It was 256 KB — "roughly eight full-width 32 KB
+/// lines" — chosen before there was a rule set to time. `semantic.rs`'s tripwire test then
+/// measured its 21-rule catalogue at ~11.9 µs for a 150-byte row in release, about 80 ns per byte:
+/// 256 KB was ~21 ms of highlighting, over the frame the budget exists to protect. 64 KB is ~5 ms
+/// with the catalogue alone (a user's rules go on top), two full-width lines, and still four to
+/// eight screenfuls of ordinary 100–200 byte rows.
+pub const FRAME_BUDGET_BYTES: usize = 64 * 1024;
 
 /// Spans one line will produce before the highlighter stops adding more.
 ///
@@ -70,6 +84,39 @@ pub const MAX_SPANS_PER_LINE: usize = 4096;
 /// A colour, in the same linear-ish sRGB the renderer takes.
 pub type Colour = [f32; 4];
 
+/// The colours a [derived](Rule::derived) rule draws from, indexed by the hash of the matched text.
+///
+/// **Eight, spread round the hue circle at one lightness**, so that two identifiers a reader is
+/// comparing are as likely as the palette allows to differ in hue rather than in brightness — the
+/// question a derived colour answers is "is this the same one?", and same-hue-different-lightness
+/// reads as "probably". All are legible on `BACKGROUND` and none is the severity ramp's red, amber
+/// or magenta, so an identifier never impersonates an error. Provisional with the rest of the
+/// palette (`UI-DESIGN.md` §11.2 pins no hex).
+pub const IDENTIFIER_PALETTE: [Colour; 8] = [
+    [0.55, 0.78, 0.98, 1.0],
+    [0.62, 0.86, 0.66, 1.0],
+    [0.86, 0.72, 0.98, 1.0],
+    [0.55, 0.88, 0.86, 1.0],
+    [0.92, 0.80, 0.55, 1.0],
+    [0.98, 0.68, 0.78, 1.0],
+    [0.72, 0.80, 0.98, 1.0],
+    [0.80, 0.90, 0.55, 1.0],
+];
+
+/// The colour a derived rule gives `text`. Same text, same colour, everywhere and always.
+///
+/// FNV-1a over the bytes, folded onto the palette. The hash is not chosen for quality — eight
+/// buckets need no more than "not obviously correlated with the input" — but for being fully
+/// specified, so the answer cannot change with a standard-library or crate release.
+pub fn derived_colour(text: &str) -> Colour {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    IDENTIFIER_PALETTE[(hash % IDENTIFIER_PALETTE.len() as u64) as usize]
+}
+
 /// One highlight rule. §7.1's unit.
 pub struct Rule {
     /// What the user called it. Shown in the rule list and used by nothing else.
@@ -77,6 +124,9 @@ pub struct Rule {
     pub pattern: Pattern,
     pub fg: Option<Colour>,
     pub bg: Option<Colour>,
+    /// §7.1's "stable derived colours for recurring identifiers": the foreground comes from
+    /// [`derived_colour`] of the matched text, and `fg` is ignored. See the module note.
+    pub derived: bool,
     /// §7.1's "whole-line-vs-match-only toggle". Whole-line still requires a match — it changes what
     /// the match *covers*, not whether the rule fires.
     pub whole_line: bool,
@@ -96,6 +146,7 @@ impl Rule {
             pattern,
             fg: None,
             bg: None,
+            derived: false,
             whole_line: false,
             enabled: true,
             groups: Vec::new(),
@@ -104,6 +155,12 @@ impl Rule {
 
     pub fn fg(mut self, colour: Colour) -> Self {
         self.fg = Some(colour);
+        self
+    }
+
+    /// Colours each match by its own text — §7.1's identifier colours.
+    pub fn derived(mut self) -> Self {
+        self.derived = true;
         self
     }
 
@@ -164,20 +221,27 @@ pub struct Span {
 }
 
 /// Applies a rule set to lines, under §7.1's visible-rows rule and a frame budget.
+///
+/// **The budget is interior-mutable and [`line`](Self::line) takes `&self`**, because the caller
+/// is [`RowSource::row_spans`](crate::rows::RowSource::row_spans), which the painter reaches
+/// through `&dyn RowSource` — a shared borrow, for the whole frame, of the source that owns this.
+/// The alternative was a `RefCell` in every source that highlights, or a `&mut dyn RowSource`
+/// through the painter for the sake of two counters; a `Cell` for each counter is the smaller
+/// change and it is honest about what mutates: the frame's accounting, never the rules.
 pub struct Highlighter {
     set: RuleSet,
     /// Bytes left in this frame. Reset by [`begin_frame`](Self::begin_frame).
-    budget: usize,
+    budget: Cell<usize>,
     /// Rows this frame gave up on, so a caller can say so rather than leave them looking unmatched.
-    skipped: u32,
+    skipped: Cell<u32>,
 }
 
 impl Highlighter {
     pub fn new(set: RuleSet) -> Self {
         Self {
             set,
-            budget: FRAME_BUDGET_BYTES,
-            skipped: 0,
+            budget: Cell::new(FRAME_BUDGET_BYTES),
+            skipped: Cell::new(0),
         }
     }
 
@@ -189,31 +253,43 @@ impl Highlighter {
         &mut self.set
     }
 
-    /// Starts a frame's budget. Called once per frame by the painter, before any row.
-    pub fn begin_frame(&mut self) {
-        self.budget = FRAME_BUDGET_BYTES;
-        self.skipped = 0;
+    /// Starts a frame's budget. Called once per frame, before any row.
+    pub fn begin_frame(&self) {
+        self.budget.set(FRAME_BUDGET_BYTES);
+        self.skipped.set(0);
     }
 
     /// Rows this frame ran out of budget for. They draw plain; §11.3 prefers that to a late frame.
     pub fn skipped(&self) -> u32 {
-        self.skipped
+        self.skipped.get()
     }
 
     /// The spans for one line, sorted and non-overlapping.
     ///
     /// `out` is cleared and reused, so a painter holds one `Vec` for the whole frame instead of
     /// allocating per row — at fifty rows a frame that is fifty allocations a frame for nothing.
-    pub fn line(&mut self, line: &str, out: &mut Vec<Span>) {
+    pub fn line(&self, line: &str, out: &mut Vec<Span>) {
         out.clear();
-        if line.len() > self.budget {
+        self.beneath(line, out);
+    }
+
+    /// The spans for one line, **added beneath whatever `out` already holds.**
+    ///
+    /// This is how the shell layers a search's matches over the semantic catalogue: the matches
+    /// go into `out` first, and this fills in around them under the same first-claim-wins rule
+    /// that orders the set — so a match the user asked for is never hidden by a timestamp colour,
+    /// and everything a match does not cover is still coloured. `out` must be sorted and
+    /// non-overlapping on entry, which is what every producer of spans in this crate emits.
+    pub fn beneath(&self, line: &str, out: &mut Vec<Span>) {
+        let budget = self.budget.get();
+        if line.len() > budget {
             // **Charged before the work, so an over-budget row costs nothing.** Charging afterwards
             // would let one 32 KB line blow the budget it was supposed to be stopped by.
-            self.skipped += 1;
-            self.budget = 0;
+            self.skipped.set(self.skipped.get() + 1);
+            self.budget.set(0);
             return;
         }
-        self.budget -= line.len();
+        self.budget.set(budget - line.len());
 
         for rule in self.set.rules.iter().filter(|r| r.enabled) {
             rule.pattern.each_match(line, |whole, groups| {
@@ -238,12 +314,27 @@ impl Highlighter {
                 } else {
                     (whole.start, whole.end)
                 };
+                // Derived from the *match*, not the whole line, so a whole-line identifier rule
+                // still colours by the identifier it found.
+                let fg = if rule.derived {
+                    Some(derived_colour(&line[whole.start..whole.end]))
+                } else {
+                    rule.fg
+                };
+                // **A rule with no colours of its own claims only its groups.** That is how a
+                // rule anchors a group on context — `status=(\d{3})` colouring the code — without
+                // taking `status=` away from a later rule that wanted it: the linear engine has no
+                // lookbehind, so the context has to be *in* the match, and claiming it in no
+                // colour would block for nothing.
+                if fg.is_none() && rule.bg.is_none() {
+                    return;
+                }
                 claim(
                     out,
                     Span {
                         start,
                         end,
-                        fg: rule.fg,
+                        fg,
                         bg: rule.bg,
                     },
                 );
@@ -325,7 +416,7 @@ mod tests {
     }
 
     fn spans(set: RuleSet, line: &str) -> Vec<Span> {
-        let mut h = Highlighter::new(set);
+        let h = Highlighter::new(set);
         h.begin_frame();
         let mut out = Vec::new();
         h.line(line, &mut out);
@@ -461,7 +552,7 @@ mod tests {
     #[test]
     fn a_row_past_the_frame_budget_draws_plain_and_is_counted() {
         let long = "x".repeat(FRAME_BUDGET_BYTES + 1);
-        let mut h = Highlighter::new(RuleSet::new("s").with(rule("x", "x").fg(RED)));
+        let h = Highlighter::new(RuleSet::new("s").with(rule("x", "x").fg(RED)));
         h.begin_frame();
         let mut out = Vec::new();
         h.line(&long, &mut out);
@@ -478,7 +569,7 @@ mod tests {
     /// The budget is charged **before** the work, so the row that exceeds it does not also do it.
     #[test]
     fn an_over_budget_row_is_not_examined_before_being_skipped() {
-        let mut h = Highlighter::new(RuleSet::new("s").with(rule("x", "x").fg(RED)));
+        let h = Highlighter::new(RuleSet::new("s").with(rule("x", "x").fg(RED)));
         h.begin_frame();
         let mut out = Vec::new();
         // Two rows that individually fit and together do not.
@@ -559,5 +650,109 @@ mod tests {
         )
         .is_empty());
         assert_eq!(ranges(&spans(set, "ERROR Exception")), [(6, 15, Some(RED))]);
+    }
+
+    /// §7.1: "the same request ID is the same colour everywhere, in every file". Two matches of
+    /// the same text agree, on one line and across lines, and a fixed `fg` on the rule is ignored.
+    #[test]
+    fn a_derived_rule_gives_the_same_text_the_same_colour_everywhere() {
+        let set = RuleSet::new("s").with(rule("id", "req-[0-9a-f]+").fg(RED).derived());
+        let h = Highlighter::new(set);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        h.line("req-1a2b then req-9f then req-1a2b", &mut a);
+        h.line("later: req-1a2b", &mut b);
+
+        assert_eq!(a.len(), 3);
+        assert_eq!(a[0].fg, a[2].fg, "same text, same colour on one line");
+        assert_eq!(a[0].fg, b[0].fg, "same text, same colour on another line");
+        assert_ne!(
+            a[0].fg,
+            Some(RED),
+            "a derived rule ignores its fixed foreground"
+        );
+        assert!(IDENTIFIER_PALETTE.contains(&a[0].fg.expect("coloured")));
+        assert_eq!(a[0].fg, Some(derived_colour("req-1a2b")));
+    }
+
+    /// The palette is only useful if different identifiers usually differ: eight buckets cannot
+    /// separate every pair, but a run of distinct ids should not collapse onto one or two colours.
+    #[test]
+    fn derived_colours_spread_across_the_palette() {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..64 {
+            let colour = derived_colour(&format!("0HN7{i:04X}"));
+            seen.insert(colour.map(f32::to_bits));
+        }
+        assert_eq!(
+            seen.len(),
+            IDENTIFIER_PALETTE.len(),
+            "64 ids should reach every bucket"
+        );
+    }
+
+    /// The shell puts a search's matches into `out` first and calls `beneath` for the rest, so a
+    /// match keeps its colour where the rules would have claimed the same characters, and the rules
+    /// still colour everything the match does not cover.
+    #[test]
+    fn beneath_fills_around_what_is_already_claimed_and_never_over_it() {
+        let set = RuleSet::new("s").with(rule("word", "[a-z]+").fg(RED));
+        let h = Highlighter::new(set);
+        h.begin_frame();
+        let mut out = vec![Span {
+            start: 4,
+            end: 8,
+            fg: None,
+            bg: Some(BLUE),
+        }];
+        h.beneath("abc defgh ij", &mut out);
+        assert_eq!(
+            out.iter()
+                .map(|s| (s.start, s.end, s.fg, s.bg))
+                .collect::<Vec<_>>(),
+            [
+                (0, 3, Some(RED), None),
+                (4, 8, None, Some(BLUE)),
+                (8, 9, Some(RED), None),
+                (10, 12, Some(RED), None),
+            ]
+        );
+    }
+
+    /// A colourless rule with a coloured group claims the group and nothing else, so the context
+    /// it matched on stays available to the rules below it.
+    #[test]
+    fn a_colourless_rule_claims_only_its_groups() {
+        let set = RuleSet::new("s")
+            .with(rule("code", r"status=(\d{3})").group(1, RED))
+            .with(rule("key", r"([a-z]+)=").group(1, GREEN));
+        assert_eq!(
+            ranges(&spans(set, "status=503")),
+            [(0, 6, Some(GREEN)), (7, 10, Some(RED))]
+        );
+    }
+
+    /// `line` and `beneath` share one budget, and `line` is `beneath` onto an emptied `out`.
+    #[test]
+    fn line_is_beneath_onto_nothing_and_shares_the_frame_budget() {
+        let set = RuleSet::new("s").with(rule("word", "[a-z]+").fg(RED));
+        let h = Highlighter::new(set);
+        h.begin_frame();
+        let mut out = vec![Span {
+            start: 0,
+            end: 1,
+            fg: None,
+            bg: Some(BLUE),
+        }];
+        h.line("abc", &mut out);
+        assert_eq!(ranges(&out), [(0, 3, Some(RED))], "line starts from empty");
+
+        let long = "x".repeat(FRAME_BUDGET_BYTES);
+        h.beneath(&long, &mut out);
+        assert_eq!(
+            h.skipped(),
+            1,
+            "the budget `line` spent is the budget `beneath` sees"
+        );
     }
 }

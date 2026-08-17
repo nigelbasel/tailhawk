@@ -18,8 +18,9 @@ use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use tailhawk_core::find::{self, Outcome, Running, Update};
-use tailhawk_core::highlight::Span;
+use tailhawk_core::highlight::{Highlighter, Span};
 use tailhawk_core::search::{Match, SearchOptions};
+use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::{
@@ -103,6 +104,9 @@ struct Document {
     pump: Option<Pump>,
     /// The find state — the query, its matches, and the pass producing them. See [`Finder`].
     finder: Finder,
+    /// §7.1's zero-config semantic layer, applied to visible rows beneath the search's matches.
+    /// Built with the document, on the worker, because it compiles twenty regexes.
+    highlighter: Highlighter,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -135,11 +139,19 @@ impl RowSource for Document {
         (span.start_cell < end).then_some(span.start_cell..end)
     }
 
-    /// §7.1's colours over §7.4's results: every match on this row, the current one in its own
-    /// colour. **Visible rows only**, which is what §7.1 requires and what being called from the
-    /// painter's row loop delivers for free.
+    /// §7.1's colours: the search's matches on top, the semantic catalogue beneath. **Visible rows
+    /// only**, which is what §7.1 requires and what being called from the painter's row loop
+    /// delivers for free.
+    ///
+    /// **The matches go in first**, so a hit the user asked for is never hidden by a timestamp
+    /// colour, and the catalogue fills in around them — `Highlighter::beneath` exists for this
+    /// call. A row whose text is not in memory yet gets the matches and nothing else, which is
+    /// also what it gets drawn as.
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
         self.finder.spans(row, out);
+        if let Some(line) = self.set.row_text(row) {
+            self.highlighter.beneath(line, out);
+        }
     }
 }
 
@@ -171,6 +183,7 @@ impl Document {
             selection: None,
             dragging: false,
             finder: Finder::default(),
+            highlighter: Highlighter::new(semantic::catalogue()),
             pump: None,
             stream_done: false,
         })
@@ -203,6 +216,7 @@ impl Document {
             selection: None,
             dragging: false,
             finder: Finder::default(),
+            highlighter: Highlighter::new(semantic::catalogue()),
             pump: Some(pump),
             stream_done: false,
         })
@@ -1022,6 +1036,9 @@ impl Shell {
                 Some(doc) => {
                     let cell = renderer.cell()?;
                     doc.lay_out(cell, (w, h));
+                    // The highlighter's frame budget starts here, alongside the painter's own
+                    // `begin_frame` inside `paint_rows` — one frame, one budget, §11.3.
+                    doc.highlighter.begin_frame();
                     // `Rows` is the row source, so the painter reads its text and its column
                     // anchors by reference — the closure this replaced allocated a `String` per row
                     // per frame and had nowhere to put the anchors at all.
@@ -2287,19 +2304,73 @@ mod tests {
             "the match should have been stepped to as it arrived"
         );
 
-        // And the painter's question is answered for that row and no other.
+        // And the painter's question is answered for that row and no other. A match is the span
+        // with a background; the semantic layer beneath it only ever sets ink.
         let mut spans = Vec::new();
         doc.row_spans(137, &mut spans);
-        assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[0].bg, Some(CURRENT_MATCH_BG));
+        assert_eq!(spans.iter().filter(|s| s.bg.is_some()).count(), 1);
         doc.row_spans(136, &mut spans);
-        assert!(spans.is_empty());
+        assert!(spans.iter().all(|s| s.bg.is_none()), "row 136 has no match");
 
         // The view moved to it: row 137 is not in the first screenful of 20 rows.
         assert!(
             doc.view.grid().scroll().row > 100,
             "the view did not follow the match, it is at row {}",
             doc.view.grid().scroll().row
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// §7.1's layer order, on a real file: the semantic catalogue colours a row on its own, and a
+    /// search's match sits **over** it — the match keeps its background where the two want the
+    /// same characters, and the catalogue keeps everything the match does not cover.
+    #[test]
+    fn the_semantic_layer_colours_rows_and_a_match_sits_over_it() {
+        let path = std::env::temp_dir().join("tailhawk_semantic_test.log");
+        std::fs::write(
+            &path,
+            "2026-08-16 09:14:02.117 INFO  Api.Controller returned 412 rows in 88ms\n\
+             2026-08-16 09:14:02.118 ERROR Api.Dispatch job 41982 failed\n",
+        )
+        .expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.highlighter.begin_frame();
+
+        // With no search, the catalogue alone: timestamp, level, number, duration.
+        let mut spans = Vec::new();
+        doc.row_spans(1, &mut spans);
+        let inks: Vec<_> = spans.iter().map(|s| (s.start, s.end, s.fg, s.bg)).collect();
+        assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
+        assert_eq!(inks[1], (24, 29, Some(semantic::ERROR), None));
+        assert!(spans.iter().all(|s| s.bg.is_none()));
+
+        doc.finder.query = "ERROR".to_owned();
+        doc.find();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.finder.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_find();
+            std::thread::yield_now();
+        }
+        doc.poll_find();
+        assert_eq!(doc.finder.matches.len(), 1);
+
+        // Now the match owns `ERROR` — its background *and* its ink — and the timestamp before it
+        // and the number after it are still the catalogue's.
+        doc.row_spans(1, &mut spans);
+        let inks: Vec<_> = spans.iter().map(|s| (s.start, s.end, s.fg, s.bg)).collect();
+        assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
+        assert_eq!(
+            inks[1],
+            (24, 29, Some(CURRENT_MATCH_INK), Some(CURRENT_MATCH_BG))
+        );
+        assert!(
+            inks.iter()
+                .any(|&(_, _, fg, _)| fg == Some(semantic::NUMBER)),
+            "41982 is still a number: {inks:?}"
         );
 
         let _ = std::fs::remove_file(&path);
