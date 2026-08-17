@@ -41,6 +41,7 @@ use tailhawk_core::{
     Position, Renderer, RowEnd, RowSource, Selection, View, WindowHandle, RENDER_CAP_CELLS,
 };
 use windows::core::{Result, PCWSTR};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use windows::Win32::Foundation::{
     GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
@@ -81,12 +82,12 @@ use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDR
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    SetClassLongPtrW, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    AllowSetForegroundWindow, PostMessageW, SetClassLongPtrW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP,
     SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO,
     SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST,
     SPI_GETWHEELSCROLLLINES,
-    GCLP_HBRBACKGROUND, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    ASFW_ANY, GCLP_HBRBACKGROUND, SWP_NOACTIVATE, SWP_NOZORDER, WM_APP, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_DROPFILES, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_SYSKEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -4100,6 +4101,152 @@ fn set_title(hwnd: HWND, title: &str) {
 
 /// The system open dialog. Modal on the window thread, which is what it is; the follow tick and
 /// the paint keep running underneath it because it pumps our messages too.
+/// §12.3's single instance: the mutex that says one is running, the pipe that carries the argv.
+mod single {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, HANDLE};
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    const MUTEX: windows::core::PCWSTR = windows::core::w!(r"Local\Tailhawk-instance");
+    const PIPE: &str = r"\\.\pipe\Tailhawk-instance";
+
+    /// The message the pipe thread posts once it has queued the paths.
+    pub const WM_HANDED_OFF: u32 = WM_APP + 7;
+
+    /// What another instance handed us, waiting for the window thread.
+    pub static INBOX: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    /// Claims the per-session mutex. `false` means an instance is already running.
+    pub fn claim() -> bool {
+        match unsafe { CreateMutexW(None, false, MUTEX) } {
+            Ok(_handle) => {
+                // Held for the life of the process: the handle is deliberately leaked.
+                let already = windows::core::Error::from_win32().code() == ERROR_ALREADY_EXISTS.to_hresult();
+                !already
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// Hands `paths` to the running instance. `Ok` means it took them; the caller exits 3.
+    pub fn hand_off(paths: &[PathBuf]) -> std::io::Result<()> {
+        unsafe {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
+        let mut pipe = std::fs::OpenOptions::new().write(true).open(PIPE)?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+        for path in paths {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            bytes.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+            for unit in wide {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        pipe.write_all(&bytes)?;
+        pipe.flush()
+    }
+
+    /// Serves the pipe for the life of the process: each connection's paths go to [`INBOX`] and
+    /// [`WM_HANDED_OFF`] is posted to `hwnd`.
+    pub fn serve(hwnd: isize) {
+        std::thread::Builder::new()
+            .name("tailhawk-instance".to_owned())
+            .spawn(move || loop {
+                let name: Vec<u16> = PIPE.encode_utf16().chain(std::iter::once(0)).collect();
+                let handle = unsafe {
+                    CreateNamedPipeW(
+                        windows::core::PCWSTR(name.as_ptr()),
+                        PIPE_ACCESS_INBOUND,
+                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                        PIPE_UNLIMITED_INSTANCES,
+                        0,
+                        65_536,
+                        0,
+                        None,
+                    )
+                };
+                if handle.is_invalid() {
+                    return;
+                }
+                if unsafe { ConnectNamedPipe(handle, None) }.is_err() {
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
+                    continue;
+                }
+                let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
+                let mut bytes = Vec::new();
+                let _ = file.read_to_end(&mut bytes);
+                let paths = decode(&bytes);
+                let _ = unsafe { DisconnectNamedPipe(HANDLE(handle.0)) };
+                drop(file);
+                if !paths.is_empty() {
+                    if let Ok(mut inbox) = INBOX.lock() {
+                        inbox.extend(paths);
+                    }
+                    unsafe {
+                        let _ = PostMessageW(HWND(hwnd as *mut _), WM_HANDED_OFF, WPARAM(0), LPARAM(0));
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// The wire format: a count, then each path as a length and UTF-16 units, all little-endian.
+    fn decode(bytes: &[u8]) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        let u32_at = |at: &mut usize| -> Option<u32> {
+            let v = u32::from_le_bytes(bytes.get(*at..*at + 4)?.try_into().ok()?);
+            *at += 4;
+            Some(v)
+        };
+        let Some(count) = u32_at(&mut at) else {
+            return out;
+        };
+        for _ in 0..count.min(1024) {
+            let Some(len) = u32_at(&mut at) else { break };
+            let end = at + (len as usize) * 2;
+            let Some(slice) = bytes.get(at..end) else { break };
+            let units: Vec<u16> = slice
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            out.push(PathBuf::from(std::ffi::OsString::from_wide(&units)));
+            at = end;
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_wire_format_round_trips_paths() {
+            let paths = vec![PathBuf::from(r"C:\logs\app.log"), PathBuf::from(r"D:\ü\日本.txt")];
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+            for path in &paths {
+                let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+                bytes.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+                for unit in wide {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+            }
+            assert_eq!(decode(&bytes), paths);
+            assert!(decode(&bytes[..7]).is_empty(), "a truncated message yields nothing");
+            assert_eq!(decode(&[]).len(), 0);
+        }
+    }
+}
+
 /// A Save dialog for E21's export and tee. Modal like [`ask_for_file`], and dispatched the same way.
 fn ask_to_save(hwnd: HWND) -> Option<std::path::PathBuf> {
     let mut file = [0u16; 32_768];
@@ -4345,6 +4492,24 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     shell.poll_file(hwnd);
                 }
             });
+            LRESULT(0)
+        }
+        // §12.3: another instance handed its paths over — open each as a tab and come forward.
+        m if m == single::WM_HANDED_OFF => {
+            let paths: Vec<PathBuf> = single::INBOX
+                .lock()
+                .map(|mut inbox| std::mem::take(&mut *inbox))
+                .unwrap_or_default();
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    for path in paths {
+                        shell.open_path(hwnd, path);
+                    }
+                }
+            });
+            unsafe {
+                let _ = SetForegroundWindow(hwnd);
+            }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == SMOOTH_TIMER => {
@@ -4968,6 +5133,37 @@ fn main() -> Result<()> {
         }
         reading.push(spawn_open(move || Document::open(&path)));
     }
+    // §12.3: one instance per session. With paths to open and an instance already running — and
+    // no pipe on stdin, which cannot be forwarded — the paths are handed to it and this process
+    // exits 3. `--new-instance` opts out.
+    let new_instance = std::env::args_os().any(|a| a == "--new-instance");
+    let mut handoff: Vec<std::path::PathBuf> = Vec::new();
+    let mut skip = false;
+    for arg in std::env::args_os().skip(1) {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if let Some(text) = arg.to_str() {
+            if matches!(text, "-n" | "-c" | "-s" | "--sleep-interval" | "--pid") {
+                skip = true;
+                continue;
+            }
+            if text.starts_with('-') {
+                continue;
+            }
+        }
+        let path = std::path::PathBuf::from(&arg);
+        handoff.push(std::path::absolute(&path).unwrap_or(path));
+    }
+    let is_first = single::claim();
+    if !is_first && !new_instance && !handoff.is_empty() {
+        // A hand-off that fails — the other instance is closing, say — falls through to a window
+        // of our own, which is what the user asked for either way.
+        if single::hand_off(&handoff).is_ok() {
+            std::process::exit(3);
+        }
+    }
     // **No path, so look at the standard input handle** — §4.2. `FILE_TYPE_CHAR` is an
     // interactive console and §4.2 says "do not block": reading it would wait for a human to
     // type, which for a windowed application means a window that never appears.
@@ -5062,6 +5258,10 @@ fn main() -> Result<()> {
     unsafe {
         // §12's drop target: a file dropped on the window opens in it.
         DragAcceptFiles(hwnd, true);
+        // §12.3: from here on, a second `tailhawk file.log` lands in this window.
+        if is_first {
+            single::serve(hwnd.0 as isize);
+        }
         SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
         let _ = ShowWindow(
             hwnd,
