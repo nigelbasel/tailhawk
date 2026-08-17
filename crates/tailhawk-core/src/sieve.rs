@@ -40,6 +40,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use crate::filter::Chips;
 use crate::find::{Excerpt, Outcome};
+use crate::format::Format;
 use crate::indexer::ChunkReader;
 use crate::record::Record;
 use crate::search::{each_line, run_chunked, Cancel, SearchOptions};
@@ -96,6 +97,7 @@ impl Drop for Running {
 /// a caller keeps its own copy for the title and the next edit.
 pub fn start(
     chips: Chips,
+    format: Option<&'static Format>,
     members: Vec<Excerpt>,
     from: u64,
     to: u64,
@@ -107,7 +109,7 @@ pub fn start(
         let cancel = cancel.clone();
         std::thread::Builder::new()
             .name("tailhawk-filter".to_owned())
-            .spawn(move || run(chips, members, from, to, options, &cancel, &tx))
+            .spawn(move || run(chips, format, members, from..to, options, &cancel, &tx))
             .map_err(|e| crate::Error(format!("starting the filter worker: {e}")))?
     };
     Ok(Running {
@@ -120,9 +122,9 @@ pub fn start(
 /// The worker body: every member in row order, clipped to `[from, to)`, under one cancel flag.
 fn run(
     chips: Chips,
+    format: Option<&'static Format>,
     members: Vec<Excerpt>,
-    from: u64,
-    to: u64,
+    rows: std::ops::Range<u64>,
     options: SearchOptions,
     cancel: &Cancel,
     tx: &Sender<Update>,
@@ -135,13 +137,14 @@ fn run(
         }
         // The member's rows in set space are `first_row..first_row + lines`; clip to the range.
         let lines = member.index.line_count();
-        let begin = from.max(member.first_row);
-        let end = to.min(member.first_row.saturating_add(lines));
+        let begin = rows.start.max(member.first_row);
+        let end = rows.end.min(member.first_row.saturating_add(lines));
         if begin >= end {
             continue;
         }
         let sieve = Sieve {
             chips: &chips,
+            format,
             charset: member.charset,
             options,
             cancel: cancel.clone(),
@@ -178,6 +181,9 @@ fn shift(kept: &Kept, first_row: u64) -> Kept {
 /// One member's pass: the chips against every line of `[from, to)`, member-local rows.
 struct Sieve<'a> {
     chips: &'a Chips,
+    /// The detected format, when a chip names a field: `level >= Warning` needs the record, and
+    /// only a parse produces one. Text-only chips never pay for it.
+    format: Option<&'static Format>,
     charset: crate::encoding::Charset,
     options: SearchOptions,
     cancel: Cancel,
@@ -223,6 +229,12 @@ impl Sieve<'_> {
     ) -> Result<Kept> {
         let mut kept = Kept::default();
         let mut record = Record::unparsed(String::new());
+        let parse = self.format.filter(|_| {
+            self.chips
+                .chips
+                .iter()
+                .any(|c| !c.predicate.fields().is_empty())
+        });
         each_line(
             reader,
             self.charset,
@@ -231,9 +243,15 @@ impl Sieve<'_> {
             to,
             self.cancel.flag(),
             |line, text| {
-                record.raw.clear();
-                record.raw.push_str(text);
-                if self.chips.keeps(&record) {
+                let keeps = match parse.and_then(|f| f.parse(text)) {
+                    Some(parsed) => self.chips.keeps(&parsed),
+                    None => {
+                        record.raw.clear();
+                        record.raw.push_str(text);
+                        self.chips.keeps(&record)
+                    }
+                };
+                if keeps {
                     kept.rows.push(line);
                 }
                 kept.scanned += 1;
@@ -310,6 +328,7 @@ mod tests {
         let members = vec![excerpt(&path, text, 0)];
         let running = start(
             chips(&["error"], &["retrying"]),
+            None,
             members,
             0,
             5,
@@ -332,8 +351,15 @@ mod tests {
     fn no_chips_keeps_every_row() {
         let path = fixture("tailhawk_sieve_none.log");
         let members = vec![excerpt(&path, "a\nb\nc\n", 0)];
-        let running =
-            start(Chips::default(), members, 0, 3, SearchOptions::default()).expect("start");
+        let running = start(
+            Chips::default(),
+            None,
+            members,
+            0,
+            3,
+            SearchOptions::default(),
+        )
+        .expect("start");
         let (rows, _, outcome) = collect(&running);
         assert_eq!((rows, outcome), (vec![0, 1, 2], Outcome::Complete));
         let _ = std::fs::remove_file(&path);
@@ -349,8 +375,15 @@ mod tests {
             excerpt(&a, "x1\ny\nx2\n", 0),
             excerpt(&b, "x3\ny\ny\nx4\n", 3),
         ];
-        let running =
-            start(chips(&["x"], &[]), members, 0, 7, SearchOptions::default()).expect("start");
+        let running = start(
+            chips(&["x"], &[]),
+            None,
+            members,
+            0,
+            7,
+            SearchOptions::default(),
+        )
+        .expect("start");
         let (rows, scanned, _) = collect(&running);
         assert_eq!(rows, [0, 2, 3, 6]);
         assert_eq!(scanned, 7);
@@ -360,8 +393,15 @@ mod tests {
             excerpt(&a, "x1\ny\nx2\n", 0),
             excerpt(&b, "x3\ny\ny\nx4\n", 3),
         ];
-        let running =
-            start(chips(&["x"], &[]), members, 5, 7, SearchOptions::default()).expect("start");
+        let running = start(
+            chips(&["x"], &[]),
+            None,
+            members,
+            5,
+            7,
+            SearchOptions::default(),
+        )
+        .expect("start");
         let (rows, scanned, _) = collect(&running);
         assert_eq!(rows, [6]);
         assert_eq!(
@@ -381,6 +421,7 @@ mod tests {
         let members = vec![excerpt(&path, &text, 0)];
         let running = start(
             chips(&["row"], &[]),
+            None,
             members,
             0,
             1000,
@@ -422,6 +463,7 @@ mod tests {
         let members = vec![excerpt(&path, &text, 0)];
         let running = start(
             chips(&["row"], &[]),
+            None,
             members,
             0,
             200_000,
@@ -436,6 +478,47 @@ mod tests {
         let (_, scanned, outcome) = collect(&running);
         assert_eq!(outcome, Outcome::Cancelled);
         assert!(scanned < 200_000, "a cancelled pass did not read it all");
+        let _ = std::fs::remove_file(&path);
+    }
+    /// A chip that names a field — `level >= Warning` — evaluates against the parsed record when a
+    /// format is given, and to *unknown* (which an include chip drops) when it is not. §7.2's rule,
+    /// end to end through the pass.
+    #[test]
+    fn a_field_chip_needs_the_format_and_gets_it() {
+        let path = fixture("tailhawk_sieve_fields.log");
+        let text = "2026-08-16 09:14:02.117 +02:00 [INF] started\n\
+                    2026-08-16 09:14:03.884 +02:00 [ERR] failed\n\
+                    2026-08-16 09:14:04.002 +02:00 [WRN] retrying\n";
+        let serilog = crate::format::by_id("serilog-file").expect("catalogue");
+
+        let members = vec![excerpt(&path, text, 0)];
+        let running = start(
+            chips(&["level >= Warning"], &[]),
+            Some(serilog),
+            members,
+            0,
+            3,
+            SearchOptions::default(),
+        )
+        .expect("start");
+        let (rows, _, outcome) = collect(&running);
+        assert_eq!((rows, outcome), (vec![1, 2], Outcome::Complete));
+
+        let members = vec![excerpt(&path, text, 0)];
+        let running = start(
+            chips(&["level >= Warning"], &[]),
+            None,
+            members,
+            0,
+            3,
+            SearchOptions::default(),
+        )
+        .expect("start");
+        let (rows, _, _) = collect(&running);
+        assert!(
+            rows.is_empty(),
+            "with no format the field is unknown and an include drops all"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

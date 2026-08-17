@@ -253,8 +253,15 @@ fn the_filter_worker_streams_survivors_from_a_snapshot_of_ten_gigabytes() {
     };
 
     let began = Instant::now();
-    let running =
-        sieve::start(chips, vec![excerpt], 0, lines, SearchOptions::default()).expect("start");
+    let running = sieve::start(
+        chips,
+        None,
+        vec![excerpt],
+        0,
+        lines,
+        SearchOptions::default(),
+    )
+    .expect("start");
 
     let (mut rows, mut first_at, mut outcome, mut scanned) = (Vec::new(), None, None, 0u64);
     while outcome.is_none() {

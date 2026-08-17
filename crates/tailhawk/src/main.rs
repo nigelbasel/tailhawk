@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use tailhawk_core::detect::{self, Detection};
 use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::highlight::{Highlighter, Span};
@@ -115,6 +116,10 @@ struct Document {
     highlighter: Highlighter,
     /// The filter state and the derived row space it makes — §7.3. See [`Filtering`].
     filtering: Filtering,
+    /// What §6.3's detector made of the newest member's head — the format, if one was accepted,
+    /// the candidates if not. Run on the worker that opens the file, from the head sample only;
+    /// §6.3's mid and tail samples are not taken yet.
+    detection: Detection,
     /// The first frame goes to the tail. **A tail tool opens at the end** — `SPEC.md` §6.1: "for a
     /// tailing tool the tail is what the user cares about" — and `Grid::is_following` is derived from
     /// being at the bottom, so this is also what makes a freshly opened file follow. Cleared once
@@ -192,6 +197,7 @@ impl Document {
         // with its own encoding detection and index, and gives them one row space; a log with
         // nothing beside it comes back as a set of one, so there is no second path here.
         let set = LogSet::open(path).map_err(|e| format!("{name}: {e}"))?;
+        let detection = detect_set(&set);
 
         // **Only the name is fixed.** Everything else in the title -- the encoding, the membership,
         // the counts -- can change while the log is being followed, so `describe` formats them per
@@ -210,6 +216,7 @@ impl Document {
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
+            detection,
             open_at_tail: true,
             pump: None,
             stream_done: false,
@@ -232,6 +239,7 @@ impl Document {
     fn from_pipe() -> std::result::Result<Self, String> {
         let pump = Pump::start().map_err(|e| format!("stdin: {e}"))?;
         let set = LogSet::open_single(pump.path()).map_err(|e| format!("stdin: {e}"))?;
+        let detection = detect_set(&set);
         Ok(Self {
             view: View::new(1.0, 1.0),
             set,
@@ -245,6 +253,7 @@ impl Document {
             finder: Finder::default(),
             highlighter: Highlighter::new(semantic::catalogue()),
             filtering: Filtering::default(),
+            detection,
             open_at_tail: true,
             pump: Some(pump),
             stream_done: false,
@@ -354,8 +363,12 @@ impl Document {
         } else {
             ""
         };
+        let format = match self.detection.describe() {
+            Some(text) => format!(" · {text}"),
+            None => String::new(),
+        };
         format!(
-            "{find}{filter}{reveal}{}: {}{flag}{source}, {} lines, {} bytes",
+            "{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -511,6 +524,7 @@ impl Document {
         }
         match sieve::start(
             self.filtering.chips.clone(),
+            self.detection.accepted,
             self.set.snapshot(),
             from,
             total,
@@ -965,6 +979,15 @@ impl Finder {
             text.push_str(&format!(", {} lines too slow to search", self.truncated));
         }
         Some(text)
+    }
+}
+
+/// §6.3's detection over the newest member's head. On the worker that opens the file, so the
+/// 150 ms open budget is not the window thread's problem; a set with no members detects nothing.
+fn detect_set(set: &LogSet) -> Detection {
+    match set.snapshot().last() {
+        Some(newest) => detect::detect(&detect::head_lines(&*newest.file, newest.charset)),
+        None => detect::detect(&[]),
     }
 }
 
@@ -3062,6 +3085,43 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(doc.filtering.kept, [0], "started over on the new bytes");
+        let _ = std::fs::remove_file(&path);
+    }
+    /// §6.3 end to end: a Serilog file is detected on open, the title says so, and a field chip
+    /// — `level >= Warning` — filters through the parsed record. Before M6 that chip evaluated
+    /// to unknown on every row.
+    #[test]
+    fn a_detected_format_names_itself_and_makes_field_chips_work() {
+        let path = std::env::temp_dir().join("tailhawk_detect_test.log");
+        let text: String = (0..120)
+            .map(|i| {
+                let level = match i % 4 {
+                    0 => "ERR",
+                    1 => "WRN",
+                    _ => "INF",
+                };
+                format!(
+                    "2026-08-16 09:14:{:02}.117 +02:00 [{level}] line {i}\n",
+                    i % 60
+                )
+            })
+            .collect();
+        std::fs::write(&path, text).expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.detection.accepted.map(|f| f.id), Some("serilog-file"));
+        assert!(
+            doc.describe().contains("· Serilog (file) "),
+            "{}",
+            doc.describe()
+        );
+
+        filter_for(&mut doc, "level >= Warning", Polarity::Include);
+        assert_eq!(doc.filtering.outcome, Some(Outcome::Complete));
+        assert_eq!(doc.filtering.kept.len(), 60, "30 ERR + 30 WRN of 120");
+        assert_eq!(doc.filtering.kept[0], 0);
+        assert_eq!(doc.filtering.kept[1], 1);
+        assert_eq!(doc.filtering.kept[2], 4);
         let _ = std::fs::remove_file(&path);
     }
 }
