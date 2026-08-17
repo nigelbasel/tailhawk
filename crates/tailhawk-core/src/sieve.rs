@@ -95,9 +95,13 @@ impl Drop for Running {
 /// writer has appended since. Members whose rows fall entirely outside the range are skipped
 /// without a read; the rest are clipped to it. `chips` is moved to the worker: it is `Clone`, and
 /// a caller keeps its own copy for the title and the next edit.
+/// `records_only` keeps only lines the format calls first lines — §6.4's "continuations are
+/// collapsed" — composed with the chips: a row survives if it is a first line *and* the chips keep
+/// it. Without a format it means nothing and keeps everything.
 pub fn start(
     chips: Chips,
     format: Option<&'static Format>,
+    records_only: bool,
     members: Vec<Excerpt>,
     from: u64,
     to: u64,
@@ -109,7 +113,20 @@ pub fn start(
         let cancel = cancel.clone();
         std::thread::Builder::new()
             .name("tailhawk-filter".to_owned())
-            .spawn(move || run(chips, format, members, from..to, options, &cancel, &tx))
+            .spawn(move || {
+                run(
+                    Job {
+                        chips,
+                        format,
+                        records_only,
+                    },
+                    members,
+                    from..to,
+                    options,
+                    &cancel,
+                    &tx,
+                )
+            })
             .map_err(|e| crate::Error(format!("starting the filter worker: {e}")))?
     };
     Ok(Running {
@@ -120,9 +137,15 @@ pub fn start(
 }
 
 /// The worker body: every member in row order, clipped to `[from, to)`, under one cancel flag.
-fn run(
+/// What one pass evaluates every line against.
+struct Job {
     chips: Chips,
     format: Option<&'static Format>,
+    records_only: bool,
+}
+
+fn run(
+    job: Job,
     members: Vec<Excerpt>,
     rows: std::ops::Range<u64>,
     options: SearchOptions,
@@ -143,8 +166,9 @@ fn run(
             continue;
         }
         let sieve = Sieve {
-            chips: &chips,
-            format,
+            chips: &job.chips,
+            format: job.format,
+            records_only: job.records_only,
             charset: member.charset,
             options,
             cancel: cancel.clone(),
@@ -184,6 +208,8 @@ struct Sieve<'a> {
     /// The detected format, when a chip names a field: `level >= Warning` needs the record, and
     /// only a parse produces one. Text-only chips never pay for it.
     format: Option<&'static Format>,
+    /// §6.4's collapse: drop lines that are not first lines under `format`.
+    records_only: bool,
     charset: crate::encoding::Charset,
     options: SearchOptions,
     cancel: Cancel,
@@ -243,6 +269,10 @@ impl Sieve<'_> {
             to,
             self.cancel.flag(),
             |line, text| {
+                if self.records_only && self.format.is_some_and(|f| !f.is_first_line(text)) {
+                    kept.scanned += 1;
+                    return;
+                }
                 let keeps = match parse.and_then(|f| f.parse(text)) {
                     Some(parsed) => self.chips.keeps(&parsed),
                     None => {
@@ -329,6 +359,7 @@ mod tests {
         let running = start(
             chips(&["error"], &["retrying"]),
             None,
+            false,
             members,
             0,
             5,
@@ -354,6 +385,7 @@ mod tests {
         let running = start(
             Chips::default(),
             None,
+            false,
             members,
             0,
             3,
@@ -378,6 +410,7 @@ mod tests {
         let running = start(
             chips(&["x"], &[]),
             None,
+            false,
             members,
             0,
             7,
@@ -396,6 +429,7 @@ mod tests {
         let running = start(
             chips(&["x"], &[]),
             None,
+            false,
             members,
             5,
             7,
@@ -422,6 +456,7 @@ mod tests {
         let running = start(
             chips(&["row"], &[]),
             None,
+            false,
             members,
             0,
             1000,
@@ -464,6 +499,7 @@ mod tests {
         let running = start(
             chips(&["row"], &[]),
             None,
+            false,
             members,
             0,
             200_000,
@@ -495,6 +531,7 @@ mod tests {
         let running = start(
             chips(&["level >= Warning"], &[]),
             Some(serilog),
+            false,
             members,
             0,
             3,
@@ -508,6 +545,7 @@ mod tests {
         let running = start(
             chips(&["level >= Warning"], &[]),
             None,
+            false,
             members,
             0,
             3,

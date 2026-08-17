@@ -53,8 +53,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_BACK, VK_C, VK_CONTROL,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L, VK_LEFT, VK_NEXT, VK_O, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+    VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L, VK_LEFT, VK_NEXT, VK_O,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -590,6 +590,7 @@ impl Document {
         match sieve::start(
             self.filtering.chips.clone(),
             self.detection.accepted,
+            self.filtering.records_only,
             self.set.snapshot(),
             from,
             total,
@@ -1121,6 +1122,9 @@ fn push_typed_unit(text: &mut String, pending_high: &mut Option<u16>, unit: u16)
 #[derive(Default)]
 struct Filtering {
     chips: Chips,
+    /// §6.4's collapse: only first lines are rows, continuations hidden. A row space like the
+    /// chips', sieved by the same pass, so the two compose. Meaningless without a format.
+    records_only: bool,
     /// A chip being typed, and its polarity, or `None` when keystrokes are not going here.
     typing: Option<(Polarity, String)>,
     pending_high: Option<u16>,
@@ -1138,7 +1142,7 @@ struct Filtering {
 
 impl Filtering {
     fn active(&self) -> bool {
-        !self.chips.chips.is_empty()
+        !self.chips.chips.is_empty() || self.records_only
     }
 
     /// Forgets the survivors and stops the pass, keeping the chips — what a truncate needs.
@@ -1181,6 +1185,9 @@ impl Filtering {
             return Some(format!("▼ {error}"));
         }
         let mut text = String::new();
+        if self.records_only {
+            text.push_str(" ▤ records");
+        }
         for chip in &self.chips.chips {
             let sign = match chip.polarity {
                 Polarity::Include => '+',
@@ -1702,12 +1709,32 @@ impl Shell {
         }
         // `Ctrl+O` is not here: the dialog pumps messages and `wndproc` would re-enter `STATE`
         // while this borrow is held. It is dispatched before the borrow, in `wndproc`.
-        if key != VK_I.0 {
-            return false;
-        }
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
+        if key == VK_E.0 {
+            // §6.4's collapse, as a toggle: only with a format, since only a format knows what a
+            // first line is. Provisional binding, like `Ctrl+I`.
+            if doc.detection.accepted.is_none() {
+                return true;
+            }
+            doc.filtering.records_only = !doc.filtering.records_only;
+            doc.filtering.clear_results();
+            doc.refilter();
+            {
+                let rows = doc.view_rows();
+                doc.view.grid_mut().set_total_rows(rows);
+            }
+            self.sync_scrollbar(hwnd);
+            self.retitle(hwnd);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return true;
+        }
+        if key != VK_I.0 {
+            return false;
+        }
         let cells = doc.view.cells_mut();
         cells.reveal_invisibles = !cells.reveal_invisibles;
         self.retitle(hwnd);
@@ -3210,6 +3237,48 @@ mod tests {
         assert_eq!(doc.filtering.kept[0], 0);
         assert_eq!(doc.filtering.kept[1], 1);
         assert_eq!(doc.filtering.kept[2], 4);
+        let _ = std::fs::remove_file(&path);
+    }
+    /// §6.4's collapse: with `records_only`, continuations leave the row space and the record's
+    /// first lines remain — composed with a chip when there is one.
+    #[test]
+    fn collapsing_hides_continuations_and_composes_with_a_chip() {
+        let path = std::env::temp_dir().join("tailhawk_collapse_test.log");
+        std::fs::write(
+            &path,
+            "2026-08-16 09:14:02.117 +02:00 [INF] Started\n\
+             2026-08-16 09:14:03.884 +02:00 [ERR] Failed to dispatch job 41982\n\
+             System.InvalidOperationException: boom\n\
+                at Api.Dispatch.Run() in Dispatch.cs:line 42\n\
+             2026-08-16 09:14:04.002 +02:00 [WRN] Retry 1/3 for job 41982\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.detection.accepted.map(|f| f.id), Some("serilog-file"));
+
+        doc.filtering.records_only = true;
+        doc.filtering.clear_results();
+        doc.refilter();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+            doc.poll_filter();
+            std::thread::yield_now();
+        }
+        doc.poll_filter();
+        assert_eq!(
+            doc.filtering.kept,
+            [0, 1, 4],
+            "three records, two frames hidden"
+        );
+        assert!(doc.describe().contains("▤ records"), "{}", doc.describe());
+
+        filter_for(&mut doc, "job", Polarity::Include);
+        assert_eq!(
+            doc.filtering.kept,
+            [1, 4],
+            "the chip composes with the collapse"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
