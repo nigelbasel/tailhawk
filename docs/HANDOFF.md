@@ -24,8 +24,11 @@ template in the app's own config beside the log is compiled and used.
 click to focus, caret, selection, clipboard, undo, IME; `Ctrl+F` / `Ctrl+L` focus them; a click on a
 chip removes it.
 
-**Missing before daily use is comfortable:** no tabs (one file per window), no split view, no menus,
-no chip toggle/edit/reorder, no column resize/reorder/hide; no settings or persistence; no
+**Tabs:** several files in one window (`Ctrl+O` / drop open a new tab, `Ctrl+Tab` switches, `Ctrl+W`
+closes).
+
+**Missing before daily use is comfortable:** no split view, no menus, no chip toggle/edit/reorder,
+no column resize/reorder/hide; no settings or persistence; no
 user highlight-rules editor or format wizard; no installer or signing.
 
 **After that:** CLI flags (`-n`, `-f`, `--filter`), RDP-friendly rendering, UI Automation, docs and
@@ -50,8 +53,10 @@ the ship work. In plan terms that is M6 (structure), M7 (shell), M7b, M8, M9.
 `▸`; a click on a chip *removes* it — §5's toggle, reorder and edit are not there; no `.*` toggle on
 the find field (the query is always a regex); the disambiguation chip is bar text.
 
-**Next in M7:** **V7** tabs (several documents, `Ctrl+Tab`, `Ctrl+W`); chip toggle/edit; **V13**
-theming; **E19** watched folders; V10 detail pane; V12 pointer scroll; V15 UIA; E20–E22, E27; V9.
+| **V7 tabs** — several documents; `Ctrl+O` / drop open a new one; `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+W`; a strip above the bar when there are two, click to switch; every tab keeps following | `Tabs` in `main.rs` | headless: three tabs, the shown one lighter |
+
+**Next in M7:** chip toggle/edit (a click toggles, not removes); drag-reorder and drag-out-to-split;
+**V13** theming; **E19** watched folders; V10 detail pane; V12 pointer scroll; V15 UIA; E20–E22, E27; V9.
 
 ---
 
