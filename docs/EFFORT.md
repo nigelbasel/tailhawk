@@ -39,7 +39,8 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-13 | ² | ² | 12 | Follow, rotation by identity, scrollbar, selection wiring, activity log |
 | 2026-08-14 | ² | ² | 19 | M4 finished (follow tick, E30, E16, off-thread scan); M5 E26, E15, E13, MODE_SOLID |
 | 2026-08-16 | 1.2⁴ | 287 k⁴ | 6 | Search wired to the UI: the span pass, `find.rs`, the keys, the 10 GB worker criterion |
-| **Total** | **~37.1** | **~7.3 M** | **133**³ | **M0–M4, plus 6 of M5's 10 items** |
+| 2026-08-17 | 1.2⁴ | 285 k⁴ | 6 | The find harness run at last; E23 catalogue + derived colours, wired beneath matches, on screen; E14 library half — `sieve.rs`, the shared pass, the 10 GB filter criterion |
+| **Total** | **~38.3** | **~7.6 M** | **139**³ | **M0–M4, plus 7 of M5's 10 items and half of an eighth** |
 
 ⁴ **Measured while the session was still running**, so it is a floor rather than a total — 710 turns
 between 14:31 and 15:49, by the method above. Recorded now rather than at the end because the last

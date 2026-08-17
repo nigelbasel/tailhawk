@@ -6,7 +6,7 @@
 outstanding item — `verify-find.ps1` had never run, because the agent's shell had no desktop — ran
 this session and passed: `1 of 4` in the title, the current match painted orange on screen. Then
 E23: `semantic.rs`, §7.1's zero-config layer, wired beneath the search's matches and reaching pixels.
-**7 of M5's 10 items.**
+Then the library half of E14, measured on 10 GB. **7 of M5's 10 items, and half of the eighth.**
 
 | | |
 |---|---|
@@ -64,14 +64,59 @@ file, so `PgUp` scrolls nothing — that cost one run.
 The find harness also gained DPI awareness (the capture was landing on the desktop beside the
 window on a scaled display) and a wait for the foreground it types into.
 
-### Where M5 stands, and the next thing
+### E14, the library half — `sieve.rs`, and 10 GB through it
 
-**7 of 10:** off-thread work, E26, E15, E13, E23, `MODE_SOLID`, verification. **Left:** **E14** —
-the filter sub-view, §7.3, three of the owner's five daily features and the largest remaining
-piece: a `find.rs`-shaped pass streaming surviving row numbers, a derived row space the view maps
-through, growth sieved on the worker as it arrives, `Ctrl+L` / `Ctrl+Shift+L` typed like the find
-query since there is no chip row until M7; **E24** ANSI/bidi/reveal-invisibles; **V5** columns,
-still without a producer until M6's detection. The command bar is M7's widget layer.
+Started after E23 landed, and split the way search was split across sessions 16 and 17: **the pass
+on a worker is done and measured; the derived row space in the shell is next.**
+
+| | |
+|---|---|
+| The pass | `sieve.rs` — `find.rs`'s shape: an `Excerpt` per member, one worker, `Update::Chunk(Kept)` / `Finished(Outcome)` on a channel, cancellable, joined on drop. **Streams the set-wide row numbers that survive the chips**, clipped to a row range `[from, to)` |
+| The shared machinery | `search::run_chunked` (chunk scheduling, work-stealing counter, cancel between chunks, report-before-merge) and `search::each_line` (one `offset_of_line`, forward read, decode) — factored out of `Search::run`, which now uses them too |
+| **10.74 GB, through the worker** | **first survivor 0.117 s, whole pass 7.463 s (1439 MB/s)**, all 114,230,003 lines evaluated against two includes and one exclude, exactly the two canaries survive. `tests/search_criterion.rs`, `--ignored` |
+| A bug the refactor found | **`Search::run` never searched the unterminated last line** — the decoder held it and nothing called `finish`. `each_line` does; `the_unterminated_last_line_is_searched` fails on the old code (scanned 1 of 2) and passes now |
+| A cost the pass found | `Predicate::Text` lower-cased the *whole row* per evaluation — an allocation and a fold per line per chip, i.e. the cost of the pass. It now compiles its needle once as a case-insensitive literal `regex` and touches nothing but the row |
+
+Two decisions are argued in the module note: **surviving row numbers rather than a bitmap**, because
+the consumer needs "the *k*-th survivor" and a sorted `Vec<u64>` maintained by splice is what
+`find.rs`'s match list already is (a bitmap-with-rank is the named fallback if a measurement says
+80 MB at 10 % of 100 M lines is too much); and **rows appended after the snapshot are sieved by the
+same worker over a range**, never on the window thread, because §11.3 governs a follow tick as much
+as a frame.
+
+### ⛔ The next thing, precisely: the derived row space in the shell
+
+`sieve.rs` is a library and nothing calls it. What the shell needs, in the order to build it:
+
+1. **A scattered fetch.** `Rows` serves a contiguous window keyed by `(first, count, …)`; a
+   hide-non-matching view shows rows `kept[k..k+n]`, which are anywhere. Give `Rows` a row *list*
+   (`Vec<u64>`, sorted; contiguous fetch fills it as `first..first+n`; `line(row)` becomes a binary
+   search) and a `fetch_rows(reader, index, &[u64], anchored)` that does one `offset_of_line` and one
+   read per row; then `LogSet::fetch_rows(&[u64], anchored)` splitting by member the way `fetch` does.
+   Fifty rows a frame, only when the viewport moves — the cache key still applies. **If that is slow,
+   have the sieve carry byte offsets alongside rows** (16 bytes a survivor) so the fetch skips the
+   index walk; do not guess, measure with the frame instrument.
+2. **`Filtering` in `Document`**, alongside `Finder`: the `Chips`, the running `sieve::Running`, the
+   sorted `kept: Vec<u64>` maintained by `partition_point` + splice as `Finder::absorb` does, the
+   scanned count and outcome for the title. `lay_out` sets the grid's total to `kept.len()` when
+   chips exist and fetches `kept[visible]`; `row_text` / `row_anchors` / `row_spans` map view row →
+   `kept[row]` first. **Matches are real rows** — `finder.spans(kept[row], …)`, and `find_step`'s
+   `show_row` must land on the *view* row (`kept.partition_point`), skipping hidden matches or not
+   (decide, and say which; hiding a match the user stepped to is the surprising choice).
+3. **Growth.** In `poll_follow`, when the total grows from `a` to `b` and chips exist,
+   `sieve::start(chips, snapshot, a, b, …)` — a second `Running`, or a queue of ranges — and splice
+   what it returns. A truncate or retirement drops `kept` and re-runs over everything, as it drops
+   the matches. Following stays following: "at the bottom" is now the bottom of `kept`.
+4. **Keys**, per `UI-DESIGN.md` §12: `Ctrl+L` types an *include* chip into the window as `Ctrl+F`
+   types the query, `Ctrl+Shift+L` an *exclude*, `Enter` adds it and starts the pass, `Esc` clears the
+   chips. The title shows them — `▼ +timeout −DEBUG · 1,204 of 20,000 · scanning 62%` — as the find
+   fragment does. Record the "no chip row until M7" deviation in `CLEANROOM.md` as the find bar's was.
+5. **`tools/verify-filter.ps1`** on `Screen.ps1`: type a chip, count the rows on screen (every row
+   should carry the include's colour or text), read the title's count. Then §7.3's *split view* mode
+   is a second pane and belongs with M7's panes; **in-place hide is the mode to ship in M5**.
+
+After E14: **E24** ANSI/bidi/reveal-invisibles; **V5** columns, still without a producer until M6's
+detection. The command bar is M7's widget layer.
 
 ---
 
