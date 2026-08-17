@@ -916,6 +916,12 @@ impl Document {
                 .iter()
                 .map(|(n, text)| format!("{n}:{text}"))
                 .collect(),
+            columns: match (&self.layout, &self.column_defaults) {
+                (Some(layout), Some(defaults)) if &layout.widths != defaults => {
+                    layout.widths.iter().map(|&w| w as u64).collect()
+                }
+                _ => Vec::new(),
+            },
         })
     }
 
@@ -935,6 +941,14 @@ impl Document {
         self.filtering.records_only = state.collapse && self.detection.accepted.is_some();
         self.filtering.error = None;
         self.bookmarks.extend(state.bookmarks.iter().copied());
+        if !state.columns.is_empty() {
+            if let Some(layout) = self.layout.as_mut() {
+                if state.columns.len() == layout.widths.len() {
+                    layout.widths = state.columns.iter().map(|&w| w as usize).collect();
+                    self.header = Some(layout.header());
+                }
+            }
+        }
         for label in &state.labels {
             if let Some((n, text)) = label.split_once(':') {
                 if let Ok(n) = n.parse::<u8>() {
@@ -3071,6 +3085,7 @@ impl Shell {
                             collapse: false,
                             bookmarks: Vec::new(),
                             labels: Vec::new(),
+                            columns: Vec::new(),
                         });
                     }
                     let key = document

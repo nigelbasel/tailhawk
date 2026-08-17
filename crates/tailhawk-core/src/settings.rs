@@ -49,6 +49,8 @@ pub struct FileState {
     pub bookmarks: Vec<u64>,
     /// The colour labels, each `n:text` — the digit key and the literal it marks.
     pub labels: Vec<String>,
+    /// Column widths in cells after the user resized them; empty means the measured widths.
+    pub columns: Vec<u64>,
 }
 
 /// Everything persisted.
@@ -77,6 +79,7 @@ impl Settings {
             || state.collapse
             || !state.bookmarks.is_empty()
             || !state.labels.is_empty()
+            || !state.columns.is_empty()
         {
             self.files.push(state);
         }
@@ -210,6 +213,12 @@ impl Settings {
                                     .collect()
                             }
                             "labels" => f.labels = array(value),
+                            "columns" => {
+                                f.columns = array(value)
+                                    .iter()
+                                    .filter_map(|v| v.parse().ok())
+                                    .collect()
+                            }
                             _ => {}
                         }
                     }
@@ -397,6 +406,7 @@ mod tests {
             collapse: true,
             bookmarks: vec![0, 42, 1_000_000],
             labels: vec!["1:Exception".to_owned(), "9:a \"quoted\" one".to_owned()],
+            columns: vec![19, 5, 0],
         });
         s.set_file(FileState {
             path: r"C:\logs\other.log".to_owned(),
@@ -404,6 +414,7 @@ mod tests {
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
+            columns: Vec::new(),
         });
         s
     }
@@ -430,6 +441,7 @@ mod tests {
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
+            columns: Vec::new(),
         });
         assert!(s.file(r"C:\logs\app.log").is_none());
         s.set_file(FileState {
@@ -438,6 +450,7 @@ mod tests {
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
+            columns: Vec::new(),
         });
         assert_eq!(s.files.len(), 1, "case-insensitive path replaces");
         assert_eq!(s.file(r"C:\logs\other.log").unwrap().chips, ["+x"]);
@@ -479,6 +492,7 @@ mod tests {
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
+            columns: Vec::new(),
         });
         std::fs::create_dir_all(tiers[1].parent().unwrap()).unwrap();
         std::fs::write(&tiers[1], personal.to_toml()).unwrap();
@@ -492,6 +506,7 @@ mod tests {
             collapse: true,
             bookmarks: Vec::new(),
             labels: Vec::new(),
+            columns: Vec::new(),
         });
         curated.set_file(FileState {
             path: "b.log".into(),
@@ -499,6 +514,7 @@ mod tests {
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
+            columns: Vec::new(),
         });
         std::fs::write(&tiers[0], curated.to_toml()).unwrap();
         let merged = load(&tiers);
