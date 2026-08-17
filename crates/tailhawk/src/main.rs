@@ -135,6 +135,9 @@ struct Document {
     /// The status bar's text — the title's status, set by the shell before each frame so the
     /// document can draw it in the footer band. The title keeps it too: the harnesses read it there.
     status: String,
+    /// §8.1's per-tab change indication: this document grew while another tab was shown. Set by
+    /// the shell on the follow tick, cleared when the tab is shown, drawn as a dot on its tab.
+    unseen: bool,
     /// What §6.3's detector made of the newest member's head — the format, if one was accepted,
     /// the candidates if not. Run on the worker that opens the file, from the head sample only;
     /// §6.3's mid and tail samples are not taken yet.
@@ -443,6 +446,7 @@ impl Document {
             chrome: Chrome::default(),
             tab_strip: (Vec::new(), 0),
             status: String::new(),
+            unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -486,6 +490,7 @@ impl Document {
             chrome: Chrome::default(),
             tab_strip: (Vec::new(), 0),
             status: String::new(),
+            unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
             layout,
@@ -1583,9 +1588,102 @@ impl Tabs {
         self.docs.len()
     }
 
-    /// The tab strip's labels — each document's file name — and which is active, for drawing.
-    fn labels(&self) -> Vec<String> {
-        self.docs.iter().map(|d| d.summary.clone()).collect()
+    /// The tab strip's labels — each document's file name, with §8.1's dot when it grew unseen —
+    /// and which is active, for drawing. Asking clears the shown tab's dot: it is being seen.
+    fn labels(&mut self) -> Vec<String> {
+        let active = self.active;
+        if let Some(doc) = self.docs.get_mut(active) {
+            doc.unseen = false;
+        }
+        self.docs
+            .iter()
+            .map(|d| {
+                if d.unseen {
+                    format!("● {}", d.summary)
+                } else {
+                    d.summary.clone()
+                }
+            })
+            .collect()
+    }
+}
+
+/// A watched folder — §8.1: "a directory plus a glob; new matching files are adopted as they
+/// appear." The glob is the simple kind a shell offers: `*` and `?` in a file name.
+struct Watch {
+    dir: std::path::PathBuf,
+    /// A file-name pattern such as `*.log`; `*` alone matches everything.
+    pattern: String,
+    /// Files already adopted (or seen at start), so a scan opens only what is new.
+    known: std::collections::HashSet<std::path::PathBuf>,
+}
+
+/// Follow ticks between folder scans: 2 s at 100 ms — a directory listing is not a length check.
+const WATCH_EVERY_TICKS: u64 = 20;
+
+impl Watch {
+    /// From a command-line argument: a directory (glob `*.log`), or `dir\*.txt`-style. `None` if
+    /// the argument is neither.
+    fn from_arg(arg: &std::path::Path) -> Option<Self> {
+        if arg.is_dir() {
+            return Some(Self {
+                dir: arg.to_path_buf(),
+                pattern: "*.log".to_owned(),
+                known: std::collections::HashSet::new(),
+            });
+        }
+        let name = arg.file_name()?.to_string_lossy().into_owned();
+        if !name.contains(['*', '?']) {
+            return None;
+        }
+        let dir = arg.parent().filter(|p| !p.as_os_str().is_empty())?;
+        dir.is_dir().then(|| Self {
+            dir: dir.to_path_buf(),
+            pattern: name,
+            known: std::collections::HashSet::new(),
+        })
+    }
+
+    fn matches(pattern: &str, name: &str) -> bool {
+        fn go(p: &[char], n: &[char]) -> bool {
+            match (p.first(), n.first()) {
+                (None, None) => true,
+                (Some('*'), _) => go(&p[1..], n) || (!n.is_empty() && go(p, &n[1..])),
+                (Some('?'), Some(_)) => go(&p[1..], &n[1..]),
+                (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => go(&p[1..], &n[1..]),
+                _ => false,
+            }
+        }
+        let p: Vec<char> = pattern.chars().collect();
+        let n: Vec<char> = name.chars().collect();
+        go(&p, &n)
+    }
+
+    /// The matching files not yet known, oldest first by modification time, and marks them known.
+    fn new_files(&mut self) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut fresh: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                let name = path.file_name()?.to_string_lossy().into_owned();
+                if !path.is_file() || !Self::matches(&self.pattern, &name) {
+                    return None;
+                }
+                if self.known.contains(&path) {
+                    return None;
+                }
+                let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+                Some((modified, path))
+            })
+            .collect();
+        fresh.sort();
+        for (_, path) in &fresh {
+            self.known.insert(path.clone());
+        }
+        fresh.into_iter().map(|(_, p)| p).collect()
     }
 }
 
@@ -1693,7 +1791,13 @@ struct Shell {
     /// What the two workers have reported so far. Either can land first, so the title is rebuilt
     /// from both rather than written by whichever finishes.
     driver: Option<String>,
-    reading: Option<Receiver<std::result::Result<Document, String>>>,
+    /// Files being opened on workers — one receiver each. Several at once is a file set from the
+    /// command line or a watched folder adopting new files (§8.1).
+    reading: Vec<Receiver<std::result::Result<Document, String>>>,
+    /// Watched folders — a directory and a glob; new matching files are adopted as tabs as they
+    /// appear (§8.1). Scanned on the follow tick, every [`WATCH_EVERY_TICKS`].
+    watching: Vec<Watch>,
+    ticks: u64,
     file: Option<String>,
     document: Tabs,
     /// Set by [`Shell::paint`] when the frame rasterised glyphs, and acted on by `WM_PAINT` **after**
@@ -1807,36 +1911,38 @@ impl Shell {
     }
 
     fn poll_file(&mut self, hwnd: HWND) {
-        let Some(rx) = self.reading.as_ref() else {
+        let mut landed = false;
+        let mut i = 0;
+        while i < self.reading.len() {
+            match self.reading[i].try_recv() {
+                Ok(Ok(document)) => {
+                    self.reading.remove(i);
+                    self.file = Some(document.describe());
+                    self.document.push(document);
+                    landed = true;
+                }
+                Ok(Err(e)) => {
+                    self.reading.remove(i);
+                    self.file = Some(e);
+                    landed = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.reading.remove(i);
+                    self.file = Some("read failed".to_owned());
+                    landed = true;
+                }
+                Err(TryRecvError::Empty) => i += 1,
+            }
+        }
+        if !landed {
             return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(document)) => {
-                self.reading = None;
-                self.file = Some(document.describe());
-                self.document.push(document);
-                self.refresh_title(hwnd);
-                // Tailing starts the moment there is something to tail.
-                unsafe {
-                    SetTimer(hwnd, FOLLOW_TIMER, FOLLOW_POLL_MS, None);
-                }
-                // The file only becomes visible on the next frame, and nothing else will ask for
-                // one — the window is otherwise idle once the device has landed.
-                unsafe {
-                    let _ = InvalidateRect(hwnd, None, false);
-                }
-            }
-            Ok(Err(e)) => {
-                self.reading = None;
-                self.file = Some(e);
-                self.refresh_title(hwnd);
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.reading = None;
-                self.file = Some("read failed".to_owned());
-                self.refresh_title(hwnd);
-            }
-            Err(TryRecvError::Empty) => {}
+        }
+        self.refresh_title(hwnd);
+        // Tailing starts the moment there is something to tail; and the file only becomes visible
+        // on the next frame, which nothing else will ask for — the window is otherwise idle.
+        unsafe {
+            SetTimer(hwnd, FOLLOW_TIMER, FOLLOW_POLL_MS, None);
+            let _ = InvalidateRect(hwnd, None, false);
         }
     }
 
@@ -1873,7 +1979,7 @@ impl Shell {
             format!("Tailhawk — {status}")
         };
         set_title(hwnd, &title);
-        if self.pending.is_none() && self.reading.is_none() {
+        if self.pending.is_none() && self.reading.is_empty() {
             stop_polling(hwnd);
         }
     }
@@ -2142,7 +2248,7 @@ impl Shell {
     /// index and a window that went blank without a word would look hung.
     fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
         self.file = Some(format!("opening {}…", path.display()));
-        self.reading = Some(spawn_open(move || Document::open(&path)));
+        self.reading.push(spawn_open(move || Document::open(&path)));
         self.refresh_title(hwnd);
         unsafe {
             SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
@@ -2751,6 +2857,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // tick just takes several ticks to catch up, which is §11.3's requirement — the UI stays
             // responsive, not every append lands in one go.
             // Every tab follows, so switching to one is not a jump; only the shown one repaints.
+            // A tab that grew while not shown gets §8.1's dot. Watched folders are scanned every
+            // WATCH_EVERY_TICKS and adopt what is new as tabs.
             let grew = STATE.with(|s| {
                 let mut state = s.borrow_mut();
                 let Some(shell) = state.as_mut() else {
@@ -2759,8 +2867,30 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let active = shell.document.active;
                 let mut shown_grew = false;
                 for (i, doc) in shell.document.docs.iter_mut().enumerate() {
-                    if doc.poll_follow() && i == active {
-                        shown_grew = true;
+                    if doc.poll_follow() {
+                        if i == active {
+                            shown_grew = true;
+                        } else {
+                            doc.unseen = true;
+                        }
+                    }
+                }
+                shell.ticks += 1;
+                if shell.ticks % WATCH_EVERY_TICKS == 0 {
+                    let fresh: Vec<std::path::PathBuf> = shell
+                        .watching
+                        .iter_mut()
+                        .flat_map(Watch::new_files)
+                        .collect();
+                    for path in fresh {
+                        shell
+                            .reading
+                            .push(spawn_open(move || Document::open(&path)));
+                    }
+                    if !shell.reading.is_empty() {
+                        unsafe {
+                            SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
+                        }
                     }
                 }
                 shown_grew
@@ -3178,21 +3308,34 @@ fn main() -> Result<()> {
     // cheap — it lists `%TEMP%` once and only touches names this product produces.
     let _ = reap_orphans();
 
-    let reading = match std::env::args_os().nth(1) {
-        // `-` is the conventional name for the standard input stream, and `PLAN.md`'s M4
-        // done-criterion spells the command out: `docker logs -f svc | tailhawk -`. It is not part
-        // of §12.2's option surface — it is a *path* that by convention names the stream — so
-        // honouring it now is not a guess at the flag design that lands at M8.
-        Some(arg) if arg == "-" => Some(spawn_open(Document::from_pipe)),
-        Some(arg) => Some(spawn_open(move || {
-            Document::open(std::path::Path::new(&arg))
-        })),
-        // **No path, so look at the standard input handle** — §4.2. `FILE_TYPE_CHAR` is an
-        // interactive console and §4.2 says "do not block": reading it would wait for a human to
-        // type, which for a windowed application means a window that never appears.
-        None if stdin_kind().readable() => Some(spawn_open(Document::from_pipe)),
-        None => None,
-    };
+    // Every positional argument opens — a file set from the command line, §8.1 — and a directory
+    // or a `dir\*.log` glob is a watched folder: its matching files open now and new ones are
+    // adopted as they appear. `-` is the standard input stream by convention.
+    let mut reading = Vec::new();
+    let mut watching = Vec::new();
+    let mut any_arg = false;
+    for arg in std::env::args_os().skip(1) {
+        any_arg = true;
+        if arg == "-" {
+            reading.push(spawn_open(Document::from_pipe));
+            continue;
+        }
+        let path = std::path::PathBuf::from(&arg);
+        if let Some(mut watch) = Watch::from_arg(&path) {
+            for file in watch.new_files() {
+                reading.push(spawn_open(move || Document::open(&file)));
+            }
+            watching.push(watch);
+            continue;
+        }
+        reading.push(spawn_open(move || Document::open(&path)));
+    }
+    // **No path, so look at the standard input handle** — §4.2. `FILE_TYPE_CHAR` is an
+    // interactive console and §4.2 says "do not block": reading it would wait for a human to
+    // type, which for a windowed application means a window that never appears.
+    if !any_arg && stdin_kind().readable() {
+        reading.push(spawn_open(Document::from_pipe));
+    }
 
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let class_name = windows::core::w!("TailhawkMain");
@@ -3226,7 +3369,8 @@ fn main() -> Result<()> {
             pending: Some(rx),
             driver: None,
             reading,
-
+            watching,
+            ticks: 0,
             document: Tabs::default(),
 
             needs_frame: false,
@@ -4286,5 +4430,42 @@ mod tests {
         assert!(!tabs.close_active(), "closing nothing is not an error");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+    /// §8.1's watched folder: a directory plus a glob; what matches now is opened, what appears
+    /// later is adopted, and nothing is adopted twice.
+    #[test]
+    fn a_watched_folder_adopts_new_matching_files_once() {
+        assert!(Watch::matches("*.log", "app.log"));
+        assert!(
+            Watch::matches("*.LOG", "app.log"),
+            "case-insensitive, as Windows names are"
+        );
+        assert!(Watch::matches("app-??.log", "app-01.log"));
+        assert!(!Watch::matches("*.log", "app.txt"));
+        assert!(!Watch::matches("app-??.log", "app-1.log"));
+
+        let dir = std::env::temp_dir().join("tailhawk-watch-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("a.log"), "one\n").expect("a");
+        std::fs::write(dir.join("notes.txt"), "no\n").expect("txt");
+        let mut watch = Watch::from_arg(&dir).expect("a directory is a watch");
+        assert_eq!(watch.pattern, "*.log");
+        let first = watch.new_files();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].ends_with("a.log"));
+        assert!(watch.new_files().is_empty(), "nothing new");
+        std::fs::write(dir.join("b.log"), "two\n").expect("b");
+        let next = watch.new_files();
+        assert_eq!(next.len(), 1);
+        assert!(next[0].ends_with("b.log"));
+
+        let glob = Watch::from_arg(&dir.join("*.txt")).expect("a glob is a watch");
+        assert_eq!(glob.pattern, "*.txt");
+        assert!(
+            Watch::from_arg(&dir.join("a.log")).is_none(),
+            "a plain file is not"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
