@@ -2947,6 +2947,8 @@ struct Shell {
     rules_tiers: Vec<PathBuf>,
     /// The rules that did not compile, by name — shown in the status bar.
     rules_failed: Vec<String>,
+    /// §14's first-run surface, kept while it is shown so a click on a recent file can be resolved.
+    welcome: Option<Welcome>,
     /// A tab or a chip being dragged to a new place — `UI-DESIGN.md` §2.1 / §5 — from its index.
     dragging_bar: Option<(BarDrag, usize)>,
     /// How long recent frames took. See [`Frames`].
@@ -3210,9 +3212,25 @@ impl Shell {
             .attach(WindowHandle(hwnd.0 as isize), w, h)
             .and_then(|()| {
                 if pane_count == 0 {
-                    // No file yet: the background, which is all M1 ever drew.
-                    return renderer.paint();
+                    // No file yet: §14's first-run surface, the recent files on it.
+                    let cell = renderer.cell()?;
+                    self.cell_w = cell.0;
+                    self.cell_h = cell.1;
+                    let recent: Vec<String> = self
+                        .settings
+                        .files
+                        .iter()
+                        .rev()
+                        .take(6)
+                        .map(|f| f.path.clone())
+                        .collect();
+                    let welcome = Welcome::new(cell, (w, h), &recent);
+                    let laid = renderer.paint_rows(&welcome.view, &welcome)?;
+                    rasterised = laid.rasterised;
+                    self.welcome = Some(welcome);
+                    return Ok(());
                 }
+                self.welcome = None;
                 // **The metrics come from the measured face every frame, not once.** §3.1 requires
                 // integer cell advances re-derived at the current scale, and a DPI change between
                 // frames is exactly the case a cached cell would get wrong.
@@ -4383,6 +4401,80 @@ fn set_title(hwnd: HWND, title: &str) {
 
 /// The system open dialog. Modal on the window thread, which is what it is; the follow tick and
 /// the paint keep running underneath it because it pumps our messages too.
+/// `UI-DESIGN.md` §14's first-run surface: what the window shows with no file — a line of
+/// welcome, how to open one, the recent files (a click opens one), and the claim §13.2 makes.
+/// Drawn by the same painter as a document, as rows of centred text.
+struct Welcome {
+    lines: Vec<String>,
+    /// The path a row opens when clicked, for the "Recent" rows.
+    opens: Vec<Option<PathBuf>>,
+    view: View,
+}
+
+impl Welcome {
+    /// Composes the surface for a client `width_cells` wide, listing the newest `recent` files.
+    fn new(cell: (f32, f32), size: (u32, u32), recent: &[String]) -> Self {
+        let (cell_w, row_h) = cell;
+        let width_cells = ((size.0 as f32) / cell_w.max(1.0)).max(20.0) as usize;
+        let centre = |text: &str| {
+            let pad = width_cells.saturating_sub(text.chars().count()) / 2;
+            format!("{}{}", " ".repeat(pad), text)
+        };
+        let left = |text: &str| format!("{}{}", " ".repeat(width_cells / 6), text);
+        let mut lines = Vec::new();
+        let mut opens = Vec::new();
+        let rows_high = ((size.1 as f32) / row_h.max(1.0)) as usize;
+        let top_gap = rows_high.saturating_sub(10 + recent.len()) / 3;
+        for _ in 0..top_gap {
+            lines.push(String::new());
+            opens.push(None);
+        }
+        for text in [
+            "Watch your logs like a hawk",
+            "",
+            "Drop a log file here, or press Ctrl+O   (once a file is open, Ctrl+K lists every command)",
+            "",
+        ] {
+            lines.push(centre(text));
+            opens.push(None);
+        }
+        if !recent.is_empty() {
+            lines.push(left("Recent"));
+            opens.push(None);
+            for path in recent {
+                lines.push(left(&format!("  {path}")));
+                opens.push(Some(PathBuf::from(path)));
+            }
+            lines.push(String::new());
+            opens.push(None);
+        }
+        lines.push(centre("Tailhawk never phones home: no telemetry, no update ping, no fetch of any kind."));
+        opens.push(None);
+        let mut view = View::new(cell_w, row_h);
+        view.set_metrics(cell_w, row_h);
+        view.set_viewport(size.0 as f32, size.1 as f32);
+        view.grid_mut().set_total_rows(lines.len() as u64);
+        view.hgrid_mut().set_columns(width_cells as u64 + 1);
+        Self { lines, opens, view }
+    }
+
+    /// The recent file a client `y` lands on, if any.
+    fn path_at(&self, y: f32) -> Option<PathBuf> {
+        let row = self.view.grid().row_at_y(y)?;
+        self.opens.get(row as usize).cloned().flatten()
+    }
+}
+
+impl RowSource for Welcome {
+    fn row_text(&self, row: u64) -> Option<&str> {
+        self.lines.get(row as usize).map(String::as_str)
+    }
+
+    fn row_number(&self, _row: u64) -> Option<u64> {
+        None
+    }
+}
+
 /// V15 — `UI-DESIGN.md` §13's minimal UIA chrome provider: the window answers `WM_GETOBJECT` with
 /// a fragment root whose children are the controls the bar draws — tabs, the two fields, the
 /// chips, the status bar, the palette's query while it is up — with names, control types,
@@ -5829,6 +5921,15 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     .document
                     .as_ref()
                     .map_or(0.0, |d| d.pane_top);
+                // No document: the welcome surface — a click on a recent file opens it.
+                if shell.document.panes().is_empty() {
+                    if msg == WM_LBUTTONDOWN {
+                        if let Some(path) = shell.welcome.as_ref().and_then(|w| w.path_at(y)) {
+                            shell.open_path(hwnd, path);
+                        }
+                    }
+                    return;
+                }
                 // A tab or a chip being dragged along the bar lands where the button goes up.
                 if shell.dragging_bar.is_some() {
                     if msg == WM_LBUTTONUP {
@@ -6257,6 +6358,7 @@ fn main() -> Result<()> {
             pending_save: None,
             wheel_remaining: 0.0,
             dragging_bar: None,
+            welcome: None,
             rule_specs,
             rules_tiers,
             rules_failed,
@@ -7650,6 +7752,14 @@ mod tests {
         };
         let (w, h) = (1200u32, 500u32);
         let cell = renderer.cell().expect("cell metrics");
+        // `TAILHAWK_SHOT_WELCOME=1`: the first-run surface instead of a document.
+        if std::env::var_os("TAILHAWK_SHOT_WELCOME").is_some() {
+            let welcome = Welcome::new(cell, (w, h), &[r"C:\logs\app.log".to_owned(), r"C:\logs\other.log".to_owned()]);
+            let pixels = renderer.snapshot(w, h, &welcome.view, &welcome).expect("snapshot");
+            write_bmp(std::path::Path::new(&out), &pixels);
+            eprintln!("wrote {}", out.to_string_lossy());
+            return;
+        }
         // `TAILHAWK_SHOT_THEME=light` — set before the document, whose catalogue takes the hues.
         if let Some(t) = std::env::var("TAILHAWK_SHOT_THEME").ok().and_then(|n| theme::by_name(&n)) {
             theme::set_theme(t);
