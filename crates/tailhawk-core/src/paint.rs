@@ -68,7 +68,7 @@ use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline, MODE_SOLID};
 use crate::view::View;
 use crate::Result;
-use crate::SELECTION_INK;
+use crate::{REVEAL_MARK, SELECTION_INK};
 
 /// What colours one row, gathered because the three arrive together and mean nothing apart.
 ///
@@ -346,6 +346,24 @@ impl Painter {
             // **After the advance, never before.** A cluster absorbed into a preceding ligature
             // draws nothing of its own but still occupies its cells, and skipping the advance
             // would shift the rest of the row left by one cluster per ligature.
+            // §13.4's reveal toggle: an invisible given a cell draws a marker there, never its own
+            // glyphs — those carry a full advance and would land on the next character. See
+            // `CellModel::is_revealed`.
+            if view
+                .cells()
+                .is_revealed(&line[start..start + cluster.span.byte_len])
+            {
+                let inset = cell_width * 0.25;
+                self.instances.push(Instance {
+                    pos: [view.hgrid().x_of_column(at) + inset, y + row_height * 0.3],
+                    size: [cell_width - 2.0 * inset, row_height * 0.4],
+                    tint: REVEAL_MARK,
+                    mode: MODE_SOLID,
+                    ..Instance::default()
+                });
+                laid.quads += 1;
+                continue;
+            }
             if cluster.glyph_count == 0 || cells == 0 {
                 // `cells == 0` is a zero-width cluster — a bidi override, a joiner. It occupies no
                 // column, so it draws nothing here; §13.4's reveal toggle is what gives it a cell,
@@ -791,6 +809,70 @@ mod tests {
     /// The ordering claim is the one that would otherwise be untested and is the easiest to break:
     /// a background appended at the end of the row draws *over* the text, which looks like the
     /// highlight working until you notice the log line has gone.
+    /// §13.4's reveal toggle: a bidi override — the Trojan Source character — draws nothing with
+    /// the toggle off and occupies no column; with it on it takes a column and that column holds a
+    /// marker quad rather than the override's own glyph, and the character after it moves right by
+    /// one cell. `a` + ZWJ, absorbed into `a`'s cluster, is the recorded gap and stays unrevealed.
+    #[test]
+    fn a_revealed_invisible_draws_a_marker_in_its_own_column() {
+        let Some((off, mut painter)) = painter_or_skip("a_revealed_invisible_draws_a_marker")
+        else {
+            return;
+        };
+        let mut view = view_for(&painter, 1, 200);
+        let line = "ab\u{202E}cd";
+
+        painter.begin_frame();
+        painter
+            .lay_out_row(
+                &view,
+                line,
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
+            .expect("lay out");
+        let solids = painter
+            .instances()
+            .iter()
+            .filter(|i| i.mode == MODE_SOLID)
+            .count();
+        assert_eq!(solids, 0, "off: nothing marks the override");
+        let glyphs_off = painter.instances().len();
+
+        view.cells_mut().reveal_invisibles = true;
+        painter.begin_frame();
+        painter
+            .lay_out_row(
+                &view,
+                line,
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
+            .expect("lay out");
+        let solids: Vec<&Instance> = painter
+            .instances()
+            .iter()
+            .filter(|i| i.mode == MODE_SOLID)
+            .collect();
+        assert_eq!(solids.len(), 1, "on: one marker");
+        assert_eq!(solids[0].tint, REVEAL_MARK);
+        let col2 = view.hgrid().x_of_column(2);
+        assert!(
+            solids[0].pos[0] > col2
+                && solids[0].pos[0] + solids[0].size[0] < col2 + painter.cell_width(),
+            "the marker sits inside column 2: {:?}",
+            solids[0]
+        );
+        assert_eq!(
+            painter.instances().len(),
+            glyphs_off + 1,
+            "the override still shapes to no drawn glyph; only the marker was added"
+        );
+        drop(off);
+    }
+
     #[test]
     fn a_spans_background_is_drawn_under_exactly_its_own_columns() {
         let Some((off, mut painter)) = painter_or_skip("a_spans_background_is_drawn_under") else {

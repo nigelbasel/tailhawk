@@ -48,8 +48,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_BACK, VK_C, VK_CONTROL,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_L, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F3, VK_HOME, VK_I, VK_L, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetScrollInfo,
@@ -333,8 +333,13 @@ impl Document {
             Some(text) => format!("{text} — "),
             None => String::new(),
         };
+        let reveal = if self.view.cells().reveal_invisibles {
+            "¶ revealing invisibles — "
+        } else {
+            ""
+        };
         format!(
-            "{find}{filter}{}: {}{flag}{source}, {} lines, {} bytes",
+            "{find}{filter}{reveal}{}: {}{flag}{source}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -1557,6 +1562,25 @@ impl Shell {
         true
     }
 
+    /// View toggles. `Ctrl+I` is §13.4's **reveal invisibles** — a key of our choosing, because
+    /// `UI-DESIGN.md` §12 gives the toggle no binding and the command palette that would carry it
+    /// is M7. Recorded as provisional in `CLEANROOM.md`.
+    fn view_key(&mut self, hwnd: HWND, key: u16, ctrl: bool) -> bool {
+        if !(ctrl && key == VK_I.0) {
+            return false;
+        }
+        let Some(doc) = self.document.as_mut() else {
+            return false;
+        };
+        let cells = doc.view.cells_mut();
+        cells.reveal_invisibles = !cells.reveal_invisibles;
+        self.retitle(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        true
+    }
+
     /// One keystroke, offered to the filter state before the find state and the navigation map.
     ///
     /// `UI-DESIGN.md` §12: `Ctrl+L` focuses the filter. Here it starts an *include* chip and
@@ -1862,7 +1886,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
-                    shell.filter_key(hwnd, wparam.0 as u16, ctrl, shift)
+                    shell.view_key(hwnd, wparam.0 as u16, ctrl)
+                        || shell.filter_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.find_key(hwnd, wparam.0 as u16, ctrl, shift)
                 })
             });

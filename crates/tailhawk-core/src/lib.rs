@@ -178,6 +178,11 @@ pub const CURRENT_MATCH_BG: [f32; 4] = [0.95, 0.62, 0.16, 1.0];
 /// unverified guess away from.
 pub const CURRENT_MATCH_INK: [f32; 4] = [0.071, 0.078, 0.090, 1.0];
 
+/// The marker drawn in the cell of a revealed invisible — §13.4's toggle. A muted amber block,
+/// unlike any glyph, so a hidden character reads as "something is here" and never as text.
+/// Provisional with the rest of the palette.
+pub const REVEAL_MARK: [f32; 4] = [0.85, 0.65, 0.25, 1.0];
+
 /// Errors that cross the seam. Deliberately opaque — the shell can report one but cannot act on
 /// the distinction, and `SPEC.md` §3.2 forbids panicking on device loss.
 #[derive(Debug)]

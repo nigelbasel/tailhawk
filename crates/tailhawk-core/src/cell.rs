@@ -258,6 +258,18 @@ impl CellModel {
     ///
     /// A zero-width result stays zero unless §13.4's reveal toggle is on. See [`CellModel`] for what
     /// that toggle does **not** yet cover.
+    /// Whether this cluster occupies a cell **only because** the reveal toggle is on — a
+    /// zero-width cluster (a bidi override, a joiner, a zero-width space) that §13.4 wants shown.
+    ///
+    /// The painter draws a marker in that cell instead of the cluster's glyphs: the glyphs of an
+    /// invisible carry a full advance and would land on the next character, and an empty cell says
+    /// nothing. Byte offsets are untouched — this is a question about drawing, not about text.
+    pub fn is_revealed(&self, cluster: &str) -> bool {
+        self.reveal_invisibles
+            && cluster.chars().next().is_some_and(|c| c.width().is_some())
+            && cluster.width() == 0
+    }
+
     pub fn cluster_width(&self, cluster: &str) -> usize {
         let Some(base) = cluster.chars().next() else {
             return 0;
