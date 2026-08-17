@@ -293,14 +293,26 @@ impl RowSource for Document {
             };
             let label = format!("{sign}{}", chip.source);
             let w = cells.cell_count(&label) as f32 * cell_w;
-            let bg = match chip.polarity {
-                Polarity::Include => CHIP_INCLUDE_BG,
-                Polarity::Exclude => CHIP_EXCLUDE_BG,
+            // The body toggles, the `×` after it removes; a disabled chip is drawn dim on its fill.
+            let close_w = cell_w * 2.0;
+            let bg = match (chip.polarity, chip.enabled) {
+                (Polarity::Include, true) => CHIP_INCLUDE_BG,
+                (Polarity::Exclude, true) => CHIP_EXCLUDE_BG,
+                (_, false) => FIELD_BG,
             };
-            painter.fill(x - 2.0, text_y - 2.0, w + 4.0, row_h + 4.0, bg);
-            let _ = painter.lay_out_at(view, x, text_y, &label, Colours::plain(INK));
+            painter.fill(x - 2.0, text_y - 2.0, w + close_w + 4.0, row_h + 4.0, bg);
+            let ink = if chip.enabled { INK } else { FIELD_HINT };
+            let _ = painter.lay_out_at(view, x, text_y, &label, Colours::plain(ink));
+            let _ = painter.lay_out_at(
+                view,
+                x + w + cell_w * 0.5,
+                text_y,
+                "×",
+                Colours::plain(FIELD_HINT),
+            );
             hits.push((x..x + w, Hit::Chip(i)));
-            x += w + cell_w * 1.5;
+            hits.push((x + w..x + w + close_w, Hit::ChipClose(i)));
+            x += w + close_w + cell_w * 1.5;
         }
         // The new-chip field.
         let chip_w = CHIP_CELLS as f32 * cell_w;
@@ -1435,7 +1447,10 @@ struct Chrome {
 enum Hit {
     Find,
     NewChip,
+    /// A chip's body: toggles it.
     Chip(usize),
+    /// A chip's `×`: removes it.
+    ChipClose(usize),
     Tab(usize),
 }
 
@@ -2412,6 +2427,17 @@ impl Shell {
         match hit {
             Some(Hit::Tab(_)) => {}
             Some(Hit::Chip(i)) => {
+                if let Some(chip) = doc.filtering.chips.chips.get_mut(i) {
+                    chip.enabled = !chip.enabled;
+                    doc.filtering.clear_results();
+                    doc.refilter();
+                    {
+                        let rows = doc.view_rows();
+                        doc.view.grid_mut().set_total_rows(rows);
+                    }
+                }
+            }
+            Some(Hit::ChipClose(i)) => {
                 if i < doc.filtering.chips.chips.len() {
                     doc.filtering.chips.chips.remove(i);
                     doc.filtering.clear_results();

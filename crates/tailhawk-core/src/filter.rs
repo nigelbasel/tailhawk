@@ -471,6 +471,9 @@ pub enum Polarity {
 pub struct Chip {
     pub predicate: Predicate,
     pub polarity: Polarity,
+    /// §7.1's per-rule enable/disable, for chips: a disabled chip keeps its place and its text and
+    /// takes no part in [`Chips::keeps`] — `UI-DESIGN.md` §5's checkbox.
+    pub enabled: bool,
     /// The text the user typed, kept so §7.2's "there is no hidden second representation" holds —
     /// a chip made by the UI's *"filter for this value"* is editable as the text it round-trips to.
     pub source: String,
@@ -481,6 +484,7 @@ impl Chip {
         Ok(Self {
             predicate: parse(text)?,
             polarity,
+            enabled: true,
             source: text.to_string(),
         })
     }
@@ -499,7 +503,7 @@ impl Chips {
     /// **No chips means everything survives**, which is the unfiltered view and not an empty one.
     pub fn keeps(&self, record: &Record) -> bool {
         let mut any_include = false;
-        for chip in &self.chips {
+        for chip in self.chips.iter().filter(|c| c.enabled) {
             match chip.polarity {
                 Polarity::Include => {
                     any_include = true;
