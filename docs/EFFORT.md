@@ -4,32 +4,6 @@
 ahead or behind" has been unanswerable. This file closes that, and is meant to be **appended to at
 the end of every session** — one row, four numbers.
 
-
-### Scored: M7 — forecast 19.8 h / 3.0 M, actual **~7 h / ~1.3 M**, E22 and V9's editor UI outstanding — 2026-08-18
-
-The same day as the forecast, one long session. **Landed:** V14 (fields, focus, IME), V8 (bar, chips
-with toggle/edit/drag, **palette**), V7 (tabs, drag-reorder, middle-click close, **split view**), V10
-(detail pane, JSON re-indent), V12-lite (eased wheel; no `WM_POINTER`), V13 (dark/light/High
-Contrast, `--theme`), **V15** (UIA chrome provider + `tools/verify-uia.ps1`, which passes on the
-shipped binary without a free desktop), E19, E20 (+ severity glyphs), E21 (export + live tee, TSV),
-E27; and from M8, E17, E18, E28. **Not landed:** E22 sort/top-N; V9's rules *editor* and format
-wizard as UI — the rules file (`tailhawk.rules.toml`) and the config import stand in; column
-reorder and saved widths; Mica.
-
-**~2.8× high, and the shape held.** V14 — the new shape — cost about 1.5 h, not 4: a text field is
-a well-known thing, and the caret model was `selection.rs`. Everything after it was the reuse
-pattern (each item 20–60 min). The forecast's verification line (3.5 h) was mostly not spent on the
-desktop — it was busy all evening — but on the headless snapshot path and the UIA harness, which
-between them cost ~1 h and are now the standing verification for the chrome. **The one thing this
-scoring adds to the record:** a session that does not stop between items lands about three items
-an hour of this size; the earlier scorings' hours were dominated by the stops.
-
-Two defects the work found, worth the record: **the gutter stretched every frame** for two commits
-(the shader was told the grid's width without the gutter — seen only because a headless shot was
-compared with the previous one); and **a whole-line background flattened every rule under it**
-(the highlighter's claim took the ink with the background) — fixed with `claim_bg`, which tints
-under the ink.
-
 ## What the numbers mean, and what they do not
 
 **Active hours** is the sum of gaps between consecutive transcript messages, **capped at 5 minutes**.
@@ -399,6 +373,32 @@ The rest is the reuse pattern and is more likely over than under.
 
 Score this when M7 lands — and score V14 on its own when it does, since it decides the rest.
 
+### Scored: M7 — forecast 19.8 h / 3.0 M, actual **~7 h / ~1.3 M**, E22 and V9's editor UI outstanding — 2026-08-18
+
+The same day as the forecast, one long session. **Landed:** V14 (fields, focus, IME), V8 (bar, chips
+with toggle/edit/drag, **palette**), V7 (tabs, drag-reorder, middle-click close, **split view**), V10
+(detail pane, JSON re-indent), V12-lite (eased wheel; no `WM_POINTER`), V13 (dark/light/High
+Contrast, `--theme`), **V15** (UIA chrome provider + `tools/verify-uia.ps1`, which passes on the
+shipped binary without a free desktop), E19, E20 (+ severity glyphs), E21 (export + live tee, TSV),
+E27; and from M8, E17, E18, E28. **Not landed:** E22 sort/top-N; V9's rules *editor* and format
+wizard as UI — the rules file (`tailhawk.rules.toml`) and the config import stand in; column
+reorder and saved widths; Mica.
+
+**~2.8× high, and the shape held.** V14 — the new shape — cost about 1.5 h, not 4: a text field is
+a well-known thing, and the caret model was `selection.rs`. Everything after it was the reuse
+pattern (each item 20–60 min). The forecast's verification line (3.5 h) was mostly not spent on the
+desktop — it was busy all evening — but on the headless snapshot path and the UIA harness, which
+between them cost ~1 h and are now the standing verification for the chrome. **The one thing this
+scoring adds to the record:** a session that does not stop between items lands about three items
+an hour of this size; the earlier scorings' hours were dominated by the stops.
+
+Two defects the work found, worth the record: **the gutter stretched every frame** for two commits
+(the shader was told the grid's width without the gutter — seen only because a headless shot was
+compared with the previous one); and **a whole-line background flattened every rule under it**
+(the highlighter's claim took the ink with the background) — fixed with `claim_bg`, which tints
+under the ink.
+
+
 ## Forecast, on this evidence
 
 | Milestone | Plan | Naive extrapolation | Confidence |
@@ -431,3 +431,4 @@ perl -ne '
 Then add one row. **Estimate first, in the same units, before starting a milestone** — a forecast
 written afterwards is not a forecast, and the point of this file is to find out how wrong the
 estimates are.
+
