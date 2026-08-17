@@ -121,6 +121,13 @@ const SMOOTH_EASE: f32 = 0.35;
 /// `i32` -- the grid speaks in fractions at both ends and Win32 never sees a row number.
 const SCROLL_RANGE: i32 = 10_000;
 
+/// `SPEC.md` §12's `--column-pattern="<ts> <level> <logger> - <message>"` (the §6.5 DSL) and
+/// `--columns=none`: formats given on the command line, and whether detection runs at all. Read on
+/// the open worker by `detect_set`; set once in `main` before any file opens.
+static CLI_FORMATS: std::sync::OnceLock<Vec<&'static tailhawk_core::format::Format>> =
+    std::sync::OnceLock::new();
+static CLI_NO_COLUMNS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 thread_local! {
     static STATE: RefCell<Option<Shell>> = const { RefCell::new(None) };
 }
@@ -2211,7 +2218,10 @@ fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Optio
         Some(newest) => detect::head_lines(&*newest.file, newest.charset),
         None => Vec::new(),
     };
-    let templates: Vec<&'static tailhawk_core::format::Format> = path
+    if CLI_NO_COLUMNS.load(std::sync::atomic::Ordering::Relaxed) {
+        return (Detection::default(), None);
+    }
+    let mut templates: Vec<&'static tailhawk_core::format::Format> = path
         .map(template::scan)
         .unwrap_or_default()
         .into_iter()
@@ -2224,7 +2234,23 @@ fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Optio
             template::compile(found.language, &found.template, &origin).ok()
         })
         .collect();
-    let detection = detect::detect_with(&lines, &templates);
+    // The command line's formats outrank what is found beside the file: the user said so.
+    if let Some(cli) = CLI_FORMATS.get() {
+        templates.splice(0..0, cli.iter().copied());
+    }
+    let mut detection = detect::detect_with(&lines, &templates);
+    // A format the user gave on the command line is not a candidate to be scored: it is the
+    // answer, as long as it parses something in the head.
+    if detection.accepted.is_none() {
+        if let Some(cli) = CLI_FORMATS.get() {
+            if let Some(forced) = cli
+                .iter()
+                .find(|f| lines.iter().any(|l| f.is_first_line(l)))
+            {
+                detection.accepted = Some(forced);
+            }
+        }
+    }
     let layout = detection
         .accepted
         .map(|format| Layout::from_sample(format, &lines));
@@ -6417,6 +6443,20 @@ fn main() -> Result<()> {
     let mut any_arg = false;
     // §7.2: `--filter=EXPR` and `--exclude=EXPR` are repeatable; each occurrence creates one chip,
     // applied to every file this command opens. `--stateless` is §12.4's and is read above.
+    // §12: `--column-pattern=` (repeatable) and `--columns=none`, before any file is opened.
+    let mut cli_formats = Vec::new();
+    for arg in std::env::args() {
+        if let Some(pattern) = arg.strip_prefix("--column-pattern=") {
+            match template::compile(template::Language::Dsl, pattern, "command line") {
+                Ok(format) => cli_formats.push(format),
+                Err(e) => eprintln!("--column-pattern: {e}"),
+            }
+        }
+        if arg == "--columns=none" {
+            CLI_NO_COLUMNS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _ = CLI_FORMATS.set(cli_formats);
     let mut initial_chips: Vec<String> = Vec::new();
     // E17: `tail`'s flags are accepted so `tailhawk -n 100 -f app.log` behaves — a viewer already
     // opens at the tail and follows, so `-f`, `-F` and `-c` change nothing, and `-n N` is the

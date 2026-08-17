@@ -78,7 +78,7 @@ pub struct Candidate {
 }
 
 /// The outcome of detection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Detection {
     /// The format to use, **only if accepted** — otherwise the file is plain text.
     pub accepted: Option<&'static Format>,

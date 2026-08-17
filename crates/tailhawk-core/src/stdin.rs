@@ -606,8 +606,11 @@ mod tests {
         let _ = std::fs::remove_file(&control);
 
         let sid = current_user_sid().expect("our own sid");
+        // SDDL abbreviates the built-in Administrator (RID 500) to `LA` rather than spelling its
+        // SID — which is who a CI runner is.
+        let as_alias = sid.ends_with("-500") && sddl.contains(";;;LA)");
         assert!(
-            sddl.contains(&sid),
+            sddl.contains(&sid) || as_alias,
             "the owner should be granted access: {sddl}"
         );
 
