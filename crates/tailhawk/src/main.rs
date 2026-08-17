@@ -4608,10 +4608,10 @@ mod tests {
                 .is_some_and(|s| s.chips.is_empty() && !s.collapse),
             "nothing to remember yet"
         );
-        filter_for(&mut doc, "line 1", Polarity::Include);
-        filter_for(&mut doc, "line 12", Polarity::Exclude);
+        filter_for(&mut doc, "record", Polarity::Include);
+        filter_for(&mut doc, "\"line 12\"", Polarity::Exclude);
         let state = doc.file_state().expect("chips to remember");
-        assert_eq!(state.chips, ["+line 1", "-line 12"]);
+        assert_eq!(state.chips, ["+record", "-\"line 12\""]);
         assert!(!state.collapse);
 
         let mut settings = settings::Settings::default();
