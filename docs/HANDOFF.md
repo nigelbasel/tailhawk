@@ -1,14 +1,22 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-18, session 19 (paused for a tool change; state is all in git)
+## ▶ Resume point — 2026-08-18, session 20 (the project now runs in Nimbalyst)
 
 **Where the plan is:** M7 has **one item left — V9's rules *editor* and format *wizard* as UI**
 (the rules file and the config import stand in), plus Mica and `WM_POINTER` inertia as polish.
 Then M7b (RDP path), M8's i18n externalisation, M9 (installer, signing, docs). Session 19 landed
-**E22 sort + top-N** (`fe732be`, reviewed, pushed; check CI on that commit first — it was running at
-the pause).
+**E22 sort + top-N** (`fe732be`, reviewed, pushed) and paused for the tool change.
 
-**Start the next session with:** `git status` (clean), the CI result for `fe732be`, then V9's UI —
+**The tool change:** development moved from the terminal to Nimbalyst at session 20. The milestones
+and the outstanding work above are now mirrored as tracker items on the board; this file stays the
+narrative resume point and the place knowingly-left-undone work is explained. `CLAUDE.md` at the
+repo root now states the operating rules that used to live only in this section.
+
+**CI was red at the handover.** Session 19's push failed the `provenance` job: `sort.rs` shipped
+with no `CLEANROOM.md` §5 entry — the fifth §1.5 slip, and the first one the gate caught rather
+than a later review. The entry is filed at `13c5c7b`, with the lateness recorded in the row itself.
+
+**Start the next session with:** `git status` (clean), then V9's UI —
 `UI-DESIGN.md` §6 (rules editor) and §7 (format wizard) on V14's fields, opened from the palette,
 live preview on the visible rows. Keep `logs/agent.log` fed via `tools/agentlog.sh` from the first
 turn (a "turn" line), commit straight to master, review each component with a subagent before
