@@ -16,11 +16,42 @@ repo root now states the operating rules that used to live only in this section.
 with no `CLEANROOM.md` §5 entry — the fifth §1.5 slip, and the first one the gate caught rather
 than a later review. The entry is filed at `13c5c7b`, with the lateness recorded in the row itself.
 
-**Start the next session with:** `git status` (clean), then V9's UI —
-`UI-DESIGN.md` §6 (rules editor) and §7 (format wizard) on V14's fields, opened from the palette,
-live preview on the visible rows. Keep `logs/agent.log` fed via `tools/agentlog.sh` from the first
-turn (a "turn" line), commit straight to master, review each component with a subagent before
-committing, and do not stop between items.
+**Correct the section numbers before using them.** Earlier resume points said "§6 (rules editor)
+and §7 (format wizard)". They are wrong and cost a false start: `UI-DESIGN.md` **§5 is Highlight
+rules and filters**, **§6 is Format detection and the format wizard** (§6.1 the chip, §6.2 define
+from example, §6.3 import from config), and **§7 is Trace correlation, marked `[v2]`** — not in
+M7 at all.
+
+### V9 part 1 of 4 is done: the rules editor *model* (`06066e2`, CI green)
+
+`ruleset.rs` is §5's grid as a portable model — 30 tests. Rows carry their own compile error and
+revalidate per keystroke, precedence is the vector's order, `import` is the strict §13.1 sibling of
+the lenient `rules::parse`. The pre-commit review caught four real defects; the CLEANROOM row
+records what it changed. **One of those changed the file format:** `rules::Spec` now has a
+`literal` flag, because §5's `.*`/`Ab` toggle is regex-versus-plain-text (`SPEC.md` §7.1) and the
+first draft had wrongly mapped it onto `case_insensitive`.
+
+**Next: V9 part 2, the rules editor's shell UI.** This is a `main.rs` integration and the wiring is
+already scouted — the palette is the precedent to copy throughout:
+
+| What | Where |
+|---|---|
+| The model to hold | `ruleset::Editor`, on `Shell` beside `rule_specs` / `rules_tiers` / `rules_failed` (~3467) — **not** per-document, unlike `Palette` |
+| Overlay paint | copy the palette's block (~516–570): `painter.fill`, `draw_field` (~3348), hit rects into `chrome.*_hits` (~2745) |
+| Keys, modal while open | copy `palette_key` (~4360), offered before it; `field_edit` (~2456) drives the cell |
+| The command | add to `Command` (~2842) and `Command::LISTED` (~2890) beside the existing `OpenRules` / `ReloadRules`, which stay as the file-as-editor path |
+| Live preview | `rebuild_highlighter_with(doc, editor.specs())` (~5840) on every change — the real grid behind the overlay *is* §5's preview, so it cannot drift |
+| Save | `editor.to_toml()` into the last tier (`rules_tiers.last()`), then `mark_saved`; `open_rules_file` (~4187) already does the create-if-absent dance |
+
+Then part 3, the wizard model (`UI-DESIGN.md` §6.2/§6.3) — note its engine already exists:
+`template::compile(Language::Dsl, "<ts> <level> …")` is what `--column-pattern` uses (`main.rs`
+~6805), and `template::scan(log)` is §6.3's folder scan. Then part 4, the wizard's UI and the §6.1
+chip menu.
+
+**Keep to the working rules:** `logs/agent.log` fed via `tools/agentlog.sh` from the first turn (a
+"turn" line), the `CLEANROOM.md` §5 entry written *before* each new core module, commit straight to
+master, review each component with a subagent before committing, push and **wait for CI**, and do
+not stop between items.
 
 **Known and left as is (from E22's review):** `view_row` under a sort is a linear scan (fine at the
 2 M cap); `F3` / `F2` step in *file* order under a sort, so they jump around the sorted view; export
