@@ -31,6 +31,7 @@ pub mod pattern;
 pub mod record;
 pub mod rows;
 pub mod rules;
+pub mod ruleset;
 pub mod search;
 pub mod selection;
 pub mod semantic;

@@ -15,6 +15,7 @@
 //! whole_line = true       # optional; colour the whole line, not just the match
 //! enabled = true          # optional; default true
 //! case_insensitive = true # optional; default true
+//! literal = false         # optional; default false — true matches the pattern as plain text
 //! ```
 //!
 //! **A rule that does not compile is skipped and named**, never fatal — the settings module's
@@ -41,6 +42,10 @@ pub struct Spec {
     pub whole_line: bool,
     pub enabled: bool,
     pub case_insensitive: bool,
+    /// `SPEC.md` §7.1: a rule is **plain text or regex**. When set, `pattern` is matched literally
+    /// — `UI-DESIGN.md` §5's `Ab` against its `.*`. Independent of `case_insensitive`, which is the
+    /// other axis: all four combinations are askable for.
+    pub literal: bool,
 }
 
 impl Spec {
@@ -52,8 +57,12 @@ impl Spec {
         if self.fg.is_none() && self.bg.is_none() {
             return Err(format!("{}: neither fg nor bg", self.name));
         }
-        let pattern = Pattern::compile(&self.pattern, Charset::UTF_8, self.case_insensitive)
-            .map_err(|e| format!("{}: {e}", self.name))?;
+        let compiled = if self.literal {
+            Pattern::literal(&self.pattern, Charset::UTF_8, self.case_insensitive)
+        } else {
+            Pattern::compile(&self.pattern, Charset::UTF_8, self.case_insensitive)
+        };
+        let pattern = compiled.map_err(|e| format!("{}: {e}", self.name))?;
         let mut rule = Rule::new(self.name.clone(), pattern);
         rule.fg = self.fg;
         rule.bg = self.bg;
@@ -111,6 +120,7 @@ pub fn parse(text: &str) -> Vec<Spec> {
             "whole_line" => spec.whole_line = value == "true",
             "enabled" => spec.enabled = value != "false",
             "case_insensitive" => spec.case_insensitive = value != "false",
+            "literal" => spec.literal = value == "true",
             _ => {}
         }
     }
@@ -122,7 +132,8 @@ pub fn parse(text: &str) -> Vec<Spec> {
 pub fn to_toml(specs: &[Spec]) -> String {
     let mut out = String::from(
         "# Tailhawk highlight rules — SPEC.md §7.1. One [[rule]] per rule, first wins overlaps.\n\
-         # pattern is a regex; fg / bg are #rrggbb; whole_line colours the line, not the match.\n",
+         # pattern is a regex unless literal = true; fg / bg are #rrggbb; whole_line colours the\n\
+          # line, not the match.\n",
     );
     for spec in specs {
         out.push_str("\n[[rule]]\n");
@@ -143,6 +154,9 @@ pub fn to_toml(specs: &[Spec]) -> String {
         if !spec.case_insensitive {
             out.push_str("case_insensitive = false\n");
         }
+        if spec.literal {
+            out.push_str("literal = true\n");
+        }
     }
     out
 }
@@ -158,6 +172,7 @@ pub fn template() -> String {
             whole_line: false,
             enabled: true,
             case_insensitive: false,
+            literal: false,
         },
         Spec {
             name: "example: whole line".to_owned(),
@@ -167,6 +182,7 @@ pub fn template() -> String {
             whole_line: true,
             enabled: false,
             case_insensitive: true,
+            literal: true,
         },
     ])
 }
@@ -224,12 +240,12 @@ pub fn colour(text: &str) -> Option<Colour> {
     }
 }
 
-fn hex(c: Colour) -> String {
+pub(crate) fn hex(c: Colour) -> String {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", byte(c[0]), byte(c[1]), byte(c[2]))
 }
 
-fn strip_comment(value: &str) -> &str {
+pub(crate) fn strip_comment(value: &str) -> &str {
     // A `#` outside quotes starts a comment; inside a basic string it is text.
     let mut in_quotes = false;
     let mut escaped = false;
@@ -265,7 +281,7 @@ fn quote(s: &str) -> String {
     out
 }
 
-fn unquote(value: &str) -> String {
+pub(crate) fn unquote(value: &str) -> String {
     let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
         return value.to_owned();
     };
