@@ -58,6 +58,10 @@ pub mod sieve;
 #[cfg(windows)]
 pub mod export;
 
+/// Column sort and top-N on a worker. Windows-only for the same reason as [`find`].
+#[cfg(windows)]
+pub mod sort;
+
 #[cfg(windows)]
 pub mod glyphs;
 

@@ -34,6 +34,7 @@ use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
 use tailhawk_core::settings;
 use tailhawk_core::sieve;
+use tailhawk_core::sort;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::template;
 use tailhawk_core::theme::{self, theme, Theme};
@@ -648,11 +649,11 @@ impl Document {
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
             moving: None,
+            palette: Palette::new(Command::entries_for(layout.as_ref())),
             layout,
             presented: Vec::new(),
             open_at_tail: true,
             bookmarks: Default::default(),
-            palette: Palette::new(Command::entries()),
             labels: Vec::new(),
             history: History::default(),
             detail: DetailPane::default(),
@@ -705,11 +706,11 @@ impl Document {
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
             moving: None,
+            palette: Palette::new(Command::entries_for(layout.as_ref())),
             layout,
             presented: Vec::new(),
             open_at_tail: true,
             bookmarks: Default::default(),
-            palette: Palette::new(Command::entries()),
             labels: Vec::new(),
             history: History::default(),
             detail: DetailPane::default(),
@@ -731,6 +732,20 @@ impl Document {
         let (cell_w, row_h) = cell;
         self.view.set_metrics(cell_w, row_h);
         self.view.set_viewport(size.0 as f32, size.1 as f32);
+        // E22: the header's sort mark follows the sort that is actually in force. The sort is
+        // dropped by every path that resets the row space (`Filtering::clear_results`), and none of
+        // them can reach the layout, so the mark is reconciled here, once a frame, cheaply.
+        let mark = self
+            .filtering
+            .sort
+            .as_ref()
+            .map(|s| (s.order.column, s.order.descending));
+        if let Some(layout) = self.layout.as_mut() {
+            if layout.sort != mark {
+                layout.sort = mark;
+                self.header = Some(layout.header());
+            }
+        }
         // The command bar always, the tab strip when there is more than one tab; one row of header
         // when there are columns. Set after the viewport, which is what all three are subtracted from.
         let strip = if self.tab_strip.0.len() > 1 {
@@ -790,10 +805,14 @@ impl Document {
         // A read that fails does not fail the frame — §11.3. `Rows` keeps what it got and records
         // why the rest is missing; those rows simply draw nothing.
         let anchored = self.view.hgrid().visible_columns().start > 0;
-        let file_rows: Vec<u64> = visible
+        // Ascending, whatever order the view shows them in: the set's scattered fetch and the
+        // presentation lookup both search this list — E22's sort is what makes that a step.
+        let mut file_rows: Vec<u64> = visible
             .iter()
             .filter_map(|&r| self.filtering.file_row(r))
             .collect();
+        file_rows.sort_unstable();
+        file_rows.dedup();
         // A format whose message is the next line (MEL Simple) has that line pulled into the
         // record's row while continuations are collapsed — the assembly §6.4 asks for. That needs
         // the successors fetched too, one more read per visible row; without collapse the message
@@ -1006,19 +1025,175 @@ impl Document {
                 }
             }
         }
-        if self.filtering.active() {
+        if self.filtering.filtered() {
             self.filtering.clear_results();
             self.refilter();
         }
     }
 
-    /// Rows in the view's row space: the survivors while a filter is on, the file's rows otherwise.
+    /// Rows in the view's row space: the sorted rows once a sort has landed, the survivors while
+    /// a filter is on, the file's rows otherwise.
     fn view_rows(&self) -> u64 {
-        if self.filtering.active() {
+        if let Some(rows) = self.filtering.sorted() {
+            rows.len() as u64
+        } else if self.filtering.filtered() {
             self.filtering.kept.len() as u64
         } else {
             self.set.total_rows()
         }
+    }
+
+    /// E22: asks for the rows in `order` — a whole sort or a top-N — by a column of the layout.
+    /// The pass starts on the next tick, once the filter has judged every row, so it orders the
+    /// survivors and not a part of them. Reports whether anything was asked for.
+    fn sort_by(&mut self, order: sort::Order) -> bool {
+        let Some(layout) = self.layout.as_mut() else {
+            return false;
+        };
+        if order.column >= layout.format.columns.len() {
+            return false;
+        }
+        layout.sort = Some((order.column, order.descending));
+        self.header = Some(layout.header());
+        self.filtering.sort = Some(Sorting {
+            order,
+            rows: None,
+            running: None,
+            scanned: 0,
+            covered: 0,
+            error: None,
+        });
+        true
+    }
+
+    /// A click on a column's title: no sort → ascending → descending → none.
+    fn cycle_sort(&mut self, column: usize) -> bool {
+        let current = self
+            .filtering
+            .sort
+            .as_ref()
+            .filter(|s| s.order.column == column && s.order.top.is_none())
+            .map(|s| s.order.descending);
+        match current {
+            None => self.sort_by(sort::Order {
+                column,
+                descending: false,
+                top: None,
+            }),
+            Some(false) => self.sort_by(sort::Order {
+                column,
+                descending: true,
+                top: None,
+            }),
+            Some(true) => self.clear_sort(),
+        }
+    }
+
+    /// Drops the sort: the view is the survivors (or the file) in file order again, and the growth
+    /// the sort held back is shown. Reports whether there was one.
+    fn clear_sort(&mut self) -> bool {
+        if self.filtering.sort.take().is_none() {
+            return false;
+        }
+        if let Some(layout) = self.layout.as_mut() {
+            layout.sort = None;
+            self.header = Some(layout.header());
+        }
+        let rows = self.view_rows();
+        self.view.grid_mut().set_total_rows(rows);
+        true
+    }
+
+    /// The name of column `i` as the header shows it, for the status bar and the palette.
+    fn column_name(&self, i: usize) -> String {
+        let Some(layout) = self.layout.as_ref() else {
+            return String::new();
+        };
+        layout.title(i).to_owned()
+    }
+
+    /// Starts the sort pass once the filter has judged every row, collects what it reports, and
+    /// puts the order in place when it lands. Reports whether the view changed.
+    fn poll_sort(&mut self) -> bool {
+        let Some(format) = self.layout.as_ref().map(|l| l.format) else {
+            return false;
+        };
+        let total = self.set.total_rows();
+        let filtered = self.filtering.filtered();
+        let judged =
+            !filtered || (self.filtering.running.is_none() && self.filtering.covered >= total);
+        let sortable = self.filtering.sortable_rows(total);
+        // The survivor list is copied for the worker only on the tick that starts it.
+        let keep = match &self.filtering.sort {
+            Some(s) if s.rows.is_none() && s.running.is_none() && s.error.is_none() && filtered => {
+                Some(sort::Keep::Rows(self.filtering.kept.clone()))
+            }
+            _ => None,
+        };
+        let Some(sorting) = self.filtering.sort.as_mut() else {
+            return false;
+        };
+        if sorting.rows.is_none() && sorting.running.is_none() && sorting.error.is_none() {
+            if !judged {
+                return false;
+            }
+            if sorting.order.top.is_none() && sortable > SORT_CAP {
+                sorting.error =
+                    Some("needs 2 M rows or fewer — filter first, or take a top-N".to_owned());
+                return true;
+            }
+            match sort::start(
+                self.set.snapshot(),
+                keep.unwrap_or(sort::Keep::All),
+                0,
+                total,
+                format,
+                sorting.order,
+            ) {
+                Ok(running) => {
+                    sorting.running = Some(running);
+                    sorting.covered = total;
+                }
+                Err(e) => sorting.error = Some(e.to_string()),
+            }
+            return true;
+        }
+        let Some(running) = sorting.running.as_ref() else {
+            return false;
+        };
+        let updates: Vec<sort::Update> = running.drain().collect();
+        if updates.is_empty() {
+            return false;
+        }
+        let mut landed = false;
+        for update in updates {
+            match update {
+                sort::Update::Progress { scanned } => sorting.scanned = scanned,
+                sort::Update::Finished(Outcome::Complete, rows) => {
+                    sorting.rows = Some(rows);
+                    sorting.running = None;
+                    landed = true;
+                }
+                sort::Update::Finished(Outcome::Cancelled, _) => {
+                    sorting.running = None;
+                    sorting.error = Some("cancelled".to_owned());
+                }
+                sort::Update::Finished(outcome, _) => {
+                    sorting.running = None;
+                    sorting.error = Some(match outcome {
+                        Outcome::Failed(why) => why,
+                        _ => "did not finish".to_owned(),
+                    });
+                }
+            }
+        }
+        if landed {
+            let rows = self.view_rows();
+            self.view.grid_mut().set_total_rows(rows);
+            self.view.grid_mut().scroll_to_row(0);
+            self.selection = None;
+        }
+        true
     }
 
     /// The title text, rebuilt from the live state — every part of it except the name.
@@ -1093,7 +1268,17 @@ impl Document {
         // §12: scrolling up pauses following, and the affordance to resume must be visible — the
         // "single most-wanted behaviour in every tail tool", and getting it wrong is very visible.
         // A pipe that has finished is not paused, it is done.
-        let following = if self.stream_done {
+        // E22: a sort holds the view still, so it is neither following nor merely paused; the
+        // sort fragment says so and takes the lead's place.
+        let sort = self
+            .filtering
+            .sort
+            .as_ref()
+            .map(|s| self.column_name(s.order.column))
+            .and_then(|name| self.filtering.describe_sort(&name, self.set.total_rows()))
+            .map(|text| format!("{text} — "))
+            .unwrap_or_default();
+        let following = if self.stream_done || !sort.is_empty() {
             ""
         } else if self.view.grid().is_following() {
             "● following — "
@@ -1101,7 +1286,7 @@ impl Document {
             "‖ paused · Ctrl+End to follow — "
         };
         format!(
-            "{following}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
+            "{following}{sort}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
             self.summary,
             self.set.charset().name(),
             self.set.total_rows(),
@@ -1315,7 +1500,7 @@ impl Document {
 
     /// Drops every chip and the survivors with them: the unfiltered view.
     fn clear_filter(&mut self) {
-        if !self.filtering.active() {
+        if !self.filtering.filtered() {
             return;
         }
         self.remember();
@@ -1332,7 +1517,7 @@ impl Document {
     /// changes, only the growth after a follow tick. **Never on the window thread**: §7.3 says a
     /// filter change is a full-file pass, and §11.3 says a frame is not the place for one.
     fn refilter(&mut self) {
-        if !self.filtering.active() || self.filtering.running.is_some() {
+        if !self.filtering.filtered() || self.filtering.running.is_some() {
             return;
         }
         let total = self.set.total_rows();
@@ -1431,7 +1616,11 @@ impl Document {
     fn show_row(&mut self, row: u64) {
         // A file row; the view scrolls in its own row space. A hidden match lands on the next
         // survivor, which keeps `F3` moving through the file rather than stalling on a row that
-        // is not there to be shown.
+        // is not there to be shown. Under a sort there is no "next": a row the order does not
+        // hold (a top-N left it out, or it arrived since) leaves the view where it is.
+        if !self.filtering.shown(row) {
+            return;
+        }
         let row = self.filtering.view_row(row);
         let grid = self.view.grid();
         let first = grid.scroll().row;
@@ -1479,7 +1668,8 @@ impl Document {
         let from = current
             .and_then(|r| self.filtering.file_row(r))
             .unwrap_or(0);
-        let lands_elsewhere = |&&b: &&u64| Some(self.filtering.view_row(b)) != current;
+        let lands_elsewhere =
+            |&&b: &&u64| self.filtering.shown(b) && Some(self.filtering.view_row(b)) != current;
         let target = if forward {
             self.bookmarks
                 .range(from + 1..)
@@ -1512,8 +1702,11 @@ impl Document {
         if total == 0 {
             return;
         }
-        self.remember();
         let file_row = line.saturating_sub(1).min(total - 1);
+        if !self.filtering.shown(file_row) {
+            return;
+        }
+        self.remember();
         let view_row = self.filtering.view_row(file_row);
         self.selection = Some(Selection::at(Position {
             row: view_row,
@@ -1725,12 +1918,12 @@ impl Document {
         if tee.covered >= total {
             return changed;
         }
-        let judged = !self.filtering.active()
+        let judged = !self.filtering.filtered()
             || (self.filtering.running.is_none() && self.filtering.covered >= total);
         if !judged {
             return changed;
         }
-        let keep = if self.filtering.active() {
+        let keep = if self.filtering.filtered() {
             let from = self.filtering.kept.partition_point(|&r| r < tee.covered);
             export::Keep::Rows(self.filtering.kept[from..].to_vec())
         } else {
@@ -2357,36 +2550,130 @@ struct Filtering {
     outcome: Option<Outcome>,
     /// A chip that did not parse. Held, like the finder's, because the window is not modal.
     error: Option<String>,
+    /// E22's sort, layered over the survivors (or the whole file). See [`Sorting`].
+    sort: Option<Sorting>,
 }
 
+/// E22 — `SPEC.md` §11.4: the view's rows in column order, produced by [`tailhawk_core::sort`]
+/// on a worker over the filter's survivors (or every row), and **held still** once it lands:
+/// sorting disables follow, and rows that arrive after the pass are counted, not shown, until the
+/// sort goes. A whole sort is refused above [`SORT_CAP`] rows; a top-N is not.
+struct Sorting {
+    order: sort::Order,
+    /// The rows in order, once the pass finished — the view's row space from then on.
+    rows: Option<Vec<u64>>,
+    running: Option<sort::Running>,
+    scanned: u64,
+    /// The row count the pass covered; rows past it are growth held until the sort goes.
+    covered: u64,
+    /// Why there is no order — the cap, a failed pass — shown in the status bar.
+    error: Option<String>,
+}
+
+/// §11.4's cap on a whole sort, in rows of the set being sorted.
+const SORT_CAP: u64 = 2_000_000;
+
+/// How many rows a top-N from the palette keeps — "the hundred slowest requests".
+const TOP_N: usize = 100;
+
 impl Filtering {
+    /// Whether the row space is derived — by the chips, the collapse or a landed sort — so a
+    /// visible row is a scattered file row rather than the row of the same number.
     fn active(&self) -> bool {
+        self.filtered() || self.sorted().is_some()
+    }
+
+    /// Whether the chips or the collapse are in play — the filter machinery's own question.
+    fn filtered(&self) -> bool {
         !self.chips.chips.is_empty() || self.records_only
     }
 
-    /// Forgets the survivors and stops the pass, keeping the chips — what a truncate needs.
+    /// The sorted rows, once a sort has landed.
+    fn sorted(&self) -> Option<&[u64]> {
+        self.sort.as_ref()?.rows.as_deref()
+    }
+
+    /// Forgets the survivors and stops the pass, keeping the chips — what a truncate needs. The
+    /// sort goes with them: it was an order over these survivors.
     fn clear_results(&mut self) {
         self.running = None;
         self.kept.clear();
         self.covered = 0;
         self.scanned = 0;
         self.outcome = None;
+        self.sort = None;
     }
 
     /// The view row a file row lands on: its own slot if it survived, otherwise the slot of the
-    /// next survivor — which is where a hidden match, stepped to, puts the view.
+    /// next survivor — which is where a hidden match, stepped to, puts the view. Under a sort,
+    /// its place in the order, or the top when it is not there.
     fn view_row(&self, file_row: u64) -> u64 {
-        if !self.active() {
+        if let Some(rows) = self.sorted() {
+            return rows.iter().position(|&r| r == file_row).unwrap_or(0) as u64;
+        }
+        if !self.filtered() {
             return file_row;
         }
         self.kept.partition_point(|&r| r < file_row) as u64
     }
 
     fn file_row(&self, view_row: u64) -> Option<u64> {
-        if !self.active() {
+        if let Some(rows) = self.sorted() {
+            return rows.get(usize::try_from(view_row).ok()?).copied();
+        }
+        if !self.filtered() {
             return Some(view_row);
         }
         self.kept.get(usize::try_from(view_row).ok()?).copied()
+    }
+
+    /// Whether a file row has a place in the view. Always, without a sort — a filtered-out row
+    /// lands on the next survivor by design; under a sort, only if the order holds it.
+    fn shown(&self, file_row: u64) -> bool {
+        match self.sorted() {
+            Some(rows) => rows.contains(&file_row),
+            None => true,
+        }
+    }
+
+    /// The rows a sort would order: the survivors under a filter, every row otherwise.
+    fn sortable_rows(&self, total_rows: u64) -> u64 {
+        if self.filtered() {
+            self.kept.len() as u64
+        } else {
+            total_rows
+        }
+    }
+
+    /// The status bar's sort fragment: the pass in progress, the order that landed and the growth
+    /// it holds back, or why there is none.
+    fn describe_sort(&self, column: &str, total_rows: u64) -> Option<String> {
+        let sort = self.sort.as_ref()?;
+        let arrow = if sort.order.descending { '▼' } else { '▲' };
+        let what = match sort.order.top {
+            Some(n) => format!("top {n} by {column} {arrow}"),
+            None => format!("sorted by {column} {arrow}"),
+        };
+        if let Some(why) = &sort.error {
+            return Some(format!("↕ {what}: {why}"));
+        }
+        if sort.rows.is_none() {
+            let pct = (sort.scanned * 100)
+                .checked_div(total_rows)
+                .map_or(0, |p| p.min(100));
+            return Some(format!("↕ sorting by {column}… {pct}%"));
+        }
+        let held = if self.filtered() {
+            self.kept.partition_point(|&r| r < sort.covered)
+        } else {
+            usize::try_from(sort.covered).unwrap_or(usize::MAX)
+        };
+        let held = self.sortable_rows(total_rows).saturating_sub(held as u64);
+        let mut text = format!("↕ {what} · not following");
+        if held > 0 {
+            text.push_str(&format!(" · {held} newer rows held"));
+        }
+        Some(text)
     }
 
     /// Adds one chunk's survivors, in their slot, without sorting the list.
@@ -2418,7 +2705,7 @@ impl Filtering {
             return None;
         }
         let mut text = format!("▼{text}");
-        if self.active() {
+        if self.filtered() {
             text.push_str(&format!(" · {} of {total_rows}", self.kept.len()));
             if self.running.is_some() {
                 let pct = (self.scanned * 100)
@@ -2590,6 +2877,11 @@ enum Command {
     NextTab,
     PreviousTab,
     CloseTab,
+    /// E22: order the view by a column, ascending or descending.
+    SortBy(usize, bool),
+    /// E22: the [`TOP_N`] rows by a column, largest first.
+    TopN(usize),
+    ClearSort,
 }
 
 impl Command {
@@ -2680,6 +2972,11 @@ impl Command {
         (Command::NextTab, "Next tab", "Ctrl+Tab"),
         (Command::PreviousTab, "Previous tab", "Ctrl+Shift+Tab"),
         (Command::CloseTab, "Close tab", "Ctrl+W"),
+        (
+            Command::ClearSort,
+            "Clear the sort (click the sorted header again)",
+            "Esc",
+        ),
     ];
 
     fn entries() -> Vec<Entry> {
@@ -2690,10 +2987,40 @@ impl Command {
             .collect()
     }
 
+    /// The listed commands and, after them, E22's three per column of `layout` — sort ascending,
+    /// sort descending, top-N — with ids that [`from_choice`](Self::from_choice) decodes.
+    fn entries_for(layout: Option<&Layout>) -> Vec<Entry> {
+        let mut entries = Self::entries();
+        let Some(layout) = layout else {
+            return entries;
+        };
+        let mut id = Self::LISTED.len();
+        for i in 0..layout.format.columns.len() {
+            let title = layout.title(i);
+            entries.push(Entry::new(id, &format!("Sort by {title}, ascending"), ""));
+            entries.push(Entry::new(
+                id + 1,
+                &format!("Sort by {title}, descending"),
+                "",
+            ));
+            entries.push(Entry::new(id + 2, &format!("Top {TOP_N} by {title}"), ""));
+            id += 3;
+        }
+        entries
+    }
+
     /// The command a palette choice names.
     fn from_choice(choice: Choice) -> Option<Command> {
         match choice {
             Choice::GoToLine(n) => Some(Command::GoToLine(n)),
+            Choice::Command(id) if id >= Self::LISTED.len() => {
+                let k = id - Self::LISTED.len();
+                Some(match k % 3 {
+                    0 => Command::SortBy(k / 3, false),
+                    1 => Command::SortBy(k / 3, true),
+                    _ => Command::TopN(k / 3),
+                })
+            }
             Choice::Command(id) => Self::LISTED.get(id).map(|(c, _, _)| *c),
         }
     }
@@ -4148,6 +4475,23 @@ impl Shell {
             Command::ResetColumns => {
                 doc.reset_columns();
             }
+            Command::SortBy(column, descending) => {
+                doc.sort_by(sort::Order {
+                    column,
+                    descending,
+                    top: None,
+                });
+            }
+            Command::TopN(column) => {
+                doc.sort_by(sort::Order {
+                    column,
+                    descending: true,
+                    top: Some(TOP_N),
+                });
+            }
+            Command::ClearSort => {
+                doc.clear_sort();
+            }
             Command::EditLastChip => {
                 let last = doc.filtering.chips.chips.len().checked_sub(1);
                 if let Some(i) = last {
@@ -4242,7 +4586,9 @@ impl Shell {
         } else if key == VK_ESCAPE.0 && doc.chrome.focus == Focus::Grid {
             if !doc.finder.matches.is_empty() || doc.finder.running.is_some() {
                 doc.finder.clear();
-            } else if doc.filtering.active() {
+            } else if doc.filtering.sort.is_some() {
+                doc.clear_sort();
+            } else if doc.filtering.filtered() {
                 doc.clear_filter();
             } else {
                 return false;
@@ -4522,7 +4868,7 @@ impl Shell {
     fn poll_filter(&mut self, hwnd: HWND) {
         let mut changed = false;
         for doc in self.document.panes_mut() {
-            changed |= doc.poll_filter() | doc.poll_tee();
+            changed |= doc.poll_filter() | doc.poll_sort() | doc.poll_tee();
         }
         if !changed {
             return;
@@ -6197,7 +6543,17 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             unsafe {
                                 let _ = ReleaseCapture();
                             }
-                            doc.drop_column(x)
+                            // Dropped where it was picked up: a click, not a drag — E22's sort
+                            // on that column, cycling ascending, descending, none.
+                            let picked = doc.moving;
+                            let dropped = doc.column_at_cell(doc.header_cell(x));
+                            if doc.drop_column(x) {
+                                true
+                            } else if let (Some(from), Some(to)) = (picked, dropped) {
+                                hit.is_some() && from == to && doc.cycle_sort(from)
+                            } else {
+                                false
+                            }
                         }
                         (WM_LBUTTONDBLCLK, Some(Some(col))) => {
                             let width = doc
@@ -7359,7 +7715,21 @@ mod tests {
             Command::from_choice(Choice::Command(0)),
             Some(Command::OpenFile)
         );
-        assert_eq!(Command::from_choice(Choice::Command(999)), None);
+        // E22: ids past the list are the per-column entries, three a column.
+        let n = Command::LISTED.len();
+        assert_eq!(
+            Command::from_choice(Choice::Command(n)),
+            Some(Command::SortBy(0, false))
+        );
+        assert_eq!(
+            Command::from_choice(Choice::Command(n + 4)),
+            Some(Command::SortBy(1, true))
+        );
+        assert_eq!(
+            Command::from_choice(Choice::Command(n + 5)),
+            Some(Command::TopN(1))
+        );
+        assert_eq!(Command::entries_for(None).len(), n);
         let entries = Command::entries();
         assert_eq!(entries.len(), Command::LISTED.len());
         assert!(entries.iter().all(|e| !e.label.is_empty()));
@@ -8013,6 +8383,169 @@ mod tests {
         assert_eq!(doc.filtering.kept[2], 4);
         let _ = std::fs::remove_file(&path);
     }
+    fn sort_for(doc: &mut Document, order: sort::Order) {
+        assert!(doc.sort_by(order));
+        land_sort(doc);
+    }
+
+    /// Polls until the sort asked for lands or fails.
+    fn land_sort(doc: &mut Document) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.filtering.sorted().is_none()
+            && doc
+                .filtering
+                .sort
+                .as_ref()
+                .is_some_and(|s| s.error.is_none())
+            && std::time::Instant::now() < deadline
+        {
+            doc.poll_filter();
+            doc.poll_sort();
+            std::thread::yield_now();
+        }
+    }
+
+    /// E22 end to end: a sort by level puts the errors first and the view's rows are the sorted
+    /// order; the header carries the mark; a click cycles descending then off; the sort composes
+    /// with a chip (over the survivors only); a top-N is the head of the order; growth after the
+    /// sort is held and counted, not shown, and clearing the sort shows it.
+    #[test]
+    fn sort_by_column_orders_the_view_and_holds_growth() {
+        let path = std::env::temp_dir().join("tailhawk_sort_test.log");
+        let text: String = (0..12)
+            .map(|i| {
+                let level = match i % 4 {
+                    0 => "ERR",
+                    1 => "WRN",
+                    _ => "INF",
+                };
+                format!(
+                    "2026-08-16 09:14:{:02}.117 +02:00 [{level}] line {i}\n",
+                    i % 60
+                )
+            })
+            .collect();
+        std::fs::write(&path, &text).expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        let level = doc
+            .layout
+            .as_ref()
+            .and_then(|l| l.format.columns.iter().position(|c| *c == "level"))
+            .expect("a level column");
+
+        // Ascending: INF (2,3,6,7,10,11) then WRN (1,5,9) then ERR (0,4,8).
+        assert!(doc.cycle_sort(level));
+        land_sort(&mut doc);
+        assert_eq!(
+            doc.filtering.sorted().map(|r| r.to_vec()),
+            Some(vec![2, 3, 6, 7, 10, 11, 1, 5, 9, 0, 4, 8])
+        );
+        assert_eq!(doc.view_rows(), 12);
+        assert_eq!(doc.filtering.file_row(0), Some(2));
+        assert_eq!(
+            doc.filtering.view_row(9),
+            8,
+            "the sorted place, not the file row"
+        );
+        assert!(
+            doc.header_text().unwrap_or("").contains("level▲"),
+            "{:?}",
+            doc.header_text()
+        );
+        assert!(
+            doc.describe()
+                .contains("↕ sorted by level ▲ · not following"),
+            "{}",
+            doc.describe()
+        );
+
+        // A second click on the same header: descending, errors first.
+        assert!(doc.cycle_sort(level));
+        land_sort(&mut doc);
+        assert_eq!(doc.filtering.file_row(0), Some(0));
+        assert_eq!(doc.filtering.file_row(2), Some(8));
+        assert!(doc.header_text().unwrap_or("").contains("level▼"));
+
+        // Growth after the sort is held: the row count stands, the status counts it.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            f.write_all(b"2026-08-16 09:15:00.000 +02:00 [ERR] late\n")
+                .expect("append");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.set.total_rows() < 13 && std::time::Instant::now() < deadline {
+            doc.poll_follow();
+            doc.poll_filter();
+            doc.poll_sort();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(doc.set.total_rows(), 13);
+        assert_eq!(doc.view_rows(), 12, "the late row is held, not shown");
+        assert!(
+            doc.describe().contains("1 newer rows held"),
+            "{}",
+            doc.describe()
+        );
+
+        // A third click clears the sort: file order, and the late row is there.
+        assert!(doc.cycle_sort(level));
+        assert!(doc.filtering.sort.is_none());
+        assert_eq!(doc.view_rows(), 13);
+        assert_eq!(doc.filtering.file_row(12), Some(12));
+        assert!(!doc.header_text().unwrap_or("").contains('▼'));
+
+        // Over a filter: only the survivors are ordered. `level >= Warning` keeps 7 rows;
+        // sorted ascending they are the WRNs then the ERRs.
+        filter_for(&mut doc, "level >= Warning", Polarity::Include);
+        assert_eq!(doc.filtering.kept.len(), 7);
+        sort_for(
+            &mut doc,
+            sort::Order {
+                column: level,
+                descending: false,
+                top: None,
+            },
+        );
+        assert_eq!(
+            doc.filtering.sorted().map(|r| r.to_vec()),
+            Some(vec![1, 5, 9, 0, 4, 8, 12])
+        );
+        // A chip change drops the sort with the survivors it ordered — and the header's mark with
+        // it, on the next frame.
+        assert!(doc.header_text().unwrap_or("").contains('▲'));
+        doc.clear_filter();
+        assert!(doc.filtering.sort.is_none());
+        assert_eq!(doc.view_rows(), 13);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(
+            !doc.header_text().unwrap_or("").contains('▲'),
+            "{:?}",
+            doc.header_text()
+        );
+
+        // Top-N: the two highest levels — errors — by file order.
+        sort_for(
+            &mut doc,
+            sort::Order {
+                column: level,
+                descending: true,
+                top: Some(2),
+            },
+        );
+        assert_eq!(doc.filtering.sorted().map(|r| r.to_vec()), Some(vec![0, 4]));
+        assert!(
+            doc.describe().contains("↕ top 2 by level ▼"),
+            "{}",
+            doc.describe()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// §6.4's collapse: with `records_only`, continuations leave the row space and the record's
     /// first lines remain — composed with a chip when there is one.
     #[test]
@@ -8264,6 +8797,25 @@ mod tests {
                 "width" => {
                     let (col, w) = arg.split_once(':').expect("width:<col>:<cells>");
                     doc.set_column_width(col.parse().expect("col"), w.parse().expect("cells"));
+                }
+                "sort" => {
+                    // sort:<col>[:desc][:top]
+                    let mut parts = arg.split(':');
+                    let column = parts
+                        .next()
+                        .and_then(|c| c.parse().ok())
+                        .expect("sort:<col>");
+                    let descending = parts.next() == Some("desc");
+                    let top = parts.next().and_then(|n| n.parse().ok());
+                    sort_for(
+                        &mut doc,
+                        sort::Order {
+                            column,
+                            descending,
+                            top,
+                        },
+                    );
+                    assert!(doc.filtering.sorted().is_some(), "{}", doc.describe());
                 }
                 "palette" => {
                     doc.palette.open();

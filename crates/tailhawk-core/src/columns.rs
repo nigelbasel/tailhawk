@@ -52,6 +52,8 @@ pub struct Layout {
     /// The display order of the columns before the last — indices into `widths` — after the user
     /// has dragged one; the message column stays last. `UI-DESIGN.md` §2.1's reorderable columns.
     pub order: Vec<usize>,
+    /// The column the rows are sorted by and whether descending — E22 — for the header's mark.
+    pub sort: Option<(usize, bool)>,
 }
 
 impl Layout {
@@ -91,33 +93,53 @@ impl Layout {
             format,
             widths,
             order,
+            sort: None,
         }
     }
 
     /// The header line: each column's name padded to its width, in the row's own cells, so it sits
-    /// over the values. Built once; the layout does not change while a file is open.
+    /// over the values. The sorted column, if any, carries `▲` or `▼` in the gap after its title —
+    /// E22's affordance, on the column that has it and nowhere else, taking no room from the
+    /// title. Rebuilt whenever a width, the order or the sort changes.
     pub fn header(&self) -> String {
         let mut text = String::new();
         let last = self.widths.len().saturating_sub(1);
-        let title = |i: usize| match self.format.titles {
-            Some(titles) => titles.get(i).copied().unwrap_or(self.format.columns[i]),
-            None => column_title(self.format.columns[i]),
+        let title = |i: usize| self.title(i);
+        let mark = |i: usize| match self.sort {
+            Some((c, false)) if c == i => "▲",
+            Some((c, true)) if c == i => "▼",
+            _ => "",
         };
+        let model = CellModel::new();
         for &i in self.shown_order() {
             if self.widths[i] == 0 {
                 continue;
             }
-            let name = title(i);
-            let take = cut_to_cells(&CellModel::new(), name, self.widths[i]);
+            let take = cut_to_cells(&model, title(i), self.widths[i]);
+            let mark = mark(i);
             text.push_str(take);
-            for _ in CellModel::new().cell_count(take)..self.widths[i] + GAP {
+            text.push_str(mark);
+            for _ in model.cell_count(take) + model.cell_count(mark)..self.widths[i] + GAP {
                 text.push(' ');
             }
         }
         if !self.format.columns.is_empty() {
             text.push_str(title(last));
+            text.push_str(mark(last));
         }
         text
+    }
+
+    /// Column `i`'s title as the header shows it: the format's own title when it declares one, the
+    /// capture name spelt out otherwise (`ts` → `timestamp`).
+    pub fn title(&self, i: usize) -> &'static str {
+        match self.format.titles {
+            Some(titles) => titles
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| self.format.columns.get(i).copied().unwrap_or("")),
+            None => column_title(self.format.columns.get(i).copied().unwrap_or("")),
+        }
     }
 
     /// The columns before the last, in display order — `order` when it names them all, the

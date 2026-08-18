@@ -46,6 +46,7 @@ session); dropping a file on the window does the same; `Ctrl+O` asks for one.
 | `PgUp` `PgDn` `Space` `b` `Home` `End` `↑↓←→` | Move; scrolling up pauses following, `Ctrl+End` resumes |
 | wheel, `Shift+wheel` | Vertical (eased), horizontal |
 | header boundary drag | Resize a column; to zero hides it; double-click resets one; palette resets all |
+| header title drag / click | Drag a title onto another column to reorder; **click** to sort by that column — ascending, again descending, again off (`Esc` also clears it) |
 
 ## Filters
 
@@ -63,6 +64,17 @@ startsWith(logger, "Zenith.")
 Fields are `level`, `timestamp`, `body`, `source`, `trace`, `span`, any column the detected format
 names, or `attributes.<key>`. A field the format does not have makes an include chip exclude the row
 and an exclude chip keep it, and the chip says so.
+
+## Sort and top-N
+
+Click a column title to sort the visible rows by it (`▲` after the title; click again for `▼`, again
+for file order). Level sorts by severity, timestamps by instant, numbers as numbers, the rest as
+text; rows the column is missing from come last. **Sorting holds the view still**: it is not
+following, and rows that arrive while it is sorted are counted in the status bar (`↕ sorted by level
+▼ · not following · 12 newer rows held`) and shown when the sort clears. A sort is over the rows a
+filter keeps, needs 2 M rows or fewer (filter first), and drops when the chips change. The palette
+also lists *Sort by <column>, ascending / descending* and **Top 100 by <column>** — the hundred
+highest by that column (slowest requests, biggest responses), which has no size cap.
 
 ## Highlighting
 

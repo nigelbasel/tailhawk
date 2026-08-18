@@ -44,8 +44,12 @@ closes); several paths on the command line open together; a directory or `dir*.l
 new files join as tabs. A **status bar** says whether the view is following. **Remembered between
 runs:** the window's place, and each file's chips and collapse (`tailhawk.settings.toml`).
 
+**Sort (added 2026-08-18):** click a column title to **sort** by it (▲, then ▼, then off; `Esc` clears); the
+palette also offers **Top 100 by** a column. Sorting holds the view still and counts the rows that arrive
+meanwhile; it needs 2 M rows or fewer (filter first) — top-N has no cap.
+
 **Missing before daily use is comfortable:** no menus (the palette is the discovery
-surface); columns resize, hide and reorder by header drag; no user highlight-rules editor or
+surface); columns resize, hide, reorder and sort by header drag/click; no user highlight-rules editor or
 format wizard UI (`tailhawk.rules.toml` holds user highlight rules — the palette opens it; colour labels
 are the quick form); no installer or signing.
 
@@ -53,7 +57,7 @@ are the quick form); no installer or signing.
 file, export/tee, what is remembered.
 
 **After that:** RDP-friendly rendering (M7b), the last of M8 (i18n externalisation), docs, installer and
-signing (M9). In plan terms: the rest of M7 (sort, rules editor / format wizard, column reorder), then
+signing (M9). In plan terms: the rest of M7 (rules editor / format wizard UI, Mica), then
 M7b, M8, M9. **`tools/verify-uia.ps1` is the automated interaction test** — it drives the shipped binary
 through UI Automation and needs no free desktop.
 
@@ -116,12 +120,15 @@ message must be moved to the un-nested one that causes it.**
 | **Pushed to origin** (172 commits since M4) — CI's `cargo fmt --check` failed once on the day's work; formatted and pushed again | `.github/workflows/ci.yml` | CI |
 | **`--column-pattern=` / `--columns=none`** — a §6.5 DSL pattern taken as the format (not scored); detection off | `CLI_FORMATS`, `detect_set` | real binary: `pattern (command line)` in the title |
 | CI: the stdin spill DACL test accepts SDDL's `LA` alias for the built-in Administrator (the runner) | `stdin.rs` test | CI |
+| **E22 sort + top-N** (2026-08-18, after the restart) — `sort.rs`: a worker pass keyed by column through the format (severity, instant, number, lowercase text; missing last either way; ties by row), whole sort or a heap for top-N; `Filtering.sort` layers the order over the survivors, `active()` now means "derived row space", `filtered()` the chips; header title **click** cycles ▲ ▼ off (a drag still reorders); palette lists *Sort by <col> asc/desc* and *Top 100 by <col>* per column; §11.4's **2 M cap** refused with a status message; **growth is held and counted** while sorted (`↕ sorted by level ▼ · not following · N newer rows held`), shown when it clears; `Esc` clears the sort first; a chip change drops it; the scattered fetch list is sorted (fetch_rows and the presentation lookup binary-search it — the sort found that) | `sort.rs` (3 tests), `Sorting`, `Document::sort_by/cycle_sort/clear_sort/poll_sort`, `Layout::sort` + header mark | headless (`sort:1:desc`, `chip:job;sort:1:desc:5`) + end-to-end test; verify-uia 11/11 |
+
+**Deviations recorded (E22):** `UI-DESIGN.md` §2.1 wants the sort affordance shown on every eligible header; only the *sorted* column carries a mark (an ineligible click says why in the status bar). Export and tee under a sort write in **file** order (one pass over the file), not the sorted order. `⇅` is not in Cascadia Mono; the lead glyph is `↕`.
 
 **Deviation recorded:** `UI-DESIGN.md` §12 gives `Ctrl+Shift+0…9` to *both* numbered bookmarks and
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Left of M7:** E22 sort/top-N; V9's rules *editor* and format wizard UI (the rules file works); Mica; `WM_POINTER` inertia (a wheel notch is eased now). **The
+**Left of M7:** V9's rules *editor* and format wizard UI (the rules file works); Mica; `WM_POINTER` inertia (a wheel notch is eased now). **The
 desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
 Save dialog.

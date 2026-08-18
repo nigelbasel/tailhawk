@@ -380,9 +380,11 @@ with toggle/edit/drag, **palette**), V7 (tabs, drag-reorder, middle-click close,
 (detail pane, JSON re-indent), V12-lite (eased wheel; no `WM_POINTER`), V13 (dark/light/High
 Contrast, `--theme`), **V15** (UIA chrome provider + `tools/verify-uia.ps1`, which passes on the
 shipped binary without a free desktop), E19, E20 (+ severity glyphs), E21 (export + live tee, TSV),
-E27; and from M8, E17, E18, E28. **Not landed:** E22 sort/top-N; V9's rules *editor* and format
-wizard as UI — the rules file (`tailhawk.rules.toml`) and the config import stand in; column
-reorder and saved widths; Mica.
+E27; and from M8, E17, E18, E28. **Not landed at scoring:** E22 sort/top-N (landed the next
+morning, 2026-08-18, ~1 h — the pass was `export.rs`'s shape, and its one surprise was that the
+scattered fetch and the presentation lookup both assumed an ascending row list); V9's rules *editor*
+and format wizard as UI — the rules file (`tailhawk.rules.toml`) and the config import stand in;
+column reorder and saved widths (also landed later on 2026-08-17); Mica.
 
 **~2.8× high, and the shape held.** V14 — the new shape — cost about 1.5 h, not 4: a text field is
 a well-known thing, and the caret model was `selection.rs`. Everything after it was the reuse
