@@ -1,5 +1,30 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-08-18, session 19 (paused for a tool change; state is all in git)
+
+**Where the plan is:** M7 has **one item left — V9's rules *editor* and format *wizard* as UI**
+(the rules file and the config import stand in), plus Mica and `WM_POINTER` inertia as polish.
+Then M7b (RDP path), M8's i18n externalisation, M9 (installer, signing, docs). Session 19 landed
+**E22 sort + top-N** (`fe732be`, reviewed, pushed; check CI on that commit first — it was running at
+the pause).
+
+**Start the next session with:** `git status` (clean), the CI result for `fe732be`, then V9's UI —
+`UI-DESIGN.md` §6 (rules editor) and §7 (format wizard) on V14's fields, opened from the palette,
+live preview on the visible rows. Keep `logs/agent.log` fed via `tools/agentlog.sh` from the first
+turn (a "turn" line), commit straight to master, review each component with a subagent before
+committing, and do not stop between items.
+
+**Known and left as is (from E22's review):** `view_row` under a sort is a linear scan (fine at the
+2 M cap); `F3` / `F2` step in *file* order under a sort, so they jump around the sorted view; export
+and tee under a sort write in file order; the sort is not in `Alt+←` history; a whole-file sort asked
+for while the opening scan is still folding rows sorts what is indexed and counts the rest as held;
+the message column sorts only from the palette (its title is not a drag target). **A pre-existing
+flake:** `semantic::tests::a_screenful_costs_a_fraction_of_a_frame` fails under the full parallel
+suite on a loaded machine and passes alone / on CI — a timing criterion, not a defect in the change
+under test.
+
+---
+
 ## 🧭 What the app can do, in plain terms — kept current, read this first
 
 *(2026-08-17.)* **Windows only** — `SPEC.md` §2.1 scopes v1 to Windows 10 1809+ x64; the shell is

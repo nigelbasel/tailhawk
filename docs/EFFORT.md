@@ -40,7 +40,8 @@ the time. The method is above and is reproducible, but it was derived after the 
 | 2026-08-14 | ² | ² | 19 | M4 finished (follow tick, E30, E16, off-thread scan); M5 E26, E15, E13, MODE_SOLID |
 | 2026-08-16 | 1.2⁴ | 287 k⁴ | 6 | Search wired to the UI: the span pass, `find.rs`, the keys, the 10 GB worker criterion |
 | 2026-08-17 | 14.5⁴ | 2.8 M⁴ | 110 | The find harness run at last; E23; E14; E24; open-at-tail, Ctrl+O + drop, the wndproc guard; M5 scored; **M6 delivered less V9**; M6 scored, M7 begun — **V14** text field + focus, the **command bar** on real fields, IME, headless snapshot, **tabs**, status bar, chips toggle, E19 watched folders, E28 settings, `--filter/--exclude`; then the **gutter + E20 bookmarks**, **V8 command palette**, colour labels, **E27 history**, **V10 detail pane**, **E21 export/tee** + TSV copy; **split view**, **V13 theming**, E17/E18, glyphs, smooth wheel, chip edit, column resize, drag-reorder, **V15 UIA + verify-uia.ps1**, user rules file; **M7 scored**; welcome surface, saved column widths, `docs/USING.md`, column reorder, `--column-pattern`, **pushed; CI green** |
-| **Total** | **~50.6** | **~10.0 M** | **243**³ | **M0–M7 (less E22, V9's editor UI), plus M8's E17, E18, E28** |
+| 2026-08-18 | ~1.5⁴ | ~0.3 M⁴ | 2 | **E22 sort + top-N** (after a restart): `sort.rs`, header-click sort, per-column palette entries, the 2 M cap, held growth; a review pass (14 findings, 2 bugs fixed); USING/HANDOFF; pushed. Paused for a tool change (Nimbalyst) |
+| **Total** | **~52.1** | **~10.3 M** | **245**³ | **M0–M7 (less V9's editor UI), plus M8's E17, E18, E28** |
 
 ⁴ **Measured while the session was still running**, so it is a floor rather than a total — 710 turns
 between 14:31 and 15:49, by the method above. Recorded now rather than at the end because the last
