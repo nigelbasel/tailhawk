@@ -31,8 +31,49 @@ records what it changed. **One of those changed the file format:** `rules::Spec`
 `literal` flag, because §5's `.*`/`Ab` toggle is regex-versus-plain-text (`SPEC.md` §7.1) and the
 first draft had wrongly mapped it onto `case_insensitive`.
 
-**Next: V9 part 2, the rules editor's shell UI.** This is a `main.rs` integration and the wiring is
-already scouted — the palette is the precedent to copy throughout:
+### V9 part 2 is done too: the rules editor's shell UI
+
+`Ctrl+H` (§12's binding, previously unbound) or the palette's "Highlight rules…" opens an overlay
+over the grid: the enable mark, the `.*`/`Ab` toggle, the pattern, colour swatches, whole-line, and
+each rule's compile error inline beside it. Modal while up. The **live preview is the grid itself** —
+every change rebuilds the highlighter, so the rows behind the box cannot disagree with the set.
+`Ctrl+S` writes the personal tier; `Esc` closes and puts the saved rules back.
+
+The pre-commit review found 21 items, four of them blocking, and all four were real:
+
+- **Nothing could be typed into it.** `WM_CHAR` (`find_char`) returns early unless the chrome has
+  focus or the palette is open, and had no branch for the editor — the feature was unusable.
+- **Saving corrupted the rules file.** `load_rule_specs` *merges* every tier; writing the merged set
+  back to the personal tier duplicated the curated rules on each save+restart and resurrected
+  anything deleted. The editor now loads and writes **only the personal tier**, with earlier tiers
+  held in `rules_fixed` and applied under it. The two-tier round trip is now a test.
+- **The edited cell was discarded**, so Name/Fg/Bg all drew as "pattern".
+- **Clicks fell through the overlay** onto the grid behind it, contradicting the modal claim.
+
+Also fixed from the review: `Ctrl+Delete` destroying a rule mid-edit, a full recompile of every rule
+in every tab on each arrow key, a negative box width on narrow windows, and the title/error/legend
+bleeding past the box edge. Two defects came from *looking* at it rather than from tests — ☑/☐ fell
+back to tofu so an enabled rule looked disabled (now `●`/`○`), and the empty-state line overstruck
+the legend.
+
+**Knowingly undone in the editor** — raise individually when one bites:
+
+- **Import/Export are unwired.** `ruleset::import` exists, is tested, and is the *only* sanctioned
+  door for an untrusted set per `SPEC.md` §13.1 — wire the Import button to it and nothing else.
+- No mouse drag on the `⣿` handle (keyboard `Ctrl+↑↓` reorders); no `Apply to ▾` (`Editor::bound_to`
+  is carried but never set or drawn); no name column; no `identifier` role (§7, v2); no fg swatch —
+  the foreground is used as the row's ink instead.
+- **No viewport**: past roughly 40 rules the box runs off the bottom and the selection can move
+  where it cannot be seen. Clamp the height and window the rows around the selection.
+- The preview updates on commit, not per keystroke — a real per-keystroke preview needs debouncing,
+  because a rebuild recompiles every rule in every tab.
+- `Ctrl+O` and drag-and-drop escape the modal, and a document opened that way is built from the
+  *saved* set while the other tabs show the preview.
+- The overlay is invisible to UIA (§13); `verify-uia.ps1` asserts nothing about it either way.
+- While the editor is up, `Ctrl+W`, `Ctrl+D` and `Ctrl+Tab` are reassigned from their §12 meanings.
+  §12 has not been updated to say so.
+
+**Next: V9 part 3, the wizard model.** The wiring for it is scouted below.
 
 | What | Where |
 |---|---|

@@ -75,8 +75,8 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
     VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G,
-    VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z,
+    VK_H, VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_N, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_R,
+    VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
@@ -205,6 +205,10 @@ struct Document {
     /// `Ctrl+K`'s command palette — `UI-DESIGN.md` §9. Per document, so a tab switch keeps its
     /// query; every one lists the same commands.
     palette: Palette,
+    /// V9's rules editor as it should be drawn this frame — the shell's knowledge, handed to the
+    /// document that draws it, exactly as [`Document::tab_strip`] and [`Document::status`] are.
+    /// The editor itself is the shell's; this is only its picture.
+    rules_overlay: Option<RulesOverlay>,
     /// The ad-hoc colour labels in force — `(n, text)` — mirrored as rules at the front of the
     /// highlighter's set. Kept here so they can be listed and saved.
     labels: Vec<(u8, String)>,
@@ -513,6 +517,10 @@ impl RowSource for Document {
             );
         }
 
+        // V9's rules editor, under the palette — §5. Before it, so a palette opened while the
+        // editor is up is still the thing on top.
+        self.draw_rules(painter, view, cells);
+
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
         // query on its first line, then the rows, the selected one filled. Rows are remembered by
         // their y for the click.
@@ -608,6 +616,141 @@ impl RowSource for Document {
 }
 
 impl Document {
+    /// V9's rules editor over the grid — `UI-DESIGN.md` §5. Drawn after the palette's box so the
+    /// palette, which can be opened over anything, stays on top of it.
+    ///
+    /// The rows behind this box are the live preview: the shell has already rebuilt the
+    /// highlighter from the set under edit, so there is nothing to draw here for it.
+    fn draw_rules(&self, painter: &mut Painter, view: &View, cells: &CellModel) {
+        let Some(overlay) = self.rules_overlay.as_ref() else {
+            return;
+        };
+        let cell_w = painter.cell_width();
+        let row_h = painter.row_height();
+        let width = view.hgrid().viewport_px();
+        let box_x = view.gutter_px() + cell_w;
+        let box_w = (RULES_CELLS as f32 * cell_w)
+            .min(width - box_x - cell_w)
+            .max(0.0);
+        // Title, the rules (or the one line that stands in for none), and the legend.
+        let box_h = row_h * (overlay.rows.len().max(1) + 2) as f32 + 8.0;
+        let box_y = view.chrome_px();
+        painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
+        let inner_x = box_x + cell_w;
+        // What fits inside the box, so nothing this draws bleeds onto the grid behind it.
+        let inner_cells = ((box_w / cell_w) as usize).saturating_sub(2);
+        let mut y = box_y + 4.0;
+        let _ = painter.lay_out_at(
+            view,
+            inner_x,
+            y,
+            tailhawk_core::widget::fit_from_right(cells, &overlay.title, inner_cells),
+            Colours::plain(theme().header_ink),
+        );
+        y += row_h;
+
+        // §10 — the states usually neglected. A first run has no rules file, so the editor opens
+        // on nothing; saying what the box is for beats an empty box with a legend under it.
+        if overlay.rows.is_empty() {
+            let _ = painter.lay_out_at(
+                view,
+                inner_x,
+                y,
+                tailhawk_core::widget::fit_from_right(cells, RULES_EMPTY, inner_cells),
+                Colours::plain(theme().field_hint),
+            );
+            y += row_h;
+        }
+
+        let mut hits = self.chrome.rules_hits.borrow_mut();
+        hits.clear();
+        for (i, row) in overlay.rows.iter().enumerate() {
+            if row.selected {
+                painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
+            }
+            let mut x = inner_x;
+            let mark = if row.enabled { RULE_ON } else { RULE_OFF };
+            let _ = painter.lay_out_at(view, x, y, mark, Colours::plain(theme().ink));
+            x += 2.0 * cell_w;
+            // §5's `.*` / `Ab`: which of the two the pattern is read as.
+            let kind = if row.literal { "Ab" } else { ".*" };
+            let _ = painter.lay_out_at(view, x, y, kind, Colours::plain(theme().field_hint));
+            x += 3.0 * cell_w;
+            match overlay.editing {
+                Some((editing_row, cell, ref field)) if editing_row == i => {
+                    // Which cell has the caret is otherwise invisible: all four are edited in the
+                    // same place, so the hint is the only thing that says which one this is.
+                    let hint = match cell {
+                        tailhawk_core::ruleset::Cell::Name => "name",
+                        tailhawk_core::ruleset::Cell::Pattern => "pattern",
+                        tailhawk_core::ruleset::Cell::Fg => "text colour #rrggbb",
+                        tailhawk_core::ruleset::Cell::Bg => "background #rrggbb",
+                    };
+                    draw_field(
+                        painter,
+                        view,
+                        cells,
+                        field,
+                        true,
+                        x + 2.0 * cell_w,
+                        y,
+                        RULES_PATTERN_CELLS - 2,
+                        hint,
+                    );
+                }
+                _ => {
+                    // §5 draws the colours as swatches beside the rule rather than by tinting it,
+                    // so a rule whose colour is a background is still legible in the list.
+                    if let Some(bg) = row.bg {
+                        painter.fill(x, y + row_h * 0.2, cell_w, row_h * 0.6, bg);
+                    }
+                    let shown = tailhawk_core::widget::fit_from_right(
+                        cells,
+                        &row.text,
+                        RULES_PATTERN_CELLS - 2,
+                    );
+                    let ink = row.fg.unwrap_or(theme().ink);
+                    let _ =
+                        painter.lay_out_at(view, x + 2.0 * cell_w, y, shown, Colours::plain(ink));
+                }
+            }
+            x += (RULES_PATTERN_CELLS + 1) as f32 * cell_w;
+            if row.whole_line {
+                let _ = painter.lay_out_at(
+                    view,
+                    x,
+                    y,
+                    "whole line",
+                    Colours::plain(theme().field_hint),
+                );
+            }
+            // §5: the error sits inline beside its own rule, never in a dialog at the end.
+            if let Some(error) = row.error.as_deref() {
+                // A regex compiler's complaint can be long; it is right-aligned in the box, so
+                // clamp it to what is left of the row rather than let it run onto the grid.
+                let room = (((box_w - (x - box_x)) / cell_w) as usize).saturating_sub(1);
+                let error = tailhawk_core::widget::fit_from_right(cells, error, room);
+                let ex = box_x + box_w - (cells.cell_count(error) as f32 + 1.0) * cell_w;
+                let _ = painter.lay_out_at(
+                    view,
+                    ex.max(x),
+                    y,
+                    error,
+                    Colours::plain(theme().semantic.error),
+                );
+            }
+            hits.push((y..y + row_h, i));
+            y += row_h;
+        }
+        let _ = painter.lay_out_at(
+            view,
+            inner_x,
+            y,
+            tailhawk_core::widget::fit_from_right(cells, RULES_LEGEND, inner_cells),
+            Colours::plain(theme().field_hint),
+        );
+    }
+
     /// Opens, detects and indexes. Runs on a worker.
     fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
         let name = path
@@ -650,6 +793,7 @@ impl Document {
             resizing: None,
             moving: None,
             palette: Palette::new(Command::entries_for(layout.as_ref())),
+            rules_overlay: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -707,6 +851,7 @@ impl Document {
             resizing: None,
             moving: None,
             palette: Palette::new(Command::entries_for(layout.as_ref())),
+            rules_overlay: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -2744,6 +2889,74 @@ struct Chrome {
     origins: std::cell::Cell<(f32, f32)>,
     /// The palette's rows by their y, for a click on one.
     palette_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
+    /// The rules editor's rows by their y, for a click on one.
+    rules_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
+}
+
+/// V9's rules editor as one frame should draw it — see [`Document::rules_overlay`].
+#[derive(Clone, Default)]
+struct RulesOverlay {
+    title: String,
+    rows: Vec<RulesRow>,
+    /// The row whose cell is under edit, and the field to draw in its place.
+    editing: Option<(usize, tailhawk_core::ruleset::Cell, TextField)>,
+}
+
+/// The picture of `editor` for one frame, or `None` when it is not up.
+///
+/// Free rather than a method so it can be tested without a window, a device or a `Shell`: it is
+/// pure mapping, and it is where the overlay's reading of a rule is decided.
+fn rules_overlay_of(editor: &tailhawk_core::ruleset::Editor) -> Option<RulesOverlay> {
+    if !editor.is_open() {
+        return None;
+    }
+    let editing = editor
+        .editing()
+        .map(|cell| (editor.selected(), cell, editor.field.clone()));
+    let unsaved = if editor.is_dirty() {
+        " — unsaved"
+    } else {
+        ""
+    };
+    Some(RulesOverlay {
+        title: format!("Rules — {}{unsaved}", editor.name),
+        rows: editor
+            .rows()
+            .into_iter()
+            .map(|row| RulesRow {
+                // A rule with no pattern yet is the one §5's "+ Add rule" just made. Showing its
+                // name keeps the row identifiable while it is being filled in; showing an empty
+                // pattern would leave a blank line the user cannot tell from a bug.
+                text: if row.pattern.is_empty() {
+                    row.name.to_owned()
+                } else {
+                    row.pattern.to_owned()
+                },
+                enabled: row.enabled,
+                literal: row.literal,
+                whole_line: row.whole_line,
+                fg: row.fg,
+                bg: row.bg,
+                selected: row.selected,
+                error: row.error.map(str::to_owned),
+            })
+            .collect(),
+        editing,
+    })
+}
+
+/// One rule as the overlay draws it.
+#[derive(Clone)]
+struct RulesRow {
+    /// The pattern, or the rule's name when the name is what is being shown.
+    text: String,
+    enabled: bool,
+    literal: bool,
+    whole_line: bool,
+    fg: Option<[f32; 4]>,
+    bg: Option<[f32; 4]>,
+    selected: bool,
+    error: Option<String>,
 }
 
 /// E21 — an export in progress, or a live tee. See [`tailhawk_core::export`]: a tee is the export
@@ -2869,6 +3082,8 @@ enum Command {
     ToggleTheme,
     EditLastChip,
     ResetColumns,
+    /// V9's rules editor — `UI-DESIGN.md` §5.
+    EditRules,
     OpenRules,
     ReloadRules,
     GoToTop,
@@ -2960,9 +3175,10 @@ impl Command {
             "Reset column widths (drag a header boundary to resize; to 0 hides)",
             "",
         ),
+        (Command::EditRules, "Highlight rules…", "Ctrl+H"),
         (
             Command::OpenRules,
-            "Edit highlight rules (tailhawk.rules.toml)…",
+            "Edit highlight rules in a text editor (tailhawk.rules.toml)…",
             "",
         ),
         (Command::ReloadRules, "Reload highlight rules", ""),
@@ -3062,6 +3278,7 @@ impl Default for Chrome {
             hits: std::cell::RefCell::new(Vec::new()),
             origins: std::cell::Cell::new((0.0, 0.0)),
             palette_hits: std::cell::RefCell::new(Vec::new()),
+            rules_hits: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -3342,6 +3559,27 @@ impl Watch {
 /// The palette box's width, in cells.
 const PALETTE_CELLS: usize = 64;
 
+/// The rules editor box's width, in cells, and how much of it the pattern gets.
+const RULES_CELLS: usize = 120;
+const RULES_PATTERN_CELLS: usize = 40;
+
+/// The keys the rules editor answers to, along its bottom edge — §5 has no buttons, and the
+/// palette's habit of teaching its keys beside the thing they do applies here too.
+/// §5's enable checkbox. The mock draws `☑` / `☐`, and those fell back to a missing-glyph box on
+/// the shipped font — an enabled rule looked disabled, which is the one thing this control must
+/// never do. These are from the geometric block the gutter's `▲` and the palette's `▸` already
+/// prove renders.
+const RULE_ON: &str = "●";
+const RULE_OFF: &str = "○";
+
+/// §10's empty state: a first run has no rules file at all.
+const RULES_EMPTY: &str =
+    "No highlight rules yet. Ctrl+N adds one; the zero-config colouring underneath stays either way.";
+
+const RULES_LEGEND: &str =
+    "Enter edit · Tab cell · Space on/off · Ctrl+R .*/Ab · Ctrl+W whole line · Ctrl+↑↓ order · \
+     Ctrl+N add · Ctrl+D delete · Ctrl+S save · Esc close";
+
 /// One field: its text (cut from the left to fit), a hint when empty and unfocused, the selection
 /// as a background span, the caret as a two-pixel fill, and a mark under an IME composition.
 #[allow(clippy::too_many_arguments)]
@@ -3468,6 +3706,12 @@ struct Shell {
     rules_tiers: Vec<PathBuf>,
     /// The rules that did not compile, by name — shown in the status bar.
     rules_failed: Vec<String>,
+    /// V9's rules editor — `UI-DESIGN.md` §5. On the shell rather than the document because the
+    /// rules are the estate's, not one tab's; the palette is per-document because a query is.
+    rules_editor: tailhawk_core::ruleset::Editor,
+    /// Rules from tiers the editor cannot write — a curated file beside the exe. Applied under
+    /// whatever the editor holds, so the preview shows the set that will actually be in force.
+    rules_fixed: Vec<tailhawk_core::rules::Spec>,
     /// §14's first-run surface, kept while it is shown so a click on a recent file can be resolved.
     welcome: Option<Welcome>,
     /// A tab or a chip being dragged to a new place — `UI-DESIGN.md` §2.1 / §5 — from its index.
@@ -3728,6 +3972,7 @@ impl Shell {
         // The strip and the status are the shell's knowledge, handed to the document that draws them.
         let strip = (self.document.labels(), self.document.active);
         let status = self.status_text();
+        let rules_overlay = self.rules_overlay();
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
@@ -3773,6 +4018,9 @@ impl Shell {
                     } else {
                         (Vec::new(), 0)
                     };
+                    // The overlay goes on the pane that carries the strip, so it is drawn once
+                    // whatever the split, and over the pane the user is looking at first.
+                    doc.rules_overlay = if i == 0 { rules_overlay.clone() } else { None };
                     doc.show_footer = i + 1 == pane_count;
                     doc.status = if doc.show_footer {
                         status.clone()
@@ -4355,6 +4603,187 @@ impl Shell {
         true
     }
 
+    /// V9's rules editor keys — `UI-DESIGN.md` §5 — offered before the palette's, and modal while
+    /// it is up for the palette's reason: a half-typed regex wants the same keys the grid does.
+    ///
+    /// `Esc` unwinds one level at a time, the cell under edit before the editor itself, so an
+    /// abandoned edit never costs the set. Every mutation ends in
+    /// [`Self::preview_rules`] so §5's live preview — which is the grid behind the box — keeps up.
+    fn rules_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
+        use tailhawk_core::ruleset::Cell;
+        // §12 gives the editor `Ctrl+H`. It opens from outside, and closes from inside, so the
+        // one key both reaches it and dismisses it.
+        if ctrl && key == VK_H.0 {
+            if self.rules_editor.is_open() {
+                self.close_rules_editor();
+            } else if self.document.as_ref().is_some() {
+                self.open_rules_editor();
+            } else {
+                return false;
+            }
+            return self.after_chrome_key(hwnd);
+        }
+        if !self.rules_editor.is_open() {
+            return false;
+        }
+        let editing = self.rules_editor.editing().is_some();
+        // Whether the rules themselves moved, as against the selection or the caret. Only that
+        // needs the preview rebuilt, and rebuilding it costs every rule a recompile.
+        let mut changed = true;
+        match key {
+            k if k == VK_ESCAPE.0 => {
+                if editing {
+                    self.rules_editor.cancel_edit();
+                    changed = false;
+                } else {
+                    self.close_rules_editor();
+                    changed = false;
+                }
+            }
+            k if k == VK_UP.0 && ctrl => self.rules_editor.move_row(-1),
+            k if k == VK_DOWN.0 && ctrl => self.rules_editor.move_row(1),
+            // An arrow commits the cell under edit and then only moves. Rebuilding the preview
+            // costs every rule a recompile in every tab, so it is not something a bare arrow does.
+            k if k == VK_UP.0 => {
+                self.rules_editor.move_selection(-1);
+                changed = editing;
+            }
+            k if k == VK_DOWN.0 => {
+                self.rules_editor.move_selection(1);
+                changed = editing;
+            }
+            k if k == VK_RETURN.0 => {
+                if editing {
+                    self.rules_editor.commit_edit();
+                } else {
+                    self.rules_editor.begin_edit(Cell::Pattern);
+                    changed = false;
+                }
+            }
+            k if k == VK_TAB.0 => {
+                let next = match (self.rules_editor.editing(), shift) {
+                    (None, _) => Cell::Name,
+                    (Some(Cell::Name), false) => Cell::Pattern,
+                    (Some(Cell::Pattern), false) => Cell::Fg,
+                    (Some(Cell::Fg), false) => Cell::Bg,
+                    (Some(Cell::Bg), false) => Cell::Name,
+                    (Some(Cell::Name), true) => Cell::Bg,
+                    (Some(Cell::Pattern), true) => Cell::Name,
+                    (Some(Cell::Fg), true) => Cell::Pattern,
+                    (Some(Cell::Bg), true) => Cell::Fg,
+                };
+                self.rules_editor.begin_edit(next);
+                changed = editing;
+            }
+            k if k == VK_SPACE.0 && !editing => self.rules_editor.toggle_enabled(),
+            k if k == VK_N.0 && ctrl => self.rules_editor.add_rule(),
+            k if k == VK_R.0 && ctrl => self.rules_editor.toggle_literal(),
+            k if k == VK_W.0 && ctrl => self.rules_editor.toggle_whole_line(),
+            // Only when not editing: `Ctrl+Delete` is "delete the word to the right" everywhere
+            // else, and losing a rule to it mid-pattern is unrecoverable — there is no undo
+            // across the set.
+            k if (k == VK_DELETE.0 || k == VK_D.0) && ctrl && !editing => {
+                self.rules_editor.remove_rule()
+            }
+            k if k == VK_S.0 && ctrl => {
+                self.save_rules(hwnd);
+                changed = false;
+            }
+            _ if editing && field_edit(&mut self.rules_editor.field, key, ctrl, shift) => {
+                self.rules_editor.preview_edit();
+                changed = false;
+            }
+            // Every other key is swallowed: the editor is modal while it is up.
+            _ => changed = false,
+        }
+        if changed {
+            self.preview_rules();
+        }
+        self.after_chrome_key(hwnd)
+    }
+
+    /// The rules editor as this frame should draw it, or `None` when it is not up.
+    ///
+    /// A snapshot rather than a borrow, because the document does the drawing and the editor is
+    /// the shell's — the same arrangement the tab strip and the status bar already have.
+    fn rules_overlay(&self) -> Option<RulesOverlay> {
+        rules_overlay_of(&self.rules_editor)
+    }
+
+    /// §5's live preview: the rules under edit, over the real rows, through the same path a
+    /// reloaded file takes. The overlay sits on the grid, so the grid *is* the preview and cannot
+    /// disagree with the set it is previewing.
+    ///
+    /// Every tab, not just the visible one, for the reason the rules live on the shell: they are
+    /// the estate's, and a tab behind this one must not be left showing the set as it was.
+    fn preview_rules(&mut self) {
+        let mut specs = self.rules_fixed.clone();
+        specs.extend(self.rules_editor.specs().iter().cloned());
+        for (_, doc) in self.document.all_mut() {
+            rebuild_highlighter_with(doc, &specs);
+        }
+    }
+
+    /// Opens V9's editor on **the personal tier only** — the one file `save_rules` can write.
+    ///
+    /// `load_rule_specs` merges every tier, so the applied set can include rules from a curated
+    /// file beside the exe. Those are not editable here: writing the merged set back into the
+    /// personal tier would duplicate them on the next load, and deleting one would only have it
+    /// return. They stay in [`Self::rules_fixed`], applied under whatever the editor holds.
+    fn open_rules_editor(&mut self) {
+        let (mine, fixed) = match self.rules_tiers.split_last() {
+            Some((personal, earlier)) => (
+                load_rule_specs(std::slice::from_ref(personal)).0,
+                load_rule_specs(earlier).0,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.rules_fixed = fixed;
+        self.rules_editor =
+            tailhawk_core::ruleset::Editor::new(tailhawk_core::rules::FILE_NAME, mine);
+        self.rules_editor.open();
+    }
+
+    /// Closes the editor and puts the saved rules back over every document.
+    ///
+    /// Closing is not saving: whatever the preview was showing, the rules in force once the box is
+    /// gone are the ones on disk. §10 — an unsaved set thrown away silently is the state that
+    /// costs the user their work, so the status bar says it happened.
+    fn close_rules_editor(&mut self) {
+        if self.rules_editor.is_dirty() {
+            self.file = Some("rules closed unsaved — Ctrl+H, Ctrl+S to save".to_owned());
+        }
+        self.rules_editor.close();
+        let specs = self.rule_specs.clone();
+        for (_, doc) in self.document.all_mut() {
+            rebuild_highlighter_with(doc, &specs);
+        }
+    }
+
+    /// Writes the editor's set to the personal tier and reloads, so what applies afterwards is
+    /// what a restart would load rather than what was on screen.
+    ///
+    /// Only the personal tier is written; see [`Self::open_rules_editor`].
+    fn save_rules(&mut self, hwnd: HWND) {
+        let Some(target) = self.rules_tiers.last().cloned() else {
+            return;
+        };
+        if let Some(dir) = target.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // §10: a read-only profile is a state, not an impossibility. Say so rather than let the
+        // title go on claiming the set is unsaved with no reason given.
+        if let Err(e) = std::fs::write(&target, self.rules_editor.to_toml()) {
+            self.file = Some(format!("rules not saved: {e}"));
+            return;
+        }
+        self.rules_editor.mark_saved();
+        let (specs, failed) = load_rule_specs(&self.rules_tiers);
+        self.rule_specs = specs;
+        self.rules_failed = failed;
+        self.retitle(hwnd);
+    }
+
     /// The palette's keys, offered before anything else while it is open: `Ctrl+K` opens and
     /// closes it (`Ctrl+G` opens it too — a typed number is "go to line"), `Up`/`Down` move,
     /// `Enter` runs the selection, `Esc` closes, and the editing keys are the query field's.
@@ -4422,6 +4851,10 @@ impl Shell {
             }
             Command::ToggleTheme => {
                 self.toggle_theme(hwnd);
+                return true;
+            }
+            Command::EditRules => {
+                self.open_rules_editor();
                 return true;
             }
             Command::OpenRules => {
@@ -4553,6 +4986,7 @@ impl Shell {
             | Command::Split
             | Command::FocusOtherPane
             | Command::ToggleTheme
+            | Command::EditRules
             | Command::OpenRules
             | Command::ReloadRules
             | Command::CloseTab => {}
@@ -4611,6 +5045,26 @@ impl Shell {
     /// `WM_CHAR` delivers a non-BMP character as two messages, and inserting each on its own puts
     /// two replacement characters into the field.
     fn find_char(&mut self, hwnd: HWND, unit: u16) -> bool {
+        // V9's editor takes typed text before anything else while it is up, and it does not use
+        // the chrome's focus: it is modal, so the cell under edit is where a character goes.
+        if self.rules_editor.is_open() {
+            if self.rules_editor.editing().is_none() {
+                return true;
+            }
+            let mut text = String::new();
+            let Some(doc) = self.document.as_mut() else {
+                return true;
+            };
+            if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
+                return true;
+            }
+            self.rules_editor.field.insert(&text);
+            self.rules_editor.preview_edit();
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return true;
+        }
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
@@ -4745,6 +5199,23 @@ impl Shell {
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
     /// chip is removed. Returns whether the click was the bar's.
     fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, extend: bool) -> bool {
+        // V9's editor is modal, so a click inside it selects a rule and a click anywhere else is
+        // swallowed. Without this the grid behind the box takes the click and the user finds
+        // themselves dragging a selection through log text they cannot see.
+        if self.rules_editor.is_open() {
+            let hit = self.document.as_ref().and_then(|doc| {
+                doc.chrome
+                    .rules_hits
+                    .borrow()
+                    .iter()
+                    .find(|(range, _)| range.contains(&y))
+                    .map(|(_, row)| *row)
+            });
+            if let Some(row) = hit {
+                self.rules_editor.select(row);
+            }
+            return self.after_chrome_key(hwnd);
+        }
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
@@ -6349,7 +6820,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
-                    shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
+                    shell.rules_key(hwnd, wparam.0 as u16, ctrl, shift)
+                        || shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.view_key(hwnd, wparam.0 as u16, ctrl)
                         || shell.chrome_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.find_key(hwnd, wparam.0 as u16, ctrl, shift)
@@ -6970,6 +7442,8 @@ fn main() -> Result<()> {
             wheel_remaining: 0.0,
             dragging_bar: None,
             welcome: None,
+            rules_editor: tailhawk_core::ruleset::Editor::default(),
+            rules_fixed: Vec::new(),
             rule_specs,
             rules_tiers,
             rules_failed,
@@ -9058,5 +9532,201 @@ mod tests {
             "the rule came back too"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn rules_editor_with(specs: Vec<tailhawk_core::rules::Spec>) -> tailhawk_core::ruleset::Editor {
+        let mut editor = tailhawk_core::ruleset::Editor::new("tailhawk.rules.toml", specs);
+        editor.open();
+        editor
+    }
+
+    fn a_spec(name: &str, pattern: &str) -> tailhawk_core::rules::Spec {
+        tailhawk_core::rules::Spec {
+            name: name.to_owned(),
+            pattern: pattern.to_owned(),
+            fg: Some([1.0, 0.4, 0.4, 1.0]),
+            bg: None,
+            whole_line: false,
+            enabled: true,
+            case_insensitive: true,
+            literal: false,
+        }
+    }
+
+    #[test]
+    fn the_rules_overlay_is_drawn_only_while_the_editor_is_up() {
+        let mut editor = tailhawk_core::ruleset::Editor::new("r", vec![a_spec("e", "ERROR")]);
+        assert!(
+            rules_overlay_of(&editor).is_none(),
+            "a closed editor draws nothing"
+        );
+        editor.open();
+        assert!(rules_overlay_of(&editor).is_some());
+    }
+
+    #[test]
+    fn the_overlay_says_when_the_set_has_unsaved_changes() {
+        let mut editor = rules_editor_with(vec![a_spec("e", "ERROR")]);
+        let title = rules_overlay_of(&editor).expect("open").title;
+        assert!(
+            !title.contains("unsaved"),
+            "nothing has changed yet: {title}"
+        );
+        editor.toggle_enabled();
+        let title = rules_overlay_of(&editor).expect("open").title;
+        assert!(title.contains("unsaved"), "and now it has: {title}");
+        editor.mark_saved();
+        assert!(!rules_overlay_of(&editor)
+            .expect("open")
+            .title
+            .contains("unsaved"));
+    }
+
+    #[test]
+    fn a_rule_being_filled_in_shows_its_name_rather_than_a_blank_line() {
+        let mut editor = rules_editor_with(vec![a_spec("existing", "ERROR")]);
+        editor.add_rule();
+        // "+ Add rule" opens the pattern cell; leave it empty and name the rule instead.
+        editor.cancel_edit();
+        editor.begin_edit(tailhawk_core::ruleset::Cell::Name);
+        editor.field.set_text("half built");
+        editor.commit_edit();
+        let overlay = rules_overlay_of(&editor).expect("open");
+        assert_eq!(overlay.rows[1].text, "half built");
+        assert!(
+            overlay.rows[1].error.is_some(),
+            "and it still says it has no pattern"
+        );
+    }
+
+    #[test]
+    fn the_overlay_carries_each_rule_s_state_and_the_selection() {
+        let mut wide = a_spec("whole", "WARN");
+        wide.whole_line = true;
+        wide.literal = true;
+        wide.enabled = false;
+        wide.bg = Some([0.2, 0.2, 0.0, 1.0]);
+        let mut editor = rules_editor_with(vec![a_spec("e", "ERROR"), wide]);
+        editor.move_selection(1);
+        let overlay = rules_overlay_of(&editor).expect("open");
+        assert_eq!(overlay.rows.len(), 2);
+        assert!(overlay.rows[0].enabled && !overlay.rows[0].literal);
+        assert!(!overlay.rows[0].selected);
+        let second = &overlay.rows[1];
+        assert_eq!(second.text, "WARN");
+        assert!(!second.enabled, "the checkbox is drawn unticked");
+        assert!(second.literal, "and the toggle reads Ab, not .*");
+        assert!(second.whole_line);
+        assert!(second.bg.is_some(), "its background gets a swatch");
+        assert!(second.selected);
+    }
+
+    #[test]
+    fn a_broken_rule_carries_its_error_to_the_row_that_draws_it() {
+        let editor = rules_editor_with(vec![a_spec("good", "ERROR"), a_spec("bad", "(unclosed")]);
+        let overlay = rules_overlay_of(&editor).expect("open");
+        assert!(overlay.rows[0].error.is_none());
+        assert!(
+            overlay.rows[1].error.is_some(),
+            "§5 puts the error inline beside its own rule"
+        );
+    }
+
+    #[test]
+    fn the_cell_under_edit_is_drawn_as_a_field_on_its_own_row() {
+        let mut editor = rules_editor_with(vec![a_spec("a", "A"), a_spec("b", "B")]);
+        assert!(rules_overlay_of(&editor).expect("open").editing.is_none());
+        editor.move_selection(1);
+        editor.begin_edit(tailhawk_core::ruleset::Cell::Pattern);
+        let overlay = rules_overlay_of(&editor).expect("open");
+        let (row, cell, field) = overlay.editing.expect("a cell is under edit");
+        assert_eq!(row, 1, "the second row, which is the selected one");
+        assert_eq!(cell, tailhawk_core::ruleset::Cell::Pattern);
+        assert_eq!(field.text(), "B", "seeded with what is there");
+    }
+
+    #[test]
+    fn the_overlay_says_which_cell_has_the_caret_not_just_that_one_does() {
+        let mut editor = rules_editor_with(vec![a_spec("a", "A")]);
+        editor.begin_edit(tailhawk_core::ruleset::Cell::Fg);
+        let (_, cell, field) = rules_overlay_of(&editor)
+            .expect("open")
+            .editing
+            .expect("a cell is under edit");
+        assert_eq!(
+            cell,
+            tailhawk_core::ruleset::Cell::Fg,
+            "all four cells are edited in the same place, so the overlay must carry which one \
+             it is or every hint reads \"pattern\""
+        );
+        assert!(
+            field.text().starts_with('#'),
+            "a colour cell is seeded as #rrggbb: {}",
+            field.text()
+        );
+    }
+
+    #[test]
+    fn editing_the_personal_tier_does_not_duplicate_the_curated_one() {
+        // `load_rule_specs` merges every tier. If the editor held the merged set and wrote it
+        // back to the personal file, the exe-adjacent rules would be written into it too and
+        // reload twice — growing on every save, and resurrecting anything deleted.
+        let dir = std::env::temp_dir().join("tailhawk_rules_tiers");
+        let _ = std::fs::create_dir_all(&dir);
+        let curated = dir.join("curated.rules.toml");
+        let personal = dir.join("personal.rules.toml");
+        std::fs::write(
+            &curated,
+            "[[rule]]\nname = \"curated\"\npattern = \"FATAL\"\nfg = \"#ff0000\"\n",
+        )
+        .expect("write the curated tier");
+        std::fs::write(
+            &personal,
+            "[[rule]]\nname = \"mine\"\npattern = \"ERROR\"\nfg = \"#00ff00\"\n",
+        )
+        .expect("write the personal tier");
+        let tiers = vec![curated.clone(), personal.clone()];
+
+        let merged = load_rule_specs(&tiers).0;
+        assert_eq!(merged.len(), 2, "both tiers are in force");
+
+        let (mine, fixed) = match tiers.split_last() {
+            Some((last, earlier)) => (
+                load_rule_specs(std::slice::from_ref(last)).0,
+                load_rule_specs(earlier).0,
+            ),
+            None => unreachable!("two tiers"),
+        };
+        assert_eq!(mine.len(), 1, "the editor gets only what it can write");
+        assert_eq!(mine[0].name, "mine");
+        assert_eq!(
+            fixed.len(),
+            1,
+            "and the curated rule stays out of its hands"
+        );
+
+        let editor = tailhawk_core::ruleset::Editor::new("tailhawk.rules.toml", mine);
+        std::fs::write(&personal, editor.to_toml()).expect("save");
+        let reloaded = load_rule_specs(&tiers).0;
+        assert_eq!(
+            reloaded.len(),
+            2,
+            "a save-and-reload round trip leaves the same two rules, not three"
+        );
+        assert_eq!(reloaded[0].name, "curated");
+        assert_eq!(reloaded[1].name, "mine");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_empty_state_is_an_overlay_with_no_rows_rather_than_no_overlay() {
+        let mut editor = tailhawk_core::ruleset::Editor::new("tailhawk.rules.toml", Vec::new());
+        editor.open();
+        let overlay = rules_overlay_of(&editor).expect("a first run still opens the editor");
+        assert!(
+            overlay.rows.is_empty(),
+            "and it is the empty row list that RULES_EMPTY stands in for"
+        );
     }
 }

@@ -51,18 +51,27 @@ pub struct Spec {
 impl Spec {
     /// The rule this compiles to, or why it does not.
     pub fn compile(&self) -> Result<Rule, String> {
+        // A rule being typed into V9's editor has no name yet, and "…: no pattern" with nothing
+        // before the colon reads as a bug. Unnamed rules say only what is wrong.
+        let named = |what: &str| {
+            if self.name.is_empty() {
+                what.to_owned()
+            } else {
+                format!("{}: {what}", self.name)
+            }
+        };
         if self.pattern.is_empty() {
-            return Err(format!("{}: no pattern", self.name));
+            return Err(named("no pattern"));
         }
         if self.fg.is_none() && self.bg.is_none() {
-            return Err(format!("{}: neither fg nor bg", self.name));
+            return Err(named("neither fg nor bg"));
         }
         let compiled = if self.literal {
             Pattern::literal(&self.pattern, Charset::UTF_8, self.case_insensitive)
         } else {
             Pattern::compile(&self.pattern, Charset::UTF_8, self.case_insensitive)
         };
-        let pattern = compiled.map_err(|e| format!("{}: {e}", self.name))?;
+        let pattern = compiled.map_err(|e| named(&e.to_string()))?;
         let mut rule = Rule::new(self.name.clone(), pattern);
         rule.fg = self.fg;
         rule.bg = self.bg;
