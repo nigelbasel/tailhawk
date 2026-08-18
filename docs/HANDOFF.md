@@ -73,7 +73,64 @@ the legend.
 - While the editor is up, `Ctrl+W`, `Ctrl+D` and `Ctrl+Tab` are reassigned from their §12 meanings.
   §12 has not been updated to say so.
 
-**Next: V9 part 3, the wizard model.** The wiring for it is scouted below.
+### V9 part 3 is done: the format wizard *model*
+
+`wizard.rs` is §6.2 and §6.3 as one portable model — 50 tests. Both doors produce the same artefact,
+a template string plus the language it is written in, and `template::compile` is what turns that into
+a `Format`. **Define from example** holds the line, the boundaries across it and a role per span, and
+renders the DSL as text; **import** recognises a pasted layout by counting each language's markers;
+`tailhawk.formats.toml` is read and written in the shape `rules.rs` established.
+
+**The leak trap the last session scouted is closed.** `template()` and `error()` allocate a string
+and nothing that outlives the call, so they are free to run on every drag. Only `compile()` and
+`test()` reach `template::compile`, and both memoise on `(language, template, name)` — so testing one
+pattern twice leaks once, and a wizard nobody tests leaks nothing. A test asserts it: sixteen drags
+leave the cache empty.
+
+The pre-commit review found five blocking defects and all five were real. Every one is now a named
+regression test:
+
+- **A pipe-delimited line reported 100% matched with the wrong text in the columns.** The proposer
+  left the `|` inside the message, so two DSL tokens sat flush together and `Build::settle` silently
+  made the earlier one greedy — `logger` captured `Zenith.Runner|off`. §6.2 offers the match rate as
+  the verification, and the match rate agreed with the mistake. Separators now stay outside both
+  fields, and two touching fields are refused outright.
+- **`error()` was decorative.** It checked the shape of the field list but never that a token could
+  match the span it covered — so widening `<ts>` over its trailing space, stretching `<_>` across two
+  words, or merging `<ts>` into a bracket all validated clean and failed only as a 0% preview.
+- **Serilog's own default file template was mis-proposed.** `[ERR]` became a column called `thread`,
+  leaving `Level::None` on a format whose severity was in plain sight; and ` +02:00` was baked in as
+  a mandatory literal, so the format would have failed silently at the next DST change.
+  `TIMESTAMP_SHAPE` now admits one optional space before the offset.
+- **A level word inside an English message turned the prose before it into a mandatory literal**, in
+  one case producing an empty message column. The proposer now has a horizon.
+- **§6.5's `ExpressionTemplate` exclusion was enforced only on first paste** — editing the box walked
+  past it. The check moved to where the text is set, and now also catches the `{@t}`/`{@l}`/`{@m}`
+  form, which carries no `{#if}` and is the common one.
+
+Also fixed from the review: the compile memo ignored the definition's name, so renaming one went on
+handing back a `Format` carrying the old name for §6.1's chip; `recognise` took the first language
+that matched anything rather than the one with the most markers, which lost every Serilog template
+containing a literal `%` and every log4net pattern containing a `${env:…}` lookup; two field-naming
+schemes could collide; and every layout from one config file compiled to the same `Format::id`.
+
+**Knowingly undone in the wizard model** — raise individually when one bites:
+
+- **No quoted-string candidate in the proposer.** `SPEC.md` §6.5 names quoted strings among what the
+  tokenisation should already recognise. It is also the piece most likely to improve the horizon
+  heuristic, since a quoted run is a strong signal of where the header stops.
+- **No "Edit as regex…"**, which §6.2 and §6.5 both name as the escape hatch for the 10% who need it.
+  There is no path from a `Wizard` to a raw pattern.
+- The compile cache is unbounded: N distinct patterns explicitly tested is N leaked `Format`s. That
+  is bounded by user patience rather than by code, and is the honest cost of `Box::leak`.
+- `Definition::glob` is stored but nothing matches against it yet — §6.5.1's "remembered per path and
+  per glob" needs the chip (part 4).
+- Nothing loads `tailhawk.formats.toml` at startup yet; `load` exists and is tested, and deliberately
+  does **not** compile, so a file of forty definitions costs forty leaks for the one that is needed.
+
+**Next: V9 part 4, the wizard's UI and the §6.1 format chip menu.** The model is done; what is left
+is the surface. The rules editor (part 2) is the precedent for every piece of it — a modal overlay
+over the grid, keys offered before `palette_key`, hit rects into `chrome`, `Ctrl+S` to save.
 
 | What | Where |
 |---|---|
@@ -84,20 +141,25 @@ the legend.
 | Live preview | `rebuild_highlighter_with(doc, editor.specs())` (~5840) on every change — the real grid behind the overlay *is* §5's preview, so it cannot drift |
 | Save | `editor.to_toml()` into the last tier (`rules_tiers.last()`), then `mark_saved`; `open_rules_file` (~4187) already does the create-if-absent dance |
 
-**Next: V9 part 3, the wizard model** (`UI-DESIGN.md` §6.2 define-from-example, §6.3 import from
-config). Its engine already exists: `template::compile(Language::Dsl, "<ts> <level> …")` is what
-`--column-pattern` uses (`main.rs` ~6805), `template::Language` has `Serilog` / `NLog` / `Log4net` /
-`Dsl`, and `template::scan(log) -> Vec<Found>` is §6.3's folder scan. Then part 4, the wizard's UI
-and the §6.1 chip menu.
+**What part 4 needs from the model**, all of it already built and tested:
 
-**The trap to design around before writing a line of it:** `template::compile` returns a
-`&'static Format`, and it gets that by `Box::leak` (`format.rs` ~333, ~406). The leak is deliberate
-and documented — but it is sized for *"one per opened file"*. §6.2 says the pattern and the preview
-"update live" as the user drags the boundary handles, and a wizard that compiles on each drag or
-keystroke would leak a `Format` per frame: thousands in one sitting, against a budget written for
-tens. So the model must **build the DSL string from the boundaries without compiling** — that part
-is pure text — and compile only on an explicit *Test*, on Save, or behind a debounce. Decide this in
-the `CLEANROOM.md` entry, before the code, not after a review finds it.
+| §6.2 / §6.3 asks for | Call |
+|---|---|
+| Open on a right-clicked line, with a split proposed | `Wizard::from_example(line)` |
+| The ruler under the example | `wizard.example()`, `wizard.fields()` — byte spans and roles |
+| Drag a handle | `move_boundary(i, Edge::Start\|End, byte)`; also `split`, `merge`, `add_field`, `remove_field` |
+| The `Roles` row | `set_role(i, Role::…)`, `set_name(i, …)` |
+| The `Pattern` field, live | `template()` — pure text, safe on every mouse move |
+| The error under it, live | `error()` — reads the model, never compiles |
+| Preview over the next 200 lines, and its readout | `set_samples(…)`, then `test()` → `Test { columns, rows, matched }`, `Test::rate()` |
+| §6.3's paste box | `Wizard::paste(text)` / `set_layout(text)`; `recognise` → `language_label` for "Recognised as" |
+| §6.3's folder scan | `template::scan(log)`, then `Wizard::from_found(&found, index)` per finding |
+| Save as… | `definition()` → `to_toml`, into `tiers(exe_dir, roaming).last()` |
+
+**Two rules the surface must not break.** Call `template()` and `error()` as freely as you like, and
+call `test()` **only** on the Test button, on Save, or behind a debounce — never per drag, never per
+keystroke. And wire §6.3's Import to `Wizard::paste`, which is the only door that applies §13.1 and
+§6.5's `ExpressionTemplate` exclusion.
 
 **Keep to the working rules:** `logs/agent.log` fed via `tools/agentlog.sh` from the first turn (a
 "turn" line), the `CLEANROOM.md` §5 entry written *before* each new core module, commit straight to

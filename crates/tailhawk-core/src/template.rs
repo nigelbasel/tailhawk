@@ -536,7 +536,11 @@ fn dsl(pattern: &str) -> Result<Compiled, String> {
 }
 
 /// The timestamps a `<ts>` token accepts — the shapes `semantic.rs` colours, less the slash dates.
-const TIMESTAMP_SHAPE: &str = r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)?|\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?|[A-Z][a-z]{2} [ 0-3]?\d \d{2}:\d{2}:\d{2}";
+///
+/// The zone offset may be preceded by a space: ISO 8601 does not allow one, but Serilog's default
+/// file template writes `2026-08-16 09:14:03.884 +02:00`, and a wizard that left the offset outside
+/// the token would bake the user's current offset into the format as a mandatory literal.
+pub(crate) const TIMESTAMP_SHAPE: &str = r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?: ?(?:Z|[+-]\d{2}:?\d{2}))?)?|\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?|[A-Z][a-z]{2} [ 0-3]?\d \d{2}:\d{2}:\d{2}";
 
 /// Finds templates in config files beside `log` and up to three directories above it.
 pub fn scan(log: &Path) -> Vec<Found> {

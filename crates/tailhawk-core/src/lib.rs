@@ -40,6 +40,7 @@ pub mod template;
 pub mod theme;
 pub mod view;
 pub mod widget;
+pub mod wizard;
 
 #[cfg(windows)]
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
