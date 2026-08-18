@@ -84,10 +84,20 @@ the legend.
 | Live preview | `rebuild_highlighter_with(doc, editor.specs())` (~5840) on every change — the real grid behind the overlay *is* §5's preview, so it cannot drift |
 | Save | `editor.to_toml()` into the last tier (`rules_tiers.last()`), then `mark_saved`; `open_rules_file` (~4187) already does the create-if-absent dance |
 
-Then part 3, the wizard model (`UI-DESIGN.md` §6.2/§6.3) — note its engine already exists:
-`template::compile(Language::Dsl, "<ts> <level> …")` is what `--column-pattern` uses (`main.rs`
-~6805), and `template::scan(log)` is §6.3's folder scan. Then part 4, the wizard's UI and the §6.1
-chip menu.
+**Next: V9 part 3, the wizard model** (`UI-DESIGN.md` §6.2 define-from-example, §6.3 import from
+config). Its engine already exists: `template::compile(Language::Dsl, "<ts> <level> …")` is what
+`--column-pattern` uses (`main.rs` ~6805), `template::Language` has `Serilog` / `NLog` / `Log4net` /
+`Dsl`, and `template::scan(log) -> Vec<Found>` is §6.3's folder scan. Then part 4, the wizard's UI
+and the §6.1 chip menu.
+
+**The trap to design around before writing a line of it:** `template::compile` returns a
+`&'static Format`, and it gets that by `Box::leak` (`format.rs` ~333, ~406). The leak is deliberate
+and documented — but it is sized for *"one per opened file"*. §6.2 says the pattern and the preview
+"update live" as the user drags the boundary handles, and a wizard that compiles on each drag or
+keystroke would leak a `Format` per frame: thousands in one sitting, against a budget written for
+tens. So the model must **build the DSL string from the boundaries without compiling** — that part
+is pure text — and compile only on an explicit *Test*, on Save, or behind a debounce. Decide this in
+the `CLEANROOM.md` entry, before the code, not after a review finds it.
 
 **Keep to the working rules:** `logs/agent.log` fed via `tools/agentlog.sh` from the first turn (a
 "turn" line), the `CLEANROOM.md` §5 entry written *before* each new core module, commit straight to
