@@ -132,6 +132,25 @@ schemes could collide; and every layout from one config file compiled to the sam
 is the surface. The rules editor (part 2) is the precedent for every piece of it — a modal overlay
 over the grid, keys offered before `palette_key`, hit rects into `chrome`, `Ctrl+S` to save.
 
+**Part 4 is already begun, and begun in the right order.** Its `CLEANROOM.md` §5 entry is filed
+(`ae0b9ca`) *before* any of its code, and it settles the two decisions worth settling first: the
+preview is drawn **inside the box**, not by the grid behind it — a rules change repaints the same
+rows, but a format change re-columnises the whole document, and a Cancel that had to undo that is a
+much larger promise than the button looks — and the surface calls `template()` / `error()` freely
+but `test()` only on Test, on Save, and behind a debounce.
+
+`Wizard::last_test()` (`0b8da0a`) makes that second decision a property of the types rather than a
+discipline: the painter is handed a `&Wizard`, `test()` needs `&mut`, so **a frame cannot compile
+even by mistake**. It returns `None` when the pattern has moved on, which is what §6.2's readout
+should show as *not tested* rather than a rate belonging to a pattern the user has edited away.
+Start the surface from there.
+
+Two things the entry commits the surface to that are easy to forget: the chip's **warning state**
+(§6.1 — no format clearing 0.75 absolute *and* a 15% margin renders as a warning, never a silent
+pick) belongs to the chip and the detection, not to the wizard; and Import wires to `wizard::paste`
+and to nothing else, because that is the only door applying §13.1's bound and §6.5's
+`ExpressionTemplate` exclusion.
+
 | What | Where |
 |---|---|
 | The model to hold | `ruleset::Editor`, on `Shell` beside `rule_specs` / `rules_tiers` / `rules_failed` (~3467) — **not** per-document, unlike `Palette` |
