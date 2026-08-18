@@ -549,6 +549,23 @@ impl Wizard {
         }
     }
 
+    /// The last [`Wizard::test`], if it still belongs to the pattern as it now stands — **without
+    /// compiling anything**.
+    ///
+    /// This is the seam that makes the module note's rule a property of the types rather than a
+    /// discipline the surface has to remember: a painter is handed a `&Wizard`, [`Wizard::test`]
+    /// needs `&mut`, and so a frame *cannot* compile even by mistake.
+    ///
+    /// `None` means the pattern has changed since the last Test. §6.2's readout should say so —
+    /// a match rate belonging to a pattern the user has since edited away is worse than no rate at
+    /// all, because the rate is the reassurance §6.2 leans on.
+    pub fn last_test(&self) -> Option<&Test> {
+        match &self.tested {
+            Some((was, test)) if *was == self.origin() => Some(test),
+            _ => None,
+        }
+    }
+
     /// §6.2's preview and its match-rate readout, and §6.5's **Test** button. Compiles — see the
     /// module note on why nothing else here does.
     pub fn test(&mut self) -> &Test {
@@ -1545,6 +1562,28 @@ mod tests {
             recognise("%date [%thread] %-5level %logger - %message%newline ${env:X}"),
             Ok(Language::Log4net)
         );
+    }
+
+    #[test]
+    fn a_frame_can_read_the_last_test_but_never_provoke_one() {
+        let mut w = Wizard::from_example(LINE);
+        w.set_samples([LINE.to_owned()]);
+        assert!(w.last_test().is_none(), "nothing has been tested yet");
+        assert_eq!(w.test().matched, 1);
+        assert_eq!(w.last_test().expect("tested").matched, 1);
+        assert!(w.cache.len() == 1);
+
+        let end = w.fields()[0].end;
+        w.move_boundary(0, Edge::End, end - 1).expect("moves");
+        assert!(
+            w.last_test().is_none(),
+            "the rate belonged to a pattern that has been edited away"
+        );
+        assert_eq!(w.cache.len(), 1, "reading it did not compile");
+
+        w.test();
+        w.name = "renamed".to_owned();
+        assert!(w.last_test().is_none(), "and a rename is a change too");
     }
 
     #[test]
