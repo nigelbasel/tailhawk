@@ -15,6 +15,15 @@
 //! dispatches it. An [`Item`] carries `Ctrl+O` as a string so the menu can *teach* the keyboard,
 //! and the two are held together by a test rather than by this module taking over dispatch.
 
+/// One character, case-folded for matching a typed mnemonic.
+///
+/// `to_ascii_lowercase` would leave `Ü` alone and so make `&Ünicode` reachable only by the shifted
+/// key. A fold that produces several characters — `ẞ` — keeps the first, which is the letter on the
+/// key the user presses.
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
 /// What an [`Item`] is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -143,10 +152,10 @@ impl Item {
         self.parsed().1
     }
 
-    /// The letter that opens or runs this item, lowercased.
+    /// The letter that opens or runs this item, case-folded.
     pub fn mnemonic(&self) -> Option<char> {
         let (text, at) = self.parsed();
-        text.chars().nth(at?).map(|c| c.to_ascii_lowercase())
+        text.chars().nth(at?).map(fold)
     }
 
     /// Whether the keyboard may land on it: a separator never, a disabled item never.
@@ -157,17 +166,35 @@ impl Item {
 
 /// A menu bar, or one context menu.
 ///
-/// `open` is the path to what is currently showing: empty when nothing is down, `[2]` when the
-/// third top-level menu is open, `[2, 5]` when its sixth item is a submenu and that is open too.
-/// `selected` is the path to the item under the keyboard.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// **The two differ in exactly one number**, and every navigation rule is written against it:
+/// [`Menu::root_depth`] — the length `open` has when the *outermost* list is showing. A bar's
+/// headings sit on a row, so its outermost list is one level down (`open == [k]`); a context menu
+/// *is* its outermost list (`open == []`). Writing the rules against the bar's depth and letting a
+/// context menu inherit them is what made `Esc` inside a context submenu tear the whole menu down.
+///
+/// `selected` is always `open` plus one index into that list, or empty. Nothing may leave it
+/// pointing outside the list that is drawn — a highlight the user can see on a list they cannot is
+/// how a mnemonic ends up running a command from somewhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Menu {
     items: Vec<Item>,
     open: Vec<usize>,
     selected: Vec<usize>,
-    /// A bar keeps its headings on a row and opens downward; a context menu is the open list
-    /// itself, with no row above it.
+    /// Whether a list is drawn. Held explicitly rather than derived, as `palette.rs` holds its
+    /// own: a context menu's `open` is empty *while it is showing*, so emptiness cannot mean shut.
+    shown: bool,
+    /// `Alt` on a bar: the headings have the keyboard and nothing is down yet. `UI-DESIGN.md` §12
+    /// makes this a state of its own, and without it a bare arrow key opens a menu nobody asked for.
+    focused: bool,
     bar: bool,
+}
+
+impl Default for Menu {
+    /// An empty **bar**, closed. A `Default` that produced a context menu would be one that reports
+    /// itself open before anything has been put in it.
+    fn default() -> Menu {
+        Menu::bar(Vec::new())
+    }
 }
 
 impl Menu {
@@ -177,22 +204,23 @@ impl Menu {
             items,
             open: Vec::new(),
             selected: Vec::new(),
+            shown: false,
+            focused: false,
             bar: true,
         }
     }
 
-    /// `SPEC.md` §6.5's right-click: a menu that is already open, with no headings above it.
+    /// `SPEC.md` §6.5's right-click: a menu that is already showing, with no headings above it.
     pub fn context(items: Vec<Item>) -> Menu {
         let mut menu = Menu {
             items,
             open: Vec::new(),
             selected: Vec::new(),
+            shown: true,
+            focused: false,
             bar: false,
         };
-        menu.selected = menu
-            .first_selectable(&[])
-            .map(|i| vec![i])
-            .unwrap_or_default();
+        menu.select_first();
         menu
     }
 
@@ -200,17 +228,26 @@ impl Menu {
         self.bar
     }
 
-    /// Whether anything is showing: for a bar, whether a heading is down; for a context menu,
-    /// always, until it is closed.
+    /// The length `open` has when the outermost list is showing. See the type's note.
+    fn root_depth(&self) -> usize {
+        usize::from(self.bar)
+    }
+
+    /// Whether a list is drawn.
     pub fn is_open(&self) -> bool {
-        !self.bar || !self.open.is_empty()
+        self.shown
+    }
+
+    /// Whether the bar has the keyboard with nothing dropped down — `Alt`, and no more.
+    pub fn is_focused(&self) -> bool {
+        self.focused
     }
 
     pub fn items(&self) -> &[Item] {
         &self.items
     }
 
-    /// The path to the open list, deepest last. Empty for a context menu's own list.
+    /// The path to the list that is drawn, deepest last. Empty for a context menu's own list.
     pub fn open_path(&self) -> &[usize] {
         &self.open
     }
@@ -239,57 +276,108 @@ impl Menu {
     }
 
     fn first_selectable(&self, path: &[usize]) -> Option<usize> {
-        let items = self.at(path)?;
-        items.iter().position(Item::selectable)
+        self.at(path)?.iter().position(Item::selectable)
     }
 
-    /// Drops a heading open, or closes it if it already is. `top` indexes the bar.
-    pub fn open_top(&mut self, top: usize) {
-        if !self.bar || self.items.get(top).is_none() {
+    /// Puts the keyboard on the first usable item of whatever list is open.
+    fn select_first(&mut self) {
+        let path = self.open.clone();
+        self.selected = match self.first_selectable(&path) {
+            Some(i) => [path, vec![i]].concat(),
+            None => Vec::new(),
+        };
+    }
+
+    /// A heading that can actually be dropped down: enabled, and a submenu.
+    fn openable(&self, top: usize) -> bool {
+        self.items
+            .get(top)
+            .is_some_and(|i| i.selectable() && i.kind == Kind::Submenu)
+    }
+
+    /// `Alt`: the bar takes the keyboard with nothing open. A second `Alt` gives it back.
+    pub fn focus(&mut self) {
+        if !self.bar {
             return;
         }
-        if self.open.first() == Some(&top) {
+        if self.focused || self.shown {
+            self.close();
+            return;
+        }
+        self.focused = true;
+        self.shown = false;
+        self.open.clear();
+        self.selected = match self.items.iter().position(|i| i.selectable()) {
+            Some(i) => vec![i],
+            None => Vec::new(),
+        };
+    }
+
+    /// Drops a heading open, or shuts it if it already is. `top` indexes the bar.
+    pub fn open_top(&mut self, top: usize) {
+        if !self.bar || !self.openable(top) {
+            return;
+        }
+        if self.shown && self.open.first() == Some(&top) {
             self.close();
             return;
         }
         self.open = vec![top];
-        self.selected = match self.first_selectable(&[top]) {
-            Some(i) => vec![top, i],
-            None => vec![top],
-        };
+        self.shown = true;
+        self.focused = false;
+        self.select_first();
     }
 
-    /// Closes everything. A bar keeps its headings; a context menu is done.
+    /// Closes everything. A bar keeps its headings and loses the keyboard; a context menu is done.
     pub fn close(&mut self) {
         self.open.clear();
         self.selected.clear();
+        self.shown = false;
+        self.focused = false;
     }
 
-    /// `Esc`: shuts the deepest submenu, and only when there is none does it close the menu.
+    /// `Esc`: shuts the deepest submenu and puts the highlight back on the item that opened it,
+    /// which is where Windows leaves it. Only at the outermost list does it close the menu.
+    ///
     /// Reports whether anything is still showing.
     pub fn escape(&mut self) -> bool {
-        if self.open.len() > 1 {
+        if self.shown && self.open.len() > self.root_depth() {
+            let parent = self.open.clone();
             self.open.pop();
-            let head = self.open.clone();
-            self.selected = head;
+            self.selected = parent;
             return true;
         }
         self.close();
         false
     }
 
-    /// `↑` / `↓` within the open list, skipping separators and disabled items. Does not wrap past
-    /// the ends, because a menu that wraps makes the last item hard to reach by holding a key.
+    /// `↑` / `↓` within the open list, skipping separators and disabled items. Does not wrap: a
+    /// list that wraps makes the last item hard to reach by holding a key.
+    ///
+    /// On a bar that is merely focused, `↓` drops the highlighted heading open instead.
     pub fn step(&mut self, by: isize) {
-        let Some((last, head)) = self.selected.split_last().map(|(l, h)| (*l, h.to_vec())) else {
-            // Nothing selected yet: the first item of whatever is open.
-            let path = self.open.clone();
-            if let Some(i) = self.first_selectable(&path) {
-                self.selected = [path, vec![i]].concat();
+        if self.focused && !self.shown {
+            if by > 0 {
+                if let Some(top) = self.selected.first().copied() {
+                    self.open_top(top);
+                }
             }
             return;
-        };
+        }
+        if !self.shown {
+            return;
+        }
+        let head = self.open.clone();
         let Some(items) = self.at(&head) else { return };
+        let Some(last) = self
+            .selected
+            .get(head.len())
+            .copied()
+            .filter(|_| self.selected.len() == head.len() + 1)
+        else {
+            self.select_first();
+            return;
+        };
         let mut at = last as isize;
         for _ in 0..items.len() {
             at += by;
@@ -303,50 +391,83 @@ impl Menu {
         }
     }
 
-    /// `←` / `→` along the bar's headings, opening the one it lands on.
+    /// `→` opens the submenu under the highlight; `←` shuts the one that is open. Failing either,
+    /// and only on a bar, they walk to the next usable heading.
     ///
-    /// Inside a submenu, `→` opens it and `←` shuts it — which is what makes the arrows one gesture
-    /// rather than two, the way every Windows menu behaves.
-    pub fn across(&mut self, by: isize) -> Option<u32> {
-        if by > 0 {
-            if let Some(item) = self.item(&self.selected.clone()) {
-                if item.kind == Kind::Submenu {
-                    self.enter();
-                    return None;
-                }
+    /// One gesture rather than two, which is how every Windows menu behaves.
+    pub fn across(&mut self, by: isize) {
+        if self.shown {
+            // Inside a list — `selected` is one deeper than `open` — a submenu takes the arrow.
+            let inside = self.selected.len() == self.open.len() + 1;
+            if by > 0
+                && inside
+                && self
+                    .item(&self.selected.clone())
+                    .is_some_and(|i| i.kind == Kind::Submenu)
+            {
+                self.enter();
+                return;
+            }
+            if by < 0 && self.open.len() > self.root_depth() {
+                self.escape();
+                return;
             }
         }
-        if by < 0 && self.open.len() > 1 {
-            self.escape();
-            return None;
-        }
         if !self.bar {
-            return None;
+            return;
         }
-        let top = *self.open.first().unwrap_or(&0) as isize;
+        self.walk_headings(by);
+    }
+
+    /// Moves along the bar to the next heading that can be used, wrapping. Keeps whatever the bar
+    /// was doing: a focused bar stays focused, an open one opens the heading it lands on.
+    fn walk_headings(&mut self, by: isize) {
         let count = self.items.len() as isize;
-        if count == 0 {
-            return None;
+        if count == 0 || by == 0 {
+            return;
         }
-        let next = (top + by).rem_euclid(count) as usize;
-        self.open = Vec::new();
-        self.open_top(next);
-        None
+        let from = if self.shown {
+            *self.open.first().unwrap_or(&0)
+        } else if self.focused {
+            *self.selected.first().unwrap_or(&0)
+        } else {
+            return;
+        } as isize;
+        let mut at = from;
+        for _ in 0..count {
+            at = (at + by).rem_euclid(count);
+            let top = at as usize;
+            if !self.items[top].selectable() {
+                continue;
+            }
+            if self.shown {
+                self.open = Vec::new();
+                self.shown = false;
+                self.open_top(top);
+            } else {
+                self.selected = vec![top];
+            }
+            return;
+        }
     }
 
     /// `Enter`, or a click: opens a submenu, or reports the command chosen and closes.
     pub fn enter(&mut self) -> Option<u32> {
+        if self.focused && !self.shown {
+            if let Some(top) = self.selected.first().copied() {
+                self.open_top(top);
+            }
+            return None;
+        }
         let path = self.selected.clone();
         let item = self.item(&path)?;
         if !item.selectable() {
             return None;
         }
         if item.kind == Kind::Submenu {
-            self.open = path.clone();
-            self.selected = match self.first_selectable(&path) {
-                Some(i) => [path, vec![i]].concat(),
-                None => path,
-            };
+            self.open = path;
+            self.shown = true;
+            self.select_first();
             return None;
         }
         let id = item.id;
@@ -354,24 +475,57 @@ impl Menu {
         id
     }
 
-    /// Puts the keyboard on `path` — the mouse moving over an item, or a click resolving to one.
-    /// A submenu under the pointer opens, as it does on Windows.
+    /// Puts the keyboard on `path` — the pointer moving over an item, or a click resolving to one.
+    ///
+    /// **Only while something is already showing.** Windows switches menus on hover once one is
+    /// down, and does nothing at all when none is; a bar that dropped a menu because the pointer
+    /// crossed it would be unusable. A submenu under the pointer opens; a sibling that is not one
+    /// shuts whatever was open below this level, so the highlight is never on a list that is not
+    /// the drawn one.
     pub fn hover(&mut self, path: &[usize]) {
-        if self.item(path).is_some_and(Item::selectable) {
+        if !self.shown || path.is_empty() {
+            return;
+        }
+        if !self.item(path).is_some_and(Item::selectable) {
+            return;
+        }
+        let parent = &path[..path.len() - 1];
+        if parent.len() < self.root_depth() {
+            return;
+        }
+        self.open = parent.to_vec();
+        self.selected = path.to_vec();
+        if self.item(path).is_some_and(|i| i.kind == Kind::Submenu) {
+            self.open = path.to_vec();
+            self.select_first();
             self.selected = path.to_vec();
-            if self.item(path).is_some_and(|i| i.kind == Kind::Submenu) {
-                self.open = path.to_vec();
-            }
         }
     }
 
-    /// A mnemonic letter. On a closed bar it opens the heading; in an open list it runs the item,
-    /// which is what `Alt`, `F`, `O` does on Windows.
+    /// Hovering a heading of the bar while a menu is down: switches to it, as Windows does.
+    pub fn hover_top(&mut self, top: usize) {
+        if !self.bar || !(self.shown || self.focused) || !self.openable(top) {
+            return;
+        }
+        if self.shown {
+            if self.open.first() != Some(&top) {
+                self.open = Vec::new();
+                self.shown = false;
+                self.open_top(top);
+            }
+        } else {
+            self.selected = vec![top];
+        }
+    }
+
+    /// A mnemonic letter. On a bar with nothing down it opens the heading; in an open list it runs
+    /// the item — which is what `Alt`, `F`, `O` does on Windows.
     ///
-    /// Reports the command when the letter chose one.
+    /// Searches **the list the highlight is in**, which is the one being drawn. Reports the command
+    /// when the letter chose one.
     pub fn mnemonic(&mut self, letter: char) -> Option<u32> {
-        let letter = letter.to_ascii_lowercase();
-        if self.bar && self.open.is_empty() {
+        let letter = fold(letter);
+        if self.bar && !self.shown {
             let at = self
                 .items
                 .iter()
@@ -379,16 +533,18 @@ impl Menu {
             self.open_top(at);
             return None;
         }
+        if !self.shown {
+            return None;
+        }
         let path = self.open.clone();
-        let items = self.at(&path)?;
-        let at = items
+        let at = self
+            .at(&path)?
             .iter()
             .position(|i| i.selectable() && i.mnemonic() == Some(letter))?;
         self.selected = [path, vec![at]].concat();
         self.enter()
     }
 
-    /// Every command id the menu offers, at any depth — what a test walks to check §12.
     pub fn ids(&self) -> Vec<u32> {
         fn walk(items: &[Item], out: &mut Vec<u32>) {
             for item in items {
@@ -647,13 +803,164 @@ mod tests {
     }
 
     #[test]
-    fn stepping_with_nothing_selected_lands_on_the_first_usable_item() {
-        let mut menu = a_bar();
-        menu.open_top(0);
-        menu.close();
-        menu.open = vec![0];
-        menu.step(1);
+    fn a_heading_whose_items_are_all_unusable_is_not_a_dead_end() {
+        // On a first run with no file open, whole menus are disabled item by item. Descending into
+        // one used to leave the selection on the heading, where `→` read it as a submenu, re-opened
+        // the same list, and the bar could not be walked rightwards again at all.
+        let mut menu = Menu::bar(vec![
+            Item::submenu("&File", vec![Item::command("&Open…", "Ctrl+O", 1)]),
+            Item::submenu(
+                "&Edit",
+                vec![Item::command("&Copy", "Ctrl+C", 2).disabled()],
+            ),
+            Item::submenu("&Help", vec![Item::command("&About", "", 3)]),
+        ]);
+        menu.open_top(1);
+        assert!(
+            menu.selected().is_empty(),
+            "there is nothing to select in Edit"
+        );
+        menu.across(1);
+        assert_eq!(menu.open_path(), &[2], "and Right still reaches Help");
+        menu.across(-1);
+        assert_eq!(menu.open_path(), &[1]);
+        menu.across(-1);
+        assert_eq!(menu.open_path(), &[0]);
+    }
+
+    #[test]
+    fn a_context_menu_navigates_its_own_submenus_without_being_torn_down() {
+        // The bar's outermost list is one level down; a context menu *is* its outermost list. Both
+        // `Esc` and `←` used to test the bar's depth, so either one destroyed a context menu from
+        // inside a submenu instead of stepping back out of it.
+        let mut menu = Menu::context(vec![
+            Item::submenu("&More", vec![Item::command("&A", "", 1)]),
+            Item::command("&B", "", 2),
+        ]);
+        assert_eq!(menu.selected(), &[0]);
+        menu.across(1);
+        assert_eq!(menu.open_path(), &[0], "Right opened the submenu");
         assert_eq!(menu.selected(), &[0, 0]);
+        menu.across(-1);
+        assert_eq!(menu.open_path(), &[0; 0], "and Left came back out of it");
+        assert!(menu.is_open(), "without taking the menu with it");
+        menu.across(1);
+        assert!(
+            menu.escape(),
+            "Esc out of a submenu leaves the menu showing"
+        );
+        assert_eq!(menu.selected(), &[0], "on the item that opened it");
+        assert!(!menu.escape(), "and only then closes it");
+        assert!(!menu.is_open());
+    }
+
+    #[test]
+    fn a_context_menu_reports_itself_closed_once_it_is() {
+        let mut menu = Menu::context(vec![Item::command("&Copy", "Ctrl+C", 1)]);
+        assert!(menu.is_open());
+        assert_eq!(menu.enter(), Some(1));
+        assert!(
+            !menu.is_open(),
+            "the shell has no other way to know the popup is finished"
+        );
+        let mut menu = Menu::context(vec![Item::command("&Copy", "Ctrl+C", 1)]);
+        menu.close();
+        assert!(!menu.is_open());
+        assert!(!Menu::default().is_open(), "and a default menu is not up");
+    }
+
+    #[test]
+    fn hovering_off_a_submenu_shuts_it_so_a_mnemonic_cannot_reach_inside_it() {
+        // The highlight and the open list must name the same list. When `hover` left a deeper
+        // `open` behind, typing the mnemonic of the *visible* item did nothing and the mnemonic of
+        // an item in the invisible submenu ran instead.
+        let mut menu = a_bar();
+        menu.open_top(1);
+        menu.hover(&[1, 2]);
+        assert_eq!(menu.open_path(), &[1, 2], "Theme opened under the pointer");
+        menu.hover(&[1, 1]);
+        assert_eq!(
+            menu.open_path(),
+            &[1],
+            "and shut again when the pointer left"
+        );
+        assert_eq!(menu.selected(), &[1, 1]);
+        assert_eq!(
+            menu.mnemonic('i'),
+            Some(11),
+            "Invisibles, the one on screen"
+        );
+    }
+
+    #[test]
+    fn a_closed_bar_is_not_opened_by_the_pointer_crossing_it() {
+        let mut menu = a_bar();
+        menu.hover(&[1, 0]);
+        assert!(
+            !menu.is_open(),
+            "Windows opens on click, then tracks on hover"
+        );
+        menu.hover_top(1);
+        assert!(!menu.is_open());
+        menu.open_top(0);
+        menu.hover_top(1);
+        assert_eq!(menu.open_path(), &[1], "once one is down, hover switches");
+    }
+
+    #[test]
+    fn alt_focuses_the_bar_without_dropping_anything_down() {
+        let mut menu = a_bar();
+        menu.focus();
+        assert!(menu.is_focused());
+        assert!(!menu.is_open(), "§12: Alt alone is a state of its own");
+        assert_eq!(menu.selected(), &[0]);
+        menu.across(1);
+        assert_eq!(menu.selected(), &[1], "the arrows walk the headings");
+        assert!(!menu.is_open(), "and still nothing is down");
+        menu.step(1);
+        assert!(menu.is_open(), "Down is what opens it");
+        assert_eq!(menu.open_path(), &[1]);
+        menu.focus();
+        assert!(
+            !menu.is_open() && !menu.is_focused(),
+            "a second Alt gives it back"
+        );
+    }
+
+    #[test]
+    fn a_bare_arrow_does_nothing_to_a_bar_nobody_has_touched() {
+        let mut menu = a_bar();
+        menu.across(1);
+        assert!(!menu.is_open(), "Right on an untouched bar opened a menu");
+        menu.step(1);
+        assert!(!menu.is_open());
+        assert!(menu.selected().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_heading_can_be_neither_opened_nor_arrowed_into() {
+        let mut menu = Menu::bar(vec![
+            Item::submenu("&File", vec![Item::command("&A", "", 1)]),
+            Item::submenu("&Edit", vec![Item::command("&B", "", 2)]).disabled(),
+            Item::submenu("&View", vec![Item::command("&C", "", 3)]),
+        ]);
+        menu.open_top(1);
+        assert!(!menu.is_open(), "a disabled heading does not drop down");
+        menu.open_top(0);
+        menu.across(1);
+        assert_eq!(menu.open_path(), &[2], "and the arrows step over it");
+        assert_eq!(menu.mnemonic('e'), None);
+    }
+
+    #[test]
+    fn a_mnemonic_is_folded_for_the_key_the_user_actually_presses() {
+        let mut menu = Menu::bar(vec![Item::submenu(
+            "&Ünicode",
+            vec![Item::command("&Ärger", "", 7)],
+        )]);
+        assert_eq!(menu.mnemonic('ü'), None, "the unshifted key opens it");
+        assert_eq!(menu.open_path(), &[0]);
+        assert_eq!(menu.mnemonic('ä'), Some(7));
     }
 
     #[test]
@@ -684,7 +991,7 @@ mod tests {
         assert!(!menu.is_open());
         menu.open_top(0);
         menu.step(1);
-        assert_eq!(menu.across(1), None);
+        menu.across(1);
         assert_eq!(menu.enter(), None);
         assert_eq!(menu.mnemonic('a'), None);
         assert!(!menu.escape());
