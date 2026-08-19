@@ -26,6 +26,12 @@ kinds in use: `turn`, `task`, `commit`, `test`, `docs`, `ci`, `push`, `note`, `i
 tails `logs/agent.log` to see what you are doing. A session that works silently is a session the
 owner cannot supervise.
 
+**Read the log before you write to it.** `tail -30 logs/agent.log` at the start of every turn, after
+any pause, and before every commit. Writing to a log you never read is bookkeeping; reading it is
+what makes it memory. Session 21 wrote a `note` naming every file it had created, then ten minutes
+later could not account for one of those files and went to the transcripts to identify it — the
+answer was already in the log, four lines up.
+
 **Log every file you create or substantially rewrite, at the moment you do it — naming the file.**
 The log is not only the owner's window in; it is *your own memory*, and the only part of this
 session that survives compaction. Session 21 wrote `menu.rs` — 658 lines and 20 tests — logged

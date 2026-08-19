@@ -6779,10 +6779,21 @@ impl Shell {
         }
     }
 
+    /// `WM_SIZE`: resizes the swapchain **and draws a frame at the new size before returning**.
+    ///
+    /// Both halves matter. `ResizeBuffers` on its own leaves the window with no frame at the new
+    /// size until the next `WM_PAINT`, and Windows sends `WM_SIZE` continuously while a border is
+    /// dragged — so the gap is every frame of the drag rather than one. Painting here is what makes
+    /// a resize track the pointer the way every other Windows application's does.
     fn resize(&mut self, hwnd: HWND) {
         if let Some(renderer) = self.renderer.as_mut() {
             let (w, h) = Self::client_size(hwnd);
             let _ = renderer.resize(w, h);
+        }
+        if self.paint(hwnd) {
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::ValidateRect(hwnd, None);
+            }
         }
     }
 }
@@ -7951,6 +7962,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     result
 }
 
+/// `DefWindowProcW`, with the re-entry guard **released for its duration**.
+///
+/// Windows runs entire modal loops inside this one call: the move/size loop a border drag enters,
+/// the system-menu loop, a scrollbar's tracking loop. Each pumps `WM_SIZE`, `WM_PAINT` and input
+/// back to this same window from inside it — and with the guard still set, every one of those was
+/// sent straight back to `DefWindowProcW` and lost. A drag-resize therefore resized no swapchain
+/// and painted no frame for the whole of the drag. `DXGI_SCALING_STRETCH` hid it by rubber-banding
+/// the stale frame to the new size, and turning that off is what made it visible.
+///
+/// Releasing the guard here is safe for the same reason the guard exists: what it prevents is a
+/// second mutable borrow of `STATE`, and **no borrow is held while `DefWindowProcW` runs** — every
+/// arm of [`handle`] takes its borrow inside its own `STATE::with` and has dropped it before
+/// reaching here. A message pumped out of a modal loop is an ordinary top-level message, not a
+/// nested handler, and handling it is the whole point.
+fn def_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let was = IN_WNDPROC.with(|flag| flag.replace(false));
+    let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    IN_WNDPROC.with(|flag| flag.set(was));
+    result
+}
+
 fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION => {
@@ -7962,7 +7994,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if consumed {
                 LRESULT(0)
             } else {
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                def_proc(hwnd, msg, wparam, lparam)
             }
         }
         WM_DROPFILES => {
@@ -7987,7 +8019,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if let Some(result) = uia::get_object(hwnd, wparam, lparam) {
                 return result;
             }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            def_proc(hwnd, msg, wparam, lparam)
         }
         // §12.3: another instance handed its paths over — open each as a tab and come forward.
         m if m == single::WM_HANDED_OFF => {
@@ -8119,7 +8151,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             } else {
                 // Stage one: DefWindowProcW's BeginPaint/EndPaint erases with the class brush,
                 // which is the same colour the renderer clears to.
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                def_proc(hwnd, msg, wparam, lparam)
             }
         }
         WM_SIZE => {
@@ -8192,7 +8224,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     return LRESULT(0);
                 }
             }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            def_proc(hwnd, msg, wparam, lparam)
         }
         WM_KEYDOWN => {
             let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
@@ -8322,7 +8354,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     });
                     LRESULT(0)
                 }
-                None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+                None => def_proc(hwnd, msg, wparam, lparam),
             }
         }
         // Typed text, which only exists as a message because `TranslateMessage` produces it from
@@ -8337,7 +8369,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if consumed {
                 LRESULT(0)
             } else {
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                def_proc(hwnd, msg, wparam, lparam)
             }
         }
         // §2.1: middle-click closes the tab under the pointer.
@@ -8624,7 +8656,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => def_proc(hwnd, msg, wparam, lparam),
     }
 }
 

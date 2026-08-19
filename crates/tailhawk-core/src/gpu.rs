@@ -18,8 +18,8 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIFactory2, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS,
     DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
-    DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 use crate::{Error, Result, WindowHandle};
@@ -389,6 +389,15 @@ impl Gpu {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 3,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            // **Not the default.** `DXGI_SCALING_STRETCH` is what `Default` gives, and on a
+            // flip-model chain it tells DWM to rubber-band the last presented frame to the new
+            // window size for as long as it takes a fresh one to arrive. Dragging an edge then
+            // stretches and squashes the text, which no Windows application does.
+            //
+            // `NONE` pins the buffer to the top-left and leaves the uncovered strip showing the
+            // window background until the next frame — which, with the synchronous repaint in
+            // `WM_SIZE`, is the same frame.
+            Scaling: DXGI_SCALING_NONE,
             ..Default::default()
         };
         let swapchain = unsafe {

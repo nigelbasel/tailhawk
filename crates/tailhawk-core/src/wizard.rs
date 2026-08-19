@@ -1365,7 +1365,7 @@ mod tests {
         w.glob = Some(r"C:\logs\ndc\*.log".to_owned());
         w.set_samples([LINE.to_owned()]);
         let def = w.definition();
-        let back = parse(&to_toml(&[def.clone()]));
+        let back = parse(&to_toml(std::slice::from_ref(&def)));
         assert_eq!(back, vec![def]);
     }
 
