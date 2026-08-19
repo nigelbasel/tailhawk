@@ -50,10 +50,33 @@ contact. Everything else follows from five principles:
 |---|---|
 | MDI child windows with their own title bars | Flat tab strip, drag-to-reorder, drag-out-to-split |
 | Grey 3D-bevelled Win32 chrome | Flat surfaces, Windows 11 Mica on chrome, opaque grid |
-| Toolbar of ambiguous 16×16 icons | Command palette (`Ctrl+K`) + a handful of labelled controls |
+| Toolbar of ambiguous 16×16 icons | **A menu bar and a toolbar**, primary; the command palette (`Ctrl+K`) as an extra |
 | Modal config dialogs per feature | Inline editors with live preview over real data |
 | Settings spread across 6 tabbed property sheets | One searchable settings surface |
 | Fixed-function status bar | Status bar as a row of **live, clickable chips** |
+
+**On menus and toolbars — a decision reversed, 2026-08-19.** An earlier draft of this table rejected
+both, and made the command palette the only route to a command with no dedicated control. That was
+wrong, and it is recorded here rather than quietly fixed.
+
+**The ordering is now explicit: menus and the toolbar are the primary interface. The palette is an
+additional option, not the answer.** A palette serves the user who already knows what a command is
+called. A menu serves the user asking *"what can this program do?"* — and on Windows that question
+is answered along the top of the window. It is the convention, users are entitled to it, and a
+keyboard shortcut is not a substitute for it. Every feature must be reachable **by mouse, through
+the menu or the toolbar**, and the palette must not be the only way to reach anything.
+
+The rejection had a measurable cost. Building palette-first meant the mouse was consistently the
+part deferred: by V9 the app had no `WM_RBUTTONDOWN` handler at all, six of §2.1's seven "live,
+clickable" status chips were not clickable, and §6.2's boundary handles — specified as a *drag* —
+were keyboard-only. A principle that reads as restraint was in practice a licence to skip the half
+of the interface most users reach for first.
+
+**What stays true** is the *register*, not the omission. No ribbon; no toolbar of ambiguous,
+unlabelled 16×16 icons. The menu bar and toolbar are **drawn by the app** in its own flat
+Windows 11 style — not a classic Win32 `HMENU`, whose grey 3D chrome the row above still rejects.
+Toolbar buttons carry text, or an icon with a text label beside it, never an icon alone. Every menu
+item names its accelerator, so the menu teaches the keyboard instead of competing with it.
 
 ---
 
@@ -180,6 +203,47 @@ chooses per tab.
 
 Selecting in either pane scrolls the other to the same record. The bottom pane is a real view, not a
 copy — bookmarks, highlight rules and column layout all apply.
+
+### 3.1 Many logs at once — tiled panes, independent follow, and scroll lock
+
+*(Owner's requirement, 2026-08-19. §3 above is one log split two ways; this is several logs at
+once, which is a different problem and the one MDI existed to solve.)*
+
+**Layout is the user's choice, not the app's.** Some people want tabs; some want four services
+tiled across a monitor. Both ship, and the window switches between them — **Tabbed** and **Tiled**
+on the View menu, remembered per §12.4. Neither is the "real" one.
+
+**Tiled.** The window divides into a grid of panes — 2-up, 2×2, or arbitrary splits by dragging a
+pane edge. Every pane is a full independent document: its own file (or rotated set), its own
+filters, its own columns, its own bookmarks. Nothing about a pane is a lesser version of a tab.
+
+**Follow is per pane.** All panes tail by default, and *pausing one does not pause the others* —
+scroll back through the gateway's log while the API's keeps running at the tail. This is the
+behaviour that makes tiling worth having, and §12's "scrolling up auto-pauses follow" applies to
+the pane under the pointer alone.
+
+**Scroll lock — the point of the whole arrangement.** Panes may be **linked**, and a linked pane
+follows the one being scrolled. Two ways to link, because they answer different questions:
+
+| Lock | Links on | For |
+|---|---|---|
+| **By timestamp** | The record time | *"What was the gateway doing when the API threw?"* — the reason to tile at all |
+| **By line number** | The physical line number | Two runs of the same log, or a file against its own rotated predecessor |
+
+A timestamp lock needs no shared clock discipline to be useful, but it must be honest about what it
+does not know: a pane whose format carries no timezone (log4net `%date`, RFC 3164) says so, the same
+way §4's merged view does, and offers the same per-source override. A pane whose format has **no
+timestamp at all** cannot take part in a timestamp lock and is shown as unlinkable with the reason,
+rather than silently scrolling to nothing.
+
+Lock state is visible: linked panes carry a matching link mark, and the status bar says what the
+lock is on. Locking is opt-in, per pane, and a pane can be dropped out of the group without
+disturbing the rest.
+
+**How this relates to §4.** The merged timeline puts every source in *one* grid, interleaved. Tiling
+with a timestamp lock keeps them in *separate* grids, aligned. They answer the same question and
+neither replaces the other: merge is better for a request crossing four services; tiled-and-locked
+is better when each log has its own columns worth reading. §4 stays `[v2]`; this is v1.
 
 **The streaming bar is not cosmetic.** Filtering is a full-file pass (SPEC §7.2), so the UI tells the
 truth about it: partial results appear immediately, the match counter climbs, the scrollbar is
