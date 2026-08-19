@@ -89,6 +89,10 @@ filter action.
 ┌───────────────────────────────────────────────────────────────────────────────────────────┐
 │ 🦅  api.log  ×  │ jobdispatcher.log ● × │ nginx-access.log × │  +          ─  □  ✕        │  ← Mica title bar,
 ├───────────────────────────────────────────────────────────────────────────────────────────┤     tabs inline
+│ File   Edit   View   Format   Rules   Help                                                │  ← menu bar §2.2
+├───────────────────────────────────────────────────────────────────────────────────────────┤
+│ Open  Find  Filter  Follow  Collapse  Detail  Rules  Format  Export                       │  ← toolbar §2.3
+├───────────────────────────────────────────────────────────────────────────────────────────┤
 │ ⌕ Search…              │ ⊕ level >= Warning ⊗ /healthz/ ⊕ Ab timeout  + Filter │ ⚙ Rules  │  ← command bar:
 ├──┬────────────┬─────────────────────┬─────┬──────────┬───────────────────────────────────┤     filter CHIPS
 │  │ #          │ Timestamp           │ Lvl │ Logger   │ Message                           │  ← column header
@@ -110,6 +114,10 @@ filter action.
 (Windows 11 22621+, probed at runtime). A tab shows a **●** when new content has arrived while
 unfocused. Middle-click closes; drag reorders; drag out of the strip creates a split pane; drag onto
 another window merges. `+` opens a file, a file set, or a watched folder.
+
+**Menu bar and toolbar.** Two rows under the tab strip — see §2.2 and §2.3. Together they are the
+**primary** interface per §1.1: every feature is reachable by mouse from one of them, and the palette
+is an accelerator over the top rather than the only door.
 
 **Command bar.** Search on the left; a **filter chip row** on the right; rules button.
 
@@ -177,6 +185,74 @@ horizontally.
 (`99.2% parsed · 812 continuation · 14 unparsed`) on hover. This single number is what lets a user
 judge whether the detected format is right, and it is far more useful than a confidence percentage
 they cannot check.
+
+### 2.2 The menu bar `[v1]`
+
+Six menus. Every item names its accelerator, so the menu **teaches** the keyboard rather than
+competing with it; an item with no accelerator has none rather than a blank column.
+
+```
+ File            Edit                  View               Format            Rules             Help
+ ─────────────── ───────────────────── ────────────────── ───────────────── ───────────────── ──────────────
+ Open…    Ctrl+O Copy           Ctrl+C Follow tail      F Format…           Highlight rules…  Command palette
+ Open set…  ^⇧O  Copy as TSV   Ctrl+⇧C Collapse    Ctrl+E   ✓ Serilog 99%     …………… Ctrl+H    ………… Ctrl+K
+ ─────────────── ───────────────────── Invisibles  Ctrl+I   Plain text      Open rules file   Keyboard map
+ Export view…    Find…          Ctrl+F Record detail ^⏎    ───────────────── Reload rules     About Tailhawk
+ Tee to file…    Find next          F3 ────────────────── Define from a line…
+ ─────────────── Find previous    ⇧+F3 Split pane   Ctrl+\ Import layout…
+ Close tab Ctrl+W Go to line…   Ctrl+G Next tab   Ctrl+Tab ─────────────────
+ Exit      Alt+F4 ───────────────────── Previous  ^⇧Tab   Encoding        ▸
+                 Filter: include Ctrl+L Back        Alt+←
+                 Filter: exclude ^⇧L    Forward     Alt+→
+                 Clear filters         ──────────────────
+                 ───────────────────── Theme: dark / light
+                 Bookmark      Ctrl+D
+                 Bookmarks     Ctrl+⇧D
+```
+
+- **Custom-drawn**, per §1.1 — not a Win32 `HMENU`. That means `Alt` activation, mnemonics, arrow
+  navigation, type-ahead and the UIA tree are this application's own work, and §13 holds them to the
+  same standard as any other surface.
+- `Alt` alone focuses the bar; `Alt+F` and friends open a menu directly; `←`/`→` move between menus
+  with one open, `↑`/`↓` within one, `Enter` chooses, `Esc` closes one level.
+- A menu item that cannot act right now is **shown disabled, not hidden** — a menu whose shape
+  changes is a menu that cannot be learned.
+- Items that reflect state carry a **✓** (Follow tail, Collapse, Invisibles, the current format, the
+  current theme).
+- **One popup implementation** serves the menu bar, §6.1's format chip, the status chips and §2.4's
+  context menus. A second would drift.
+
+### 2.3 The toolbar `[v1]`
+
+One row, **text labels** — or an icon with a label beside it, never an icon alone (§1.1).
+
+```
+ Open   Find   Filter   Follow   Collapse   Detail   Rules   Format   Export
+```
+
+Buttons are the commands reached most often in a session, not a mirror of the menu. A button whose
+command is unavailable is disabled in place. Toggles (Follow, Collapse, Detail) draw pressed when
+their state is on, so the toolbar reads as a status display as well as a control.
+
+The toolbar is **hideable** — `View ▸ Toolbar` — and its state is remembered per §12.4, because a
+user who works from the keyboard should be able to buy the row back.
+
+### 2.4 Context menus `[v1]`
+
+Right-click is a first-class route, not a shortcut for people who know it is there. Every surface
+that has actions has a context menu, and each is a strict subset of what the menu bar offers:
+
+| Right-click on | Offers |
+|---|---|
+| A grid line | Copy, Copy as TSV, **Define format from this line…** (`SPEC.md` §6.5), Filter to / Filter out this text, Bookmark, Record detail |
+| The column header | Sort ascending / descending, Top N, Hide column, Reset columns |
+| A tab | Close, Close others, Split pane, Copy path, Reveal in Explorer |
+| A filter chip | Edit, Include ⇄ exclude, Disable, Remove |
+| The gutter | Bookmark, Clear bookmarks |
+| A status chip | The same menu its left-click drops |
+
+**"Define format from this line"** is the one §6.5 names explicitly, and it is the reason the grid's
+context menu exists at all: the wizard is documented as opening on a right-clicked line.
 
 ---
 
@@ -616,6 +692,7 @@ conflict.
 
 | Key | Action |
 |---|---|
+| `Alt` | Focus the menu bar; `Alt+F`, `Alt+E`, `Alt+V`, `Alt+O`, `Alt+R`, `Alt+H` open a menu directly (§2.2) |
 | `Ctrl+K` | Command palette |
 | `Ctrl+O` / `Ctrl+Shift+O` | Open file / open file set |
 | `Ctrl+F` / `F3` / `Shift+F3` | Search / next / previous |
