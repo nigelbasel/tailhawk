@@ -166,6 +166,19 @@ pub const DEFAULT_FONTS: &[&str] = &["Cascadia Mono", "Consolas", "Courier New",
 /// the value at the Win32 unit-DPI baseline of 96 and not a fixed size.
 pub const DEFAULT_PX_PER_EM: u16 = 16;
 
+/// Faces for the **chrome** — `UI-DESIGN.md` §1.1's menus, toolbar and status bar — most preferred
+/// first, and used only until the shell has read the real answer out of the system.
+///
+/// These are a fallback, not the policy. The shell asks `SPI_GETNONCLIENTMETRICS` which family and
+/// size Windows draws its own menus in, so a Japanese machine gets Yu Gothic UI and a user who has
+/// turned text size up gets their size; see the shell's `chrome_font`. This list is what to use
+/// when that call fails, and every entry ships with Windows.
+pub const DEFAULT_CHROME_FONTS: &[&str] =
+    &["Segoe UI Variable Text", "Segoe UI", "Tahoma", "Arial"];
+
+/// Windows' own 9 pt default at the 96-DPI baseline, for the same fallback case.
+pub const DEFAULT_CHROME_PX_PER_EM: u16 = 12;
+
 /// The grid's foreground. Provisional alongside [`BACKGROUND`] — `UI-DESIGN.md` §10 pins no hex.
 pub const INK: [f32; 4] = [0.878, 0.890, 0.906, 1.0];
 
@@ -252,25 +265,78 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `render_frame_with` the `Gpu` is mutably borrowed and cannot lend its device out, but the draw
 /// callback is handed one — and that path is the one that matters, because it is the retry after a
 /// mid-frame rebuild.
+/// A built [`paint::Painter`] and everything it was built *from*, so [`ensure_painter`] can tell
+/// whether it is still the right one.
+///
+/// Every field here is part of the key. The device generation and the grid's scale were always
+/// (§3.1's "rebuilt per scale factor"); the chrome's scale and family joined them when the chrome
+/// stopped being the grid's font, because `WM_SETTINGCHANGE` can change either one without the DPI
+/// moving at all — a user switching Windows' UI font, or turning text size up.
+#[cfg(windows)]
+struct Built {
+    generation: u32,
+    px_per_em: u16,
+    chrome_px_per_em: u16,
+    /// The chrome families as asked for, not as resolved: comparing what was *requested* is what
+    /// notices a settings change, and it is a handful of short strings once per frame.
+    chrome: Vec<String>,
+    painter: paint::Painter,
+}
+
+/// The two faces a frame is drawn in: the grid's monospace and the chrome's system UI font.
+///
+/// One argument rather than four, because they always travel together and the pairing is the point
+/// — a `px_per_em` belongs to a family, and passing them separately is how a chrome size ends up
+/// applied to the grid.
+#[cfg(windows)]
+#[derive(Copy, Clone)]
+pub struct Fonts<'a> {
+    pub grid: &'a [String],
+    pub grid_px: u16,
+    pub chrome: &'a [String],
+    pub chrome_px: u16,
+}
+
 #[cfg(windows)]
 fn ensure_painter<'a>(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     generation: u32,
-    slot: &'a mut Option<(u32, u16, paint::Painter)>,
-    candidates: &[String],
-    px_per_em: u16,
+    slot: &'a mut Option<Built>,
+    fonts: Fonts<'_>,
 ) -> Result<&'a mut paint::Painter> {
-    if !matches!(slot, Some((g, px, _)) if *g == generation && *px == px_per_em) {
+    let stale = match slot.as_ref() {
+        Some(b) => {
+            b.generation != generation
+                || b.px_per_em != fonts.grid_px
+                || b.chrome_px_per_em != fonts.chrome_px
+                || b.chrome != fonts.chrome
+        }
+        None => true,
+    };
+    if stale {
         // Released before the replacement is asked for, so a driver mid-reset is not holding two
         // atlases at once.
         *slot = None;
-        let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
-        let mut fresh = paint::Painter::new(device, &names, px_per_em)?;
+        let names: Vec<&str> = fonts.grid.iter().map(String::as_str).collect();
+        let chrome_names: Vec<&str> = fonts.chrome.iter().map(String::as_str).collect();
+        let mut fresh = paint::Painter::new(
+            device,
+            &names,
+            fonts.grid_px,
+            &chrome_names,
+            fonts.chrome_px,
+        )?;
         fresh.prime(context);
-        *slot = Some((generation, px_per_em, fresh));
+        *slot = Some(Built {
+            generation,
+            px_per_em: fonts.grid_px,
+            chrome_px_per_em: fonts.chrome_px,
+            chrome: fonts.chrome.to_vec(),
+            painter: fresh,
+        });
     }
-    Ok(&mut slot.as_mut().expect("just built").2)
+    Ok(&mut slot.as_mut().expect("just built").painter)
 }
 
 /// The renderer the shell drives.
@@ -292,9 +358,14 @@ pub struct Renderer {
     ///
     /// The `u16` is the `px_per_em` it was rasterised at — the second half of the key, per §3.1's
     /// "the glyph atlas is rebuilt per scale factor".
-    painter: Option<(u32, u16, paint::Painter)>,
+    painter: Option<Built>,
     font_candidates: Vec<String>,
     px_per_em: u16,
+    /// The system UI font for the chrome, and its size — see the shell's `chrome_font`. Held
+    /// beside the grid's because the two answer different questions: the grid follows the
+    /// monitor's DPI, the chrome follows what the user set Windows' menus to.
+    chrome_candidates: Vec<String>,
+    chrome_px_per_em: u16,
 }
 
 #[cfg(windows)]
@@ -310,6 +381,11 @@ impl Renderer {
             painter: None,
             font_candidates: DEFAULT_FONTS.iter().map(|s| (*s).to_owned()).collect(),
             px_per_em: DEFAULT_PX_PER_EM,
+            chrome_candidates: DEFAULT_CHROME_FONTS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            chrome_px_per_em: DEFAULT_CHROME_PX_PER_EM,
         })
     }
 
@@ -325,6 +401,22 @@ impl Renderer {
     /// and at a `WM_DPICHANGED` the caller is usually about to resize too. [`ensure_painter`] sees
     /// the new value on the next frame and rebuilds the atlas then, which is also what keeps the
     /// device-loss and scale-change paths from being two mechanisms.
+    /// Sets the chrome's face and size, and reports whether either changed.
+    ///
+    /// The shell reads these from `SPI_GETNONCLIENTMETRICS` at start, at `WM_SETTINGCHANGE` and at
+    /// `WM_DPICHANGED`. As with [`Renderer::set_dpi`], nothing is rebuilt here — [`ensure_painter`]
+    /// sees the new values on the next frame and replaces the atlas then, so a settings change and
+    /// a scale change and a device loss stay one mechanism rather than three.
+    pub fn set_chrome_font(&mut self, candidates: &[String], px_per_em: u16) -> bool {
+        let px = px_per_em.clamp(6, 200);
+        if self.chrome_candidates == candidates && self.chrome_px_per_em == px {
+            return false;
+        }
+        self.chrome_candidates = candidates.to_vec();
+        self.chrome_px_per_em = px;
+        true
+    }
+
     pub fn set_dpi(&mut self, dpi: u32) -> bool {
         // 96 is the Win32 unit-DPI baseline, so `dpi / 96` is the scale factor.
         let scaled = (f64::from(DEFAULT_PX_PER_EM) * f64::from(dpi.max(1)) / 96.0).round();
@@ -357,6 +449,8 @@ impl Renderer {
             painter,
             font_candidates,
             px_per_em,
+            chrome_candidates,
+            chrome_px_per_em,
         } = self;
         let (device, context) = gpu.resources();
         let p = ensure_painter(
@@ -364,8 +458,12 @@ impl Renderer {
             context,
             gpu.generation(),
             painter,
-            font_candidates,
-            *px_per_em,
+            Fonts {
+                grid: font_candidates,
+                grid_px: *px_per_em,
+                chrome: chrome_candidates,
+                chrome_px: *chrome_px_per_em,
+            },
         )?;
         Ok((p.cell_width(), p.row_height()))
     }
@@ -484,6 +582,8 @@ impl Renderer {
             painter,
             font_candidates,
             px_per_em,
+            chrome_candidates,
+            chrome_px_per_em,
         } = self;
         let mut laid = paint::Laid::default();
 
@@ -494,8 +594,12 @@ impl Renderer {
                 context,
                 generation,
                 painter,
-                font_candidates,
-                *px_per_em,
+                Fonts {
+                    grid: font_candidates,
+                    grid_px: *px_per_em,
+                    chrome: chrome_candidates,
+                    chrome_px: *chrome_px_per_em,
+                },
             )?;
 
             p.begin_frame();
@@ -522,8 +626,9 @@ impl Renderer {
         // present would stall every one of them. Paying it *nowhere* is not the alternative it might
         // look like — the atlas would never fill, so every frame would draw placeholder boxes for
         // ever and `queued` would never fall to zero.
-        if let Some((generation, _, p)) = painter.as_mut() {
-            debug_assert_eq!(*generation, gpu.generation());
+        if let Some(built) = painter.as_mut() {
+            debug_assert_eq!(built.generation, gpu.generation());
+            let p = &mut built.painter;
             let (_, context) = gpu.resources();
             laid.rasterised = p.flush_misses(context)?;
         }
@@ -603,7 +708,7 @@ mod tests {
         assert!(first.quads > 0, "nothing was laid out");
         assert_eq!(r.device_generation(), 1);
         assert_eq!(
-            r.painter.as_ref().map(|(g, _, _)| *g),
+            r.painter.as_ref().map(|b| b.generation),
             Some(1),
             "the painter should be keyed to the device that built it"
         );
@@ -615,7 +720,7 @@ mod tests {
 
         assert_eq!(r.device_generation(), 2, "the device was not rebuilt");
         assert_eq!(
-            r.painter.as_ref().map(|(g, _, _)| *g),
+            r.painter.as_ref().map(|b| b.generation),
             Some(2),
             "the painter is still keyed to the dead device — its atlas draws nothing and says nothing"
         );
@@ -647,7 +752,7 @@ mod tests {
         assert_eq!(r.px_per_em(), DEFAULT_PX_PER_EM);
         let at_100 = r.cell().expect("a cell at 100%");
         r.paint_rows(&view, &line).expect("a frame at 100%");
-        assert_eq!(r.painter.as_ref().map(|(_, px, _)| *px), Some(16));
+        assert_eq!(r.painter.as_ref().map(|b| b.px_per_em), Some(16));
 
         // 144 dpi is the 150% monitor named in M3's done-criterion.
         assert!(r.set_dpi(144), "150% should be a scale change");
@@ -664,7 +769,7 @@ mod tests {
 
         r.paint_rows(&view, &line).expect("a frame at 150%");
         assert_eq!(
-            r.painter.as_ref().map(|(_, px, _)| *px),
+            r.painter.as_ref().map(|b| b.px_per_em),
             Some(24),
             "the atlas is still the 100% one, so every glyph is being upscaled into a bigger cell"
         );

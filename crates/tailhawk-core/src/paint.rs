@@ -146,9 +146,21 @@ impl Laid {
 pub struct Painter {
     shaper: Shaper,
     cache: GlyphCache,
+    /// The **chrome** face and its own atlas — `UI-DESIGN.md` §1.1's menus, toolbar and status bar
+    /// are drawn in the system UI font, not in the grid's monospace.
+    ///
+    /// A second cache rather than a second face in the first one, because [`crate::atlas`] gives
+    /// every glyph an identical slot sized by measuring one face. That uniformity is what makes
+    /// eviction O(1) with no repacking, and it is exactly what a proportional face cannot share: a
+    /// cell wide enough for `W` wastes most of the sheet on `i`, and one sized for the monospace
+    /// grid would clip half of Segoe UI.
+    chrome: GlyphCache,
     pipeline: TextPipeline,
     px_per_em: u16,
     instances: Vec<Instance>,
+    /// The chrome's quads, drawn after [`Painter::instances`] with the chrome sheet bound — a
+    /// second draw call, and the reason the two cannot share a buffer.
+    chrome_instances: Vec<Instance>,
     /// One row's coloured runs, reused for every row of the frame. See
     /// [`RowSource::row_spans`](crate::rows::RowSource::row_spans) for why it is filled rather than
     /// returned.
@@ -156,20 +168,91 @@ pub struct Painter {
 }
 
 impl Painter {
-    pub fn new(device: &ID3D11Device, candidates: &[&str], px_per_em: u16) -> Result<Self> {
+    /// `candidates` and `px_per_em` are the **grid's** face and scale; `chrome` and `chrome_px` are
+    /// the system UI font's, from `SPI_GETNONCLIENTMETRICS`. The two are independent: the grid
+    /// follows the monitor's DPI, the chrome follows what the user set Windows' menus to.
+    pub fn new(
+        device: &ID3D11Device,
+        candidates: &[&str],
+        px_per_em: u16,
+        chrome: &[&str],
+        chrome_px: u16,
+    ) -> Result<Self> {
         Ok(Self {
             shaper: Shaper::new()?,
             cache: GlyphCache::new(device, candidates, px_per_em)?,
+            chrome: GlyphCache::new(device, chrome, chrome_px)?,
             pipeline: TextPipeline::new(device)?,
             px_per_em,
             instances: Vec::new(),
+            chrome_instances: Vec::new(),
             spans: Vec::new(),
         })
     }
 
+    /// The chrome face's line height — what a menu row, a toolbar band or the status bar is tall.
+    pub fn chrome_line_height(&self) -> f32 {
+        let ink = self.chrome.cell().height as f32;
+        self.chrome
+            .face()
+            .line_height(self.chrome.px_per_em())
+            .ceil()
+            .max(ink)
+    }
+
+    /// How wide `text` is in the chrome face, without drawing it — for a hit rectangle, or for
+    /// right-aligning an accelerator against a menu's edge.
+    ///
+    /// Shapes, which is the only honest way to answer: a proportional face's width is not a
+    /// character count times anything.
+    pub fn chrome_measure(&self, text: &str) -> f32 {
+        self.shaper
+            .shape(self.chrome.face(), text, self.chrome.px_per_em())
+            .map(|shaped| shaped.advances.iter().sum())
+            .unwrap_or(0.0)
+    }
+
+    /// Draws `text` in the chrome face with its top-left at `(x, y)`, and reports how wide it was.
+    ///
+    /// **A pen walked by the shaper's own advances** — the opposite of [`Painter::lay_out_row`],
+    /// which places every cluster at its column because §3.3 says the cell grid wins. That rule
+    /// exists so one fallback glyph cannot knock a log line out of column for the rest of its
+    /// length; it has nothing to say about a menu label, where honouring the advances is the whole
+    /// point of using a proportional face.
+    pub fn chrome_run(&mut self, text: &str, x: f32, y: f32, tint: [f32; 4]) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let px = self.chrome.px_per_em();
+        let Ok(shaped) = self.shaper.shape(self.chrome.face(), text, px) else {
+            return 0.0;
+        };
+        // As in `lay_out_row`: the cell's `top` is the ink's offset from the baseline, negative
+        // above it, and `quad` adds it back — so subtracting lands the ink on the row's top edge.
+        // Half the leading above and half below, for the reason given there.
+        let leading = (self.chrome_line_height() - self.chrome.cell().height as f32) * 0.5;
+        let baseline_y = y + leading - self.chrome.cell().top as f32;
+        let mut pen = x;
+        for (i, glyph) in shaped.glyphs.iter().enumerate() {
+            let offset = shaped.offsets[i];
+            if let Some(quad) = self.chrome.quad(
+                *glyph,
+                pen + offset.advance,
+                baseline_y - offset.ascender,
+                tint,
+            ) {
+                self.chrome_instances.push(quad);
+            }
+            pen += shaped.advances[i];
+        }
+        pen - x
+    }
+
     /// Uploads the placeholder. Until this succeeds a missing glyph draws nothing rather than a box.
     pub fn prime(&mut self, context: &ID3D11DeviceContext) -> bool {
-        self.cache.prime(context)
+        let grid = self.cache.prime(context);
+        let chrome = self.chrome.prime(context);
+        grid && chrome
     }
 
     /// The measured cell — **what [`View`]'s metrics must be set from.** §3.1 requires integer cell
@@ -210,7 +293,9 @@ impl Painter {
     /// Starts a frame: drops the previous frame's quads and its miss list.
     pub fn begin_frame(&mut self) {
         self.instances.clear();
+        self.chrome_instances.clear();
         self.cache.begin_frame();
+        self.chrome.begin_frame();
     }
 
     /// Lays out every visible row. `line_at` returns a row's text, or `None` for a row whose bytes
@@ -590,14 +675,21 @@ impl Painter {
 
     pub fn draw(&self, context: &ID3D11DeviceContext, viewport: (u32, u32)) -> Result<()> {
         self.pipeline
-            .draw(context, self.cache.sheet(), viewport, &self.instances)
+            .draw(context, self.cache.sheet(), viewport, &self.instances)?;
+        // Chrome second, so it is over the grid rather than under it.
+        self.pipeline.draw(
+            context,
+            self.chrome.sheet(),
+            viewport,
+            &self.chrome_instances,
+        )
     }
 
     /// Rasterises what this frame queued. **After presenting, never before drawing** — that
     /// ordering is §3.2's requirement and the whole reason [`Laid::queued`] is reported rather than
     /// waited on.
     pub fn flush_misses(&mut self, context: &ID3D11DeviceContext) -> Result<usize> {
-        self.cache.flush_misses(context)
+        Ok(self.cache.flush_misses(context)? + self.chrome.flush_misses(context)?)
     }
 }
 
@@ -609,6 +701,8 @@ mod tests {
 
     const CANDIDATES: &[&str] = &["Cascadia Mono", "Consolas", "Courier New", "Segoe UI"];
     const EM: u16 = 14;
+    const CHROME: &[&str] = &["Segoe UI Variable Text", "Segoe UI", "Tahoma", "Arial"];
+    const CHROME_EM: u16 = 12;
     const TARGET: u32 = 256;
     const INK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
@@ -632,7 +726,7 @@ mod tests {
                 return None;
             }
         };
-        match Painter::new(off.device(), CANDIDATES, EM) {
+        match Painter::new(off.device(), CANDIDATES, EM, CHROME, CHROME_EM) {
             Ok(mut p) => {
                 assert!(p.prime(off.context()), "the placeholder must upload");
                 Some((off, p))

@@ -65,6 +65,7 @@ use windows::Win32::UI::Controls::Dialogs::{
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::SetScrollInfo;
+use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -87,16 +88,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetMessageW, GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetClassLongPtrW, SetForegroundWindow, SetTimer,
     SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, ASFW_ANY,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, IDC_ARROW, MSG, SB_BOTTOM,
-    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
-    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
-    SPI_GETHIGHCONTRAST, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
-    SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT,
-    WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_GETOBJECT, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, IDC_ARROW, MSG, NONCLIENTMETRICSW,
+    SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK,
+    SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
+    SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_GETOBJECT, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -538,16 +539,20 @@ impl RowSource for Document {
         if footer > 0.0 && !self.status.is_empty() {
             let fy = view.height_px() - footer;
             painter.fill(0.0, fy, width, footer, theme().chrome_bg);
-            let avail = ((width - cell_w) / cell_w).max(0.0) as usize;
-            let shown = tailhawk_core::widget::fit_from_right(cells, &self.status, avail);
-            let ty = fy + ((footer - row_h) / 2.0).floor();
-            let _ = painter.lay_out_at(
-                view,
-                cell_w * 0.5,
-                ty,
-                shown,
-                Colours::plain(theme().header_ink),
-            );
+            // §1.1: chrome is drawn in the system UI font, not the grid's monospace. The status
+            // bar is the first surface converted, and it is the one that proves the second atlas
+            // works before the menu bar is built on top of it.
+            let chrome_h = painter.chrome_line_height();
+            let ty = fy + ((footer - chrome_h) / 2.0).floor();
+            let room = width - cell_w;
+            let mut shown = self.status.clone();
+            // Cut from the right if it will not fit; the front is the part that changes. Measured
+            // rather than counted — a proportional face has no cells to count.
+            while !shown.is_empty() && painter.chrome_measure(&shown) > room {
+                let cut = shown.char_indices().next_back().map_or(0, |(at, _)| at);
+                shown.truncate(cut);
+            }
+            painter.chrome_run(&shown, cell_w * 0.5, ty, theme().header_ink);
         }
 
         // V9's rules editor, under the palette — §5. Before it, so a palette opened while the
@@ -4656,7 +4661,13 @@ impl Shell {
                 // before any window exists, so it starts at 100%; a window opened on a 150% monitor
                 // never sees a `WM_DPICHANGED` for it, because nothing changed. Reading the DPI on
                 // adoption is the only thing that makes the *first* frame correct there.
-                renderer.set_dpi(unsafe { GetDpiForWindow(hwnd) });
+                let dpi = unsafe { GetDpiForWindow(hwnd) };
+                renderer.set_dpi(dpi);
+                // §1.1: the chrome is drawn in the system UI font, and the system is asked what
+                // that is rather than told. Same reason as the DPI read above — the first frame
+                // has to be right, and no message announces the answer.
+                let (chrome, chrome_px) = chrome_font(dpi);
+                renderer.set_chrome_font(&chrome, chrome_px);
                 self.renderer = Some(renderer);
                 self.pending = None;
                 self.refresh_title(hwnd);
@@ -4946,10 +4957,13 @@ impl Shell {
         // `WM_DPICHANGED` handler, and `wndproc` drops nested messages (see its note). So the
         // swap chain is resized here, from the client size the window now has.
         self.resize(hwnd);
-        let changed = self
-            .renderer
-            .as_mut()
-            .is_some_and(|renderer| renderer.set_dpi(dpi));
+        let (chrome, chrome_px) = chrome_font(dpi);
+        let changed = self.renderer.as_mut().is_some_and(|renderer| {
+            // Both, and not short-circuiting: the chrome metrics are reported per DPI, so a
+            // monitor change moves the UI font size as well as the grid's.
+            let scaled = renderer.set_dpi(dpi);
+            renderer.set_chrome_font(&chrome, chrome_px) || scaled
+        });
         if changed {
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
@@ -7792,6 +7806,81 @@ fn resolve_theme(name: Option<&str>) -> Theme {
     }
 }
 
+/// The face and size Windows says this machine's **menus** are drawn in, at `dpi`.
+///
+/// `UI-DESIGN.md` §1.1's menus and toolbar are drawn by the app, and an app that draws its own
+/// chrome still has to answer the questions the OS already answers: which family, and how big.
+/// `SPI_GETNONCLIENTMETRICS` is where both live, so this reads them rather than naming a font.
+/// Three things come free with that and are the reason not to hard-code one:
+///
+/// - **Locale.** A Japanese or Chinese Windows reports Yu Gothic UI or Microsoft JhengHei UI. A
+///   hard-coded `Segoe UI` would put every menu label through a fallback cascade on those machines.
+/// - **Accessibility.** "Make text bigger" changes the reported size, and the chrome should follow.
+/// - **Per-monitor DPI.** The `ForDpi` variant reports the metrics for the monitor the window is
+///   actually on, which is the same question `Renderer::set_dpi` already answers for the grid.
+///
+/// **The one place this departs from the system's answer** is the family: `NONCLIENTMETRICS`
+/// reports `Segoe UI`, never `Segoe UI Variable`, which is the Windows 11 face WinUI applications
+/// name explicitly. So Variable is preferred *only* when the system named the stock font — a user
+/// who has chosen their own UI font, or a locale with a different default, gets exactly what they
+/// asked for.
+///
+/// Returns the family candidates most-preferred first, and the em size in device pixels.
+fn chrome_font(dpi: u32) -> (Vec<String>, u16) {
+    let mut m = NONCLIENTMETRICSW {
+        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
+            m.cbSize,
+            Some(&mut m as *mut _ as *mut _),
+            0,
+            dpi.max(1),
+        )
+    };
+    if ok.is_err() {
+        return (
+            CHROME_FONTS.iter().map(|s| (*s).to_owned()).collect(),
+            chrome_px_per_em(dpi),
+        );
+    }
+    let font = m.lfMenuFont;
+    let named = String::from_utf16_lossy(&font.lfFaceName)
+        .trim_end_matches('\0')
+        .to_owned();
+    // A negative `lfHeight` is the **character** height — the em size, which is what the
+    // rasteriser wants — and that is what `SPI_GETNONCLIENTMETRICS` returns (-12 at 96 DPI, i.e.
+    // 9pt). A positive one would be the *cell* height, ascent plus descent, which is larger than
+    // the em and would over-scale the chrome; it is scaled back rather than merely negated.
+    let px = match font.lfHeight {
+        0 => chrome_px_per_em(dpi),
+        h if h < 0 => h.unsigned_abs() as u16,
+        h => ((f64::from(h) * 0.8).round() as u16).max(1),
+    }
+    .clamp(8, 72);
+    let mut candidates = Vec::new();
+    if named.eq_ignore_ascii_case("Segoe UI") {
+        candidates.push("Segoe UI Variable Text".to_owned());
+    }
+    if !named.is_empty() {
+        candidates.push(named);
+    }
+    candidates.extend(CHROME_FONTS.iter().map(|s| (*s).to_owned()));
+    (candidates, px)
+}
+
+/// Fallbacks when `SPI_GETNONCLIENTMETRICS` cannot be read at all, most-preferred first. Every one
+/// of them ships with Windows, so the list degrades rather than fails — as `DEFAULT_FONTS` does for
+/// the grid.
+const CHROME_FONTS: &[&str] = &["Segoe UI Variable Text", "Segoe UI", "Tahoma", "Arial"];
+
+/// The chrome em size when the metrics are unreadable: Windows' own 9pt default, scaled.
+fn chrome_px_per_em(dpi: u32) -> u16 {
+    ((9.0 * f64::from(dpi.max(1)) / 72.0).round() as u16).clamp(8, 72)
+}
+
 /// `SPI_GETHIGHCONTRAST`: when the flag is on, a theme from `GetSysColor`'s window text, window
 /// and highlight colours.
 fn high_contrast_theme() -> Option<Theme> {
@@ -8606,6 +8695,39 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 }
             });
             LRESULT(0)
+        }
+        // The user changed something in Windows' own settings. `"WindowMetrics"` is the UI font and
+        // the non-client sizes — §1.1's chrome is drawn in that font, so it follows the change
+        // rather than keeping whatever was true at start. Rebuilding is `ensure_painter`'s job on
+        // the next frame; all this does is record the new answer and ask for that frame.
+        WM_SETTINGCHANGE => {
+            let area = if lparam.0 == 0 {
+                String::new()
+            } else {
+                let mut len = 0usize;
+                let p = lparam.0 as *const u16;
+                while unsafe { *p.add(len) } != 0 && len < 64 {
+                    len += 1;
+                }
+                String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
+            };
+            if area == "WindowMetrics" {
+                let (chrome, chrome_px) = chrome_font(unsafe { GetDpiForWindow(hwnd) });
+                let changed = STATE.with(|s| {
+                    s.borrow_mut().as_mut().is_some_and(|shell| {
+                        shell
+                            .renderer
+                            .as_mut()
+                            .is_some_and(|r| r.set_chrome_font(&chrome, chrome_px))
+                    })
+                });
+                if changed {
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            def_proc(hwnd, msg, wparam, lparam)
         }
         WM_DPICHANGED => {
             // **Both halves are required and they are separate.** `lParam` carries the window rect
