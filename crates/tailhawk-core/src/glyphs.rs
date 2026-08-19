@@ -90,6 +90,10 @@ impl GlyphCache {
         &self.sheet
     }
 
+    pub fn px_per_em(&self) -> u16 {
+        self.px_per_em
+    }
+
     pub fn face(&self) -> &Face {
         &self.face
     }

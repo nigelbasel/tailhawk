@@ -9458,11 +9458,11 @@ mod tests {
         let mut spans = Vec::new();
         doc.row_spans(1, &mut spans);
         let inks: Vec<_> = spans.iter().map(|s| (s.start, s.end, s.fg, s.bg)).collect();
-        assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
+        assert_eq!(inks[0], (0, 23, Some(theme().semantic.timestamp), None));
         // The row is presented in columns (the fixture detects as timestamped text), so the level
         // sits where the layout put it rather than at its raw offset.
         let e = doc.row_text(1).expect("row").find("ERROR").expect("level");
-        assert_eq!(inks[1], (e, e + 5, Some(semantic::ERROR), None));
+        assert_eq!(inks[1], (e, e + 5, Some(theme().semantic.error), None));
         assert!(spans.iter().all(|s| s.bg.is_none()));
 
         doc.finder.query = "ERROR".to_owned();
@@ -9479,7 +9479,7 @@ mod tests {
         // and the number after it are still the catalogue's.
         doc.row_spans(1, &mut spans);
         let inks: Vec<_> = spans.iter().map(|s| (s.start, s.end, s.fg, s.bg)).collect();
-        assert_eq!(inks[0], (0, 23, Some(semantic::TIMESTAMP), None));
+        assert_eq!(inks[0], (0, 23, Some(theme().semantic.timestamp), None));
         assert_eq!(
             inks[1],
             (
@@ -9491,7 +9491,7 @@ mod tests {
         );
         assert!(
             inks.iter()
-                .any(|&(_, _, fg, _)| fg == Some(semantic::NUMBER)),
+                .any(|&(_, _, fg, _)| fg == Some(theme().semantic.number)),
             "41982 is still a number: {inks:?}"
         );
 

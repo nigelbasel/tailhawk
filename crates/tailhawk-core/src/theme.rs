@@ -317,7 +317,7 @@ impl Default for Theme {
     }
 }
 
-static THEME: RwLock<Theme> = RwLock::new(Theme::light());
+static THEME: RwLock<Theme> = RwLock::new(Theme::dark());
 
 /// The theme in force. A copy — see the module note.
 pub fn theme() -> Theme {
@@ -343,7 +343,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_two_sets_are_opposite_in_ground_and_the_default_is_dark() {
+    fn the_two_sets_are_opposite_in_ground_and_the_default_is_light() {
         let dark = Theme::dark();
         let light = Theme::light();
         assert!(dark.dark && !light.dark);
@@ -351,7 +351,8 @@ mod tests {
         assert!(luminance(light.background) > 0.9);
         assert!(luminance(dark.ink) > 0.7);
         assert!(luminance(light.ink) < 0.3);
-        assert_eq!(Theme::default(), dark);
+        // §11.2: the shipped default is black on white; --theme=dark asks for the other one.
+        assert_eq!(Theme::default(), light);
         assert_eq!(dark.background_rgb8(), (18, 20, 23));
         assert_eq!(by_name("light"), Some(light));
         assert_eq!(by_name("system"), None);

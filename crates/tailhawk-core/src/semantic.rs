@@ -252,7 +252,7 @@ mod tests {
 
     /// The coloured runs of one line, as text, in order — what a reader would see.
     fn coloured(line: &str) -> Vec<(&str, Colour)> {
-        let h = Highlighter::new(catalogue());
+        let h = Highlighter::new(catalogue_for(&crate::theme::Theme::dark()));
         h.begin_frame();
         let mut out: Vec<Span> = Vec::new();
         h.line(line, &mut out);
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn every_rule_compiles_on_the_linear_engine() {
-        let set = catalogue();
+        let set = catalogue_for(&crate::theme::Theme::dark());
         assert!(set.rules.len() >= 20);
         for rule in &set.rules {
             assert!(
@@ -524,7 +524,7 @@ mod tests {
     /// tripwire against a rule that quietly turns quadratic.
     #[test]
     fn a_screenful_costs_a_fraction_of_a_frame() {
-        let h = Highlighter::new(catalogue());
+        let h = Highlighter::new(catalogue_for(&crate::theme::Theme::dark()));
         let line = r#"2026-08-16 09:14:02.117 INFO  Api.Controller line 41982 returned 412 rows in 88ms for /api/users?x=1 from 10.0.0.1 status=200 id=3f2504e0-4f89-11d3-9a0c-0305e82c3301"#;
         let mut out = Vec::new();
         h.begin_frame();
