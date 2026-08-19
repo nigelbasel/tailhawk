@@ -99,42 +99,54 @@ impl Item {
         self
     }
 
-    /// The label without its mnemonic marker, which is what a painter draws.
-    pub fn text(&self) -> String {
-        let mut out = String::with_capacity(self.label.len());
+    /// The drawn text and where its underline goes, read from the one label in one pass — so the
+    /// letter that is underlined and the letter that is typed cannot disagree.
+    ///
+    /// `&&` is a literal ampersand, as it is everywhere on Windows: `Fish && Chips` draws
+    /// `Fish & Chips` and marks no mnemonic.
+    fn parsed(&self) -> (String, Option<usize>) {
+        let mut text = String::with_capacity(self.label.len());
+        let mut at = None;
+        let mut count = 0;
         let mut mark = false;
         for c in self.label.chars() {
-            match c {
-                '&' if !mark => mark = true,
-                c => {
-                    out.push(c);
+            match (mark, c) {
+                (false, '&') => mark = true,
+                (true, '&') => {
+                    text.push('&');
+                    count += 1;
                     mark = false;
+                }
+                (true, c) => {
+                    at.get_or_insert(count);
+                    text.push(c);
+                    count += 1;
+                    mark = false;
+                }
+                (false, c) => {
+                    text.push(c);
+                    count += 1;
                 }
             }
         }
-        out
+        (text, at)
+    }
+
+    /// The label without its mnemonic markers, which is what a painter draws.
+    pub fn text(&self) -> String {
+        self.parsed().0
     }
 
     /// Where the underline goes, as a **character** offset into [`Item::text`], or `None` when the
     /// label marks no mnemonic.
     pub fn mnemonic_at(&self) -> Option<usize> {
-        let mut at = 0;
-        let mut mark = false;
-        for c in self.label.chars() {
-            match c {
-                '&' if !mark => mark = true,
-                _ if mark => return Some(at),
-                _ => at += 1,
-            }
-        }
-        None
+        self.parsed().1
     }
 
     /// The letter that opens or runs this item, lowercased.
     pub fn mnemonic(&self) -> Option<char> {
-        let text = self.text();
-        let at = self.mnemonic_at()?;
-        text.chars().nth(at).map(|c| c.to_ascii_lowercase())
+        let (text, at) = self.parsed();
+        text.chars().nth(at?).map(|c| c.to_ascii_lowercase())
     }
 
     /// Whether the keyboard may land on it: a separator never, a disabled item never.
@@ -177,7 +189,10 @@ impl Menu {
             selected: Vec::new(),
             bar: false,
         };
-        menu.selected = menu.first_selectable(&[]).map(|i| vec![i]).unwrap_or_default();
+        menu.selected = menu
+            .first_selectable(&[])
+            .map(|i| vec![i])
+            .unwrap_or_default();
         menu
     }
 
@@ -437,7 +452,11 @@ mod tests {
         menu.open_top(0);
         assert!(menu.is_open());
         assert_eq!(menu.open_path(), &[0]);
-        assert_eq!(menu.selected(), &[0, 0], "on the first item that can be used");
+        assert_eq!(
+            menu.selected(),
+            &[0, 0],
+            "on the first item that can be used"
+        );
     }
 
     #[test]
@@ -474,7 +493,11 @@ mod tests {
         menu.step(-1);
         assert_eq!(menu.selected(), &[0, 0]);
         menu.step(-1);
-        assert_eq!(menu.selected(), &[0, 0], "the top does not wrap to the bottom");
+        assert_eq!(
+            menu.selected(),
+            &[0, 0],
+            "the top does not wrap to the bottom"
+        );
     }
 
     #[test]
@@ -527,7 +550,11 @@ mod tests {
         menu.across(1);
         assert_eq!(menu.open_path(), &[1]);
         menu.across(1);
-        assert_eq!(menu.open_path(), &[0], "the bar wraps even though a list does not");
+        assert_eq!(
+            menu.open_path(),
+            &[0],
+            "the bar wraps even though a list does not"
+        );
         menu.across(-1);
         assert_eq!(menu.open_path(), &[1]);
     }
@@ -539,9 +566,17 @@ mod tests {
         menu.step(1);
         menu.step(1);
         menu.across(1);
-        assert_eq!(menu.open_path(), &[1, 2], "right opened it rather than moving on");
+        assert_eq!(
+            menu.open_path(),
+            &[1, 2],
+            "right opened it rather than moving on"
+        );
         menu.across(-1);
-        assert_eq!(menu.open_path(), &[1], "and left shut it rather than moving back");
+        assert_eq!(
+            menu.open_path(),
+            &[1],
+            "and left shut it rather than moving back"
+        );
     }
 
     #[test]
