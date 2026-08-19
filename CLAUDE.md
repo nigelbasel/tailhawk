@@ -26,6 +26,22 @@ kinds in use: `turn`, `task`, `commit`, `test`, `docs`, `ci`, `push`, `note`, `i
 tails `logs/agent.log` to see what you are doing. A session that works silently is a session the
 owner cannot supervise.
 
+**Log every file you create or substantially rewrite, at the moment you do it — naming the file.**
+The log is not only the owner's window in; it is *your own memory*, and the only part of this
+session that survives compaction. Session 21 wrote `menu.rs` — 658 lines and 20 tests — logged
+nothing, lost it when the conversation was compacted, then found it in `git status` looking like
+someone else's work and recorded it in `CLEANROOM.md` as the **owner's** module. A one-line
+`task` entry naming the file would have made that impossible. Write enough detail that you can
+reconstruct what you did from the log alone, because at some point that is all you will have.
+
+**An unexplained file in `git status` is investigated, never attributed by inference.** `git log`
+shows the owner's name on every commit — that is the configured identity, not evidence. Check
+`logs/agent.log` first, then this project's transcripts:
+`grep -o '"file_path":"[^"]*NAME"' ~/.claude/projects/C--dev-git-TailHawk/*.jsonl`.
+
+**Stage named paths. Never `git add -A` or `git add .`** — this project commits straight to master,
+so a swept-in file and a wrong `CLEANROOM.md` row publish in the same step.
+
 **Commit straight to master, and often.** No branches, no PRs on this project. Push, then check CI
 and *wait for the result* — do not push and walk away. Sessions have ended leaving master red.
 
