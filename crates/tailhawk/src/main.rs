@@ -332,7 +332,7 @@ impl RowSource for Document {
         self.header_text()
     }
 
-    /// The command bar: `▸ [find] ▼ [+chip] [−chip] [add filter…]     · format`.
+    /// The command bar: `► [find] ▼ [+chip] [−chip] [add filter…]     · format`.
     ///
     /// Everything is placed in cells so it lines up with the rows. Fields are filled rectangles
     /// with their text over them; the focused one carries a caret and, while an IME composes, a
@@ -352,46 +352,55 @@ impl RowSource for Document {
 
         // The tab strip, when there is more than one tab: each file's name on its own fill, the
         // shown one lighter, and a click on one shows it (`Hit::Tab`). Above the bar.
+        let chrome_h = painter.chrome_line_height();
+        let pad = painter.chrome_measure("n").max(4.0);
         let (labels, active) = &self.tab_strip;
         let strip = if labels.len() > 1 {
-            let strip_h = Chrome::strip_height(row_h);
-            let ty = ((strip_h - row_h) / 2.0).floor();
-            let mut tx = cell_w * 0.5;
+            let strip_h = Chrome::strip_height(chrome_h);
+            let ty = ((strip_h - chrome_h) / 2.0).floor();
+            let mut tx = pad * 0.5;
             for (i, label) in labels.iter().enumerate() {
-                let w = cells.cell_count(label) as f32 * cell_w;
+                let w = painter.chrome_measure(label);
                 let bg = if i == *active {
                     theme().tab_active_bg
                 } else {
                     theme().tab_bg
                 };
-                painter.fill(tx - 2.0, 1.0, w + cell_w * 2.0 + 4.0, strip_h - 2.0, bg);
+                painter.fill(tx - 2.0, 1.0, w + pad * 2.0 + 4.0, strip_h - 2.0, bg);
                 let ink = if i == *active {
                     theme().ink
                 } else {
                     theme().header_ink
                 };
-                let _ = painter.lay_out_at(view, tx + cell_w, ty, label, Colours::plain(ink));
-                hits.push((tx..tx + w + cell_w * 2.0, Hit::Tab(i)));
-                tx += w + cell_w * 3.0;
+                painter.chrome_run(label, tx + pad, ty, ink);
+                hits.push((tx..tx + w + pad * 2.0, Hit::Tab(i)));
+                tx += w + pad * 3.0;
             }
             strip_h
         } else {
             0.0
         };
-        let text_y = strip + ((band - strip - row_h) / 2.0).floor();
-        let mut x = cell_w * 0.5;
+        let text_y = strip + ((band - strip - chrome_h) / 2.0).floor();
+        let mut x = pad * 0.5;
 
-        // ▸ and the find field. (`UI-DESIGN.md` §2.1's ▸ is not in Cascadia Mono, and the painter
-        // has one face until fallback lands; a placeholder box is worse than a plain marker.)
-        let _ = painter.lay_out_at(view, x, text_y, "▸", Colours::plain(theme().header_ink));
-        x += cell_w * 2.0;
-        let find_w = FIND_CELLS as f32 * cell_w;
+        // §2.1's prompt and the find field.
+        //
+        // **U+25BA ►, not U+25B8 ▸.** Segoe UI Variable Text has none of ▸, ▾ or ▶ —
+        // `GetGlyphIndices` returns .notdef for all three, and this cache has one face with no
+        // per-glyph fallback, so each drew as a box. It does have ► and ▼, which say the same
+        // thing. `the_chrome_face_has_the_markers_the_chrome_draws` catches it before the window
+        // does; the first draft of this line picked two of the three missing ones.
+        x += painter.chrome_run("►", x, text_y, theme().header_ink) + pad;
+        // The fields keep a width in *ems* of the chrome face rather than a cell count: the point
+        // of `FIND_CELLS` was "wide enough for a real query", and that survives the face change.
+        let em = painter.chrome_measure("0").max(1.0);
+        let find_w = FIND_CELLS as f32 * em;
         let find_focused = self.chrome.focus == Focus::Find;
         painter.fill(
             x - 2.0,
             text_y - 2.0,
             find_w + 4.0,
-            row_h + 4.0,
+            chrome_h + 4.0,
             if find_focused {
                 theme().field_bg_focused
             } else {
@@ -402,54 +411,45 @@ impl RowSource for Document {
         let find_origin = x;
         draw_field(
             painter,
-            view,
-            cells,
             &self.chrome.find,
             find_focused,
             x,
             text_y,
-            FIND_CELLS,
+            find_w,
             "search (Ctrl+F)",
         );
-        x += find_w + cell_w * 2.0;
+        x += find_w + pad * 2.0;
 
         // ▼ and the chips.
-        let _ = painter.lay_out_at(view, x, text_y, "▼", Colours::plain(theme().header_ink));
-        x += cell_w * 2.0;
+        x += painter.chrome_run("▼", x, text_y, theme().header_ink) + pad;
         for (i, chip) in self.filtering.chips.chips.iter().enumerate() {
             let sign = match chip.polarity {
                 Polarity::Include => "+",
                 Polarity::Exclude => "−",
             };
             let label = format!("{sign}{}", chip.source);
-            let w = cells.cell_count(&label) as f32 * cell_w;
+            let w = painter.chrome_measure(&label);
             // The body toggles, the `×` after it removes; a disabled chip is drawn dim on its fill.
-            let close_w = cell_w * 2.0;
+            let close_w = painter.chrome_measure("×") + pad;
             let bg = match (chip.polarity, chip.enabled) {
                 (Polarity::Include, true) => theme().chip_include_bg,
                 (Polarity::Exclude, true) => theme().chip_exclude_bg,
                 (_, false) => theme().field_bg,
             };
-            painter.fill(x - 2.0, text_y - 2.0, w + close_w + 4.0, row_h + 4.0, bg);
+            painter.fill(x - 2.0, text_y - 2.0, w + close_w + 4.0, chrome_h + 4.0, bg);
             let ink = if chip.enabled {
                 theme().ink
             } else {
                 theme().field_hint
             };
-            let _ = painter.lay_out_at(view, x, text_y, &label, Colours::plain(ink));
-            let _ = painter.lay_out_at(
-                view,
-                x + w + cell_w * 0.5,
-                text_y,
-                "×",
-                Colours::plain(theme().field_hint),
-            );
+            painter.chrome_run(&label, x, text_y, ink);
+            painter.chrome_run("×", x + w + pad * 0.5, text_y, theme().field_hint);
             hits.push((x..x + w, Hit::Chip(i)));
             hits.push((x + w..x + w + close_w, Hit::ChipClose(i)));
-            x += w + close_w + cell_w * 1.5;
+            x += w + close_w + pad * 1.5;
         }
         // The new-chip field.
-        let chip_w = CHIP_CELLS as f32 * cell_w;
+        let chip_w = CHIP_CELLS as f32 * em;
         let chip_focused = self.chrome.focus == Focus::NewChip;
         painter.fill(
             x - 2.0,
@@ -470,13 +470,11 @@ impl RowSource for Document {
         };
         draw_field(
             painter,
-            view,
-            cells,
             &self.chrome.chip,
             chip_focused,
             x,
             text_y,
-            CHIP_CELLS,
+            chip_w,
             hint,
         );
         self.chrome.origins.set((find_origin, chip_origin));
@@ -488,31 +486,38 @@ impl RowSource for Document {
         // mis-columnising is worse than none. `describe` already says "format? … · …" in that
         // case; drawing it in the ordinary ink would leave the warning to be read rather than seen.
         if let Some(text) = self.detection.describe() {
-            let text = format!("{text} ▾");
+            let text = format!("{text} ▼");
             // The warning form is the *longest* — `format? log4net 100% · timestamped text 100%` —
             // so a chip drawn only when it fits whole is a chip that disappears in exactly the
             // state §6.1 wants it seen. Fit it to the room instead, and give up only when there is
             // none: the click target goes with it, and this is the door to every way back.
-            let room = (((width - x - chip_w - 2.0 * cell_w) / cell_w) as usize)
-                .min(cells.cell_count(&text));
-            if room >= FORMAT_CHIP_MIN_CELLS {
-                let shown = tailhawk_core::widget::fit_from_right(cells, &text, room);
-                let w = cells.cell_count(shown) as f32 * cell_w;
-                let fx = width - w - cell_w;
+            let room = width - x - chip_w - pad * 2.0;
+            let mut shown = text.clone();
+            while !shown.is_empty() && painter.chrome_measure(&shown) > room {
+                let cut = shown.char_indices().next_back().map_or(0, |(at, _)| at);
+                shown.truncate(cut);
+            }
+            let w = painter.chrome_measure(&shown);
+            if w >= FORMAT_CHIP_MIN_CELLS as f32 * em {
+                let fx = width - w - pad;
                 let ink = if self.detection.accepted.is_none() {
                     theme().semantic.warn
                 } else {
                     theme().header_ink
                 };
-                let _ = painter.lay_out_at(view, fx, text_y, shown, Colours::plain(ink));
+                painter.chrome_run(&shown, fx, text_y, ink);
                 hits.push((fx..fx + w, Hit::FormatChip));
             }
         }
 
         // V10: the detail pane, above the status bar. The first line is the record's title; the
         // rest its fields, body and tail; a pane too short for them says how many are left.
+        //
+        // **The same band height `lay_out` reserved.** Reserving from the chrome face here and
+        // measuring from the grid's row there left the status bar a different size from its own
+        // hole, so the last log row drew into it.
         let strip = if self.show_footer {
-            Chrome::strip_height(row_h)
+            Chrome::strip_height(self.band_h(row_h))
         } else {
             0.0
         };
@@ -583,13 +588,11 @@ impl RowSource for Document {
             let _ = painter.lay_out_at(view, inner_x, y, "▸", Colours::plain(theme().field_hint));
             draw_field(
                 painter,
-                view,
-                cells,
                 &self.palette.field,
                 true,
                 inner_x + 2.0 * cell_w,
                 y,
-                PALETTE_CELLS - 4,
+                (PALETTE_CELLS - 4) as f32 * painter.chrome_measure("0").max(1.0),
                 "type a command, or a line number",
             );
             y += row_h;
@@ -734,13 +737,11 @@ impl Document {
                     };
                     draw_field(
                         painter,
-                        view,
-                        cells,
                         field,
                         true,
                         x + 2.0 * cell_w,
                         y,
-                        RULES_PATTERN_CELLS - 2,
+                        (RULES_PATTERN_CELLS - 2) as f32 * painter.chrome_measure("0").max(1.0),
                         hint,
                     );
                 }
@@ -895,6 +896,19 @@ impl Document {
         self.presented.clear();
     }
 
+    /// The height a chrome band is laid out and drawn against — the chrome face's line height, or
+    /// the grid's row when no renderer has said what that is, which is a test.
+    ///
+    /// **One answer, asked by everything.** Reserving a band from one number and drawing it from
+    /// another is how the status bar ended up a different size from the hole left for it.
+    fn band_h(&self, row_h: f32) -> f32 {
+        if self.chrome_h > 0.0 {
+            self.chrome_h
+        } else {
+            row_h
+        }
+    }
+
     /// §6.2's box: the example with a ruler under it, the pattern it builds, and the preview.
     ///
     /// Unlike [`Document::draw_rules`], whose preview is the grid behind it, this one draws its
@@ -948,13 +962,11 @@ impl Document {
             match overlay.editing {
                 Some((WizardCell::Layout, ref field)) => draw_field(
                     painter,
-                    view,
-                    cells,
                     field,
                     true,
                     inner_x,
                     y,
-                    inner_cells.saturating_sub(1),
+                    inner_cells.saturating_sub(1) as f32 * painter.chrome_measure("0").max(1.0),
                     WIZARD_PASTE_HINT,
                 ),
                 _ => line(painter, y, text, theme().ink),
@@ -1047,13 +1059,11 @@ impl Document {
                 };
                 draw_field(
                     painter,
-                    view,
-                    cells,
                     field,
                     true,
                     inner_x,
                     y,
-                    inner_cells.saturating_sub(1),
+                    (inner_cells.saturating_sub(1)) as f32 * painter.chrome_measure("0").max(1.0),
                     hint,
                 );
             }
@@ -1265,13 +1275,7 @@ impl Document {
         }
         // The command bar always, the tab strip when there is more than one tab; one row of header
         // when there are columns. Set after the viewport, which is what all three are subtracted from.
-        // The bands are the chrome's, so they are sized by the chrome face — falling back to the
-        // grid's row height only when no renderer has said what that is, which is a test.
-        let chrome_h = if self.chrome_h > 0.0 {
-            self.chrome_h
-        } else {
-            row_h
-        };
+        let chrome_h = self.band_h(row_h);
         let strip = if self.tab_strip.0.len() > 1 {
             Chrome::strip_height(chrome_h)
         } else {
@@ -2895,12 +2899,12 @@ impl Finder {
     /// "no matches" — that the pattern did not compile.
     fn describe(&self) -> Option<String> {
         if let Some(error) = &self.error {
-            return Some(format!("▸ {} — {error}", self.query));
+            return Some(format!("► {} — {error}", self.query));
         }
         if self.query.is_empty() {
             return None;
         }
-        let mut text = format!("▸ {}", self.query);
+        let mut text = format!("► {}", self.query);
         match (self.current, self.matches.len()) {
             (_, 0) if self.running.is_some() => text.push_str(" — searching…"),
             (_, 0) => text.push_str(" — no matches"),
@@ -4452,68 +4456,67 @@ const RULES_LEGEND: &str =
 /// One field: its text (cut from the left to fit), a hint when empty and unfocused, the selection
 /// as a background span, the caret as a two-pixel fill, and a mark under an IME composition.
 #[allow(clippy::too_many_arguments)]
+/// One line-edit of the chrome — the find field, the new-chip field, a cell of the rules editor —
+/// drawn in the **chrome face** at a pixel width.
+///
+/// Everything that was a cell count is now a measurement. A proportional face has no cells, so the
+/// caret, the selection behind it, the composition underline and the scroll that keeps the caret on
+/// screen are all `chrome_measure` of a prefix rather than `cell_at_byte`.
 fn draw_field(
     painter: &mut Painter,
-    view: &View,
-    cells: &CellModel,
     field: &TextField,
     focused: bool,
     x: f32,
     y: f32,
-    width_cells: usize,
+    width: f32,
     hint: &str,
 ) {
-    let cell_w = painter.cell_width();
-    let row_h = painter.row_height();
+    let line_h = painter.chrome_line_height();
     let display = field.display();
     if display.is_empty() && !focused {
-        let _ = painter.lay_out_at(view, x, y, hint, Colours::plain(theme().field_hint));
+        painter.chrome_run(hint, x, y, theme().field_hint);
         return;
     }
-    let (shown, cut) = Chrome::fitted(cells, &display, width_cells);
-    // The selection, as a span with a background — the painter's own way of filling behind text.
-    let mut spans = Vec::new();
+    // **Cut from the left, so the caret end is always on screen.** The old cell version did the
+    // same; what changes is that "how much to cut" is answered by measuring rather than counting.
+    let caret = field.display_caret().min(display.len());
+    let mut cut = 0;
+    while cut < caret && painter.chrome_measure(&display[cut..caret]) > width {
+        cut = display[cut + 1..]
+            .char_indices()
+            .next()
+            .map_or(caret, |(at, _)| cut + 1 + at);
+    }
+    let shown = &display[cut..];
+    let at = |painter: &Painter, byte: usize| -> f32 {
+        let byte = byte.saturating_sub(cut).min(shown.len());
+        painter.chrome_measure(&shown[..byte])
+    };
+
+    // The selection is a fill behind the text, so it is emitted first — `chrome_run` draws over it.
     if let Some(sel) = field.selection() {
-        let start = sel.start.saturating_sub(cut);
-        let end = sel.end.saturating_sub(cut);
-        if start < end && end <= shown.len() {
-            spans.push(Span {
-                start,
-                end,
-                fg: None,
-                bg: Some(theme().field_selection_bg),
-            });
+        let (from, to) = (at(painter, sel.start), at(painter, sel.end));
+        if to > from {
+            painter.fill(
+                x + from,
+                y,
+                (to - from).min(width - from),
+                line_h,
+                theme().field_selection_bg,
+            );
         }
     }
-    let _ = painter.lay_out_at(
-        view,
-        x,
-        y,
-        shown,
-        Colours {
-            tint: theme().ink,
-            selected: None,
-            spans: &spans,
-        },
-    );
+    painter.chrome_run(shown, x, y, theme().ink);
     if !focused {
         return;
     }
     // The composition's mark: a thin line under it.
     if let Some(comp) = field.display_composition() {
-        let from = cells.cell_at_byte(shown, comp.start.saturating_sub(cut).min(shown.len()));
-        let to = cells.cell_at_byte(shown, comp.end.saturating_sub(cut).min(shown.len()));
-        painter.fill(
-            x + from as f32 * cell_w,
-            y + row_h - 2.0,
-            (to.saturating_sub(from)) as f32 * cell_w,
-            1.0,
-            theme().caret,
-        );
+        let (from, to) = (at(painter, comp.start), at(painter, comp.end));
+        painter.fill(x + from, y + line_h - 2.0, to - from, 1.0, theme().caret);
     }
-    let caret_byte = field.display_caret().saturating_sub(cut).min(shown.len());
-    let caret_cell = cells.cell_at_byte(shown, caret_byte);
-    painter.fill(x + caret_cell as f32 * cell_w, y, 2.0, row_h, theme().caret);
+    let caret_x = at(painter, caret);
+    painter.fill(x + caret_x, y, 2.0, line_h, theme().caret);
 }
 
 /// What a mouse event means for the selection.
@@ -7149,12 +7152,15 @@ mod uia {
             with_shell(|s| {
                 let doc = s.document.as_ref()?;
                 let row_h = s.cell_h.max(1.0);
+                // §13's rects must be the ones the frame drew, so the bands are measured the
+                // way `draw` measures them — from the chrome face.
+                let band = doc.band_h(row_h);
                 let strip = if doc.tab_strip.0.len() > 1 {
-                    Chrome::strip_height(row_h)
+                    Chrome::strip_height(band)
                 } else {
                     0.0
                 };
-                let bar_h = Chrome::height(row_h);
+                let bar_h = Chrome::height(band);
                 let (w, h) = (
                     doc.view.gutter_px() + doc.view.hgrid().viewport_px(),
                     doc.view.height_px(),
@@ -7187,7 +7193,7 @@ mod uia {
                         (r.start, strip, r.end - r.start, bar_h)
                     }
                     Kind::Status => {
-                        let footer = Chrome::strip_height(row_h);
+                        let footer = Chrome::strip_height(band);
                         (0.0, h - footer, w, footer)
                     }
                 })
@@ -10366,7 +10372,7 @@ mod tests {
         assert!(doc.view.grid().is_following());
         assert_eq!(doc.row_text(299), Some("INFO line 299 fine"));
         assert_eq!(doc.row_text(298), Some("INFO line 298 fine"));
-        assert!(doc.describe().contains("▸ "), "{}", doc.describe());
+        assert!(doc.describe().contains("► "), "{}", doc.describe());
 
         let _ = std::fs::remove_file(&path);
     }

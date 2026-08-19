@@ -191,6 +191,11 @@ impl Painter {
     }
 
     /// The chrome face's line height — what a menu row, a toolbar band or the status bar is tall.
+    /// The chrome face, for a caller that needs to ask what it contains.
+    pub fn chrome_face(&self) -> &crate::raster::Face {
+        self.chrome.face()
+    }
+
     pub fn chrome_line_height(&self) -> f32 {
         let ink = self.chrome.cell().height as f32;
         self.chrome
@@ -744,6 +749,41 @@ mod tests {
         v.hgrid_mut().set_columns(columns);
         v.set_viewport(TARGET as f32, TARGET as f32);
         v
+    }
+
+    /// The chrome face must actually contain the markers the chrome draws.
+    ///
+    /// `GetGlyphIndices` maps a codepoint the face lacks to **0**, `.notdef`, and this cache has one
+    /// face with no per-glyph fallback — so a marker the face does not have is a box on screen, not
+    /// a substitution. That is what `▸`, `▼` and `▾` became when the chrome moved from Cascadia
+    /// Mono to Segoe UI Variable Text, and nothing but looking at the window said so.
+    #[test]
+    fn the_chrome_face_has_the_markers_the_chrome_draws() {
+        let Some((_off, p)) = painter_or_skip("chrome markers") else {
+            return;
+        };
+        // Every marker `draw_chrome` and the overlays actually draw. Segoe UI Variable Text has
+        // `►` and `▼` but **not** `▸`, `▾` or `▶` — a distinction nothing but this test or the
+        // window itself will tell you, and the first draft picked two of the missing three.
+        let markers = [
+            '\u{25BA}', // ► the find field's prompt
+            '\u{25BC}', // ▼ the filter row, and the format chip's dropdown
+            '\u{00D7}', // × a chip's remove
+            '\u{25CF}', // ● an enabled highlight rule
+            '\u{25CB}', // ○ a disabled one
+        ];
+        let codepoints: Vec<u32> = markers.iter().map(|c| *c as u32).collect();
+        let ids = p.chrome_face().glyph_indices(&codepoints);
+        let missing: Vec<char> = markers
+            .iter()
+            .zip(&ids)
+            .filter(|(_, id)| **id == 0)
+            .map(|(c, _)| *c)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the chrome face draws these as .notdef boxes: {missing:?}"
+        );
     }
 
     /// The whole path, end to end: a viewport of rows becomes quads, the first frame draws
