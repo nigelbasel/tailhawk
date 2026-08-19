@@ -516,8 +516,29 @@ impl Wizard {
         Ok(())
     }
 
-    /// Replaces the layout text — §6.3's paste box as it is typed into. Keeps the language it was
-    /// recognised as; use [`Wizard::paste`] to recognise afresh.
+    /// §6.3's paste box as it is typed into: sets the text **and re-reads which language it is
+    /// in**.
+    ///
+    /// This is what the paste box must call, not [`Wizard::set_layout`]. A box that only ever
+    /// stored the text would keep whatever language it was opened with — and it is opened empty,
+    /// so that language is a placeholder. The user would then paste an NLog layout, be told "NLog
+    /// layout" by [`recognise`], and have it compiled as a DSL pattern.
+    ///
+    /// A text the language check cannot place is still stored: it may be half-typed. The refusals
+    /// are §13.1's — too long, or §6.5's excluded `ExpressionTemplate` — and those keep the model
+    /// as it was so the caller can say why.
+    pub fn repaste(&mut self, text: &str) -> Result<(), String> {
+        let known = recognise(text).ok();
+        self.set_layout(text)?;
+        if let (Some(known), Source::Layout { language, .. }) = (known, &mut self.source) {
+            *language = known;
+            self.tested = None;
+        }
+        Ok(())
+    }
+
+    /// Replaces the layout text, keeping the language. §6.3's paste box wants [`Wizard::repaste`];
+    /// this is for a caller that already knows the language and is only editing the text.
     pub fn set_layout(&mut self, text: &str) -> Result<(), String> {
         if text.len() > MAX_LAYOUT {
             return Err(format!("layout is longer than {MAX_LAYOUT} bytes"));
@@ -1278,6 +1299,40 @@ mod tests {
         assert!(w.fields().is_empty());
         assert!(w.move_boundary(0, Edge::End, 0).is_err());
         assert!(w.set_role(0, Role::Message).is_err());
+    }
+
+    #[test]
+    fn the_paste_box_learns_the_language_of_what_is_pasted_into_it() {
+        // §6.3's box opens empty, so whatever language it was built with is a placeholder. Storing
+        // the text without re-reading the language compiled every pasted layout as a DSL pattern
+        // while the box confidently announced "NLog layout".
+        let mut w = Wizard::from_layout(Language::Dsl, "");
+        w.repaste("${longdate}|${level:uppercase=true}|${logger}|${message}")
+            .expect("stored");
+        assert_eq!(w.language(), Language::NLog);
+        w.set_samples(["2026-07-28 09:14:02.1170|INFO|Zen.Runner|off we go".to_owned()]);
+        let test = w.test();
+        assert_eq!(test.error, None);
+        assert_eq!(test.matched, 1);
+        assert!(test.columns.iter().any(|c| c == "logger"));
+    }
+
+    #[test]
+    fn a_half_typed_layout_is_kept_but_an_excluded_one_is_not() {
+        let mut w = Wizard::from_layout(Language::Dsl, "");
+        w.repaste("${long").expect("half a token is still text");
+        assert_eq!(w.template(), "${long");
+        w.repaste("<ts> <level> <message>").expect("stored");
+        assert_eq!(w.language(), Language::Dsl);
+        let why = w
+            .repaste("{#if X}{@m}{#end}")
+            .expect_err("§6.5 excludes it");
+        assert!(why.contains("ExpressionTemplate"), "{why}");
+        assert_eq!(
+            w.template(),
+            "<ts> <level> <message>",
+            "a refused paste leaves the model as it was, so the caller can say why"
+        );
     }
 
     #[test]

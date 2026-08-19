@@ -168,9 +168,7 @@ has one. A run of spaces or tabs now compiles to `[ \t]+`; the same log previews
 - **§6.1's chip menu.** The format is still text at the right of the command bar. The menu, the
   runner-up when the margin is under 15%, the warning state, Plain text, and §6.5.1's *Remember for*
   radio are all unbuilt. `Definition::glob` is stored and never matched against.
-- **§6.3 entirely** — the paste box, "Recognised as", and the folder scan's findings list.
-  `wizard::{paste, recognise, from_layout, from_found}` exist and are tested but are called from
-  nowhere in the shell.
+- ~~**§6.3 entirely**~~ — **done in part 4b**, below.
 - **No mouse drag on the boundary handles**, which is how §6.2 describes the control; the keyboard
   nudges by one character. No right-click-a-line entry point (§6.5) — the palette is the only door.
   No "Edit as regex…". §6.2's *Save as… / Test / Cancel* footer is a legend, not buttons.
@@ -186,8 +184,47 @@ has one. A run of spaces or tabs now compiles to `[ \t]+`; the same log previews
 **Part 4's `CLEANROOM.md` §5 entry was filed before its code** (`ae0b9ca`) and amended before this
 commit to record the three design changes the review forced and to correct the scope it claimed.
 
-**Part 4b is next.** Its entry is already written — the row covers §6.1 and §6.3 as well as §6.2, so
-no new provenance is needed, only the work.
+### V9 part 4b is done too: §6.3's import
+
+*Import layout from config…* opens a paste box with the folder scan's findings listed under it —
+`appsettings*.json`, `nlog.config`, `log4net.config` and the rest, beside the log and three
+directories above. Type or paste a layout and the line under the box says what it was recognised as;
+`↑↓` and `Enter` take a scanned one instead; `Ctrl+F` rescans; `Ctrl+T` previews; `Ctrl+S` saves.
+The two boxes share one surface, driven by `wizard::Source`.
+
+The review found four blocking defects, and the first changed the model:
+
+- **A pasted layout was compiled as the wrong language.** §6.3's box opens empty, so the language it
+  is built with is a placeholder, and `set_layout` deliberately keeps the language. Nothing re-read
+  it — so a pasted NLog layout was *announced* as NLog by `recognise` and *compiled* as a DSL
+  pattern, failing with "the template names no timestamp, level or message". §6.3's headline path,
+  broken in the one way the UI could not show. **`Wizard::repaste` is now the paste box's door**: it
+  stores the text and re-reads the language together.
+- **Typing in the name cell overwrote the layout**, because the guard was "is this an import" rather
+  than "is this the paste box". `Tab`-then-name is the documented flow.
+- **The paste box was drawn twice**, once as itself and again on the pattern row — and that is the
+  state §6.3 opens in. The pattern row now shows `save as <name>`, which is otherwise nowhere.
+- **Taking a finding discarded the name the user had typed** and numbered the definition by the
+  list's index rather than its position within its own config file, so the only layout in the second
+  file was called its own second.
+
+Two more, both about state going stale: a bare caret move re-pushed the text and threw the Test
+result away, and `Ctrl+T` committed the edit and left the box with no caret and no way back that the
+legend mentioned.
+
+**Knowingly undone after 4b** — this is part 4c:
+
+- **§6.1's chip menu and §6.5.1's *Remember for*.** The format is still text at the right of the
+  command bar. The menu, the runner-up under a 15% margin, the warning state and Plain text are
+  unbuilt, and `Definition::glob` is stored but never matched against. The palette is the only door
+  to either wizard box.
+- Everything in 4a's list that is still true: no mouse drag on the boundary handles, no right-click
+  entry, no "Edit as regex…", §6.2's footer is a legend rather than buttons, no viewport on a long
+  example, `Ctrl+O` and drag-and-drop escape the modal, and the overlay is invisible to UIA.
+- §6.3's findings show each layout's *text* where the mock shows the config *key path*;
+  `template::Found` does not carry the key path. Recorded in `CLEANROOM.md` as a deliberate drift.
+- The mock's `✓ compiles` beside "Recognised as" is deliberately absent: compiling to draw a tick is
+  what the compile contract forbids, and `Ctrl+T` is where that answer belongs.
 
 **Part 4 is already begun, and begun in the right order.** Its `CLEANROOM.md` §5 entry is filed
 (`ae0b9ca`) *before* any of its code, and it settles the two decisions worth settling first: the

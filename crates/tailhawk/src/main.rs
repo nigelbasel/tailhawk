@@ -827,7 +827,15 @@ impl Document {
         // Title, the example and its ruler (one line when there is no example), the pattern, the
         // error-or-readout, the preview's head, its rows or the one line standing in for none, and
         // the legend. Counted the way the branches below draw it, so the fill is the right height.
-        let lines = 5 + if overlay.example.is_empty() { 1 } else { 2 } + overlay.rows.len().max(1);
+        let body = match &overlay.layout {
+            Some(_) => {
+                2 + overlay.found.len().clamp(1, WIZARD_FOUND_ROWS)
+                    + usize::from(overlay.found.len() > WIZARD_FOUND_ROWS)
+            }
+            None if overlay.example.is_empty() => 1,
+            None => 2,
+        };
+        let lines = 5 + body + overlay.rows.len().max(1);
         let box_h = (row_h * lines as f32 + 8.0).min(view.hgrid().viewport_px());
         let box_y = view.chrome_px();
         painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
@@ -847,7 +855,61 @@ impl Document {
         line(painter, y, &overlay.title, theme().header_ink);
         y += row_h;
 
-        if overlay.example.is_empty() {
+        if let Some(text) = overlay.layout.as_deref() {
+            // §6.3: the paste box, and "Recognised as" under it. The box is always the cell under
+            // edit, so the caret is where a paste lands without the user having to find it.
+            match overlay.editing {
+                Some((WizardCell::Layout, ref field)) => draw_field(
+                    painter,
+                    view,
+                    cells,
+                    field,
+                    true,
+                    inner_x,
+                    y,
+                    inner_cells.saturating_sub(1),
+                    WIZARD_PASTE_HINT,
+                ),
+                _ => line(painter, y, text, theme().ink),
+            }
+            y += row_h;
+            let unrecognised =
+                !text.trim().is_empty() && tailhawk_core::wizard::recognise(text).is_err();
+            let ink = if unrecognised {
+                theme().semantic.error
+            } else {
+                theme().field_hint
+            };
+            line(painter, y, &overlay.recognised, ink);
+            y += row_h;
+            let mut hits = self.chrome.wizard_hits.borrow_mut();
+            hits.clear();
+            if overlay.found.is_empty() {
+                line(painter, y, WIZARD_NO_CONFIG, theme().field_hint);
+                y += row_h;
+            }
+            // A solution root with per-environment `appsettings.*.json` yields dozens of findings,
+            // and a list that ran past the box would paint over the grid and stay clickable there.
+            for (i, (label, selected)) in overlay.found.iter().take(WIZARD_FOUND_ROWS).enumerate() {
+                if *selected {
+                    painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
+                }
+                let mark = if *selected { RULE_ON } else { RULE_OFF };
+                line(painter, y, &format!("{mark} {label}"), theme().ink);
+                hits.push((box_x..box_x + box_w, y..y + row_h, i));
+                y += row_h;
+            }
+            if overlay.found.len() > WIZARD_FOUND_ROWS {
+                line(
+                    painter,
+                    y,
+                    &format!("… and {} more", overlay.found.len() - WIZARD_FOUND_ROWS),
+                    theme().field_hint,
+                );
+                y += row_h;
+            }
+        } else if overlay.example.is_empty() {
+            self.chrome.wizard_hits.borrow_mut().clear();
             line(painter, y, WIZARD_EMPTY, theme().field_hint);
             y += row_h;
         } else {
@@ -881,10 +943,20 @@ impl Document {
         }
 
         match overlay.editing {
+            // The paste box has already been drawn as itself, above. Drawing it again here would
+            // put the same string and a second caret on two consecutive rows — and it is the cell
+            // §6.3 opens with the caret in, so that is the state the box is normally in.
+            Some((WizardCell::Layout, _)) => line(
+                painter,
+                y,
+                &format!("save as {}", overlay.name),
+                theme().field_hint,
+            ),
             Some((cell, ref field)) => {
                 let hint = match cell {
                     WizardCell::Name => "save the format as…",
                     WizardCell::Column => "column name",
+                    WizardCell::Layout => WIZARD_PASTE_HINT,
                 };
                 draw_field(
                     painter,
@@ -898,6 +970,12 @@ impl Document {
                     hint,
                 );
             }
+            None if overlay.layout.is_some() => line(
+                painter,
+                y,
+                &format!("save as {}", overlay.name),
+                theme().field_hint,
+            ),
             None => line(painter, y, &overlay.pattern, theme().ink),
         }
         y += row_h;
@@ -944,7 +1022,12 @@ impl Document {
             }
             y += row_h;
         }
-        line(painter, y, WIZARD_LEGEND, theme().field_hint);
+        let legend = if overlay.layout.is_some() {
+            WIZARD_IMPORT_LEGEND
+        } else {
+            WIZARD_LEGEND
+        };
+        line(painter, y, legend, theme().field_hint);
     }
 
     /// Opens, detects and indexes. Runs on a worker.
@@ -2804,14 +2887,42 @@ fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Optio
 /// other roles take their names from the language. Free rather than a method so the decision can
 /// be tested — it is a small table, and getting it wrong is how the column cell became unreachable
 /// in the first draft of this surface.
-fn wizard_next_cell(current: Option<WizardCell>, named: bool, back: bool) -> Option<WizardCell> {
+fn wizard_next_cell(
+    current: Option<WizardCell>,
+    named: bool,
+    importing: bool,
+    back: bool,
+) -> Option<WizardCell> {
+    // §6.3's box is two cells and nothing else, and the caret never leaves them: the paste box is
+    // the whole control, so `Tab` names the definition and comes straight back to it.
+    if importing {
+        return Some(match current {
+            Some(WizardCell::Layout) => WizardCell::Name,
+            _ => WizardCell::Layout,
+        });
+    }
     match (current, named, back) {
         (None, true, true) => Some(WizardCell::Column),
         (None, _, _) => Some(WizardCell::Name),
         (Some(WizardCell::Name), true, _) => Some(WizardCell::Column),
         (Some(WizardCell::Name), false, _) => None,
-        (Some(WizardCell::Column), _, _) => None,
+        (Some(WizardCell::Column) | Some(WizardCell::Layout), _, _) => None,
     }
+}
+
+/// How many earlier findings came out of the same config file as `selected`.
+///
+/// `Wizard::from_found` numbers a second layout **within one file**, so it needs this and not the
+/// list's own index: numbering by the index would call the only layout in the second file its own
+/// second, and that number becomes the definition's name and the compiled format's id.
+fn nth_in_file(found: &[tailhawk_core::template::Found], selected: usize) -> usize {
+    let Some(chosen) = found.get(selected) else {
+        return 0;
+    };
+    found[..selected]
+        .iter()
+        .filter(|f| f.source == chosen.source)
+        .count()
 }
 
 /// Puts what was typed into a cell back into the model, and reports why the model refused it.
@@ -2827,6 +2938,7 @@ fn wizard_commit(
             None
         }
         WizardCell::Column => wizard.set_name(selected, text).err(),
+        WizardCell::Layout => wizard.repaste(text).err(),
     }
 }
 
@@ -3285,6 +3397,8 @@ struct RulesRow {
 enum WizardCell {
     /// What the definition will be called.
     Name,
+    /// §6.3's paste box.
+    Layout,
     /// The selected field's column name, when its role is a named column.
     Column,
 }
@@ -3305,8 +3419,18 @@ struct WizardOverlay {
     /// §6.2's example line, with `ruler` marking the spans under it.
     example: String,
     ruler: Vec<WizardMark>,
+    /// §6.3's pasted layout, when this wizard came from one rather than from an example. The two
+    /// are exclusive: a layout has no line to put a ruler under.
+    layout: Option<String>,
+    /// What §6.3 prints after "Recognised as", or why the paste was not recognised.
+    recognised: String,
+    /// §6.3's findings from the folder scan — `(label, selected)`.
+    found: Vec<(String, bool)>,
     /// The pattern, rebuilt from the boundaries as text.
     pattern: String,
+    /// What Save would write it as. §6.3 has no pattern line of its own — its layout *is* the
+    /// pattern, drawn above — so this goes there instead of the same string twice.
+    name: String,
     /// The fault under the pattern field — read from the model, never compiled for.
     error: Option<String>,
     /// The cell under edit and the field to draw in its place.
@@ -3328,6 +3452,7 @@ fn wizard_overlay_of(
     wizard: Option<&tailhawk_core::wizard::Wizard>,
     selected: usize,
     editing: Option<(WizardCell, TextField)>,
+    found: &[tailhawk_core::template::Found],
 ) -> Option<WizardOverlay> {
     let wizard = wizard?;
     let named = if wizard.name.is_empty() {
@@ -3336,6 +3461,43 @@ fn wizard_overlay_of(
         wizard.name.clone()
     };
     let example = wizard.example().unwrap_or_default().to_owned();
+    let layout = match wizard.source() {
+        tailhawk_core::wizard::Source::Layout { template, .. } => Some(template.clone()),
+        tailhawk_core::wizard::Source::Example { .. } => None,
+    };
+    // §6.3's "Recognised as". A wizard built from a layout knows its language already; the paste
+    // box says what the language of what is *in it* would be, which is not always the same while
+    // it is being edited.
+    // An **empty** box is not a fault. It is what §6.3 opens on, and reporting "nothing pasted" in
+    // the error colour before the user has done anything reads as a failure they caused.
+    let recognised = match &layout {
+        None => String::new(),
+        Some(text) if text.trim().is_empty() => WIZARD_PASTE_HINT.to_owned(),
+        Some(text) => match tailhawk_core::wizard::recognise(text) {
+            Ok(language) => format!(
+                "recognised as {}",
+                tailhawk_core::wizard::language_label(language)
+            ),
+            Err(why) => why,
+        },
+    };
+    let found: Vec<(String, bool)> = found
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            (
+                format!(
+                    "{} → {}",
+                    f.source
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    f.template
+                ),
+                i == selected,
+            )
+        })
+        .collect();
     let ruler = wizard
         .fields()
         .iter()
@@ -3384,12 +3546,26 @@ fn wizard_overlay_of(
                 .collect()
         })
         .unwrap_or_default();
+    // Likewise the fault under the pattern: an empty box has not failed to compile, it has not
+    // been asked to.
+    let error = match &layout {
+        Some(text) if text.trim().is_empty() => None,
+        _ => wizard.error(),
+    };
     Some(WizardOverlay {
-        title: format!("Define format — {named}"),
+        title: if layout.is_some() {
+            format!("Import layout — {named}")
+        } else {
+            format!("Define format — {named}")
+        },
         example,
         ruler,
+        layout,
+        recognised,
+        found,
         pattern: wizard.template(),
-        error: wizard.error(),
+        name: named.clone(),
+        error,
         editing,
         columns: test.map(|t| t.columns.clone()).unwrap_or_default(),
         rows,
@@ -3523,6 +3699,7 @@ enum Command {
     /// V9's rules editor — `UI-DESIGN.md` §5.
     EditRules,
     DefineFormat,
+    ImportLayout,
     OpenRules,
     ReloadRules,
     GoToTop,
@@ -3616,6 +3793,7 @@ impl Command {
         ),
         (Command::EditRules, "Highlight rules…", "Ctrl+H"),
         (Command::DefineFormat, "Define format from a line…", ""),
+        (Command::ImportLayout, "Import layout from config…", ""),
         (
             Command::OpenRules,
             "Edit highlight rules in a text editor (tailhawk.rules.toml)…",
@@ -4028,6 +4206,20 @@ const WIZARD_EMPTY: &str = "no line to define a format from";
 /// §10 again: the preview table before there is anything in it.
 const WIZARD_NO_PREVIEW: &str = "nothing previewed yet";
 
+/// §6.3's paste box before anything is in it.
+const WIZARD_PASTE_HINT: &str =
+    "paste a layout from your logging config — Serilog outputTemplate, NLog layout, log4net pattern";
+
+/// The most findings §6.3 lists before saying how many more there are.
+const WIZARD_FOUND_ROWS: usize = 8;
+
+/// §10: the folder scan found no logging config beside the log or above it.
+const WIZARD_NO_CONFIG: &str = "no logging config found beside this log — Ctrl+F scans again";
+
+/// The keys §6.3's box answers to.
+const WIZARD_IMPORT_LEGEND: &str =
+    "Ctrl+T test  Ctrl+S save  Esc close  type or paste a layout  ↑↓ a scanned config  Enter take it  Ctrl+F rescan  Tab name";
+
 /// The keys the rules editor answers to, along its bottom edge — §5 has no buttons, and the
 /// palette's habit of teaching its keys beside the thing they do applies here too.
 /// §5's enable checkbox. The mock draws `☑` / `☐`, and those fell back to a missing-glyph box on
@@ -4181,6 +4373,8 @@ struct Shell {
     wizard_selected: usize,
     /// The definition's name, or the selected column's, while one is being typed.
     wizard_editing: Option<(WizardCell, TextField)>,
+    /// §6.3's folder scan, while its findings are being chosen from.
+    wizard_found: Vec<tailhawk_core::template::Found>,
     /// Where `tailhawk.formats.toml` is looked for and written — `SPEC.md` §12.4's tiers.
     formats_tiers: Vec<PathBuf>,
     /// Rules from tiers the editor cannot write — a curated file beside the exe. Applied under
@@ -5266,6 +5460,7 @@ impl Shell {
             self.wizard.as_ref(),
             self.wizard_selected,
             self.wizard_editing.clone(),
+            &self.wizard_found,
         )
     }
 
@@ -5297,6 +5492,77 @@ impl Shell {
         self.wizard = Some(wizard);
         self.wizard_selected = 0;
         self.wizard_editing = None;
+        // §6.2 and §6.3 share `wizard_selected` and the hit rects; a findings list left over from
+        // an import would still be clickable behind the ruler.
+        self.wizard_found.clear();
+    }
+
+    /// §6.3, on an empty paste box. The scan runs at the same time, so the findings are already
+    /// listed under the box rather than behind a second command.
+    fn open_import(&mut self) {
+        let mut wizard =
+            tailhawk_core::wizard::Wizard::from_layout(tailhawk_core::template::Language::Dsl, "");
+        if let Some(doc) = self.document.as_ref() {
+            wizard.set_samples(doc.wizard_sample());
+            wizard.name = doc
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "format".to_owned());
+        }
+        self.wizard_found = self.scan_for_config();
+        self.wizard = Some(wizard);
+        self.wizard_selected = 0;
+        self.begin_wizard_edit(WizardCell::Layout);
+    }
+
+    /// §6.3's "Scan folder for logging config": `appsettings*.json`, `nlog.config` and the rest,
+    /// beside the log and up to three directories above it.
+    fn scan_for_config(&self) -> Vec<tailhawk_core::template::Found> {
+        self.document
+            .as_ref()
+            .and_then(|doc| doc.path.as_deref())
+            .map(tailhawk_core::template::scan)
+            .unwrap_or_default()
+    }
+
+    /// §6.3's paste box, as it is typed into: the text and the language it is in, together.
+    ///
+    /// A refusal is §13.1's or §6.5's, and it is *said* rather than dropped — the field keeps what
+    /// was typed while the model keeps what it will compile, and the two disagreeing silently is
+    /// how a save writes something the box was not showing.
+    fn repaste(&mut self, text: &str) {
+        let refused = self.wizard.as_mut().and_then(|w| w.repaste(text).err());
+        if let Some(why) = refused {
+            self.file = Some(why);
+        }
+    }
+
+    /// Takes the selected finding as the layout — §6.3's list is a shortcut into the paste box,
+    /// not a separate path, so what is imported went through the same door.
+    ///
+    /// The name and glob the user has already chosen survive it: the list picks the *layout*, and
+    /// silently renaming a definition because the user browsed the findings is not what a list is
+    /// for.
+    fn take_finding(&mut self) {
+        let Some(found) = self.wizard_found.get(self.wizard_selected).cloned() else {
+            return;
+        };
+        // `from_found` numbers a second layout **within one config file**; the list's index is
+        // across every file, and numbering by it would call the only layout in the second file its
+        // own second.
+        let nth = nth_in_file(&self.wizard_found, self.wizard_selected);
+        let mut wizard = tailhawk_core::wizard::Wizard::from_found(&found, nth);
+        if let Some(old) = self.wizard.as_ref() {
+            wizard.set_samples(old.samples().to_vec());
+            if !old.name.is_empty() {
+                wizard.name = old.name.clone();
+            }
+            wizard.glob = old.glob.clone();
+        }
+        self.wizard = Some(wizard);
+        self.begin_wizard_edit(WizardCell::Layout);
     }
 
     /// Closes the box. Nothing is applied that was not saved: the definition is the artefact, and
@@ -5307,6 +5573,7 @@ impl Shell {
         }
         self.wizard_selected = 0;
         self.wizard_editing = None;
+        self.wizard_found.clear();
     }
 
     /// §6.2's **Save as…**: appends the definition to `tailhawk.formats.toml`'s last tier, then
@@ -5380,8 +5647,11 @@ impl Shell {
             return self.after_chrome_key(hwnd);
         }
         if ctrl && key == VK_S.0 {
-            self.commit_wizard_edit();
-            self.save_format(hwnd);
+            // A refused cell is why the save does not happen; overwriting the reason with
+            // "format saved" would make the refusal invisible and the save a wrong answer.
+            if self.commit_wizard_edit() {
+                self.save_format(hwnd);
+            }
             return self.after_chrome_key(hwnd);
         }
         if key == VK_TAB.0 {
@@ -5394,13 +5664,65 @@ impl Shell {
             }
             return self.after_chrome_key(hwnd);
         }
+        // §6.3's box: the paste box has the caret throughout, so the findings list is stepped with
+        // the arrows and taken with Enter rather than by leaving the field first.
+        let importing = self.wizard.as_ref().is_some_and(|w| w.example().is_none());
+        if importing {
+            match key {
+                k if k == VK_UP.0 => {
+                    self.wizard_selected = self.wizard_selected.saturating_sub(1);
+                    return self.after_chrome_key(hwnd);
+                }
+                k if k == VK_DOWN.0 => {
+                    self.wizard_selected =
+                        (self.wizard_selected + 1).min(self.wizard_found.len().saturating_sub(1));
+                    return self.after_chrome_key(hwnd);
+                }
+                k if k == VK_RETURN.0 && !self.wizard_found.is_empty() => {
+                    self.take_finding();
+                    return self.after_chrome_key(hwnd);
+                }
+                k if k == VK_F.0 && ctrl => {
+                    self.wizard_found = self.scan_for_config();
+                    self.wizard_selected = 0;
+                    return self.after_chrome_key(hwnd);
+                }
+                // No commit first: the paste box drives the model on every keystroke, so there is
+                // nothing pending — and committing would take the caret out of the only field
+                // this box has.
+                k if k == VK_T.0 && ctrl => {
+                    if let Some(w) = self.wizard.as_mut() {
+                        w.test();
+                    }
+                    return self.after_chrome_key(hwnd);
+                }
+                // Likewise Enter with nothing to take: it would otherwise fall through to the
+                // generic commit and leave the box with no caret and no way back but Tab.
+                k if k == VK_RETURN.0 => return self.after_chrome_key(hwnd),
+                _ => {}
+            }
+        }
+        // Offered after §6.3's own keys, because there `Enter` takes the selected finding and the
+        // paste box has no commit to make: it drives the model on every keystroke.
         if key == VK_RETURN.0 && editing {
             self.commit_wizard_edit();
             return self.after_chrome_key(hwnd);
         }
         if editing {
-            if let Some((_, field)) = self.wizard_editing.as_mut() {
+            let was = self
+                .wizard_editing
+                .as_ref()
+                .map(|(_, field)| field.text().to_owned());
+            if let Some((cell, field)) = self.wizard_editing.as_mut() {
+                let cell = *cell;
                 if field_edit(field, key, ctrl, shift) {
+                    let text = field.text().to_owned();
+                    // Only the paste box, and only when the text actually moved: `field_edit`
+                    // answers to `←`, `Home` and `Ctrl+C` as well, and pushing an unchanged string
+                    // at the model would throw away the Test result for a caret move.
+                    if cell == WizardCell::Layout && was.as_deref() != Some(text.as_str()) {
+                        self.repaste(&text);
+                    }
                     return self.after_chrome_key(hwnd);
                 }
             }
@@ -5478,6 +5800,7 @@ impl Shell {
         wizard_next_cell(
             self.wizard_editing.as_ref().map(|(cell, _)| *cell),
             named,
+            self.wizard.as_ref().is_some_and(|w| w.example().is_none()),
             back,
         )
     }
@@ -5486,6 +5809,10 @@ impl Shell {
     fn begin_wizard_edit(&mut self, cell: WizardCell) {
         let text = match (cell, self.wizard.as_ref()) {
             (WizardCell::Name, Some(w)) => w.name.clone(),
+            (WizardCell::Layout, Some(w)) => match w.source() {
+                tailhawk_core::wizard::Source::Layout { template, .. } => template.clone(),
+                tailhawk_core::wizard::Source::Example { .. } => String::new(),
+            },
             (WizardCell::Column, Some(w)) => w
                 .fields()
                 .get(self.wizard_selected)
@@ -5499,17 +5826,21 @@ impl Shell {
     }
 
     /// Puts what was typed back into the model, and says why if the model refuses it.
-    fn commit_wizard_edit(&mut self) {
+    fn commit_wizard_edit(&mut self) -> bool {
         let Some((cell, field)) = self.wizard_editing.take() else {
-            return;
+            return true;
         };
         let text = field.text().to_owned();
         let selected = self.wizard_selected;
         let Some(wizard) = self.wizard.as_mut() else {
-            return;
+            return true;
         };
-        if let Some(why) = wizard_commit(wizard, selected, cell, &text) {
-            self.file = Some(why);
+        match wizard_commit(wizard, selected, cell, &text) {
+            Some(why) => {
+                self.file = Some(why);
+                false
+            }
+            None => true,
         }
     }
 
@@ -5588,6 +5919,10 @@ impl Shell {
             }
             Command::DefineFormat => {
                 self.open_wizard();
+                return true;
+            }
+            Command::ImportLayout => {
+                self.open_import();
                 return true;
             }
             Command::OpenRules => {
@@ -5721,6 +6056,7 @@ impl Shell {
             | Command::ToggleTheme
             | Command::EditRules
             | Command::DefineFormat
+            | Command::ImportLayout
             | Command::OpenRules
             | Command::ReloadRules
             | Command::CloseTab => {}
@@ -5792,8 +6128,16 @@ impl Shell {
             if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
                 return true;
             }
-            if let Some((_, field)) = self.wizard_editing.as_mut() {
+            if let Some((cell, field)) = self.wizard_editing.as_mut() {
                 field.insert(&text);
+                // §6.3's "Recognised as" follows the paste box as it is typed into, so the text
+                // reaches the model here as well as on the editing keys.
+                if *cell == WizardCell::Layout {
+                    let typed = field.text().to_owned();
+                    if let Some(w) = self.wizard.as_mut() {
+                        let _ = w.set_layout(&typed);
+                    }
+                }
             }
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
@@ -5967,8 +6311,13 @@ impl Shell {
                     .map(|(_, _, field)| *field)
             });
             if let Some(field) = hit {
-                self.commit_wizard_edit();
+                let importing = self.wizard.as_ref().is_some_and(|w| w.example().is_none());
                 self.wizard_selected = field;
+                if importing {
+                    self.take_finding();
+                } else {
+                    self.commit_wizard_edit();
+                }
             }
             return self.after_chrome_key(hwnd);
         }
@@ -8233,6 +8582,7 @@ fn main() -> Result<()> {
             wizard: None,
             wizard_selected: 0,
             wizard_editing: None,
+            wizard_found: Vec::new(),
             formats_tiers,
             rules_fixed: Vec::new(),
             rule_specs,
@@ -10425,7 +10775,7 @@ mod tests {
 
     #[test]
     fn a_closed_wizard_draws_nothing() {
-        assert!(wizard_overlay_of(None, 0, None).is_none());
+        assert!(wizard_overlay_of(None, 0, None, &[]).is_none());
     }
 
     #[test]
@@ -10434,7 +10784,7 @@ mod tests {
             "2026-07-28 09:14:02,117 [12] INFO  Zenith.Automation.Runner - Evaluated 412 triggers";
         let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
         wizard.name = "ndc".to_owned();
-        let overlay = wizard_overlay_of(Some(&wizard), 2, None).expect("open");
+        let overlay = wizard_overlay_of(Some(&wizard), 2, None, &[]).expect("open");
         assert_eq!(overlay.title, "Define format — ndc");
         assert_eq!(overlay.example, line);
         assert_eq!(
@@ -10460,7 +10810,7 @@ mod tests {
         let line = "2026-07-28 09:14:02 INFO hello";
         let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
         wizard.set_samples([line.to_owned()]);
-        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None, &[]).expect("open");
         assert_eq!(overlay.readout, WIZARD_UNTESTED);
         assert!(overlay.rows.is_empty());
         assert!(overlay.columns.is_empty());
@@ -10472,7 +10822,7 @@ mod tests {
         let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
         wizard.set_samples([line.to_owned(), "not a log line".to_owned()]);
         wizard.test();
-        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None, &[]).expect("open");
         assert_eq!(overlay.readout, "1 of 2 matched (50%)");
         assert_eq!(overlay.rows.len(), 2);
         assert!(overlay.rows[1].is_none(), "the second line did not match");
@@ -10491,7 +10841,7 @@ mod tests {
         wizard.set_samples([line.to_owned()]);
         wizard.test();
         assert_eq!(
-            wizard_overlay_of(Some(&wizard), 0, None)
+            wizard_overlay_of(Some(&wizard), 0, None, &[])
                 .expect("open")
                 .readout,
             "1 of 1 matched (100%)"
@@ -10500,7 +10850,7 @@ mod tests {
         wizard
             .move_boundary(0, tailhawk_core::wizard::Edge::End, end - 1)
             .expect("moves");
-        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None, &[]).expect("open");
         assert_eq!(
             overlay.readout, WIZARD_UNTESTED,
             "§6.2 leans on the rate, so a stale one is worse than none"
@@ -10516,7 +10866,7 @@ mod tests {
         wizard
             .move_boundary(0, tailhawk_core::wizard::Edge::End, end + 1)
             .expect("moves");
-        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None, &[]).expect("open");
         assert!(
             overlay.error.expect("error").contains("timestamp shape"),
             "the fault is read off the model, not learned by compiling"
@@ -10528,8 +10878,8 @@ mod tests {
         let wizard = tailhawk_core::wizard::Wizard::from_example("2026-07-28 09:14:02 INFO hi");
         let mut field = TextField::default();
         field.insert("worker");
-        let overlay =
-            wizard_overlay_of(Some(&wizard), 1, Some((WizardCell::Column, field))).expect("open");
+        let overlay = wizard_overlay_of(Some(&wizard), 1, Some((WizardCell::Column, field)), &[])
+            .expect("open");
         let (cell, field) = overlay.editing.expect("a cell is under edit");
         assert_eq!(cell, WizardCell::Column);
         assert_eq!(field.text(), "worker");
@@ -10541,7 +10891,7 @@ mod tests {
         let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
         wizard.set_samples((0..40).map(|i| format!("2026-07-28 09:14:0{} INFO n{i}", i % 10)));
         wizard.test();
-        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None, &[]).expect("open");
         assert_eq!(overlay.rows.len(), WIZARD_PREVIEW_ROWS);
         assert!(
             overlay.readout.contains("of 40 matched"),
@@ -10583,23 +10933,26 @@ mod tests {
     fn tab_reaches_the_column_cell_and_not_only_the_name() {
         // The bug this replaces: the next cell was chosen from state the commit had already
         // cleared, so every Tab chose Name and a column could never be renamed at all.
-        assert_eq!(wizard_next_cell(None, true, false), Some(WizardCell::Name));
         assert_eq!(
-            wizard_next_cell(Some(WizardCell::Name), true, false),
+            wizard_next_cell(None, true, false, false),
+            Some(WizardCell::Name)
+        );
+        assert_eq!(
+            wizard_next_cell(Some(WizardCell::Name), true, false, false),
             Some(WizardCell::Column),
             "a named column is reachable from the name cell"
         );
         assert_eq!(
-            wizard_next_cell(Some(WizardCell::Name), false, false),
+            wizard_next_cell(Some(WizardCell::Name), false, false, false),
             None,
             "a timestamp has no name of the user's to type"
         );
         assert_eq!(
-            wizard_next_cell(Some(WizardCell::Column), true, false),
+            wizard_next_cell(Some(WizardCell::Column), true, false, false),
             None
         );
         assert_eq!(
-            wizard_next_cell(None, true, true),
+            wizard_next_cell(None, true, false, true),
             Some(WizardCell::Column),
             "Shift+Tab reaches the column first"
         );
@@ -10628,6 +10981,160 @@ mod tests {
             .expect("the model refuses a role word as a column name");
         assert!(why.contains("role"), "{why}");
         assert_eq!(wizard.fields()[1].name, "thread", "and nothing changed");
+    }
+
+    #[test]
+    fn the_import_box_says_what_it_recognised_and_what_it_did_not() {
+        let wizard = tailhawk_core::wizard::Wizard::from_layout(
+            tailhawk_core::template::Language::NLog,
+            "${longdate}|${level}|${message}",
+        );
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None, &[]).expect("open");
+        assert!(overlay.title.starts_with("Import layout"));
+        assert_eq!(
+            overlay.layout.as_deref(),
+            Some("${longdate}|${level}|${message}")
+        );
+        assert_eq!(overlay.recognised, "recognised as NLog layout");
+        assert!(overlay.ruler.is_empty(), "a layout has no line to rule");
+
+        let wizard = tailhawk_core::wizard::Wizard::from_layout(
+            tailhawk_core::template::Language::Dsl,
+            "just some prose",
+        );
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None, &[]).expect("open");
+        assert!(
+            overlay.recognised.starts_with("not a Serilog"),
+            "§6.3 says why, rather than leaving the line blank: {:?}",
+            overlay.recognised
+        );
+    }
+
+    #[test]
+    fn the_scan_findings_are_listed_with_the_selected_one_marked() {
+        let found = |file: &str, template: &str| tailhawk_core::template::Found {
+            language: tailhawk_core::template::Language::NLog,
+            template: template.to_owned(),
+            source: PathBuf::from(r"C:\dev\ndc\Api").join(file),
+        };
+        let all = [
+            found("NLog.config", "${longdate}|${message}"),
+            found("appsettings.json", "${level}|${message}"),
+        ];
+        let wizard =
+            tailhawk_core::wizard::Wizard::from_layout(tailhawk_core::template::Language::Dsl, "");
+        let overlay = wizard_overlay_of(Some(&wizard), 1, None, &all).expect("open");
+        assert_eq!(
+            overlay
+                .found
+                .iter()
+                .map(|(l, _)| l.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "NLog.config → ${longdate}|${message}",
+                "appsettings.json → ${level}|${message}",
+            ]
+        );
+        assert_eq!(overlay.found.iter().filter(|(_, on)| *on).count(), 1);
+        assert!(overlay.found[1].1, "the second finding is the selected one");
+    }
+
+    #[test]
+    fn tab_in_the_import_box_names_the_definition_and_comes_back() {
+        assert_eq!(
+            wizard_next_cell(None, false, true, false),
+            Some(WizardCell::Layout),
+            "the paste box takes the caret the moment the box opens"
+        );
+        assert_eq!(
+            wizard_next_cell(Some(WizardCell::Layout), false, true, false),
+            Some(WizardCell::Name)
+        );
+        assert_eq!(
+            wizard_next_cell(Some(WizardCell::Name), false, true, false),
+            Some(WizardCell::Layout),
+            "and back — an import box the caret can leave for good is a dead end"
+        );
+    }
+
+    #[test]
+    fn typing_into_the_paste_box_reaches_the_model() {
+        let mut wizard =
+            tailhawk_core::wizard::Wizard::from_layout(tailhawk_core::template::Language::Dsl, "");
+        assert_eq!(
+            wizard_commit(
+                &mut wizard,
+                0,
+                WizardCell::Layout,
+                "%date [%thread] %-5level %message"
+            ),
+            None
+        );
+        assert_eq!(wizard.template(), "%date [%thread] %-5level %message");
+        let why = wizard_commit(&mut wizard, 0, WizardCell::Layout, "{#if X}{@m}{#end}")
+            .expect("§6.5 excludes an ExpressionTemplate, and the box is a door §13.1 guards");
+        assert!(why.contains("ExpressionTemplate"), "{why}");
+    }
+
+    #[test]
+    fn the_paste_box_carries_the_language_into_the_model_not_just_the_text() {
+        // The bug this replaces: the box was built with a placeholder language and only ever had
+        // its text replaced, so a pasted NLog layout was announced as NLog and compiled as a DSL
+        // pattern — §6.3's headline path failing while the UI said it had worked.
+        let mut wizard =
+            tailhawk_core::wizard::Wizard::from_layout(tailhawk_core::template::Language::Dsl, "");
+        assert_eq!(
+            wizard_commit(
+                &mut wizard,
+                0,
+                WizardCell::Layout,
+                "${longdate}|${level:uppercase=true}|${logger}|${message}",
+            ),
+            None
+        );
+        assert_eq!(wizard.language(), tailhawk_core::template::Language::NLog);
+        wizard.set_samples(["2026-07-28 09:14:02.1170|INFO|Zen.Runner|go".to_owned()]);
+        assert_eq!(wizard.test().matched, 1);
+    }
+
+    #[test]
+    fn naming_an_import_does_not_overwrite_the_layout_with_the_name() {
+        let mut wizard = tailhawk_core::wizard::Wizard::from_layout(
+            tailhawk_core::template::Language::NLog,
+            "${longdate}|${message}",
+        );
+        assert_eq!(
+            wizard_commit(&mut wizard, 0, WizardCell::Name, "ndc-api"),
+            None
+        );
+        assert_eq!(wizard.name, "ndc-api");
+        assert_eq!(
+            wizard.template(),
+            "${longdate}|${message}",
+            "the name cell is not the paste box"
+        );
+    }
+
+    #[test]
+    fn a_finding_is_numbered_within_its_own_config_file() {
+        let found = |file: &str, template: &str| tailhawk_core::template::Found {
+            language: tailhawk_core::template::Language::NLog,
+            template: template.to_owned(),
+            source: PathBuf::from(r"C:\dev\ndc\Api").join(file),
+        };
+        let all = [
+            found("NLog.config", "${longdate}|${message}"),
+            found("NLog.config", "${level}|${message}"),
+            found("appsettings.json", "${logger}|${message}"),
+        ];
+        assert_eq!(nth_in_file(&all, 0), 0);
+        assert_eq!(nth_in_file(&all, 1), 1, "the second layout of NLog.config");
+        assert_eq!(
+            nth_in_file(&all, 2),
+            0,
+            "the only layout of appsettings.json, not the list's third"
+        );
+        assert_eq!(nth_in_file(&all, 9), 0, "out of range is not a panic");
     }
 
     #[test]
