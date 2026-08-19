@@ -443,6 +443,33 @@ impl Renderer {
     /// chicken-and-egg the caller cannot break: a `View` needs the cell before it can say which rows
     /// are visible, and the painter that measures the cell would otherwise only exist once a frame
     /// has been drawn. Re-read it after a resize or a DPI change rather than caching it.
+    /// The chrome face's line height — what a menu row, a toolbar band or the status bar is tall.
+    /// Built alongside [`Renderer::cell`] and read the same way: per frame, never cached.
+    pub fn chrome_line_height(&mut self) -> Result<f32> {
+        let Self {
+            gpu,
+            painter,
+            font_candidates,
+            px_per_em,
+            chrome_candidates,
+            chrome_px_per_em,
+        } = self;
+        let (device, context) = gpu.resources();
+        let p = ensure_painter(
+            device,
+            context,
+            gpu.generation(),
+            painter,
+            Fonts {
+                grid: font_candidates,
+                grid_px: *px_per_em,
+                chrome: chrome_candidates,
+                chrome_px: *chrome_px_per_em,
+            },
+        )?;
+        Ok(p.chrome_line_height())
+    }
+
     pub fn cell(&mut self) -> Result<(f32, f32)> {
         let Self {
             gpu,

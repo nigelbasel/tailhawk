@@ -223,6 +223,12 @@ struct Document {
     /// V9's format wizard as it should be drawn this frame — the shell's knowledge handed over
     /// exactly as [`Document::rules_overlay`] is.
     wizard_overlay: Option<WizardOverlay>,
+    /// The **chrome** face's line height, set by the shell before each frame as the overlays above
+    /// are. The bands — command bar, tab strip, status — are sized from this and not from the
+    /// grid's row height, because §1.1's chrome is drawn in the system UI font and that font is
+    /// shorter than the grid's. Zero until the shell has said, and the helpers fall back to the
+    /// grid's row height then, which is what keeps a `Document` usable in a test with no renderer.
+    chrome_h: f32,
     /// §6.1's chip menu as it should be drawn this frame, or `None` when it is not down.
     format_menu: Option<Vec<FormatRow>>,
     /// The ad-hoc colour labels in force — `(n, text)` — mirrored as rules at the front of the
@@ -1156,6 +1162,7 @@ impl Document {
             rules_overlay: None,
             wizard_overlay: None,
             format_menu: None,
+            chrome_h: 0.0,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -1216,6 +1223,7 @@ impl Document {
             rules_overlay: None,
             wizard_overlay: None,
             format_menu: None,
+            chrome_h: 0.0,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -1257,23 +1265,30 @@ impl Document {
         }
         // The command bar always, the tab strip when there is more than one tab; one row of header
         // when there are columns. Set after the viewport, which is what all three are subtracted from.
+        // The bands are the chrome's, so they are sized by the chrome face — falling back to the
+        // grid's row height only when no renderer has said what that is, which is a test.
+        let chrome_h = if self.chrome_h > 0.0 {
+            self.chrome_h
+        } else {
+            row_h
+        };
         let strip = if self.tab_strip.0.len() > 1 {
-            Chrome::strip_height(row_h)
+            Chrome::strip_height(chrome_h)
         } else {
             0.0
         };
-        self.view.set_chrome_px(strip + Chrome::height(row_h));
+        self.view.set_chrome_px(strip + Chrome::height(chrome_h));
         // V10: the detail pane sits above the status bar, a third of the height at most, when open.
         let pane_rows = if self.detail.open {
             let grid_rows =
-                ((size.1 as f32 - strip - Chrome::height(row_h)) / row_h.max(1.0)) as u64;
+                ((size.1 as f32 - strip - Chrome::height(chrome_h)) / row_h.max(1.0)) as u64;
             (grid_rows / 3).clamp(4, DETAIL_MAX_ROWS) as usize
         } else {
             0
         };
         self.detail.rows = pane_rows;
         let footer = if self.show_footer {
-            Chrome::strip_height(row_h)
+            Chrome::strip_height(chrome_h)
         } else {
             0.0
         };
@@ -4102,13 +4117,16 @@ impl Chrome {
 
     /// The bar's height for a row height: the row plus a little air, so the fields read as
     /// fields and not as a first row.
-    fn height(row_h: f32) -> f32 {
-        (row_h + 8.0).round()
+    /// The command bar's height. Takes the **chrome** face's line height — §1.1's bar is drawn
+    /// in the system UI font, so sizing it by the grid's row height left a band too tall for the
+    /// text in it.
+    fn height(chrome_h: f32) -> f32 {
+        (chrome_h + 8.0).round()
     }
 
     /// The tab strip's height, when it is drawn.
-    fn strip_height(row_h: f32) -> f32 {
-        (row_h + 4.0).round()
+    fn strip_height(chrome_h: f32) -> f32 {
+        (chrome_h + 4.0).round()
     }
 
     /// The text of a field as it fits its width: cut from the left so the caret end is always on
@@ -4880,6 +4898,8 @@ impl Shell {
                 let cell = renderer.cell()?;
                 self.cell_w = cell.0;
                 self.cell_h = cell.1;
+                // §1.1: the chrome bands are sized by the chrome face, not the grid's row.
+                let chrome_h = renderer.chrome_line_height()?;
                 // The panes stack: the first carries the tab strip, the last the status bar.
                 let tops = pane_tops(h as f32, pane_count);
                 let panes = self.document.panes_mut();
@@ -4895,6 +4915,7 @@ impl Shell {
                     doc.rules_overlay = if i == 0 { rules_overlay.clone() } else { None };
                     doc.wizard_overlay = if i == 0 { wizard_overlay.clone() } else { None };
                     doc.format_menu = if i == 0 { format_menu.clone() } else { None };
+                    doc.chrome_h = chrome_h;
                     doc.show_footer = i + 1 == pane_count;
                     doc.status = if doc.show_footer {
                         status.clone()
