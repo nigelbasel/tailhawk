@@ -132,6 +132,63 @@ schemes could collide; and every layout from one config file compiled to the sam
 is the surface. The rules editor (part 2) is the precedent for every piece of it — a modal overlay
 over the grid, keys offered before `palette_key`, hit rects into `chrome`, `Ctrl+S` to save.
 
+### V9 part 4a is done: §6.2's define-from-example overlay
+
+`Ctrl+K` → *Define format from a line…* opens a modal box over the grid on the top visible row (or
+the selection's first row), with the next 200 lines as its sample. The example is drawn with §6.2's
+**ruler** under it — one label per field, inside the span it labels — then the pattern the
+boundaries build, the model's error or the match-rate readout, and the preview table. `←→` moves
+between fields, `Ctrl+←→` and `Shift+←→` move a field's two edges a character at a time, `R` cycles
+the role, `Tab` reaches the definition's name and a named column's, `Ctrl+N` splits, `Ctrl+M`
+merges, `Ctrl+D` drops, **`Ctrl+T` tests**, `Ctrl+S` saves, `Esc` closes.
+
+**Saved formats now come back.** `tailhawk.formats.toml` is compiled once at start into
+`SAVED_FORMATS` and scored beside the catalogue by `detect_set`, ranking above a template merely
+found in a config file. Before this the file was write-only.
+
+The pre-commit review found three blocking defects, all real, all now regression tests:
+
+- **A column could never be named.** `Tab`'s next cell was chosen from state the commit had already
+  cleared, so every `Tab` chose the definition's name and `WizardCell::Column` was dead code — the
+  same class as part 2's "nothing could be typed into it".
+- **Saving made the chip lie.** `adopt_format` set `detection.accepted` but left the candidates, and
+  the chip is `Detection::describe`, which reads the candidates — so after saving, a document
+  columnised by the user's brand-new definition announced `log4net 61%`. On a plain-text file it
+  announced nothing at all while silently growing columns.
+- **The ruler overprinted itself on §6.2's own worked example.** `<thread>` is eight cells wide over
+  a span of two; drawn as its own run it smeared across the level beside it.
+
+And a fourth found only by *looking at the binary* on a real log, which no test had caught:
+**3 of 5 lines matched**. `template::Build::literal` escaped a run of spaces verbatim, and
+`%-5level` pads — so a template read off an `INFO` line demanded two spaces where an `ERROR` line
+has one. A run of spaces or tabs now compiles to `[ \t]+`; the same log previews 5 of 5.
+
+**Knowingly undone in part 4a** — this is part 4b's list:
+
+- **§6.1's chip menu.** The format is still text at the right of the command bar. The menu, the
+  runner-up when the margin is under 15%, the warning state, Plain text, and §6.5.1's *Remember for*
+  radio are all unbuilt. `Definition::glob` is stored and never matched against.
+- **§6.3 entirely** — the paste box, "Recognised as", and the folder scan's findings list.
+  `wizard::{paste, recognise, from_layout, from_found}` exist and are tested but are called from
+  nowhere in the shell.
+- **No mouse drag on the boundary handles**, which is how §6.2 describes the control; the keyboard
+  nudges by one character. No right-click-a-line entry point (§6.5) — the palette is the only door.
+  No "Edit as regex…". §6.2's *Save as… / Test / Cancel* footer is a legend, not buttons.
+- The box has no viewport: with a long example or a wide preview it draws to the window's edge and
+  the legend is clipped. Same shape as the rules editor's, and the same fix.
+- `Ctrl+O`, drag-and-drop and the single-instance handoff escape the modal, and a file opened that
+  way becomes the target of `Ctrl+S` — which re-columnises the *wrong* document. Worse here than in
+  the rules editor, where the same leak is harmless because rules are global.
+- While the box is up, `Ctrl+D`, `Ctrl+M`, `R`, `Space` and `F` are reassigned from their §12
+  meanings, and §12 has no row saying so.
+- The overlay is invisible to UIA (§13).
+
+**Part 4's `CLEANROOM.md` §5 entry was filed before its code** (`ae0b9ca`) and amended before this
+commit to record the three design changes the review forced and to correct the scope it claimed.
+
+**Part 4b is next.** Its entry is already written — the row covers §6.1 and §6.3 as well as §6.2, so
+no new provenance is needed, only the work.
+
 **Part 4 is already begun, and begun in the right order.** Its `CLEANROOM.md` §5 entry is filed
 (`ae0b9ca`) *before* any of its code, and it settles the two decisions worth settling first: the
 preview is drawn **inside the box**, not by the grid behind it — a rules change repaints the same

@@ -75,8 +75,9 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
     VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G,
-    VK_H, VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_N, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_R,
-    VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z,
+    VK_H, VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_M, VK_N, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_R,
+    VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y,
+    VK_Z,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
@@ -126,6 +127,15 @@ const SCROLL_RANGE: i32 = 10_000;
 /// `--columns=none`: formats given on the command line, and whether detection runs at all. Read on
 /// the open worker by `detect_set`; set once in `main` before any file opens.
 static CLI_FORMATS: std::sync::OnceLock<Vec<&'static tailhawk_core::format::Format>> =
+    std::sync::OnceLock::new();
+
+/// §6.5's saved definitions — `tailhawk.formats.toml`, compiled once at start and scored beside the
+/// catalogue by `detect_set`, exactly as a template found in a config file is.
+///
+/// Compiled here and nowhere else. `wizard::load` deliberately does not compile: every definition
+/// costs a leaked `Format` (`format::custom`), so they are turned into formats once, at start, for
+/// the whole session — not once per opened file.
+static SAVED_FORMATS: std::sync::OnceLock<Vec<&'static tailhawk_core::format::Format>> =
     std::sync::OnceLock::new();
 static CLI_NO_COLUMNS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -209,6 +219,9 @@ struct Document {
     /// document that draws it, exactly as [`Document::tab_strip`] and [`Document::status`] are.
     /// The editor itself is the shell's; this is only its picture.
     rules_overlay: Option<RulesOverlay>,
+    /// V9's format wizard as it should be drawn this frame — the shell's knowledge handed over
+    /// exactly as [`Document::rules_overlay`] is.
+    wizard_overlay: Option<WizardOverlay>,
     /// The ad-hoc colour labels in force — `(n, text)` — mirrored as rules at the front of the
     /// highlighter's set. Kept here so they can be listed and saved.
     labels: Vec<(u8, String)>,
@@ -520,6 +533,7 @@ impl RowSource for Document {
         // V9's rules editor, under the palette — §5. Before it, so a palette opened while the
         // editor is up is still the thing on top.
         self.draw_rules(painter, view, cells);
+        self.draw_wizard(painter, view, cells);
 
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
         // query on its first line, then the rows, the selected one filled. Rows are remembered by
@@ -751,6 +765,188 @@ impl Document {
         );
     }
 
+    /// The line §6.2 defines a format from, and the lines it previews over: the top visible row
+    /// and the rows after it, **raw**.
+    ///
+    /// Raw and not presented: a document already under a layout draws its rows aligned into
+    /// columns, and defining a format from that would be defining it from Tailhawk's own output.
+    fn wizard_sample(&self) -> Vec<String> {
+        let top = self
+            .selection
+            .as_ref()
+            .map(|s| s.first_row())
+            .unwrap_or_else(|| self.view.grid().scroll().row);
+        (top..top + tailhawk_core::wizard::MAX_SAMPLES as u64 + 1)
+            .filter_map(|row| {
+                let file_row = self.filtering.file_row(row)?;
+                self.set.row_text(file_row).map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// Installs `format` over this document — where §6.2's Save lands, and where §6.1's chip
+    /// override will land. The layout is measured from the head sample, as an open measures it.
+    fn adopt_format(&mut self, format: &'static tailhawk_core::format::Format) {
+        let lines = match self.set.snapshot().last() {
+            Some(newest) => detect::head_lines(&*newest.file, newest.charset),
+            None => Vec::new(),
+        };
+        // §6.1 calls the chip "the whole trust model in one control", and the chip is
+        // `Detection::describe`, which reads the *candidates* rather than what was accepted.
+        // Setting `accepted` alone would leave it announcing the format the scorer liked, at the
+        // confidence the scorer gave it, over a document this one has just re-columnised.
+        self.detection = detect::detect_with(&lines, &[format]);
+        self.detection.accepted = Some(format);
+        let layout = Layout::from_sample(format, &lines);
+        self.header = Some(layout.header());
+        self.column_defaults = Some(layout.widths.clone());
+        // A sort in force is keyed on a column of the layout that is going away, and the palette
+        // lists that layout's columns to sort by. Both belong to the format, so both go with it.
+        self.filtering.sort = None;
+        self.palette = Palette::new(Command::entries_for(Some(&layout)));
+        self.layout = Some(layout);
+        self.presented.clear();
+    }
+
+    /// §6.2's box: the example with a ruler under it, the pattern it builds, and the preview.
+    ///
+    /// Unlike [`Document::draw_rules`], whose preview is the grid behind it, this one draws its
+    /// own table. A rules change repaints the same rows; a format change re-columnises the whole
+    /// document, and a Cancel that had to undo that is a far larger promise than the button looks.
+    fn draw_wizard(&self, painter: &mut Painter, view: &View, cells: &CellModel) {
+        let Some(overlay) = self.wizard_overlay.as_ref() else {
+            return;
+        };
+        let cell_w = painter.cell_width();
+        let row_h = painter.row_height();
+        let width = view.hgrid().viewport_px();
+        let box_x = view.gutter_px() + cell_w;
+        let box_w = (WIZARD_CELLS as f32 * cell_w)
+            .min(width - box_x - cell_w)
+            .max(0.0);
+        // Title, the example and its ruler (one line when there is no example), the pattern, the
+        // error-or-readout, the preview's head, its rows or the one line standing in for none, and
+        // the legend. Counted the way the branches below draw it, so the fill is the right height.
+        let lines = 5 + if overlay.example.is_empty() { 1 } else { 2 } + overlay.rows.len().max(1);
+        let box_h = (row_h * lines as f32 + 8.0).min(view.hgrid().viewport_px());
+        let box_y = view.chrome_px();
+        painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
+        let inner_x = box_x + cell_w;
+        let inner_cells = ((box_w / cell_w) as usize).saturating_sub(2);
+        let mut y = box_y + 4.0;
+        let line = |painter: &mut Painter, y: f32, text: &str, colour: [f32; 4]| {
+            let _ = painter.lay_out_at(
+                view,
+                inner_x,
+                y,
+                tailhawk_core::widget::fit_from_right(cells, text, inner_cells),
+                Colours::plain(colour),
+            );
+        };
+
+        line(painter, y, &overlay.title, theme().header_ink);
+        y += row_h;
+
+        if overlay.example.is_empty() {
+            line(painter, y, WIZARD_EMPTY, theme().field_hint);
+            y += row_h;
+        } else {
+            line(painter, y, &overlay.example, theme().ink);
+            y += row_h;
+            // The ruler is laid out as **one string**, each label held inside the span it labels —
+            // which is how §6.2 draws it, and also what makes overprinting impossible. `<thread>`
+            // is eight cells wide over a span of two, and drawn as its own run it would smear
+            // across the level beside it.
+            let mut hits = self.chrome.wizard_hits.borrow_mut();
+            hits.clear();
+            let mut ruler = String::new();
+            for (i, mark) in overlay.ruler.iter().enumerate() {
+                let head = cells.cell_count(&overlay.example[..mark.span.start]);
+                let span = cells.cell_count(&overlay.example[mark.span.clone()]).max(1);
+                let at = cells.cell_count(&ruler);
+                if head < at {
+                    continue;
+                }
+                ruler.push_str(&" ".repeat(head - at));
+                ruler.push_str(&ruler_run(&mark.token, span));
+                let x = inner_x + head as f32 * cell_w;
+                let w = span as f32 * cell_w;
+                if mark.selected {
+                    painter.fill(x, y, w, row_h, theme().palette_selected_bg);
+                }
+                hits.push((x..x + w, y..y + row_h, i));
+            }
+            line(painter, y, &ruler, theme().field_hint);
+            y += row_h;
+        }
+
+        match overlay.editing {
+            Some((cell, ref field)) => {
+                let hint = match cell {
+                    WizardCell::Name => "save the format as…",
+                    WizardCell::Column => "column name",
+                };
+                draw_field(
+                    painter,
+                    view,
+                    cells,
+                    field,
+                    true,
+                    inner_x,
+                    y,
+                    inner_cells.saturating_sub(1),
+                    hint,
+                );
+            }
+            None => line(painter, y, &overlay.pattern, theme().ink),
+        }
+        y += row_h;
+
+        match overlay.error.as_deref() {
+            Some(error) => line(painter, y, error, theme().semantic.error),
+            None => line(painter, y, &overlay.readout, theme().field_hint),
+        }
+        y += row_h;
+
+        // The preview's head, then its rows. Every column is clamped to the same width so one long
+        // message cannot push the columns after it off the box.
+        let column_x = |i: usize| inner_x + (i * (WIZARD_COLUMN_CELLS + 1)) as f32 * cell_w;
+        for (i, title) in overlay.columns.iter().enumerate() {
+            let x = column_x(i);
+            if x + cell_w > box_x + box_w {
+                break;
+            }
+            let shown = tailhawk_core::widget::fit_from_right(cells, title, WIZARD_COLUMN_CELLS);
+            let _ = painter.lay_out_at(view, x, y, shown, Colours::plain(theme().header_ink));
+        }
+        y += row_h;
+
+        // The readout is on the line above; this one says why the table under it is empty, which
+        // is a different sentence.
+        if overlay.rows.is_empty() {
+            line(painter, y, WIZARD_NO_PREVIEW, theme().field_hint);
+            y += row_h;
+        }
+        for row in &overlay.rows {
+            match row {
+                None => line(painter, y, "— did not match —", theme().semantic.error),
+                Some(fields) => {
+                    for (i, text) in fields.iter().enumerate() {
+                        let x = column_x(i);
+                        if x + cell_w > box_x + box_w {
+                            break;
+                        }
+                        let shown =
+                            tailhawk_core::widget::fit_from_right(cells, text, WIZARD_COLUMN_CELLS);
+                        let _ = painter.lay_out_at(view, x, y, shown, Colours::plain(theme().ink));
+                    }
+                }
+            }
+            y += row_h;
+        }
+        line(painter, y, WIZARD_LEGEND, theme().field_hint);
+    }
+
     /// Opens, detects and indexes. Runs on a worker.
     fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
         let name = path
@@ -794,6 +990,7 @@ impl Document {
             moving: None,
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
+            wizard_overlay: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -852,6 +1049,7 @@ impl Document {
             moving: None,
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
+            wizard_overlay: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -2572,6 +2770,11 @@ fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Optio
             template::compile(found.language, &found.template, &origin).ok()
         })
         .collect();
+    // A format the user defined and saved outranks one merely found in a config file beside the
+    // log: they went to the trouble of defining it.
+    if let Some(saved) = SAVED_FORMATS.get() {
+        templates.splice(0..0, saved.iter().copied());
+    }
     // The command line's formats outrank what is found beside the file: the user said so.
     if let Some(cli) = CLI_FORMATS.get() {
         templates.splice(0..0, cli.iter().copied());
@@ -2593,6 +2796,120 @@ fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Optio
         .accepted
         .map(|format| Layout::from_sample(format, &lines));
     (detection, layout)
+}
+
+/// Which cell `Tab` moves to from `current`, or `None` to give the caret back to the ruler.
+///
+/// The column cell is offered only when the selected field is one the DSL lets the user name; the
+/// other roles take their names from the language. Free rather than a method so the decision can
+/// be tested — it is a small table, and getting it wrong is how the column cell became unreachable
+/// in the first draft of this surface.
+fn wizard_next_cell(current: Option<WizardCell>, named: bool, back: bool) -> Option<WizardCell> {
+    match (current, named, back) {
+        (None, true, true) => Some(WizardCell::Column),
+        (None, _, _) => Some(WizardCell::Name),
+        (Some(WizardCell::Name), true, _) => Some(WizardCell::Column),
+        (Some(WizardCell::Name), false, _) => None,
+        (Some(WizardCell::Column), _, _) => None,
+    }
+}
+
+/// Puts what was typed into a cell back into the model, and reports why the model refused it.
+fn wizard_commit(
+    wizard: &mut tailhawk_core::wizard::Wizard,
+    selected: usize,
+    cell: WizardCell,
+    text: &str,
+) -> Option<String> {
+    match cell {
+        WizardCell::Name => {
+            wizard.name = text.to_owned();
+            None
+        }
+        WizardCell::Column => wizard.set_name(selected, text).err(),
+    }
+}
+
+/// The middle of a field's span as a byte offset into the example, on a character boundary — where
+/// `Ctrl+N` cuts it in two. A span of one character has no middle, and reports its own start, which
+/// the model then refuses.
+fn wizard_half(example: &str, field: &tailhawk_core::wizard::Field) -> usize {
+    let span = &example[field.start..field.end];
+    let middle = span.chars().count() / 2;
+    field.start
+        + span
+            .char_indices()
+            .nth(middle)
+            .map_or(0, |(offset, _)| offset)
+}
+
+/// One field's stretch of §6.2's ruler, exactly `width` cells wide: `├──── ts ────┤` where the
+/// label fits between the brackets, the label alone where it does not, and a plain rule where not
+/// even that will go. The token arrives as `<ts>`; the brackets are the ruler's own.
+fn ruler_run(token: &str, width: usize) -> String {
+    let name = token.trim_start_matches('<').trim_end_matches('>');
+    // §6.2's own ruler abbreviates rather than truncating, and it is right to: `leve` under a
+    // four-cell `INFO` reads as a typo, where `lvl` reads as a label.
+    let short = match name {
+        "level" => "lvl",
+        "message" => "msg",
+        "thread" => "th",
+        "logger" => "log",
+        other => other,
+    };
+    let name = if name.chars().count() <= width {
+        name
+    } else {
+        short
+    };
+    let label: String = name.chars().take(width).collect();
+    let wide = label.chars().count();
+    if wide == 0 {
+        return "─".repeat(width);
+    }
+    let pad = width - wide - if wide + 2 <= width { 2 } else { 0 };
+    let left = pad / 2;
+    let (open, close) = if wide + 2 <= width {
+        ("├", "┤")
+    } else {
+        ("", "")
+    };
+    format!(
+        "{open}{}{label}{}{close}",
+        "─".repeat(left),
+        "─".repeat(pad - left)
+    )
+}
+
+/// Moves one edge of a field by one character of the example — §6.2's drag, from the keyboard.
+///
+/// The model refuses a boundary that is not a character boundary, so this steps by `char_indices`
+/// rather than by bytes and a refusal here means the edge is already at the end of the line.
+fn wizard_nudge(
+    wizard: &mut tailhawk_core::wizard::Wizard,
+    field: usize,
+    edge: tailhawk_core::wizard::Edge,
+    by: isize,
+) {
+    use tailhawk_core::wizard::Edge;
+    let Some(example) = wizard.example().map(str::to_owned) else {
+        return;
+    };
+    let Some(f) = wizard.fields().get(field) else {
+        return;
+    };
+    let at = match edge {
+        Edge::Start => f.start,
+        Edge::End => f.end,
+    };
+    let to = if by < 0 {
+        example[..at].char_indices().next_back().map(|(i, _)| i)
+    } else {
+        example[at..].chars().next().map(|c| at + c.len_utf8())
+    };
+    if let Some(to) = to {
+        let _ = wizard.move_boundary(field, edge, to);
+    }
 }
 
 /// The editing keys every one-line field answers to — caret moves (`Ctrl` by word, `Shift`
@@ -2891,6 +3208,10 @@ struct Chrome {
     palette_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
     /// The rules editor's rows by their y, for a click on one.
     rules_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
+    /// §6.2's ruler marks, by x **and** y, so a click outside the ruler is not read as a click
+    /// on its first field.
+    #[allow(clippy::type_complexity)]
+    wizard_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, std::ops::Range<f32>, usize)>>,
 }
 
 /// V9's rules editor as one frame should draw it — see [`Document::rules_overlay`].
@@ -2957,6 +3278,123 @@ struct RulesRow {
     bg: Option<[f32; 4]>,
     selected: bool,
     error: Option<String>,
+}
+
+/// Which of the wizard's two text cells has the caret — §6.2's "Save as…" and its `Roles` row.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum WizardCell {
+    /// What the definition will be called.
+    Name,
+    /// The selected field's column name, when its role is a named column.
+    Column,
+}
+
+/// One field of §6.2's ruler, as the overlay draws it under the example line.
+#[derive(Clone)]
+struct WizardMark {
+    span: std::ops::Range<usize>,
+    /// The DSL token the span becomes — `<ts>`, `<level>`, `<logger>`.
+    token: String,
+    selected: bool,
+}
+
+/// V9's format wizard as one frame should draw it — see [`Document::wizard_overlay`].
+#[derive(Clone, Default)]
+struct WizardOverlay {
+    title: String,
+    /// §6.2's example line, with `ruler` marking the spans under it.
+    example: String,
+    ruler: Vec<WizardMark>,
+    /// The pattern, rebuilt from the boundaries as text.
+    pattern: String,
+    /// The fault under the pattern field — read from the model, never compiled for.
+    error: Option<String>,
+    /// The cell under edit and the field to draw in its place.
+    editing: Option<(WizardCell, TextField)>,
+    /// §6.2's preview: the column titles, then one row per sample — `None` where it did not match.
+    columns: Vec<String>,
+    rows: Vec<Option<Vec<String>>>,
+    /// The match rate, or that there is not one yet.
+    readout: String,
+}
+
+/// The picture of `wizard` for one frame, or `None` when it is not up.
+///
+/// Free rather than a method for the reason [`rules_overlay_of`] is, and with one more that is
+/// worth stating: it takes a **shared** reference, and [`tailhawk_core::wizard::Wizard::test`]
+/// needs an exclusive one. A frame therefore cannot compile a format even by mistake — the rule
+/// the `CLEANROOM.md` entry set out is enforced by the signature rather than by remembering it.
+fn wizard_overlay_of(
+    wizard: Option<&tailhawk_core::wizard::Wizard>,
+    selected: usize,
+    editing: Option<(WizardCell, TextField)>,
+) -> Option<WizardOverlay> {
+    let wizard = wizard?;
+    let named = if wizard.name.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        wizard.name.clone()
+    };
+    let example = wizard.example().unwrap_or_default().to_owned();
+    let ruler = wizard
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| WizardMark {
+            span: f.start..f.end,
+            token: f.token(),
+            selected: i == selected,
+        })
+        .collect();
+    let test = wizard.last_test();
+    // §6.2 leans on the match rate as its verification, so a rate belonging to a pattern that has
+    // since been dragged is worse than none: say the pattern is untested instead.
+    let readout = match test {
+        None => WIZARD_UNTESTED.to_owned(),
+        Some(t) => match (&t.error, t.rate()) {
+            (Some(why), _) => why.clone(),
+            (None, None) => "no sample lines to preview".to_owned(),
+            (None, Some(rate)) => format!(
+                "{} of {} matched ({:.0}%)",
+                t.matched,
+                t.rows.len(),
+                rate * 100.0
+            ),
+        },
+    };
+    let samples = wizard.samples();
+    let rows = test
+        .map(|t| {
+            t.rows
+                .iter()
+                .enumerate()
+                .take(WIZARD_PREVIEW_ROWS)
+                .map(|(i, row)| {
+                    let line = samples.get(i)?;
+                    Some(
+                        row.as_ref()?
+                            .iter()
+                            .map(|span| {
+                                span.as_ref()
+                                    .map_or(String::new(), |s| line[s.clone()].to_owned())
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(WizardOverlay {
+        title: format!("Define format — {named}"),
+        example,
+        ruler,
+        pattern: wizard.template(),
+        error: wizard.error(),
+        editing,
+        columns: test.map(|t| t.columns.clone()).unwrap_or_default(),
+        rows,
+        readout,
+    })
 }
 
 /// E21 — an export in progress, or a live tee. See [`tailhawk_core::export`]: a tee is the export
@@ -3084,6 +3522,7 @@ enum Command {
     ResetColumns,
     /// V9's rules editor — `UI-DESIGN.md` §5.
     EditRules,
+    DefineFormat,
     OpenRules,
     ReloadRules,
     GoToTop,
@@ -3176,6 +3615,7 @@ impl Command {
             "",
         ),
         (Command::EditRules, "Highlight rules…", "Ctrl+H"),
+        (Command::DefineFormat, "Define format from a line…", ""),
         (
             Command::OpenRules,
             "Edit highlight rules in a text editor (tailhawk.rules.toml)…",
@@ -3279,6 +3719,7 @@ impl Default for Chrome {
             origins: std::cell::Cell::new((0.0, 0.0)),
             palette_hits: std::cell::RefCell::new(Vec::new()),
             rules_hits: std::cell::RefCell::new(Vec::new()),
+            wizard_hits: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -3563,6 +4004,30 @@ const PALETTE_CELLS: usize = 64;
 const RULES_CELLS: usize = 120;
 const RULES_PATTERN_CELLS: usize = 40;
 
+/// The format wizard box's width, in cells.
+const WIZARD_CELLS: usize = 132;
+
+/// How many of §6.2's 200 previewed lines the box shows. The model tests all of them — the rate is
+/// over the whole sample — but a preview taller than this would cover the window it sits in.
+const WIZARD_PREVIEW_ROWS: usize = 8;
+
+/// The widest a preview column is drawn, in cells, so one long message cannot push the rest out.
+const WIZARD_COLUMN_CELLS: usize = 22;
+
+/// §6.2's readout before anything has been tested. It says which key does it, because the model
+/// deliberately will not test on its own: a compile per drag would leak a format per frame.
+const WIZARD_UNTESTED: &str = "not tested yet — Ctrl+T previews the next 200 lines";
+
+/// The keys the wizard answers to, along its bottom edge, as §5's editor teaches its own.
+const WIZARD_LEGEND: &str =
+    "Ctrl+T test  Ctrl+S save  Esc close  ←→ field  Ctrl+←→ end  Shift+←→ start  R role  Tab name  Ctrl+N split  Ctrl+M merge  Ctrl+D drop";
+
+/// §10's empty state: a document with no line to define a format from.
+const WIZARD_EMPTY: &str = "no line to define a format from";
+
+/// §10 again: the preview table before there is anything in it.
+const WIZARD_NO_PREVIEW: &str = "nothing previewed yet";
+
 /// The keys the rules editor answers to, along its bottom edge — §5 has no buttons, and the
 /// palette's habit of teaching its keys beside the thing they do applies here too.
 /// §5's enable checkbox. The mock draws `☑` / `☐`, and those fell back to a missing-glyph box on
@@ -3709,6 +4174,15 @@ struct Shell {
     /// V9's rules editor — `UI-DESIGN.md` §5. On the shell rather than the document because the
     /// rules are the estate's, not one tab's; the palette is per-document because a query is.
     rules_editor: tailhawk_core::ruleset::Editor,
+    /// V9's format wizard — `UI-DESIGN.md` §6.2. On the shell for the reason the rules editor is:
+    /// a format definition outlives the tab that prompted it. `None` when the box is not up.
+    wizard: Option<tailhawk_core::wizard::Wizard>,
+    /// Which field of §6.2's ruler the keyboard acts on.
+    wizard_selected: usize,
+    /// The definition's name, or the selected column's, while one is being typed.
+    wizard_editing: Option<(WizardCell, TextField)>,
+    /// Where `tailhawk.formats.toml` is looked for and written — `SPEC.md` §12.4's tiers.
+    formats_tiers: Vec<PathBuf>,
     /// Rules from tiers the editor cannot write — a curated file beside the exe. Applied under
     /// whatever the editor holds, so the preview shows the set that will actually be in force.
     rules_fixed: Vec<tailhawk_core::rules::Spec>,
@@ -3973,6 +4447,7 @@ impl Shell {
         let strip = (self.document.labels(), self.document.active);
         let status = self.status_text();
         let rules_overlay = self.rules_overlay();
+        let wizard_overlay = self.wizard_overlay();
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
@@ -4021,6 +4496,7 @@ impl Shell {
                     // The overlay goes on the pane that carries the strip, so it is drawn once
                     // whatever the split, and over the pane the user is looking at first.
                     doc.rules_overlay = if i == 0 { rules_overlay.clone() } else { None };
+                    doc.wizard_overlay = if i == 0 { wizard_overlay.clone() } else { None };
                     doc.show_footer = i + 1 == pane_count;
                     doc.status = if doc.show_footer {
                         status.clone()
@@ -4784,6 +5260,259 @@ impl Shell {
         self.retitle(hwnd);
     }
 
+    /// The wizard as this frame should draw it, or `None` when it is not up.
+    fn wizard_overlay(&self) -> Option<WizardOverlay> {
+        wizard_overlay_of(
+            self.wizard.as_ref(),
+            self.wizard_selected,
+            self.wizard_editing.clone(),
+        )
+    }
+
+    /// §6.2, opened on the caret's row — or the top visible one, which is what the eye is on when
+    /// there is no caret.
+    ///
+    /// The samples are the rows after it, so the preview is over the file the user is looking at
+    /// rather than over the head of it.
+    fn open_wizard(&mut self) {
+        let Some(doc) = self.document.as_ref() else {
+            self.file =
+                Some("open a log first — the wizard defines a format from a line".to_owned());
+            return;
+        };
+        let lines = doc.wizard_sample();
+        // §10: a command that appears to do nothing is worse than one that says why it did not.
+        let Some((example, rest)) = lines.split_first() else {
+            self.file = Some("no line to define a format from".to_owned());
+            return;
+        };
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(example);
+        wizard.set_samples(rest.iter().cloned());
+        wizard.name = doc
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "format".to_owned());
+        self.wizard = Some(wizard);
+        self.wizard_selected = 0;
+        self.wizard_editing = None;
+    }
+
+    /// Closes the box. Nothing is applied that was not saved: the definition is the artefact, and
+    /// §6.2's Cancel means the document is left exactly as it was found.
+    fn close_wizard(&mut self) {
+        if self.wizard.take().is_some() {
+            self.file = Some("format wizard closed — nothing saved".to_owned());
+        }
+        self.wizard_selected = 0;
+        self.wizard_editing = None;
+    }
+
+    /// §6.2's **Save as…**: appends the definition to `tailhawk.formats.toml`'s last tier, then
+    /// applies the compiled format to the document it was defined against.
+    ///
+    /// Compiles — deliberately, and here rather than in the painter. A definition that will not
+    /// compile is not written: it would be read back at every start and fail every time.
+    fn save_format(&mut self, hwnd: HWND) {
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        // A nameless definition is written, read back as "format 1", and never matched by name
+        // again — so the next save appends another rather than replacing it. §6.2 calls the
+        // control "Save as…"; asking for the name is what that means.
+        if wizard.name.trim().is_empty() {
+            self.file = Some("name the format first — Tab, then type".to_owned());
+            return;
+        }
+        let format = match wizard.compile() {
+            Ok(format) => format,
+            Err(why) => {
+                self.file = Some(format!("format not saved: {why}"));
+                return;
+            }
+        };
+        let Some(target) = self.formats_tiers.last().cloned() else {
+            return;
+        };
+        if let Some(dir) = target.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut defs =
+            tailhawk_core::wizard::parse(&std::fs::read_to_string(&target).unwrap_or_default());
+        let def = wizard.definition();
+        // Saving twice under one name replaces, rather than leaving two definitions that differ.
+        match defs.iter().position(|d| d.name == def.name) {
+            Some(at) => defs[at] = def,
+            None => defs.push(def),
+        }
+        // §10: a read-only profile is a state, not an impossibility.
+        if let Err(e) = std::fs::write(&target, tailhawk_core::wizard::to_toml(&defs)) {
+            self.file = Some(format!("format not saved: {e}"));
+            return;
+        }
+        if let Some(doc) = self.document.as_mut() {
+            doc.adopt_format(format);
+        }
+        self.wizard = None;
+        self.wizard_editing = None;
+        self.file = Some(format!("format saved to {}", target.display()));
+        self.retitle(hwnd);
+    }
+
+    /// §6.2's keys. Modal while the box is up, as §5's editor is.
+    ///
+    /// `Ctrl+T` is the only thing here that compiles, and it is a key rather than a consequence of
+    /// editing for the reason the model's own note gives: a compile per drag would leak a format
+    /// per frame against a budget written for one per opened file.
+    fn wizard_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
+        use tailhawk_core::wizard::{Edge, Role};
+        if self.wizard.is_none() {
+            return false;
+        }
+        let editing = self.wizard_editing.is_some();
+        if key == VK_ESCAPE.0 {
+            if editing {
+                self.wizard_editing = None;
+            } else {
+                self.close_wizard();
+            }
+            return self.after_chrome_key(hwnd);
+        }
+        if ctrl && key == VK_S.0 {
+            self.commit_wizard_edit();
+            self.save_format(hwnd);
+            return self.after_chrome_key(hwnd);
+        }
+        if key == VK_TAB.0 {
+            // Which cell is next depends on which one has the caret, so it is decided **before**
+            // committing — committing is what clears it.
+            let next = self.wizard_editing_next(shift);
+            self.commit_wizard_edit();
+            if let Some(cell) = next {
+                self.begin_wizard_edit(cell);
+            }
+            return self.after_chrome_key(hwnd);
+        }
+        if key == VK_RETURN.0 && editing {
+            self.commit_wizard_edit();
+            return self.after_chrome_key(hwnd);
+        }
+        if editing {
+            if let Some((_, field)) = self.wizard_editing.as_mut() {
+                if field_edit(field, key, ctrl, shift) {
+                    return self.after_chrome_key(hwnd);
+                }
+            }
+            return self.after_chrome_key(hwnd);
+        }
+        let selected = self.wizard_selected;
+        let wizard = self.wizard.as_mut().expect("checked");
+        let fields = wizard.fields().len();
+        match key {
+            k if k == VK_T.0 && ctrl => {
+                wizard.test();
+            }
+            // Splits the selected field — or, when `Ctrl+D` has taken the last one away, puts a
+            // field back over the whole line. Without that second case the box has a state it
+            // cannot be got out of except by closing it and losing the work.
+            k if k == VK_N.0 && ctrl => {
+                let example = wizard.example().unwrap_or_default().to_owned();
+                match wizard
+                    .fields()
+                    .get(selected)
+                    .map(|f| wizard_half(&example, f))
+                {
+                    Some(at) => {
+                        let _ = wizard.split(selected, at);
+                    }
+                    None => {
+                        let _ = wizard.add_field(
+                            0..example.len(),
+                            tailhawk_core::wizard::Role::Message,
+                            "",
+                        );
+                        self.wizard_selected = 0;
+                    }
+                }
+            }
+            k if (k == VK_D.0 || k == VK_DELETE.0) && ctrl => {
+                let _ = wizard.remove_field(selected);
+                self.wizard_selected = selected.min(fields.saturating_sub(2));
+            }
+            k if k == VK_M.0 && ctrl => {
+                let _ = wizard.merge(selected);
+            }
+            // Ctrl and Shift move the field's two edges; a bare arrow moves between fields.
+            k if k == VK_LEFT.0 && ctrl => wizard_nudge(wizard, selected, Edge::End, -1),
+            k if k == VK_RIGHT.0 && ctrl => wizard_nudge(wizard, selected, Edge::End, 1),
+            k if k == VK_LEFT.0 && shift => wizard_nudge(wizard, selected, Edge::Start, -1),
+            k if k == VK_RIGHT.0 && shift => wizard_nudge(wizard, selected, Edge::Start, 1),
+            k if k == VK_LEFT.0 => self.wizard_selected = selected.saturating_sub(1),
+            k if k == VK_RIGHT.0 => {
+                self.wizard_selected = (selected + 1).min(fields.saturating_sub(1))
+            }
+            k if k == VK_R.0 => {
+                let next = match wizard.fields().get(selected).map(|f| f.role) {
+                    Some(Role::Timestamp) => Role::Severity,
+                    Some(Role::Severity) => Role::Named,
+                    Some(Role::Named) => Role::Message,
+                    Some(Role::Message) => Role::Discard,
+                    Some(Role::Discard) | None => Role::Timestamp,
+                };
+                let _ = wizard.set_role(selected, next);
+            }
+            // Every other key is swallowed: the box is modal while it is up.
+            _ => {}
+        }
+        self.after_chrome_key(hwnd)
+    }
+
+    /// Which cell `Tab` moves to, or `None` when the selected field has no name to type.
+    fn wizard_editing_next(&self, back: bool) -> Option<WizardCell> {
+        let named = self
+            .wizard
+            .as_ref()
+            .and_then(|w| w.fields().get(self.wizard_selected))
+            .is_some_and(|f| f.role == tailhawk_core::wizard::Role::Named);
+        wizard_next_cell(
+            self.wizard_editing.as_ref().map(|(cell, _)| *cell),
+            named,
+            back,
+        )
+    }
+
+    /// Puts the cell's current text into the field and gives it the caret.
+    fn begin_wizard_edit(&mut self, cell: WizardCell) {
+        let text = match (cell, self.wizard.as_ref()) {
+            (WizardCell::Name, Some(w)) => w.name.clone(),
+            (WizardCell::Column, Some(w)) => w
+                .fields()
+                .get(self.wizard_selected)
+                .map(|f| f.name.clone())
+                .unwrap_or_default(),
+            (_, None) => return,
+        };
+        let mut field = TextField::default();
+        field.insert(&text);
+        self.wizard_editing = Some((cell, field));
+    }
+
+    /// Puts what was typed back into the model, and says why if the model refuses it.
+    fn commit_wizard_edit(&mut self) {
+        let Some((cell, field)) = self.wizard_editing.take() else {
+            return;
+        };
+        let text = field.text().to_owned();
+        let selected = self.wizard_selected;
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        if let Some(why) = wizard_commit(wizard, selected, cell, &text) {
+            self.file = Some(why);
+        }
+    }
+
     /// The palette's keys, offered before anything else while it is open: `Ctrl+K` opens and
     /// closes it (`Ctrl+G` opens it too — a typed number is "go to line"), `Up`/`Down` move,
     /// `Enter` runs the selection, `Esc` closes, and the editing keys are the query field's.
@@ -4855,6 +5584,10 @@ impl Shell {
             }
             Command::EditRules => {
                 self.open_rules_editor();
+                return true;
+            }
+            Command::DefineFormat => {
+                self.open_wizard();
                 return true;
             }
             Command::OpenRules => {
@@ -4987,6 +5720,7 @@ impl Shell {
             | Command::FocusOtherPane
             | Command::ToggleTheme
             | Command::EditRules
+            | Command::DefineFormat
             | Command::OpenRules
             | Command::ReloadRules
             | Command::CloseTab => {}
@@ -5045,6 +5779,27 @@ impl Shell {
     /// `WM_CHAR` delivers a non-BMP character as two messages, and inserting each on its own puts
     /// two replacement characters into the field.
     fn find_char(&mut self, hwnd: HWND, unit: u16) -> bool {
+        // §6.2's box is modal too, and takes typed text before the editor or the chrome. Without
+        // this branch the name and column cells cannot be typed into at all.
+        if self.wizard.is_some() {
+            if self.wizard_editing.is_none() {
+                return true;
+            }
+            let mut text = String::new();
+            let Some(doc) = self.document.as_mut() else {
+                return true;
+            };
+            if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
+                return true;
+            }
+            if let Some((_, field)) = self.wizard_editing.as_mut() {
+                field.insert(&text);
+            }
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return true;
+        }
         // V9's editor takes typed text before anything else while it is up, and it does not use
         // the chrome's focus: it is modal, so the cell under edit is where a character goes.
         if self.rules_editor.is_open() {
@@ -5199,6 +5954,24 @@ impl Shell {
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
     /// chip is removed. Returns whether the click was the bar's.
     fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, extend: bool) -> bool {
+        // §6.2's box is modal for the same reason §5's is: a click on the ruler picks a field, and
+        // a click anywhere else is swallowed rather than dragging a selection through log text
+        // the box is covering.
+        if self.wizard.is_some() {
+            let hit = self.document.as_ref().and_then(|doc| {
+                doc.chrome
+                    .wizard_hits
+                    .borrow()
+                    .iter()
+                    .find(|(xs, ys, _)| xs.contains(&x) && ys.contains(&y))
+                    .map(|(_, _, field)| *field)
+            });
+            if let Some(field) = hit {
+                self.commit_wizard_edit();
+                self.wizard_selected = field;
+            }
+            return self.after_chrome_key(hwnd);
+        }
         // V9's editor is modal, so a click inside it selects a rule and a click anywhere else is
         // swallowed. Without this the grid behind the box takes the click and the user finds
         // themselves dragging a selection through log text they cannot see.
@@ -6820,7 +7593,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
-                    shell.rules_key(hwnd, wparam.0 as u16, ctrl, shift)
+                    shell.wizard_key(hwnd, wparam.0 as u16, ctrl, shift)
+                        || shell.rules_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.view_key(hwnd, wparam.0 as u16, ctrl)
                         || shell.chrome_key(hwnd, wparam.0 as u16, ctrl, shift)
@@ -7387,6 +8161,19 @@ fn main() -> Result<()> {
     // §7.1: the user's highlight rules, from the same tiers.
     let rules_tiers = tailhawk_core::rules::tiers(exe_dir.as_deref(), roaming.as_deref());
     let (rule_specs, rules_failed) = load_rule_specs(&rules_tiers);
+    // §6.5: the wizard's definitions, from the same tiers again. Compiled once, here, so a format
+    // defined in one session is detected in the next; a definition that no longer compiles is
+    // dropped rather than allowed to stop the others being read.
+    let formats_tiers = tailhawk_core::wizard::tiers(exe_dir.as_deref(), roaming.as_deref());
+    let _ = SAVED_FORMATS.set(
+        tailhawk_core::wizard::load(&formats_tiers)
+            .into_iter()
+            .filter_map(|def| {
+                let language = def.language?;
+                template::compile(language, &def.template, &def.name).ok()
+            })
+            .collect(),
+    );
     let placement = settings.window;
     // V13: the theme — `--theme=dark|light|system` on the command line, else what was saved, else
     // dark; High Contrast overrides all of them with the system's colours (§11.2). Chosen before the
@@ -7443,6 +8230,10 @@ fn main() -> Result<()> {
             dragging_bar: None,
             welcome: None,
             rules_editor: tailhawk_core::ruleset::Editor::default(),
+            wizard: None,
+            wizard_selected: 0,
+            wizard_editing: None,
+            formats_tiers,
             rules_fixed: Vec::new(),
             rule_specs,
             rules_tiers,
@@ -9630,6 +10421,223 @@ mod tests {
             overlay.rows[1].error.is_some(),
             "§5 puts the error inline beside its own rule"
         );
+    }
+
+    #[test]
+    fn a_closed_wizard_draws_nothing() {
+        assert!(wizard_overlay_of(None, 0, None).is_none());
+    }
+
+    #[test]
+    fn the_wizard_overlay_carries_the_ruler_the_example_and_the_pattern() {
+        let line =
+            "2026-07-28 09:14:02,117 [12] INFO  Zenith.Automation.Runner - Evaluated 412 triggers";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        wizard.name = "ndc".to_owned();
+        let overlay = wizard_overlay_of(Some(&wizard), 2, None).expect("open");
+        assert_eq!(overlay.title, "Define format — ndc");
+        assert_eq!(overlay.example, line);
+        assert_eq!(
+            overlay.pattern,
+            "<ts> [<thread>] <level>  <logger> - <message>"
+        );
+        assert_eq!(overlay.error, None);
+        let tokens: Vec<&str> = overlay.ruler.iter().map(|m| m.token.as_str()).collect();
+        assert_eq!(
+            tokens,
+            vec!["<ts>", "<thread>", "<level>", "<logger>", "<message>"]
+        );
+        assert_eq!(&line[overlay.ruler[2].span.clone()], "INFO");
+        assert!(
+            overlay.ruler[2].selected,
+            "the third field is the selected one"
+        );
+        assert!(overlay.ruler.iter().filter(|m| m.selected).count() == 1);
+    }
+
+    #[test]
+    fn an_untested_wizard_says_so_rather_than_showing_a_rate_it_does_not_have() {
+        let line = "2026-07-28 09:14:02 INFO hello";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        wizard.set_samples([line.to_owned()]);
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        assert_eq!(overlay.readout, WIZARD_UNTESTED);
+        assert!(overlay.rows.is_empty());
+        assert!(overlay.columns.is_empty());
+    }
+
+    #[test]
+    fn a_tested_wizard_carries_the_preview_table_and_the_rate() {
+        let line = "2026-07-28 09:14:02 INFO hello";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        wizard.set_samples([line.to_owned(), "not a log line".to_owned()]);
+        wizard.test();
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        assert_eq!(overlay.readout, "1 of 2 matched (50%)");
+        assert_eq!(overlay.rows.len(), 2);
+        assert!(overlay.rows[1].is_none(), "the second line did not match");
+        let first = overlay.rows[0].as_ref().expect("matched");
+        assert!(
+            first.iter().any(|text| text == "hello"),
+            "the preview carries the captured text, not the whole line: {first:?}"
+        );
+        assert_eq!(first.len(), overlay.columns.len());
+    }
+
+    #[test]
+    fn a_rate_that_belongs_to_an_edited_away_pattern_is_not_shown() {
+        let line = "2026-07-28 09:14:02 INFO hello";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        wizard.set_samples([line.to_owned()]);
+        wizard.test();
+        assert_eq!(
+            wizard_overlay_of(Some(&wizard), 0, None)
+                .expect("open")
+                .readout,
+            "1 of 1 matched (100%)"
+        );
+        let end = wizard.fields()[0].end;
+        wizard
+            .move_boundary(0, tailhawk_core::wizard::Edge::End, end - 1)
+            .expect("moves");
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        assert_eq!(
+            overlay.readout, WIZARD_UNTESTED,
+            "§6.2 leans on the rate, so a stale one is worse than none"
+        );
+        assert!(overlay.rows.is_empty(), "and the table goes with it");
+    }
+
+    #[test]
+    fn the_wizard_overlay_shows_the_models_error_without_compiling_for_it() {
+        let line = "2026-07-28 09:14:02 INFO hello";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        let end = wizard.fields()[0].end;
+        wizard
+            .move_boundary(0, tailhawk_core::wizard::Edge::End, end + 1)
+            .expect("moves");
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        assert!(
+            overlay.error.expect("error").contains("timestamp shape"),
+            "the fault is read off the model, not learned by compiling"
+        );
+    }
+
+    #[test]
+    fn the_wizard_cell_under_edit_is_drawn_as_a_field_and_says_which_one() {
+        let wizard = tailhawk_core::wizard::Wizard::from_example("2026-07-28 09:14:02 INFO hi");
+        let mut field = TextField::default();
+        field.insert("worker");
+        let overlay =
+            wizard_overlay_of(Some(&wizard), 1, Some((WizardCell::Column, field))).expect("open");
+        let (cell, field) = overlay.editing.expect("a cell is under edit");
+        assert_eq!(cell, WizardCell::Column);
+        assert_eq!(field.text(), "worker");
+    }
+
+    #[test]
+    fn the_preview_is_clamped_so_a_long_sample_cannot_outgrow_the_box() {
+        let line = "2026-07-28 09:14:02 INFO hello";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        wizard.set_samples((0..40).map(|i| format!("2026-07-28 09:14:0{} INFO n{i}", i % 10)));
+        wizard.test();
+        let overlay = wizard_overlay_of(Some(&wizard), 0, None).expect("open");
+        assert_eq!(overlay.rows.len(), WIZARD_PREVIEW_ROWS);
+        assert!(
+            overlay.readout.contains("of 40 matched"),
+            "the rate is over every sample even though the box shows eight: {}",
+            overlay.readout
+        );
+    }
+
+    #[test]
+    fn a_ruler_run_never_outgrows_the_span_it_labels() {
+        // `<thread>` over a span of two is the case that smeared across the level beside it.
+        for width in 0..12 {
+            for token in ["<ts>", "<thread>", "<message>", "<_>", "<a_very_long_name>"] {
+                let run = ruler_run(token, width);
+                assert_eq!(
+                    run.chars().count(),
+                    width,
+                    "{token:?} in {width} cells came out as {run:?}"
+                );
+            }
+        }
+        assert_eq!(ruler_run("<ts>", 12), "├────ts────┤");
+        assert_eq!(
+            ruler_run("<level>", 4),
+            "lvl─",
+            "abbreviated, not truncated to \"leve\""
+        );
+        assert_eq!(ruler_run("<message>", 5), "├msg┤");
+        assert_eq!(
+            ruler_run("<thread>", 2),
+            "th",
+            "too narrow for brackets, but still legible"
+        );
+        assert_eq!(ruler_run("<ts>", 3), "ts─");
+        assert_eq!(ruler_run("<_>", 0), "");
+    }
+
+    #[test]
+    fn tab_reaches_the_column_cell_and_not_only_the_name() {
+        // The bug this replaces: the next cell was chosen from state the commit had already
+        // cleared, so every Tab chose Name and a column could never be renamed at all.
+        assert_eq!(wizard_next_cell(None, true, false), Some(WizardCell::Name));
+        assert_eq!(
+            wizard_next_cell(Some(WizardCell::Name), true, false),
+            Some(WizardCell::Column),
+            "a named column is reachable from the name cell"
+        );
+        assert_eq!(
+            wizard_next_cell(Some(WizardCell::Name), false, false),
+            None,
+            "a timestamp has no name of the user's to type"
+        );
+        assert_eq!(
+            wizard_next_cell(Some(WizardCell::Column), true, false),
+            None
+        );
+        assert_eq!(
+            wizard_next_cell(None, true, true),
+            Some(WizardCell::Column),
+            "Shift+Tab reaches the column first"
+        );
+    }
+
+    #[test]
+    fn typing_a_column_name_reaches_the_model() {
+        let line = "2026-07-28 09:14:02,117 [12] INFO  Zen.Runner - go";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        assert_eq!(wizard.fields()[1].role, tailhawk_core::wizard::Role::Named);
+        assert_eq!(
+            wizard_commit(&mut wizard, 1, WizardCell::Column, "worker"),
+            None
+        );
+        assert_eq!(wizard.fields()[1].name, "worker");
+        assert!(wizard.template().contains("<worker>"));
+        assert_eq!(wizard_commit(&mut wizard, 1, WizardCell::Name, "ndc"), None);
+        assert_eq!(wizard.name, "ndc");
+    }
+
+    #[test]
+    fn a_refused_column_name_is_reported_rather_than_swallowed() {
+        let line = "2026-07-28 09:14:02,117 [12] INFO  Zen.Runner - go";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        let why = wizard_commit(&mut wizard, 1, WizardCell::Column, "level")
+            .expect("the model refuses a role word as a column name");
+        assert!(why.contains("role"), "{why}");
+        assert_eq!(wizard.fields()[1].name, "thread", "and nothing changed");
+    }
+
+    #[test]
+    fn ctrl_n_splits_a_field_on_a_character_boundary() {
+        let line = "héllo wörld";
+        let mut wizard = tailhawk_core::wizard::Wizard::from_example(line);
+        let at = wizard_half(line, &wizard.fields()[0]);
+        assert!(line.is_char_boundary(at), "{at} is inside a character");
+        wizard.split(0, at).expect("splits");
+        assert_eq!(wizard.fields().len(), 2);
     }
 
     #[test]

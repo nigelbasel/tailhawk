@@ -66,6 +66,19 @@ pub struct Field {
     pub name: String,
 }
 
+impl Field {
+    /// The DSL token this field becomes — what §6.2's ruler labels the span with.
+    pub fn token(&self) -> String {
+        match self.role {
+            Role::Timestamp => "<ts>".to_owned(),
+            Role::Severity => "<level>".to_owned(),
+            Role::Message => "<message>".to_owned(),
+            Role::Discard => "<_>".to_owned(),
+            Role::Named => format!("<{}>", self.name),
+        }
+    }
+}
+
 /// Which end of a field a drag is moving.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Edge {
@@ -234,7 +247,7 @@ impl Wizard {
                 let mut at = 0;
                 for f in fields {
                     out.push_str(&example[at..f.start]);
-                    out.push_str(&token(f));
+                    out.push_str(&f.token());
                     at = f.end;
                 }
                 out.push_str(&example[at..]);
@@ -661,17 +674,6 @@ fn next_name(fields: &[Field]) -> String {
         .map(|n| format!("f{n}"))
         .find(|candidate| !fields.iter().any(|f| f.name == *candidate))
         .expect("unbounded")
-}
-
-/// The DSL token a field becomes.
-fn token(f: &Field) -> String {
-    match f.role {
-        Role::Timestamp => "<ts>".to_owned(),
-        Role::Severity => "<level>".to_owned(),
-        Role::Message => "<message>".to_owned(),
-        Role::Discard => "<_>".to_owned(),
-        Role::Named => format!("<{}>", f.name),
-    }
 }
 
 /// The capture name a field claims, for the duplicate check.
@@ -1561,6 +1563,28 @@ mod tests {
         assert_eq!(
             recognise("%date [%thread] %-5level %logger - %message%newline ${env:X}"),
             Ok(Language::Log4net)
+        );
+    }
+
+    #[test]
+    fn a_padded_level_does_not_pin_the_format_to_the_line_it_came_from() {
+        // log4net's `%-5level` writes "INFO " and "ERROR", so a template read off an INFO line
+        // carries two spaces where an ERROR line has one. Escaping the run verbatim built a format
+        // that matched three lines of five — found by previewing a real log, not by a test.
+        let line = "2026-07-28 09:14:02,117 [12] INFO  Zenith.Automation.Runner - Evaluated 412";
+        let mut w = Wizard::from_example(line);
+        w.set_samples([
+            "2026-07-28 09:14:03,884 [12] ERROR Zenith.Data.SessionFactory - Could not open"
+                .to_owned(),
+            "2026-07-28 09:14:04,001 [15] WARN  Zenith.Automation.Runner - Retry 1 of 3".to_owned(),
+            "2026-07-28 09:14:06,742 [18] DEBUG Zenith.Data.SessionFactory - Pool size 8"
+                .to_owned(),
+        ]);
+        let test = w.test();
+        assert_eq!(test.error, None);
+        assert_eq!(
+            test.matched, 3,
+            "every line matches, whatever the level's width"
         );
     }
 

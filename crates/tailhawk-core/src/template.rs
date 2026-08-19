@@ -100,6 +100,9 @@ type Compiled = (
 
 const DOTNET_CONTINUATION: &str = r"^\s*(at\s|--->\s|--- End of inner exception|\S+Exception\b)";
 
+/// What a run of spaces or tabs in a template's literal text compiles to. See [`Build::literal`].
+const BLANK_RUN: &str = r"[ \t]+";
+
 /// A pattern being assembled: literals escaped, tokens appended, columns remembered.
 struct Build {
     pattern: String,
@@ -126,6 +129,13 @@ impl Build {
         }
     }
 
+    /// Appends literal text between two tokens — **with a run of spaces or tabs matching a run of
+    /// any length**.
+    ///
+    /// Layouts pad. `%-5level` writes `INFO ` and `ERROR`, so a template read off an `INFO` line
+    /// carries two spaces where an `ERROR` line has one; escaping the run verbatim would build a
+    /// format that matches the line it was taken from and fails on every longer level in the file.
+    /// The wizard found this the moment it previewed a real log: three lines of five.
     fn literal(&mut self, text: &str) {
         if self.ended || text.is_empty() {
             return;
@@ -136,7 +146,20 @@ impl Build {
             let shape = if text.starts_with(' ') { ".*?" } else { r"\S+" };
             self.pattern.replace_range(at..at, shape);
         }
-        self.pattern.push_str(&regex::escape(text));
+        let mut rest = text;
+        while !rest.is_empty() {
+            let blank = rest
+                .find(|c: char| c != ' ' && c != '\t')
+                .unwrap_or(rest.len());
+            if blank > 0 {
+                self.pattern.push_str(BLANK_RUN);
+                rest = &rest[blank..];
+                continue;
+            }
+            let plain = rest.find([' ', '\t']).unwrap_or(rest.len());
+            self.pattern.push_str(&regex::escape(&rest[..plain]));
+            rest = &rest[plain..];
+        }
     }
 
     fn capture(&mut self, name: &str, shape: &str) {
@@ -178,11 +201,18 @@ impl Build {
             self.pattern.replace_range(at..at, ".*");
         }
         // A literal space before a token that contributed nothing (`${exception}` at the end of
-        // an NLog layout) must not demand a trailing space of every line.
-        let trimmed = self.pattern.trim_end_matches(' ').len();
-        if trimmed < self.pattern.len() {
-            self.pattern.truncate(trimmed);
+        // an NLog layout) must not demand a trailing space of every line. Since `literal` now
+        // compiles a run of blanks to `[ \t]+`, that is the shape to look for as well as a bare
+        // space left by anything that appends one directly.
+        if let Some(head) = self.pattern.strip_suffix(BLANK_RUN) {
+            self.pattern.truncate(head.len());
             self.pattern.push_str(r"\s*");
+        } else {
+            let trimmed = self.pattern.trim_end_matches(' ').len();
+            if trimmed < self.pattern.len() {
+                self.pattern.truncate(trimmed);
+                self.pattern.push_str(r"\s*");
+            }
         }
         self.pattern.push('$');
         self.ended = true;

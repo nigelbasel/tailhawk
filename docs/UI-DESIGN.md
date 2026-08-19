@@ -558,6 +558,7 @@ conflict.
 | `Ctrl+L` | Focus filter |
 | `Ctrl+G` | Go to line |
 | `Ctrl+H` | Rules editor |
+| `Ctrl+T` / `Ctrl+N` / `Ctrl+M` / `R` | **Inside the format wizard only** (§6.2): test, split a field, merge, cycle its role. The wizard is modal, so while it is up `Ctrl+D`, `Space` and `F` are its own too, not the rows in this table. |
 | `F` | Toggle follow (also `Ctrl+End` jumps to tail and re-enables) |
 | `Ctrl+Enter` | Record detail pane |
 | `Ctrl+D` / `Ctrl+Shift+D` | Toggle bookmark / bookmarks panel |
