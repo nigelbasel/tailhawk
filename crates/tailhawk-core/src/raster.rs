@@ -24,10 +24,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, RECT};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory, IDWriteFactory2, IDWriteFontFace,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_DEFAULT,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-    DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN,
+    DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE,
 };
 
 use crate::atlas::{GlyphId, Ink};
@@ -86,6 +86,26 @@ pub struct Face {
 }
 
 impl Face {
+    /// The face's designed line height in pixels at `px_per_em` — ascent + descent + line gap,
+    /// which is the distance a typographer intends between one baseline and the next.
+    ///
+    /// **This is the row advance, and it is not the ink box.** [`Rasteriser::measure_cell`]
+    /// measures the tight bounding box of the printable ASCII, which runs from the top of the
+    /// tallest ascender to the bottom of the deepest descender and has *no space between lines in
+    /// it at all*. Using it as the row height is what made a `g` on one row touch an `l` on the
+    /// next: correct for packing glyphs into an atlas, unreadable as a page of text.
+    ///
+    /// The gap is the face's own `lineGap`, so a font that asks for none gets none.
+    pub fn line_height(&self, px_per_em: u16) -> f32 {
+        let mut m = DWRITE_FONT_METRICS::default();
+        unsafe { self.face.GetMetrics(&mut m) };
+        if m.designUnitsPerEm == 0 {
+            return 0.0;
+        }
+        let design = f32::from(m.ascent) + f32::from(m.descent) + f32::from(m.lineGap);
+        design * f32::from(px_per_em) / f32::from(m.designUnitsPerEm)
+    }
+
     /// Bulk codepoint → glyph index. A codepoint the face does not have maps to **0**, the
     /// `.notdef` glyph, rather than failing — which is the signal to try the next face in the
     /// fallback chain (§3.3).

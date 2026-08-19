@@ -179,8 +179,32 @@ impl Painter {
         self.cache.cell().width as f32
     }
 
+    /// The distance from one row's baseline to the next — the **face's designed line height**, not
+    /// the height of the ink.
+    ///
+    /// [`Rasteriser::measure_cell`](crate::raster::Rasteriser::measure_cell) measures the tight
+    /// bounding box of the printable ASCII, top of the tallest ascender to bottom of the deepest
+    /// descender, with no space between lines in it at all. That is the right box to pack an atlas
+    /// with and the wrong number to advance a row by: used as the row height it put a `g` hard
+    /// against the `l` below it, and a screenful read as one solid block.
+    ///
+    /// The ink box is still the floor. A face that reports a line height smaller than its own ink —
+    /// or reports nothing usable — gets the ink box rather than glyphs that overlap outright.
     pub fn row_height(&self) -> f32 {
-        self.cache.cell().height as f32
+        let ink = self.cache.cell().height as f32;
+        self.cache
+            .face()
+            .line_height(self.cache.px_per_em())
+            .ceil()
+            .max(ink)
+    }
+
+    /// The space above the ink inside a row — half of what the line height adds to the ink box.
+    ///
+    /// Rounded down so the ink stays on a whole pixel: a half-pixel baseline is a blurred one, and
+    /// the atlas rasterised these glyphs for an integer grid.
+    fn half_leading(&self) -> f32 {
+        ((self.row_height() - self.cache.cell().height as f32) / 2.0).floor()
     }
 
     /// Starts a frame: drops the previous frame's quads and its miss list.
@@ -340,7 +364,12 @@ impl Painter {
         // The cell box's `top` is the ink's offset from the baseline and is negative above it, and
         // `quad` adds it back. Subtracting it here therefore lands the cell exactly on the row's top
         // edge — the one place screen space and font metrics meet, resolved once.
-        let baseline_y = y - self.cache.cell().top as f32;
+        //
+        // **Half of the leading goes above the ink and half below.** The row is now the face's line
+        // height rather than the height of the ink (see [`Painter::row_height`]), so there is space
+        // to place; putting all of it under the glyphs would sit every line hard against the row
+        // above and leave a gap beneath, which reads as badly as no leading did.
+        let baseline_y = y + self.half_leading() - self.cache.cell().top as f32;
 
         let mut laid = Laid {
             rtl_runs: shaped.runs.iter().filter(|r| r.level % 2 == 1).count(),

@@ -285,9 +285,27 @@ copy — bookmarks, highlight rules and column layout all apply.
 *(Owner's requirement, 2026-08-19. §3 above is one log split two ways; this is several logs at
 once, which is a different problem and the one MDI existed to solve.)*
 
-**Layout is the user's choice, not the app's.** Some people want tabs; some want four services
-tiled across a monitor. Both ship, and the window switches between them — **Tabbed** and **Tiled**
-on the View menu, remembered per §12.4. Neither is the "real" one.
+**Tabs and document windows are not two modes. They are both, always** — HooWinTail's arrangement,
+and the owner's requirement.
+
+Every open log is a **document window** inside the main window, and every open log has a **tab**,
+whatever those windows are doing. Maximise a document window and the result reads as an ordinary
+tabbed viewer: one log filling the frame, tabs across the top. Restore it and the others are there
+beside or behind it — and the tab strip is still the way to bring one to the front, which is the
+thing that makes overlapping windows usable rather than a pile.
+
+So a tab is *"show me this document"*, and it means that in every layout. It does not mean "switch
+to the only visible pane"; there may be four visible, and clicking a tab raises and focuses one of
+them. The View menu offers **Maximise**, **Tile** and **Cascade** over the document windows, per
+§2.2; none of them takes the tabs away.
+
+**This reverses §1.1's rejection of MDI child windows** — the third of that section's original
+positions to be overturned, after menus and toolbars. What was actually wrong with MDI was never
+the child windows; it was the grey bevelled chrome, the title bar on every child eating vertical
+space, and windows that could not be snapped or tiled without dragging them by hand. A document
+window here is drawn in the app's own flat register with a one-line header, and Tile and Cascade
+are commands rather than an exercise in mouse dexterity. The rest of §1.1 — no ribbon, no toolbar of
+unlabelled icons, thin quiet chrome — is untouched.
 
 **Tiled.** The window divides into a grid of panes — 2-up, 2×2, or arbitrary splits by dragging a
 pane edge. Every pane is a full independent document: its own file (or rotated set), its own

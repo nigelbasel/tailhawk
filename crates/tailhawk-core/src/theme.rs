@@ -310,12 +310,14 @@ fn luminance(c: Colour) -> f32 {
 }
 
 impl Default for Theme {
+    /// Light. `UI-DESIGN.md` §11.2: the shipped default is black on white, and `--theme=dark` or
+    /// the View menu is what asks for the other one.
     fn default() -> Self {
-        Self::dark()
+        Self::light()
     }
 }
 
-static THEME: RwLock<Theme> = RwLock::new(Theme::dark());
+static THEME: RwLock<Theme> = RwLock::new(Theme::light());
 
 /// The theme in force. A copy — see the module note.
 pub fn theme() -> Theme {

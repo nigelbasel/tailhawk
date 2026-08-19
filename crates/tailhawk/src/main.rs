@@ -7787,8 +7787,8 @@ fn resolve_theme(name: Option<&str>) -> Theme {
                 Theme::dark()
             }
         }
-        Some(other) => theme::by_name(other).unwrap_or_else(Theme::dark),
-        None => Theme::dark(),
+        Some(other) => theme::by_name(other).unwrap_or_else(Theme::light),
+        None => Theme::light(),
     }
 }
 
