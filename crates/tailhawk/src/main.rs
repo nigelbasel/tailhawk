@@ -222,6 +222,8 @@ struct Document {
     /// V9's format wizard as it should be drawn this frame — the shell's knowledge handed over
     /// exactly as [`Document::rules_overlay`] is.
     wizard_overlay: Option<WizardOverlay>,
+    /// §6.1's chip menu as it should be drawn this frame, or `None` when it is not down.
+    format_menu: Option<Vec<FormatRow>>,
     /// The ad-hoc colour labels in force — `(n, text)` — mirrored as rules at the front of the
     /// highlighter's set. Kept here so they can be listed and saved.
     labels: Vec<(u8, String)>,
@@ -472,13 +474,31 @@ impl RowSource for Document {
         );
         self.chrome.origins.set((find_origin, chip_origin));
 
-        // The format, at the right edge — §6.5's chip, as text for now.
+        // §6.1's format chip, at the right edge: the detection, a `▾`, and a click target.
+        //
+        // **Its colour is the trust model.** §6.1: a detection that clears neither 0.75 absolute
+        // nor a 15% margin renders as a warning rather than silently picking, because silent
+        // mis-columnising is worse than none. `describe` already says "format? … · …" in that
+        // case; drawing it in the ordinary ink would leave the warning to be read rather than seen.
         if let Some(text) = self.detection.describe() {
-            let w = cells.cell_count(&text) as f32 * cell_w;
-            let fx = width - w - cell_w;
-            if fx > x + chip_w + cell_w {
-                let _ =
-                    painter.lay_out_at(view, fx, text_y, &text, Colours::plain(theme().header_ink));
+            let text = format!("{text} ▾");
+            // The warning form is the *longest* — `format? log4net 100% · timestamped text 100%` —
+            // so a chip drawn only when it fits whole is a chip that disappears in exactly the
+            // state §6.1 wants it seen. Fit it to the room instead, and give up only when there is
+            // none: the click target goes with it, and this is the door to every way back.
+            let room = (((width - x - chip_w - 2.0 * cell_w) / cell_w) as usize)
+                .min(cells.cell_count(&text));
+            if room >= FORMAT_CHIP_MIN_CELLS {
+                let shown = tailhawk_core::widget::fit_from_right(cells, &text, room);
+                let w = cells.cell_count(shown) as f32 * cell_w;
+                let fx = width - w - cell_w;
+                let ink = if self.detection.accepted.is_none() {
+                    theme().semantic.warn
+                } else {
+                    theme().header_ink
+                };
+                let _ = painter.lay_out_at(view, fx, text_y, shown, Colours::plain(ink));
+                hits.push((fx..fx + w, Hit::FormatChip));
             }
         }
 
@@ -534,6 +554,7 @@ impl RowSource for Document {
         // editor is up is still the thing on top.
         self.draw_rules(painter, view, cells);
         self.draw_wizard(painter, view, cells);
+        self.draw_format_menu(painter, view, cells);
 
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
         // query on its first line, then the rows, the selected one filled. Rows are remembered by
@@ -765,6 +786,46 @@ impl Document {
         );
     }
 
+    /// §6.1's chip menu, dropped from the chip at the right of the command bar.
+    fn draw_format_menu(&self, painter: &mut Painter, view: &View, cells: &CellModel) {
+        let Some(rows) = self.format_menu.as_ref() else {
+            self.chrome.format_hits.borrow_mut().clear();
+            return;
+        };
+        let cell_w = painter.cell_width();
+        let row_h = painter.row_height();
+        let width = view.hgrid().viewport_px();
+        let box_w = (FORMAT_MENU_CELLS as f32 * cell_w).min(width).max(0.0);
+        // Under the chip, which is at the right edge — so the menu hangs from the right too.
+        let box_x = (width - box_w - cell_w).max(0.0);
+        let box_y = view.chrome_px();
+        let box_h = row_h * rows.len() as f32 + 8.0;
+        painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
+        let inner_x = box_x + cell_w;
+        let inner_cells = ((box_w / cell_w) as usize).saturating_sub(2);
+        let mut y = box_y + 4.0;
+        let mut hits = self.chrome.format_hits.borrow_mut();
+        hits.clear();
+        for (i, row) in rows.iter().enumerate() {
+            if row.selected {
+                painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
+            }
+            let ink = match row.action {
+                FormatAction::Separator => theme().field_hint,
+                _ => theme().ink,
+            };
+            let _ = painter.lay_out_at(
+                view,
+                inner_x,
+                y,
+                tailhawk_core::widget::fit_from_right(cells, &row.label, inner_cells),
+                Colours::plain(ink),
+            );
+            hits.push((y..y + row_h, i));
+            y += row_h;
+        }
+    }
+
     /// The line §6.2 defines a format from, and the lines it previews over: the top visible row
     /// and the rows after it, **raw**.
     ///
@@ -784,8 +845,23 @@ impl Document {
             .collect()
     }
 
+    /// §6.5's first tier, and §6.1's "Plain text": show the file exactly as it is written.
+    ///
+    /// The detection is left as it was found rather than emptied, so the chip goes on saying what
+    /// *was* detected — the user turned columns off, they did not disprove the format, and the way
+    /// back to it is the same menu.
+    fn show_as_written(&mut self) {
+        self.detection.accepted = None;
+        self.layout = None;
+        self.header = None;
+        self.column_defaults = None;
+        self.filtering.sort = None;
+        self.palette = Palette::new(Command::entries_for(None));
+        self.presented.clear();
+    }
+
     /// Installs `format` over this document — where §6.2's Save lands, and where §6.1's chip
-    /// override will land. The layout is measured from the head sample, as an open measures it.
+    /// override lands. The layout is measured from the head sample, as an open measures it.
     fn adopt_format(&mut self, format: &'static tailhawk_core::format::Format) {
         let lines = match self.set.snapshot().last() {
             Some(newest) => detect::head_lines(&*newest.file, newest.charset),
@@ -1074,6 +1150,7 @@ impl Document {
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             wizard_overlay: None,
+            format_menu: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -1133,6 +1210,7 @@ impl Document {
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             wizard_overlay: None,
+            format_menu: None,
             layout,
             presented: Vec::new(),
             open_at_tail: true,
@@ -3324,6 +3402,8 @@ struct Chrome {
     /// on its first field.
     #[allow(clippy::type_complexity)]
     wizard_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, std::ops::Range<f32>, usize)>>,
+    /// §6.1's chip menu rows, by y.
+    format_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
 }
 
 /// V9's rules editor as one frame should draw it — see [`Document::rules_overlay`].
@@ -3700,6 +3780,7 @@ enum Command {
     EditRules,
     DefineFormat,
     ImportLayout,
+    FormatMenu,
     OpenRules,
     ReloadRules,
     GoToTop,
@@ -3792,6 +3873,7 @@ impl Command {
             "",
         ),
         (Command::EditRules, "Highlight rules…", "Ctrl+H"),
+        (Command::FormatMenu, "Format…", ""),
         (Command::DefineFormat, "Define format from a line…", ""),
         (Command::ImportLayout, "Import layout from config…", ""),
         (
@@ -3877,6 +3959,106 @@ enum Hit {
     /// A chip's `×`: removes it.
     ChipClose(usize),
     Tab(usize),
+    /// §6.1's format chip, at the right of the bar: opens its menu.
+    FormatChip,
+}
+
+/// What choosing a row of §6.1's chip menu does.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum FormatAction {
+    /// Take this format, whatever detection made of it.
+    Adopt(&'static tailhawk_core::format::Format),
+    /// §6.5's first tier: show the file as it is written.
+    PlainText,
+    /// §6.2 and §6.3, the two doors the menu offers onto the wizard.
+    Define,
+    Import,
+    /// A rule between groups; not choosable.
+    Separator,
+}
+
+/// One row of §6.1's chip menu.
+#[derive(Clone, PartialEq, Debug)]
+struct FormatRow {
+    label: String,
+    action: FormatAction,
+    selected: bool,
+}
+
+/// §6.1's menu for `detection`, with `selected` marked.
+///
+/// Free so the menu's *contents* can be tested without a window — which is where §6.1's rules
+/// actually live: the tick against what is in force, and the runner-up shown only when the margin
+/// is short enough that the pick was close.
+fn format_menu_of(detection: &Detection, selected: usize) -> Vec<FormatRow> {
+    let mut rows: Vec<FormatRow> = Vec::new();
+    let close = match (detection.best(), detection.runner_up()) {
+        (Some(best), Some(second)) => best.score < second.score * detect::ACCEPT_MARGIN,
+        _ => false,
+    };
+    // The accepted format, then the runner-up when the two were close. §6.1 shows the runner-up
+    // precisely so a near-miss is visible rather than resolved silently.
+    let shown = if close { 2 } else { 1 };
+    for candidate in detection.candidates.iter().take(shown) {
+        let tick = if detection.accepted == Some(candidate.format) {
+            "✓"
+        } else {
+            " "
+        };
+        rows.push(FormatRow {
+            label: format!(
+                "{tick} {}  {:.0}%",
+                candidate.format.name,
+                candidate.quality * 100.0
+            ),
+            action: FormatAction::Adopt(candidate.format),
+            selected: false,
+        });
+    }
+    let tick = if detection.accepted.is_none() {
+        "✓"
+    } else {
+        " "
+    };
+    rows.push(FormatRow {
+        label: format!("{tick} Plain text"),
+        action: FormatAction::PlainText,
+        selected: false,
+    });
+    rows.push(FormatRow {
+        label: "─".repeat(FORMAT_MENU_CELLS),
+        action: FormatAction::Separator,
+        selected: false,
+    });
+    rows.push(FormatRow {
+        label: "  Define format from a line…".to_owned(),
+        action: FormatAction::Define,
+        selected: false,
+    });
+    rows.push(FormatRow {
+        label: "  Import layout from config…".to_owned(),
+        action: FormatAction::Import,
+        selected: false,
+    });
+    if let Some(row) = rows.get_mut(selected) {
+        row.selected = true;
+    }
+    rows
+}
+
+/// The first row of §6.1's menu that can be chosen, stepping by `by` from `from`.
+fn format_menu_step(rows: &[FormatRow], from: usize, by: isize) -> usize {
+    let mut at = from as isize;
+    for _ in 0..rows.len() {
+        at += by;
+        if at < 0 || at >= rows.len() as isize {
+            return from;
+        }
+        if rows[at as usize].action != FormatAction::Separator {
+            return at as usize;
+        }
+    }
+    from
 }
 
 /// The bar's geometry, in cells. The find field is wide enough for a real query; the new-chip
@@ -3898,6 +4080,7 @@ impl Default for Chrome {
             palette_hits: std::cell::RefCell::new(Vec::new()),
             rules_hits: std::cell::RefCell::new(Vec::new()),
             wizard_hits: std::cell::RefCell::new(Vec::new()),
+            format_hits: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -4182,6 +4365,12 @@ const PALETTE_CELLS: usize = 64;
 const RULES_CELLS: usize = 120;
 const RULES_PATTERN_CELLS: usize = 40;
 
+/// The narrowest §6.1's chip is drawn at. Below this the bar has no room for it at all.
+const FORMAT_CHIP_MIN_CELLS: usize = 10;
+
+/// §6.1's chip menu, in cells.
+const FORMAT_MENU_CELLS: usize = 44;
+
 /// The format wizard box's width, in cells.
 const WIZARD_CELLS: usize = 132;
 
@@ -4375,6 +4564,8 @@ struct Shell {
     wizard_editing: Option<(WizardCell, TextField)>,
     /// §6.3's folder scan, while its findings are being chosen from.
     wizard_found: Vec<tailhawk_core::template::Found>,
+    /// §6.1's chip menu while it is down, and which row the keyboard is on.
+    format_menu: Option<usize>,
     /// Where `tailhawk.formats.toml` is looked for and written — `SPEC.md` §12.4's tiers.
     formats_tiers: Vec<PathBuf>,
     /// Rules from tiers the editor cannot write — a curated file beside the exe. Applied under
@@ -4642,6 +4833,7 @@ impl Shell {
         let status = self.status_text();
         let rules_overlay = self.rules_overlay();
         let wizard_overlay = self.wizard_overlay();
+        let format_menu = self.format_menu_rows();
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
@@ -4691,6 +4883,7 @@ impl Shell {
                     // whatever the split, and over the pane the user is looking at first.
                     doc.rules_overlay = if i == 0 { rules_overlay.clone() } else { None };
                     doc.wizard_overlay = if i == 0 { wizard_overlay.clone() } else { None };
+                    doc.format_menu = if i == 0 { format_menu.clone() } else { None };
                     doc.show_footer = i + 1 == pane_count;
                     doc.status = if doc.show_footer {
                         status.clone()
@@ -5454,6 +5647,61 @@ impl Shell {
         self.retitle(hwnd);
     }
 
+    /// §6.1's menu as this frame should draw it, or `None` when the chip is not open.
+    fn format_menu_rows(&self) -> Option<Vec<FormatRow>> {
+        let selected = self.format_menu?;
+        let doc = self.document.as_ref()?;
+        Some(format_menu_of(&doc.detection, selected))
+    }
+
+    /// §6.1's keys while the menu is down. Modal, as the palette is.
+    fn format_menu_key(&mut self, hwnd: HWND, key: u16) -> bool {
+        let Some(selected) = self.format_menu else {
+            return false;
+        };
+        let rows = match self.format_menu_rows() {
+            Some(rows) => rows,
+            None => {
+                self.format_menu = None;
+                return false;
+            }
+        };
+        match key {
+            k if k == VK_ESCAPE.0 => self.format_menu = None,
+            k if k == VK_UP.0 => self.format_menu = Some(format_menu_step(&rows, selected, -1)),
+            k if k == VK_DOWN.0 => self.format_menu = Some(format_menu_step(&rows, selected, 1)),
+            k if k == VK_RETURN.0 => {
+                let action = rows.get(selected).map(|row| row.action);
+                self.format_menu = None;
+                if let Some(action) = action {
+                    self.run_format_action(action);
+                }
+            }
+            // Every other key is swallowed: the menu is modal while it is down.
+            _ => {}
+        }
+        self.after_chrome_key(hwnd)
+    }
+
+    /// §6.1's choices: take a format, drop back to plain text, or open one of the wizard's doors.
+    fn run_format_action(&mut self, action: FormatAction) {
+        match action {
+            FormatAction::Adopt(format) => {
+                if let Some(doc) = self.document.as_mut() {
+                    doc.adopt_format(format);
+                }
+            }
+            FormatAction::PlainText => {
+                if let Some(doc) = self.document.as_mut() {
+                    doc.show_as_written();
+                }
+            }
+            FormatAction::Define => self.open_wizard(),
+            FormatAction::Import => self.open_import(),
+            FormatAction::Separator => {}
+        }
+    }
+
     /// The wizard as this frame should draw it, or `None` when it is not up.
     fn wizard_overlay(&self) -> Option<WizardOverlay> {
         wizard_overlay_of(
@@ -5925,6 +6173,12 @@ impl Shell {
                 self.open_import();
                 return true;
             }
+            // §6.1's menu is a click target on the chip; §13 wants a key to it too, and a
+            // control reachable only by mouse is one a screen reader cannot reach at all.
+            Command::FormatMenu => {
+                self.format_menu = Some(0);
+                return true;
+            }
             Command::OpenRules => {
                 self.open_rules_file();
                 return true;
@@ -6057,6 +6311,7 @@ impl Shell {
             | Command::EditRules
             | Command::DefineFormat
             | Command::ImportLayout
+            | Command::FormatMenu
             | Command::OpenRules
             | Command::ReloadRules
             | Command::CloseTab => {}
@@ -6298,6 +6553,26 @@ impl Shell {
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
     /// chip is removed. Returns whether the click was the bar's.
     fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, extend: bool) -> bool {
+        // §6.1's menu is modal while it is down: a click on a row takes it, anywhere else closes.
+        if self.format_menu.is_some() {
+            let hit = self.document.as_ref().and_then(|doc| {
+                doc.chrome
+                    .format_hits
+                    .borrow()
+                    .iter()
+                    .find(|(range, _)| range.contains(&y))
+                    .map(|(_, row)| *row)
+            });
+            let action = hit.and_then(|row| {
+                self.format_menu_rows()
+                    .and_then(|rows| rows.get(row).map(|r| r.action))
+            });
+            self.format_menu = None;
+            if let Some(action) = action {
+                self.run_format_action(action);
+            }
+            return self.after_chrome_key(hwnd);
+        }
         // §6.2's box is modal for the same reason §5's is: a click on the ruler picks a field, and
         // a click anywhere else is swallowed rather than dragging a selection through log text
         // the box is covering.
@@ -6396,6 +6671,21 @@ impl Shell {
         };
         match hit {
             Some(Hit::Tab(_)) => {}
+            // §6.1: the chip is the door to everything the format can be changed to. It opens on
+            // the row that is in force, so the first thing under the pointer is where you are.
+            Some(Hit::FormatChip) => {
+                let rows = format_menu_of(&doc.detection, 0);
+                let at = rows
+                    .iter()
+                    .position(|row| match row.action {
+                        FormatAction::Adopt(format) => doc.detection.accepted == Some(format),
+                        FormatAction::PlainText => doc.detection.accepted.is_none(),
+                        _ => false,
+                    })
+                    .unwrap_or(0);
+                self.format_menu = Some(at);
+                return self.after_chrome_key(hwnd);
+            }
             Some(Hit::Chip(i)) if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
                 doc.edit_chip(i);
             }
@@ -7942,7 +8232,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
-                    shell.wizard_key(hwnd, wparam.0 as u16, ctrl, shift)
+                    shell.format_menu_key(hwnd, wparam.0 as u16)
+                        || shell.wizard_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.rules_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.view_key(hwnd, wparam.0 as u16, ctrl)
@@ -8583,6 +8874,7 @@ fn main() -> Result<()> {
             wizard_selected: 0,
             wizard_editing: None,
             wizard_found: Vec::new(),
+            format_menu: None,
             formats_tiers,
             rules_fixed: Vec::new(),
             rule_specs,
@@ -11135,6 +11427,84 @@ mod tests {
             "the only layout of appsettings.json, not the list's third"
         );
         assert_eq!(nth_in_file(&all, 9), 0, "out of range is not a panic");
+    }
+
+    fn a_detection(accepted: bool, close: bool) -> Detection {
+        let serilog = tailhawk_core::format::by_id("serilog-file").expect("catalogue");
+        let log4net = tailhawk_core::format::by_id("log4net").expect("catalogue");
+        let candidate = |format, score: f32| detect::Candidate {
+            format,
+            score,
+            quality: score,
+            match_rate: score,
+            field_validity: 1.0,
+            coverage: 1.0,
+        };
+        Detection {
+            accepted: accepted.then_some(serilog),
+            self_described: None,
+            sampled: 6,
+            candidates: vec![
+                candidate(serilog, 0.99),
+                candidate(log4net, if close { 0.95 } else { 0.20 }),
+            ],
+        }
+    }
+
+    #[test]
+    fn the_chip_menu_ticks_what_is_in_force() {
+        let rows = format_menu_of(&a_detection(true, false), 0);
+        assert!(rows[0].label.starts_with("✓ Serilog"), "{}", rows[0].label);
+        assert!(rows.iter().any(|r| r.label == "  Plain text"));
+        assert!(rows.iter().any(|r| r.action == FormatAction::Define));
+        assert!(rows.iter().any(|r| r.action == FormatAction::Import));
+
+        let rows = format_menu_of(&a_detection(false, false), 0);
+        assert!(
+            rows.iter().any(|r| r.label == "✓ Plain text"),
+            "nothing accepted means the file is shown as written, and the tick says so"
+        );
+    }
+
+    #[test]
+    fn the_runner_up_is_shown_only_when_the_pick_was_close() {
+        let clear = format_menu_of(&a_detection(true, false), 0);
+        assert_eq!(
+            clear
+                .iter()
+                .filter(|r| matches!(r.action, FormatAction::Adopt(_)))
+                .count(),
+            1,
+            "a clear win needs no runner-up: {clear:?}"
+        );
+        let close = format_menu_of(&a_detection(true, true), 0);
+        assert_eq!(
+            close
+                .iter()
+                .filter(|r| matches!(r.action, FormatAction::Adopt(_)))
+                .count(),
+            2,
+            "§6.1 shows the runner-up under a 15% margin so a near-miss is visible"
+        );
+        assert!(close[1].label.contains("log4net"));
+    }
+
+    #[test]
+    fn stepping_the_chip_menu_skips_the_rule_between_its_groups() {
+        let rows = format_menu_of(&a_detection(true, false), 0);
+        let rule = rows
+            .iter()
+            .position(|r| r.action == FormatAction::Separator)
+            .expect("a separator");
+        assert_eq!(
+            format_menu_step(&rows, rule - 1, 1),
+            rule + 1,
+            "down from the last row of a group lands past the rule, not on it"
+        );
+        assert_eq!(format_menu_step(&rows, rule + 1, -1), rule - 1);
+        assert_eq!(format_menu_step(&rows, 0, -1), 0, "the top does not wrap");
+        let last = rows.len() - 1;
+        assert_eq!(format_menu_step(&rows, last, 1), last, "nor the bottom");
     }
 
     #[test]
