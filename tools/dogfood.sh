@@ -42,6 +42,18 @@ if [ "$stop_only" -eq 1 ]; then
   exit 0
 fi
 
+# **Build before launching, and that is not belt-and-braces.** `docs/HANDOFF.md` asks for the
+# *newest working version* to be the one running, and the obvious way to satisfy that — restart
+# after the gate — does not: `cargo test --workspace` builds the bin's **test harness**, not the
+# plain `tailhawk.exe`. So a run that went build-free left this script relaunching whatever binary
+# happened to be on disk. It was caught by reading a label in a screenshot that the source no
+# longer contained; nothing else would have said so.
+echo "building the release binary so the newest version is the one that runs..."
+if ! cargo build --release -p tailhawk 2>&1 | grep -E "^error" -A 6; then
+  : # grep found no errors, which is the good case
+fi
+[ -x "$exe" ] || { echo "the build produced no binary at $exe" >&2; exit 1; }
+
 (nohup "$exe" "$log" >/dev/null 2>&1 &)
 sleep 2
 
