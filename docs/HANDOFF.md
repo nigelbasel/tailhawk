@@ -1,10 +1,80 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-18, session 20 (the project now runs in Nimbalyst)
+## ▶ Resume point — 2026-08-20, session 22
 
-**Where the plan is:** M7 has **one item left — V9's rules *editor* and format *wizard* as UI**
-(the rules file and the config import stand in), plus Mica, `WM_POINTER` inertia and the
-horizontal scrollbar below as polish.
+**Master is green at `93a0710`.** Working tree clean, CI green on x64 and arm64, and the dogfood
+instance is running on the current build.
+
+### What landed today
+
+- **§2.2's menu bar draws and answers.** Seven conventional menus — File, Edit, View, Format,
+  Rules, Settings, Help. `Alt` focuses and reveals mnemonics, `Alt`+letter opens, the arrows walk
+  it, the mouse hovers and clicks, and a click that only dismisses is swallowed. `Cut`/`Paste` are
+  shown permanently disabled: this is a viewer, but an Edit menu without them reads as broken.
+- **§1.2's discoverability rule is a test now.** `every_listed_command_appears_in_at_least_one_menu`
+  failed on first run naming nine commands in no menu; all nine were placed. That broke mnemonic
+  uniqueness in four places, which a second test caught.
+- **The application icon**, in the PE resource — taskbar, Alt+Tab, title bar and Explorer.
+- **A PE version resource**, `YYYY.M.D.<seconds/2>`, readable with `GetFileVersionInfo`. Both the
+  icon and the version are written into a `.res` **built by hand in `build.rs`** — no crate, no
+  `rc.exe`, and architecture-neutral, which the green arm64 leg proves.
+- **"Tee" became "Keep saving…"** everywhere, because the owner did not recognise the Unix term.
+
+### Read this before touching the column header
+
+The owner made five observations about it. **Three of them are the same shape: the capability
+exists and the affordance does not.** Verified in source, not inferred:
+
+1. The header **already has a `header_bg` fill**. Dark is `[0.11,0.12,0.14]` against a
+   `[0.071,0.078,0.090]` background; light is `[0.92,0.92,0.91]` against `[0.985,0.985,0.98]`.
+   The band is drawn and cannot be seen. **The bug is contrast, not a missing band** — an earlier
+   note in this file said "ink only" and was wrong.
+2. **Column resize, reorder and click-to-sort all work today** — `header_cell`,
+   `column_boundaries`, `begin_resize`/`resize_to`, `drop_column`, `cycle_sort`. Nothing is drawn
+   for any of them, so the only place the resize is documented is a palette description.
+3. **There is no cursor feedback anywhere in the shell.** No `WM_SETCURSOR`, no `SetCursor`, no
+   `IDC_SIZEWE`. The class sets `IDC_ARROW` once at registration and that is all.
+4. **The filter model already parses field-scoped predicates** (`attributes.<key>`, or a bare
+   column name). Per-column filtering is an affordance gap, not an engine gap. Note
+   `UI-DESIGN.md` marks per-field filter *actions* `[v2]`.
+5. The owner suggests the **chrome face**, so it reads like a Windows ListView. **Not decided** —
+   they said so explicitly. The tension to resolve first: resize and reorder hit-test in **cells**,
+   and `SPEC.md` §3.3 makes the cell grid win, so a proportional label cannot sit over the column
+   it names without a separate measurement path or accepting misalignment.
+
+**Constraints any answer must survive**, and the first is the one most likely to decide it:
+
+- **High contrast sets `header_bg = background`.** Any answer resting on a fill is worth nothing
+  there. A rule derived from the foreground is worth 21:1.
+- `UI-DESIGN.md` requires **persistent controls, not hover**, because of M7b's RDP path.
+- The chrome face is missing glyphs. Only `U+25BA`, `U+25BC`, `U+00D7`, `U+25CF`, `U+25CB` are
+  proven by `the_chrome_face_has_the_markers_the_chrome_draws`. **`U+2713` is `.notdef`** and cost
+  a tofu box this session. `U+25B2` is unproven — extend that test before drawing a sort arrow.
+- There is **no bold face**: the atlas holds the grid face and the chrome face, nothing else.
+
+Still unverified and load-bearing: the contrast arithmetic and which colour space those floats are
+in, and whether `suppress_rules` gates rule emission — which decides whether drawing a header rule
+quietly changes documented high-contrast behaviour.
+
+### ⚠ The `Workflow` tool does not work on this project
+
+Two runs, ~1.3M tokens, nothing produced. **Background subagents cannot surface a permission
+prompt; their tool calls resolve straight to denial**, with no prompt to the owner and no error
+surfaced anywhere. Confirmed by the owner sitting idle through an 8.3-minute run and seeing
+nothing, and by the contrast with a **synchronous** `Explore` agent, which read `theme.rs` without
+trouble. It is not the allow-list and not the owner interrupting; both were tested and eliminated.
+
+**Use synchronous agents or the main loop.** The main loop verified all four observations above
+without difficulty.
+
+### Where the plan is
+
+M7 has **one item left — V9's format *wizard* UI, part 4b: the §6.1 format chip menu** (the rules
+editor and the define-from-example overlay are done), plus Mica, `WM_POINTER` inertia and the
+horizontal scrollbar below as polish. Then M7b (RDP), M8 (CLI, settings, i18n), M9 (ship).
+
+Also open, small: **"Stop saving" is enabled whenever a document is open** rather than only when a
+tee is live. It is gated on `open`, and there is no accessor for "a tee is running".
 
 ### The column header does not read as a header — raised 2026-08-20, deferred by the owner
 
