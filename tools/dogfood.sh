@@ -61,8 +61,16 @@ if powershell -NoProfile -Command \
      "if (Get-CimInstance Win32_Process -Filter \"Name='tailhawk.exe'\" |
             Where-Object { \$_.CommandLine -match 'agent\.log' }) { exit 0 } else { exit 1 }" \
      >/dev/null 2>&1; then
-  "$root/tools/agentlog.sh" INFO note "dogfood instance restarted on the freshly built binary, tailing logs/agent.log"
-  echo "tailhawk is up on logs/agent.log"
+  # The version comes from the file's own PE resource rather than from anything this script knows,
+  # so the log records what is *actually* running. That is the whole point of stamping it: the day
+  # a rename appeared to have no effect, nothing could answer "is this the new binary?".
+  # `cygpath`, because `$exe` is a POSIX path and PowerShell cannot resolve one. Without it the
+  # lookup fails silently and the log says "unknown", which is how this line was caught.
+  win_exe=$(cygpath -w "$exe" 2>/dev/null || echo "$exe")
+  version=$(powershell -NoProfile -Command \
+    "[System.Diagnostics.FileVersionInfo]::GetVersionInfo('$win_exe').FileVersion" 2>/dev/null | tr -d '\r')
+  "$root/tools/agentlog.sh" INFO note "dogfood instance restarted on tailhawk ${version:-unknown}, tailing logs/agent.log"
+  echo "tailhawk ${version:-unknown} is up on logs/agent.log"
 else
   echo "tailhawk did not come up" >&2
   exit 1

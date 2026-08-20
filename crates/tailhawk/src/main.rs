@@ -16,6 +16,7 @@
 
 mod icon;
 mod menubar;
+mod version;
 
 use menubar::{menu_frame_of, MenuFrame, MenuHit};
 
@@ -4959,10 +4960,14 @@ impl Shell {
 
     fn refresh_title(&self, hwnd: HWND) {
         let status = self.status_text();
+        // The build, in the one place a person looks to identify a window. It earns its space:
+        // the day a shipped rename appeared to do nothing, there was no way to tell whether this
+        // window was the new binary or yesterday's — see [`version`].
+        let name = format!("Tailhawk {}", version::VERSION);
         let title = if status.is_empty() {
-            String::from("Tailhawk")
+            name
         } else {
-            format!("Tailhawk — {status}")
+            format!("{name} — {status}")
         };
         set_title(hwnd, &title);
         if self.pending.is_none() && self.reading.is_empty() {

@@ -11,6 +11,13 @@
 //! from a linker resource and nothing else. `assets/tailhawk.ico` is written by
 //! `tools/make-icon.ps1` alongside these, ready for M9's installer to point at when that arrives.
 //!
+//! **That gap is now cheap to close, and the reasoning above is worth re-reading before someone
+//! does.** The argument against a linker resource was the toolchain it drags in — a `build.rs`, a
+//! resource compiler to find, a crate with 23 transitive dependencies. `build.rs` now hand-builds a
+//! `.res` for the version stamp with none of that, so adding `RT_GROUP_ICON` and `RT_ICON` entries
+//! beside it is a few dozen lines against machinery that already exists and is tested. The runtime
+//! path here would stay regardless: it is what gives a per-monitor-DPI window the right cut.
+//!
 //! The artwork itself is generated: `tools/make-icon.ps1` draws it, so a change of palette is a
 //! change of two constants rather than an export from a drawing program nobody has.
 
