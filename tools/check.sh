@@ -36,7 +36,39 @@ step() {
 
 step "fmt" cargo fmt -p tailhawk -p tailhawk-core -- --check
 step "clippy" cargo clippy --release -p tailhawk -p tailhawk-core --all-targets -- -D warnings
-step "test" cargo test --release --workspace
+
+# The suite, kept in a file so the known timing flake can be told apart from a real failure.
+echo
+echo "=== test ==="
+if cargo test --release --workspace > "$root/target/check-test.log" 2>&1; then
+  echo "ok"
+else
+  # `semantic::tests::a_screenful_costs_a_fraction_of_a_frame` is a timing criterion documented in
+  # `CLAUDE.md`: it fails under the full parallel suite on a loaded machine and passes alone. The
+  # rule there is to rerun it alone before blaming a change, so that is done here rather than left
+  # to whoever reads the log — but **only** when it is the sole failure. Anything alongside it is a
+  # real failure and the gate stays red.
+  failed=$(grep -cE '^test .* FAILED' "$root/target/check-test.log" || true)
+  flake=$(grep -cE '^test semantic::tests::a_screenful_costs_a_fraction_of_a_frame \.\.\. FAILED' \
+    "$root/target/check-test.log" || true)
+  if [ "$failed" = "1" ] && [ "$flake" = "1" ]; then
+    echo "the known timing flake failed under the parallel suite; rerunning it alone"
+    if cargo test --release -p tailhawk-core a_screenful_costs_a_fraction_of_a_frame >/dev/null 2>&1
+    then
+      echo "ok (the flake passes alone, as CLAUDE.md says it does)"
+      "$root/tools/agentlog.sh" INFO test \
+        "the screenful timing flake failed under the parallel suite and passed alone — not a regression"
+    else
+      echo "FAILED — it fails alone too, so this is real"
+      fail=1
+    fi
+  else
+    echo "FAILED"
+    grep -E '^test .* FAILED' "$root/target/check-test.log" || true
+    fail=1
+  fi
+  echo "full output: target/check-test.log"
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then
