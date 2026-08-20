@@ -253,6 +253,30 @@ impl Painter {
         pen - x
     }
 
+    /// Drops chrome text already queued inside the rectangle, so a surface drawn *later* actually
+    /// covers it.
+    ///
+    /// **Chrome text is a second instance buffer, drawn after every fill** — that is what lets a
+    /// field's ink sit over the field's own background without ordering the two by hand. The cost
+    /// is that a box drawn later cannot hide the text beneath it: the command bar's placeholder
+    /// reads straight through an open menu, and the gutter's line numbers through the palette.
+    /// A later surface calls this over its own box before drawing its own text, and the two rules
+    /// stop fighting.
+    ///
+    /// Whole quads only — a glyph is either under the box or it is not. A glyph straddling the
+    /// edge is kept, which is right for a box drawn against a boundary and never noticeable for
+    /// one drawn over the middle of something.
+    pub fn occlude_chrome(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        self.chrome_instances.retain(|q| {
+            let (qx, qy) = (q.pos[0], q.pos[1]);
+            let (qw, qh) = (q.size[0], q.size[1]);
+            qx < x || qy < y || qx + qw > x + w || qy + qh > y + h
+        });
+    }
+
     /// Uploads the placeholder. Until this succeeds a missing glyph draws nothing rather than a box.
     pub fn prime(&mut self, context: &ID3D11DeviceContext) -> bool {
         let grid = self.cache.prime(context);
@@ -769,7 +793,7 @@ mod tests {
             '\u{25BA}', // ► the find field's prompt
             '\u{25BC}', // ▼ the filter row, and the format chip's dropdown
             '\u{00D7}', // × a chip's remove
-            '\u{25CF}', // ● an enabled highlight rule
+            '\u{25CF}', // ● an enabled highlight rule, and §2.2's ticked menu item
             '\u{25CB}', // ○ a disabled one
         ];
         let codepoints: Vec<u32> = markers.iter().map(|c| *c as u32).collect();

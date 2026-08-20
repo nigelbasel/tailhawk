@@ -3,7 +3,30 @@
 ## ▶ Resume point — 2026-08-18, session 20 (the project now runs in Nimbalyst)
 
 **Where the plan is:** M7 has **one item left — V9's rules *editor* and format *wizard* as UI**
-(the rules file and the config import stand in), plus Mica and `WM_POINTER` inertia as polish.
+(the rules file and the config import stand in), plus Mica, `WM_POINTER` inertia and the
+horizontal scrollbar below as polish.
+
+### No horizontal scrollbar — raised 2026-08-20, deferred by the owner
+
+The owner reports that a line wider than the window cannot be scrolled. The gap is narrower than
+that sounds, and worth stating precisely before someone rebuilds machinery that already exists:
+
+- **The model is there and is fed correctly.** `HGrid` carries the offset, `overflows()` and
+  `max_offset_px()`, and `lay_out` sets its column count from the widest line **across the whole
+  set** (§5.5b), not just the live member.
+- **Three input paths already drive it**: `Shift`+wheel and a tilt wheel (`Navigate::ByColumns`),
+  `←`/`→`, and `Home`/`End` (`LineStart`/`LineEnd`).
+- **What is missing is the scrollbar.** The window is created `WS_OVERLAPPEDWINDOW | WS_VSCROLL` —
+  there is no `WS_HSCROLL`, no `WM_HSCROLL` handler and no thumb.
+
+So this is a `UI-DESIGN.md` §1.2 breach rather than a missing feature: the capability exists but
+nothing on screen advertises it, and §1.2 requires the mouse and the keyboard to *each* be a
+complete path. Adding `WS_HSCROLL`, a `WM_HSCROLL` arm alongside the existing `WM_VSCROLL` one, and
+a `SetScrollInfo` fed from `HGrid::content_px`/`max_offset_px` is the whole job.
+
+**Not confirmed on screen.** The reading above is from the source; the live check was not made
+because the dogfood window was too narrow to judge and the single-instance forwarding blocks
+`shot.ps1` while that window is up. Confirm before assuming the keyboard paths really work.
 Then M7b (RDP path), M8's i18n externalisation, M9 (installer, signing, docs). Session 19 landed
 **E22 sort + top-N** (`fe732be`, reviewed, pushed) and paused for the tool change.
 
