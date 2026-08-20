@@ -344,7 +344,6 @@ impl RowSource for Document {
         let row_h = painter.row_height();
         let band = view.chrome_px();
         let width = view.hgrid().viewport_px();
-        let cells = view.cells();
         let mut hits = self.chrome.hits.borrow_mut();
         hits.clear();
 
@@ -568,61 +567,56 @@ impl RowSource for Document {
 
         // V9's rules editor, under the palette — §5. Before it, so a palette opened while the
         // editor is up is still the thing on top.
-        self.draw_rules(painter, view, cells);
-        self.draw_wizard(painter, view, cells);
-        self.draw_format_menu(painter, view, cells);
+        self.draw_rules(painter, view);
+        self.draw_wizard(painter, view);
+        self.draw_format_menu(painter, view);
 
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
         // query on its first line, then the rows, the selected one filled. Rows are remembered by
         // their y for the click.
         self.chrome.palette_hits.borrow_mut().clear();
         if self.palette.is_open() {
-            let box_x = view.gutter_px() + cell_w;
-            let box_w = (PALETTE_CELLS as f32 * cell_w).min(width - box_x - cell_w);
+            let chrome_h = painter.chrome_line_height();
+            let pad = painter.chrome_measure("n").max(4.0);
+            let em = painter.chrome_measure("0").max(1.0);
+            let box_x = view.gutter_px() + pad;
+            let box_w = (PALETTE_CELLS as f32 * em).min(width - box_x - pad);
             let rows = self.palette.rows();
-            let box_h = row_h * (rows.len() + 1) as f32 + 8.0;
+            let box_h = chrome_h * (rows.len() + 1) as f32 + 8.0;
             let box_y = band;
             painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
-            let inner_x = box_x + cell_w;
+            let inner_x = box_x + pad;
             let mut y = box_y + 4.0;
-            let _ = painter.lay_out_at(view, inner_x, y, "▸", Colours::plain(theme().field_hint));
+            let prompt = painter.chrome_run("►", inner_x, y, theme().field_hint);
+            let field_x = inner_x + prompt + pad * 0.5;
             draw_field(
                 painter,
                 &self.palette.field,
                 true,
-                inner_x + 2.0 * cell_w,
+                field_x,
                 y,
-                (PALETTE_CELLS - 4) as f32 * painter.chrome_measure("0").max(1.0),
+                (box_x + box_w - pad - field_x).max(0.0),
                 "type a command, or a line number",
             );
-            y += row_h;
+            y += chrome_h;
             let mut hits = self.chrome.palette_hits.borrow_mut();
             for (i, row) in rows.iter().enumerate() {
                 if row.selected {
-                    painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
+                    painter.fill(box_x, y, box_w, chrome_h, theme().palette_selected_bg);
                 }
-                let key_cells = cells.cell_count(row.key);
-                let label_avail = (PALETTE_CELLS - 4).saturating_sub(key_cells + 2);
-                let label = tailhawk_core::widget::fit_from_right(cells, &row.label, label_avail);
-                let _ = painter.lay_out_at(
-                    view,
-                    inner_x + 2.0 * cell_w,
-                    y,
-                    label,
-                    Colours::plain(theme().ink),
-                );
+                // The accelerator is right-aligned against the box's edge, so the label's room is
+                // whatever is left — measured, because a proportional key column has no width in
+                // cells.
+                let key_w = painter.chrome_measure(row.key);
+                let label_x = inner_x + pad;
+                let label_w = (box_x + box_w - pad - key_w - pad - label_x).max(0.0);
+                chrome_line(painter, label_x, y, label_w, &row.label, theme().ink);
                 if !row.key.is_empty() {
-                    let kx = box_x + box_w - (key_cells as f32 + 1.0) * cell_w;
-                    let _ = painter.lay_out_at(
-                        view,
-                        kx,
-                        y,
-                        row.key,
-                        Colours::plain(theme().field_hint),
-                    );
+                    let kx = box_x + box_w - key_w - pad;
+                    painter.chrome_run(row.key, kx, y, theme().field_hint);
                 }
-                hits.push((y..y + row_h, i));
-                y += row_h;
+                hits.push((y..y + chrome_h, i));
+                y += chrome_h;
             }
         }
     }
@@ -670,47 +664,58 @@ impl Document {
     ///
     /// The rows behind this box are the live preview: the shell has already rebuilt the
     /// highlighter from the set under edit, so there is nothing to draw here for it.
-    fn draw_rules(&self, painter: &mut Painter, view: &View, cells: &CellModel) {
+    fn draw_rules(&self, painter: &mut Painter, view: &View) {
         let Some(overlay) = self.rules_overlay.as_ref() else {
             return;
         };
-        let cell_w = painter.cell_width();
-        let row_h = painter.row_height();
+        let em = painter.chrome_measure("0").max(1.0);
+        let pad = painter.chrome_measure("n").max(4.0);
+        let row_h = painter.chrome_line_height();
         let width = view.hgrid().viewport_px();
-        let box_x = view.gutter_px() + cell_w;
-        let box_w = (RULES_CELLS as f32 * cell_w)
-            .min(width - box_x - cell_w)
-            .max(0.0);
+        let box_x = view.gutter_px() + pad;
+        let box_w = (RULES_CELLS as f32 * em).min(width - box_x - pad).max(0.0);
         // Title, the rules (or the one line that stands in for none), and the legend.
         let box_h = row_h * (overlay.rows.len().max(1) + 2) as f32 + 8.0;
         let box_y = view.chrome_px();
         painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
-        let inner_x = box_x + cell_w;
+        let inner_x = box_x + pad;
         // What fits inside the box, so nothing this draws bleeds onto the grid behind it.
-        let inner_cells = ((box_w / cell_w) as usize).saturating_sub(2);
+        let inner_w = (box_w - pad * 2.0).max(0.0);
         let mut y = box_y + 4.0;
-        let _ = painter.lay_out_at(
-            view,
+        chrome_line(
+            painter,
             inner_x,
             y,
-            tailhawk_core::widget::fit_from_right(cells, &overlay.title, inner_cells),
-            Colours::plain(theme().header_ink),
+            inner_w,
+            &overlay.title,
+            theme().header_ink,
         );
         y += row_h;
 
         // §10 — the states usually neglected. A first run has no rules file, so the editor opens
         // on nothing; saying what the box is for beats an empty box with a legend under it.
         if overlay.rows.is_empty() {
-            let _ = painter.lay_out_at(
-                view,
+            chrome_line(
+                painter,
                 inner_x,
                 y,
-                tailhawk_core::widget::fit_from_right(cells, RULES_EMPTY, inner_cells),
-                Colours::plain(theme().field_hint),
+                inner_w,
+                RULES_EMPTY,
+                theme().field_hint,
             );
             y += row_h;
         }
 
+        // The row's columns, as widths rather than cell counts. `.*`/`Ab` is two characters and
+        // the swatch is one square; the pattern gets what §5 gave it, in ems of the chrome face.
+        let mark_w = painter
+            .chrome_measure(RULE_ON)
+            .max(painter.chrome_measure(RULE_OFF));
+        let kind_w = painter
+            .chrome_measure(".*")
+            .max(painter.chrome_measure("Ab"));
+        let swatch_w = em;
+        let pattern_w = (RULES_PATTERN_CELLS - 2) as f32 * em;
         let mut hits = self.chrome.rules_hits.borrow_mut();
         hits.clear();
         for (i, row) in overlay.rows.iter().enumerate() {
@@ -719,12 +724,12 @@ impl Document {
             }
             let mut x = inner_x;
             let mark = if row.enabled { RULE_ON } else { RULE_OFF };
-            let _ = painter.lay_out_at(view, x, y, mark, Colours::plain(theme().ink));
-            x += 2.0 * cell_w;
+            painter.chrome_run(mark, x, y, theme().ink);
+            x += mark_w + pad;
             // §5's `.*` / `Ab`: which of the two the pattern is read as.
             let kind = if row.literal { "Ab" } else { ".*" };
-            let _ = painter.lay_out_at(view, x, y, kind, Colours::plain(theme().field_hint));
-            x += 3.0 * cell_w;
+            painter.chrome_run(kind, x, y, theme().field_hint);
+            x += kind_w + pad;
             match overlay.editing {
                 Some((editing_row, cell, ref field)) if editing_row == i => {
                     // Which cell has the caret is otherwise invisible: all four are edited in the
@@ -735,86 +740,66 @@ impl Document {
                         tailhawk_core::ruleset::Cell::Fg => "text colour #rrggbb",
                         tailhawk_core::ruleset::Cell::Bg => "background #rrggbb",
                     };
-                    draw_field(
-                        painter,
-                        field,
-                        true,
-                        x + 2.0 * cell_w,
-                        y,
-                        (RULES_PATTERN_CELLS - 2) as f32 * painter.chrome_measure("0").max(1.0),
-                        hint,
-                    );
+                    draw_field(painter, field, true, x + swatch_w + pad, y, pattern_w, hint);
                 }
                 _ => {
                     // §5 draws the colours as swatches beside the rule rather than by tinting it,
                     // so a rule whose colour is a background is still legible in the list.
                     if let Some(bg) = row.bg {
-                        painter.fill(x, y + row_h * 0.2, cell_w, row_h * 0.6, bg);
+                        painter.fill(x, y + row_h * 0.2, swatch_w, row_h * 0.6, bg);
                     }
-                    let shown = tailhawk_core::widget::fit_from_right(
-                        cells,
-                        &row.text,
-                        RULES_PATTERN_CELLS - 2,
-                    );
                     let ink = row.fg.unwrap_or(theme().ink);
-                    let _ =
-                        painter.lay_out_at(view, x + 2.0 * cell_w, y, shown, Colours::plain(ink));
+                    chrome_line(painter, x + swatch_w + pad, y, pattern_w, &row.text, ink);
                 }
             }
-            x += (RULES_PATTERN_CELLS + 1) as f32 * cell_w;
+            x += swatch_w + pad + pattern_w + pad;
             if row.whole_line {
-                let _ = painter.lay_out_at(
-                    view,
-                    x,
-                    y,
-                    "whole line",
-                    Colours::plain(theme().field_hint),
-                );
+                x += painter.chrome_run("whole line", x, y, theme().field_hint) + pad;
             }
             // §5: the error sits inline beside its own rule, never in a dialog at the end.
             if let Some(error) = row.error.as_deref() {
                 // A regex compiler's complaint can be long; it is right-aligned in the box, so
                 // clamp it to what is left of the row rather than let it run onto the grid.
-                let room = (((box_w - (x - box_x)) / cell_w) as usize).saturating_sub(1);
-                let error = tailhawk_core::widget::fit_from_right(cells, error, room);
-                let ex = box_x + box_w - (cells.cell_count(error) as f32 + 1.0) * cell_w;
-                let _ = painter.lay_out_at(
-                    view,
-                    ex.max(x),
-                    y,
-                    error,
-                    Colours::plain(theme().semantic.error),
-                );
+                let room = (box_x + box_w - pad - x).max(0.0);
+                let mut shown = error.to_owned();
+                while !shown.is_empty() && painter.chrome_measure(&shown) > room {
+                    let cut = shown.char_indices().next_back().map_or(0, |(at, _)| at);
+                    shown.truncate(cut);
+                }
+                let ex = (box_x + box_w - pad - painter.chrome_measure(&shown)).max(x);
+                painter.chrome_run(&shown, ex, y, theme().semantic.error);
             }
             hits.push((y..y + row_h, i));
             y += row_h;
         }
-        let _ = painter.lay_out_at(
-            view,
+        chrome_line(
+            painter,
             inner_x,
             y,
-            tailhawk_core::widget::fit_from_right(cells, RULES_LEGEND, inner_cells),
-            Colours::plain(theme().field_hint),
+            inner_w,
+            RULES_LEGEND,
+            theme().field_hint,
         );
     }
 
     /// §6.1's chip menu, dropped from the chip at the right of the command bar.
-    fn draw_format_menu(&self, painter: &mut Painter, view: &View, cells: &CellModel) {
+    fn draw_format_menu(&self, painter: &mut Painter, view: &View) {
         let Some(rows) = self.format_menu.as_ref() else {
             self.chrome.format_hits.borrow_mut().clear();
             return;
         };
-        let cell_w = painter.cell_width();
-        let row_h = painter.row_height();
+        let row_h = painter.chrome_line_height();
+        let pad = painter.chrome_measure("n").max(4.0);
+        let em = painter.chrome_measure("0").max(1.0);
         let width = view.hgrid().viewport_px();
-        let box_w = (FORMAT_MENU_CELLS as f32 * cell_w).min(width).max(0.0);
+        let box_w = (FORMAT_MENU_CELLS as f32 * em).min(width).max(0.0);
         // Under the chip, which is at the right edge — so the menu hangs from the right too.
-        let box_x = (width - box_w - cell_w).max(0.0);
+        let box_x = (width - box_w - pad).max(0.0);
         let box_y = view.chrome_px();
         let box_h = row_h * rows.len() as f32 + 8.0;
         painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
-        let inner_x = box_x + cell_w;
-        let inner_cells = ((box_w / cell_w) as usize).saturating_sub(2);
+        let inner_x = box_x + pad;
+        let inner_w = (box_w - pad * 2.0).max(0.0);
         let mut y = box_y + 4.0;
         let mut hits = self.chrome.format_hits.borrow_mut();
         hits.clear();
@@ -822,17 +807,17 @@ impl Document {
             if row.selected {
                 painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
             }
-            let ink = match row.action {
-                FormatAction::Separator => theme().field_hint,
-                _ => theme().ink,
-            };
-            let _ = painter.lay_out_at(
-                view,
-                inner_x,
-                y,
-                tailhawk_core::widget::fit_from_right(cells, &row.label, inner_cells),
-                Colours::plain(ink),
-            );
+            if row.action == FormatAction::Separator {
+                painter.fill(
+                    inner_x,
+                    y + (row_h * 0.5).floor(),
+                    inner_w,
+                    1.0,
+                    theme().pane_edge,
+                );
+            } else {
+                chrome_line(painter, inner_x, y, inner_w, &row.label, theme().ink);
+            }
             hits.push((y..y + row_h, i));
             y += row_h;
         }
@@ -914,17 +899,21 @@ impl Document {
     /// Unlike [`Document::draw_rules`], whose preview is the grid behind it, this one draws its
     /// own table. A rules change repaints the same rows; a format change re-columnises the whole
     /// document, and a Cancel that had to undo that is a far larger promise than the button looks.
-    fn draw_wizard(&self, painter: &mut Painter, view: &View, cells: &CellModel) {
+    fn draw_wizard(&self, painter: &mut Painter, view: &View) {
         let Some(overlay) = self.wizard_overlay.as_ref() else {
             return;
         };
-        let cell_w = painter.cell_width();
-        let row_h = painter.row_height();
+        let em = painter.chrome_measure("0").max(1.0);
+        let pad = painter.chrome_measure("n").max(4.0);
+        let row_h = painter.chrome_line_height();
+        // **The example line, its ruler and the preview table stay in the grid's monospace.** They
+        // are log data, not chrome: §6.2's ruler marks spans *of a log line*, and a label can only
+        // sit under the span it names if both are on the same cell grid. The chrome around them —
+        // title, pattern, error, readout, findings, legend — is the system UI font like every other
+        // surface. Mixing the two is the point, not a compromise.
         let width = view.hgrid().viewport_px();
-        let box_x = view.gutter_px() + cell_w;
-        let box_w = (WIZARD_CELLS as f32 * cell_w)
-            .min(width - box_x - cell_w)
-            .max(0.0);
+        let box_x = view.gutter_px() + pad;
+        let box_w = (WIZARD_CELLS as f32 * em).min(width - box_x - pad).max(0.0);
         // Title, the example and its ruler (one line when there is no example), the pattern, the
         // error-or-readout, the preview's head, its rows or the one line standing in for none, and
         // the legend. Counted the way the branches below draw it, so the fill is the right height.
@@ -940,17 +929,11 @@ impl Document {
         let box_h = (row_h * lines as f32 + 8.0).min(view.hgrid().viewport_px());
         let box_y = view.chrome_px();
         painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
-        let inner_x = box_x + cell_w;
-        let inner_cells = ((box_w / cell_w) as usize).saturating_sub(2);
+        let inner_x = box_x + pad;
+        let inner_w = (box_w - pad * 2.0).max(0.0);
         let mut y = box_y + 4.0;
         let line = |painter: &mut Painter, y: f32, text: &str, colour: [f32; 4]| {
-            let _ = painter.lay_out_at(
-                view,
-                inner_x,
-                y,
-                tailhawk_core::widget::fit_from_right(cells, text, inner_cells),
-                Colours::plain(colour),
-            );
+            chrome_line(painter, inner_x, y, inner_w, text, colour);
         };
 
         line(painter, y, &overlay.title, theme().header_ink);
@@ -966,7 +949,7 @@ impl Document {
                     true,
                     inner_x,
                     y,
-                    inner_cells.saturating_sub(1) as f32 * painter.chrome_measure("0").max(1.0),
+                    inner_w - pad,
                     WIZARD_PASTE_HINT,
                 ),
                 _ => line(painter, y, text, theme().ink),
@@ -1012,8 +995,22 @@ impl Document {
             line(painter, y, WIZARD_EMPTY, theme().field_hint);
             y += row_h;
         } else {
-            line(painter, y, &overlay.example, theme().ink);
-            y += row_h;
+            // **The example, its ruler and the preview table are the grid's font, not the
+            // chrome's** — they are *log data*, and two things follow from that. A log line should
+            // look here exactly as it looks in the grid behind the box, and §6.2's ruler only
+            // aligns under the span it labels if every character is the same width. Everything
+            // round them — the title, the pattern, the error, the readout, the legend — is chrome
+            // and is drawn in the chrome face.
+            let cells = view.cells();
+            let cell_w = painter.cell_width();
+            let grid_h = painter.row_height();
+            let shown = tailhawk_core::widget::fit_from_right(
+                cells,
+                &overlay.example,
+                ((inner_w / cell_w) as usize).max(1),
+            );
+            let _ = painter.lay_out_at(view, inner_x, y, shown, Colours::plain(theme().ink));
+            y += grid_h;
             // The ruler is laid out as **one string**, each label held inside the span it labels —
             // which is how §6.2 draws it, and also what makes overprinting impossible. `<thread>`
             // is eight cells wide over a span of two, and drawn as its own run it would smear
@@ -1033,12 +1030,18 @@ impl Document {
                 let x = inner_x + head as f32 * cell_w;
                 let w = span as f32 * cell_w;
                 if mark.selected {
-                    painter.fill(x, y, w, row_h, theme().palette_selected_bg);
+                    painter.fill(x, y, w, grid_h, theme().palette_selected_bg);
                 }
-                hits.push((x..x + w, y..y + row_h, i));
+                hits.push((x..x + w, y..y + grid_h, i));
             }
-            line(painter, y, &ruler, theme().field_hint);
-            y += row_h;
+            let _ = painter.lay_out_at(
+                view,
+                inner_x,
+                y,
+                &ruler,
+                Colours::plain(theme().field_hint),
+            );
+            y += grid_h;
         }
 
         match overlay.editing {
@@ -1057,15 +1060,7 @@ impl Document {
                     WizardCell::Column => "column name",
                     WizardCell::Layout => WIZARD_PASTE_HINT,
                 };
-                draw_field(
-                    painter,
-                    field,
-                    true,
-                    inner_x,
-                    y,
-                    (inner_cells.saturating_sub(1)) as f32 * painter.chrome_measure("0").max(1.0),
-                    hint,
-                );
+                draw_field(painter, field, true, inner_x, y, inner_w - pad, hint);
             }
             None if overlay.layout.is_some() => line(
                 painter,
@@ -1085,14 +1080,14 @@ impl Document {
 
         // The preview's head, then its rows. Every column is clamped to the same width so one long
         // message cannot push the columns after it off the box.
-        let column_x = |i: usize| inner_x + (i * (WIZARD_COLUMN_CELLS + 1)) as f32 * cell_w;
+        let column_w = WIZARD_COLUMN_CELLS as f32 * em;
+        let column_x = |i: usize| inner_x + i as f32 * (column_w + em);
         for (i, title) in overlay.columns.iter().enumerate() {
             let x = column_x(i);
-            if x + cell_w > box_x + box_w {
+            if x + em > box_x + box_w {
                 break;
             }
-            let shown = tailhawk_core::widget::fit_from_right(cells, title, WIZARD_COLUMN_CELLS);
-            let _ = painter.lay_out_at(view, x, y, shown, Colours::plain(theme().header_ink));
+            chrome_line(painter, x, y, column_w, title, theme().header_ink);
         }
         y += row_h;
 
@@ -1108,12 +1103,10 @@ impl Document {
                 Some(fields) => {
                     for (i, text) in fields.iter().enumerate() {
                         let x = column_x(i);
-                        if x + cell_w > box_x + box_w {
+                        if x + em > box_x + box_w {
                             break;
                         }
-                        let shown =
-                            tailhawk_core::widget::fit_from_right(cells, text, WIZARD_COLUMN_CELLS);
-                        let _ = painter.lay_out_at(view, x, y, shown, Colours::plain(theme().ink));
+                        chrome_line(painter, x, y, column_w, text, theme().ink);
                     }
                 }
             }
@@ -3057,44 +3050,6 @@ fn wizard_half(example: &str, field: &tailhawk_core::wizard::Field) -> usize {
             .map_or(0, |(offset, _)| offset)
 }
 
-/// One field's stretch of §6.2's ruler, exactly `width` cells wide: `├──── ts ────┤` where the
-/// label fits between the brackets, the label alone where it does not, and a plain rule where not
-/// even that will go. The token arrives as `<ts>`; the brackets are the ruler's own.
-fn ruler_run(token: &str, width: usize) -> String {
-    let name = token.trim_start_matches('<').trim_end_matches('>');
-    // §6.2's own ruler abbreviates rather than truncating, and it is right to: `leve` under a
-    // four-cell `INFO` reads as a typo, where `lvl` reads as a label.
-    let short = match name {
-        "level" => "lvl",
-        "message" => "msg",
-        "thread" => "th",
-        "logger" => "log",
-        other => other,
-    };
-    let name = if name.chars().count() <= width {
-        name
-    } else {
-        short
-    };
-    let label: String = name.chars().take(width).collect();
-    let wide = label.chars().count();
-    if wide == 0 {
-        return "─".repeat(width);
-    }
-    let pad = width - wide - if wide + 2 <= width { 2 } else { 0 };
-    let left = pad / 2;
-    let (open, close) = if wide + 2 <= width {
-        ("├", "┤")
-    } else {
-        ("", "")
-    };
-    format!(
-        "{open}{}{label}{}{close}",
-        "─".repeat(left),
-        "─".repeat(pad - left)
-    )
-}
-
 /// Moves one edge of a field by one character of the example — §6.2's drag, from the keyboard.
 ///
 /// The model refuses a boundary that is not a character boundary, so this steps by `char_indices`
@@ -4050,7 +4005,10 @@ fn format_menu_of(detection: &Detection, selected: usize) -> Vec<FormatRow> {
         selected: false,
     });
     rows.push(FormatRow {
-        label: "─".repeat(FORMAT_MENU_CELLS),
+        // Empty: a rule between groups is drawn as a line, not as repeated box-drawing glyphs.
+        // At a proportional width those would not reach the box's edge, and they are one more
+        // codepoint to depend on the chrome face having.
+        label: String::new(),
         action: FormatAction::Separator,
         selected: false,
     });
@@ -4456,6 +4414,80 @@ const RULES_LEGEND: &str =
 /// One field: its text (cut from the left to fit), a hint when empty and unfocused, the selection
 /// as a background span, the caret as a two-pixel fill, and a mark under an IME composition.
 #[allow(clippy::too_many_arguments)]
+/// §6.2's label for one field of the ruler, fitted to the `width` pixels the field occupies.
+///
+/// Brackets when there is room for them and the label, the label alone when there is only room for
+/// that, and a rule when there is not even that. The cell-counting version this replaces could
+/// assume a character was a fixed width; here every candidate is measured, because the span's width
+/// comes from the example's own text in a proportional face.
+/// One field's stretch of §6.2's ruler, exactly `width` **cells** wide: `├──── ts ────┤` where the
+/// label fits between the brackets, the label alone where it does not, and a plain rule where not
+/// even that will go. The token arrives as `<ts>`; the brackets are the ruler's own.
+///
+/// **Cells, not pixels, and deliberately.** The ruler sits under the example line, which is log
+/// data drawn in the *grid's* font — see `draw_wizard`. A ruler measured in a proportional face
+/// would not line up with the spans it labels.
+fn ruler_run(token: &str, width: usize) -> String {
+    ruler_label(token, width as f32, &|s| s.chars().count() as f32)
+}
+
+/// [`ruler_run`] with the measuring passed in, so the choice can be tested without a device — and
+/// so the same rule serves a cell count and a pixel width.
+fn ruler_label(token: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> String {
+    let name = token.trim_start_matches('<').trim_end_matches('>');
+    // §6.2's ruler abbreviates rather than truncating: `leve` under a four-cell `INFO` reads as a
+    // typo, where `lvl` reads as a label.
+    let short = match name {
+        "level" => "lvl",
+        "message" => "msg",
+        "thread" => "th",
+        "logger" => "log",
+        other => other,
+    };
+    for label in [name, short] {
+        let w = measure(label);
+        if w <= width {
+            if measure("├┤") <= width - w {
+                return format!("├{label}┤");
+            }
+            return label.to_owned();
+        }
+    }
+    let mut cut = short.to_owned();
+    while !cut.is_empty() && measure(&cut) > width {
+        let at = cut.char_indices().next_back().map_or(0, |(at, _)| at);
+        cut.truncate(at);
+    }
+    cut
+}
+
+/// One line of an overlay, in the chrome face, cut to `width` pixels.
+///
+/// The overlays used `widget::fit_from_right`, which counts cells — and a proportional face has
+/// none. This measures instead, and cutting from the right keeps the front of the line, which is
+/// the part that identifies it.
+fn chrome_line(
+    painter: &mut Painter,
+    x: f32,
+    y: f32,
+    width: f32,
+    text: &str,
+    ink: [f32; 4],
+) -> f32 {
+    if width <= 0.0 || text.is_empty() {
+        return 0.0;
+    }
+    if painter.chrome_measure(text) <= width {
+        return painter.chrome_run(text, x, y, ink);
+    }
+    let mut shown = text.to_owned();
+    while !shown.is_empty() && painter.chrome_measure(&shown) > width {
+        let cut = shown.char_indices().next_back().map_or(0, |(at, _)| at);
+        shown.truncate(cut);
+    }
+    painter.chrome_run(&shown, x, y, ink)
+}
+
 /// One line-edit of the chrome — the find field, the new-chip field, a cell of the rules editor —
 /// drawn in the **chrome face** at a pixel width.
 ///
@@ -11374,32 +11406,35 @@ mod tests {
     }
 
     #[test]
-    fn a_ruler_run_never_outgrows_the_span_it_labels() {
+    fn a_ruler_label_never_outgrows_the_span_it_labels() {
+        // A stand-in for the chrome face: every character ten pixels wide, so the arithmetic is
+        // checkable. The real one measures Segoe UI, which is why the choice takes the measuring
+        // as an argument rather than counting characters itself.
+        let ten = |s: &str| s.chars().count() as f32 * 10.0;
         // `<thread>` over a span of two is the case that smeared across the level beside it.
-        for width in 0..12 {
+        for cells in 0..12 {
+            let width = cells as f32 * 10.0;
             for token in ["<ts>", "<thread>", "<message>", "<_>", "<a_very_long_name>"] {
-                let run = ruler_run(token, width);
-                assert_eq!(
-                    run.chars().count(),
-                    width,
-                    "{token:?} in {width} cells came out as {run:?}"
+                let run = ruler_label(token, width, &ten);
+                assert!(
+                    ten(&run) <= width,
+                    "{token:?} in {width}px came out as {run:?}, which is wider"
                 );
             }
         }
-        assert_eq!(ruler_run("<ts>", 12), "├────ts────┤");
+        assert_eq!(ruler_label("<ts>", 120.0, &ten), "├ts┤");
         assert_eq!(
-            ruler_run("<level>", 4),
-            "lvl─",
+            ruler_label("<level>", 40.0, &ten),
+            "lvl",
             "abbreviated, not truncated to \"leve\""
         );
-        assert_eq!(ruler_run("<message>", 5), "├msg┤");
+        assert_eq!(ruler_label("<message>", 50.0, &ten), "├msg┤");
         assert_eq!(
-            ruler_run("<thread>", 2),
+            ruler_label("<thread>", 20.0, &ten),
             "th",
             "too narrow for brackets, but still legible"
         );
-        assert_eq!(ruler_run("<ts>", 3), "ts─");
-        assert_eq!(ruler_run("<_>", 0), "");
+        assert_eq!(ruler_label("<_>", 0.0, &ten), "");
     }
 
     #[test]

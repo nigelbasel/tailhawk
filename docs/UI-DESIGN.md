@@ -43,6 +43,7 @@ contact. Everything else follows from five principles:
 5. **Density without noise.** This is a professional tool used all day. Compact rows, real columns,
    generous information density — but a restrained palette so that *user* highlight colours are the
    loudest thing on screen.
+6. **The four pillars of usability are requirements, not aspirations** — see §1.2.
 
 ### 1.1 What "modern, not MDI" means concretely
 
@@ -79,6 +80,48 @@ Toolbar buttons carry text, or an icon with a text label beside it, never an ico
 item names its accelerator, so the menu teaches the keyboard instead of competing with it.
 
 ---
+
+### 1.2 The four pillars, and how each is checked
+
+*(Owner's requirement, 2026-08-20. Stated here because the first five principles are about what the
+window looks like, and these are about whether anyone can use it.)*
+
+A principle that cannot fail a check is a slogan. Each pillar below has a rule that can be pointed
+at a build and answered yes or no.
+
+**Discoverability — can a user find it without being told?**
+
+- Every command in the register appears in **at least one menu**. This is a test, not an intention:
+  `Menu::ids()` and `Command::LISTED` exist to be walked against each other, and a command reachable
+  only from the palette fails it.
+- Everything reachable by keyboard is reachable by **mouse**, through the menu, the toolbar, a
+  context menu or a chip. The palette is an accelerator for people who already know the name.
+- A right-click offers what applies **to the thing under the pointer**. §6.5's "right-click a
+  representative line" is the pattern: the object carries its own verbs.
+- §10's neglected states say what to do next, not merely what went wrong.
+
+**Memorability — having found it once, can they find it again?**
+
+- One command has **one name**, everywhere it appears — menu, toolbar, palette, context menu. The
+  register is the single source, so the same string is drawn in all four.
+- Position is stable. A menu's items do not reorder by frequency, and a command that is unavailable
+  is **greyed in place** rather than removed (§1.1) — a menu whose shape changes cannot be learned.
+
+**Learnability — does using it teach the faster way?**
+
+- Every menu item **names its accelerator** beside it. The menu is how the keyboard is learned; it
+  does not compete with it.
+- Modal surfaces carry a legend of their own keys along the bottom, as §5's rules editor and §6.2's
+  wizard do.
+- The toolbar is labelled. An icon with no text teaches nothing the second time either.
+
+**Usability — how much work is the common thing?**
+
+- The daily actions — follow, find, filter, change format, change rules — are **one action from the
+  main window**, not two levels into a menu.
+- Nothing modal on the hot path (principle 3), and every inline editor previews over real data.
+- Mouse and keyboard are each **complete paths**. Neither is a second-class route that runs out
+  halfway, which is the failure §1.1 records: by V9 the app had no `WM_RBUTTONDOWN` handler at all.
 
 ## 2. Main window `[v1]`
 
