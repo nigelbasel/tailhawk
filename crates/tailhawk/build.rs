@@ -40,7 +40,22 @@ fn main() {
     let revision = seconds_today / 2;
     let version = format!("{year}.{month}.{day}.{revision}");
 
-    let res = Resource::version_info(year, month, day, revision, &version);
+    // The icon, so Explorer, the taskbar's pinned entry and any installer see it without the
+    // program running. **Read without a `cargo:rerun-if-changed`, deliberately** — see the note at
+    // the top of this file: declaring any watched file would switch Cargo out of its default
+    // "rerun when the package changed" mode and freeze the version stamp. Re-cutting the artwork
+    // therefore needs a touched source file to take effect, which `tools/make-icon.ps1` says.
+    let ico = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets this"))
+        .join("../../assets/tailhawk.ico");
+    let icon = std::fs::read(&ico).ok();
+    if icon.is_none() {
+        println!(
+            "cargo:warning=no icon at {} — the binary will carry the version stamp but no icon",
+            ico.display()
+        );
+    }
+
+    let res = Resource::build(year, month, day, revision, &version, icon.as_deref());
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let path = out.join("tailhawk.res");
     std::fs::write(&path, res).expect("writing the version resource");
@@ -84,20 +99,77 @@ fn now_utc() -> (u16, u16, u16, u32) {
 struct Resource(Vec<u8>);
 
 impl Resource {
+    const RT_ICON: u16 = 3;
     const RT_VERSION: u16 = 16;
+    const RT_GROUP_ICON: u16 = 14;
     /// US English, and the "Unicode" code page 1200 — the pair every version resource is keyed by.
     const LANG_EN_US: u16 = 0x0409;
     const CODEPAGE_UNICODE: u32 = 1200;
+    /// The application icon's group. **Shell32 picks the numerically lowest `RT_GROUP_ICON`** as
+    /// the executable's icon, so this being 1 is what makes Explorer show the hawk.
+    const ICON_GROUP_ID: u16 = 1;
 
-    /// The whole file: the leading empty entry, then `VS_VERSIONINFO` as resource 1 of type 16.
-    fn version_info(year: u16, month: u16, day: u16, revision: u32, version: &str) -> Vec<u8> {
+    /// The whole file: the leading empty entry, then the icon, then `VS_VERSIONINFO`.
+    fn build(
+        year: u16,
+        month: u16,
+        day: u16,
+        revision: u32,
+        version: &str,
+        ico: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut body = Blob::new();
         body.version_info_root(year, month, day, revision, version);
 
         let mut file = Resource(Vec::new());
         file.empty_entry();
+        if let Some(ico) = ico {
+            file.icon_group(ico);
+        }
         file.entry(Self::RT_VERSION, 1, &body.0);
         file.0
+    }
+
+    /// An `.ico` file becomes one `RT_ICON` per image plus an `RT_GROUP_ICON` directory naming
+    /// them.
+    ///
+    /// **The directory is not the `.ico`'s own.** They are deliberately different structures: an
+    /// `ICONDIRENTRY` ends with a 32-bit *file offset*, a `GRPICONDIRENTRY` ends with a 16-bit
+    /// *resource id*, so the entry is fourteen bytes rather than sixteen. Copying the file's
+    /// directory across — the obvious shortcut — produces a group Windows reads as garbage.
+    fn icon_group(&mut self, ico: &[u8]) {
+        const FILE_HEADER: usize = 6;
+        const FILE_ENTRY: usize = 16;
+
+        if ico.len() < FILE_HEADER {
+            return;
+        }
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        let mut directory = Vec::with_capacity(FILE_HEADER + count * 14);
+        directory.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        directory.extend_from_slice(&1u16.to_le_bytes()); // type: icon
+        directory.extend_from_slice(&(count as u16).to_le_bytes());
+
+        for i in 0..count {
+            let at = FILE_HEADER + i * FILE_ENTRY;
+            let Some(entry) = ico.get(at..at + FILE_ENTRY) else {
+                continue;
+            };
+            let bytes = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+            let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+            let Some(image) = ico.get(offset..offset + bytes) else {
+                continue;
+            };
+
+            // Ids start at 1 and are the group's own business; nothing else refers to them.
+            let id = i as u16 + 1;
+            self.entry(Self::RT_ICON, id, image);
+
+            directory.extend_from_slice(&entry[0..8]); // width, height, colours, reserved, planes, bits
+            directory.extend_from_slice(&(bytes as u32).to_le_bytes());
+            directory.extend_from_slice(&id.to_le_bytes());
+        }
+        self.entry(Self::RT_GROUP_ICON, Self::ICON_GROUP_ID, &directory);
     }
 
     /// The 32-byte null entry every `.res` begins with.
