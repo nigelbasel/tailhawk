@@ -1034,13 +1034,8 @@ impl Document {
                 }
                 hits.push((x..x + w, y..y + grid_h, i));
             }
-            let _ = painter.lay_out_at(
-                view,
-                inner_x,
-                y,
-                &ruler,
-                Colours::plain(theme().field_hint),
-            );
+            let _ =
+                painter.lay_out_at(view, inner_x, y, &ruler, Colours::plain(theme().field_hint));
             y += grid_h;
         }
 
