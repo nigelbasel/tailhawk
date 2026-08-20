@@ -6331,7 +6331,13 @@ impl Shell {
             // §2.2 lists a keyboard map and an About box; neither surface exists yet, so both are
             // drawn **disabled** by `menubar::menu_bar` rather than offered and then ignored. If
             // one is reached anyway it does nothing, and says so by reporting `false`.
-            menubar::ID_KEYMAP | menubar::ID_ABOUT | menubar::ID_UNLISTED => false,
+            menubar::ID_KEYMAP
+            | menubar::ID_ABOUT
+            | menubar::ID_CUT
+            | menubar::ID_PASTE
+            | menubar::ID_FONT
+            | menubar::ID_PREFS
+            | menubar::ID_UNLISTED => false,
             id => match menubar::command_of(id) {
                 Some(command) => self.run(hwnd, command),
                 None => false,
@@ -6388,6 +6394,49 @@ impl Shell {
             self.menu_choose(hwnd, id);
         }
         true
+    }
+
+    /// The pointer moving over §2.2's bar while a menu is down.
+    ///
+    /// **A menu tracks the pointer, and only a menu that is already open does.** With one heading
+    /// down, moving sideways along the bar opens each heading in turn without a click, and moving
+    /// down the list walks the highlight — which is what every menu bar on the system does, and
+    /// what a menu that needs a click for each step conspicuously does not. With nothing open the
+    /// bar ignores the pointer entirely, so merely crossing it on the way to the grid drops no
+    /// menu in front of the user.
+    ///
+    /// Reports whether the move **changed** anything, not merely whether it was over the menu:
+    /// `WM_MOUSEMOVE` arrives many times a second and a frame per message, for a highlight that has
+    /// not moved, is a redraw of the whole window for nothing.
+    fn menu_hover(&mut self, x: f32, y: f32) -> bool {
+        if !self.menu.is_open() {
+            return false;
+        }
+        let hit = {
+            let Some(doc) = self.document.as_ref() else {
+                return false;
+            };
+            let hits = doc.chrome.menu_hits.borrow();
+            menubar::hit_at(&hits, x, y)
+        };
+        let before = (self.menu.open_path().to_vec(), self.menu.selected().to_vec());
+        match hit {
+            Some(MenuHit::Heading(i)) => self.menu.hover_top(i),
+            Some(MenuHit::Entry(i)) => {
+                let mut path = self.menu.open_path().to_vec();
+                path.push(i);
+                self.menu.hover(&path);
+            }
+            // Off the menu entirely: the open list stays as it is. Windows keeps the last
+            // highlight rather than clearing it, so a pointer that strays does not lose the row it
+            // was on.
+            None => return false,
+        }
+        let changed = before != (self.menu.open_path().to_vec(), self.menu.selected().to_vec());
+        if changed {
+            self.needs_frame = true;
+        }
+        changed
     }
 
     /// A click at `(x, y)` in the window, while §2.2's bar is drawn. Reports whether the menu took
@@ -8863,6 +8912,16 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 if msg == WM_LBUTTONDOWN && shell.menu_click(hwnd, x, y) {
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    return;
+                }
+                // An open menu tracks the pointer. It also **swallows** the move: while a list is
+                // down, the grid must not be hovering rows underneath it.
+                if msg == WM_MOUSEMOVE && shell.menu.is_open() {
+                    if shell.menu_hover(x, y) {
+                        unsafe {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
                     }
                     return;
                 }

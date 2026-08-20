@@ -123,12 +123,19 @@ pub const ID_EXIT: u32 = 10_001;
 pub const ID_PALETTE: u32 = 10_002;
 pub const ID_KEYMAP: u32 = 10_003;
 pub const ID_ABOUT: u32 = 10_004;
+/// Shown so the Edit menu reads as an Edit menu, and permanently disabled: Tailhawk is a viewer
+/// and nothing in it edits a log. See the Edit menu in [`menu_bar`].
+pub const ID_CUT: u32 = 10_005;
+pub const ID_PASTE: u32 = 10_006;
+/// Surfaces that are planned but not built. Disabled, never hidden.
+pub const ID_FONT: u32 = 10_007;
+pub const ID_PREFS: u32 = 10_008;
 
-/// §2.2's six menus, built from the command register each time the bar is opened.
+/// §2.2's seven menus, built from the command register each time the bar is opened.
 ///
 /// **Rebuilt rather than cached**, per the model's own note: enablement is a property of the moment
 /// — there is no document, or no selection, or no sort to clear — and a tree built afresh cannot
-/// hold a stale answer. Six menus of a dozen items costs nothing beside a frame.
+/// hold a stale answer. Seven menus of a dozen items costs nothing beside a frame.
 ///
 /// An item that cannot act is **disabled, not hidden**, per §1.1 and §1.2's memorability rule: a
 /// menu whose shape changes under the user is a menu they cannot learn.
@@ -153,28 +160,36 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
             "&File",
             vec![
                 cmd("&Open…", "Ctrl+O", Command::OpenFile),
+                on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
                 Item::separator(),
                 on(cmd("&Export view…", "", Command::Export), open),
                 on(cmd("&Tee to file…", "", Command::Tee), open),
                 on(cmd("&Stop the tee", "", Command::StopTee), open),
                 Item::separator(),
-                on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
                 Item::command("E&xit", "Alt+F4", ID_EXIT),
             ],
         ),
         Item::submenu(
             "&Edit",
             vec![
+                // **Cut and Paste are shown and permanently disabled**, and that is a deliberate
+                // answer rather than an oversight. Tailhawk is a *viewer*: §5.1 opens files
+                // read-only and nothing in it edits a log. Leaving the two out entirely makes the
+                // Edit menu read as broken to anyone who has used a Windows application; showing
+                // them greyed says "this program does not do that", which is the honest message and
+                // the one §1.1's "never lie, never silently drop" asks for.
+                Item::command("Cu&t", "Ctrl+X", ID_CUT).disabled(),
                 on(cmd("&Copy", "Ctrl+C", Command::Copy), selected),
+                Item::command("&Paste", "Ctrl+V", ID_PASTE).disabled(),
                 on(
-                    cmd("Copy as &TSV", "Ctrl+Shift+C", Command::CopyTsv),
+                    cmd("Copy as TS&V", "Ctrl+Shift+C", Command::CopyTsv),
                     selected && columns,
                 ),
                 Item::separator(),
                 on(cmd("&Find…", "Ctrl+F", Command::Find), open),
                 on(cmd("Find &next", "F3", Command::FindNext), open),
                 on(
-                    cmd("Find &previous", "Shift+F3", Command::FindPrevious),
+                    cmd("Find previo&us", "Shift+F3", Command::FindPrevious),
                     open,
                 ),
                 on(cmd("C&lear search", "Esc", Command::ClearSearch), open),
@@ -196,7 +211,7 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
                 on(cmd("&Bookmark", "Ctrl+D", Command::ToggleBookmark), open),
                 on(cmd("Next book&mark", "F2", Command::NextBookmark), open),
                 on(
-                    cmd("Previo&us bookmark", "Shift+F2", Command::PreviousBookmark),
+                    cmd("Previous bookmar&k", "Shift+F2", Command::PreviousBookmark),
                     open,
                 ),
             ],
@@ -205,7 +220,7 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
             "&View",
             vec![
                 on(
-                    check("&Follow tail", "F", Command::FollowTail, following),
+                    check("&Follow tail", "Ctrl+End", Command::FollowTail, following),
                     open,
                 ),
                 on(
@@ -241,56 +256,60 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
                 ),
                 Item::separator(),
                 on(cmd("Go to &top", "Ctrl+Home", Command::GoToTop), open),
-                Item::separator(),
                 on(cmd("&Split pane", "Ctrl+\\", Command::Split), open),
                 on(
                     cmd("Focus other pa&ne", "F6", Command::FocusOtherPane),
                     open,
                 ),
+                Item::separator(),
                 on(cmd("Ne&xt tab", "Ctrl+Tab", Command::NextTab), open),
                 on(
                     cmd("Pre&vious tab", "Ctrl+Shift+Tab", Command::PreviousTab),
                     open,
                 ),
                 Item::separator(),
-                on(cmd("&Back", "Alt+Left", Command::Back), open),
-                on(cmd("F&orward", "Alt+Right", Command::Forward), open),
-                Item::separator(),
-                check("&Dark theme", "", Command::ToggleTheme, dark),
+                on(cmd("&Back", "Alt+←", Command::Back), open),
+                on(cmd("F&orward", "Alt+→", Command::Forward), open),
             ],
         ),
         Item::submenu(
             "F&ormat",
             vec![
-                on(cmd("&Format…", "", Command::FormatMenu), open),
-                Item::separator(),
+                on(cmd("&Log format…", "", Command::FormatMenu), open),
                 on(cmd("&Define from a line…", "", Command::DefineFormat), open),
                 on(cmd("&Import layout…", "", Command::ImportLayout), open),
                 Item::separator(),
                 on(cmd("&Reset columns", "", Command::ResetColumns), columns),
                 on(cmd("Clear &sort", "", Command::ClearSort), columns),
+                Item::separator(),
+                // The font picker is not built. Shown disabled rather than omitted, so the shape of
+                // the menu does not change the day it arrives — §1.2's memorability rule.
+                Item::command("&Font…", "", ID_FONT).disabled(),
             ],
         ),
         Item::submenu(
             "&Rules",
             vec![
                 cmd("&Highlight rules…", "Ctrl+H", Command::EditRules),
-                Item::separator(),
                 cmd("&Open rules file", "", Command::OpenRules),
                 cmd("&Reload rules", "", Command::ReloadRules),
                 Item::separator(),
-                // `Label(n)` is one command per colour, `Ctrl+Shift+1`…`9`. The menu lists the
-                // first, because a menu of nine identical colour rows teaches less than one row
-                // and its key range — and §1.2 asks only that the command be *reachable*.
                 on(
-                    cmd(
-                        "Colour-&label selection",
-                        "Ctrl+Shift+1…9",
-                        Command::Label(1),
-                    ),
+                    cmd("&Colour-label lines", "Ctrl+Shift+1…9", Command::Label(1)),
                     selected,
                 ),
-                on(cmd("&Clear labels", "", Command::ClearLabels), open),
+                on(
+                    cmd("Clear &labels", "Ctrl+Shift+0", Command::ClearLabels),
+                    open,
+                ),
+            ],
+        ),
+        Item::submenu(
+            "&Settings",
+            vec![
+                check("&Dark theme", "", Command::ToggleTheme, dark),
+                Item::separator(),
+                Item::command("&Preferences…", "", ID_PREFS).disabled(),
             ],
         ),
         Item::submenu(
@@ -610,6 +629,41 @@ mod tests {
         assert!(bare.is_empty(), "these items mark no mnemonic: {bare:#?}");
     }
 
+    /// **An open menu survives the per-frame rebuild.** This is the exact sequence the shell runs:
+    /// a click opens a heading, and then the very next frame rebuilds the tree from the register.
+    /// If the rebuild dropped the open path the menu would shut within milliseconds of being
+    /// opened — and on a tailing file, frames never stop, so it would never appear at all.
+    #[test]
+    fn an_open_menu_survives_the_rebuild_the_next_frame_does() {
+        let mut menu = menu_bar(None, false);
+        menu.open_top(0);
+        assert!(menu.is_open(), "open_top did not open the menu");
+
+        for _ in 0..5 {
+            menu.rebuild(menu_bar(None, false));
+        }
+        assert!(menu.is_open(), "the rebuild shut the menu");
+
+        let frame = menu_frame_of(&menu);
+        assert_eq!(frame.open, Some(0), "the frame lost which menu is down");
+        assert!(!frame.entries.is_empty(), "the frame drew an empty list");
+    }
+
+    /// The same for `Alt` alone: focus is a state the rebuild must carry, or the mnemonics flash
+    /// for one frame and vanish.
+    #[test]
+    fn alt_focus_survives_the_rebuild_the_next_frame_does() {
+        let mut menu = menu_bar(None, false);
+        menu.focus();
+        assert!(menu.is_focused(), "focus() did not focus the bar");
+
+        for _ in 0..5 {
+            menu.rebuild(menu_bar(None, false));
+        }
+        assert!(menu.is_focused(), "the rebuild dropped the focus");
+        assert!(menu_frame_of(&menu).show_mnemonics);
+    }
+
     /// The id a command is given round-trips back to the same command — the whole basis of routing
     /// a chosen menu item back through `Command::LISTED`.
     #[test]
@@ -626,7 +680,17 @@ mod tests {
     /// be a menu item that quietly does the wrong thing.
     #[test]
     fn the_menus_own_ids_are_not_register_positions() {
-        for id in [ID_EXIT, ID_PALETTE, ID_KEYMAP, ID_ABOUT, ID_UNLISTED] {
+        for id in [
+            ID_EXIT,
+            ID_PALETTE,
+            ID_KEYMAP,
+            ID_ABOUT,
+            ID_CUT,
+            ID_PASTE,
+            ID_FONT,
+            ID_PREFS,
+            ID_UNLISTED,
+        ] {
             assert_eq!(command_of(id), None, "id {id} collides with the register");
         }
     }
@@ -635,7 +699,7 @@ mod tests {
     #[test]
     fn a_closed_bar_draws_headings_and_no_list() {
         let frame = menu_frame_of(&menu_bar(None, false));
-        assert_eq!(frame.headings.len(), 6);
+        assert_eq!(frame.headings.len(), 7);
         assert!(frame.entries.is_empty());
         assert!(frame.open.is_none());
         assert!(!frame.show_mnemonics);
@@ -680,14 +744,14 @@ mod tests {
     fn the_theme_item_is_ticked_to_match_the_theme() {
         for dark in [true, false] {
             let mut menu = menu_bar(None, dark);
-            // View is the third heading.
-            menu.open_top(2);
+            // Settings is the sixth heading.
+            menu.open_top(5);
             let frame = menu_frame_of(&menu);
             let theme_item = frame
                 .entries
                 .iter()
                 .find(|e| e.text.contains("Dark theme"))
-                .expect("the View menu carries the theme toggle");
+                .expect("the Settings menu carries the theme toggle");
             assert_eq!(theme_item.checked, dark);
         }
     }
