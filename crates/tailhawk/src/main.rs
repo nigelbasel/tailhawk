@@ -1860,7 +1860,7 @@ impl Document {
             None => String::new(),
             Some(t) => match (&t.error, t.live, t.done) {
                 (Some(e), _, _) => format!("⚠ export failed: {e} — "),
-                (None, true, _) => format!("⇥ tee → {} ({} lines) — ", t.name(), t.written),
+                (None, true, _) => format!("⇥ saving → {} ({} lines) — ", t.name(), t.written),
                 (None, false, true) => format!("✓ exported {} lines → {} — ", t.written, t.name()),
                 (None, false, false) => {
                     format!("⇥ exporting → {} ({} lines) — ", t.name(), t.written)
@@ -3911,12 +3911,16 @@ impl Command {
             "",
         ),
         (Command::Export, "Export the visible rows to a file…", ""),
+        // **Not "tee".** The Unix name is a plumbing metaphor — a T-junction, one flow in and two
+        // out — and it is exactly as opaque as that sounds to anyone who has not met it. §1.2's
+        // memorability rule wants a name that can be learned from the name; `Command::Tee` and
+        // `struct Tee` keep the technical term because they are read by people editing this file.
         (
             Command::Tee,
-            "Tee: keep writing the visible rows to a file as they arrive…",
+            "Keep saving the visible rows to a file as they arrive…",
             "",
         ),
-        (Command::StopTee, "Stop the tee", ""),
+        (Command::StopTee, "Stop saving", ""),
         (
             Command::CopyTsv,
             "Copy selection as TSV with columns",
@@ -10515,7 +10519,7 @@ mod tests {
         assert_eq!(tee.written, 3, "{:?}", tee.error);
         assert_eq!(tee.covered, 6);
         assert!(
-            doc.describe().contains("⇥ tee → out.txt (3 lines)"),
+            doc.describe().contains("⇥ saving → out.txt (3 lines)"),
             "{}",
             doc.describe()
         );
