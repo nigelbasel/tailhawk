@@ -295,6 +295,40 @@ impl Menu {
             .is_some_and(|i| i.selectable() && i.kind == Kind::Submenu)
     }
 
+    /// Replaces the items, keeping what is open and where the keyboard is.
+    ///
+    /// The shell rebuilds the tree from the command register every frame, because enablement is a
+    /// property of the moment — there is no document, or no selection, or no filter to clear — and
+    /// a tree built afresh cannot hold a stale answer. What it must *not* do is close the menu the
+    /// user is reading, so the paths are carried over and then checked against the new tree: if a
+    /// rebuild made them meaningless, they are dropped rather than left pointing at nothing.
+    pub fn rebuild(&mut self, fresh: Menu) {
+        let (open, selected, shown, focused) = (
+            std::mem::take(&mut self.open),
+            std::mem::take(&mut self.selected),
+            self.shown,
+            self.focused,
+        );
+        *self = fresh;
+        if !shown && !focused {
+            return;
+        }
+        if self.at(&open).is_none() {
+            return;
+        }
+        self.open = open;
+        self.shown = shown;
+        self.focused = focused;
+        // The highlight survives only if it still names a usable item; otherwise the first one.
+        if self.item(&selected).is_some_and(Item::selectable) {
+            self.selected = selected;
+        } else if shown {
+            self.select_first();
+        } else {
+            self.selected = selected;
+        }
+    }
+
     /// `Alt`: the bar takes the keyboard with nothing open. A second `Alt` gives it back.
     pub fn focus(&mut self) {
         if !self.bar {
@@ -950,6 +984,61 @@ mod tests {
         menu.across(1);
         assert_eq!(menu.open_path(), &[2], "and the arrows step over it");
         assert_eq!(menu.mnemonic('e'), None);
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_menu_the_user_is_reading_open() {
+        // The shell rebuilds from the command register every frame so enablement is never stale.
+        // What it must not do is shut the list under the pointer, or leave the highlight naming an
+        // item the rebuild removed.
+        let mut menu = a_bar();
+        menu.open_top(1);
+        menu.step(1);
+        assert_eq!(menu.selected(), &[1, 1]);
+        menu.rebuild(a_bar());
+        assert!(menu.is_open(), "the rebuild shut the menu under the user");
+        assert_eq!(menu.open_path(), &[1]);
+        assert_eq!(menu.selected(), &[1, 1], "and moved the highlight");
+
+        // A rebuild that removes what was selected falls back to the first usable item rather
+        // than leaving the highlight pointing at nothing.
+        let mut menu = a_bar();
+        menu.open_top(1);
+        menu.step(1);
+        menu.rebuild(Menu::bar(vec![
+            Item::submenu("&File", vec![Item::command("&Open…", "Ctrl+O", 1)]),
+            Item::submenu("&View", vec![Item::command("&Only", "", 99)]),
+        ]));
+        assert_eq!(menu.open_path(), &[1]);
+        assert_eq!(menu.selected(), &[1, 0]);
+
+        // A rebuild that removes the open heading closes rather than pointing at nothing.
+        let mut menu = a_bar();
+        menu.open_top(1);
+        menu.rebuild(Menu::bar(vec![Item::submenu(
+            "&File",
+            vec![Item::command("&Open…", "", 1)],
+        )]));
+        assert!(!menu.is_open());
+    }
+
+    #[test]
+    fn a_rebuild_of_a_closed_bar_leaves_it_closed() {
+        let mut menu = a_bar();
+        menu.rebuild(a_bar());
+        assert!(!menu.is_open() && !menu.is_focused());
+        assert!(menu.selected().is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_bar_merely_focused() {
+        let mut menu = a_bar();
+        menu.focus();
+        menu.across(1);
+        assert_eq!(menu.selected(), &[1]);
+        menu.rebuild(a_bar());
+        assert!(menu.is_focused() && !menu.is_open());
+        assert_eq!(menu.selected(), &[1], "Alt's highlight survives a rebuild");
     }
 
     #[test]
