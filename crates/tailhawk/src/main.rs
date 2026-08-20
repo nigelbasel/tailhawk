@@ -6419,7 +6419,10 @@ impl Shell {
             let hits = doc.chrome.menu_hits.borrow();
             menubar::hit_at(&hits, x, y)
         };
-        let before = (self.menu.open_path().to_vec(), self.menu.selected().to_vec());
+        let before = (
+            self.menu.open_path().to_vec(),
+            self.menu.selected().to_vec(),
+        );
         match hit {
             Some(MenuHit::Heading(i)) => self.menu.hover_top(i),
             Some(MenuHit::Entry(i)) => {
@@ -6432,7 +6435,11 @@ impl Shell {
             // was on.
             None => return false,
         }
-        let changed = before != (self.menu.open_path().to_vec(), self.menu.selected().to_vec());
+        let changed = before
+            != (
+                self.menu.open_path().to_vec(),
+                self.menu.selected().to_vec(),
+            );
         if changed {
             self.needs_frame = true;
         }

@@ -6,18 +6,22 @@
 (the rules file and the config import stand in), plus Mica, `WM_POINTER` inertia and the
 horizontal scrollbar below as polish.
 
-### Column headers are not visibly headers — raised 2026-08-20, deferred by the owner
+### The column header does not read as a header — raised 2026-08-20, deferred by the owner
 
-The header row draws in the **grid's monospace face at the row's own size**, separated from the
-data only by `theme().header_ink`. The owner's point is that colour alone does not say "header":
-at a glance the row reads as the first line of the log.
+V5's column header draws in **the grid's monospace face, at the grid's size, differing from the
+rows only by ink** (`theme().header_ink` instead of `theme().ink`). The owner's observation is that
+colour alone is not enough: it reads as another log line rather than as the band that names the
+columns.
 
-The band already exists — `View::header_px` reserves it and `paint.rs` lays the header out through
-`lay_out_row` with `Colours::plain(t.header_ink)` — so this is a question of *treatment*, not of
-structure. Worth knowing before choosing: the grid face is loaded as one face with **no bold
-sibling**, so "make it bold" is not a colour change — it means either loading a second face (as
-§1.1's chrome face already is, so the machinery exists) or giving the band a fill and a rule under
-it, which needs no new font at all. The second is cheaper and is what the tab strip already does.
+Worth knowing before someone reaches for the obvious fix: **there is no bold face loaded.** The
+atlas holds one grid face and one chrome face (`SPEC.md` §3.2, and `paint.rs`'s two-face cache),
+so "make it bold" is not a flag — it is a third face, its own atlas pressure, and a decision about
+what happens when the chosen monospace family has no bold. The cheaper moves that need no new face
+are a filled band behind the header row, a rule under it, or drawing it in the **chrome** face
+which is already loaded and is proportional — the last of which would also stop the header
+pretending to line up with cells it no longer matches.
+
+Not started; no preference has been expressed between those options.
 
 ### No horizontal scrollbar — raised 2026-08-20, deferred by the owner
 
