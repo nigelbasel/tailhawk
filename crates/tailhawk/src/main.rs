@@ -11217,6 +11217,87 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// §6.5.1 end to end: a definition **written to disk** claims a real file opened from disk,
+    /// compiles, and re-columnises the document.
+    ///
+    /// The unit tests either side of this prove the pieces — `claims` picks the right subject,
+    /// `compile` keeps the saved language, `in_force` gets the precedence right. None of them
+    /// proves the pieces are *joined*, and a feature whose promise is "this will still be true
+    /// tomorrow" is exactly the kind that can pass every unit test and do nothing. So this one
+    /// writes the TOML, reads it back through `wizard::load`, and checks the document ends up with
+    /// the remembered columns rather than the ones detection would have given it.
+    #[test]
+    fn a_definition_on_disk_claims_a_real_file_and_recolumnises_it() {
+        use tailhawk_core::template::Language;
+        use tailhawk_core::wizard::{self, Definition};
+
+        let dir = std::env::temp_dir().join("tailhawk-remember-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dirs");
+
+        // A log the generic catch-all can read, but only as ts/level/msg — the very shape that
+        // prompted this feature.
+        let log = dir.join("service.log");
+        let text: String = (0..40)
+            .map(|i| format!("2026-08-21 09:14:{:02}.117|INFO|Ndc.Api|line {i}\n", i % 60))
+            .collect();
+        std::fs::write(&log, text).expect("write the fixture");
+
+        // The definition, saved as the wizard would save it, claiming *.log by name.
+        std::fs::write(
+            dir.join("tailhawk.formats.toml"),
+            wizard::to_toml(&[Definition {
+                name: "ndc pipeline".to_owned(),
+                language: Some(Language::NLog),
+                template: "${longdate}|${level}|${logger}|${message}".to_owned(),
+                glob: Some("*.log".to_owned()),
+                samples: Vec::new(),
+            }]),
+        )
+        .expect("write the definitions");
+
+        let remembered = wizard::load(&wizard::tiers(Some(&dir), None));
+        assert_eq!(remembered.len(), 1, "the definition was read back");
+
+        let mut doc = Document::open(&log).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (900, 300));
+
+        // Detection on its own would not give a `logger` column — that is the point of remembering.
+        let detected_columns = doc
+            .layout
+            .as_ref()
+            .map(|l| l.format.columns.to_vec())
+            .unwrap_or_default();
+        assert!(
+            !detected_columns.contains(&"logger"),
+            "the premise: detection alone does not find the logger column, got {detected_columns:?}"
+        );
+
+        match in_force(&doc.detection, &remembered, doc.path.as_deref()) {
+            InForce::Remembered { name, glob, .. } => {
+                assert_eq!(name, "ndc pipeline");
+                assert_eq!(glob, "*.log");
+            }
+            other => panic!("the saved definition should claim this file, got {other:?}"),
+        }
+
+        let format = remembered[0].compile().expect("the saved layout compiles");
+        doc.adopt_format(format);
+        doc.lay_out((8.0, 10.0), (900, 300));
+
+        let columns = doc
+            .layout
+            .as_ref()
+            .map(|l| l.format.columns.to_vec())
+            .expect("adopting a format gives the document a layout");
+        assert!(
+            columns.contains(&"logger"),
+            "the remembered format's columns are in force, got {columns:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// §6.5.1's precedence: **a remembered definition beats detection**, and the chip is told
     /// enough to say so.
     ///
