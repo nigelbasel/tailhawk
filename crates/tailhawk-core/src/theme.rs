@@ -323,8 +323,11 @@ fn luminance(c: Colour) -> f32 {
 }
 
 impl Default for Theme {
-    /// Light. `UI-DESIGN.md` §11.2: the shipped default is black on white, and `--theme=dark` or
-    /// the View menu is what asks for the other one.
+    /// Light — a `Default` for callers that need *a* theme, not the one a session opens with.
+    ///
+    /// What a real session opens with is [`chosen`], which follows Windows. Nothing about black on
+    /// white is settled in `UI-DESIGN.md`; an earlier version of this comment claimed §11.2 said so
+    /// and §11.2 is the severity ramp.
     fn default() -> Self {
         Self::light()
     }
@@ -348,6 +351,49 @@ pub fn by_name(name: &str) -> Option<Theme> {
         "dark" => Some(Theme::dark()),
         "light" => Some(Theme::light()),
         _ => None,
+    }
+}
+
+/// Where a frame's ground comes from, once the question has been decided.
+///
+/// This names the *source* rather than carrying a [`Theme`], for two reasons. High Contrast could
+/// not carry one anyway — its colours are the ones the user configured in Windows, and reading them
+/// needs `SystemParametersInfoW` and `GetSysColor`. And a palette is some six hundred bytes, so an
+/// enum with one in it is an enum that is expensive to return in order to say "light".
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ThemeChoice {
+    /// High Contrast is on: the shell reads the system's own colours and uses those.
+    SystemHighContrast,
+    /// [`Theme::dark`].
+    Dark,
+    /// [`Theme::light`].
+    Light,
+}
+
+/// Decide which palette a session opens with.
+///
+/// `asked` is `--theme=` if it was given, else the saved setting, else nothing at all. The two
+/// system facts arrive as arguments rather than being read here, so the whole decision is a
+/// function of its inputs and can be exercised without a window.
+///
+/// High Contrast wins over everything — a user who has turned it on has said something louder than
+/// a config file. Otherwise `"system"`, an unrecognised name and no answer at all all mean the same
+/// thing: follow Windows. A Windows 11 app that stays white on a dark desktop looks broken, and its
+/// title bar — which the compositor draws, not us — will follow the system regardless of what we
+/// paint underneath it.
+pub fn chosen(asked: Option<&str>, high_contrast: bool, system_is_light: bool) -> ThemeChoice {
+    if high_contrast {
+        return ThemeChoice::SystemHighContrast;
+    }
+    let follow_system = if system_is_light {
+        ThemeChoice::Light
+    } else {
+        ThemeChoice::Dark
+    };
+    match asked {
+        Some("dark") => ThemeChoice::Dark,
+        Some("light") => ThemeChoice::Light,
+        _ => follow_system,
     }
 }
 
@@ -437,6 +483,58 @@ mod tests {
     }
 
     #[test]
+    fn high_contrast_outranks_every_other_answer() {
+        for asked in [None, Some("dark"), Some("light"), Some("system")] {
+            assert_eq!(
+                chosen(asked, true, true),
+                ThemeChoice::SystemHighContrast,
+                "High Contrast is the user shouting; {asked:?} does not talk over it"
+            );
+            assert_eq!(chosen(asked, true, false), ThemeChoice::SystemHighContrast);
+        }
+    }
+
+    #[test]
+    fn an_explicit_name_is_obeyed_whatever_windows_thinks() {
+        for system_is_light in [true, false] {
+            assert_eq!(
+                chosen(Some("dark"), false, system_is_light),
+                ThemeChoice::Dark
+            );
+            assert_eq!(
+                chosen(Some("light"), false, system_is_light),
+                ThemeChoice::Light
+            );
+        }
+    }
+
+    #[test]
+    fn system_means_system() {
+        assert_eq!(chosen(Some("system"), false, true), ThemeChoice::Light);
+        assert_eq!(chosen(Some("system"), false, false), ThemeChoice::Dark);
+    }
+
+    #[test]
+    fn asked_nothing_follows_windows_rather_than_forcing_white() {
+        assert_eq!(chosen(None, false, true), ThemeChoice::Light);
+        assert_eq!(
+            chosen(None, false, false),
+            ThemeChoice::Dark,
+            "a first run on a dark desktop opened white under a dark title bar"
+        );
+    }
+
+    #[test]
+    fn a_name_we_do_not_know_is_not_a_vote_for_white() {
+        assert_eq!(
+            chosen(Some("solarized"), false, false),
+            ThemeChoice::Dark,
+            "a typo in the settings file fell through to light on a dark desktop"
+        );
+        assert_eq!(chosen(Some("solarized"), false, true), ThemeChoice::Light);
+    }
+
+    #[test]
     fn the_two_sets_are_opposite_in_ground_and_the_default_is_light() {
         let dark = Theme::dark();
         let light = Theme::light();
@@ -445,7 +543,8 @@ mod tests {
         assert!(luminance(light.background) > 0.9);
         assert!(luminance(dark.ink) > 0.7);
         assert!(luminance(light.ink) < 0.3);
-        // §11.2: the shipped default is black on white; --theme=dark asks for the other one.
+        // A palette asked for by name is exactly itself; which one an unasked session opens with
+        // is `chosen`'s business, not this test's.
         assert_eq!(Theme::default(), light);
         assert_eq!(dark.background_rgb8(), (18, 20, 23));
         assert_eq!(by_name("light"), Some(light));

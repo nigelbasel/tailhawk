@@ -5706,12 +5706,15 @@ impl Shell {
         if current.suppress_rules {
             return;
         }
+        // The non-client frame follows the theme too — see [`dress_frame`]. Applied after
+        // `set_theme` below, not here, so it reads the theme that won.
         let next = if current.dark {
             Theme::light()
         } else {
             Theme::dark()
         };
         theme::set_theme(next);
+        dress_frame(hwnd, next.dark);
         self.settings.theme = Some(if next.dark { "dark" } else { "light" }.to_owned());
         let specs = self.rule_specs.clone();
         for (_, doc) in self.document.all_mut() {
@@ -8321,20 +8324,16 @@ fn ask_to_save(hwnd: HWND) -> Option<std::path::PathBuf> {
 /// The theme for a name — `dark`, `light`, `system` (the apps-use-light-theme registry value) — with
 /// High Contrast on top: `UI-DESIGN.md` §11.2 says system colours are respected there whatever was
 /// asked, so it is read first.
+/// Read the two facts Windows holds, hand them to [`theme::chosen`], and fetch whatever it names.
+///
+/// The choosing is `tailhawk-core`'s and is unit-tested; all that is left here is asking the
+/// registry and `SystemParametersInfoW`, which is the only part that needs a machine to run on.
 fn resolve_theme(name: Option<&str>) -> Theme {
-    if let Some(hc) = high_contrast_theme() {
-        return hc;
-    }
-    match name {
-        Some("system") => {
-            if system_uses_light_theme() {
-                Theme::light()
-            } else {
-                Theme::dark()
-            }
-        }
-        Some(other) => theme::by_name(other).unwrap_or_else(Theme::light),
-        None => Theme::light(),
+    let hc = high_contrast_theme();
+    match theme::chosen(name, hc.is_some(), system_uses_light_theme()) {
+        theme::ThemeChoice::SystemHighContrast => hc.unwrap_or_else(Theme::light),
+        theme::ThemeChoice::Dark => Theme::dark(),
+        theme::ThemeChoice::Light => Theme::light(),
     }
 }
 
@@ -8597,6 +8596,47 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 /// arm of [`handle`] takes its borrow inside its own `STATE::with` and has dropped it before
 /// reaching here. A message pumped out of a modal loop is an ordinary top-level message, not a
 /// nested handler, and handling it is the whole point.
+/// Dresses the **non-client** frame to match the theme: a dark title bar when the theme is dark,
+/// and §2.1's Mica backdrop behind it.
+///
+/// **The title bar is DWM's, not ours.** Everything else in this window is drawn by the app, which
+/// is why a dark theme could ship with a white title bar and nobody notice in code review — the
+/// mismatch only exists on screen. `DWMWA_USE_IMMERSIVE_DARK_MODE` is the whole fix.
+///
+/// Mica is scoped by `SPEC.md` §2.1 to "title bar, tab strip and side panels **only**": the grid
+/// renders to an opaque target and stays opaque, both for text antialiasing and because
+/// translucency behind a wall of moving text is noise rather than depth.
+///
+/// Both attributes are **best-effort**. `DWMWA_SYSTEMBACKDROP_TYPE` needs Windows 11 22H2 and the
+/// dark-mode attribute needs 20H1; on anything older `DwmSetWindowAttribute` returns an error and
+/// the window is simply the system's default, which is a perfectly usable window. `SPEC.md` §2.1
+/// scopes support to Windows 10 1809+, so refusing to start over a cosmetic attribute would be
+/// absurd — the results are deliberately discarded.
+fn dress_frame(hwnd: HWND, dark: bool) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    let on = windows::Win32::Foundation::BOOL::from(dark);
+    let backdrop = DWMSBT_MAINWINDOW;
+    // SAFETY: both calls take a pointer to a value we own, sized by the length we pass, and DWM
+    // copies rather than retaining. An unsupported attribute is refused, not undefined.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            std::ptr::addr_of!(on).cast(),
+            std::mem::size_of_val(&on) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            std::ptr::addr_of!(backdrop).cast(),
+            std::mem::size_of_val(&backdrop) as u32,
+        );
+    }
+}
+
 fn def_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let was = IN_WNDPROC.with(|flag| flag.replace(false));
     let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
@@ -9724,8 +9764,9 @@ fn main() -> Result<()> {
     );
     let placement = settings.window;
     // V13: the theme — `--theme=dark|light|system` on the command line, else what was saved, else
-    // dark; High Contrast overrides all of them with the system's colours (§11.2). Chosen before the
-    // class brush, which is stage one of the two-stage paint and must be the theme's ground.
+    // whatever Windows is set to; High Contrast overrides all of them with the system's colours.
+    // Chosen before the class brush, which is stage one of the two-stage paint and must be the
+    // theme's ground.
     let asked = std::env::args()
         .find_map(|a| a.strip_prefix("--theme=").map(str::to_owned))
         .or_else(|| settings.theme.clone());
@@ -9817,6 +9858,9 @@ fn main() -> Result<()> {
             None,
         )?
     };
+    // §2.1: the frame follows the theme — a dark title bar under a dark theme, and Mica behind it.
+    dress_frame(hwnd, theme().dark);
+
     unsafe {
         // The title bar's mark. The class carries the large icon, which is what the taskbar and
         // Alt+Tab read; the small one is per-window and has to be set here, or Windows derives it
