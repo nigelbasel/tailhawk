@@ -60,6 +60,18 @@ highlighted — with no document open, the greyed `Close Tab` would have run `Op
 because none could have one where it sat. Each became testable the moment the decision moved out:
 `Document::header_columns`, `menubar::chosen_by_click`, `menubar::hit_at`.
 
+**This is MVVM, and the codebase already names it** — the owner's framing, 2026-08-21, and worth
+holding on to because a pattern with a name is easier to apply than a preference. `MenuFrame`,
+`RulesOverlay`, `WizardOverlay`, `FormatRow` and `HeaderColumn` are **view-models**: each is the
+surface "as one frame should draw it", carrying no `HWND` and no device. The `*_of` functions —
+`menu_frame_of`, `rules_overlay_of`, `wizard_overlay_of`, `format_menu_of` — are the model → view-
+model mapping, and every one of them is pure and unit-tested. The Win32 shell is the **view**: it
+draws a view-model and routes input back, and ideally decides nothing.
+
+So the test for new UI work is: *could this run with no window?* If the answer is no and it is not
+literally a `SetWindowPos` call, the decision is in the wrong half. All three defects above were
+decisions that had stayed in the view.
+
 **Write the test first, and make it fail for the right reason.** `../../CLAUDE.md`'s TDD rule, with
 the failure mode this project actually hit: the disabled-item fix was written first and the test
 second, and the test asserted on a predicate *introduced by the fix* — so it could never have failed
