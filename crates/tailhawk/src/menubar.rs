@@ -531,6 +531,46 @@ fn draw_list(
     }
 }
 
+/// What a click on `hit` does to the menu, and the command id it chose if it chose one.
+///
+/// **The decision lives here, apart from the shell, so it can be tested.** It used to be inline in
+/// `Shell::menu_click`, where it needed a window and a `Shell` to exercise and so was never tested
+/// at all — which is how the defect below survived being written.
+///
+/// A click on an item that cannot be chosen — disabled, or a separator — **does nothing**. That is
+/// §1.1's rule and it is not automatic: `Menu::hover` declines to move onto a non-selectable item,
+/// which is right on its own, but a handler that hovers and then calls `Menu::enter` inherits the
+/// selection hover left alone and runs *that*. §2.2's Settings menu opens with `Dark theme`
+/// highlighted, so clicking the greyed `Preferences…` toggled the theme. Every disabled item in
+/// every menu carried the same hazard.
+pub fn chosen_by_click(menu: &mut tailhawk_core::menu::Menu, hit: MenuHit) -> Option<u32> {
+    match hit {
+        MenuHit::Heading(i) => {
+            // A second click on the open heading shuts it, as every menu bar does.
+            if menu.is_open() && menu.open_path().first() == Some(&i) {
+                menu.close();
+            } else {
+                menu.open_top(i);
+            }
+            None
+        }
+        MenuHit::Entry(i) => {
+            let mut path = menu.open_path().to_vec();
+            path.push(i);
+            // The guard the defect above needs. Without it `hover` declines, the old selection
+            // stands, and `enter` runs it.
+            if !menu
+                .item(&path)
+                .is_some_and(tailhawk_core::menu::Item::selectable)
+            {
+                return None;
+            }
+            menu.hover(&path);
+            menu.enter()
+        }
+    }
+}
+
 /// The hit a click at `(x, y)` landed on, if any.
 ///
 /// Searched **last to first** so the open list wins over the bar row it overlaps. Nothing else
@@ -663,6 +703,95 @@ mod tests {
         }
         assert!(menu.is_focused(), "the rebuild dropped the focus");
         assert!(menu_frame_of(&menu).show_mnemonics);
+    }
+
+    /// **Clicking a disabled item chooses nothing — in every menu, not just the one reported.**
+    ///
+    /// The owner found that clicking the greyed `Preferences…` in Settings toggled the theme. The
+    /// cause is a trap in composing two correct pieces: `Menu::hover` declines to move onto a
+    /// non-selectable item, and a handler that then calls `Menu::enter` runs whatever was
+    /// highlighted instead. Settings opens with `Dark theme` highlighted.
+    ///
+    /// This drives [`chosen_by_click`] — the real decision the shell makes — rather than a
+    /// predicate invented alongside the fix. Remove the guard from that function and this fails.
+    #[test]
+    fn clicking_a_disabled_item_chooses_nothing() {
+        let reference = menu_bar(None, false);
+        for top in 0..reference.items().len() {
+            let Some(items) = reference.at(&[top]).map(<[_]>::to_vec) else {
+                continue;
+            };
+            for (i, item) in items.iter().enumerate() {
+                if item.selectable() {
+                    continue;
+                }
+                let mut menu = menu_bar(None, false);
+                menu.open_top(top);
+                let chosen = chosen_by_click(&mut menu, MenuHit::Entry(i));
+                assert_eq!(
+                    chosen,
+                    None,
+                    "clicking the disabled {:?} in {:?} chose a command",
+                    item.text(),
+                    reference.items()[top].text()
+                );
+            }
+        }
+    }
+
+    /// The exact case the owner reported, named so a regression is recognisable rather than merely
+    /// a failing assertion: Settings is `Dark theme`, a separator, then a disabled `Preferences…`.
+    #[test]
+    fn clicking_the_greyed_preferences_does_not_toggle_the_theme() {
+        let mut menu = menu_bar(None, false);
+        let settings = menu
+            .items()
+            .iter()
+            .position(|i| i.text() == "Settings")
+            .expect("a Settings menu");
+        menu.open_top(settings);
+
+        let items = menu.at(&[settings]).expect("Settings has items").to_vec();
+        let prefs = items
+            .iter()
+            .position(|i| i.text().starts_with("Preferences"))
+            .expect("a Preferences item");
+        assert!(!items[prefs].selectable(), "Preferences is disabled");
+
+        let theme_id = command_id(Command::ToggleTheme);
+        assert_eq!(
+            chosen_by_click(&mut menu, MenuHit::Entry(prefs)),
+            None,
+            "the greyed Preferences chose a command — and the one it used to choose was \
+             ToggleTheme (id {theme_id}), because that is what Settings opens highlighted"
+        );
+    }
+
+    /// The other half: an enabled item still chooses its command, or the guard would deaden the
+    /// whole menu and the first test would pass for the wrong reason.
+    #[test]
+    fn clicking_an_enabled_item_still_chooses_it() {
+        let mut menu = menu_bar(None, false);
+        menu.open_top(0); // File — `Open…` is never disabled.
+        assert_eq!(
+            chosen_by_click(&mut menu, MenuHit::Entry(0)),
+            Some(command_id(Command::OpenFile))
+        );
+    }
+
+    /// A click on a heading opens it, and a second click shuts it.
+    #[test]
+    fn clicking_a_heading_opens_it_and_clicking_again_shuts_it() {
+        let mut menu = menu_bar(None, false);
+        assert_eq!(chosen_by_click(&mut menu, MenuHit::Heading(1)), None);
+        assert!(menu.is_open());
+        assert_eq!(menu.open_path().first(), Some(&1));
+
+        assert_eq!(chosen_by_click(&mut menu, MenuHit::Heading(1)), None);
+        assert!(
+            !menu.is_open(),
+            "a second click on the open heading shuts it"
+        );
     }
 
     /// The id a command is given round-trips back to the same command — the whole basis of routing

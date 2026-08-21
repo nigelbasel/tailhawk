@@ -6564,22 +6564,13 @@ impl Shell {
             menubar::hit_at(&hits, x, y)
         };
         match hit {
-            Some(MenuHit::Heading(i)) => {
-                // A second click on the open heading shuts it, as every menu bar does.
-                if self.menu.open_path().first() == Some(&i) && self.menu.is_open() {
-                    self.menu.close();
-                } else {
-                    self.menu.open_top(i);
-                }
-                self.needs_frame = true;
-                true
-            }
-            Some(MenuHit::Entry(i)) => {
-                let mut path = self.menu.open_path().to_vec();
-                path.push(i);
-                self.menu.hover(&path);
-                let chosen = self.menu.enter();
-                if let Some(id) = chosen {
+            // **What the click means is [`menubar::chosen_by_click`]'s to decide, not this
+            // function's.** It used to be decided inline here, where exercising it needed a window
+            // and a `Shell` — so it was never tested, and a defect lived in it: a click on a
+            // disabled item ran whatever the menu had highlighted. All that is left here is acting
+            // on the answer, which is the part that genuinely needs the shell.
+            Some(hit) => {
+                if let Some(id) = menubar::chosen_by_click(&mut self.menu, hit) {
                     self.menu.close();
                     self.menu_choose(hwnd, id);
                 }
