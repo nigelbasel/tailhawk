@@ -114,6 +114,30 @@ pub struct Definition {
     pub samples: Vec<String>,
 }
 
+impl Definition {
+    /// Whether this definition claims `path` — §6.5.1's "remembered per path and per glob".
+    ///
+    /// **The pattern decides what is matched, and that is the whole decision here.** A bare pattern
+    /// like `*.log` is about the file *name*, and should claim a match wherever the file lives; a
+    /// rooted one like `C:\logs\ndc\*.log` is about the *path*, and must not claim a same-named
+    /// file in some other directory. [`crate::glob::matches`] deliberately takes no view on which,
+    /// so this is the only place that can get it right — or wrong, in a way whose symptom is one
+    /// service's log silently columnised with another's format.
+    ///
+    /// A definition with no glob claims nothing. §6.5.1 only promises the remembering when the user
+    /// asked for a pattern; one saved for a single file by hand is not a claim on the world.
+    pub fn claims(&self, path: &std::path::Path) -> bool {
+        let Some(pattern) = self.glob.as_deref() else {
+            return false;
+        };
+        if pattern.contains('\\') || pattern.contains('/') {
+            return crate::glob::matches(pattern, &path.to_string_lossy());
+        }
+        path.file_name()
+            .is_some_and(|name| crate::glob::matches(pattern, &name.to_string_lossy()))
+    }
+}
+
 /// One row of §6.2's preview: the span of each column within the sample line, or `None` for a
 /// sample the format did not match.
 pub type PreviewRow = Option<Vec<Option<Range<usize>>>>;
@@ -1048,6 +1072,77 @@ mod tests {
 
     const LINE: &str =
         "2026-07-28 09:14:02,117 [12] INFO  Zenith.Automation.Runner - Evaluated 412 triggers";
+
+    /// §6.5.1's "remembered per path and per glob": whether a saved definition claims the file
+    /// being opened.
+    ///
+    /// **The subject depends on the pattern, and that is the whole decision.** A bare pattern like
+    /// `*.log` is about the *file name* — it should claim a matching file wherever it lives. A
+    /// rooted one like `C:\logs\ndc\*.log` is about the *path*, and must not claim a same-named
+    /// file in a different directory. `glob::matches` deliberately takes no view on this, so if
+    /// this function gets it wrong nothing else will catch it.
+    #[test]
+    fn a_definition_claims_by_name_or_by_path_depending_on_its_glob() {
+        let named = |glob: &str| Definition {
+            name: "test".to_owned(),
+            language: None,
+            template: String::new(),
+            glob: Some(glob.to_owned()),
+            samples: Vec::new(),
+        };
+
+        // A bare pattern is about the name, so it claims a match wherever the file sits.
+        let bare = named("*.log");
+        assert!(bare.claims(std::path::Path::new(r"C:\logs\ndc\api.log")));
+        assert!(bare.claims(std::path::Path::new(r"D:\elsewhere\api.log")));
+        assert!(bare.claims(std::path::Path::new("api.log")));
+        assert!(!bare.claims(std::path::Path::new(r"C:\logs\ndc\api.txt")));
+
+        // A rooted pattern is about the path, and must not claim the same name elsewhere. This is
+        // the assertion that fails if the subject is chosen wrongly, and it is the one that would
+        // otherwise columnise an unrelated file with somebody else's format.
+        let rooted = named(r"C:\logs\ndc\*.log");
+        assert!(rooted.claims(std::path::Path::new(r"C:\logs\ndc\api.log")));
+        assert!(
+            !rooted.claims(std::path::Path::new(r"D:\elsewhere\api.log")),
+            "a rooted glob must not claim a same-named file in another directory"
+        );
+        assert!(!rooted.claims(std::path::Path::new(r"C:\logs\other\api.log")));
+
+        // Case, because Windows paths are.
+        assert!(rooted.claims(std::path::Path::new(r"c:\LOGS\NDC\API.LOG")));
+
+        // A definition with no glob claims nothing — it was saved for one file by hand, and §6.5.1
+        // only promises the remembering when the user asked for a pattern.
+        let none = Definition {
+            glob: None,
+            ..named("*.log")
+        };
+        assert!(!none.claims(std::path::Path::new(r"C:\logs\ndc\api.log")));
+    }
+
+    /// The first definition that claims the path wins, and the tiers are already ordered
+    /// exe-adjacent first by [`load`]. Nothing else may reorder them.
+    #[test]
+    fn the_first_claiming_definition_wins() {
+        let with = |name: &str, glob: &str| Definition {
+            name: name.to_owned(),
+            language: None,
+            template: String::new(),
+            glob: Some(glob.to_owned()),
+            samples: Vec::new(),
+        };
+        let all = [
+            with("specific", r"C:\logs\ndc\*.log"),
+            with("general", "*.log"),
+        ];
+        let path = std::path::Path::new(r"C:\logs\ndc\api.log");
+        assert_eq!(
+            all.iter().find(|d| d.claims(path)).map(|d| d.name.as_str()),
+            Some("specific"),
+            "both claim it; the earlier tier wins"
+        );
+    }
 
     fn span<'a>(line: &'a str, f: &Field) -> &'a str {
         &line[f.start..f.end]
