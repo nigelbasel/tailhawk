@@ -44,7 +44,11 @@ otherwise.
 
 - Printing. Export covers the underlying need.
 - Editing log files. Tailhawk is **read-only, always**, and this is a tested guarantee.
-- Querying remote backends (Loki, Tempo, Azure Monitor).
+- Querying remote backends (Loki, Tempo, Azure Monitor). **This bounds the protocol, not the
+  reach**: §4.2's stdin pump means `logcli query --tail '{app="x"}' | tailhawk` works today, with the
+  backend's own client doing the querying. Tailhawk speaks nobody's query API and holds §13.2's
+  zero-network guarantee; it reads a pipe. Worth stating because the non-goal reads as "centralised
+  logs are out of reach", and they are not.
 - Metrics and traces as first-class data. Trace *IDs* are used for correlation only.
 - ETW / WPP real-time sessions.
 - `.evtx` binary parsing. Detect the file type and fail informatively.
@@ -894,9 +898,19 @@ percentage the user cannot verify.
    - Logback pattern — `%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n`
 
    …and Tailhawk compiles it to the extraction pattern and column set.
+
+   **The paste is the differentiator; the scan is a convenience.** `Wizard::paste` takes the layout
+   as *text*, so it works wherever the text can be got — source control, a pull request, a message
+   from whoever owns the service. That matters because the assumption behind the alternative is
+   usually false: **a viewer normally has the log and nothing else.** Logs are copied off a server,
+   read from a share, or sent by someone; co-location with the running application is the
+   development machine and not much else, and it does not exist at all when the application ships
+   its logs to Loki or Seq rather than writing beside its own config.
+
    **"Scan for logging config"** walks up from the log file's directory for `appsettings.json`,
-   `NLog.config` and `log4net.config` and offers the layouts it finds. **Nothing else on Windows does
-   this**, and it converts format definition from a regex-writing session into two clicks.
+   `NLog.config` and `log4net.config` and offers the layouts it finds. It turns format definition
+   into two clicks **when the config happens to be reachable**, and is worth having for exactly
+   that case — but nothing should be designed on the assumption that it is the common one.
 
    *Not supported:* Serilog `ExpressionTemplate`. Its `{#if}`/`{#each}` directives make optional
    segments appear and disappear line to line, so the confidence scorer must not penalise a format

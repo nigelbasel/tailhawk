@@ -610,7 +610,7 @@ The generated artefact is a **pattern DSL** string (`<name>` captures, `<_>` dis
 it is what a normal engineer can read and edit, and it compiles to a linear scanner. "Edit as regex"
 is there for the 10% who need it. **Test** re-runs the definition's stored sample lines.
 
-### 6.3 Import from config — the .NET differentiator
+### 6.3 Import a layout — paste first, scan if you can
 
 ```
 ┌─ Import layout ───────────────────────────────────────────────────────────── ✕ ──┐
@@ -630,6 +630,17 @@ is there for the 10% who need it. **Test** re-runs the definition's stored sampl
 
 Two clicks instead of a regex-writing session. Serilog `outputTemplate`, NLog `layout`, log4net
 `conversionPattern` and Logback patterns are all accepted.
+
+**The paste box is the primary route and the scan is the fallback**, which is why the box is at the
+top and the scan sits under an "── or ──". A viewer normally has the log and nothing else: logs are
+copied off a server, read from a share, or sent by someone, and an application that ships to Loki or
+Seq keeps no config anywhere near its output. Pasting needs only the text — from source control, a
+pull request, whoever owns the service — so it works in every one of those cases. The scan needs the
+config to be a few directories up from the log, which is the development machine and little else.
+
+That ordering is already what the mock draws; it is stated here because the section used to be
+titled "the .NET differentiator", which invited the opposite reading and would have someone build
+toward an access model that mostly does not exist.
 
 ---
 
