@@ -67,6 +67,27 @@ const FETCH_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 /// step; the loop grows the read for the ones that do not.
 const SCATTER_READ_BYTES: usize = 4 * 1024;
 
+/// One box of the column header — `UI-DESIGN.md` §2.5.
+///
+/// Positions are in **cells**, not pixels, because that is what the grid and the hit-testing both
+/// speak: `HGrid::x_of_column` turns a cell into an x that already accounts for the horizontal
+/// scroll, and `Document::header_cell` turns a click back the other way. Keeping the boundary in
+/// cells is what lets the divider drawn here and the resize target be the same edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderColumn {
+    /// The column's title, as the user reads it. No padding and no sort marker — both are the
+    /// painter's business now.
+    pub title: String,
+    /// The first cell of this column's box.
+    pub start: usize,
+    /// How many cells wide the box is, including the gap that separates it from the next.
+    pub cells: usize,
+    /// `Some(false)` ascending, `Some(true)` descending, `None` not sorted. §11.4 makes sorting a
+    /// mode you leave following for, so the indicator matters: it is the only thing on screen that
+    /// says why the rows are in this order.
+    pub sort: Option<bool>,
+}
+
 /// Where a painter gets the text of a visible row, and the anchors that make placing it cheap.
 ///
 /// **A trait rather than a closure because the two travel together.** The painter needs a row's text
@@ -118,8 +139,26 @@ pub trait RowSource {
 
     /// The column header, when the source has columns — drawn in the band `View::header_px` reserves,
     /// in the same cells as the rows so it lines up with them. `None` means no band.
+    ///
+    /// Still the thing that decides **whether** there is a band. What goes *in* it is
+    /// [`header_columns`](Self::header_columns) when that returns anything.
     fn header(&self) -> Option<&str> {
         None
+    }
+
+    /// The header as **boxes rather than one padded string** — `UI-DESIGN.md` §2.5.
+    ///
+    /// The padded-string form above lines each title up by counting monospace cells, which is why
+    /// the header had to be drawn in the grid's face: the padding *is* the alignment. A Windows
+    /// list header does not work that way. Each column is its own box, its label drawn at the box's
+    /// left edge in the **UI font**, and the boxes are told apart by dividers rather than by
+    /// spacing.
+    ///
+    /// So a source that has real columns returns them here and the painter places each label
+    /// itself. Returning an empty list keeps the old single-string path, which is what a source
+    /// with no layout wants.
+    fn header_columns(&self) -> Vec<HeaderColumn> {
+        Vec::new()
     }
 
     /// The number shown in the gutter for a view row — §6.4: "line numbers shown to the user are

@@ -433,20 +433,26 @@ impl Painter {
                 ..Instance::default()
             });
             total.quads += 1;
-            spans.clear();
-            let from = self.instances.len();
-            match self.lay_out_row(
-                view,
-                header,
-                ColumnAnchors::none_ref(),
-                Colours::plain(t.header_ink),
-                chrome,
-            ) {
-                Ok(laid) => total.merge(laid),
-                Err(_) => total.failed_rows += 1,
-            }
-            for instance in &mut self.instances[from..] {
-                instance.pos[0] += view.gutter_px();
+            let columns = source.header_columns();
+            if columns.is_empty() {
+                // No real columns: the old single-string path, laid out in the grid's cells.
+                spans.clear();
+                let from = self.instances.len();
+                match self.lay_out_row(
+                    view,
+                    header,
+                    ColumnAnchors::none_ref(),
+                    Colours::plain(t.header_ink),
+                    chrome,
+                ) {
+                    Ok(laid) => total.merge(laid),
+                    Err(_) => total.failed_rows += 1,
+                }
+                for instance in &mut self.instances[from..] {
+                    instance.pos[0] += view.gutter_px();
+                }
+            } else {
+                total.quads += self.lay_out_header_boxes(view, &columns, chrome, header_px);
             }
             // The rule under the band — `UI-DESIGN.md` §2.5. **This, not the fill, is what makes
             // the strip read as a header.** The fill is deliberately quiet, because principle 5
@@ -662,6 +668,112 @@ impl Painter {
 
     /// A filled rectangle in `tint`, in viewport pixels — the chrome's backgrounds, a caret, a
     /// mark under a composition.
+    /// The column header as boxes — `UI-DESIGN.md` §2.5. Reports the quads added.
+    ///
+    /// **Each label is drawn in the chrome face at its own column's edge**, which is what makes the
+    /// strip read as a list header rather than as the first line of the log. The face is
+    /// proportional, so nothing here counts cells to align text — the *box* is placed in cells and
+    /// the label simply starts inside it. That costs the character-grid alignment the padded-string
+    /// header had, and it is not a loss worth mourning: a label sitting over its own column is what
+    /// alignment was for.
+    ///
+    /// **The dividers are the point as much as the labels are.** They separate the boxes, and they
+    /// stand exactly where `Document::header_cell` resolves a resize drag, so the line you can see
+    /// is the line you can grab. Drawing them made an affordance that already worked discoverable
+    /// for the first time.
+    fn lay_out_header_boxes(
+        &mut self,
+        view: &crate::view::View,
+        columns: &[crate::rows::HeaderColumn],
+        top: f32,
+        height: f32,
+    ) -> usize {
+        let t = crate::theme::theme();
+        let gutter = view.gutter_px();
+        let width = view.hgrid().viewport_px();
+        let cell_w = view.hgrid().cell_width();
+        let chrome_h = self.chrome_line_height();
+        // The label sits on the baseline the band centres, and a hair in from its own edge so it is
+        // not welded to the divider on its left.
+        let text_y = top + ((height - chrome_h) * 0.5).floor().max(0.0);
+        let pad = (cell_w * 0.5).max(3.0);
+        let mut quads = 0;
+
+        for (i, column) in columns.iter().enumerate() {
+            let x = gutter + view.hgrid().x_of_column(column.start);
+            let right = gutter + view.hgrid().x_of_column(column.start + column.cells);
+
+            // Wholly scrolled off: nothing to draw, and no divider either.
+            if right <= gutter || x >= gutter + width {
+                continue;
+            }
+
+            // The sort indicator, right-aligned in the box, drawn first so the title can be cut
+            // short of it rather than run underneath it. §11.4 is why it earns the space: sorting
+            // is a mode, and this is the only thing that says the rows are not in file order.
+            let mut room = (right - x - pad * 2.0).max(0.0);
+            if let Some(descending) = column.sort {
+                let mark = if descending { "\u{25BC}" } else { "\u{25B2}" };
+                let mark_w = self.chrome_measure(mark);
+                if room > mark_w {
+                    self.chrome_run(mark, right - pad - mark_w, text_y, t.header_ink);
+                    quads += 1;
+                    room -= mark_w + pad;
+                }
+            }
+
+            // The title, cut to what its own box will hold. A header that overruns into the next
+            // column is worse than one that is short.
+            let title = self.fit_to_width(&column.title, room);
+            if !title.is_empty() {
+                self.chrome_run(&title, x + pad, text_y, t.header_ink);
+                quads += 1;
+            }
+
+            // The divider on this column's right edge, for every column but the last — the band's
+            // own rule already closes the strip.
+            if i + 1 < columns.len() && right > gutter && right < gutter + width {
+                self.fill(
+                    right,
+                    top + 2.0,
+                    1.0,
+                    (height - 4.0).max(1.0),
+                    t.header_rule,
+                );
+                quads += 1;
+            }
+        }
+        quads
+    }
+
+    /// The longest prefix of `text` that fits `room` pixels in the chrome face.
+    ///
+    /// Measured rather than counted: the face is proportional, so there is no cell count that
+    /// answers this. Cut at a character boundary, and give back nothing rather than a single
+    /// letter when the box is too narrow to say anything useful.
+    fn fit_to_width(&mut self, text: &str, room: f32) -> String {
+        if room <= 0.0 {
+            return String::new();
+        }
+        if self.chrome_measure(text) <= room {
+            return text.to_owned();
+        }
+        let mut cut = text.len();
+        while cut > 0 {
+            match text.get(..cut) {
+                Some(slice) if self.chrome_measure(slice) <= room => {
+                    return if slice.chars().count() > 1 {
+                        slice.to_owned()
+                    } else {
+                        String::new()
+                    };
+                }
+                _ => cut -= 1,
+            }
+        }
+        String::new()
+    }
+
     pub fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, tint: [f32; 4]) {
         if w <= 0.0 || h <= 0.0 {
             return;

@@ -51,8 +51,9 @@ use tailhawk_core::{
 };
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
-    GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, GetSysColor, InvalidateRect, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
 };
@@ -89,7 +90,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
 };
-use windows::Win32::UI::WindowsAndMessaging::ICON_SMALL;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW,
@@ -105,6 +105,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN,
     WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -341,6 +344,50 @@ impl RowSource for Document {
     /// also what it gets drawn as.
     fn header(&self) -> Option<&str> {
         self.header_text()
+    }
+
+    /// §2.5's header boxes, from the layout's own geometry.
+    ///
+    /// **The cell arithmetic is `Layout::header`'s, deliberately duplicated rather than shared**:
+    /// that function builds a padded string and this one builds boundaries, and the one thing they
+    /// must agree on is where a column starts. Both walk `shown_order`, skip a zero-width column,
+    /// and advance by `widths[i] + GAP` — the same walk `column_boundaries` makes for the resize
+    /// hit-test, which is what keeps the divider drawn here on the edge the drag expects.
+    fn header_columns(&self) -> Vec<tailhawk_core::rows::HeaderColumn> {
+        let Some(layout) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for &i in layout.shown_order() {
+            if layout.widths[i] == 0 {
+                continue;
+            }
+            let cells = layout.widths[i] + tailhawk_core::columns::GAP;
+            out.push(tailhawk_core::rows::HeaderColumn {
+                title: layout.title(i).to_owned(),
+                start: at,
+                cells,
+                sort: layout.sort.and_then(|(c, d)| (c == i).then_some(d)),
+            });
+            at += cells;
+        }
+        // **The last column is not in `shown_order`, and forgetting that loses its title.**
+        // `shown_order` is documented as "the columns before the last" because the final column —
+        // the message — is the free remainder that takes whatever width is left, so it has no entry
+        // in `widths` to walk. `Layout::header` appends it after its own loop for the same reason;
+        // this dropped it, and `message` simply vanished from the band.
+        let last = layout.widths.len().saturating_sub(1);
+        if !layout.format.columns.is_empty() {
+            out.push(tailhawk_core::rows::HeaderColumn {
+                title: layout.title(last).to_owned(),
+                start: at,
+                // It runs to the edge: whatever the viewport still has, in cells.
+                cells: self.view.hgrid().columns().saturating_sub(at),
+                sort: layout.sort.and_then(|(c, d)| (c == last).then_some(d)),
+            });
+        }
+        out
     }
 
     /// The command bar: `► [find] ▼ [+chip] [−chip] [add filter…]     · format`.
@@ -8901,6 +8948,65 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 }
             });
             LRESULT(0)
+        }
+        // §2.5: the pointer says what the column boundary does. Until this existed, resize was a
+        // gesture with no sign of itself anywhere on screen — the only place it was written down
+        // was a palette description.
+        //
+        // **`lParam` does not carry the pointer here**, unlike every other mouse message; its low
+        // word is a hit-test code. The position has to be asked for, which is the classic way this
+        // handler ends up correct only at the window's origin.
+        WM_SETCURSOR => {
+            const HTCLIENT: u16 = 1;
+            if (lparam.0 as u32 & 0xFFFF) as u16 != HTCLIENT {
+                return def_proc(hwnd, msg, wparam, lparam);
+            }
+            let sizing = STATE.with(|s| {
+                let state = s.borrow();
+                let Some(shell) = state.as_ref() else {
+                    return false;
+                };
+                // A drag already in flight keeps the cursor whatever the pointer strays over: the
+                // slop is about a cell, and a resize that flickers back to an arrow mid-drag reads
+                // as having been dropped.
+                if shell
+                    .document
+                    .as_ref()
+                    .is_some_and(|d| d.resizing.is_some())
+                {
+                    return true;
+                }
+                let mut point = POINT::default();
+                // SAFETY: both take a pointer to a `POINT` we own, and neither retains it.
+                unsafe {
+                    if GetCursorPos(&mut point).is_err()
+                        || !ScreenToClient(hwnd, &mut point).as_bool()
+                    {
+                        return false;
+                    }
+                }
+                let (x, y) = (point.x as f32, point.y as f32);
+                let Some((pane, _)) = shell.pane_at(y) else {
+                    return false;
+                };
+                let Some(doc) = shell.document.panes().get(pane) else {
+                    return false;
+                };
+                // `Some(Some(_))` is a boundary; `Some(None)` is a title, which stays an arrow, as
+                // a list header does.
+                matches!(doc.header_hit(x, y - doc.pane_top), Some(Some(_)))
+            });
+            if sizing {
+                // SAFETY: a shared system cursor; `LoadCursorW` with a null instance and an
+                // `IDC_*` ordinal cannot fail in a way that matters, and the handle is not owned.
+                unsafe {
+                    if let Ok(cursor) = LoadCursorW(None, IDC_SIZEWE) {
+                        SetCursor(cursor);
+                    }
+                }
+                return LRESULT(1);
+            }
+            def_proc(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MOUSEMOVE | WM_LBUTTONUP => {
             // Client-relative already, and **signed**: a drag above the window gives a negative y,
