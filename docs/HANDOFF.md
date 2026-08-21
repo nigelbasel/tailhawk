@@ -97,9 +97,26 @@ is written to `tailhawk.formats.toml` and never read back, so the wizard has to 
 session. That connection is worth keeping in mind when scheduling it: it is not a nicety, it is what
 turns a one-off into detection.
 
-For a Serilog application the better answer is §6.3's import — read the `outputTemplate` from
-`appsettings.json` and derive the columns exactly. `agent.log` is written by a shell script, so the
-wizard is its path.
+**⚠ An earlier draft of this paragraph said §6.3's import means reading `appsettings.json`, and the
+owner was right to challenge it**: a viewer usually has the log and nothing else — copied off a
+server, read from a share, sent by someone else. Co-location with the deployment is the exception,
+not the rule, and a feature that assumed it would be worth little.
+
+It does not assume it. §6.3 has **two doors, and the one that needs no file access is the primary
+one**:
+
+- **Paste.** `Wizard::paste` takes the layout *as text* — an `outputTemplate`, an NLog layout — and
+  `recognise` scores it to work out which language wrote it. The template comes from wherever the
+  user can see it: source control, a config open in another window, a colleague, documentation. The
+  deployment directory is not involved.
+- **Scan.** `template::scan` walks a folder for config files, for the case where the app *is* to
+  hand. Convenience, not the premise.
+
+So the honest hierarchy for an unknown log is: a catalogue format matches and nothing is needed; or
+the user has the template text and pastes it, and the columns are exact; or they have only the log,
+and §6.2's define-from-example proposes a tokenisation from one representative line. Only the last
+requires judgement, and it is the only one that works with no external artefact at all — which is
+why it, not the import, is the answer for `agent.log`.
 
 ### ⚠ The `Workflow` tool does not work on this project
 
