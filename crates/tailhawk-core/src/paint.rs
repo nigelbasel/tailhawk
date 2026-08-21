@@ -196,6 +196,16 @@ impl Painter {
         self.chrome.face()
     }
 
+    /// The **grid** face — the monospace one the rows and the column header are drawn in.
+    ///
+    /// Exposed for the same reason [`chrome_face`](Self::chrome_face) is: so a test can ask whether
+    /// a glyph this face is about to draw actually exists in it. The header carries §E22's sort
+    /// triangles and is laid out in *this* face, not the chrome's, so proving them there proves
+    /// nothing here.
+    pub fn grid_face(&self) -> &crate::raster::Face {
+        self.cache.face()
+    }
+
     pub fn chrome_line_height(&self) -> f32 {
         let ink = self.chrome.cell().height as f32;
         self.chrome
@@ -781,6 +791,34 @@ mod tests {
     /// face with no per-glyph fallback — so a marker the face does not have is a box on screen, not
     /// a substitution. That is what `▸`, `▼` and `▾` became when the chrome moved from Cascadia
     /// Mono to Segoe UI Variable Text, and nothing but looking at the window said so.
+    /// The **grid** face must contain the markers the *header* draws — which is a different face
+    /// and therefore a different question from the test below it.
+    ///
+    /// `Layout::header` inserts `▲` or `▼` beside the sorted column's title, and the header is laid
+    /// out by `lay_out_row` in the grid's monospace face. Everything proven about the chrome face
+    /// is irrelevant to it. Nothing tested this, so a sorted column has been one absent glyph away
+    /// from drawing a box since E22 landed, with no way to find out but sorting a column and
+    /// looking.
+    #[test]
+    fn the_grid_face_has_the_markers_the_header_draws() {
+        let Some((_off, p)) = painter_or_skip("grid markers") else {
+            return;
+        };
+        let markers = ['\u{25B2}', '\u{25BC}']; // ▲ ▼ — E22's sort indicator, in `Layout::header`
+        let codepoints: Vec<u32> = markers.iter().map(|c| *c as u32).collect();
+        let ids = p.grid_face().glyph_indices(&codepoints);
+        let missing: Vec<char> = markers
+            .iter()
+            .zip(&ids)
+            .filter(|(_, id)| **id == 0)
+            .map(|(c, _)| *c)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the grid face draws the sort indicator as .notdef boxes: {missing:?}"
+        );
+    }
+
     #[test]
     fn the_chrome_face_has_the_markers_the_chrome_draws() {
         let Some((_off, p)) = painter_or_skip("chrome markers") else {
@@ -795,6 +833,14 @@ mod tests {
             '\u{00D7}', // × a chip's remove
             '\u{25CF}', // ● an enabled highlight rule, and §2.2's ticked menu item
             '\u{25CB}', // ○ a disabled one
+            // §2.2's column header will want a sort indicator, so the candidates were checked here
+            // **before** anything drew them. `▲` is present and pairs with the `▼` above.
+            //
+            // **The small variants are not.** `▴` U+25B4 and `▾` U+25BE are both `.notdef` in
+            // Segoe UI Variable Text, which is not guessable from `▲` and `▼` being present — they
+            // are separate glyphs, exactly as `✓` was. Anyone reaching for a quieter arrow than
+            // `▲` has to reach for a smaller *size*, not a smaller *character*.
+            '\u{25B2}', // ▲ sort ascending, with U+25BC above as descending
         ];
         let codepoints: Vec<u32> = markers.iter().map(|c| *c as u32).collect();
         let ids = p.chrome_face().glyph_indices(&codepoints);
