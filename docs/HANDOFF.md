@@ -89,9 +89,17 @@ without difficulty.
 
 ### Where the plan is
 
-M7 has **one item left — V9's format *wizard* UI, part 4b: the §6.1 format chip menu** (the rules
-editor and the define-from-example overlay are done), plus Mica, `WM_POINTER` inertia and the
-horizontal scrollbar below as polish. Then M7b (RDP), M8 (CLI, settings, i18n), M9 (ship).
+**Corrected 2026-08-21 — the previous line here was wrong, and so was the §"Knowingly undone after
+4b" section further down.** Parts 4a, 4b and 4c are all done: the define-from-example overlay
+(`9d168a5`), §6.3's import (`96dec59`), and **§6.1's chip menu** (`3ae0c4e`, 2026-08-19 — that
+section still lists it as unbuilt and has simply never been updated).
+
+M7's remaining V9 item is **§6.5.1's "Remember for"**, and it is a real functional gap rather than
+polish: `wizard.rs` stores `Definition::glob` and serialises it to `tailhawk.formats.toml`, but
+**there is no matching function anywhere** and nothing loads that file at start-up. The wizard
+offers to remember a format for `*.log` and then never applies it. Plus the leftovers listed under
+part 4c, Mica, `WM_POINTER` inertia and the horizontal scrollbar. Then M7b (RDP), M8 (CLI,
+settings, i18n), M9 (ship).
 
 Also open, small: **"Stop saving" is enabled whenever a document is open** rather than only when a
 tee is live. It is gated on `open`, and there is no accessor for "a tee is running".
@@ -342,7 +350,9 @@ Two more, both about state going stale: a bare caret move re-pushed the text and
 result away, and `Ctrl+T` committed the edit and left the box with no caret and no way back that the
 legend mentioned.
 
-**Knowingly undone after 4b** — this is part 4c:
+**Knowingly undone after 4b** — this was part 4c. ⚠ **The first bullet is stale**: §6.1's chip
+menu landed in `3ae0c4e` on 2026-08-19. What survives of this list is §6.5.1's "Remember for",
+which is unbuilt, and the leftovers below it.
 
 - **§6.1's chip menu and §6.5.1's *Remember for*.** The format is still text at the right of the
   command bar. The menu, the runner-up under a 15% margin, the warning state and Plain text are
