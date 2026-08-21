@@ -368,6 +368,7 @@ impl RowSource for Document {
                 title: layout.title(i).to_owned(),
                 start: at,
                 cells,
+                content: layout.widths[i],
                 sort: layout.sort.and_then(|(c, d)| (c == i).then_some(d)),
             });
             at += cells;
@@ -382,8 +383,10 @@ impl RowSource for Document {
             out.push(tailhawk_core::rows::HeaderColumn {
                 title: layout.title(last).to_owned(),
                 start: at,
-                // It runs to the edge: whatever the viewport still has, in cells.
+                // It runs to the edge: whatever the viewport still has, in cells. No gap follows it,
+                // so the box and its content are the same width.
                 cells: self.view.hgrid().columns().saturating_sub(at),
+                content: self.view.hgrid().columns().saturating_sub(at),
                 sort: layout.sort.and_then(|(c, d)| (c == last).then_some(d)),
             });
         }
@@ -11013,6 +11016,99 @@ mod tests {
         assert_eq!(doc.filtering.kept[2], 4);
         let _ = std::fs::remove_file(&path);
     }
+
+    /// §2.5's header boxes name **every** column, the last one included, and their edges are the
+    /// edges a resize drag is tested against.
+    ///
+    /// **The last column is the whole reason this test exists.** `Layout::shown_order` is "the
+    /// columns before the last" — the message is the free remainder and has no entry in `widths` —
+    /// so a loop over `shown_order` alone silently drops it. That is exactly what the first cut of
+    /// `header_columns` did, and `message` vanished from the band with nothing failing: it was
+    /// caught by looking at a screenshot. Titles that go missing must not depend on someone
+    /// looking.
+    #[test]
+    fn the_header_boxes_name_every_column_and_sit_on_the_resize_boundaries() {
+        use tailhawk_core::rows::RowSource;
+
+        let path = std::env::temp_dir().join("tailhawk_header_boxes_test.log");
+        let text: String = (0..40)
+            .map(|i| format!("2026-08-16 09:14:{:02}.117 +02:00 [INF] line {i}\n", i % 60))
+            .collect();
+        std::fs::write(&path, text).expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        let layout = doc
+            .layout
+            .as_ref()
+            .expect("the fixture is a detected format");
+        let expected = layout.format.columns.len();
+        let boxes = doc.header_columns();
+        assert_eq!(
+            boxes.len(),
+            expected,
+            "every column gets a box, including the last: {:?}",
+            boxes.iter().map(|b| &b.title).collect::<Vec<_>>()
+        );
+        assert!(
+            boxes.iter().all(|b| !b.title.is_empty()),
+            "a box with no title draws nothing and reads as a missing column: {boxes:?}"
+        );
+
+        // The boxes tile: each starts where the previous ended, so there are no gaps a divider
+        // could be drawn into and no overlaps to draw one twice.
+        for pair in boxes.windows(2) {
+            assert_eq!(
+                pair[0].start + pair[0].cells,
+                pair[1].start,
+                "boxes must tile: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // **The dividers and the resize target are the same edges.** This is what makes the line
+        // the user sees the line they can grab; if they ever drift apart the affordance points at
+        // nothing. `column_boundaries` is what `header_hit` tests a drag against.
+        let drag_edges: Vec<usize> = doc
+            .column_boundaries()
+            .into_iter()
+            .map(|(_, at)| at)
+            .collect();
+        for boundary in boxes
+            .iter()
+            .take(boxes.len().saturating_sub(1))
+            .map(|b| b.start + b.content)
+        {
+            assert!(
+                drag_edges.contains(&boundary),
+                "the divider at cell {boundary} is on no resize boundary: {drag_edges:?}"
+            );
+        }
+
+        // The sort indicator is the header's, and only the sorted column carries one.
+        assert!(
+            boxes.iter().all(|b| b.sort.is_none()),
+            "nothing is sorted yet"
+        );
+        let level = layout
+            .format
+            .columns
+            .iter()
+            .position(|c| *c == "level")
+            .expect("a level column");
+        assert!(doc.cycle_sort(level));
+        land_sort(&mut doc);
+        let sorted = doc.header_columns();
+        assert_eq!(
+            sorted.iter().filter(|b| b.sort.is_some()).count(),
+            1,
+            "exactly one column is marked"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn sort_for(doc: &mut Document, order: sort::Order) {
         assert!(doc.sort_by(order));
         land_sort(doc);

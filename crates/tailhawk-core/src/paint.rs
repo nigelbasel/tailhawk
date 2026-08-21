@@ -730,16 +730,16 @@ impl Painter {
                 quads += 1;
             }
 
-            // The divider on this column's right edge, for every column but the last — the band's
-            // own rule already closes the strip.
-            if i + 1 < columns.len() && right > gutter && right < gutter + width {
-                self.fill(
-                    right,
-                    top + 2.0,
-                    1.0,
-                    (height - 4.0).max(1.0),
-                    t.header_rule,
-                );
+            // The divider, for every column but the last — the band's own rule closes the strip.
+            //
+            // **At the end of the column's data, not at the edge of its box.** The gap between
+            // columns belongs to neither, and `Document::column_boundaries` records the resize
+            // boundary at the data's edge — it adds the width, notes the edge, and only then adds
+            // the gap. Drawing at the box edge put the line `GAP` cells to the right of the drag
+            // target it advertises, which a test caught before the window did.
+            let edge = gutter + view.hgrid().x_of_column(column.start + column.content);
+            if i + 1 < columns.len() && edge > gutter && edge < gutter + width {
+                self.fill(edge, top + 2.0, 1.0, (height - 4.0).max(1.0), t.header_rule);
                 quads += 1;
             }
         }

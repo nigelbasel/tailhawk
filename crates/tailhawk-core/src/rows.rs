@@ -80,8 +80,17 @@ pub struct HeaderColumn {
     pub title: String,
     /// The first cell of this column's box.
     pub start: usize,
-    /// How many cells wide the box is, including the gap that separates it from the next.
+    /// How many cells wide the box is, **including** the gap that separates it from the next. This
+    /// is what makes the boxes tile: the next one starts at `start + cells`.
     pub cells: usize,
+    /// How many cells the column's own data occupies, **excluding** that gap.
+    ///
+    /// **The divider goes at `start + content`, not at `start + cells`, and the difference is not
+    /// cosmetic.** `Document::column_boundaries` puts the resize boundary at the end of the data —
+    /// it adds the width, records the edge, and only then adds the gap — so a divider drawn at the
+    /// box edge sits `GAP` cells to the right of the line the drag actually responds to. The line
+    /// would be visibly beside its own grab target, which is worse than drawing nothing.
+    pub content: usize,
     /// `Some(false)` ascending, `Some(true)` descending, `None` not sorted. §11.4 makes sorting a
     /// mode you leave following for, so the indicator matters: it is the only thing on screen that
     /// says why the rows are in this order.
