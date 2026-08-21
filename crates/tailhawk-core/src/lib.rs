@@ -20,6 +20,7 @@ pub mod encoding;
 pub mod filter;
 pub mod follow;
 pub mod format;
+pub mod glob;
 pub mod grid;
 pub mod hgrid;
 pub mod highlight;
