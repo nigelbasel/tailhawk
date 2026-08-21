@@ -299,6 +299,52 @@ context menu exists at all: the wizard is documented as opening on a right-click
 
 ---
 
+### 2.5 The column header `[v1]`
+
+*(Settled 2026-08-21, from the owner's observation that the header does not read as a header.)*
+
+**The header is a control strip, not a caption.** It already carries three gestures — click a title
+to cycle the sort, drag a boundary to resize, drag a title to reorder — and §2.4 gives it a context
+menu. What it has never had is anything on screen saying so.
+
+**Why it does not read as a header, measured rather than guessed.** The band *is* filled, with
+`header_bg`; the fill is simply invisible. Against the row background that is **1.11 : 1** in the
+dark theme and **1.16 : 1** in the light one, where nothing is discernible below about 1.5. Worse,
+the header's ink is **6.9 : 1** dark and **4.8 : 1** light against a row ink of **14.3 : 1** — so
+the strip that names the columns is drawn *fainter than the data it names*. A header quieter than
+its own rows is backwards, and no change of typeface fixes it.
+
+**Sorting is kept, and deliberately not promoted.** `SPEC.md` §11.4 already makes sorting a mode
+you leave following for: it disables follow and says so, rows arriving while sorted are held rather
+than inserted, the status counts them, and clearing the sort releases them in file order. That is
+the right behaviour and it is why sorting a live log is coherent at all. But it means **sort is the
+one header action that breaks the tool's primary mode**, so it does not get an inviting click
+target. Its routes are the context menu of §2.4, the menu bar, and the indicator already drawn
+beside a sorted column's title. Explorer invites sorting because a folder is static; a log is not.
+
+Three consequences follow, and they are the design rules for this strip:
+
+- **Filter belongs in the header; sort does not.** Filtering preserves following, sorting ends it.
+  That asymmetry, not familiarity with spreadsheets, is what decides which action earns the
+  prominent affordance. (The per-field filter *action* is `[v2]` — see §1.2's note on scope.)
+- **Top-N deserves a better route than the palette.** It is the honest answer to "show me the
+  slowest requests" *while still following*, because it is a heap over a scan and §11.4 leaves it
+  uncapped. Today it is reachable only as three palette entries per column.
+- **Any sort affordance must respect §11.4's eligibility.** Above the cap a whole sort is refused,
+  and a control that invites a click it will decline fails §1.1's "never lie".
+
+**Removing sorting was considered and rejected**, and the reasoning is worth keeping because the
+saving looks larger than it is. `sort.rs` is *"Column sort and top-N"* — one module, one `Order`
+carrying `top: Option<usize>`, sharing the key extraction, the comparison, the direction handling
+and the rule that a value the format cannot read is **missing** rather than text, so an unknown
+spelling never floats to the top. Dropping sort drops top-N with it. And the derived row space it
+appears to justify is not its own: `Filtering::active()` is `filtered() || sorted().is_some()`, so
+the `file_row`/`view_row` indirection exists for filtering regardless. Removal would buy a handful
+of call sites, cost the feature that answers the question people actually ask, and leave the
+architecture where it was.
+
+---
+
 ## 3. Split view — the two-pane model
 
 klogg's most-validated layout, plus the in-place hide it has an open request for. Both ship; the user

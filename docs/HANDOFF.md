@@ -42,6 +42,26 @@ exists and the affordance does not.** Verified in source, not inferred:
    and `SPEC.md` §3.3 makes the cell grid win, so a proportional label cannot sit over the column
    it names without a separate measurement path or accepting misalignment.
 
+**Settled 2026-08-21 — read `UI-DESIGN.md` §2.5 before designing anything here.** Four of the five
+questions above now have measured answers rather than guesses:
+
+- **The band is filled already and the fill is invisible**: 1.11 : 1 dark, 1.16 : 1 light, against a
+  visibility threshold near 1.5. The floats are sRGB — every render target is
+  `DXGI_FORMAT_B8G8R8A8_UNORM`, not `_SRGB`, so WCAG linearisation applies to them directly.
+- **The header ink is fainter than the rows'**: 6.9 : 1 dark and 4.8 : 1 light against a row ink of
+  14.3 : 1. The strip naming the columns is drawn quieter than the data. No typeface change fixes
+  that, and it is probably as much of what the owner saw as the invisible band.
+- **`suppress_rules` is not a constraint on drawing rules.** It means the user's *highlight* rules
+  from `tailhawk.rules.toml`. Two uses in the whole shell: a status chip, and a guard on the theme
+  toggle. A word collision on "rules" sent an earlier note in this file down the wrong path.
+- **`▲` U+25B2 is present in both faces; `▴` U+25B4 and `▾` U+25BE are `.notdef`.** A quieter sort
+  arrow means a smaller *size*, not a smaller *character*. `the_grid_face_has_the_markers_the_header_draws`
+  now covers the face the header actually draws in, which nothing did before.
+
+**Sorting is kept and deliberately not promoted** — §2.5 has the reasoning, including why removing
+it would drop top-N with it. Filter earns the header affordance because it preserves following;
+sort ends it.
+
 **Constraints any answer must survive**, and the first is the one most likely to decide it:
 
 - **High contrast sets `header_bg = background`.** Any answer resting on a fill is worth nothing
