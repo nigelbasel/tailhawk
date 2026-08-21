@@ -618,6 +618,40 @@ When no format clears 0.75 absolute **and** a 15% margin, the chip renders in a 
 *"Detected: Serilog (file) — also matched log4net"* — rather than silently picking. Silent
 mis-columnising is worse than no columnising.
 
+**A remembered definition wins over detection, and the chip says so.** *(Settled 2026-08-21.)*
+§6.5.1's "Remember for" is an instruction, not a hint: a user who chose a glob has told Tailhawk
+what this family of files is, and a format that loses to a confident sniff the next time it is
+opened has not remembered anything. So when a saved definition claims the path, it is what compiles,
+whatever detection scored.
+
+That is only safe because the override is **visible rather than merely available**. The chip has a
+third state beside "detected" and "warning":
+
+```
+   ★ NDC pipeline (remembered) ▾          ← a saved definition claimed this path
+   ┌────────────────────────────────────────┐
+   │ ★ NDC pipeline    C:\logs\ndc\*.log    │
+   │   ─────────────────────────────────    │
+   │   Serilog (file)              99.2%    │  ← what detection would have picked
+   │   Plain text                           │
+   │   ─────────────────────────────────    │
+   │   Forget C:\logs\ndc\*.log             │
+   └────────────────────────────────────────┘
+```
+
+Three things that state has to do, and each answers an objection to letting the memory win:
+
+- **Name the glob that claimed the file**, so a rule written months ago for one service and now
+  catching another is legible at a glance rather than a mystery about why the columns look wrong.
+- **Still show what detection thought**, so overriding a 99% Serilog match is a visible choice and
+  one click to undo — the user does not have to guess what they are giving up.
+- **Offer "Forget"** in the same menu that offered "Remember". A memory with no way to un-remember
+  is a trap, and the chip is where the user already looks.
+
+The precedence when several definitions claim the same path is `load`'s tier order — exe-adjacent
+before roaming, first match wins — and `Definition::claims` is where a bare pattern is matched
+against the file name and a rooted one against the whole path.
+
 ### 6.2 Define from example
 
 ```

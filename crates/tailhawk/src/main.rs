@@ -4119,6 +4119,57 @@ struct FormatRow {
     selected: bool,
 }
 
+/// What format is in force for a document, and why — §6.1's chip as a view-model.
+///
+/// The "why" is not decoration. §6.1 settled that a **remembered definition wins over detection**,
+/// which is only safe because the chip says so: it names the glob that claimed the file, still
+/// shows what detection would have picked, and offers to forget. This type is what carries those
+/// three facts to the surface that draws them.
+#[derive(Clone, PartialEq, Debug)]
+enum InForce {
+    /// A saved definition claimed this path. Carries the glob that did the claiming, and what
+    /// detection would have chosen — so the override is legible and one click from being undone.
+    Remembered {
+        name: String,
+        glob: String,
+        would_detect: Option<&'static tailhawk_core::format::Format>,
+    },
+    /// Detection accepted a format outright.
+    Detected(&'static tailhawk_core::format::Format),
+    /// Nothing cleared §6.1's bar. The file is plain text and the chip warns rather than guessing.
+    PlainText,
+}
+
+/// Which format a document should use, given what was detected and what has been remembered.
+///
+/// **Pure, and that is the point** — principle 7. The precedence rule is the whole substance of
+/// §6.5.1, it is invisible from outside once compiled, and it is exactly the kind of decision that
+/// would never be tested if it lived inside the open path.
+///
+/// Remembered beats detected. A user who chose a glob has said what this family of files *is*, and
+/// a memory that loses to a confident sniff has not remembered anything. Tier order decides between
+/// competing definitions — `wizard::load` yields exe-adjacent first — and `Definition::claims`
+/// decides whether a bare pattern is matched against the name or a rooted one against the path.
+fn in_force(
+    detection: &Detection,
+    remembered: &[tailhawk_core::wizard::Definition],
+    path: Option<&std::path::Path>,
+) -> InForce {
+    if let Some(path) = path {
+        if let Some(def) = remembered.iter().find(|d| d.claims(path)) {
+            return InForce::Remembered {
+                name: def.name.clone(),
+                glob: def.glob.clone().unwrap_or_default(),
+                would_detect: detection.accepted,
+            };
+        }
+    }
+    match detection.accepted {
+        Some(format) => InForce::Detected(format),
+        None => InForce::PlainText,
+    }
+}
+
 /// §6.1's menu for `detection`, with `selected` marked.
 ///
 /// Free so the menu's *contents* can be tested without a window — which is where §6.1's rules
@@ -4763,6 +4814,10 @@ struct Shell {
     /// §7.1's user highlight rules, as written in `tailhawk.rules.toml`, and the tiers they came
     /// from; compiled into every document's highlighter above the catalogue, below the labels.
     rule_specs: Vec<tailhawk_core::rules::Spec>,
+    /// §6.5.1's remembered format definitions, read once at start-up. **Read, never compiled**
+    /// here — `wizard::load` says why: a file of forty definitions would otherwise leak forty
+    /// `Format`s for the one the opened file needs. See [`in_force`].
+    remembered: Vec<tailhawk_core::wizard::Definition>,
     rules_tiers: Vec<PathBuf>,
     /// The rules that did not compile, by name — shown in the status bar.
     rules_failed: Vec<String>,
@@ -4931,6 +4986,34 @@ impl Shell {
                     let remembered = key.and_then(|k| self.settings.file(&k).cloned());
                     if let Some(state) = remembered {
                         document.apply_state(&state);
+                    }
+                    // §6.5.1: a saved definition claiming this path beats what detection scored.
+                    // Compiled **here and only here** — once, for the one definition that claimed
+                    // the file — because compiling leaks a `Format`, which is why `wizard::load`
+                    // deliberately reads without compiling. See [`in_force`] for the precedence.
+                    if let InForce::Remembered { name, glob, .. } = in_force(
+                        &document.detection,
+                        &self.remembered,
+                        document.path.as_deref(),
+                    ) {
+                        match self
+                            .remembered
+                            .iter()
+                            .find(|d| document.path.as_deref().is_some_and(|p| d.claims(p)))
+                            .map(tailhawk_core::wizard::Definition::compile)
+                        {
+                            Some(Ok(format)) => document.adopt_format(format),
+                            // **Says so rather than falling back silently.** A remembered layout
+                            // that no longer compiles — the DSL changed, the file was hand-edited —
+                            // must not leave the user with detection's answer and no idea their
+                            // memory was ignored.
+                            Some(Err(why)) => {
+                                self.file = Some(format!(
+                                    "⚠ remembered format {name:?} for {glob} did not compile: {why}"
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                     self.file = Some(document.describe());
                     self.rebuild_highlighter(&mut document);
@@ -9620,6 +9703,11 @@ fn main() -> Result<()> {
     let settings = settings::load(&settings_tiers);
     // §7.1: the user's highlight rules, from the same tiers.
     let rules_tiers = tailhawk_core::rules::tiers(exe_dir.as_deref(), roaming.as_deref());
+    // §6.5.1: the remembered format definitions, from the same tiers. Read, not compiled.
+    let remembered = tailhawk_core::wizard::load(&tailhawk_core::wizard::tiers(
+        exe_dir.as_deref(),
+        roaming.as_deref(),
+    ));
     let (rule_specs, rules_failed) = load_rule_specs(&rules_tiers);
     // §6.5: the wizard's definitions, from the same tiers again. Compiled once, here, so a format
     // defined in one session is detected in the next; a definition that no longer compiles is
@@ -9695,6 +9783,7 @@ fn main() -> Result<()> {
             dragging_bar: None,
             welcome: None,
             menu: menubar::menu_bar(None, theme().dark),
+            remembered,
             rules_editor: tailhawk_core::ruleset::Editor::default(),
             wizard: None,
             wizard_selected: 0,
@@ -11126,6 +11215,97 @@ mod tests {
         assert_eq!(doc.filtering.kept[1], 1);
         assert_eq!(doc.filtering.kept[2], 4);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// §6.5.1's precedence: **a remembered definition beats detection**, and the chip is told
+    /// enough to say so.
+    ///
+    /// This is the rule §6.1 settled on 2026-08-21, and the reason it is safe: the override is
+    /// visible. If `in_force` ever quietly returned `Detected` where a definition claimed the path,
+    /// "Remember for" would be a suggestion rather than a memory — and the user would have no way
+    /// to tell, because a correctly-columnised file looks the same either way.
+    #[test]
+    fn a_remembered_definition_beats_detection_and_says_what_it_overrode() {
+        use tailhawk_core::wizard::Definition;
+
+        let serilog = tailhawk_core::format::catalogue()
+            .iter()
+            .find(|f| f.id == "serilog-file")
+            .expect("the catalogue has serilog-file");
+        let detected = Detection {
+            accepted: Some(serilog),
+            ..Detection::default()
+        };
+        let def = Definition {
+            name: "NDC pipeline".to_owned(),
+            glob: Some(r"C:\logs\ndc\*.log".to_owned()),
+            ..Definition::default()
+        };
+        let claimed = std::path::Path::new(r"C:\logs\ndc\api.log");
+        let other = std::path::Path::new(r"D:\elsewhere\api.log");
+
+        match in_force(&detected, std::slice::from_ref(&def), Some(claimed)) {
+            InForce::Remembered {
+                name,
+                glob,
+                would_detect,
+            } => {
+                assert_eq!(name, "NDC pipeline");
+                assert_eq!(
+                    glob, r"C:\logs\ndc\*.log",
+                    "the chip names what claimed the file"
+                );
+                assert_eq!(
+                    would_detect.map(|f| f.id),
+                    Some("serilog-file"),
+                    "the chip still shows what was overridden, or the choice is invisible"
+                );
+            }
+            other => panic!("the memory must win over a confident detection, got {other:?}"),
+        }
+
+        // A path the glob does not claim falls through to detection untouched.
+        assert_eq!(
+            in_force(&detected, std::slice::from_ref(&def), Some(other)),
+            InForce::Detected(serilog)
+        );
+
+        // No remembered definitions, and no path at all (a pipe), both fall through.
+        assert_eq!(
+            in_force(&detected, &[], Some(claimed)),
+            InForce::Detected(serilog)
+        );
+        assert_eq!(
+            in_force(&detected, std::slice::from_ref(&def), None),
+            InForce::Detected(serilog)
+        );
+
+        // Nothing detected and nothing remembered is plain text, not a guess.
+        assert_eq!(
+            in_force(&Detection::default(), &[], Some(claimed)),
+            InForce::PlainText
+        );
+    }
+
+    /// Tier order decides between definitions that both claim the file — `wizard::load` yields
+    /// exe-adjacent first, and nothing downstream may reorder it.
+    #[test]
+    fn the_earlier_tier_wins_when_two_definitions_claim_the_same_path() {
+        use tailhawk_core::wizard::Definition;
+        let with = |name: &str, glob: &str| Definition {
+            name: name.to_owned(),
+            glob: Some(glob.to_owned()),
+            ..Definition::default()
+        };
+        let all = [with("exe tier", "*.log"), with("roaming tier", "*.log")];
+        match in_force(
+            &Detection::default(),
+            &all,
+            Some(std::path::Path::new(r"C:\logs\api.log")),
+        ) {
+            InForce::Remembered { name, .. } => assert_eq!(name, "exe tier"),
+            other => panic!("expected the first tier to win, got {other:?}"),
+        }
     }
 
     /// §2.5's header boxes name **every** column, the last one included, and their edges are the

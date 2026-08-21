@@ -136,6 +136,24 @@ impl Definition {
         path.file_name()
             .is_some_and(|name| crate::glob::matches(pattern, &name.to_string_lossy()))
     }
+
+    /// Compiles this definition to the format it was saved as.
+    ///
+    /// **The language is remembered rather than re-guessed**, which is the promise this type
+    /// already makes: an imported NLog layout stays an NLog layout, re-openable in the wizard and
+    /// recompiled by whatever the compiler has learned since. A definition with no language is
+    /// §6.5's pattern DSL — the one the wizard writes itself.
+    ///
+    /// Compiling leaks a `Format`, as every compile on this path does, so a caller should do it
+    /// **once for the definition that claimed the file** and not for every definition loaded. That
+    /// is why [`load`] deliberately does not compile.
+    pub fn compile(&self) -> Result<&'static Format, String> {
+        crate::template::compile(
+            self.language.unwrap_or(Language::Dsl),
+            &self.template,
+            &self.name,
+        )
+    }
 }
 
 /// One row of §6.2's preview: the span of each column within the sample line, or `None` for a
@@ -1119,6 +1137,35 @@ mod tests {
             ..named("*.log")
         };
         assert!(!none.claims(std::path::Path::new(r"C:\logs\ndc\api.log")));
+    }
+
+    /// A remembered definition compiles to the format it was saved as.
+    ///
+    /// **The language is remembered, not re-guessed** — an imported NLog layout stays an NLog
+    /// layout, which is the promise `Definition` already documents. A definition with no language
+    /// recorded is §6.5's pattern DSL, which is the only one the wizard writes itself.
+    #[test]
+    fn a_remembered_definition_compiles_to_the_format_it_was_saved_as() {
+        let def = Definition {
+            name: "ndc".to_owned(),
+            language: Some(Language::NLog),
+            template: "${longdate}|${level:uppercase=true}|${logger}|${message}".to_owned(),
+            glob: Some("*.log".to_owned()),
+            samples: Vec::new(),
+        };
+        let format = def.compile().expect("a saved NLog layout compiles");
+        assert!(
+            format.columns.contains(&"level"),
+            "the compiled format keeps its columns: {:?}",
+            format.columns
+        );
+
+        // A template that is not the language it claims fails rather than compiling to nonsense.
+        let broken = Definition {
+            template: "not a layout at all".to_owned(),
+            ..def
+        };
+        assert!(broken.compile().is_err());
     }
 
     /// The first definition that claims the path wins, and the tiers are already ordered
