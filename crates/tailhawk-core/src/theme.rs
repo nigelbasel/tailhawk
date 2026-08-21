@@ -68,6 +68,14 @@ pub struct Theme {
     pub continuation_ink: Colour,
     pub header_bg: Colour,
     pub header_ink: Colour,
+    /// The line under the column header, and the divider between its columns.
+    ///
+    /// **A separate colour because it is the part that has to survive High Contrast.** There,
+    /// `header_bg` *is* `background` — a header told apart from the rows by its fill alone
+    /// disappears completely. A rule drawn in the system foreground is still a rule. This is what
+    /// Explorer's own header leans on too: its fill is nearly the colour of the list beneath it,
+    /// and the bottom border does the work.
+    pub header_rule: Colour,
     pub gutter_ink: Colour,
     pub chrome_bg: Colour,
     pub field_bg: Colour,
@@ -104,8 +112,9 @@ impl Theme {
             current_match_ink: [0.071, 0.078, 0.090, 1.0],
             reveal_mark: [0.85, 0.65, 0.25, 1.0],
             continuation_ink: [0.56, 0.59, 0.64, 1.0],
-            header_bg: [0.11, 0.12, 0.14, 1.0],
-            header_ink: [0.62, 0.66, 0.72, 1.0],
+            header_bg: [0.16, 0.175, 0.200, 1.0],
+            header_ink: [0.84, 0.86, 0.89, 1.0],
+            header_rule: [0.38, 0.41, 0.48, 1.0],
             gutter_ink: [0.40, 0.44, 0.50, 1.0],
             chrome_bg: [0.10, 0.11, 0.13, 1.0],
             field_bg: [0.14, 0.15, 0.18, 1.0],
@@ -176,8 +185,9 @@ impl Theme {
             current_match_ink: [0.10, 0.08, 0.05, 1.0],
             reveal_mark: [0.80, 0.55, 0.15, 1.0],
             continuation_ink: [0.45, 0.47, 0.52, 1.0],
-            header_bg: [0.92, 0.92, 0.91, 1.0],
-            header_ink: [0.38, 0.40, 0.45, 1.0],
+            header_bg: [0.88, 0.88, 0.87, 1.0],
+            header_ink: [0.20, 0.21, 0.25, 1.0],
+            header_rule: [0.62, 0.63, 0.68, 1.0],
             gutter_ink: [0.58, 0.60, 0.65, 1.0],
             chrome_bg: [0.94, 0.94, 0.93, 1.0],
             field_bg: [1.0, 1.0, 1.0, 1.0],
@@ -271,6 +281,9 @@ impl Theme {
             continuation_ink: foreground,
             header_bg: background,
             header_ink: foreground,
+            // The whole reason this colour exists: here the band and the rows share a fill, so the
+            // rule is the only thing left that can say "header".
+            header_rule: foreground,
             gutter_ink: foreground,
             chrome_bg: background,
             field_bg: background,
@@ -341,6 +354,87 @@ pub fn by_name(name: &str) -> Option<Theme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WCAG relative luminance, and the contrast ratio between two colours.
+    ///
+    /// The theme's floats are **sRGB-encoded**, not linear: every render target is
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM` rather than `_SRGB`, so nothing converts them on the way to the
+    /// display and they have to be linearised here.
+    fn linear(c: f32) -> f32 {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn relative_luminance(c: Colour) -> f32 {
+        0.2126 * linear(c[0]) + 0.7152 * linear(c[1]) + 0.0722 * linear(c[2])
+    }
+
+    fn contrast(a: Colour, b: Colour) -> f32 {
+        let (a, b) = (relative_luminance(a), relative_luminance(b));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// §2.5: the column header has to be tellable from the rows beneath it.
+    ///
+    /// **This is a regression guard on a defect that shipped.** The header band was drawn all
+    /// along, at 1.11 : 1 in the dark theme and 1.16 : 1 in the light — below the threshold where
+    /// anything is discernible — so it read as another log line, and the natural conclusion was
+    /// that the header had no formatting at all rather than formatting nobody could see.
+    ///
+    /// The rule carries the separation and the fill only supports it, which is why the fill's
+    /// threshold here is modest: principle 5 wants the user's own highlight colours to be the
+    /// loudest thing on screen, so a header that shouts is its own kind of wrong.
+    #[test]
+    fn the_column_header_is_distinguishable_from_the_rows() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let which = if theme.dark { "dark" } else { "light" };
+
+            let band = contrast(theme.header_bg, theme.background);
+            assert!(
+                band >= 1.25,
+                "{which}: the header band is {band:.2} : 1 against the rows — invisible"
+            );
+
+            let rule = contrast(theme.header_rule, theme.header_bg);
+            assert!(
+                rule >= 1.8,
+                "{which}: the header rule is {rule:.2} : 1 against its own band"
+            );
+
+            // The strip that names the columns must not be fainter than the data it names, which
+            // is what made it recede rather than stand out.
+            let header_ink = contrast(theme.header_ink, theme.header_bg);
+            let row_ink = contrast(theme.ink, theme.background);
+            assert!(
+                header_ink >= row_ink * 0.6,
+                "{which}: header ink is {header_ink:.1} : 1 where the rows are {row_ink:.1} : 1"
+            );
+        }
+    }
+
+    /// The rule is the part that has to survive High Contrast, and this is why it is its own
+    /// colour: there `header_bg` **is** `background`, so a header told apart by its fill alone is
+    /// not told apart at all.
+    #[test]
+    fn under_high_contrast_the_header_rule_still_separates() {
+        let fg = [1.0, 1.0, 1.0, 1.0];
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        let theme = Theme::high_contrast(fg, bg, [0.0, 0.4, 1.0, 1.0]);
+
+        assert_eq!(
+            contrast(theme.header_bg, theme.background),
+            1.0,
+            "the premise of this test: the fill carries nothing here"
+        );
+        assert!(
+            contrast(theme.header_rule, theme.header_bg) > 15.0,
+            "the rule is all that is left, and it has to be unmissable"
+        );
+    }
 
     #[test]
     fn the_two_sets_are_opposite_in_ground_and_the_default_is_light() {

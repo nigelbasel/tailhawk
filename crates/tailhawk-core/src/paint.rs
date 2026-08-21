@@ -448,6 +448,19 @@ impl Painter {
             for instance in &mut self.instances[from..] {
                 instance.pos[0] += view.gutter_px();
             }
+            // The rule under the band — `UI-DESIGN.md` §2.5. **This, not the fill, is what makes
+            // the strip read as a header.** The fill is deliberately quiet, because principle 5
+            // wants the user's own highlight colours to be the loudest thing on screen; and under
+            // High Contrast the fill is the row background exactly, so the rule is all there is.
+            // One instance, whatever the column count.
+            self.instances.push(Instance {
+                pos: [0.0, chrome + header_px - 1.0],
+                size: [view.gutter_px() + view.hgrid().viewport_px(), 1.0],
+                tint: t.header_rule,
+                mode: MODE_SOLID,
+                ..Instance::default()
+            });
+            total.quads += 1;
         }
         // The command bar, if the source draws one — V14. Last, so its fills sit over whatever a
         // partial top row put under them, and its text over its fills.
