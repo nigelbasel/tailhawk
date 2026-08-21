@@ -76,6 +76,31 @@ Still unverified and load-bearing: the contrast arithmetic and which colour spac
 in, and whether `suppress_rules` gates rule emission — which decides whether drawing a header rule
 quietly changes documented high-contrast behaviour.
 
+### Why a column goes undetected, and what the answer is — asked 2026-08-21
+
+The owner noticed that `logs/agent.log` has a `kind` column — `note`, `test`, `ci`, `task` —
+between the level and the message, and that Tailhawk folds it into the message. **That is the
+documented behaviour of a deliberate fallback, not a detection failure.**
+
+`format.rs`'s last catalogue entry is `generic` / "timestamped text" at confidence **0.20**, and its
+regex captures exactly three things: `ts`, an optional `level`, and `msg` as everything remaining.
+Its own sample in the catalogue is `2026-08-16T09:14:02.117Z INFO  task starting E13` — "task" going
+into `msg` is what the entry is written to do. No general rule can tell a short third token that is
+a category from the first word of a sentence, and a greedier catch-all would mis-split real
+messages, which is exactly the complaint the owner has about LogExpert's columnizers.
+
+So an unknown layout needs the user once, and the machinery for that is built: **§6.2's
+define-from-example wizard** is Tailhawk's columnizer, driven from a right-clicked representative
+line and *proposing* a tokenisation rather than starting blank. What is missing is what makes it
+stick — **§6.5.1's "Remember for"**, the outstanding M7 item above. Until that lands, a definition
+is written to `tailhawk.formats.toml` and never read back, so the wizard has to be re-run per
+session. That connection is worth keeping in mind when scheduling it: it is not a nicety, it is what
+turns a one-off into detection.
+
+For a Serilog application the better answer is §6.3's import — read the `outputTemplate` from
+`appsettings.json` and derive the columns exactly. `agent.log` is written by a shell script, so the
+wizard is its path.
+
 ### ⚠ The `Workflow` tool does not work on this project
 
 Two runs, ~1.3M tokens, nothing produced. **Background subagents cannot surface a permission

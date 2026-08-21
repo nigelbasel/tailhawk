@@ -333,6 +333,41 @@ Three consequences follow, and they are the design rules for this strip:
 - **Any sort affordance must respect §11.4's eligibility.** Above the cap a whole sort is refused,
   and a control that invites a click it will decline fails §1.1's "never lie".
 
+### 2.5.1 Colour a column by its values `[v2]` — proposed 2026-08-21
+
+*(Owner's idea: "click on the column and have the app decide on colours to use for each of those
+values".)*
+
+A column whose values come from a small fixed set — `note`, `test`, `ci`, `task`; or `GET`, `POST`,
+`PUT`; or a service name — is a column the eye should be able to sort at a glance. Choosing the
+column and letting the app assign a colour per distinct value is a **zero-typing** version of what
+§5's rules already do with a hand-written pattern each.
+
+What makes it cheap rather than a new subsystem:
+
+- **The palette exists.** `Theme::labels` is nine colours already chosen to sit together and already
+  reused per theme; §7.1's semantic hues are the precedent for assigning them by meaning rather than
+  by the user picking.
+- **The header is now a control surface** (§2.5), so "click the column" has somewhere to live, and
+  the context menu of §2.4 is where it belongs rather than as a fourth gesture on the strip.
+- **Distinct values are already computable**: the filter engine parses field-scoped predicates, so
+  the same column accessor that answers `kind = note` can enumerate what `kind` contains.
+
+The parts that need deciding, and none of them are obvious:
+
+- **What happens past nine values.** Nine labels, and a column with forty services. Colour the top
+  nine by frequency and leave the rest plain? Hash to a hue and accept collisions? Refuse and say
+  why? Refusing is the honest option and the least useful one.
+- **Whether it survives a reopen**, and therefore whether it belongs in §12.4's per-file state
+  beside the chips and bookmarks — where sort keys deliberately are *not* held.
+- **How it composes with §7.1's semantic layer and §5's user rules**, which already colour parts of
+  the same line. Three sources of colour on one row is where "restrained palette" stops being true.
+- **High Contrast**, where `suppress_rules` turns user highlighting off. This is user highlighting
+  by another name and should almost certainly go with it.
+
+Not started. Recorded here rather than in a backlog because the constraints above are the design,
+and they are cheaper to settle now than to discover during implementation.
+
 **Removing sorting was considered and rejected**, and the reasoning is worth keeping because the
 saving looks larger than it is. `sort.rs` is *"Column sort and top-N"* — one module, one `Order`
 carrying `top: Option<usize>`, sharing the key extraction, the comparison, the direction handling
