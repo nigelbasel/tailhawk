@@ -8046,10 +8046,11 @@ mod single {
             let Some(slice) = bytes.get(at..end) else {
                 break;
             };
-            let units: Vec<u16> = slice
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
+            // `as_chunks`, not `chunks_exact(2)`: the pairs arrive as `[u8; 2]` rather than as
+            // slices that have to be indexed, so `from_le_bytes` takes them directly and there is
+            // no bounds check to elide. Clippy asks for this whenever the chunk size is a constant.
+            let (pairs, _odd) = slice.as_chunks::<2>();
+            let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
             out.push(PathBuf::from(std::ffi::OsString::from_wide(&units)));
             at = end;
         }
