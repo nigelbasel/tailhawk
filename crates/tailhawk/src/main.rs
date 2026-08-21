@@ -96,15 +96,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassW, SetClassLongPtrW, SetForegroundWindow, SetTimer,
     SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, ASFW_ANY,
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, IDC_ARROW, MSG, NONCLIENTMETRICSW,
-    SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK,
-    SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
-    SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
-    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_GETOBJECT, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN,
-    WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION,
+    SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE,
+    SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW,
+    WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
@@ -5267,6 +5268,42 @@ impl Shell {
             nTrackPos: 0,
         };
         unsafe { SetScrollInfo(hwnd, SB_VERT, &info, true) };
+        self.sync_hscrollbar(hwnd);
+    }
+
+    /// The horizontal bar — §1.2's missing mouse path for a line wider than the window.
+    ///
+    /// **The capability was never missing; the affordance was.** `HGrid` has carried the offset
+    /// since V3, fed from the widest line across the whole set, and `Shift`+wheel, a tilt wheel,
+    /// `←`/`→` and `Home`/`End` have all driven it. What no one could do was *see* that it was
+    /// possible, or reach it with a mouse alone — which §1.2 requires each of mouse and keyboard to
+    /// be a complete path.
+    ///
+    /// Pixels rather than the vertical bar's fixed range: the horizontal extent is bounded by the
+    /// widest line rather than by a row count that can reach 50 M, so it fits an `i32` directly and
+    /// needs none of `SCROLL_RANGE`'s quantising.
+    fn sync_hscrollbar(&self, hwnd: HWND) {
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
+        let hgrid = doc.view.hgrid();
+        let content = hgrid.content_px().round().max(0.0) as i32;
+        let page = hgrid.viewport_px().round().max(1.0) as i32;
+        let info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            // No `SIF_DISABLENOSCROLL` here, unlike the vertical bar: a log that fits the window
+            // should have **no** horizontal bar rather than a dead full-width one, and leaving the
+            // flag off is what lets Windows hide it.
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            // `nMax` is inclusive while `nPage` is a count, so the usable travel is `nMax - nPage +
+            // 1`. Off by one here and the last column can never quite be reached.
+            nMax: content.saturating_sub(1).max(0),
+            nPage: page as u32,
+            nPos: hgrid.offset_px().round().max(0.0) as i32,
+            nTrackPos: 0,
+        };
+        unsafe { SetScrollInfo(hwnd, SB_HORZ, &info, true) };
     }
 
     /// Applies a navigation intent and asks for a frame only if the view moved.
@@ -9262,6 +9299,78 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             });
             LRESULT(0)
         }
+        // The horizontal twin of the arm above — §1.2's mouse-only path to a line wider than the
+        // window. `SB_LINELEFT`/`SB_LINERIGHT` share their numeric values with `SB_LINEUP`/`_DOWN`,
+        // which is why the same constants appear: Win32 distinguishes them by *which bar* sent the
+        // message, not by the code.
+        WM_HSCROLL => {
+            let code = (wparam.0 & 0xFFFF) as u32;
+            STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let Some(shell) = state.as_mut() else {
+                    return;
+                };
+                let Some(doc) = shell.document.as_mut() else {
+                    return;
+                };
+                const LINELEFT: i32 = SB_LINEUP.0;
+                const LINERIGHT: i32 = SB_LINEDOWN.0;
+                const PAGELEFT: i32 = SB_PAGEUP.0;
+                const PAGERIGHT: i32 = SB_PAGEDOWN.0;
+                const LEFT: i32 = SB_TOP.0;
+                const RIGHT: i32 = SB_BOTTOM.0;
+                const THUMBTRACK: i32 = SB_THUMBTRACK.0;
+                const THUMBPOSITION: i32 = SB_THUMBPOSITION.0;
+                let moved = match code as i32 {
+                    LINELEFT => doc.navigate(Navigate::ByColumns(-1)),
+                    LINERIGHT => doc.navigate(Navigate::ByColumns(1)),
+                    // A page is the viewport, less a column of overlap so the eye keeps its place.
+                    PAGELEFT | PAGERIGHT => {
+                        let cells = (doc.view.hgrid().viewport_px()
+                            / doc.view.hgrid().cell_width().max(1.0))
+                        .floor()
+                        .max(1.0) as i64;
+                        let by = (cells - 1).max(1);
+                        doc.navigate(Navigate::ByColumns(if code as i32 == PAGELEFT {
+                            -by
+                        } else {
+                            by
+                        }))
+                    }
+                    LEFT => doc.navigate(Navigate::LineStart),
+                    RIGHT => doc.navigate(Navigate::LineEnd),
+                    // `SB_THUMBTRACK` as well as the position, for the reason the vertical bar
+                    // gives: handling only the drop makes the view jump at the end of the drag
+                    // instead of following the thumb.
+                    THUMBTRACK | THUMBPOSITION => {
+                        let mut info = SCROLLINFO {
+                            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                            fMask: SIF_TRACKPOS,
+                            ..Default::default()
+                        };
+                        unsafe { GetScrollInfo(hwnd, SB_HORZ, &mut info) }
+                            .is_ok()
+                            .then(|| {
+                                let before = doc.view.hgrid().offset_px();
+                                // No absolute setter on `HGrid`, so the move is expressed as the
+                                // delta from where it is — which `scroll_by_px` already clamps.
+                                let delta = info.nTrackPos as f32 - before;
+                                doc.view.hgrid_mut().scroll_by_px(delta);
+                                doc.view.hgrid().offset_px() != before
+                            })
+                            == Some(true)
+                    }
+                    _ => false,
+                };
+                if moved {
+                    shell.sync_scrollbar(hwnd);
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
         // The user changed something in Windows' own settings. `"WindowMetrics"` is the UI font and
         // the non-client sizes — §1.1's chrome is drawn in that font, so it follows the change
         // rather than keeping whatever was true at start. Rebuilding is `ensure_painter`'s job on
@@ -9617,7 +9726,7 @@ fn main() -> Result<()> {
             WINDOW_EX_STYLE::default(),
             class_name,
             windows::core::w!("Tailhawk"),
-            WS_OVERLAPPEDWINDOW | WS_VSCROLL,
+            WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL,
             placement.map_or(CW_USEDEFAULT, |w| w.x),
             placement.map_or(CW_USEDEFAULT, |w| w.y),
             placement.map_or(1280, |w| w.width.max(320)),
