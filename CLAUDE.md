@@ -51,6 +51,22 @@ so a swept-in file and a wrong `CLEANROOM.md` row publish in the same step.
 **Commit straight to master, and often.** No branches, no PRs on this project. Push, then check CI
 and *wait for the result* — do not push and walk away. Sessions have ended leaving master red.
 
+**The decision goes in a pure function; the shell only acts on the answer.** Anything that needs an
+`HWND`, a `Shell` or a live device to exercise will not be tested, and this project has the scars to
+prove it. Three defects in one session all lived in logic tangled into `Shell` or the painter: the
+`message` column title vanished from the header, every column divider was drawn two cells from the
+drag boundary it advertises, and a click on a **disabled** menu item ran whatever the menu had
+highlighted — with no document open, the greyed `Close Tab` would have run `Open…`. None had a test,
+because none could have one where it sat. Each became testable the moment the decision moved out:
+`Document::header_columns`, `menubar::chosen_by_click`, `menubar::hit_at`.
+
+**Write the test first, and make it fail for the right reason.** `../../CLAUDE.md`'s TDD rule, with
+the failure mode this project actually hit: the disabled-item fix was written first and the test
+second, and the test asserted on a predicate *introduced by the fix* — so it could never have failed
+on the broken code. A test that cannot catch the bug it is named for is worse than no test, because
+it claims coverage. If a test is written after a fix, **take the fix out and watch it fail** before
+believing it.
+
 **Review each component with a subagent before committing it.**
 
 **Don't write backslash-heavy source through a heredoc.** `cat`/`perl` heredocs halve `\` — write
