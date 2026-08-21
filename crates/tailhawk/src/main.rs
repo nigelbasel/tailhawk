@@ -1605,6 +1605,17 @@ impl Document {
         self.filtering.filtered()
     }
 
+    /// Whether there is a save to stop — a live one from "Keep saving…", or a one-shot export
+    /// still in flight.
+    ///
+    /// **Exactly the condition `stop_tee` reports success for**, which is the point: `Stop saving`
+    /// was gated on a document merely being *open*, so it stood enabled with nothing to stop and
+    /// did nothing when chosen. §1.1's "never lie" makes an item that cannot act a disabled item,
+    /// and the only predicate that cannot drift from the action is the action's own.
+    fn is_saving(&self) -> bool {
+        self.tee.is_some()
+    }
+
     /// The presentation of a file row, if it is one of the visible rows `lay_out` presented.
     fn presentation(&self, file_row: u64) -> Option<&Presentation> {
         self.presented

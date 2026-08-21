@@ -154,6 +154,7 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
     let invisibles = doc.is_some_and(|d| d.shows_invisibles());
     let detail = doc.is_some_and(|d| d.detail_open());
     let filtered = doc.is_some_and(|d| d.is_filtered());
+    let saving = doc.is_some_and(|d| d.is_saving());
 
     Menu::bar(vec![
         Item::submenu(
@@ -164,7 +165,7 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
                 Item::separator(),
                 on(cmd("&Export view…", "", Command::Export), open),
                 on(cmd("&Keep saving…", "", Command::Tee), open),
-                on(cmd("Stop sa&ving", "", Command::StopTee), open),
+                on(cmd("Stop sa&ving", "", Command::StopTee), saving),
                 Item::separator(),
                 Item::command("E&xit", "Alt+F4", ID_EXIT),
             ],
