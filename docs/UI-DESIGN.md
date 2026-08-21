@@ -27,7 +27,7 @@
 **Tailhawk — watch your logs like a hawk.**
 
 The identity leads with the idiom, because that is what makes the name decode correctly on first
-contact. Everything else follows from five principles:
+contact. Everything else follows from seven principles:
 
 1. **The log is the interface.** Chrome is thin, quiet and gets out of the way. At any moment the
    overwhelming majority of pixels are log content. No ribbon, no toolbar of 30 icons, no MDI child
@@ -44,6 +44,7 @@ contact. Everything else follows from five principles:
    generous information density — but a restrained palette so that *user* highlight colours are the
    loudest thing on screen.
 6. **The four pillars of usability are requirements, not aspirations** — see §1.2.
+7. **The UI is MVVM, so that the interesting half can be unit-tested** — see §1.3.
 
 ### 1.1 What "modern, not MDI" means concretely
 
@@ -122,6 +123,40 @@ at a build and answered yes or no.
 - Nothing modal on the hot path (principle 3), and every inline editor previews over real data.
 - Mouse and keyboard are each **complete paths**. Neither is a second-class route that runs out
   halfway, which is the failure §1.1 records: by V9 the app had no `WM_RBUTTONDOWN` handler at all.
+
+### 1.3 The UI is MVVM `[v1]`
+
+*(Owner's framing, 2026-08-21. Stated as a principle because the pattern was already being followed
+and had no name, and an unnamed convention is one that erodes.)*
+
+**The view-model holds everything worth testing; the view is the part that could be replaced.** In a
+portable codebase that is what MVVM buys: the executable half sits in a class with no platform in
+it, and only the drawing changes per platform. Tailhawk is built that way already —
+
+| Role | Here |
+|---|---|
+| Model | `tailhawk-core` — the index, the decoder, the filter, the sort, the menu tree |
+| **View-model** | `MenuFrame`, `RulesOverlay`, `WizardOverlay`, `FormatRow`, `HeaderColumn` — each one the surface **as one frame should draw it**, carrying no `HWND` and no device |
+| Mapping | `menu_frame_of`, `rules_overlay_of`, `wizard_overlay_of`, `format_menu_of` — pure, and unit-tested |
+| View | The Win32 shell: it draws a view-model and routes input back, and ideally decides nothing |
+
+**The check, which is quicker to apply than the principle: could this run with no window?** If the
+answer is no, and the code is not literally a `SetWindowPos` call, the decision is in the wrong half.
+
+This is not theory. Three defects found in a single session all had the same shape — a decision that
+stayed in the view, where nothing could reach it:
+
+- the `message` column's title silently vanished from the header;
+- every column divider was drawn two cells away from the drag boundary it advertises;
+- a click on a **disabled** menu item ran whatever the menu had highlighted, so with no document
+  open the greyed `Close Tab` would have opened a file dialog.
+
+None of the three had a test, because none *could* have one where it sat. Each became testable the
+moment the decision moved out, into `Document::header_columns`, `menubar::chosen_by_click` and
+`menubar::hit_at`. That is the whole argument for the pattern, and it is why the rule is stated
+here rather than left as a preference.
+
+---
 
 ## 2. Main window `[v1]`
 
