@@ -1,11 +1,39 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-20, session 22
+## ▶ Resume point — 2026-08-23, session 22
 
-**Master is green at `93a0710`.** Working tree clean, CI green on x64 and arm64, and the dogfood
-instance is running on the current build.
+**M7 is done.** Master is at `67de4eb`, the dogfood instance is on the current build.
 
-### What landed today
+### What landed since the section below
+
+- **The window and its title bar agree on what theme it is** (`8edbb09`). `DwmSetWindowAttribute`
+  dresses the frame; the residual mismatch was not Mica but a default nothing had settled —
+  `resolve_theme` returned light when asked for nothing, the comment above it said "else dark", and
+  the test cited `UI-DESIGN.md` §11.2, which is the severity ramp. **An unasked session now follows
+  Windows**, and so does a name we do not recognise. `theme::chosen` is the pure decision; the shell
+  is left with the registry read and `SystemParametersInfoW`.
+- **§12's touch inertia** (`67de4eb`). `fling.rs` holds the physics *and* the routing —
+  `TouchAction`/`TouchPhase`/`Panes`/`decide` — and `tools/verify-touch.ps1` drives a real contact
+  at the real window with `InjectTouchInput`.
+
+### Two things to know before touching the touch path
+
+1. **A tap on a row does nothing on a touchscreen, and that is a real regression.** The pointer arm
+   consumes a contact that lands on the rows, so `DefWindowProc` never promotes it to
+   `WM_LBUTTONDOWN` and none of the grid's click behaviour — caret, shift-extend, double-tap word,
+   triple-tap line — is reachable by finger. The chrome is unaffected: `decide` returns `Ignore` for
+   anything not on the rows, which is exactly what keeps the menu bar and the command bar working.
+   The fix is a slop threshold — do not consume until the contact has moved far enough to be a pan,
+   and clear the selection the promoted mouse-down started — and it was left undone deliberately
+   rather than rushed in beside the physics.
+2. **Velocity is timestamped when the message is *processed*, not when it was sent.** `gesture_ms`
+   reads a monotonic clock inside the wndproc. If the UI thread stalls and a batch of
+   `WM_POINTERUPDATE`s is drained back-to-back, the positions are far apart and the timestamps are
+   not, and there is no upper clamp on the result. `POINTER_INFO` carries `dwTime` and
+   `PerformanceCount` and the shell already has the struct in hand. Not yet observed in practice —
+   the harness passes 3/3 — but it is a real hole and a clamp is the cheap half of the fix.
+
+### What landed earlier in session 22
 
 - **§2.2's menu bar draws and answers.** Seven conventional menus — File, Edit, View, Format,
   Rules, Settings, Help. `Alt` focuses and reveals mnemonics, `Alt`+letter opens, the arrows walk
@@ -136,12 +164,10 @@ without difficulty.
 (`9d168a5`), §6.3's import (`96dec59`), and **§6.1's chip menu** (`3ae0c4e`, 2026-08-19 — that
 section still lists it as unbuilt and has simply never been updated).
 
-M7's remaining V9 item is **§6.5.1's "Remember for"**, and it is a real functional gap rather than
-polish: `wizard.rs` stores `Definition::glob` and serialises it to `tailhawk.formats.toml`, but
-**there is no matching function anywhere** and nothing loads that file at start-up. The wizard
-offers to remember a format for `*.log` and then never applies it. Plus the leftovers listed under
-part 4c, Mica, `WM_POINTER` inertia and the horizontal scrollbar. Then M7b (RDP), M8 (CLI,
-settings, i18n), M9 (ship).
+**M7 is complete.** §6.5.1 "Remember for" landed in `77774da` and `a391fbd`, Mica and the dark
+title bar in `8edbb09`, the horizontal scrollbar earlier the same session, and `WM_POINTER` inertia
+in `67de4eb`. **Next is M7b (RDP), then M8 (CLI, settings, i18n), then M9 (ship).** Two known holes
+in the touch path are named at the top of this file and neither blocks M7b.
 
 Also open, small: **"Stop saving" is enabled whenever a document is open** rather than only when a
 tee is live. It is gated on `open`, and there is no accessor for "a tee is running".
@@ -600,8 +626,9 @@ message must be moved to the un-nested one that causes it.**
 colour labels; labels took the keys (highlighting is the incumbent's core feature), numbered bookmarks
 are unbound.
 
-**Left of M7:** V9's rules *editor* and format wizard UI (the rules file works); Mica; `WM_POINTER` inertia (a wheel notch is eased now). **The
-desktop was busy all evening** — everything after the gutter was verified headless; the first free
+**Left of M7 at the time:** V9's rules *editor* and format wizard UI (the rules file works); Mica;
+`WM_POINTER` inertia (a wheel notch is eased now). **All of it has since landed — see the resume
+point at the top of this file.** **The desktop was busy all evening** — everything after the gutter was verified headless; the first free
 desktop should run `tools/shot.ps1` on a real log with `^k`, `^{ENTER}`, `^d`, `%{LEFT}` and the
 Save dialog.
 
@@ -1604,10 +1631,10 @@ arm binds a variable and matches every key. The bindings compare raw `u16` codes
 
 ### ⚠ Still not done on this axis
 
-- **No smooth or inertial scrolling.** `UI-DESIGN.md` §12 requires `WM_POINTER`/Direct Manipulation
-  and says why — discrete wheel steps are what make a hand-rolled Win32 app feel homemade next to
-  Edge and Terminal. This implements discrete `WM_MOUSEWHEEL` only, and the `CLEANROOM.md` row
-  records that gap deliberately rather than quietly.
+- ~~**No smooth or inertial scrolling.**~~ **Closed.** The wheel notch is eased (V12), and §12's
+  `WM_POINTER` inertia landed in `67de4eb` — `fling.rs` plus `tools/verify-touch.ps1`. Two known
+  holes remain and are named at the top of this file: a tap on a row does nothing by finger, and
+  velocity is timestamped at message-processing time with no upper clamp.
 - **No scrollbars**, so there is no drag-to-scroll and no position feedback at all.
 - **The `WM_KEYDOWN` → `Navigate` mapping has no test** — it needs a message pump. Only
   `Document::navigate`, the half that turns an intent into a movement, is covered.
