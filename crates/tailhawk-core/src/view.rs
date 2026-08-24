@@ -512,3 +512,57 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod follow_through_the_view_tests {
+    use super::*;
+
+    /// The shell drives `View`, not `Grid`, and it re-sets the whole geometry every frame. The
+    /// grid-only tests in `grid.rs` pass; this is the same question asked through the layer the
+    /// shell actually uses, with a chrome band, a header and a footer present.
+    #[test]
+    fn following_survives_the_frames_view_geometry() {
+        let mut v = View::new(9.0, 19.0);
+        v.set_metrics(9.0, 19.0);
+        v.set_viewport(1900.0, 1572.0);
+        v.set_chrome_px(96.0);
+        v.set_footer_px(28.0);
+        v.grid_mut().set_total_rows(5000);
+        v.grid_mut().scroll_to_bottom();
+        assert!(
+            v.grid().is_following(),
+            "not following after scroll_to_bottom"
+        );
+
+        for frame in 0..5 {
+            v.set_metrics(9.0, 19.0);
+            v.set_viewport(1900.0, 1572.0);
+            v.set_chrome_px(96.0);
+            v.set_footer_px(28.0);
+            v.grid_mut().set_total_rows(5000);
+            assert!(
+                v.grid().is_following(),
+                "stopped following on frame {frame} with nothing changed"
+            );
+        }
+    }
+
+    /// A file still being indexed grows under the viewport. Scrolling to the bottom and *then*
+    /// learning about more rows must not silently strand the view above the end.
+    #[test]
+    fn following_survives_the_index_still_growing() {
+        let mut v = View::new(9.0, 19.0);
+        v.set_metrics(9.0, 19.0);
+        v.set_viewport(1900.0, 1572.0);
+        v.set_chrome_px(96.0);
+        v.grid_mut().set_total_rows(1200);
+        v.grid_mut().scroll_to_bottom();
+        for total in [2400, 3600, 5000] {
+            v.grid_mut().set_total_rows(total);
+            assert!(
+                v.grid().is_following(),
+                "lost the tail when the index reached {total}"
+            );
+        }
+    }
+}

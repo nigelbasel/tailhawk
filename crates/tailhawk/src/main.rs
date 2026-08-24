@@ -5301,9 +5301,17 @@ impl Shell {
         } else {
             Some(format!("⚠ rules: {}", self.rules_failed.join("; ")))
         };
+        // **Described afresh, not read from `self.file`.** That field is a string built once when a
+        // document lands — before its grid has been told how many rows it has — and nothing rebuilt
+        // it afterwards. So `Grid::is_following` was consulted while `total_rows` was still zero, the
+        // bar said `‖ paused` with the last line of the file on screen, and `Follow tail` and
+        // `Ctrl+End` both looked dead because the view was already at the bottom and had nothing to
+        // move: no move, no repaint, no new title. `self.file` remains the answer when a document
+        // failed to open, which is the case it is genuinely carrying.
+        let described = self.document.as_ref().map(|doc| doc.describe());
         for part in [
             self.driver.as_deref(),
-            self.file.as_deref(),
+            described.as_deref().or(self.file.as_deref()),
             rules_note.as_deref(),
         ]
         .into_iter()

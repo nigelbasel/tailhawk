@@ -1078,3 +1078,60 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod follow_frame_tests {
+    use super::*;
+
+    /// The shell re-measures the face and re-sets the geometry **every frame** — `Shell::paint`
+    /// does that deliberately, so a DPI change between frames cannot be missed. Following has to
+    /// survive being told the same numbers again.
+    #[test]
+    fn following_survives_the_frame_loop_setting_the_same_geometry_again() {
+        let mut g = Grid::new(19.0);
+        g.set_viewport_px(1466.0);
+        g.set_total_rows(5000);
+        g.scroll_to_bottom();
+        assert!(
+            g.is_at_bottom(),
+            "scroll_to_bottom must arrive at the bottom"
+        );
+
+        for frame in 0..5 {
+            g.set_row_height(19.0);
+            g.set_viewport_px(1466.0);
+            g.set_total_rows(5000);
+            assert!(
+                g.is_at_bottom(),
+                "stopped following on frame {frame} with nothing changed"
+            );
+        }
+    }
+
+    /// The same, with a viewport height whose division by the row height does not land on a bit
+    /// boundary — which is the ordinary case, not a contrived one.
+    #[test]
+    fn following_survives_a_viewport_that_does_not_divide_evenly() {
+        for (row_h, viewport) in [
+            (19.0, 1466.0),
+            (18.7, 1439.0),
+            (21.3, 1073.5),
+            (16.0, 900.0),
+        ] {
+            let mut g = Grid::new(row_h);
+            g.set_viewport_px(viewport);
+            g.set_total_rows(5000);
+            g.scroll_to_bottom();
+            assert!(
+                g.is_at_bottom(),
+                "{row_h}/{viewport}: not at bottom after scroll_to_bottom"
+            );
+            g.set_row_height(row_h);
+            g.set_viewport_px(viewport);
+            assert!(
+                g.is_at_bottom(),
+                "{row_h}/{viewport}: lost the bottom when the frame re-set the same geometry"
+            );
+        }
+    }
+}

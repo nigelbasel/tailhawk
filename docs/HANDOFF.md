@@ -59,17 +59,57 @@ So `Grid::is_at_bottom` returns false while the viewport is visibly against the 
 downstream of it is wrong with it: the chip, `Follow tail`, and the auto-follow that is the whole
 point of the product.
 
-**The suspect is float equality.** `is_at_bottom` is `self.scroll == self.max_scroll()`, `Scroll`
-carries an `f32 sub_row_px`, and `max_scroll` derives that remainder from `viewport_px` and
-`row_height` — both re-measured from the face every frame (`Shell::paint` re-reads `renderer.cell()`
-deliberately, for DPI). Two computations that differ in the last bit compare unequal. It fits the
-evidence that the **dogfood instance does show `● following`**: a growing file re-pins to the bottom
-inside the same frame that computes the comparison, so the two values match exactly.
+**Float equality was the first suspect and it has been ruled out.** `is_at_bottom` is
+`scroll == max_scroll()` over an `f32` remainder, so a per-frame re-measure differing in the last bit
+looked like the answer. `grid::follow_frame_tests` was written to catch exactly that — it drives the
+frame loop's own sequence (`set_row_height`, `set_viewport_px`, `set_total_rows`) repeatedly with
+unchanged values, and again with viewport/row-height pairs that do not divide evenly. **Both pass.**
+All three setters capture `is_following()` before mutating and re-pin through `settle`, and the model
+holds. Keep those tests; they are a real guard. But the cause is elsewhere.
 
-**Do not just add an epsilon.** `is_at_bottom` is the follow model's whole predicate, `grid.rs` has
-tests around it, and §6.4 spent two experiments on this arithmetic. Reproduce it in a unit test
-first — feed a viewport and row height whose division does not land on a bit boundary — and make it
-fail before believing any fix.
+**Two more theories were tested and also ruled out**, in `view::follow_through_the_view_tests`: the
+real `View` sequence (`set_metrics` → `set_viewport` → `set_chrome_px` → `set_footer_px` →
+`set_total_rows`, with a chrome band, header and footer present, repeated per frame), and an index
+that is **still growing** under a view already scrolled to the bottom. Both hold following. Four
+regression tests now stand between this bug and the scroll model, and none of them catches it.
+
+**So the remaining suspect is the title, and my own argument against it does not survive scrutiny.**
+I said staleness could not be the answer because `Ctrl+Home` then `Ctrl+End` moved the view and the
+bar still read `paused`. But the evidence for that movement is a screenshot showing **line 5000 at
+the bottom — which is exactly where the file opens**. If those `SendKeys` never arrived (and keyboard
+delivery to this window has been unreliable all session, see the sweep's own history), the view never
+moved and the screenshot proves nothing about `Ctrl+End`.
+
+**That makes the whole picture consistent:** the file opens at the tail; the title is built once
+during load, before the view is pinned, and says `paused`; `Follow tail` and `Ctrl+End` then find the
+view *already* at the bottom, so `Document::navigate` returns `false`, nothing repaints, `retitle`
+never runs, and the stale string stands. The dogfood instance shows `● following` because its file
+grows, so the follow poll moves the view and retitles.
+
+**The cause was found, and the scroll model is innocent.** A temporary trace in `Document::describe`
+printed, at the moment the status string was built:
+
+```
+describe: following=false at_bottom=true total=5000 scroll_row=0
+```
+
+`is_following` is `total_rows > 0 && is_at_bottom()`. `at_bottom` is **true**, and the *set* holds
+5,000 rows — so the only way following is false is that the **grid** had not yet been told its row
+count. `scroll_row=0` confirms it. `describe()` ran once, early, on a document whose grid was still
+empty, and `Shell::status_text` then read that frozen string out of `self.file` for the rest of the
+session. `retitle` was never called again — the trace file was empty when the probe sat in `retitle`
+instead.
+
+**Fixed by describing afresh:** `status_text` now calls `doc.describe()` rather than reading
+`self.file`, which stays as the answer for a document that failed to open — the case it genuinely
+carries.
+
+**⚠ Not yet confirmed on screen.** The gate is green and the reasoning is sound, but the last capture
+attempt timed out on a stale instance and the window *title* still read `paused` — expected, since
+`refresh_title` runs rarely, while the status **bar** is rebuilt every frame from `status_text`. The
+remaining job is one screenshot of the bottom band on a freshly opened file: it should now read
+`● following`. If it does not, the next thing to check is whether the view is at the bottom at rest
+at all, because everything else about the model has now been tested and holds.
 
 ### Then — the menu bar vanishes when the last tab closes
 
