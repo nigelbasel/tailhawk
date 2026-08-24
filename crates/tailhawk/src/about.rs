@@ -83,6 +83,26 @@ pub fn about_sheet_of(facts: AboutFacts<'_>) -> AboutSheet {
     }
 }
 
+/// The sheet flattened to the one string `TaskDialogIndirect` takes as its content: the labelled
+/// rows, a blank line, then the assurance. The dialog is presentation only — everything it says
+/// comes through here from the tested mapping above, so the native surface cannot fork from it.
+pub fn dialog_content(sheet: &AboutSheet) -> String {
+    let mut content = String::new();
+    for row in &sheet.rows {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&row.label);
+        content.push_str(":  ");
+        content.push_str(&row.value);
+    }
+    for (i, line) in sheet.assurance.iter().enumerate() {
+        content.push_str(if i == 0 { "\n\n" } else { "\n" });
+        content.push_str(line);
+    }
+    content
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +172,27 @@ mod tests {
         assert!(
             warp.rows.iter().any(|r| r.value == "warp"),
             "a machine that fell back to software rendering should be able to find that out here"
+        );
+    }
+
+    #[test]
+    fn the_dialog_content_carries_every_row_and_the_whole_assurance() {
+        let sheet = about_sheet_of(facts());
+        let content = dialog_content(&sheet);
+        for row in &sheet.rows {
+            assert!(content.contains(&row.label), "{} is missing", row.label);
+            assert!(content.contains(&row.value), "{} is missing", row.value);
+        }
+        for line in &sheet.assurance {
+            assert!(content.contains(line.as_str()));
+        }
+        assert!(
+            content.contains("\n\n"),
+            "the assurance is set off from the facts by a blank line"
+        );
+        assert!(
+            !content.contains(&sheet.title),
+            "the title is the dialog's main instruction, not part of the content"
         );
     }
 

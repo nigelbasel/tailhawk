@@ -118,8 +118,9 @@ impl Prefs {
         self.face_chosen
     }
 
-    /// Put the selection on the row that edits `setting`, so *Font…* can open this sheet already
-    /// pointing at the font rather than making the user find it.
+    /// Put the selection on the row that edits `setting`. *Font…* used to open this sheet through
+    /// here; it is `ChooseFontW` now, and the tests are what still steer by it.
+    #[cfg(test)]
     pub fn focus(&mut self, setting: Setting) {
         if let Some(i) = Self::ORDER.iter().position(|s| *s == setting) {
             self.selected = i;

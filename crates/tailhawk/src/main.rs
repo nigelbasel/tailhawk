@@ -72,13 +72,18 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT,
-    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    ChooseFontW, GetOpenFileNameW, GetSaveFileNameW, CF_FIXEDPITCHONLY, CF_FORCEFONTEXIST,
+    CF_INITTOLOGFONTSTRUCT, CF_SCREENFONTS, CHOOSEFONTW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
+    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::Controls::SetScrollInfo;
+use windows::Win32::UI::Controls::{
+    SetScrollInfo, TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TDCBF_OK_BUTTON,
+    TDF_ALLOW_DIALOG_CANCELLATION, TDF_USE_HICON_MAIN,
+};
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::Ime::{
     ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT,
@@ -3986,10 +3991,11 @@ type SheetLines = (String, Vec<(String, String, bool)>, String);
 /// The most states kept in either direction.
 const HISTORY_DEPTH: usize = 64;
 
-/// §2.2's three modal sheets. `About` and `Keymap` are read-only and hold their finished picture;
-/// `Prefs` holds the editable state and makes its picture per frame.
+/// §2.2's overlay sheets. `Keymap` is read-only and holds its finished picture; `Prefs` holds the
+/// editable state and makes its picture per frame. About left this enum for `TaskDialogIndirect`
+/// — the owner's direction, 2026-08-24: dialogs popped from menus use the standard Windows
+/// surfaces — and these two follow it in the same conversion.
 enum Sheet {
-    About(about::AboutSheet),
     Keymap(keymap::KeymapSheet),
     Prefs(prefs::Prefs),
 }
@@ -4000,16 +4006,6 @@ impl Sheet {
     /// cannot be honoured: a heading, or a font this machine does not have.
     fn lines(&self) -> (String, Vec<(String, String, bool)>, String) {
         match self {
-            Sheet::About(a) => {
-                let mut rows: Vec<(String, String, bool)> = a
-                    .rows
-                    .iter()
-                    .map(|r| (r.label.clone(), r.value.clone(), false))
-                    .collect();
-                rows.push((String::new(), String::new(), true));
-                rows.extend(a.assurance.iter().map(|s| (s.clone(), String::new(), true)));
-                (a.title.clone(), rows, "Esc close".to_owned())
-            }
             Sheet::Keymap(k) => {
                 let mut rows = Vec::new();
                 for (i, section) in k.sections.iter().enumerate() {
@@ -4986,6 +4982,11 @@ struct Shell {
     /// The palette chose an export or a tee (`Some(live)`): `wndproc` shows the Save dialog once
     /// this borrow is released.
     pending_save: Option<bool>,
+    /// §2.2's About — a native `TaskDialogIndirect`, deferred to `wndproc` exactly as the file
+    /// dialogs are: a modal dialog pumps messages, so it must not run inside a `STATE` borrow.
+    pending_about: bool,
+    /// §2.2's Font… — `ChooseFontW`, deferred the same way.
+    pending_font: bool,
     /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
     wheel_remaining: f32,
     /// §2.2's About, Keyboard map and Preferences. One slot, because they are the same kind of
@@ -6133,21 +6134,21 @@ impl Shell {
         })
     }
 
-    /// §2.2's Preferences, opened over the settings actually in force.
+    /// The face and size actually in force — what Preferences and the Font dialog open showing.
     ///
     /// The size comes from the renderer rather than from the settings file because the renderer is
     /// what is being looked at: a file that names a size the renderer refused would otherwise show
-    /// the refused number.
-    fn new_prefs(&self) -> prefs::Prefs {
+    /// the refused number. With no face chosen, this is the first of the built-in chain this
+    /// machine actually has — which is what is being drawn with. Showing `DEFAULT_FONTS[0]`
+    /// regardless makes a stock Windows 10 report `Cascadia Mono (not installed)` for a grid
+    /// rendering in Consolas, and the one surface whose job is to say what the appearance *is*
+    /// would be wrong about it.
+    fn current_font(&self) -> (String, u16) {
         let size = self
             .renderer
             .as_ref()
             .map_or(tailhawk_core::DEFAULT_PX_PER_EM, |r| r.base_px_per_em());
         let installed = monospace_faces();
-        // With no face chosen, show the first of the built-in chain this machine actually has —
-        // which is what is being drawn with. Showing `DEFAULT_FONTS[0]` regardless makes a stock
-        // Windows 10 report `Cascadia Mono (not installed)` for a grid rendering in Consolas, and
-        // the one sheet whose job is to say what the appearance *is* would be wrong about it.
         let face = self.grid_face.clone().unwrap_or_else(|| {
             tailhawk_core::DEFAULT_FONTS
                 .iter()
@@ -6155,6 +6156,37 @@ impl Shell {
                 .unwrap_or(&tailhawk_core::DEFAULT_FONTS[0])
                 .to_string()
         });
+        (face, size)
+    }
+
+    /// Adopt what `ChooseFontW` returned — the path Preferences' font rows take, minus the theme
+    /// half. The chosen face goes ahead of the built-in chain, so a face that turns out unusable
+    /// degrades to the default rather than to nothing.
+    ///
+    /// **Only a face the user actually picked is recorded** — `apply_prefs`'s rule, held here for
+    /// the same reason: the dialog opens seeded with whichever face is in use, and writing that
+    /// back would pin a name nobody chose into the settings file, after which the built-in chain
+    /// can never be followed again on this machine. `seeded` is what the dialog opened showing.
+    fn apply_font(&mut self, hwnd: HWND, seeded: &str, face: String, size: u16) {
+        let mut candidates = vec![face.clone()];
+        candidates.extend(tailhawk_core::DEFAULT_FONTS.iter().map(|s| (*s).to_owned()));
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_grid_font(&candidates, size, dpi);
+        }
+        if face != seeded {
+            self.grid_face = Some(face);
+        }
+        self.save_settings(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
+    /// §2.2's Preferences, opened over the settings actually in force.
+    fn new_prefs(&self) -> prefs::Prefs {
+        let (face, size) = self.current_font();
+        let installed = monospace_faces();
         prefs::Prefs::new(
             self.theme_name.as_deref().unwrap_or("system"),
             &face,
@@ -6968,8 +7000,7 @@ impl Shell {
             }
             menubar::ID_ABOUT => {
                 self.close_sheet(hwnd);
-                self.sheet = Some(Sheet::About(self.about_sheet()));
-                self.needs_frame = true;
+                self.pending_about = true;
                 true
             }
             menubar::ID_KEYMAP => {
@@ -6980,16 +7011,17 @@ impl Shell {
                 self.needs_frame = true;
                 true
             }
-            // §2.2 keeps both entries because a user looking for a font does not think to look
-            // under Preferences — but there is one sheet, opened on the row they asked for.
-            menubar::ID_PREFS | menubar::ID_FONT => {
+            menubar::ID_PREFS => {
                 self.close_sheet(hwnd);
-                let mut p = self.new_prefs();
-                if id == menubar::ID_FONT {
-                    p.focus(prefs::Setting::FontFace);
-                }
-                self.sheet = Some(Sheet::Prefs(p));
+                self.sheet = Some(Sheet::Prefs(self.new_prefs()));
                 self.needs_frame = true;
+                true
+            }
+            // §2.2 keeps a separate Font… entry because a user looking for a font does not think
+            // to look under Preferences — and it is the standard Font dialog, `ChooseFontW`.
+            menubar::ID_FONT => {
+                self.close_sheet(hwnd);
+                self.pending_font = true;
                 true
             }
             // Cut and Paste are permanently disabled — this is a viewer. If one is reached anyway
@@ -8929,7 +8961,128 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         }
         return true;
     }
+    let about = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_about))
+    });
+    if about {
+        let sheet = STATE.with(|s| s.borrow().as_ref().map(|shell| shell.about_sheet()));
+        if let Some(sheet) = sheet {
+            show_about(hwnd, &sheet);
+        }
+        return true;
+    }
+    let font = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_font))
+    });
+    if font {
+        let current = STATE.with(|s| s.borrow().as_ref().map(|shell| shell.current_font()));
+        if let Some((seeded, seeded_size)) = current {
+            if let Some((face, size)) = ask_for_font(hwnd, &seeded, seeded_size) {
+                // An OK that changed nothing applies nothing — and writes nothing.
+                if (face.as_str(), size) != (seeded.as_str(), seeded_size) {
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            shell.apply_font(hwnd, &seeded, face, size);
+                        }
+                    });
+                }
+            }
+        }
+        return true;
+    }
     false
+}
+
+/// §2.2's About as the standard modal About box — `TaskDialogIndirect` with the product's icon,
+/// an OK button and Esc to dismiss. Modal like [`ask_for_file`], and dispatched the same way.
+/// Everything it says comes through [`about::dialog_content`] from the tested mapping, so the
+/// native surface cannot disagree with the model.
+fn show_about(hwnd: HWND, sheet: &about::AboutSheet) {
+    let title = wide("About Tailhawk");
+    let instruction = wide(&sheet.title);
+    let content = wide(&about::dialog_content(sheet));
+    let (icon, _) = icon::window_icons();
+    // Field-by-field rather than `|=` and `.hMainIcon =` afterwards: the struct is packed, and a
+    // reference into it — which compound assignment takes — is undefined behaviour before it is
+    // even used.
+    let flags = match icon {
+        Some(_) => TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_HICON_MAIN,
+        None => TDF_ALLOW_DIALOG_CANCELLATION,
+    };
+    let mut config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: hwnd,
+        dwFlags: flags,
+        dwCommonButtons: TDCBF_OK_BUTTON,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        pszMainInstruction: PCWSTR(instruction.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        ..Default::default()
+    };
+    if let Some(icon) = icon {
+        config.Anonymous1 = TASKDIALOGCONFIG_0 { hMainIcon: icon };
+    }
+    // The result is deliberately ignored: the only button is OK, and a machine whose comctl32
+    // refuses the dialog has nothing useful to be told about it.
+    let _ = unsafe { TaskDialogIndirect(&config, None, None, None) };
+}
+
+/// The standard Font dialog, over the machine's fixed-pitch faces only. Takes and returns the
+/// size in the renderer's unit — device pixels at the 96-DPI baseline; `ChooseFontW` speaks
+/// tenths of a typographic point, and [`px96_of_point_tenths`] is the tested conversion back.
+fn ask_for_font(hwnd: HWND, face: &str, size: u16) -> Option<(String, u16)> {
+    use windows::Win32::Graphics::Gdi::LOGFONTW;
+    // The **system** DPI, deliberately, in both directions. comdlg32 converts between the height
+    // and the point size it displays through the screen DC, which for a per-monitor-aware process
+    // reports the system DPI — seeding from the window's monitor instead makes an untouched OK
+    // come back as a different size whenever the two DPIs disagree.
+    let dpi = unsafe { GetDpiForSystem() };
+    let mut lf = LOGFONTW {
+        // Negative asks for character height, which is how the renderer sizes an em.
+        lfHeight: -((size as i32 * dpi as i32) / 96),
+        ..Default::default()
+    };
+    for (i, unit) in face
+        .encode_utf16()
+        .take(lf.lfFaceName.len() - 1)
+        .enumerate()
+    {
+        lf.lfFaceName[i] = unit;
+    }
+    let mut cf = CHOOSEFONTW {
+        lStructSize: std::mem::size_of::<CHOOSEFONTW>() as u32,
+        hwndOwner: hwnd,
+        lpLogFont: &mut lf,
+        Flags: CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_FIXEDPITCHONLY | CF_FORCEFONTEXIST,
+        ..Default::default()
+    };
+    if !unsafe { ChooseFontW(&mut cf) }.as_bool() {
+        return None;
+    }
+    let end = lf
+        .lfFaceName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(lf.lfFaceName.len());
+    let face = String::from_utf16_lossy(&lf.lfFaceName[..end]);
+    if face.is_empty() {
+        return None;
+    }
+    Some((face, px96_of_char_height(lf.lfHeight, dpi)))
+}
+
+/// The `LOGFONTW` character height back to device pixels at 96 DPI — the exact inverse of the
+/// seeding above, using the same DPI, so an untouched dialog returns exactly the size it opened
+/// with. Rounded, and clamped to the sizes Preferences offers, so the two doors to the same
+/// setting agree on its range.
+fn px96_of_char_height(height: i32, dpi: u32) -> u16 {
+    let dpi = i64::from(dpi.max(1));
+    let px = (i64::from(-height) * 96 + dpi / 2) / dpi;
+    px.clamp(i64::from(prefs::MIN_SIZE), i64::from(prefs::MAX_SIZE)) as u16
 }
 
 /// Whether this window is being drawn down a remote-desktop connection.
@@ -10539,6 +10692,8 @@ fn main() -> Result<()> {
             needs_frame: false,
             pending_open: false,
             pending_save: None,
+            pending_about: false,
+            pending_font: false,
             wheel_remaining: 0.0,
             sheet: None,
             theme_name: asked.clone(),
@@ -10632,6 +10787,26 @@ mod tests {
     use super::*;
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// The two doors to the grid's size — Preferences and `ChooseFontW` — must agree on its unit
+    /// and its range, and the conversion must invert the seeding exactly: an untouched OK returns
+    /// the size the dialog opened with, at every DPI. The ends clamp rather than wrap, which is
+    /// `prefs.rs`'s own rule for the same numbers.
+    #[test]
+    fn choose_font_height_inverts_the_seeding_at_any_dpi() {
+        for dpi in [96u32, 120, 144, 192] {
+            for size in [prefs::MIN_SIZE, 12, 16, 21, prefs::MAX_SIZE] {
+                let seeded = -((size as i32 * dpi as i32) / 96);
+                assert_eq!(
+                    px96_of_char_height(seeded, dpi),
+                    size,
+                    "size {size} did not survive the round trip at {dpi} DPI"
+                );
+            }
+        }
+        assert_eq!(px96_of_char_height(-4, 96), prefs::MIN_SIZE);
+        assert_eq!(px96_of_char_height(-500, 96), prefs::MAX_SIZE);
+    }
 
     /// Creates a real, unshown window to hang a swapchain on. Unshown is deliberate: the test
     /// needs a valid `HWND` and a presenting swapchain, not a flash of a window on the desktop of

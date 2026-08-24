@@ -102,6 +102,9 @@ impl Resource {
     const RT_ICON: u16 = 3;
     const RT_VERSION: u16 = 16;
     const RT_GROUP_ICON: u16 = 14;
+    const RT_MANIFEST: u16 = 24;
+    /// `CREATEPROCESS_MANIFEST_RESOURCE_ID` — the id the loader reads at process start.
+    const MANIFEST_ID: u16 = 1;
     /// US English, and the "Unicode" code page 1200 — the pair every version resource is keyed by.
     const LANG_EN_US: u16 = 0x0409;
     const CODEPAGE_UNICODE: u32 = 1200;
@@ -127,6 +130,7 @@ impl Resource {
             file.icon_group(ico);
         }
         file.entry(Self::RT_VERSION, 1, &body.0);
+        file.entry(Self::RT_MANIFEST, Self::MANIFEST_ID, MANIFEST.as_bytes());
         file.0
     }
 
@@ -311,3 +315,22 @@ impl Blob {
         self.close(root);
     }
 }
+
+/// The application manifest, as an `RT_MANIFEST` resource in the same `.res` the version stamp
+/// rides in — no separate compilation step, which is what kept a manifest out until now.
+///
+/// It declares exactly one thing: the comctl32 **v6** side-by-side dependency, without which every
+/// native dialog this program shows — `TaskDialogIndirect` refuses outright, `ChooseFontW` and the
+/// template dialogs draw Windows-95 controls — falls back to v5. Per-monitor DPI awareness is
+/// **deliberately not declared here**: `main` sets it by API before any window exists, that path is
+/// proven, and `CLEANROOM.md`'s 2026-08-07 row records the deviation.
+const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="Tailhawk" type="win32"/>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>
+"#;

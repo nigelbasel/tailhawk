@@ -90,6 +90,50 @@ mod tests {
         );
     }
 
+    /// The comctl32 v6 manifest, read back the way the version stamp is: by asking Windows.
+    ///
+    /// `build.rs` writes it as `RT_MANIFEST` id 1 in the same `.res`. Without it
+    /// `TaskDialogIndirect` refuses to open and every other native dialog draws unthemed — so a
+    /// build whose manifest went missing must fail here, not in front of the owner's Help menu.
+    #[test]
+    fn the_executable_carries_the_common_controls_manifest() {
+        use windows::Win32::System::LibraryLoader::{
+            FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
+        };
+        const RT_MANIFEST: usize = 24;
+        const MANIFEST_ID: usize = 1;
+        let module = unsafe { GetModuleHandleW(None) }.expect("a process has a module handle");
+        // SAFETY: ordinals passed as `MAKEINTRESOURCE` pointers, the documented convention.
+        let found = unsafe {
+            FindResourceW(
+                module,
+                PCWSTR(MANIFEST_ID as *const u16),
+                PCWSTR(RT_MANIFEST as *const u16),
+            )
+        };
+        assert!(
+            !found.is_invalid(),
+            "no RT_MANIFEST in this executable — the .res lost its manifest entry"
+        );
+        let size = unsafe { SizeofResource(module, found) } as usize;
+        let data = unsafe { LoadResource(module, found) }.expect("a found resource loads");
+        let bytes = unsafe { LockResource(data) };
+        assert!(!bytes.is_null() && size > 0);
+        // SAFETY: `bytes` points at `size` bytes of the mapped resource, which lives as long as
+        // the module.
+        let text =
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes.cast(), size) })
+                .into_owned();
+        assert!(
+            text.contains("Microsoft.Windows.Common-Controls"),
+            "the manifest is present but does not declare the common-controls dependency"
+        );
+        assert!(
+            text.contains("6.0.0.0"),
+            "the dependency is not pinned to comctl32 v6"
+        );
+    }
+
     /// The shape the owner's other builds use: the date, then a revision inside the day.
     #[test]
     fn the_version_is_a_date_and_a_revision_that_fit_a_version_field() {
