@@ -5084,6 +5084,13 @@ impl Shell {
                     }
                     self.file = Some(document.describe());
                     self.rebuild_highlighter(&mut document);
+                    // File ▸ Open Recent learns the file **here**, on success — a mistyped path
+                    // or an unreadable file never enters the history.
+                    if let Some(path) = document.path.as_ref() {
+                        let path = path.to_string_lossy().into_owned();
+                        self.settings.remember_recent(&path);
+                        self.save_settings(hwnd);
+                    }
                     self.document.push(document);
                     landed = true;
                 }
@@ -5232,8 +5239,11 @@ impl Shell {
         // disabled rather than offered — `menubar::menu_bar` explains why it is rebuilt and not
         // cached. `Menu::rebuild` keeps the open path, so a menu does not shut under the user
         // while a tail is arriving behind it.
-        self.menu
-            .rebuild(menubar::menu_bar(self.document.as_ref(), theme().dark));
+        self.menu.rebuild(menubar::menu_bar(
+            self.document.as_ref(),
+            theme().dark,
+            &self.settings.recent,
+        ));
         let menu_frame = menu_frame_of(&self.menu);
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
@@ -5816,7 +5826,7 @@ impl Shell {
         // resolved to today loses the instruction.
         self.theme_name = Some(name.to_owned());
         self.settings.theme = self.theme_name.clone();
-        self.menu = menubar::menu_bar(self.document.as_ref(), next.dark);
+        self.menu = menubar::menu_bar(self.document.as_ref(), next.dark, &self.settings.recent);
         let specs = self.rule_specs.clone();
         for (_, doc) in self.document.all_mut() {
             rebuild_highlighter_with(doc, &specs);
@@ -6811,6 +6821,21 @@ impl Shell {
                 self.pending_font = true;
                 true
             }
+            menubar::ID_CLEAR_RECENT => {
+                self.settings.recent.clear();
+                self.save_settings(hwnd);
+                true
+            }
+            id if (menubar::ID_RECENT_BASE
+                ..menubar::ID_RECENT_BASE + settings::RECENT_MAX as u32)
+                .contains(&id) =>
+            {
+                let at = (id - menubar::ID_RECENT_BASE) as usize;
+                if let Some(path) = self.settings.recent.get(at).cloned() {
+                    self.open_path(hwnd, std::path::PathBuf::from(path));
+                }
+                true
+            }
             // Cut and Paste are permanently disabled — this is a viewer. If one is reached anyway
             // it does nothing, and says so by reporting `false`.
             menubar::ID_CUT | menubar::ID_PASTE | menubar::ID_UNLISTED => false,
@@ -7779,6 +7804,10 @@ impl RowSource for Welcome {
         painter.fill(0.0, 0.0, width, band, theme().chrome_bg);
         let (_, open_x) = menubar::draw_bar(painter, &self.menu_frame, &mut hits, 0.0, width);
         menubar::draw_open_list(painter, &self.menu_frame, &mut hits, open_x, band, width);
+        // The harnesses aim at this window too — without the dump they click against whatever
+        // rects the previous instance left in the file, which is how verify-recent.ps1 first
+        // failed here.
+        menubar::dump_hits(&hits);
     }
 }
 
@@ -10479,6 +10508,7 @@ fn main() -> Result<()> {
     }
 
     let chosen_face = settings.font.clone();
+    let menu = menubar::menu_bar(None, theme().dark, &settings.recent);
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
             cell_w: 0.0,
@@ -10512,7 +10542,7 @@ fn main() -> Result<()> {
             fling_on: None,
             dragging_bar: None,
             welcome: None,
-            menu: menubar::menu_bar(None, theme().dark),
+            menu,
             remembered,
             rules_editor: tailhawk_core::ruleset::Editor::default(),
             wizard: None,

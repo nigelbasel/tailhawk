@@ -130,6 +130,10 @@ pub const ID_PASTE: u32 = 10_006;
 /// Surfaces that are planned but not built. Disabled, never hidden.
 pub const ID_FONT: u32 = 10_007;
 pub const ID_PREFS: u32 = 10_008;
+pub const ID_CLEAR_RECENT: u32 = 10_009;
+/// File ▸ Open Recent's entries: `ID_RECENT_BASE + n` opens the n-th newest, for the shell to
+/// resolve against the list it passed in. A range, because the entries are data, not commands.
+pub const ID_RECENT_BASE: u32 = 10_100;
 
 /// §2.2's seven menus, built from the command register each time the bar is opened.
 ///
@@ -139,7 +143,11 @@ pub const ID_PREFS: u32 = 10_008;
 ///
 /// An item that cannot act is **disabled, not hidden**, per §1.1 and §1.2's memorability rule: a
 /// menu whose shape changes under the user is a menu they cannot learn.
-pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu {
+pub fn menu_bar(
+    doc: Option<&Document>,
+    dark: bool,
+    recent: &[String],
+) -> tailhawk_core::menu::Menu {
     use tailhawk_core::menu::{Item, Menu};
     let cmd = |label: &str, key: &str, c: Command| Item::command(label, key, command_id(c));
     let on = |item: Item, yes: bool| if yes { item } else { item.disabled() };
@@ -161,6 +169,7 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
             "&File",
             vec![
                 cmd("&Open…", "Ctrl+O", Command::OpenFile),
+                recent_menu(recent),
                 on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
                 Item::separator(),
                 on(cmd("&Export view…", "", Command::Export), open),
@@ -329,6 +338,50 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
             ],
         ),
     ])
+}
+
+/// File ▸ Open Recent: numbered entries newest first, then *Clear recent files* — and greyed
+/// outright when there is no history, because an empty submenu is a dead end and a vanished one
+/// breaks §1.2's memorability.
+fn recent_menu(recent: &[String]) -> tailhawk_core::menu::Item {
+    use tailhawk_core::menu::Item;
+    if recent.is_empty() {
+        return Item::submenu("Open &Recent", Vec::new()).disabled();
+    }
+    let mut items: Vec<Item> = recent
+        .iter()
+        .enumerate()
+        .map(|(n, path)| Item::command(&recent_label(n, path), "", ID_RECENT_BASE + n as u32))
+        .collect();
+    items.push(Item::separator());
+    items.push(Item::command("&Clear recent files", "", ID_CLEAR_RECENT));
+    Item::submenu("Open &Recent", items)
+}
+
+/// One Open Recent entry: the customary numbered mnemonic — `&1` through `&9`, then `1&0` — and
+/// the path. A literal `&` in the path is doubled so it draws as itself instead of underlining
+/// the next letter.
+fn recent_label(n: usize, path: &str) -> String {
+    let shown = compact_path(path, RECENT_LABEL_CHARS).replace('&', "&&");
+    match n {
+        9 => format!("1&0  {shown}"),
+        n => format!("&{}  {shown}", n + 1),
+    }
+}
+
+/// What fits on a menu row comfortably, in characters.
+const RECENT_LABEL_CHARS: usize = 48;
+
+/// Elides the middle of a path that will not fit: the tail survives whole because the filename is
+/// the part that identifies the entry, and enough head survives to say which drive and root.
+fn compact_path(path: &str, max: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= max {
+        return path.to_owned();
+    }
+    let head: String = chars[..6].iter().collect();
+    let tail: String = chars[chars.len() - (max - 7)..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// What was drawn where, so a click can be resolved: an x-range, a y-range, and what is there.
@@ -623,7 +676,7 @@ mod tests {
     /// does not, is not there at all.
     #[test]
     fn every_listed_command_appears_in_at_least_one_menu() {
-        let ids = menu_bar(None, false).ids();
+        let ids = menu_bar(None, false, &[]).ids();
         let missing: Vec<&str> = Command::LISTED
             .iter()
             .enumerate()
@@ -644,7 +697,7 @@ mod tests {
     /// is what stops that fix quietly breaking §1.2's usability one.
     #[test]
     fn no_two_items_in_one_menu_share_a_mnemonic() {
-        let menu = menu_bar(None, false);
+        let menu = menu_bar(None, false, &[]);
         let mut clashes: Vec<String> = Vec::new();
 
         let heads: Vec<Option<char>> = menu.items().iter().map(|i| i.mnemonic()).collect();
@@ -683,7 +736,7 @@ mod tests {
     /// keyboard once the menu is open, which §1.2 requires to be a complete path.
     #[test]
     fn every_choosable_item_marks_a_mnemonic() {
-        let menu = menu_bar(None, false);
+        let menu = menu_bar(None, false, &[]);
         let mut bare: Vec<String> = Vec::new();
         for top in 0..menu.items().len() {
             let Some(items) = menu.at(&[top]) else {
@@ -705,12 +758,12 @@ mod tests {
     /// opened — and on a tailing file, frames never stop, so it would never appear at all.
     #[test]
     fn an_open_menu_survives_the_rebuild_the_next_frame_does() {
-        let mut menu = menu_bar(None, false);
+        let mut menu = menu_bar(None, false, &[]);
         menu.open_top(0);
         assert!(menu.is_open(), "open_top did not open the menu");
 
         for _ in 0..5 {
-            menu.rebuild(menu_bar(None, false));
+            menu.rebuild(menu_bar(None, false, &[]));
         }
         assert!(menu.is_open(), "the rebuild shut the menu");
 
@@ -723,12 +776,12 @@ mod tests {
     /// for one frame and vanish.
     #[test]
     fn alt_focus_survives_the_rebuild_the_next_frame_does() {
-        let mut menu = menu_bar(None, false);
+        let mut menu = menu_bar(None, false, &[]);
         menu.focus();
         assert!(menu.is_focused(), "focus() did not focus the bar");
 
         for _ in 0..5 {
-            menu.rebuild(menu_bar(None, false));
+            menu.rebuild(menu_bar(None, false, &[]));
         }
         assert!(menu.is_focused(), "the rebuild dropped the focus");
         assert!(menu_frame_of(&menu).show_mnemonics);
@@ -745,7 +798,7 @@ mod tests {
     /// predicate invented alongside the fix. Remove the guard from that function and this fails.
     #[test]
     fn clicking_a_disabled_item_chooses_nothing() {
-        let reference = menu_bar(None, false);
+        let reference = menu_bar(None, false, &[]);
         for top in 0..reference.items().len() {
             let Some(items) = reference.at(&[top]).map(<[_]>::to_vec) else {
                 continue;
@@ -754,7 +807,7 @@ mod tests {
                 if item.selectable() {
                     continue;
                 }
-                let mut menu = menu_bar(None, false);
+                let mut menu = menu_bar(None, false, &[]);
                 menu.open_top(top);
                 let chosen = chosen_by_click(&mut menu, MenuHit::Entry(i));
                 assert_eq!(
@@ -782,7 +835,7 @@ mod tests {
     /// removing the guard makes this return `EditRules`. Verified by doing that.
     #[test]
     fn clicking_a_greyed_item_chooses_nothing() {
-        let mut menu = menu_bar(None, false);
+        let mut menu = menu_bar(None, false, &[]);
         let rules = menu
             .items()
             .iter()
@@ -818,7 +871,7 @@ mod tests {
     /// a menu that hides working features.
     #[test]
     fn the_four_built_surfaces_are_no_longer_greyed() {
-        let menu = menu_bar(None, false);
+        let menu = menu_bar(None, false, &[]);
         for (top, label) in [
             ("Settings", "Preferences"),
             ("Help", "Keyboard map"),
@@ -846,7 +899,7 @@ mod tests {
     /// whole menu and the first test would pass for the wrong reason.
     #[test]
     fn clicking_an_enabled_item_still_chooses_it() {
-        let mut menu = menu_bar(None, false);
+        let mut menu = menu_bar(None, false, &[]);
         menu.open_top(0); // File — `Open…` is never disabled.
         assert_eq!(
             chosen_by_click(&mut menu, MenuHit::Entry(0)),
@@ -854,10 +907,51 @@ mod tests {
         );
     }
 
+    /// A click on Open Recent descends into it — and the per-frame rebuild does not throw the
+    /// open submenu away, which is exactly how the live harness first saw this fail.
+    #[test]
+    fn clicking_open_recent_descends_and_survives_the_rebuild() {
+        let paths = vec![r"C:\logs\a.log".to_owned()];
+        let mut menu = menu_bar(None, false, &paths);
+        menu.open_top(0);
+        assert_eq!(
+            chosen_by_click(&mut menu, MenuHit::Entry(1)),
+            None,
+            "a submenu opens rather than choosing"
+        );
+        assert_eq!(
+            menu.open_path(),
+            &[0, 1],
+            "the submenu is the open list now"
+        );
+        let entries = menu.at(menu.open_path()).expect("the child list");
+        assert!(entries[0].text().ends_with("a.log"));
+
+        menu.rebuild(menu_bar(None, false, &paths));
+        assert_eq!(
+            menu.open_path(),
+            &[0, 1],
+            "the every-frame rebuild kept the open submenu"
+        );
+        let clear = menu.at(&[0, 1]).expect("child list").len() - 1;
+        assert_eq!(
+            chosen_by_click(&mut menu, MenuHit::Entry(0)),
+            Some(ID_RECENT_BASE),
+            "the first entry chooses the newest file"
+        );
+        let mut menu = menu_bar(None, false, &paths);
+        menu.open_top(0);
+        let _ = chosen_by_click(&mut menu, MenuHit::Entry(1));
+        assert_eq!(
+            chosen_by_click(&mut menu, MenuHit::Entry(clear)),
+            Some(ID_CLEAR_RECENT)
+        );
+    }
+
     /// A click on a heading opens it, and a second click shuts it.
     #[test]
     fn clicking_a_heading_opens_it_and_clicking_again_shuts_it() {
-        let mut menu = menu_bar(None, false);
+        let mut menu = menu_bar(None, false, &[]);
         assert_eq!(chosen_by_click(&mut menu, MenuHit::Heading(1)), None);
         assert!(menu.is_open());
         assert_eq!(menu.open_path().first(), Some(&1));
@@ -894,16 +988,81 @@ mod tests {
             ID_PASTE,
             ID_FONT,
             ID_PREFS,
+            ID_CLEAR_RECENT,
+            ID_RECENT_BASE,
+            ID_RECENT_BASE + tailhawk_core::settings::RECENT_MAX as u32 - 1,
             ID_UNLISTED,
         ] {
             assert_eq!(command_of(id), None, "id {id} collides with the register");
         }
     }
 
+    /// File ▸ Open Recent: greyed with no history, and with history it lists the files newest
+    /// first under numbered mnemonics with *Clear recent files* at the bottom.
+    #[test]
+    fn the_file_menu_offers_recent_files_and_greys_the_empty_list() {
+        let menu = menu_bar(None, false, &[]);
+        let file = menu.at(&[0]).expect("File opens").to_vec();
+        let recent = file
+            .iter()
+            .find(|i| i.text().starts_with("Open Recent"))
+            .expect("an Open Recent entry under File");
+        assert!(
+            !recent.selectable(),
+            "an empty history is greyed, not a dead end"
+        );
+
+        let paths = vec![
+            r"C:\logs\newest.log".to_owned(),
+            r"C:\logs\older.log".to_owned(),
+        ];
+        let menu = menu_bar(None, false, &paths);
+        let at = menu
+            .at(&[0])
+            .expect("File opens")
+            .iter()
+            .position(|i| i.text().starts_with("Open Recent"))
+            .expect("the entry is still where it was — §1.2's memorability");
+        let entries = menu.at(&[0, at]).expect("the submenu opens").to_vec();
+        assert!(
+            entries[0].text().starts_with("1 ") && entries[0].text().ends_with("newest.log"),
+            "the newest file is entry 1: {}",
+            entries[0].text()
+        );
+        assert!(entries[1].text().ends_with("older.log"));
+        assert!(
+            entries
+                .last()
+                .expect("entries")
+                .text()
+                .contains("Clear recent files"),
+            "the customary way out lives at the bottom"
+        );
+    }
+
+    /// A path too long for a menu row loses its middle, never its filename.
+    #[test]
+    fn a_long_recent_path_keeps_its_filename() {
+        let path = r"C:\a\deeply\nested\folder\structure\holding\seventy\characters\of\path\app-service.log";
+        let label = recent_label(0, path);
+        assert!(label.ends_with("app-service.log"), "{label}");
+        assert!(label.contains('…'), "{label}");
+        assert!(
+            label.chars().count() <= RECENT_LABEL_CHARS + 5,
+            "{label} is still too wide for a menu row"
+        );
+        let short = recent_label(1, r"C:\logs\b.log");
+        assert!(!short.contains('…'), "a short path is shown whole");
+        // The tenth entry's mnemonic is the zero, the customary MRU shape.
+        assert!(recent_label(9, r"C:\x.log").starts_with("1&0"));
+        // A literal ampersand draws as itself.
+        assert!(recent_label(0, r"C:\a&b.log").contains("&&"));
+    }
+
     /// A closed bar draws its headings and no entries; the mnemonics stay hidden until `Alt`.
     #[test]
     fn a_closed_bar_draws_headings_and_no_list() {
-        let frame = menu_frame_of(&menu_bar(None, false));
+        let frame = menu_frame_of(&menu_bar(None, false, &[]));
         assert_eq!(frame.headings.len(), 7);
         assert!(frame.entries.is_empty());
         assert!(frame.open.is_none());
@@ -918,7 +1077,7 @@ mod tests {
     /// Opening a heading fills the list from it, and asking for `Alt` reveals the underlines.
     #[test]
     fn opening_a_heading_fills_the_list_and_reveals_the_mnemonics() {
-        let mut menu = menu_bar(None, false);
+        let mut menu = menu_bar(None, false, &[]);
         menu.open_top(0);
         let frame = menu_frame_of(&menu);
         assert_eq!(frame.open, Some(0));
@@ -931,7 +1090,7 @@ mod tests {
     /// menu would offer no way back.
     #[test]
     fn with_no_document_the_file_menu_still_offers_open() {
-        let mut menu = menu_bar(None, false);
+        let mut menu = menu_bar(None, false, &[]);
         menu.open_top(0);
         let frame = menu_frame_of(&menu);
         let open = &frame.entries[0];
@@ -948,7 +1107,7 @@ mod tests {
     #[test]
     fn the_theme_item_is_ticked_to_match_the_theme() {
         for dark in [true, false] {
-            let mut menu = menu_bar(None, dark);
+            let mut menu = menu_bar(None, dark, &[]);
             // Settings is the sixth heading.
             menu.open_top(5);
             let frame = menu_frame_of(&menu);

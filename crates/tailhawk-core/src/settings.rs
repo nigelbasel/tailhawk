@@ -64,7 +64,12 @@ pub struct Settings {
     pub font: Option<String>,
     /// §2.2 Preferences: the grid em size at the 96-DPI baseline, when the user chose one.
     pub font_size: Option<u16>,
+    /// File ▸ Open Recent, newest first, at most [`RECENT_MAX`].
+    pub recent: Vec<String>,
 }
+
+/// How many files Open Recent keeps — the platform's customary MRU depth.
+pub const RECENT_MAX: usize = 10;
 
 impl Settings {
     /// The state for `path`, if any was kept.
@@ -94,6 +99,16 @@ impl Settings {
         }
     }
 
+    /// Puts `path` at the front of the recent list, moving it there if it is already present —
+    /// compared case-insensitively, as Windows paths are — and dropping the oldest past
+    /// [`RECENT_MAX`].
+    pub fn remember_recent(&mut self, path: &str) {
+        let folded = path.to_lowercase();
+        self.recent.retain(|p| p.to_lowercase() != folded);
+        self.recent.insert(0, path.to_owned());
+        self.recent.truncate(RECENT_MAX);
+    }
+
     /// Merges `over` onto `self`: `over`'s keys win, per §12.4's "earlier tier winning per key",
     /// with the earlier tier passed as `over`.
     pub fn merged_under(mut self, over: Settings) -> Settings {
@@ -102,6 +117,10 @@ impl Settings {
         }
         if over.theme.is_some() {
             self.theme = over.theme;
+        }
+        if !over.recent.is_empty() {
+            self.recent = over.recent;
+            self.recent.truncate(RECENT_MAX);
         }
         for f in over.files {
             self.set_file(f);
@@ -127,6 +146,10 @@ impl Settings {
             if let Some(size) = self.font_size {
                 out.push_str(&format!("font_size = {size}\n"));
             }
+        }
+        if !self.recent.is_empty() {
+            let files: Vec<String> = self.recent.iter().map(|p| quote(p)).collect();
+            out.push_str(&format!("\n[recent]\nfiles = [{}]\n", files.join(", ")));
         }
         if let Some(w) = &self.window {
             out.push_str("\n[window]\n");
@@ -198,6 +221,7 @@ impl Settings {
                         Section::Window
                     }
                     "appearance" => Section::Appearance,
+                    "recent" => Section::Recent,
                     _ => Section::Other,
                 };
                 continue;
@@ -213,6 +237,12 @@ impl Settings {
                     "font_size" => settings.font_size = value.parse().ok(),
                     _ => {}
                 },
+                Section::Recent => {
+                    if key == "files" {
+                        settings.recent = array(value);
+                        settings.recent.truncate(RECENT_MAX);
+                    }
+                }
                 Section::Window => match key {
                     "x" => window.x = value.parse().unwrap_or(0),
                     "y" => window.y = value.parse().unwrap_or(0),
@@ -256,6 +286,7 @@ enum Section {
     None,
     Window,
     Appearance,
+    Recent,
     File,
     Other,
 }
@@ -405,6 +436,53 @@ pub fn save(tiers: &[PathBuf], settings: &Settings, stateless: bool) -> Option<P
 mod tests {
     use super::*;
 
+    /// File ▸ Open Recent's list: newest first, re-opening moves to the front, and two spellings
+    /// of one Windows path are one entry — paths compare case-insensitively on this platform.
+    #[test]
+    fn the_recent_list_remembers_in_order_and_dedupes_windows_paths() {
+        let mut s = Settings::default();
+        s.remember_recent(r"C:\logs\a.log");
+        s.remember_recent(r"C:\logs\b.log");
+        s.remember_recent(r"C:\LOGS\A.LOG");
+        assert_eq!(
+            s.recent,
+            vec![r"C:\LOGS\A.LOG".to_owned(), r"C:\logs\b.log".to_owned()],
+            "re-opening moved a to the front under its new spelling, not a third entry"
+        );
+        let read = Settings::from_toml(&s.to_toml());
+        assert_eq!(read.recent, s.recent, "the list survives the file");
+    }
+
+    /// Ten entries — the platform's customary MRU depth — and the oldest falls off.
+    #[test]
+    fn the_recent_list_holds_ten_newest() {
+        let mut s = Settings::default();
+        for i in 0..12 {
+            s.remember_recent(&format!(r"C:\logs\{i}.log"));
+        }
+        assert_eq!(s.recent.len(), RECENT_MAX);
+        assert_eq!(s.recent[0], r"C:\logs\11.log");
+        assert!(!s.recent.contains(&r"C:\logs\0.log".to_owned()));
+        assert!(!s.recent.contains(&r"C:\logs\1.log".to_owned()));
+    }
+
+    /// §12.4's per-key tier merge covers the list: an earlier tier's list wins whole.
+    #[test]
+    fn the_recent_list_merges_as_one_key() {
+        let mut under = Settings::default();
+        under.remember_recent(r"C:\old.log");
+        let mut over = Settings::default();
+        over.remember_recent(r"C:\new.log");
+        let merged = under.clone().merged_under(over);
+        assert_eq!(merged.recent, vec![r"C:\new.log".to_owned()]);
+        let merged = under.merged_under(Settings::default());
+        assert_eq!(
+            merged.recent,
+            vec![r"C:\old.log".to_owned()],
+            "an empty over-tier does not erase the list"
+        );
+    }
+
     fn sample() -> Settings {
         let mut s = Settings {
             window: Some(Window {
@@ -418,6 +496,7 @@ mod tests {
             theme: Some("light".to_owned()),
             font: Some("Cascadia Mono".to_owned()),
             font_size: Some(18),
+            recent: vec![r"C:\logs\app.log".to_owned()],
         };
         s.set_file(FileState {
             path: r"C:\logs\app.log".to_owned(),
