@@ -424,7 +424,7 @@ impl RowSource for Document {
         let cell_w = painter.cell_width();
         let row_h = painter.row_height();
         let band = view.chrome_px();
-        let width = view.hgrid().viewport_px();
+        let width = view.gutter_px() + view.hgrid().viewport_px();
         let mut hits = self.chrome.hits.borrow_mut();
         hits.clear();
 
@@ -977,7 +977,7 @@ impl Document {
         let row_h = painter.chrome_line_height();
         let pad = painter.chrome_measure("n").max(4.0);
         let em = painter.chrome_measure("0").max(1.0);
-        let width = view.hgrid().viewport_px();
+        let width = view.gutter_px() + view.hgrid().viewport_px();
         let box_w = (FORMAT_MENU_CELLS as f32 * em).min(width).max(0.0);
         // Under the chip, which is at the right edge — so the menu hangs from the right too.
         let box_x = (width - box_w - pad).max(0.0);
