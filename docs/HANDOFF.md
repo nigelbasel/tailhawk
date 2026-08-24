@@ -1,8 +1,37 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-23, session 22
+## ▶ Resume point — 2026-08-24, session 22
 
-**M7 is done.** Master is at `67de4eb`, the dogfood instance is on the current build.
+**Master is `b93c113`, CI green, working tree clean, dogfood on the current build (2026.8.24.20672).**
+
+**M7 is done. M7b (RDP) was started and deliberately set aside** — the owner interrupted it to ask
+why so many menu items appeared to do nothing, and that turned out to be the more urgent thread.
+Nothing of M7b was written; the survey is in the session log, and `remote_session()` already exists
+from the touch work.
+
+**Start with the two items immediately below**: the menu bar vanishing when the last tab closes, and
+the click-sweep of every menu item. Both come directly from the owner.
+
+### The Loki position was wrong here for a month — read this before quoting §1.3
+
+`SPEC.md` §1.3 listed "querying remote backends" as a non-goal. **That was reversed by the owner on
+2026-07-29** — Tailhawk **is** a Loki client, staged client-lite first (`docs/LOKI.md` §8, commits
+`fbd8cfb`, `1969929`) — and `LOKI.md` said in its own header that the decision had never been folded
+into `SPEC.md` or `PLAN.md`. Nobody folded it in, and on 2026-08-24 the stale line was quoted back to
+the owner as the current position when he asked when Loki would land. Folded in now (`5ca88ff`),
+with a first-pass costing in `PLAN.md` §2.4b (`bb8fcad`).
+
+**Still owed on it:** stages 2 and 3 are uncosted, the costing was derived from `LOKI.md`'s narrative
+figures rather than rebuilt bottom-up, and `LOKI.md` §9's first open question is unanswered — **is
+the Loki HTTP API reachable directly from the workstation, or only through Grafana's datasource
+proxy?** Every measurement in that document went through the proxy; proxy-only means a different URL
+shape, different auth and ~+1 PW. That is a question for the owner, not a thing to research.
+
+### Deploying to the owner's working install
+
+`C:\Program Files\TailHawk` is his own copy, used against other products' logs. `deploy.cmd` in the
+repo root does it; it needs an **elevated** prompt and refuses to start without one, so it is
+hand-run. Build and green-gate first — it deliberately does not build.
 
 ### What landed since the section below
 
