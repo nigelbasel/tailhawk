@@ -32,6 +32,7 @@ use tailhawk_core::encoding::Charset;
 use tailhawk_core::export;
 use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
+use tailhawk_core::fling::{self, TouchAction, TouchPhase};
 use tailhawk_core::highlight::{Highlighter, Rule, Span};
 use tailhawk_core::paint::{Colours, Painter};
 use tailhawk_core::palette::{Choice, Entry, Palette};
@@ -87,6 +88,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_PRIOR, VK_R, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_V, VK_W,
     VK_X, VK_Y, VK_Z,
 };
+use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
 };
@@ -104,11 +106,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW,
-    WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL,
+    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, PT_PEN, PT_TOUCH, SM_REMOTESESSION,
 };
 
 /// Polls for the worker's device. `SPEC.md` §3.2 wants the device off the window thread, so the
@@ -130,6 +136,12 @@ const SMOOTH_TIMER: usize = 3;
 const SMOOTH_MS: u32 = 15;
 /// The share of the remaining distance moved per tick.
 const SMOOTH_EASE: f32 = 0.35;
+
+/// §12's touch inertia: the coast after a finger lifts. The physics is [`fling::Fling`]'s and is
+/// expressed as a half-life, so this period is a smoothness choice and not a speed one — changing
+/// it changes how many frames the coast is drawn in, not how far or how long it runs.
+const FLING_TIMER: usize = 4;
+const FLING_MS: u32 = 8;
 
 /// Scrollbar units. Fixed rather than the row count, so no file size can overflow `SCROLLINFO`'s
 /// `i32` -- the grid speaks in fractions at both ends and Win32 never sees a row number.
@@ -4811,6 +4823,24 @@ struct Shell {
     pending_save: Option<bool>,
     /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
     wheel_remaining: f32,
+    /// §12's touch inertia — the physics is [`fling::Fling`]'s, this only pumps it. `None` until a
+    /// contact touches the grid.
+    fling: fling::Fling,
+    /// The pointer id of the contact currently panning the grid. A second finger is ignored: §12
+    /// asks for a coast, not for pinch-zoom.
+    panning: Option<u32>,
+    /// The clock both halves of a gesture are measured against, **re-based at every press**.
+    ///
+    /// One clock, because a velocity read off one and spent against another is a velocity that is
+    /// wrong by their drift. Re-based, because these are `f32` milliseconds: counted from process
+    /// start they would be down to 8 ms of resolution after a day open, which is coarser than the
+    /// gap between two touch samples. Counted from the press they never exceed a few thousand.
+    fling_epoch: std::time::Instant,
+    /// Milliseconds since [`Self::fling_epoch`] at the last coast tick.
+    fling_tick: f32,
+    /// The `(tab, pane)` the current gesture was made on. A coast that outlives them is not this
+    /// document's momentum any more — see [`Self::fling_step`].
+    fling_on: Option<(usize, usize)>,
     /// §7.1's user highlight rules, as written in `tailhawk.rules.toml`, and the tiers they came
     /// from; compiled into every document's highlighter above the catalogue, below the labels.
     rule_specs: Vec<tailhawk_core::rules::Spec>,
@@ -5826,6 +5856,70 @@ impl Shell {
         };
         self.wheel_remaining -= step;
         self.navigate(hwnd, Navigate::ByPixels(step));
+    }
+
+    /// Milliseconds since the current gesture began. See [`Self::fling_epoch`] for why it is not
+    /// counted from anywhere earlier, and why it is not `GetTickCount` — whose 15.6 ms tick is
+    /// coarser than the gap between two samples from a touch digitiser, and would read a flick as
+    /// several samples at the same instant and so at no speed at all.
+    fn gesture_ms(&self) -> f32 {
+        self.fling_epoch.elapsed().as_secs_f32() * 1000.0
+    }
+
+    /// One tick of §12's coast: ask [`fling::Fling`] how far the view got, and move it there.
+    ///
+    /// The elapsed time is measured rather than assumed, because `WM_TIMER` is a low-priority
+    /// message and a tick that waited behind a re-shape would otherwise drop the distance it was
+    /// late by. `Fling::step` integrates over whatever interval it is given, so a late tick covers
+    /// the ground instead of losing it.
+    fn fling_step(&mut self, hwnd: HWND) {
+        // **The coast belongs to the view it was thrown on.** A flick followed straight away by
+        // `Ctrl+Tab`, `Ctrl+W` or an open would otherwise scroll whatever took its place, for up to
+        // a second and a half, by the momentum of a gesture never made on it. Checked here rather
+        // than at every door that changes the document, because there are seven of those and this
+        // is the one place the motion is actually spent.
+        if self.fling_on != Some((self.document.active, self.document.focused_pane())) {
+            self.cancel_fling(hwnd);
+            return;
+        }
+        let now = self.gesture_ms();
+        let dt = now - self.fling_tick;
+        self.fling_tick = now;
+        let px = self.fling.step(dt);
+        // A finger moving *down* pulls the content down, which is a move *up* the document — the
+        // same negation the wheel does, and for the same reason.
+        if px != 0.0 {
+            self.navigate(hwnd, Navigate::ByPixels(-px));
+        }
+        if !self.fling.in_flight() {
+            unsafe {
+                let _ = KillTimer(hwnd, FLING_TIMER);
+            }
+        }
+    }
+
+    /// Stop a coast and forget the contact. The document is about to change under it, or the
+    /// contact was taken away — either way the motion no longer means anything.
+    fn cancel_fling(&mut self, hwnd: HWND) {
+        self.fling.halt();
+        self.panning = None;
+        self.fling_on = None;
+        unsafe {
+            let _ = KillTimer(hwnd, FLING_TIMER);
+        }
+    }
+
+    /// Drop whatever the wheel has left to ease.
+    ///
+    /// The two kinds of motion must cancel each other or they add up: a notch delivered into a
+    /// running coast is swamped and then overshoots as the coast decays, and a finger put down on a
+    /// wheel-easing view watches it keep sliding — which is the one thing a finger on a moving view
+    /// is supposed to stop.
+    fn cancel_wheel(&mut self, hwnd: HWND) {
+        self.wheel_remaining = 0.0;
+        unsafe {
+            let _ = KillTimer(hwnd, SMOOTH_TIMER);
+        }
     }
 
     /// What every handled chrome key ends with: the scrollbar, the title and a repaint.
@@ -8324,6 +8418,16 @@ fn ask_to_save(hwnd: HWND) -> Option<std::path::PathBuf> {
 /// The theme for a name — `dark`, `light`, `system` (the apps-use-light-theme registry value) — with
 /// High Contrast on top: `UI-DESIGN.md` §11.2 says system colours are respected there whatever was
 /// asked, so it is read first.
+/// Whether this window is being drawn down a remote-desktop connection.
+///
+/// `UI-DESIGN.md` §11.5 turns several things off over RDP, inertial scrolling among them: a coast
+/// spends dozens of frames redrawing the whole grid, and a remote session is exactly where a frame
+/// is expensive. **WARP is deliberately not a trigger** — a local software-rendered session is
+/// still local, and §11.5 says so.
+fn remote_session() -> bool {
+    unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
+}
+
 /// Read the two facts Windows holds, hand them to [`theme::chosen`], and fetch whatever it names.
 ///
 /// The choosing is `tailhawk-core`'s and is unit-tested; all that is left here is asking the
@@ -8848,6 +8952,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             };
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
+                    // A wheel notch takes over from a coast rather than adding to it. Both move the
+                    // view by pixels on their own timer, so left running together the notch is
+                    // swamped while the coast is fast and then overshoots as it decays.
+                    shell.cancel_fling(hwnd);
                     match n {
                         // A vertical notch is eased over a few frames — V12. Anything under a
                         // quarter of a notch is a touchpad's own smoothing and moves at once.
@@ -9172,6 +9280,111 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 return LRESULT(1);
             }
             def_proc(hwnd, msg, wparam, lparam)
+        }
+        // §12's touch and pen panning, and the coast after it. Only a contact that starts on the
+        // **rows** is taken: everything on the menu bar, the command bar and the header band falls
+        // through to `DefWindowProc`, which promotes it to a mouse click, so every control in the
+        // chrome keeps working by finger without knowing anything about pointers.
+        WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERCAPTURECHANGED => {
+            let id = (wparam.0 & 0xFFFF) as u32;
+            let mut info = POINTER_INFO::default();
+            if unsafe { GetPointerInfo(id, &mut info) }.is_err() {
+                return def_proc(hwnd, msg, wparam, lparam);
+            }
+            // A mouse arrives as a pointer too, and the wheel already eases it. Coasting a mouse
+            // drag would be a surprise, not a feature.
+            if info.pointerType != PT_TOUCH && info.pointerType != PT_PEN {
+                return def_proc(hwnd, msg, wparam, lparam);
+            }
+            let mut pt = info.ptPixelLocation;
+            unsafe {
+                let _ = ScreenToClient(hwnd, &mut pt);
+            }
+            let phase = match msg {
+                WM_POINTERDOWN => TouchPhase::Down,
+                WM_POINTERUPDATE => TouchPhase::Update,
+                WM_POINTERUP => TouchPhase::Up,
+                _ => TouchPhase::CaptureLost,
+            };
+            let taken = STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let Some(shell) = state.as_mut() else {
+                    return false;
+                };
+                let y = pt.y as f32;
+                // Everything the decision needs, and nothing decided here. `fling::decide` owns
+                // which pane the contact is in, whether a second finger may take a pan in progress,
+                // whether the point is on rows rather than chrome, and whether a capture change is
+                // even about this contact.
+                let covered = shell.menu.is_open()
+                    || shell.rules_editor.is_open()
+                    || shell.wizard.is_some()
+                    || shell.document.as_ref().is_some_and(|d| d.palette.is_open());
+                let tops: Vec<f32> = shell.document.panes().iter().map(|d| d.pane_top).collect();
+                let Some(first) = shell.document.panes().first() else {
+                    return false;
+                };
+                let panes = fling::Panes {
+                    tops: &tops,
+                    top_inset: first.view.chrome_px() + first.view.header_px(),
+                    bottom_inset: first.view.footer_px(),
+                    bottom: first.view.height_px(),
+                };
+                match fling::decide(phase, id, y, shell.panning, covered, panes) {
+                    TouchAction::Ignore => false,
+                    TouchAction::Begin { pane, y } => {
+                        shell.document.focus_pane(pane);
+                        // A finger on a moving view stops it — whichever kind of motion it is.
+                        shell.cancel_fling(hwnd);
+                        shell.cancel_wheel(hwnd);
+                        shell.fling_epoch = std::time::Instant::now();
+                        shell.fling_tick = 0.0;
+                        shell.fling.press(0.0, y);
+                        shell.panning = Some(id);
+                        shell.fling_on =
+                            Some((shell.document.active, shell.document.focused_pane()));
+                        true
+                    }
+                    TouchAction::Move { y } => {
+                        let now = shell.gesture_ms();
+                        let moved = shell.fling.drag(now, y);
+                        if moved != 0.0 {
+                            shell.navigate(hwnd, Navigate::ByPixels(-moved));
+                        }
+                        true
+                    }
+                    TouchAction::End => {
+                        shell.panning = None;
+                        let now = shell.gesture_ms();
+                        // §11.5: no coast over RDP — it defeats the scroll-region blit, and the
+                        // frames it would spend are the ones a remote session cannot afford.
+                        if !remote_session() && shell.fling.release(now) {
+                            shell.fling_tick = now;
+                            unsafe {
+                                SetTimer(hwnd, FLING_TIMER, FLING_MS, None);
+                            }
+                        }
+                        true
+                    }
+                    TouchAction::Cancel => {
+                        shell.cancel_fling(hwnd);
+                        false
+                    }
+                }
+            });
+            if taken {
+                LRESULT(0)
+            } else {
+                def_proc(hwnd, msg, wparam, lparam)
+            }
+        }
+        WM_TIMER if wparam.0 == FLING_TIMER => {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.fling_step(hwnd);
+                }
+            });
+            LRESULT(0)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MOUSEMOVE | WM_LBUTTONUP => {
             // Client-relative already, and **signed**: a drag above the window gives a negative y,
@@ -9821,6 +10034,11 @@ fn main() -> Result<()> {
             pending_open: false,
             pending_save: None,
             wheel_remaining: 0.0,
+            fling: fling::Fling::new(),
+            panning: None,
+            fling_epoch: std::time::Instant::now(),
+            fling_tick: 0.0,
+            fling_on: None,
             dragging_bar: None,
             welcome: None,
             menu: menubar::menu_bar(None, theme().dark),

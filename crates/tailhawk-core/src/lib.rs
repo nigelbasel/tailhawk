@@ -18,6 +18,7 @@ pub mod detail;
 pub mod detect;
 pub mod encoding;
 pub mod filter;
+pub mod fling;
 pub mod follow;
 pub mod format;
 pub mod glob;
