@@ -574,6 +574,36 @@ pub fn chosen_by_click(menu: &mut tailhawk_core::menu::Menu, hit: MenuHit) -> Op
 ///
 /// Searched **last to first** so the open list wins over the bar row it overlaps. Nothing else
 /// depends on the order the rects were pushed in.
+/// Writes where the bar drew every heading and item, for `tools/verify-menus.ps1`.
+///
+/// **Only when `TAILHAWK_DUMP_MENU_HITS` names a file**, and it exists because a harness that clicks
+/// menu items has to know where they are. Guessing a uniform row pitch does not work: a separator is
+/// drawn shorter than an item, so the error accumulates down the list and the sweep ends up clicking
+/// something other than what it reports. It clicked `Exit` while believing it had clicked a
+/// separator, which is exactly the sort of false finding a sweep exists to avoid.
+///
+/// One line per rect: `kind index x0 y0 x1 y1`, client coordinates.
+pub fn dump_hits(hits: &MenuHits) {
+    let Some(path) = std::env::var_os("TAILHAWK_DUMP_MENU_HITS") else {
+        return;
+    };
+    use std::io::Write;
+    let Ok(mut f) = std::fs::File::create(path) else {
+        return;
+    };
+    for (xs, ys, hit) in hits {
+        let (kind, i) = match hit {
+            MenuHit::Heading(i) => ("heading", *i),
+            MenuHit::Entry(i) => ("entry", *i),
+        };
+        let _ = writeln!(
+            f,
+            "{kind} {i} {} {} {} {}",
+            xs.start, ys.start, xs.end, ys.end
+        );
+    }
+}
+
 pub fn hit_at(hits: &MenuHits, x: f32, y: f32) -> Option<MenuHit> {
     hits.iter()
         .rev()

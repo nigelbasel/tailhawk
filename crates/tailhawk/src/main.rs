@@ -720,6 +720,7 @@ impl RowSource for Document {
             menu,
             width,
         );
+        menubar::dump_hits(&menu_hits);
     }
 
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
