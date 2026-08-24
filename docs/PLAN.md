@@ -161,6 +161,44 @@ alone is 6–10.
 > and the staged **client-lite** first step is what makes the range tractable. Until that
 > reconciliation is done, treat v2 as **uncosted**, not as 28–36.
 
+### 2.4b The Loki source — reconciliation, first pass 2026-08-24
+
+**Cost is not a gate**, and the owner settled that on 2026-07-29 (`LOKI.md` §8): this is a side
+project with no delivery date, nothing is displaced, and the "86–110% of the v2 budget" objection
+does not bind. A number is owed here so the plan is honest — it does not authorise or block anything.
+
+**Three findings that change the arithmetic, and are evidence rather than opinion:**
+
+1. **The 15 MB argument is dead, and takes +1.5 PW with it.** `LOKI.md` §5 built four binaries and
+   measured them: the full `reqwest + tokio + tokio-tungstenite + native-tls + serde_json` stack
+   costs **+1.68 MB** over baseline at `opt-level=3`/LTO/strip, and **+0.77 MB** at `opt-level="z"`
+   with `panic=abort`, against a 15 MB gate. The hand-written WinHTTP path round 2 costed at
+   +1.5 PW exists only to save bytes that are not at risk.
+2. **Round 2 costs the whole client; the decision is staged.** Its 26–38 PW spans all three stages
+   plus the timeline histogram. Stage 1 — client-lite — explicitly excludes the credential store,
+   chip pushdown, follow, the tail WebSocket, the histogram and the label browser, so round 2's
+   figure is not the number that gates starting.
+3. **The timeline histogram is the largest single deferred item, and it is stage 2.** It is a v3
+   item today, and `LOKI.md` §8 finds it load-bearing because it is the only navigation affordance a
+   time-primary source has. **It moves to v2 alongside Loki stage 2.** That is the answer to the open
+   histogram question, and it leaves stage 1 untouched.
+
+**Stage 1 (client-lite), first pass: ≈ 13–18 PW A.** The research's own "~11 PW read-only window",
+plus the stage-1 share of the six items round 1 omitted — the materialised window over the CLEF
+spill, per-partition format detection, the interning parser, cost guardrails and the §13.2 CI-test
+rewrite — less the 1.5 PW the size measurement kills. §7's **request-level** controls are inside this
+number and are not deferrable: the endpoint allowlist, the SSRF and DNS-rebinding controls, redirect
+handling with no credential across an origin change, TLS posture and the response-parse caps are all
+required from the first HTTP call.
+
+> **What this pass does not have.** Neither round's per-item table is in `LOKI.md` — only the two
+> aggregates and the list of six omissions — so the band above is derived from that document's own
+> narrative figures rather than rebuilt bottom-up. **Stages 2 and 3 are not costed here at all.**
+> Finishing this means re-deriving both rounds item by item against the staging table, and answering
+> `LOKI.md` §9's first open question: whether the Loki HTTP API is reachable **directly** from a
+> workstation or only through Grafana's datasource proxy. Every measurement in that document went
+> through the proxy, and proxy-only means a different URL shape, different auth and ~+1 PW.
+
 **v3** adds **≈ 16–22 weeks A**.
 
 ### 2.5 Honesty about these numbers
