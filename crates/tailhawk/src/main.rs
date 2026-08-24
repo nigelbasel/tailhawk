@@ -8836,6 +8836,52 @@ fn monospace_faces() -> Vec<String> {
     found
 }
 
+/// Run whatever common dialog the last command asked for, and report whether one was shown.
+///
+/// **Every path that can run a `Command` has to call this, and for a month only the keyboard did.**
+/// `Command::OpenFile` and the export/tee pair cannot show their dialog where they are handled: a
+/// modal dialog pumps messages, and doing that inside the `STATE` borrow re-enters `wndproc` and
+/// panics on the `RefCell`. So they set a flag and the message loop shows the dialog once the borrow
+/// is released — which works only if the arm that ran the command remembers to ask. The menu bar's
+/// click path did not, so **File ▸ Open…, Export view… and Keep saving… silently did nothing when
+/// clicked**, while the same three worked from the keyboard and the palette.
+fn run_pending_dialogs(hwnd: HWND) -> bool {
+    let open = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_open))
+    });
+    if open {
+        if let Some(path) = ask_for_file(hwnd) {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.open_path(hwnd, path);
+                }
+            });
+        }
+        return true;
+    }
+    let save = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|shell| shell.pending_save.take())
+    });
+    if let Some(live) = save {
+        if let Some(path) = ask_to_save(hwnd) {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    if let Some(doc) = shell.document.as_mut() {
+                        doc.start_export(path, live);
+                    }
+                    shell.retitle(hwnd);
+                }
+            });
+        }
+        return true;
+    }
+    false
+}
+
 /// Whether this window is being drawn down a remote-desktop connection.
 ///
 /// `UI-DESIGN.md` §11.5 turns several things off over RDP, inertial scrolling among them: a coast
@@ -9533,38 +9579,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 })
             });
             // The palette's "Open file…" runs here, outside the borrow, for the reason `Ctrl+O` does.
-            let open = STATE.with(|s| {
-                s.borrow_mut()
-                    .as_mut()
-                    .is_some_and(|shell| std::mem::take(&mut shell.pending_open))
-            });
-            if open {
-                if let Some(path) = ask_for_file(hwnd) {
-                    STATE.with(|s| {
-                        if let Some(shell) = s.borrow_mut().as_mut() {
-                            shell.open_path(hwnd, path);
-                        }
-                    });
-                }
-                return LRESULT(0);
-            }
-            // Likewise the palette's export and tee: the Save dialog outside the borrow.
-            let save = STATE.with(|s| {
-                s.borrow_mut()
-                    .as_mut()
-                    .and_then(|shell| shell.pending_save.take())
-            });
-            if let Some(live) = save {
-                if let Some(path) = ask_to_save(hwnd) {
-                    STATE.with(|s| {
-                        if let Some(shell) = s.borrow_mut().as_mut() {
-                            if let Some(doc) = shell.document.as_mut() {
-                                doc.start_export(path, live);
-                            }
-                            shell.retitle(hwnd);
-                        }
-                    });
-                }
+            if run_pending_dialogs(hwnd) {
                 return LRESULT(0);
             }
             if consumed {
@@ -10003,6 +10018,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     }
                 }
             });
+            // A command reached from the **menu** asks for its dialog exactly as one reached from
+            // the keyboard does, and this is the call that was missing.
+            run_pending_dialogs(hwnd);
             LRESULT(0)
         }
         WM_VSCROLL => {
