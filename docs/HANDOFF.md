@@ -1,16 +1,58 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-24, session 22
+## ▶ Resume point — 2026-08-24, end of session 22
 
-**Master is `b93c113`, CI green, working tree clean, dogfood on the current build (2026.8.24.20672).**
+**Master is `ec18150`. Working tree clean, everything pushed, dogfood running the current build.**
+**CI was still in flight on `ec18150` when the session ended — check it before building on top.** The
+local gate (`tools/check.sh`) was green on that commit; the two legs CI adds are arm64 and the binary
+size/dependency assertions.
 
-**M7 is done. M7b (RDP) was started and deliberately set aside** — the owner interrupted it to ask
-why so many menu items appeared to do nothing, and that turned out to be the more urgent thread.
-Nothing of M7b was written; the survey is in the session log, and `remote_session()` already exists
-from the touch work.
+### The one thing to do first — it takes one screenshot
 
-**Start with the two items immediately below**: the menu bar vanishing when the last tab closes, and
-the click-sweep of every menu item. Both come directly from the owner.
+`Shell::status_text` now calls `doc.describe()` afresh instead of quoting the string cached in
+`self.file` (`ec18150`). **That fix is gate-green but has not been seen working.** Open a file and
+photograph the bottom band: it should read **`● following`**, where before it read
+`‖ paused · Ctrl+End to follow` with the last line of the file plainly on screen.
+
+Do not check the window *title* — `refresh_title` runs rarely, so it can legitimately still show the
+old string. The **status bar** is what `paint_inner` rebuilds every frame. If the bar is right and the
+title is stale, that is a second, smaller bug: nothing calls `retitle` while a document sits idle.
+
+If the bar still says `paused`, the next question is whether the view is at the bottom *at rest* at
+all — because every other part of the model has now been tested and holds (see below).
+
+### What session 22 finished
+
+- **M7 complete** — `theme::chosen` and the dark title bar (`8edbb09`), `WM_POINTER` touch inertia
+  with `fling.rs` and `tools/verify-touch.ps1` (`67de4eb`).
+- **§2.2's four dead menu items built** — About, Keyboard map, Preferences, Font (`95c687a`). The
+  keyboard map is generated from `Command::LISTED`, so a key cannot go stale in it.
+- **`File ▸ Open…` fixed** (`7ec48e0`). It did nothing when *clicked* for a month while working from
+  the keyboard and the palette: the mouse path never drained the deferred-dialog flag. `Export
+  view…` and `Keep saving…` had the same fault.
+- **The menu bar survives closing the last tab** (`256c1a8`). `Welcome` implements
+  `RowSource::draw_chrome`. Note `paint.rs` gates that call on `view.chrome_px() > 0` — the first
+  attempt implemented the method perfectly and drew nothing.
+- **Every menu item swept by clicking it** (`4ca026f`, `69a26e6`) — `tools/verify-menus.ps1`,
+  62 items, geometry taken from the product via `TAILHAWK_DUMP_MENU_HITS`. **All of File, Edit,
+  Format, Settings and Help behave.**
+- **The Loki decision folded into `SPEC.md` and `PLAN.md`** (`5ca88ff`, `bb8fcad`) — see below.
+- **`deploy.cmd`** at the repo root (`b93c113`), hand-run from an elevated prompt.
+
+### M7b (RDP) was started and set aside
+
+Nothing was written. The owner interrupted it to ask why so many menu items appeared to do nothing,
+and that was the better thread — it found three real defects. `remote_session()` already exists from
+the touch work, and `UI-DESIGN.md` §11.5 plus `SPEC.md` §3.2 are the contract. **M7b is the next
+milestone once the follow bug is closed.**
+
+### The order of work from here
+
+1. **Confirm the follow fix on screen** — the screenshot described above.
+2. **M7b (RDP)** — the next milestone on the plan.
+3. **Loki**, in the sequence the owner settled: §8.3's merged-by-timestamp view first, then Loki
+   client-lite. He asked for the client "fairly soon" and chose to keep that order while getting it
+   costed. See below.
 
 ### The Loki position was wrong here for a month — read this before quoting §1.3
 
@@ -45,7 +87,7 @@ hand-run. Build and green-gate first — it deliberately does not build.
   `TouchAction`/`TouchPhase`/`Panes`/`decide` — and `tools/verify-touch.ps1` drives a real contact
   at the real window with `InjectTouchInput`.
 
-### ▶ Do this first — the tail tool says "paused" while showing the tail
+### The follow bug — diagnosed, fixed, unconfirmed on screen
 
 **Found by the menu click-sweep, 2026-08-24, and it is not a menu bug.** `View ▸ Follow tail` was one
 of only two items in 62 that produced no observable effect. Chasing it:
