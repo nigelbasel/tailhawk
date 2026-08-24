@@ -118,9 +118,12 @@ function Test-Dialog([int]$menuIndex, [int]$row, [string]$title, [string]$name) 
 }
 
 $ok = $true
-# Help is menu 6; About Tailhawk is its last entry. Format is menu 3; Font... is its last entry.
+# Help is menu 6: Keyboard map is row 1, About Tailhawk the last row. Format is menu 3 with
+# Font... last; Settings is menu 5 with Preferences... last.
 $ok = (Test-Dialog 6 -1 'About Tailhawk' 'Help > About') -and $ok
 $ok = (Test-Dialog 3 -1 'Font' 'Format > Font...') -and $ok
+$ok = (Test-Dialog 6 1 'Keyboard map' 'Help > Keyboard map') -and $ok
+$ok = (Test-Dialog 5 -1 'Preferences' 'Settings > Preferences...') -and $ok
 
-if ($ok) { Write-Host 'PASS: both menu dialogs are real native dialogs' }
+if ($ok) { Write-Host 'PASS: all four menu dialogs are real native dialogs' }
 else { Write-Host 'FAIL'; exit 1 }

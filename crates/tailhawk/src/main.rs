@@ -15,6 +15,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod about;
+mod dialog;
 mod icon;
 mod keymap;
 mod menubar;
@@ -254,10 +255,6 @@ struct Document {
     /// V9's format wizard as it should be drawn this frame — the shell's knowledge handed over
     /// exactly as [`Document::rules_overlay`] is.
     wizard_overlay: Option<WizardOverlay>,
-    /// §2.2's About, Keyboard map or Preferences sheet, flattened to the lines one frame draws:
-    /// a title, `(left, right, dim)` rows, and a legend. Handed over exactly as the two overlays
-    /// above are, and flattened in the shell so this side never learns which of the three it is.
-    sheet: Option<SheetLines>,
     /// §2.2's menu bar as it should be drawn this frame, handed over exactly as the two overlays
     /// above are. The [`menu`](tailhawk_core::menu) tree itself is the shell's — one bar serves
     /// every tab — and this is only its picture.
@@ -664,7 +661,6 @@ impl RowSource for Document {
         self.draw_rules(painter, view);
         self.draw_wizard(painter, view);
         self.draw_format_menu(painter, view);
-        self.draw_sheet(painter, view);
 
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
         // query on its first line, then the rows, the selected one filled. Rows are remembered by
@@ -771,90 +767,6 @@ impl Document {
     ///
     /// The rows behind this box are the live preview: the shell has already rebuilt the
     /// highlighter from the set under edit, so there is nothing to draw here for it.
-    /// §2.2's About, Keyboard map and Preferences — one routine for all three, because they are one
-    /// shape: a title, two columns of text, and a legend. The left column is right-padded to the
-    /// widest label so the values line up, which is the whole reason a keyboard map is readable.
-    fn draw_sheet(&self, painter: &mut Painter, view: &View) {
-        let Some((title, rows, legend)) = self.sheet.as_ref() else {
-            return;
-        };
-        let em = painter.chrome_measure("0").max(1.0);
-        let pad = painter.chrome_measure("n").max(4.0);
-        let row_h = painter.chrome_line_height();
-        let width = view.hgrid().viewport_px();
-        let box_x = view.gutter_px() + pad;
-        // **Only rows that have a right-hand value set the left column's width.** A full-width line
-        // — About's assurance, a section heading — lives in the left slot and is as long as a
-        // sentence; letting it widen the column pushes every actual value off the end of the box.
-        let left_w = rows
-            .iter()
-            .filter(|(_, r, _)| !r.is_empty())
-            .map(|(l, _, _)| painter.chrome_measure(l))
-            .fold(0.0f32, f32::max);
-        // **Measured against the column the values are actually drawn in, not each row's own
-        // label.** A value sits at `left_w + 2em` whatever its own label measures, so sizing the box
-        // from `own_label + 2em + value` makes it narrower than what it draws, and the longest face
-        // name in the font list loses its last few letters.
-        let widest = rows
-            .iter()
-            .map(|(l, r, _)| {
-                if r.is_empty() {
-                    painter.chrome_measure(l)
-                } else {
-                    left_w + em * 2.0 + painter.chrome_measure(r)
-                }
-            })
-            .fold(
-                painter
-                    .chrome_measure(title)
-                    .max(painter.chrome_measure(legend)),
-                f32::max,
-            );
-        let box_w = (widest + pad * 4.0).min(width - box_x - pad).max(0.0);
-        // Title, its blank line, the rows, a half-line of air and the legend — the count has to
-        // match what is drawn below, or the legend lands on the grid outside the box.
-        //
-        // Clamped to what is left below the header, so a long map on a short window cannot paint
-        // over the status bar. **It clips rather than pages**, which is a real limit and is recorded
-        // in `HANDOFF.md` rather than hidden: the map is the one sheet that can outgrow a window.
-        let wanted = row_h * (rows.len() as f32 + 4.5) + 8.0;
-        let room = (view.height_px() - view.chrome_px() - view.header_px() - view.footer_px()
-            + row_h)
-            .max(row_h * 3.0);
-        let box_h = wanted.min(room);
-        // Below the column header, not over it: the header is a band of text at the top of the
-        // rows, and a box whose title lands on it draws two words in the same place.
-        let box_y = view.chrome_px() + view.header_px();
-        painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
-        let inner_x = box_x + pad;
-        let inner_w = (box_w - pad * 2.0).max(0.0);
-        let mut y = box_y + 4.0;
-        chrome_line(painter, inner_x, y, inner_w, title, theme().header_ink);
-        y += row_h * 2.0;
-        for (left, right, dim) in rows {
-            let ink = if *dim {
-                theme().field_hint
-            } else {
-                theme().ink
-            };
-            chrome_line(painter, inner_x, y, inner_w, left, ink);
-            if !right.is_empty() {
-                let at = inner_x + left_w + em * 2.0;
-                chrome_line(
-                    painter,
-                    at,
-                    y,
-                    (inner_x + inner_w - at).max(0.0),
-                    right,
-                    ink,
-                );
-            }
-            y += row_h;
-        }
-        y += row_h * 0.5;
-        chrome_line(painter, inner_x, y, inner_w, legend, theme().field_hint);
-    }
-
     fn draw_rules(&self, painter: &mut Painter, view: &View) {
         let Some(overlay) = self.rules_overlay.as_ref() else {
             return;
@@ -1350,7 +1262,6 @@ impl Document {
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             wizard_overlay: None,
-            sheet: None,
             menu_frame: MenuFrame::default(),
             format_menu: None,
             chrome_h: 0.0,
@@ -1413,7 +1324,6 @@ impl Document {
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             wizard_overlay: None,
-            sheet: None,
             menu_frame: MenuFrame::default(),
             format_menu: None,
             chrome_h: 0.0,
@@ -3982,69 +3892,8 @@ struct ViewState {
     row: u64,
 }
 
-/// A sheet flattened for drawing: its title, its `(left, right, dim)` rows, and its legend.
-///
-/// Flattened in the shell so the drawing side never learns which of §2.2's three sheets it has —
-/// they are one shape, and one routine draws all three.
-type SheetLines = (String, Vec<(String, String, bool)>, String);
-
 /// The most states kept in either direction.
 const HISTORY_DEPTH: usize = 64;
-
-/// §2.2's overlay sheets. `Keymap` is read-only and holds its finished picture; `Prefs` holds the
-/// editable state and makes its picture per frame. About left this enum for `TaskDialogIndirect`
-/// — the owner's direction, 2026-08-24: dialogs popped from menus use the standard Windows
-/// surfaces — and these two follow it in the same conversion.
-enum Sheet {
-    Keymap(keymap::KeymapSheet),
-    Prefs(prefs::Prefs),
-}
-
-impl Sheet {
-    /// Title, then `(left, right, dim)` rows — the one shape all three draw as, so there is one
-    /// drawing routine rather than three that can drift apart. `dim` is a row that is present but
-    /// cannot be honoured: a heading, or a font this machine does not have.
-    fn lines(&self) -> (String, Vec<(String, String, bool)>, String) {
-        match self {
-            Sheet::Keymap(k) => {
-                let mut rows = Vec::new();
-                for (i, section) in k.sections.iter().enumerate() {
-                    if i > 0 {
-                        rows.push((String::new(), String::new(), true));
-                    }
-                    rows.push((section.heading.clone(), String::new(), true));
-                    rows.extend(
-                        section
-                            .rows
-                            .iter()
-                            .map(|r| (r.keys.clone(), r.what.clone(), false)),
-                    );
-                }
-                (k.title.clone(), rows, "Esc close".to_owned())
-            }
-            Sheet::Prefs(p) => {
-                let s = p.sheet();
-                let rows = s
-                    .rows
-                    .iter()
-                    .map(|r| {
-                        // ASCII, deliberately. `▸` is .notdef in the chrome face on this machine
-                        // and draws as a hollow box — the same trap the header markers hit, where
-                        // of the triangles only U+25B2 and U+25BC turned out safe.
-                        let mark = if r.selected { "> " } else { "  " };
-                        let value = if r.unavailable {
-                            format!("{} (not installed)", r.value)
-                        } else {
-                            r.value.clone()
-                        };
-                        (format!("{mark}{}", r.label), value, r.unavailable)
-                    })
-                    .collect();
-                (s.title.clone(), rows, s.legend.clone())
-            }
-        }
-    }
-}
 
 /// Every command the shell has, by name — what the palette lists and what the keys dispatch, so a
 /// binding and a palette entry cannot disagree about what a name does.
@@ -4987,12 +4836,12 @@ struct Shell {
     pending_about: bool,
     /// §2.2's Font… — `ChooseFontW`, deferred the same way.
     pending_font: bool,
+    /// §2.2's Keyboard map — `dialog::show_keymap`, deferred the same way.
+    pending_keymap: bool,
+    /// §2.2's Preferences — `dialog::show_prefs`, deferred the same way.
+    pending_prefs: bool,
     /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
     wheel_remaining: f32,
-    /// §2.2's About, Keyboard map and Preferences. One slot, because they are the same kind of
-    /// thing — a modal sheet over the grid — and two of them open at once would be a bug either
-    /// way, so the type says it cannot happen.
-    sheet: Option<Sheet>,
     /// §12.4's `[appearance] theme`, as chosen — `dark`, `light`, `system`, or nothing if the user
     /// has never said. Held as the *name* and not as a [`Theme`] because "system" is an
     /// instruction and not a palette, and resolving it early loses which of the two was asked for.
@@ -5379,7 +5228,6 @@ impl Shell {
         let rules_overlay = self.rules_overlay();
         let wizard_overlay = self.wizard_overlay();
         let format_menu = self.format_menu_rows();
-        let sheet_lines = self.sheet.as_ref().map(Sheet::lines);
         // §2.2's bar, rebuilt against this frame's document so an item that cannot act is drawn
         // disabled rather than offered — `menubar::menu_bar` explains why it is rebuilt and not
         // cached. `Menu::rebuild` keeps the open path, so a menu does not shut under the user
@@ -5443,7 +5291,7 @@ impl Shell {
                     doc.rules_overlay = if i == 0 { rules_overlay.clone() } else { None };
                     doc.wizard_overlay = if i == 0 { wizard_overlay.clone() } else { None };
                     doc.format_menu = if i == 0 { format_menu.clone() } else { None };
-                    doc.sheet = if i == 0 { sheet_lines.clone() } else { None };
+
                     // The bar goes on the pane that carries the strip, for the reason the overlays
                     // do: one bar per window, drawn once whatever the split.
                     doc.menu_frame = if i == 0 {
@@ -6183,101 +6031,48 @@ impl Shell {
         }
     }
 
-    /// §2.2's Preferences, opened over the settings actually in force.
-    fn new_prefs(&self) -> prefs::Prefs {
+    /// The Preferences dialog's data, over the settings actually in force.
+    fn prefs_choice(&self) -> dialog::PrefsChoice {
         let (face, size) = self.current_font();
-        let installed = monospace_faces();
-        prefs::Prefs::new(
+        dialog::PrefsChoice::of(
             self.theme_name.as_deref().unwrap_or("system"),
             &face,
             size,
-            installed,
+            monospace_faces(),
         )
     }
 
-    /// Apply what the sheet now says, and report whether the frame has to be redrawn.
-    ///
-    /// Applied on every change rather than on close, because a font you cannot see until you
-    /// dismiss the dialog is a font you have to keep reopening the dialog to choose.
-    fn apply_prefs(&mut self, hwnd: HWND) -> bool {
-        let Some(Sheet::Prefs(p)) = self.sheet.as_ref() else {
-            return false;
-        };
-        let (name, face, size) = (p.theme().to_owned(), p.face().to_owned(), p.size());
-        let face_chosen = p.face_chosen();
-        let want = resolve_theme(Some(&name));
-        let mut changed = false;
-        if want != theme() || self.theme_name.as_deref() != Some(name.as_str()) {
-            self.adopt_theme(hwnd, &name, want);
-            changed = true;
+    /// Adopt what the Preferences dialog returned: the theme, then the font, then one settings
+    /// write. A face the user did not change is not pinned into settings — [`Self::apply_font`]'s
+    /// rule, for the reason argued there; the same holds for the theme, so a session that never
+    /// chose one keeps following Windows.
+    fn apply_appearance(
+        &mut self,
+        hwnd: HWND,
+        theme_name: &str,
+        seeded: &dialog::PrefsChoice,
+        face: String,
+        size: u16,
+    ) {
+        let theme_chosen =
+            self.theme_name.is_some() || theme_name != seeded.themes[seeded.theme].as_str();
+        let want = resolve_theme(Some(theme_name));
+        if theme_chosen && (want != theme() || self.theme_name.as_deref() != Some(theme_name)) {
+            self.adopt_theme(hwnd, theme_name, want);
         }
-        // The chosen face first, then the built-in chain behind it, so a face that turns out to be
-        // unusable degrades to the default rather than to nothing.
+        let face_chosen = face != seeded.faces[seeded.face];
         let mut candidates = vec![face.clone()];
         candidates.extend(tailhawk_core::DEFAULT_FONTS.iter().map(|s| (*s).to_owned()));
         let dpi = unsafe { GetDpiForWindow(hwnd) };
         if let Some(renderer) = self.renderer.as_mut() {
-            changed |= renderer.set_grid_font(&candidates, size, dpi);
+            renderer.set_grid_font(&candidates, size, dpi);
         }
-        // **Only a face the user actually picked is recorded.** The sheet opens showing whichever
-        // face is in use, and writing that back would pin a name nobody chose into the settings
-        // file — after which the built-in chain can never be followed again on that machine.
         if face_chosen {
             self.grid_face = Some(face);
         }
-        changed
-    }
-
-    /// §2.2's sheets take the keyboard while they are up, as §5's and §6.2's overlays do.
-    ///
-    /// Reports whether the key was consumed. A sheet swallows everything: a half-read keyboard map
-    /// with the grid scrolling behind it is the state §5 already decided against.
-    fn sheet_key(&mut self, hwnd: HWND, key: u16) -> bool {
-        const VK_ESCAPE_U: u16 = 0x1B;
-        const VK_UP_U: u16 = 0x26;
-        const VK_DOWN_U: u16 = 0x28;
-        const VK_LEFT_U: u16 = 0x25;
-        const VK_RIGHT_U: u16 = 0x27;
-        if self.sheet.is_none() {
-            return false;
-        }
-        if key == VK_ESCAPE_U {
-            self.close_sheet(hwnd);
-            unsafe {
-                let _ = InvalidateRect(hwnd, None, false);
-            }
-            return true;
-        }
-        let mut moved = false;
-        if let Some(Sheet::Prefs(p)) = self.sheet.as_mut() {
-            match key {
-                VK_UP_U | VK_DOWN_U => {
-                    p.step(key == VK_DOWN_U);
-                    moved = true;
-                }
-                VK_LEFT_U | VK_RIGHT_U => {
-                    moved = p.adjust(key == VK_RIGHT_U);
-                    if moved {
-                        self.apply_prefs(hwnd);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if moved {
-            unsafe {
-                let _ = InvalidateRect(hwnd, None, false);
-            }
-        }
-        true
-    }
-
-    /// Dismiss the sheet, writing the settings file only if something was actually changed.
-    fn close_sheet(&mut self, hwnd: HWND) {
-        let dirty = matches!(self.sheet.as_ref(), Some(Sheet::Prefs(p)) if p.is_dirty());
-        self.sheet = None;
-        if dirty {
-            self.save_settings(hwnd);
+        self.save_settings(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
         }
     }
 
@@ -6999,28 +6794,20 @@ impl Shell {
                 true
             }
             menubar::ID_ABOUT => {
-                self.close_sheet(hwnd);
                 self.pending_about = true;
                 true
             }
             menubar::ID_KEYMAP => {
-                self.close_sheet(hwnd);
-                self.sheet = Some(Sheet::Keymap(keymap::keymap_sheet_of(
-                    Command::LISTED.iter().map(|(_, name, keys)| (*name, *keys)),
-                )));
-                self.needs_frame = true;
+                self.pending_keymap = true;
                 true
             }
             menubar::ID_PREFS => {
-                self.close_sheet(hwnd);
-                self.sheet = Some(Sheet::Prefs(self.new_prefs()));
-                self.needs_frame = true;
+                self.pending_prefs = true;
                 true
             }
             // §2.2 keeps a separate Font… entry because a user looking for a font does not think
             // to look under Preferences — and it is the standard Font dialog, `ChooseFontW`.
             menubar::ID_FONT => {
-                self.close_sheet(hwnd);
                 self.pending_font = true;
                 true
             }
@@ -7414,12 +7201,6 @@ impl Shell {
     fn find_char(&mut self, hwnd: HWND, unit: u16) -> bool {
         // §6.2's box is modal too, and takes typed text before the editor or the chrome. Without
         // this branch the name and column cells cannot be typed into at all.
-        // §2.2's sheets are modal too, and take typed text before anything else — otherwise a
-        // find field left focused keeps receiving keystrokes and re-filtering the document behind
-        // a box that is covering it.
-        if self.sheet.is_some() {
-            return true;
-        }
         if self.wizard.is_some() {
             if self.wizard_editing.is_none() {
                 return true;
@@ -8994,6 +8775,44 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         }
         return true;
     }
+    let keymap = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_keymap))
+    });
+    if keymap {
+        let text = dialog::keymap_text(&keymap::keymap_sheet_of(
+            Command::LISTED.iter().map(|(_, name, keys)| (*name, *keys)),
+        ));
+        dialog::show_keymap(hwnd, &text);
+        return true;
+    }
+    let prefs = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_prefs))
+    });
+    if prefs {
+        let seeded = STATE.with(|s| s.borrow().as_ref().map(|shell| shell.prefs_choice()));
+        if let Some(seeded) = seeded {
+            let mut choice = seeded.clone();
+            // An OK that changed nothing applies nothing — and writes nothing, so a visit to the
+            // dialog does not churn the settings file's modification time.
+            if dialog::show_prefs(hwnd, &mut choice)
+                && (choice.theme, choice.face, choice.size)
+                    != (seeded.theme, seeded.face, seeded.size)
+            {
+                let theme_name = choice.themes[choice.theme].clone();
+                let face = choice.faces[choice.face].clone();
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        shell.apply_appearance(hwnd, &theme_name, &seeded, face, choice.size);
+                    }
+                });
+            }
+        }
+        return true;
+    }
     false
 }
 
@@ -9619,10 +9438,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             };
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
-                    // §2.2's sheets are modal: the grid must not scroll under a box covering it.
-                    if shell.sheet.is_some() {
-                        return;
-                    }
                     // A wheel notch takes over from a coast rather than adding to it. Both move the
                     // view by pixels on their own timer, so left running together the notch is
                     // swamped while the coast is fast and then overshoots as it decays.
@@ -9692,6 +9507,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 shell.menu_choose(hwnd, id);
                             }
                         });
+                        // A command reached by mnemonic asks for its dialog exactly as one
+                        // reached by click does — without this, Alt+H,K sets the flag and the
+                        // dialog waits for whatever input happens next.
+                        run_pending_dialogs(hwnd);
                     }
                     return LRESULT(0);
                 }
@@ -9728,7 +9547,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 });
                 if took {
                     // The window is otherwise idle; nothing else will ask for the frame that shows
-                    // the menu having moved.
+                    // the menu having moved. And Enter on a menu item may have queued a dialog,
+                    // which must open on this keystroke, not the next one.
+                    run_pending_dialogs(hwnd);
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -9771,8 +9592,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
-                    shell.sheet_key(hwnd, wparam.0 as u16)
-                        || shell.format_menu_key(hwnd, wparam.0 as u16)
+                    shell.format_menu_key(hwnd, wparam.0 as u16)
                         || shell.wizard_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.rules_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
@@ -9957,8 +9777,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 // which pane the contact is in, whether a second finger may take a pan in progress,
                 // whether the point is on rows rather than chrome, and whether a capture change is
                 // even about this contact.
-                let covered = shell.sheet.is_some()
-                    || shell.menu.is_open()
+                let covered = shell.menu.is_open()
                     || shell.rules_editor.is_open()
                     || shell.wizard.is_some()
                     || shell.document.as_ref().is_some_and(|d| d.palette.is_open());
@@ -10041,19 +9860,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return;
                 };
-                // §2.2's sheets are modal, and that has to include the pointer. A click through an
-                // open box would drag a selection across text the box is covering, and a click on
-                // the menu bar would open a second surface *underneath* it — keyboard-dead, because
-                // `sheet_key` runs first and would swallow its keys.
-                if shell.sheet.is_some() {
-                    if msg == WM_LBUTTONDOWN {
-                        shell.close_sheet(hwnd);
-                        unsafe {
-                            let _ = InvalidateRect(hwnd, None, false);
-                        }
-                    }
-                    return;
-                }
                 // A split: a press focuses the pane under it, and every coordinate from here on is
                 // relative to the focused pane's top — a drag stays with the pane it started in.
                 if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
@@ -10694,8 +10500,9 @@ fn main() -> Result<()> {
             pending_save: None,
             pending_about: false,
             pending_font: false,
+            pending_keymap: false,
+            pending_prefs: false,
             wheel_remaining: 0.0,
-            sheet: None,
             theme_name: asked.clone(),
             grid_face: chosen_face,
             fling: fling::Fling::new(),
