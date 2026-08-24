@@ -1,6 +1,69 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-24, end of session 22
+## ▶ Resume point — 2026-08-24, session 23: the owner's standard-behaviour defects
+
+**The owner tested and reported six defects, all variations on one theme: behave like a standard
+Windows application.** Four are fixed, committed, live-verified and pushed; two remain, and they
+are the next work. Master is `f578d56` (check CI before building on it — it was in flight when
+this was written; every earlier push this session is green).
+
+### Fixed this session, each with its own commit and harness proof
+
+1. **Selection is a background fill, not a font recolour** (`1700792`). `theme::selection_bg`;
+   `selection_ink` is now an `Option`, `Some(system background)` only under High Contrast. The
+   paint test was rewritten first and seen failing. One noted gap: a blank line inside a
+   multi-row selection draws no fill stub.
+2. **The chrome band reaches the right window edge** (`9ba3eaa`). `Document::draw_chrome` was
+   missing `gutter_px` from its width — the block the owner saw was the clear colour showing
+   through. The footer, detail pane and format chip anchor shared the fix.
+3. **All four menu dialogs are native** (`eb642e9`, `584822e`). About = `TaskDialogIndirect`,
+   Font… = `ChooseFontW` (seeded and inverted in the **system**-DPI basis — the window's DPI
+   comes back a different size on mixed-DPI setups), Keyboard map and Preferences =
+   `DialogBoxIndirectParamW` over in-memory `DLGTEMPLATE`s built and word-tested in
+   `dialog.rs`. `build.rs` embeds the comctl32 v6 `RT_MANIFEST` in the `.res` it already
+   writes; a `version.rs` test reads it back. The overlay `Sheet` machinery is **gone** —
+   native modality replaces every guard. `tools/verify-dialogs.ps1` clicks all four open.
+   **A real regression was caught in review**: menu commands reached by keyboard set their
+   pending flag and nothing drained it until the next input; both keyboard dispatch sites now
+   call `run_pending_dialogs`, which also closed the same latent gap for Open….
+4. **File ▸ Open Recent** (`f578d56`). `[recent]` in settings — ten, newest first,
+   case-insensitive dedupe, recorded on *successful* open in `poll_file`. Numbered submenu,
+   middle-compacted paths, Clear entry, greyed when empty. `tools/verify-recent.ps1` proves
+   the loop: open, relaunch to welcome, reopen by mouse. On the way it caught that
+   `Welcome::draw_chrome` never dumped menu hit rects, so harnesses on the welcome screen
+   were aiming at the previous instance's geometry.
+
+### The two defects still open, in the owner's words
+
+5. **"The search, filter and format drop downs on the row below the menu are confusing and
+   non-standard… don't work the way any windows app I have ever looked at works."** Untouched
+   this session. What is there: a decorative `►` prompt, the find field, a decorative `▼`
+   that looks like a dropdown control but has no hit target, filter chips, the new-chip
+   field, and the format chip at the right edge. The plan: label the fields as fields
+   (borders exist; hints exist), remove or make functional the decorative glyphs, and make
+   the format chip read as the dropdown button it actually is. Read `UI-DESIGN.md` §2.1 and
+   §5 first — the bar's shape is specified there, and the spec may need the owner's sign-off
+   on a revised §2.1 before code moves.
+6. **"Review the behaviour of every single menu and make sure they behave in a standard
+   way."** Partly done by conversion (dialogs, modality) and the earlier 62-item sweep. The
+   known remaining gap is new: **Open Recent's submenu opens *in place of* the File list
+   rather than as a flyout beside it** — `MenuFrame` carries one open list, so a cascade
+   replaces its parent. Standard Windows shows parent and child at once. Also still to
+   check against standard: hover-tracking (an open menu following the mouse across
+   headings without a click), F10, and Alt+Space. `menu.rs` (core) already models descend/
+   Esc/arrows correctly and is well-tested; the work is in `MenuFrame`/`menubar::draw_*`.
+
+### Where things are, quickly
+
+- `CLEANROOM.md` has rows for the dialog conversion and the MRU, filed before the code.
+- Subagent review before commit is being followed and it is earning its keep — it caught
+  the keyboard-drain regression, the mixed-DPI font-size bug, and the format-menu anchor.
+- The dogfood deploy (`deploy.cmd`, elevated) has not been run this session; the owner's
+  install still predates all six fixes.
+- The Loki question to the owner stands: is the Loki HTTP API reachable directly from the
+  workstation, or only through Grafana's datasource proxy?
+
+## ▶ Previous resume point — 2026-08-24, end of session 22
 
 **Master is `ec18150`. Working tree clean, everything pushed, dogfood running the current build.**
 **CI was still in flight on `ec18150` when the session ended — check it before building on top.** The
