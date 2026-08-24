@@ -60,6 +60,10 @@ pub struct Settings {
     pub files: Vec<FileState>,
     /// V13: `dark`, `light` or `system`, when the user chose one.
     pub theme: Option<String>,
+    /// §2.2 Preferences: the grid font family, when the user chose one.
+    pub font: Option<String>,
+    /// §2.2 Preferences: the grid em size at the 96-DPI baseline, when the user chose one.
+    pub font_size: Option<u16>,
 }
 
 impl Settings {
@@ -109,8 +113,20 @@ impl Settings {
     pub fn to_toml(&self) -> String {
         let mut out =
             String::from("# Tailhawk settings — SPEC.md §12.4. Rewritten whole; edits survive.\n");
-        if let Some(theme) = &self.theme {
-            out.push_str(&format!("\n[appearance]\ntheme = {}\n", quote(theme)));
+        // One `[appearance]` heading however many of its keys are set — a second heading for the
+        // same table is legal TOML but reads as a mistake to anyone editing the file by hand, which
+        // §12.4 expects them to do.
+        if self.theme.is_some() || self.font.is_some() || self.font_size.is_some() {
+            out.push_str("\n[appearance]\n");
+            if let Some(theme) = &self.theme {
+                out.push_str(&format!("theme = {}\n", quote(theme)));
+            }
+            if let Some(font) = &self.font {
+                out.push_str(&format!("font = {}\n", quote(font)));
+            }
+            if let Some(size) = self.font_size {
+                out.push_str(&format!("font_size = {size}\n"));
+            }
         }
         if let Some(w) = &self.window {
             out.push_str("\n[window]\n");
@@ -191,11 +207,12 @@ impl Settings {
             };
             let (key, value) = (key.trim(), value.trim());
             match section {
-                Section::Appearance => {
-                    if key == "theme" {
-                        settings.theme = Some(unquote(value));
-                    }
-                }
+                Section::Appearance => match key {
+                    "theme" => settings.theme = Some(unquote(value)),
+                    "font" => settings.font = Some(unquote(value)),
+                    "font_size" => settings.font_size = value.parse().ok(),
+                    _ => {}
+                },
                 Section::Window => match key {
                     "x" => window.x = value.parse().unwrap_or(0),
                     "y" => window.y = value.parse().unwrap_or(0),
@@ -399,6 +416,8 @@ mod tests {
             }),
             files: Vec::new(),
             theme: Some("light".to_owned()),
+            font: Some("Cascadia Mono".to_owned()),
+            font_size: Some(18),
         };
         s.set_file(FileState {
             path: r"C:\logs\app.log".to_owned(),

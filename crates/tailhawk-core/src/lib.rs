@@ -282,6 +282,11 @@ struct Built {
     /// The chrome families as asked for, not as resolved: comparing what was *requested* is what
     /// notices a settings change, and it is a handful of short strings once per frame.
     chrome: Vec<String>,
+    /// The grid families, for the same reason and with a sharper one behind it: §2.2's Preferences
+    /// can change the face without changing the size, and a staleness test that watches only
+    /// `px_per_em` never notices — the picker appears to work on restart and to do nothing while
+    /// the app is running.
+    grid: Vec<String>,
     painter: paint::Painter,
 }
 
@@ -313,6 +318,7 @@ fn ensure_painter<'a>(
                 || b.px_per_em != fonts.grid_px
                 || b.chrome_px_per_em != fonts.chrome_px
                 || b.chrome != fonts.chrome
+                || b.grid != fonts.grid
         }
         None => true,
     };
@@ -335,6 +341,7 @@ fn ensure_painter<'a>(
             px_per_em: fonts.grid_px,
             chrome_px_per_em: fonts.chrome_px,
             chrome: fonts.chrome.to_vec(),
+            grid: fonts.grid.to_vec(),
             painter: fresh,
         });
     }
@@ -368,6 +375,13 @@ pub struct Renderer {
     /// monitor's DPI, the chrome follows what the user set Windows' menus to.
     chrome_candidates: Vec<String>,
     chrome_px_per_em: u16,
+    /// The em size the grid is asked for at the 96-DPI baseline, before the monitor's scale is
+    /// applied — §2.2's Preferences writes this, and [`Renderer::set_dpi`] multiplies it.
+    ///
+    /// Held separately from [`Renderer::px_per_em`], which is the *result*: a user who chooses 18 px
+    /// and then moves the window to a 150% monitor wants 27 px there and 18 px back, and a single
+    /// field cannot remember both halves of that.
+    base_px_per_em: u16,
 }
 
 #[cfg(windows)]
@@ -388,6 +402,7 @@ impl Renderer {
                 .map(|s| (*s).to_owned())
                 .collect(),
             chrome_px_per_em: DEFAULT_CHROME_PX_PER_EM,
+            base_px_per_em: DEFAULT_PX_PER_EM,
         })
     }
 
@@ -419,9 +434,34 @@ impl Renderer {
         true
     }
 
+    /// §2.2's Preferences: the grid's face list and its em size at the 96-DPI baseline.
+    ///
+    /// Reports whether anything changed, so the caller can rebuild the atlas and repaint only when
+    /// it must — the same contract [`Renderer::set_chrome_font`] has, and for the same reason: this
+    /// is called on every visit to the sheet, not only on a change.
+    ///
+    /// The face list is *candidates*, not a face. A name the machine does not have falls through to
+    /// the next, so a settings file carried from another machine degrades to the default rather
+    /// than to no text at all.
+    pub fn set_grid_font(&mut self, candidates: &[String], base_px_per_em: u16, dpi: u32) -> bool {
+        let base = base_px_per_em.clamp(6, 200);
+        if self.font_candidates == candidates && self.base_px_per_em == base {
+            return false;
+        }
+        self.font_candidates = candidates.to_vec();
+        self.base_px_per_em = base;
+        self.set_dpi(dpi);
+        true
+    }
+
+    /// The em size the grid is asked for before the monitor's scale — what Preferences shows.
+    pub fn base_px_per_em(&self) -> u16 {
+        self.base_px_per_em
+    }
+
     pub fn set_dpi(&mut self, dpi: u32) -> bool {
         // 96 is the Win32 unit-DPI baseline, so `dpi / 96` is the scale factor.
-        let scaled = (f64::from(DEFAULT_PX_PER_EM) * f64::from(dpi.max(1)) / 96.0).round();
+        let scaled = (f64::from(self.base_px_per_em) * f64::from(dpi.max(1)) / 96.0).round();
         // A face is unusable below a pixel or two, and DirectWrite is entitled to refuse absurd
         // sizes; clamping keeps a hostile or bogus DPI from turning a scale change into an error.
         let px = scaled.clamp(6.0, 400.0) as u16;
@@ -455,6 +495,7 @@ impl Renderer {
             px_per_em,
             chrome_candidates,
             chrome_px_per_em,
+            base_px_per_em: _,
         } = self;
         let (device, context) = gpu.resources();
         let p = ensure_painter(
@@ -480,6 +521,7 @@ impl Renderer {
             px_per_em,
             chrome_candidates,
             chrome_px_per_em,
+            base_px_per_em: _,
         } = self;
         let (device, context) = gpu.resources();
         let p = ensure_painter(
@@ -613,6 +655,7 @@ impl Renderer {
             px_per_em,
             chrome_candidates,
             chrome_px_per_em,
+            base_px_per_em: _,
         } = self;
         let mut laid = paint::Laid::default();
 

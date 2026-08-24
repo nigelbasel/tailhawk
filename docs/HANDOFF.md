@@ -16,6 +16,42 @@
   `TouchAction`/`TouchPhase`/`Panes`/`decide` — and `tools/verify-touch.ps1` drives a real contact
   at the real window with `InjectTouchInput`.
 
+### §2.2's four dead menu items are built — and what is still open on them
+
+`About`, `Keyboard map`, `Preferences` and `Font…` were the only items in the bar that did nothing.
+They are `about.rs`, `keymap.rs`, `prefs.rs` and one `draw_sheet` in the shell. The keyboard map is
+**generated from `Command::LISTED`**, so a key cannot go stale in it.
+
+A pre-commit review found fifteen issues; five were blocking and are fixed. **These are not:**
+
+1. **The keyboard map clips rather than pages, and overlaps the status bar by one line.** `room` in
+   `draw_sheet` is a line too generous, and the map is ~41 rows — longer than most windows. It needs
+   paging, or two columns.
+2. **The sheet is `gutter_px` narrower than it should be**, because `viewport_px()` already excludes
+   the gutter and `box_x` subtracts it again. Copied from `draw_rules`, which has a fixed width and
+   rarely hits the cap; the map always does.
+3. **`Alt` with a sheet open focuses the menu bar**, which is then unnavigable because `sheet_key`
+   eats the arrows. `WM_SYSKEYDOWN` has no sheet guard; the mouse, wheel, `WM_CHAR` and touch paths
+   now do.
+4. **New chrome glyphs bypass `the_chrome_face_has_the_markers_the_chrome_draws`.** `↑ ↓ ← → ·` are
+   drawn by `NAVIGATION` and the Preferences legend and are not in that test, which exists precisely
+   so a `.notdef` box is caught by a test rather than by the window. `▸` already had to be replaced
+   with `>` for exactly this reason during the work.
+5. **`font_size` is written on the first close of a fresh install** — 16, a preference nobody set —
+   and is dropped entirely if the window closes before the renderer exists.
+6. **The size clamps disagree**: `prefs.rs` offers 8–32, `Renderer::set_grid_font` accepts 6–200. A
+   hand-edited `font_size = 100` applies at startup but shows as 32 in the sheet.
+7. **`monospace_faces` lists raster faces** (`Terminal`, `Fixedsys`) that DirectWrite cannot
+   instantiate. Choosing one falls through the candidate chain, so it appears to do nothing and is
+   still persisted. Unconfirmed against the real enumeration.
+
+**Not verified on screen: that changing the *face* takes effect without a restart.** The review found
+the cause — `Built`'s staleness test compared `px_per_em` and the chrome families but not the grid
+families, so a face change repainted in the old face — and the fix is in (`Built::grid`). The About,
+Keyboard map and Preferences sheets themselves *were* checked on screen, and three defects found that
+way: values pushed off the box, the title drawn over the column header, and `▸` rendering as a
+hollow box.
+
 ### Two things to know before touching the touch path
 
 1. **A tap on a row does nothing on a touchscreen, and that is a real regression.** The pointer arm

@@ -283,9 +283,10 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
                 on(cmd("&Reset columns", "", Command::ResetColumns), columns),
                 on(cmd("Clear &sort", "", Command::ClearSort), columns),
                 Item::separator(),
-                // The font picker is not built. Shown disabled rather than omitted, so the shape of
-                // the menu does not change the day it arrives — §1.2's memorability rule.
-                Item::command("&Font…", "", ID_FONT).disabled(),
+                // §2.2 keeps a Font entry beside Preferences because a user looking for a font does
+                // not think to look under Preferences. Both open the same sheet; this one opens it
+                // on the font row.
+                Item::command("&Font…", "", ID_FONT),
             ],
         ),
         Item::submenu(
@@ -310,7 +311,7 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
             vec![
                 check("&Dark theme", "", Command::ToggleTheme, dark),
                 Item::separator(),
-                Item::command("&Preferences…", "", ID_PREFS).disabled(),
+                Item::command("&Preferences…", "", ID_PREFS),
             ],
         ),
         Item::submenu(
@@ -320,13 +321,11 @@ pub fn menu_bar(doc: Option<&Document>, dark: bool) -> tailhawk_core::menu::Menu
                     Item::command("&Command palette", "Ctrl+K", ID_PALETTE),
                     open,
                 ),
-                // Neither surface is built yet. **Disabled rather than absent**, per §1.1 and
-                // §1.2's memorability rule: a menu that grows entries as they are implemented is a
-                // menu nobody can learn, and an item that silently does nothing is worse than one
-                // that says it cannot.
-                Item::command("&Keyboard map", "", ID_KEYMAP).disabled(),
+                // Both are available with no document open: a user who cannot remember how to open
+                // a file is exactly the user who needs the keyboard map.
+                Item::command("&Keyboard map", "", ID_KEYMAP),
                 Item::separator(),
-                Item::command("&About Tailhawk", "", ID_ABOUT).disabled(),
+                Item::command("&About Tailhawk", "", ID_ABOUT),
             ],
         ),
     ])
@@ -740,31 +739,77 @@ mod tests {
     }
 
     /// The exact case the owner reported, named so a regression is recognisable rather than merely
-    /// a failing assertion: Settings is `Dark theme`, a separator, then a disabled `Preferences…`.
+    /// a failing assertion.
+    ///
+    /// **Originally written against the greyed `Preferences`**, which used to toggle the theme when
+    /// clicked because the menu ran whatever it had highlighted rather than what was under the
+    /// pointer. `Preferences` is built now, so the guard moved.
+    ///
+    /// **It moved to Rules and not to Edit, and the difference is whether the test can fail.** The
+    /// bug ran the menu's *highlighted* entry, which is the first selectable one — so a menu whose
+    /// every entry is disabled cannot exhibit it, and with no document open that is exactly what
+    /// Edit is. Rules opens with `Highlight rules…` enabled above a disabled `Clear labels`, so
+    /// removing the guard makes this return `EditRules`. Verified by doing that.
     #[test]
-    fn clicking_the_greyed_preferences_does_not_toggle_the_theme() {
+    fn clicking_a_greyed_item_chooses_nothing() {
         let mut menu = menu_bar(None, false);
-        let settings = menu
+        let rules = menu
             .items()
             .iter()
-            .position(|i| i.text() == "Settings")
-            .expect("a Settings menu");
-        menu.open_top(settings);
+            .position(|i| i.text() == "Rules")
+            .expect("a Rules menu");
+        menu.open_top(rules);
 
-        let items = menu.at(&[settings]).expect("Settings has items").to_vec();
-        let prefs = items
-            .iter()
-            .position(|i| i.text().starts_with("Preferences"))
-            .expect("a Preferences item");
-        assert!(!items[prefs].selectable(), "Preferences is disabled");
-
-        let theme_id = command_id(Command::ToggleTheme);
-        assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(prefs)),
-            None,
-            "the greyed Preferences chose a command — and the one it used to choose was \
-             ToggleTheme (id {theme_id}), because that is what Settings opens highlighted"
+        let items = menu.at(&[rules]).expect("Rules has items").to_vec();
+        assert!(
+            items
+                .iter()
+                .any(|i| i.selectable() && i.text().starts_with("Highlight rules")),
+            "the test needs an enabled entry for the bug to have something to run"
         );
+        let greyed = items
+            .iter()
+            .position(|i| i.text().starts_with("Clear labels"))
+            .expect("a Clear labels item");
+        assert!(
+            !items[greyed].selectable(),
+            "Clear labels needs a document, so with none it is greyed"
+        );
+
+        assert_eq!(
+            chosen_by_click(&mut menu, MenuHit::Entry(greyed)),
+            None,
+            "a greyed item chose a command — without the guard this returns EditRules, the first \
+             selectable entry, which is what the menu had highlighted"
+        );
+    }
+
+    /// The four surfaces §2.2 used to draw disabled are built, and a menu that still greys them is
+    /// a menu that hides working features.
+    #[test]
+    fn the_four_built_surfaces_are_no_longer_greyed() {
+        let menu = menu_bar(None, false);
+        for (top, label) in [
+            ("Settings", "Preferences"),
+            ("Help", "Keyboard map"),
+            ("Help", "About Tailhawk"),
+            ("Format", "Font"),
+        ] {
+            let at = menu
+                .items()
+                .iter()
+                .position(|i| i.text() == top)
+                .unwrap_or_else(|| panic!("a {top} menu"));
+            let items = menu.at(&[at]).expect("items").to_vec();
+            let item = items
+                .iter()
+                .find(|i| i.text().starts_with(label))
+                .unwrap_or_else(|| panic!("{label} under {top}"));
+            assert!(
+                item.selectable(),
+                "{label} is built now and must be reachable with no document open"
+            );
+        }
     }
 
     /// The other half: an enabled item still chooses its command, or the guard would deaden the
