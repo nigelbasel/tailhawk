@@ -60,7 +60,15 @@ pub struct Theme {
     pub suppress_rules: bool,
     pub background: Colour,
     pub ink: Colour,
-    pub selection_ink: Colour,
+    /// An override for the ink of selected text. `None` — the normal themes — keeps whatever ink
+    /// the cluster already had, because standard selection changes the ground, not the letters.
+    /// High Contrast sets the system background here: its fill is the system highlight, and text
+    /// that kept its foreground colour on it would not be guaranteed legible.
+    pub selection_ink: Option<Colour>,
+    /// The fill behind selected cells. Selection is a background, as it is in every standard
+    /// application; the text on it keeps its own ink except under High Contrast, where the fill is
+    /// the system highlight and the ink must invert to stay legible.
+    pub selection_bg: Colour,
     pub match_bg: Colour,
     pub current_match_bg: Colour,
     pub current_match_ink: Colour,
@@ -106,7 +114,8 @@ impl Theme {
             suppress_rules: false,
             background: [0.071, 0.078, 0.090, 1.0],
             ink: [0.878, 0.890, 0.906, 1.0],
-            selection_ink: [0.45, 0.72, 1.0, 1.0],
+            selection_ink: None,
+            selection_bg: [0.20, 0.36, 0.60, 1.0],
             match_bg: [0.36, 0.29, 0.06, 1.0],
             current_match_bg: [0.95, 0.62, 0.16, 1.0],
             current_match_ink: [0.071, 0.078, 0.090, 1.0],
@@ -179,7 +188,8 @@ impl Theme {
             suppress_rules: false,
             background: [0.985, 0.985, 0.98, 1.0],
             ink: [0.13, 0.14, 0.16, 1.0],
-            selection_ink: [0.10, 0.35, 0.75, 1.0],
+            selection_ink: None,
+            selection_bg: [0.72, 0.82, 0.98, 1.0],
             match_bg: [0.98, 0.90, 0.60, 1.0],
             current_match_bg: [0.98, 0.62, 0.16, 1.0],
             current_match_ink: [0.10, 0.08, 0.05, 1.0],
@@ -273,7 +283,8 @@ impl Theme {
             suppress_rules: true,
             background,
             ink: foreground,
-            selection_ink: highlight,
+            selection_ink: Some(background),
+            selection_bg: highlight,
             match_bg: highlight,
             current_match_bg: highlight,
             current_match_ink: background,

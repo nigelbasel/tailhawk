@@ -568,6 +568,28 @@ impl Painter {
             laid.quads += 1;
         }
 
+        // The selection's fill, over the spans' backgrounds and under the ink: selection is the
+        // user's live act and highlighting is a standing instruction, so where both claim a cell
+        // the selection is the one that must be seen. The range arrives in cell columns, so the
+        // only clamping needed is to the columns the slice actually shows.
+        if let Some(range) = &selected {
+            let end_column = view
+                .cells()
+                .cell_at_byte_anchored(line, slice.bytes.end, anchors);
+            let from = range.start.max(slice.column);
+            let to = range.end.min(end_column);
+            if to > from {
+                self.instances.push(Instance {
+                    pos: [view.hgrid().x_of_column(from), y],
+                    size: [(to - from) as f32 * cell_width, row_height],
+                    tint: t.selection_bg,
+                    mode: MODE_SOLID,
+                    ..Instance::default()
+                });
+                laid.quads += 1;
+            }
+        }
+
         // The spans again, this time for the ink. Clusters arrive in logical order and spans are
         // sorted and non-overlapping, so one forward cursor answers every cluster — no search, and
         // no dependence on how many spans the row has.
@@ -581,16 +603,11 @@ impl Painter {
             let at = column;
             column += cells;
 
-            // **A selected cluster is still drawn by re-tinting rather than as a filled rectangle,
-            // and that is now a choice rather than a limitation.** The reason it used to give — that
-            // `Instance` has no background field — stopped being true when `MODE_SOLID` landed, and
-            // the background pass above proves a filled selection is available for the asking. It is
-            // not taken here because §11.1's selection colours are not chosen and picking a fill
-            // colour on the way past would decide them. Recorded as a gap in `HANDOFF.md`.
-            //
-            // **A selected cluster keeps the selection's ink even where a span claimed it.**
-            // Selection is the user's live act and highlighting is a standing instruction; a
-            // selection the user cannot see the extent of is the one that has gone wrong.
+            // **A selected cluster keeps the ink it already had** — the fill emitted above is what
+            // says "selected", exactly as it does in every standard application; the first shipped
+            // form re-tinted the letters instead and the owner read it as the font changing
+            // colour. The one exception is High Contrast, where [`Theme::selection_ink`] carries
+            // the system background so text stays legible on the system-highlight fill.
             while span_at < spans.len() && spans[span_at].end <= start {
                 span_at += 1;
             }
@@ -599,7 +616,9 @@ impl Painter {
                 .filter(|span| span.start <= start)
                 .and_then(|span| span.fg);
             let ink = match &selected {
-                Some(range) if at >= range.start && at < range.end => t.selection_ink,
+                Some(range) if at >= range.start && at < range.end => {
+                    t.selection_ink.unwrap_or(claimed.unwrap_or(tint))
+                }
                 _ => claimed.unwrap_or(tint),
             };
 
@@ -1266,15 +1285,20 @@ mod tests {
         drop(off);
     }
 
-    /// **A selected range reaches the quads as a different ink.**
+    /// **A selected range reaches the quads as a filled background, and the ink is left alone.**
+    ///
+    /// The first shipped form re-tinted the glyphs instead — the owner read it as the font
+    /// changing colour, which no standard application does. Selection is now a `MODE_SOLID` fill
+    /// under the selected cells, emitted before the glyphs (buffer order is what makes a
+    /// background a background), and the text keeps whatever ink it already had.
     ///
     /// The model half of selection was tested and passing while the feature was **invisible on
     /// screen**, because the shell handed the painter the wrong object and `row_selection` fell back
     /// to its default `None`. A test that calls `row_selection` directly cannot see that; this one
     /// goes through `lay_out` and inspects the instances, which is the path that was broken.
     #[test]
-    fn a_selected_range_is_drawn_in_the_selection_ink() {
-        let Some((_off, mut painter)) = painter_or_skip("a_selected_range_is_drawn") else {
+    fn a_selected_range_is_filled_behind_the_text_not_retinted() {
+        let Some((_off, mut painter)) = painter_or_skip("a_selected_range_is_filled") else {
             return;
         };
         let view = view_for(&painter, 4, 200);
@@ -1293,16 +1317,47 @@ mod tests {
 
         painter.begin_frame();
         painter.lay_out(&view, INK, &source).expect("lay out");
-        let selected = painter
-            .instances()
+        let instances = painter.instances();
+        let fills: Vec<usize> = instances
             .iter()
-            .filter(|i| i.tint == Theme::dark().selection_ink)
+            .enumerate()
+            .filter(|(_, i)| i.mode == MODE_SOLID && i.tint == Theme::dark().selection_bg)
+            .map(|(at, _)| at)
+            .collect();
+        let cell_w = view.hgrid().cell_width();
+        for (_, fill) in instances
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| fills.contains(at))
+        {
+            assert_eq!(
+                fill.size[0],
+                4.0 * cell_w,
+                "each fill covers the four selected columns"
+            );
+        }
+        let retinted = instances
+            .iter()
+            .filter(|i| i.mode != MODE_SOLID && i.tint != INK)
             .count();
-        let plain = painter.instances().iter().filter(|i| i.tint == INK).count();
 
-        assert!(selected > 0, "nothing was drawn in the selection ink");
-        assert!(plain > 0, "every glyph was drawn as selected");
-        assert_eq!(selected, 8, "expected four columns on each of two rows");
+        assert_eq!(fills.len(), 2, "one fill on each of the two selected rows");
+        // Buffer order is the entire mechanism by which a background is a background: each row's
+        // fill must be emitted before that row's own glyphs, or it paints over them.
+        let row_h = view.grid().row_height();
+        for &at in &fills {
+            let fill_y = instances[at].pos[1];
+            let overdrawn = instances[..at]
+                .iter()
+                .filter(|i| i.mode != MODE_SOLID)
+                .filter(|i| i.pos[1] >= fill_y && i.pos[1] < fill_y + row_h)
+                .count();
+            assert_eq!(
+                overdrawn, 0,
+                "a selection fill was emitted after glyphs on its own row"
+            );
+        }
+        assert_eq!(retinted, 0, "selected text keeps the ink it already had");
     }
 
     /// **§7.1's colours, from a span to the quads that draw it.**
