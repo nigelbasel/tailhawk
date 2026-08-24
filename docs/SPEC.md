@@ -44,11 +44,25 @@ otherwise.
 
 - Printing. Export covers the underlying need.
 - Editing log files. Tailhawk is **read-only, always**, and this is a tested guarantee.
-- Querying remote backends (Loki, Tempo, Azure Monitor). **This bounds the protocol, not the
-  reach**: §4.2's stdin pump means `logcli query --tail '{app="x"}' | tailhawk` works today, with the
-  backend's own client doing the querying. Tailhawk speaks nobody's query API and holds §13.2's
-  zero-network guarantee; it reads a pipe. Worth stating because the non-goal reads as "centralised
-  logs are out of reach", and they are not.
+- ~~Querying remote backends (Loki, Tempo, Azure Monitor).~~ **Superseded for Loki. See `LOKI.md`.**
+
+  This line was written 2026-07-28 and reversed by the owner on 2026-07-29: **Tailhawk is a Loki
+  client, staged client-lite first** (`LOKI.md` §8; commits `fbd8cfb`, `1969929`). It sat here
+  uncorrected for a month because `LOKI.md` was never folded back into this document, and it has
+  since been quoted *to the owner* as though it were the current position. It is not.
+
+  **What still holds.** §13.2's zero-network guarantee applies to everything Tailhawk does on its
+  own account — no telemetry, no update ping, no font or CDN fetch. A Loki source is an outbound
+  connection **the user has explicitly configured and named**, which is a different thing, and
+  §13.2's wording has to be amended to say so rather than quietly contradicted.
+
+  **What is still true and useful.** §4.2's stdin pump means
+  `logcli query --output=jsonl --tail '{app="x"}' | tailhawk -` works today at roughly zero
+  incremental cost — `LOKI.md` §8 identifies it as the cheap 80% path and is explicit that it is
+  *not* the decision: it delivers no label browser, no server-side pushdown, no timeline histogram,
+  no `index/stats` pre-flight and no in-app time picker.
+
+  **Tempo and Azure Monitor remain non-goals.** The reversal is Loki's alone.
 - Metrics and traces as first-class data. Trace *IDs* are used for correlation only.
 - ETW / WPP real-time sessions.
 - `.evtx` binary parsing. Detect the file type and fail informatively.

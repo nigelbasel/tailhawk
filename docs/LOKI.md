@@ -1,6 +1,8 @@
 # Loki as a Tailhawk source — design note
 
-**Status: research complete, adversarially reviewed, NOT yet folded into `SPEC.md` or `PLAN.md`.**
+**Status: research complete, adversarially reviewed, folded into `SPEC.md` §1.3 and `PLAN.md` §2.4
+on 2026-08-24** — a month late, and only after the stale §1.3 non-goal had been quoted back to the
+owner as the current position. The cost reconciliation §8 owes `PLAN.md` is still outstanding.
 The two blocking product decisions were settled by the owner on 2026-07-29 — **Tailhawk is a Loki
 client, staged client-lite first** (§8). One design decision (§4) affects v1 and lands regardless.
 

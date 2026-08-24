@@ -148,8 +148,18 @@ things the spec and the UI design both require. That is exactly the failure the 
 supposed to prevent, and it was caught only by a reviewer checking the component list against the
 other two documents feature by feature. Treat the 75 as still likely low.
 
-**v2** (merged view, trace correlation, process sources, archives, comparison, alerts, full `--stdout`
-parity, **accessibility**) adds **≈ 28–36 weeks A**, of which accessibility alone is 6–10.
+**v2** (merged view, **the Loki source**, trace correlation, process sources, archives, comparison,
+alerts, full `--stdout` parity, **accessibility**) adds **≈ 28–36 weeks A**, of which accessibility
+alone is 6–10.
+
+> **⚠ The v2 budget does not yet cost the Loki source, and `LOKI.md` §8 says the reconciliation is
+> still owed to this document.** The owner settled on 2026-07-29 that Tailhawk **is** a Loki client,
+> staged client-lite first, sequenced after §8.3's merged view. `LOKI.md`'s two costings disagree by
+> 2x — 14–18 PW against 26–38 PW — and at the higher figure the Loki source is **86–110% of the
+> entire v2 budget on its own**. Two structural findings go with it: the timeline histogram (today
+> v3) becomes load-bearing, because it is the only navigation affordance a time-primary source has;
+> and the staged **client-lite** first step is what makes the range tractable. Until that
+> reconciliation is done, treat v2 as **uncosted**, not as 28–36.
 
 **v3** adds **≈ 16–22 weeks A**.
 
