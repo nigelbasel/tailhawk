@@ -16,6 +16,34 @@
   `TouchAction`/`TouchPhase`/`Panes`/`decide` — and `tools/verify-touch.ps1` drives a real contact
   at the real window with `InjectTouchInput`.
 
+### ▶ Do this first — the menu bar vanishes when the last tab closes
+
+**Confirmed with the owner, 2026-08-24.** Close the last tab and the window stays, the welcome
+screen appears — both correct — **and the menu bar disappears**. There is then no way to open a file
+by mouse at all: `Open…` lives in a bar that is no longer drawn.
+
+**Cause.** The bar is drawn by `Document`, and the welcome path in `Shell::paint` returns early
+before any of that:
+
+```rust
+let welcome = Welcome::new(cell, (w, h), &recent);
+let laid = renderer.paint_rows(&welcome.view, &welcome)?;   // <- no bar, no chrome
+self.welcome = Some(welcome);
+return Ok(());
+```
+
+`Welcome` already implements `RowSource`, which is the same seam `Document` draws its chrome
+through — so the fix is to give `Welcome` the `MenuFrame` and let it draw the bar and record its
+hits, exactly as `Document` does. `menu_click` also early-returns on `self.document.as_ref()` for
+the hit rects and needs the same treatment, or the bar will draw and not respond.
+
+**Related, found on the way and not yet fixed:** the owner asked for **every menu item to be swept
+by clicking it**, one at a time, against the real window. That is the only thing that finds the next
+bug of this shape — `File ▸ Open…` did nothing when *clicked* for a month while working perfectly
+from the keyboard and the palette, and no test caught it because the tests and the keyboard use the
+same path. `tools/verify-touch.ps1`'s injection harness is the tool for the sweep: it lands real
+contacts at real screen coordinates and needs no foreground trickery.
+
 ### §2.2's four dead menu items are built — and what is still open on them
 
 `About`, `Keyboard map`, `Preferences` and `Font…` were the only items in the bar that did nothing.
