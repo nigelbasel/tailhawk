@@ -45,9 +45,35 @@ hand-run. Build and green-gate first — it deliberately does not build.
   `TouchAction`/`TouchPhase`/`Panes`/`decide` — and `tools/verify-touch.ps1` drives a real contact
   at the real window with `InjectTouchInput`.
 
-### ▶ Do this first — the menu bar vanishes when the last tab closes
+### ▶ Do this first — the tail tool says "paused" while showing the tail
 
-**Confirmed with the owner, 2026-08-24.** Close the last tab and the window stays, the welcome
+**Found by the menu click-sweep, 2026-08-24, and it is not a menu bug.** `View ▸ Follow tail` was one
+of only two items in 62 that produced no observable effect. Chasing it:
+
+- `Ctrl+End` does not engage following either, so it is not the mouse path.
+- After `Ctrl+Home` then `Ctrl+End` on a 5,000-line fixture, **line 5000 sits at the very bottom of
+  the grid** — the view is unambiguously at the tail — and the status bar still reads
+  `‖ paused · Ctrl+End to follow`.
+
+So `Grid::is_at_bottom` returns false while the viewport is visibly against the end, and everything
+downstream of it is wrong with it: the chip, `Follow tail`, and the auto-follow that is the whole
+point of the product.
+
+**The suspect is float equality.** `is_at_bottom` is `self.scroll == self.max_scroll()`, `Scroll`
+carries an `f32 sub_row_px`, and `max_scroll` derives that remainder from `viewport_px` and
+`row_height` — both re-measured from the face every frame (`Shell::paint` re-reads `renderer.cell()`
+deliberately, for DPI). Two computations that differ in the last bit compare unequal. It fits the
+evidence that the **dogfood instance does show `● following`**: a growing file re-pins to the bottom
+inside the same frame that computes the comparison, so the two values match exactly.
+
+**Do not just add an epsilon.** `is_at_bottom` is the follow model's whole predicate, `grid.rs` has
+tests around it, and §6.4 spent two experiments on this arithmetic. Reproduce it in a unit test
+first — feed a viewport and row height whose division does not land on a bit boundary — and make it
+fail before believing any fix.
+
+### Then — the menu bar vanishes when the last tab closes
+
+**Fixed 2026-08-24 in `256c1a8`** — kept here because the shape recurs. Close the last tab and the window stays, the welcome
 screen appears — both correct — **and the menu bar disappears**. There is then no way to open a file
 by mouse at all: `Open…` lives in a bar that is no longer drawn.
 
@@ -66,12 +92,13 @@ through — so the fix is to give `Welcome` the `MenuFrame` and let it draw the 
 hits, exactly as `Document` does. `menu_click` also early-returns on `self.document.as_ref()` for
 the hit rects and needs the same treatment, or the bar will draw and not respond.
 
-**Related, found on the way and not yet fixed:** the owner asked for **every menu item to be swept
-by clicking it**, one at a time, against the real window. That is the only thing that finds the next
-bug of this shape — `File ▸ Open…` did nothing when *clicked* for a month while working perfectly
-from the keyboard and the palette, and no test caught it because the tests and the keyboard use the
-same path. `tools/verify-touch.ps1`'s injection harness is the tool for the sweep: it lands real
-contacts at real screen coordinates and needs no foreground trickery.
+**The sweep is built and has been run:** `tools/verify-menus.ps1`, 62 items across all seven menus,
+clicked one at a time with the rects the bar actually drew. Everything in File, Edit, Format,
+Settings and Help behaves. Four items reported no effect: `View ▸ Back` and `View ▸ Forward` (correct
+— a fresh document has no view-state history), `Rules ▸ Open rules file` (a false positive; it
+`ShellExecute`s an external editor, which takes longer than the harness waited — confirmed by the
+windowed-process count going up and `tailhawk.rules.toml` appearing), and `View ▸ Follow tail`, which
+is the real defect recorded above.
 
 ### §2.2's four dead menu items are built — and what is still open on them
 

@@ -60,6 +60,16 @@ if (-not (Test-Path $Log)) {
     $sw.Close()
 }
 
+# §12.3 is one instance per session, so a launch while the previous one is still shutting down is
+# *handed off* to it and exits with no window of its own -- and the harness sits waiting for a window
+# that will never arrive. Waiting for the field to clear is the whole fix.
+function Wait-NoTailhawk {
+    $null = Wait-For {
+        (Get-Process tailhawk -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0
+    } 'the previous instance to exit' 15
+    Start-Sleep -Milliseconds 300
+}
+
 function Tap([int]$x, [int]$y) {
     [Touch]::Send($x, $y, [Touch]::DOWN)
     Start-Sleep -Milliseconds 60
@@ -90,6 +100,7 @@ for ($menuIndex = 0; $menuIndex -lt $MENU_NAMES.Count; $menuIndex++) {
     if ($Menu -and $name -ne $Menu) { continue }
 
     # How many items this menu has, learned by opening it once.
+    Wait-NoTailhawk
     $probe = Start-Tailhawk $Log
     $po = New-Object Shot+POINT
     [void][Shot]::ClientToScreen($probe.MainWindowHandle, [ref]$po)
@@ -110,7 +121,15 @@ for ($menuIndex = 0; $menuIndex -lt $MENU_NAMES.Count; $menuIndex++) {
         # **A fresh process per item.** An item that opens a modal, closes the tab or changes the
         # theme leaves the window in a state the next item would be measured against; restarting is
         # the only way each reading means what it says.
-        $proc = Start-Tailhawk $Log
+        Wait-NoTailhawk
+        $proc = $null
+        try {
+            $proc = Start-Tailhawk $Log
+        } catch {
+            $findings += [pscustomobject]@{ Menu = $name; Row = $row; Result = 'could not start' }
+            Write-Host ("{0,-9} row {1,2}  could not start" -f $name, $row)
+            continue
+        }
         $hwnd = $proc.MainWindowHandle
         $o = New-Object Shot+POINT
         [void][Shot]::ClientToScreen($hwnd, [ref]$o)
