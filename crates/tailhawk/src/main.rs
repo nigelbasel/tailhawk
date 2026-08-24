@@ -5399,7 +5399,11 @@ impl Shell {
                         .take(6)
                         .map(|f| f.path.clone())
                         .collect();
-                    let welcome = Welcome::new(cell, (w, h), &recent);
+                    let mut welcome =
+                        Welcome::new(cell, (w, h), &recent, renderer.chrome_line_height()?);
+                    // The bar is the shell's — one bar per window, whatever is or is not open — and
+                    // this is the same handover `Document` gets a few lines below.
+                    welcome.menu_frame = menubar::menu_frame_of(&self.menu);
                     let laid = renderer.paint_rows(&welcome.view, &welcome)?;
                     rasterised = laid.rasterised;
                     self.welcome = Some(welcome);
@@ -7052,17 +7056,24 @@ impl Shell {
     /// Reports whether the move **changed** anything, not merely whether it was over the menu:
     /// `WM_MOUSEMOVE` arrives many times a second and a frame per message, for a highlight that has
     /// not moved, is a redraw of the whole window for nothing.
+    /// What the bar has at `(x, y)`, asking whichever surface drew it this frame.
+    ///
+    /// **With a document that is `Chrome::menu_hits`; with none it is the welcome screen's.** Both
+    /// the hover and the click used to read only the document's, so once the last tab closed the bar
+    /// was drawn and could not be reached — the state in which `Open…` is the only thing a user
+    /// wants and the only thing they cannot get to.
+    fn menu_hit_at(&self, x: f32, y: f32) -> Option<menubar::MenuHit> {
+        match self.document.as_ref() {
+            Some(doc) => menubar::hit_at(&doc.chrome.menu_hits.borrow(), x, y),
+            None => menubar::hit_at(&self.welcome.as_ref()?.menu_hits.borrow(), x, y),
+        }
+    }
+
     fn menu_hover(&mut self, x: f32, y: f32) -> bool {
         if !self.menu.is_open() {
             return false;
         }
-        let hit = {
-            let Some(doc) = self.document.as_ref() else {
-                return false;
-            };
-            let hits = doc.chrome.menu_hits.borrow();
-            menubar::hit_at(&hits, x, y)
-        };
+        let hit = self.menu_hit_at(x, y);
         let before = (
             self.menu.open_path().to_vec(),
             self.menu.selected().to_vec(),
@@ -7093,13 +7104,7 @@ impl Shell {
     /// A click at `(x, y)` in the window, while §2.2's bar is drawn. Reports whether the menu took
     /// it — including a click that only **shuts** the menu, which the grid must not also act on.
     fn menu_click(&mut self, hwnd: HWND, x: f32, y: f32) -> bool {
-        let hit = {
-            let Some(doc) = self.document.as_ref() else {
-                return false;
-            };
-            let hits = doc.chrome.menu_hits.borrow();
-            menubar::hit_at(&hits, x, y)
-        };
+        let hit = self.menu_hit_at(x, y);
         match hit {
             // **What the click means is [`menubar::chosen_by_click`]'s to decide, not this
             // function's.** It used to be decided inline here, where exercising it needed a window
@@ -7851,11 +7856,24 @@ struct Welcome {
     /// The path a row opens when clicked, for the "Recent" rows.
     opens: Vec<Option<PathBuf>>,
     view: View,
+    /// §2.2's bar as it should be drawn this frame, handed over exactly as [`Document`] is handed
+    /// its own — because **the welcome screen needs the bar more than any other state does**. It is
+    /// what a user sees after closing the last tab, and `Open…` lives in that bar: without it there
+    /// is no way to open a file by mouse at all.
+    menu_frame: MenuFrame,
+    /// Where the bar drew its headings and items, so a click can be resolved. Same shape and same
+    /// purpose as `Chrome::menu_hits`.
+    menu_hits: std::cell::RefCell<menubar::MenuHits>,
 }
 
 impl Welcome {
     /// Composes the surface for a client `width_cells` wide, listing the newest `recent` files.
-    fn new(cell: (f32, f32), size: (u32, u32), recent: &[String]) -> Self {
+    ///
+    /// `chrome_h` is the chrome face's line height, and it is what reserves the band §2.2's bar is
+    /// drawn in. **A view with no chrome band never has [`RowSource::draw_chrome`] called on it** —
+    /// `paint.rs` gates that call on `chrome_px() > 0` — so a `Welcome` that forgets this draws no
+    /// menu bar however carefully it implements the method.
+    fn new(cell: (f32, f32), size: (u32, u32), recent: &[String], chrome_h: f32) -> Self {
         let (cell_w, row_h) = cell;
         let width_cells = ((size.0 as f32) / cell_w.max(1.0)).max(20.0) as usize;
         let centre = |text: &str| {
@@ -7897,9 +7915,16 @@ impl Welcome {
         let mut view = View::new(cell_w, row_h);
         view.set_metrics(cell_w, row_h);
         view.set_viewport(size.0 as f32, size.1 as f32);
+        view.set_chrome_px(chrome_h + 6.0);
         view.grid_mut().set_total_rows(lines.len() as u64);
         view.hgrid_mut().set_columns(width_cells as u64 + 1);
-        Self { lines, opens, view }
+        Self {
+            lines,
+            opens,
+            view,
+            menu_frame: MenuFrame::default(),
+            menu_hits: std::cell::RefCell::new(Vec::new()),
+        }
     }
 
     /// The recent file a client `y` lands on, if any.
@@ -7916,6 +7941,22 @@ impl RowSource for Welcome {
 
     fn row_number(&self, _row: u64) -> Option<u64> {
         None
+    }
+
+    /// §2.2's bar, over the welcome text.
+    ///
+    /// Only the bar. There is no tab strip with no tabs, no command bar with nothing to search, and
+    /// no status bar with no file — drawing empty bands here would be chrome that lies about having
+    /// something in it. The bar is the exception because every one of its items is still reachable:
+    /// `Open…`, the keyboard map, About and Preferences all work with no document.
+    fn draw_chrome(&self, painter: &mut Painter, _view: &View) {
+        let width = self.view.gutter_px() + self.view.hgrid().viewport_px();
+        let mut hits = self.menu_hits.borrow_mut();
+        hits.clear();
+        let band = painter.chrome_line_height() + 6.0;
+        painter.fill(0.0, 0.0, width, band, theme().chrome_bg);
+        let (_, open_x) = menubar::draw_bar(painter, &self.menu_frame, &mut hits, 0.0, width);
+        menubar::draw_open_list(painter, &self.menu_frame, &mut hits, open_x, band, width);
     }
 }
 
@@ -12539,6 +12580,7 @@ mod tests {
                     r"C:\logs\app.log".to_owned(),
                     r"C:\logs\other.log".to_owned(),
                 ],
+                renderer.chrome_line_height().unwrap_or(18.0),
             );
             let pixels = renderer
                 .snapshot(w, h, &welcome.view, &welcome)
