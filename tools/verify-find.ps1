@@ -42,17 +42,37 @@ try {
 
     # §2.1 as resettled: Ctrl+F opens the classic modeless Find dialog. The query is typed into
     # the dialog's own edit control, and Enter is Find Next, its default button.
+    #
+    # **Scoped to the process, not the desktop.** A bare FindWindowW('#32770','Find') matches any
+    # application's Find dialog — the first draft failed against Tailhawk while faithfully
+    # reporting on a dialog belonging to something else entirely.
     Add-Type @'
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
 public static class FindDlg {
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr FindWindowW(string cls, string title);
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    public static IntPtr OfProcess(uint owner) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (pid != owner) return true;
+            var c = new StringBuilder(64); GetClassNameW(h, c, 64);
+            var t = new StringBuilder(64); GetWindowTextW(h, t, 64);
+            if (c.ToString() == "#32770" && t.ToString() == "Find") { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
 }
 '@
     $wsh.SendKeys('^f')
-    $null = Wait-For { [FindDlg]::FindWindowW('#32770', 'Find') -ne [IntPtr]::Zero } 'the Find dialog' 10
-    Write-Host 'the Find dialog is a native #32770 window'
+    $null = Wait-For { [FindDlg]::OfProcess($proc.Id) -ne [IntPtr]::Zero } 'the Find dialog' 10
+    Write-Host 'the Find dialog is a native #32770 window owned by the app'
     Start-Sleep -Milliseconds 200
     $wsh.SendKeys((ConvertTo-SendKeys $Query))
     Start-Sleep -Milliseconds 200
@@ -64,7 +84,7 @@ public static class FindDlg {
     # proves the dialog dismisses the way the standard one does.
     $wsh.SendKeys('{ESC}')
     Start-Sleep -Milliseconds 400
-    if ([FindDlg]::FindWindowW('#32770', 'Find') -ne [IntPtr]::Zero) {
+    if ([FindDlg]::OfProcess($proc.Id) -ne [IntPtr]::Zero) {
         throw 'Esc did not close the Find dialog'
     }
     $proc.Refresh()

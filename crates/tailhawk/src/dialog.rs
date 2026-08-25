@@ -505,6 +505,24 @@ unsafe extern "system" fn find_proc(
     }
 }
 
+/// A second `Ctrl+F` while the dialog is up: bring it forward with the query selected, ready to
+/// be retyped — the standard dialog's own behaviour rather than stacking a twin.
+pub fn focus_find(hdlg: HWND) {
+    const EM_SETSEL: u32 = 0x00B1;
+    unsafe {
+        if let Ok(edit) = GetDlgItem(hdlg, i32::from(ID_FIND_WHAT)) {
+            let _ = SetFocus(edit);
+        }
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_FIND_WHAT),
+            EM_SETSEL,
+            WPARAM(0),
+            LPARAM(-1),
+        );
+    }
+}
+
 /// §2.1 as resettled: the classic Find dialog, **modeless** as the standard one is — the document
 /// scrolls, tails and follows underneath it, and Esc or Cancel dismisses it. The owner's message
 /// loop pumps it through `IsDialogMessageW`; pressing Enter is Find Next, the default button.

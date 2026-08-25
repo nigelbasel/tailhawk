@@ -2064,6 +2064,25 @@ impl Document {
     /// **The snapshot is taken here and the pass runs on a worker**, because §7.4's own figure for a
     /// full pass over 10 GB is 9.93 s and §11.3 forbids blocking a frame. See [`tailhawk_core::find`]
     /// for what the worker is given and why it cannot move under it.
+    /// Seeds a fresh search from the Find dialog's last request — `F3` after `Esc` should look
+    /// for the thing, not do nothing — falling back to the bar's field while that still exists.
+    /// The field's old semantics were raw-regex and case-insensitive, and keep being.
+    fn find_from_seed(&mut self, seed: &(String, bool, bool)) {
+        let (raw, match_case, regex) = if seed.0.is_empty() {
+            (self.chrome.find.text().to_owned(), false, true)
+        } else {
+            seed.clone()
+        };
+        self.finder.query = if regex {
+            raw.clone()
+        } else {
+            tailhawk_core::search::Pattern::escape(&raw)
+        };
+        self.finder.label = raw;
+        self.finder.match_case = match_case;
+        self.find();
+    }
+
     fn find(&mut self) {
         self.finder.clear();
         if self.finder.query.is_empty() {
@@ -2902,6 +2921,10 @@ struct Finder {
     /// The Find dialog's "Match case" — false is the insensitive default the module note argues
     /// for, and the dialog is the toggle that note said did not exist yet.
     match_case: bool,
+    /// The query as the user typed it — what the title shows. [`Finder::query`] is the engine
+    /// form, which for a non-regex search is the same text escaped, and `a\.b\ \(1\)` in a title
+    /// is not something to show a person.
+    label: String,
     /// The query the current results are for — what the find field held when `Enter` was pressed.
     /// The field itself lives in [`Chrome`]; this is what the title and the pass use.
     query: String,
@@ -2925,6 +2948,16 @@ struct Finder {
 }
 
 impl Finder {
+    /// What the title shows for the query: the typed form when there is one, the engine form
+    /// when a path that predates the dialog set only that.
+    fn shown(&self) -> &str {
+        if self.label.is_empty() {
+            &self.query
+        } else {
+            &self.label
+        }
+    }
+
     /// Forgets the results, keeping the query. Cancels a running pass by dropping it.
     fn clear(&mut self) {
         self.running = None;
@@ -3066,12 +3099,12 @@ impl Finder {
     /// "no matches" — that the pattern did not compile.
     fn describe(&self) -> Option<String> {
         if let Some(error) = &self.error {
-            return Some(format!("► {} — {error}", self.query));
+            return Some(format!("► {} — {error}", self.shown()));
         }
         if self.query.is_empty() {
             return None;
         }
-        let mut text = format!("► {}", self.query);
+        let mut text = format!("► {}", self.shown());
         match (self.current, self.matches.len()) {
             (_, 0) if self.running.is_some() => text.push_str(" — searching…"),
             (_, 0) => text.push_str(" — no matches"),
@@ -5699,6 +5732,7 @@ impl Shell {
                         k if k == VK_RETURN.0 => match focus {
                             Focus::Find => {
                                 doc.finder.query = doc.chrome.find.text().to_owned();
+                                doc.finder.label = doc.finder.query.clone();
                                 doc.find();
                             }
                             Focus::NewChip => {
@@ -7064,6 +7098,7 @@ impl Shell {
             }
             _ => {}
         }
+        let last_find = self.last_find.clone();
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
@@ -7074,8 +7109,8 @@ impl Shell {
             }
             Command::FindNext | Command::FindPrevious => {
                 if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
-                    doc.finder.query = doc.chrome.find.text().to_owned();
-                    doc.find();
+                    let seed = last_find.clone();
+                    doc.find_from_seed(&seed);
                 } else {
                     doc.find_step(command == Command::FindNext);
                 }
@@ -7186,6 +7221,7 @@ impl Shell {
     /// The keys that act on results rather than fields, in whichever focus: `F3` / `Shift+F3` step
     /// the search; `Esc` with the grid focused unwinds — the finder's results first, then the chips.
     fn find_key(&mut self, hwnd: HWND, key: u16, _ctrl: bool, shift: bool) -> bool {
+        let last_find = self.last_find.clone();
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
@@ -7200,8 +7236,8 @@ impl Shell {
             // A step with no results but a query is the search the user meant — pressing `F3` after
             // `Esc` should look for the thing, not do nothing.
             if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
-                doc.finder.query = doc.chrome.find.text().to_owned();
-                doc.find();
+                let seed = last_find.clone();
+                doc.find_from_seed(&seed);
                 false
             } else {
                 doc.find_step(!shift)
@@ -8830,6 +8866,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             unsafe {
                 let _ = SetForegroundWindow(existing);
             }
+            dialog::focus_find(existing);
         } else {
             let seed = STATE.with(|s| {
                 s.borrow()
@@ -8902,6 +8939,16 @@ pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
     let Ok(owner) = owner else {
         return;
     };
+    // A Find Next with an emptied box changes nothing — the standard dialog's own behaviour,
+    // rather than wiping the standing results with a search for nothing.
+    if request.query.is_empty() {
+        return;
+    }
+    // **The re-entry guard is set for the duration, exactly as `wndproc` sets it.** The calls
+    // below — `SetScrollInfo`, `SetWindowTextW` — can send `WM_SIZE` and its kin back to the
+    // owner synchronously while this borrow is held; the guard deflects those to
+    // `DefWindowProcW` instead of letting them panic the borrow.
+    let was = IN_WNDPROC.with(|flag| flag.replace(true));
     STATE.with(|s| {
         let mut state = s.borrow_mut();
         let Some(shell) = state.as_mut() else {
@@ -8923,6 +8970,7 @@ pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
             doc.find_step(request.forwards)
         } else {
             doc.finder.query = pattern;
+            doc.finder.label = request.query.clone();
             doc.finder.match_case = request.match_case;
             doc.find();
             false
@@ -8935,6 +8983,7 @@ pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
             let _ = InvalidateRect(owner, None, false);
         }
     });
+    IN_WNDPROC.with(|flag| flag.set(was));
 }
 
 /// The modeless Find dialog went away — Esc, Cancel, or the window closing under it. Forget the
