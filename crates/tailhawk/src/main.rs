@@ -15,6 +15,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod about;
+mod controls;
 mod dialog;
 mod filterpanel;
 mod icon;
@@ -270,6 +271,8 @@ struct Document {
     detail: DetailPane,
     /// E21's export or live tee, while one is in progress.
     tee: Option<Tee>,
+    /// The filter panel's selected row, for Edit… and Remove to act on.
+    filter_selected: Option<usize>,
     /// Whether this pane draws the status bar — the bottom pane of a split does, the top does not.
     show_footer: bool,
     /// §2.1's docked filter panel: shown by `Ctrl+L`, adding a chip, or View ▸ Filter panel, and
@@ -456,7 +459,6 @@ impl RowSource for Document {
                 tx += w + pad * 3.0;
             }
         }
-        let chip_w = CHIP_CELLS as f32 * painter.chrome_measure("0").max(1.0);
 
         // V10: the detail pane, above the status bar. The first line is the record's title; the
         // rest its fields, body and tail; a pane too short for them says how many are left.
@@ -499,17 +501,44 @@ impl RowSource for Document {
         }
 
         // §2.1's docked filter panel, above the status bar — the VS tool-window posture, fixed.
-        // Every row's targets go by x and y into `panel_hits`; the add field is the same widget
-        // the bar used to carry, moved home.
+        // A title row carries the panel's name and its buttons, drawn through the shared
+        // standard-controls module so their metrics are decided once; each chip is a row whose
+        // text selects it, for Edit… and Remove to act on. Add… opens the Filter dialog — the
+        // inline field the owner found unreadable is gone.
         {
             let mut panel_hits = self.chrome.panel_hits.borrow_mut();
             panel_hits.clear();
-            let mut chip_origin = 0.0;
             if panel_h > 0.0 {
                 let top = view.height_px() - strip - panel_h;
                 painter.fill(0.0, top, width, panel_h, theme().pane_bg);
                 painter.fill(0.0, top, width, filterpanel::RULE_PX, theme().pane_edge);
                 let mut y = top + filterpanel::RULE_PX + 2.0;
+                let title_h = filterpanel::title_height(panel_row);
+                let ty = y + ((title_h - chrome_h) * 0.5).floor();
+                painter.chrome_run("Filters", pad, ty, theme().header_ink);
+                let m = controls::metrics(chrome_h);
+                let has_selection = self
+                    .filter_selected
+                    .is_some_and(|i| i < self.filtering.chips.chips.len());
+                let any = !self.filtering.chips.chips.is_empty();
+                let button_h = chrome_h + m.button_pad_y * 2.0;
+                let by = y + ((title_h - button_h) * 0.5).floor().max(0.0);
+                let mut bx = width - pad;
+                for (label, hit, enabled) in [
+                    ("Clear all", Hit::FilterClear, any),
+                    ("Remove", Hit::FilterRemove, has_selection),
+                    ("Edit…", Hit::FilterEdit, has_selection),
+                    ("Add…", Hit::FilterAdd, true),
+                ] {
+                    let (w, _) = controls::button_size(painter, chrome_h, label);
+                    bx -= w;
+                    let (xr, yr) = controls::button(painter, chrome_h, bx, by, label, enabled);
+                    if enabled {
+                        panel_hits.push((xr, yr, hit));
+                    }
+                    bx -= m.gap;
+                }
+                y += title_h;
                 for (i, row) in filterpanel::rows_of(&self.filtering.chips.chips)
                     .iter()
                     .enumerate()
@@ -521,6 +550,9 @@ impl RowSource for Document {
                     } else {
                         theme().field_hint
                     };
+                    if self.filter_selected == Some(i) {
+                        painter.fill(0.0, y, width, panel_row, theme().palette_selected_bg);
+                    }
                     let mut x = pad;
                     let mark_w = painter.chrome_run(row.mark, x, ty, ink);
                     panel_hits.push((x..x + mark_w + pad, y..y + panel_row, Hit::Chip(i)));
@@ -543,43 +575,23 @@ impl RowSource for Document {
                     ));
                     x += sign_w + pad;
                     let text_w = painter.chrome_run(&row.text, x, ty, ink);
-                    panel_hits.push((x..x + text_w + pad, y..y + panel_row, Hit::Chip(i)));
-                    x += text_w + pad * 1.5;
-                    let close_w = painter.chrome_run("×", x, ty, theme().field_hint);
-                    panel_hits.push((x..x + close_w + pad, y..y + panel_row, Hit::ChipClose(i)));
+                    let close_x = x + text_w + pad * 1.5;
+                    let close_w = painter.chrome_run("×", close_x, ty, theme().field_hint);
+                    // The `×` first: hits resolve first-match, and the select rect below runs
+                    // wide under it so most of the row is a click target.
+                    panel_hits.push((
+                        close_x..close_x + close_w + pad,
+                        y..y + panel_row,
+                        Hit::ChipClose(i),
+                    ));
+                    panel_hits.push((
+                        x..(close_x + close_w + pad).max(width * 0.6),
+                        y..y + panel_row,
+                        Hit::FilterSelect(i),
+                    ));
                     y += panel_row;
                 }
-                let ty = y + ((panel_row - chrome_h) * 0.5).floor();
-                let x = pad;
-                let chip_focused = self.chrome.focus == Focus::NewChip;
-                painter.fill(
-                    x - 2.0,
-                    ty - 2.0,
-                    chip_w + 4.0,
-                    chrome_h + 4.0,
-                    if chip_focused {
-                        theme().field_bg_focused
-                    } else {
-                        theme().field_bg
-                    },
-                );
-                panel_hits.push((x..x + chip_w, y..y + panel_row, Hit::NewChip));
-                chip_origin = x;
-                let hint = match self.chrome.chip_polarity {
-                    Polarity::Include => "+ Add filter (Ctrl+L)",
-                    Polarity::Exclude => "− Add exclude (Ctrl+Shift+L)",
-                };
-                draw_field(
-                    painter,
-                    &self.chrome.chip,
-                    chip_focused,
-                    x,
-                    ty,
-                    chip_w,
-                    hint,
-                );
             }
-            self.chrome.origins.set((0.0, chip_origin));
         }
 
         // The status bar, at the bottom: what the title says, where a user looks. Cut from the
@@ -1167,6 +1179,7 @@ impl Document {
             tee: None,
             show_footer: true,
             show_filters: false,
+            filter_selected: None,
             pane_top: 0.0,
             pump: None,
             stream_done: false,
@@ -1228,6 +1241,7 @@ impl Document {
             tee: None,
             show_footer: true,
             show_filters: false,
+            filter_selected: None,
             pane_top: 0.0,
             pump: Some(pump),
             stream_done: false,
@@ -2093,33 +2107,36 @@ impl Document {
         }
     }
 
-    /// Takes chip `i` out of the row and into the new-chip field for editing, its polarity kept,
-    /// with the field focused — `UI-DESIGN.md` §5's "editable as text". The pass restarts without
-    /// it; `Enter` in the field puts the edited chip back.
-    fn edit_chip(&mut self, i: usize) {
+    /// Drops every chip and the survivors with them: the unfiltered view.
+    /// Removes chip `i` and keeps the panel's selection honest: the removed row deselects, and a
+    /// selection past it slides up — every removal path comes through here, because the one that
+    /// did not is the one whose Remove button then acted on the wrong chip.
+    fn remove_chip(&mut self, i: usize) {
         if i >= self.filtering.chips.chips.len() {
             return;
         }
         self.remember();
-        let chip = self.filtering.chips.chips.remove(i);
-        self.chrome.chip.set_text(&chip.source);
-        self.chrome.chip.select_all();
-        self.chrome.chip_polarity = chip.polarity;
-        self.chrome.focus = Focus::NewChip;
-        self.filtering.error = None;
+        self.filtering.chips.chips.remove(i);
+        self.filter_selected = match self.filter_selected {
+            Some(s) if s == i => None,
+            Some(s) if s > i => Some(s - 1),
+            keep => keep,
+        };
         self.filtering.clear_results();
         self.refilter();
-        let rows = self.view_rows();
-        self.view.grid_mut().set_total_rows(rows);
+        {
+            let rows = self.view_rows();
+            self.view.grid_mut().set_total_rows(rows);
+        }
     }
 
-    /// Drops every chip and the survivors with them: the unfiltered view.
     fn clear_filter(&mut self) {
         if !self.filtering.filtered() {
             return;
         }
         self.remember();
         self.filtering.chips.chips.clear();
+        self.filter_selected = None;
         self.filtering.error = None;
         self.filtering.clear_results();
         {
@@ -3513,9 +3530,6 @@ impl Filtering {
 /// otherwise. What the bar shows is laid out in **cells** of the row grid — same shaper, same
 /// cell model — so its text lines up with the columns beneath and a click resolves to a cell.
 struct Chrome {
-    chip: TextField,
-    /// The polarity the next chip will have — `Ctrl+L` include, `Ctrl+Shift+L` exclude.
-    chip_polarity: Polarity,
     focus: Focus,
     /// A high surrogate waiting for its low half, for `WM_CHAR` into whichever field has focus.
     pending_high: Option<u16>,
@@ -3872,6 +3886,10 @@ struct ViewState {
     row: u64,
 }
 
+/// A self-posted kick for `run_pending_dialogs` — a UIA invoke queues a dialog with no input
+/// message following to drain it, so it posts this instead. `WM_APP`, per the convention.
+const WM_DRAIN_DIALOGS: u32 = WM_APP + 8;
+
 /// The most states kept in either direction.
 const HISTORY_DEPTH: usize = 64;
 
@@ -4088,14 +4106,20 @@ enum BarDrag {
 /// What a click on the bar landed on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Hit {
-    NewChip,
-    /// A chip's body: toggles it.
+    /// A chip's checkbox: toggles it.
     Chip(usize),
     /// A chip's `×`: removes it.
     ChipClose(usize),
     /// A chip's `+`/`−` sign in the filter panel: flips its polarity — §5's most common edit,
     /// which the bar's chips never offered.
     FilterPolarity(usize),
+    /// A chip row's text: selects the row, for Edit… and Remove to act on.
+    FilterSelect(usize),
+    /// The panel's title-row buttons.
+    FilterAdd,
+    FilterEdit,
+    FilterRemove,
+    FilterClear,
     Tab(usize),
 }
 
@@ -4243,8 +4267,6 @@ const CHIP_CELLS: usize = 24;
 impl Default for Chrome {
     fn default() -> Self {
         Self {
-            chip: TextField::default(),
-            chip_polarity: Polarity::Include,
             focus: Focus::Grid,
             pending_high: None,
             hits: std::cell::RefCell::new(Vec::new()),
@@ -4261,7 +4283,6 @@ impl Chrome {
     /// The field that has the keyboard, if one does.
     fn focused(&mut self) -> Option<&mut TextField> {
         match self.focus {
-            Focus::NewChip => Some(&mut self.chip),
             Focus::Grid => None,
         }
     }
@@ -4799,6 +4820,8 @@ struct Shell {
     /// `Ctrl+L` / `Ctrl+Shift+L` ask for the Filter dialog with this polarity preset, deferred
     /// the same way.
     pending_filter: Option<Polarity>,
+    /// The panel's Edit… asks for the Filter dialog seeded with this chip, deferred the same way.
+    pending_filter_edit: Option<usize>,
     /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
     /// through `IsDialogMessageW` and a second `Ctrl+F` focuses it instead of stacking another.
     find_dialog: HWND,
@@ -5608,31 +5631,7 @@ impl Shell {
             });
             true
         } else {
-            match doc.chrome.focus {
-                Focus::Grid => false,
-                focus => {
-                    let Some(field) = doc.chrome.focused() else {
-                        return false;
-                    };
-                    if field_edit(field, key, ctrl, shift) {
-                        return self.after_chrome_key(hwnd);
-                    }
-                    match key {
-                        k if k == VK_ESCAPE.0 => doc.chrome.focus = Focus::Grid,
-                        k if k == VK_RETURN.0 => match focus {
-                            Focus::NewChip => {
-                                let text = doc.chrome.chip.text().to_owned();
-                                let polarity = doc.chrome.chip_polarity;
-                                doc.add_chip(&text, polarity);
-                                doc.chrome.chip.set_text("");
-                            }
-                            Focus::Grid => {}
-                        },
-                        _ => return false,
-                    }
-                    true
-                }
-            }
+            false
         };
         if !handled {
             return false;
@@ -6860,9 +6859,6 @@ impl Shell {
             }
             Command::ToggleFilters => {
                 doc.show_filters = !doc.show_filters;
-                if !doc.show_filters && doc.chrome.focus == Focus::NewChip {
-                    doc.chrome.focus = Focus::Grid;
-                }
             }
             Command::ClearFilter => doc.clear_filter(),
             Command::ResetColumns => {
@@ -6888,7 +6884,7 @@ impl Shell {
             Command::EditLastChip => {
                 let last = doc.filtering.chips.chips.len().checked_sub(1);
                 if let Some(i) = last {
-                    doc.edit_chip(i);
+                    self.pending_filter_edit = Some(i);
                 }
             }
             Command::ToggleCollapse => {
@@ -7185,7 +7181,7 @@ impl Shell {
 
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
     /// chip is removed. Returns whether the click was the bar's.
-    fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, extend: bool) -> bool {
+    fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, _extend: bool) -> bool {
         // §6.2's box is modal: a click on the ruler picks a field, and a click anywhere else is
         // swallowed rather than dragging a selection through log text the box is covering.
         if self.wizard.is_some() {
@@ -7275,8 +7271,6 @@ impl Shell {
                 .find(|(range, hit)| range.contains(&x) && matches!(hit, Hit::Tab(_)) == in_strip)
                 .map(|(_, hit)| *hit)
         });
-        let (_, chip_origin) = doc.chrome.origins.get();
-        let cell_w = self.cell_w.max(1.0);
         if let Some(Hit::Tab(i)) = hit {
             self.dragging_bar = Some((BarDrag::Tab, i));
             unsafe { SetCapture(hwnd) };
@@ -7294,7 +7288,7 @@ impl Shell {
         match hit {
             Some(Hit::Tab(_)) => {}
             Some(Hit::Chip(i)) if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
-                doc.edit_chip(i);
+                self.pending_filter_edit = Some(i);
             }
             Some(Hit::Chip(i)) => {
                 if i < doc.filtering.chips.chips.len() {
@@ -7312,16 +7306,7 @@ impl Shell {
                 }
             }
             Some(Hit::ChipClose(i)) => {
-                if i < doc.filtering.chips.chips.len() {
-                    doc.remember();
-                    doc.filtering.chips.chips.remove(i);
-                    doc.filtering.clear_results();
-                    doc.refilter();
-                    {
-                        let rows = doc.view_rows();
-                        doc.view.grid_mut().set_total_rows(rows);
-                    }
-                }
+                doc.remove_chip(i);
             }
             Some(Hit::FilterPolarity(i)) => {
                 if i < doc.filtering.chips.chips.len() {
@@ -7339,18 +7324,27 @@ impl Shell {
                     }
                 }
             }
-            Some(Hit::NewChip) => {
-                let origin = chip_origin;
-                doc.chrome.focus = Focus::NewChip;
-                let width = CHIP_CELLS;
-                let cells = *doc.view.cells();
-                if let Some(field) = doc.chrome.focused() {
-                    let display = field.display();
-                    let (shown, cut) = Chrome::fitted(&cells, &display, width);
-                    let cell = ((x - origin) / cell_w).max(0.0).round() as usize;
-                    let byte = cells.byte_at_cell(shown, cell) + cut;
-                    field.place(byte, extend);
+            Some(Hit::FilterSelect(i)) => {
+                doc.filter_selected = (i < doc.filtering.chips.chips.len()).then_some(i);
+            }
+            Some(Hit::FilterAdd) => {
+                self.pending_filter = Some(Polarity::Include);
+            }
+            Some(Hit::FilterEdit) => {
+                if let Some(i) = doc.filter_selected {
+                    if i < doc.filtering.chips.chips.len() {
+                        self.pending_filter_edit = Some(i);
+                    }
                 }
+            }
+            Some(Hit::FilterRemove) => {
+                if let Some(i) = doc.filter_selected {
+                    doc.remove_chip(i);
+                }
+            }
+            Some(Hit::FilterClear) => {
+                doc.filter_selected = None;
+                doc.clear_filter();
             }
             None => doc.chrome.focus = Focus::Grid,
         }
@@ -7715,15 +7709,15 @@ mod uia {
         fn control_type(&self) -> i32 {
             match self.kind {
                 Kind::Root => UIA_PaneControlTypeId.0,
-                Kind::Palette | Kind::NewChip => UIA_EditControlTypeId.0,
-                Kind::Chip(_) => UIA_ButtonControlTypeId.0,
+                Kind::Palette => UIA_EditControlTypeId.0,
+                Kind::NewChip | Kind::Chip(_) => UIA_ButtonControlTypeId.0,
                 Kind::Tab(_) => UIA_TabItemControlTypeId.0,
                 Kind::Status => UIA_StatusBarControlTypeId.0,
             }
         }
 
         fn is_focusable(&self) -> bool {
-            matches!(self.kind, Kind::Palette | Kind::NewChip)
+            matches!(self.kind, Kind::Palette)
         }
 
         fn has_focus(&self) -> bool {
@@ -7731,7 +7725,6 @@ mod uia {
                 let doc = s.document.as_ref()?;
                 Some(match self.kind {
                     Kind::Palette => doc.palette.is_open(),
-                    Kind::NewChip => !doc.palette.is_open() && doc.chrome.focus == Focus::NewChip,
                     _ => false,
                 })
             })
@@ -7782,7 +7775,8 @@ mod uia {
                         (r.start, 0.0, r.end - r.start, strip)
                     }
                     Kind::NewChip => {
-                        let (xr, yr) = panel_rect(&|hit| *hit == Hit::NewChip)?;
+                        // The Add… button is the panel's way in now the inline field is gone.
+                        let (xr, yr) = panel_rect(&|hit| *hit == Hit::FilterAdd)?;
                         (xr.start, yr.start, xr.end - xr.start, yr.end - yr.start)
                     }
                     Kind::Chip(i) => {
@@ -7862,7 +7856,8 @@ mod uia {
 
         fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
             let supported = match self.kind {
-                Kind::Palette | Kind::NewChip | Kind::Status => pattern == UIA_ValuePatternId,
+                Kind::Palette | Kind::Status => pattern == UIA_ValuePatternId,
+                Kind::NewChip => pattern == UIA_InvokePatternId,
                 Kind::Chip(_) => pattern == UIA_InvokePatternId || pattern == UIA_TogglePatternId,
                 Kind::Tab(_) => pattern == UIA_SelectionItemPatternId,
                 Kind::Root => false,
@@ -7896,7 +7891,7 @@ mod uia {
                 p if p == UIA_IsControlElementPropertyId => VARIANT::from(true),
                 p if p == UIA_IsContentElementPropertyId => VARIANT::from(self.kind != Kind::Root),
                 p if p == UIA_ValueValuePropertyId => match self.kind {
-                    Kind::Status | Kind::Palette | Kind::NewChip => {
+                    Kind::Status | Kind::Palette => {
                         VARIANT::from(self.Value()?.to_string().as_str())
                     }
                     _ => VARIANT::default(),
@@ -7977,10 +7972,6 @@ mod uia {
             with_shell_mut(|s| {
                 let doc = s.document.as_mut()?;
                 match kind {
-                    Kind::NewChip => {
-                        doc.show_filters = true;
-                        doc.chrome.focus = Focus::NewChip;
-                    }
                     Kind::Palette => doc.palette.open(),
                     _ => return None,
                 }
@@ -8030,7 +8021,6 @@ mod uia {
                     Some(Kind::Palette)
                 } else {
                     match doc.chrome.focus {
-                        Focus::NewChip => Some(Kind::NewChip),
                         Focus::Grid => None,
                     }
                 })
@@ -8051,12 +8041,6 @@ mod uia {
             let applied = with_shell_mut(|s| {
                 let doc = s.document.as_mut()?;
                 match kind {
-                    Kind::NewChip => {
-                        doc.chrome.chip.set_text(&text);
-                        let polarity = doc.chrome.chip_polarity;
-                        doc.add_chip(&text, polarity);
-                        doc.chrome.chip.set_text("");
-                    }
                     Kind::Palette => {
                         doc.palette.field.set_text(&text);
                         doc.palette.refresh();
@@ -8076,7 +8060,6 @@ mod uia {
             let text = with_shell(|s| {
                 let doc = s.document.as_ref()?;
                 Some(match kind {
-                    Kind::NewChip => doc.chrome.chip.text().to_owned(),
                     Kind::Palette => doc.palette.field.text().to_owned(),
                     Kind::Status => doc.status.clone(),
                     _ => String::new(),
@@ -8094,26 +8077,36 @@ mod uia {
     impl IInvokeProvider_Impl for Element_Impl {
         /// A chip's Invoke is its `×`: the chip goes.
         fn Invoke(&self) -> Result<()> {
-            let Kind::Chip(i) = self.kind else {
-                return Err(Error::from_hresult(E_FAIL));
-            };
             let hwnd = self.hwnd;
-            with_shell_mut(|s| {
-                let doc = s.document.as_mut()?;
-                if i < doc.filtering.chips.chips.len() {
-                    doc.remember();
-                    doc.filtering.chips.chips.remove(i);
-                    doc.filtering.clear_results();
-                    doc.refilter();
-                    let rows = doc.view_rows();
-                    doc.view.grid_mut().set_total_rows(rows);
+            match self.kind {
+                Kind::Chip(i) => {
+                    with_shell_mut(|s| {
+                        let doc = s.document.as_mut()?;
+                        doc.remove_chip(i);
+                        s.sync_scrollbar(hwnd);
+                        s.retitle(hwnd);
+                        Some(())
+                    });
+                    self.repaint();
+                    Ok(())
                 }
-                s.sync_scrollbar(hwnd);
-                s.retitle(hwnd);
-                Some(())
-            });
-            self.repaint();
-            Ok(())
+                Kind::NewChip => {
+                    // The Add… button: queue the Filter dialog and kick the drain, because no
+                    // input message follows a UIA invoke on its own.
+                    with_shell_mut(|s| {
+                        if let Some(doc) = s.document.as_mut() {
+                            doc.show_filters = true;
+                        }
+                        s.pending_filter = Some(Polarity::Include);
+                        Some(())
+                    });
+                    unsafe {
+                        let _ = PostMessageW(hwnd, WM_DRAIN_DIALOGS, WPARAM(0), LPARAM(0));
+                    }
+                    Ok(())
+                }
+                _ => Err(Error::from_hresult(E_FAIL)),
+            }
         }
     }
 
@@ -8593,27 +8586,9 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
     });
     if let Some(polarity) = filter {
         let columns = STATE.with(|s| {
-            s.borrow().as_ref().and_then(|shell| {
-                shell.document.as_ref().map(|doc| {
-                    // The standard fields §7.2 always resolves, then the live format's own
-                    // columns — the dialog's scope combo is the format speaking.
-                    let mut columns: Vec<String> =
-                        ["level", "timestamp", "body", "source", "trace", "span"]
-                            .iter()
-                            .map(|s| (*s).to_owned())
-                            .collect();
-                    for column in doc.header_columns() {
-                        let title = column.title;
-                        if !title.is_empty()
-                            && !title.contains(' ')
-                            && !columns.iter().any(|c| c.eq_ignore_ascii_case(&title))
-                        {
-                            columns.push(title);
-                        }
-                    }
-                    columns
-                })
-            })
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.document.as_ref().map(filter_columns))
         });
         if let Some(columns) = columns {
             let mut edit = dialog::FilterEdit {
@@ -8637,6 +8612,76 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                             doc.add_chip(&edit.expression, polarity);
                             let rows = doc.view_rows();
                             doc.view.grid_mut().set_total_rows(rows);
+                        }
+                        shell.sync_scrollbar(hwnd);
+                        shell.retitle(hwnd);
+                        unsafe {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                });
+                IN_WNDPROC.with(|flag| flag.set(was));
+            }
+        }
+        return true;
+    }
+    let filter_edit = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|shell| shell.pending_filter_edit.take())
+    });
+    if let Some(at) = filter_edit {
+        let seed = STATE.with(|s| {
+            s.borrow().as_ref().and_then(|shell| {
+                let doc = shell.document.as_ref()?;
+                let chip = doc.filtering.chips.chips.get(at)?;
+                Some((
+                    filter_columns(doc),
+                    chip.source.clone(),
+                    chip.polarity == Polarity::Include,
+                    chip.enabled,
+                ))
+            })
+        });
+        if let Some((columns, expression, include, enabled)) = seed {
+            let original = expression.clone();
+            let mut edit = dialog::FilterEdit {
+                columns,
+                include,
+                expression,
+                manual: true,
+                accepted: false,
+            };
+            if dialog::show_filter_dialog(hwnd, &mut edit) {
+                let polarity = if edit.include {
+                    Polarity::Include
+                } else {
+                    Polarity::Exclude
+                };
+                let was = IN_WNDPROC.with(|flag| flag.replace(true));
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        if let Some(doc) = shell.document.as_mut() {
+                            if let Ok(mut chip) = Chip::parse(&edit.expression, polarity) {
+                                // Identity, not just bounds: the list can move under a modal
+                                // dialog (an automation client removing chips), and replacing
+                                // whatever now sits at the index would edit the wrong filter.
+                                let still_there = doc
+                                    .filtering
+                                    .chips
+                                    .chips
+                                    .get(at)
+                                    .is_some_and(|c| c.source == original);
+                                if still_there {
+                                    doc.remember();
+                                    chip.enabled = enabled;
+                                    doc.filtering.chips.chips[at] = chip;
+                                    doc.filtering.clear_results();
+                                    doc.refilter();
+                                    let rows = doc.view_rows();
+                                    doc.view.grid_mut().set_total_rows(rows);
+                                }
+                            }
                         }
                         shell.sync_scrollbar(hwnd);
                         shell.retitle(hwnd);
@@ -8689,6 +8734,25 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         return true;
     }
     false
+}
+
+/// The Filter dialog's column choices: the standard fields §7.2 always resolves, then the live
+/// format's own columns — the scope combo is the format speaking.
+fn filter_columns(doc: &Document) -> Vec<String> {
+    let mut columns: Vec<String> = ["level", "timestamp", "body", "source", "trace", "span"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for column in doc.header_columns() {
+        let title = column.title;
+        if !title.is_empty()
+            && !title.contains(' ')
+            && !columns.iter().any(|c| c.eq_ignore_ascii_case(&title))
+        {
+            columns.push(title);
+        }
+    }
+    columns
 }
 
 /// The engine form of a Find request: escaped unless the dialog said regular expression, and
@@ -9909,6 +9973,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             run_pending_dialogs(hwnd);
             LRESULT(0)
         }
+        WM_DRAIN_DIALOGS => {
+            run_pending_dialogs(hwnd);
+            LRESULT(0)
+        }
         WM_INITMENUPOPUP => {
             // §2.2 as resettled: the popup about to show is refilled from the live document, so a
             // real menu can never show stale enablement, a stale check, or last week's recents.
@@ -10421,6 +10489,7 @@ fn main() -> Result<()> {
             pending_prefs: false,
             pending_find: false,
             pending_filter: None,
+            pending_filter_edit: None,
             find_dialog: HWND::default(),
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
@@ -11608,41 +11677,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// §5's "editable as text": editing a chip takes it out of the row and into the field with its
-    /// text and polarity, the view is refiltered without it, and `Enter` puts the edit back.
-    #[test]
-    fn a_chip_can_be_taken_into_the_field_and_put_back_edited() {
-        let path = scratch_log("tailhawk_editchip_test.log", 100);
-        let mut doc = Document::open(&path).expect("open");
-        doc.lay_out((8.0, 10.0), (800, 200));
-        filter_for(&mut doc, "record", Polarity::Include);
-        filter_for(&mut doc, "\"line 1\"", Polarity::Exclude);
-        assert_eq!(doc.filtering.chips.chips.len(), 2);
-        let with_two = doc.view_rows();
-
-        doc.edit_chip(1);
-        assert_eq!(doc.filtering.chips.chips.len(), 1, "taken out of the row");
-        assert_eq!(doc.chrome.chip.text(), "\"line 1\"");
-        assert_eq!(doc.chrome.chip_polarity, Polarity::Exclude);
-        assert_eq!(doc.chrome.focus, Focus::NewChip);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
-            doc.poll_filter();
-        }
-        assert!(doc.view_rows() > with_two, "the exclude no longer applies");
-
-        // The edit: exclude `line 2` instead, as `Enter` in the field would.
-        doc.chrome.chip.set_text("\"line 2\"");
-        filter_for(&mut doc, "\"line 2\"", Polarity::Exclude);
-        assert_eq!(doc.filtering.chips.chips[1].source, "\"line 2\"");
-        assert_eq!(doc.filtering.chips.chips[1].polarity, Polarity::Exclude);
-        assert!(
-            doc.history_step(true),
-            "the edit is a view change: back restores both chips"
-        );
-        std::fs::remove_file(&path).ok();
-    }
-
     /// §2.1's resizable columns: a boundary sits after each shown column; a press on one and a
     /// drag sets that column's width from the mouse; zero hides it and the boundaries close up;
     /// reset brings the measured widths back; the header follows every change.
@@ -12617,17 +12651,7 @@ mod tests {
                     }
                     doc.poll_find();
                 }
-                "focus" => {
-                    doc.chrome.focus = match arg {
-                        "chip" => Focus::NewChip,
-                        _ => Focus::Grid,
-                    }
-                }
-                "type" => {
-                    if let Some(f) = doc.chrome.focused() {
-                        f.insert(arg);
-                    }
-                }
+                "focus" | "type" => {}
                 "tabs" => {
                     let names: Vec<String> = arg.split(',').map(str::to_owned).collect();
                     let active = names.len().saturating_sub(1);

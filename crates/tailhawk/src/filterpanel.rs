@@ -42,13 +42,22 @@ pub fn rows_of(chips: &[Chip]) -> Vec<PanelRow> {
 pub const RULE_PX: f32 = 1.0;
 const PAD_PX: f32 = 4.0;
 
-/// The band's height: a row per chip, the add row, the top rule — and nothing when hidden,
-/// which is what lets the reserver ask unconditionally.
+/// The title row's height: tall enough for the buttons it carries, which are a control's height
+/// (label plus the standard paddings), not a text row's — the first draft centred taller buttons
+/// in a shorter row and they overdrew the rule above.
+pub fn title_height(row_h: f32) -> f32 {
+    let m = crate::controls::metrics(row_h);
+    (row_h + m.button_pad_y * 2.0 + 2.0).max(row_h)
+}
+
+/// The band's height: the title row carrying the buttons, a row per chip, the top rule — and
+/// nothing when hidden, which is what lets the reserver ask unconditionally. The inline add
+/// field is gone; Add… opens the Filter dialog.
 pub fn height(chips: usize, visible: bool, row_h: f32) -> f32 {
     if !visible {
         return 0.0;
     }
-    (chips as f32 + 1.0) * row_h + RULE_PX + PAD_PX
+    title_height(row_h) + chips as f32 * row_h + RULE_PX + PAD_PX
 }
 
 #[cfg(test)]
@@ -78,12 +87,22 @@ mod tests {
     }
 
     /// The reserver and the drawer ask the same function, so the one thing worth pinning is the
-    /// shape: hidden is exactly zero, and every chip adds exactly one row to the add row.
+    /// shape: hidden is exactly zero, every chip adds exactly one row to the title row, and the
+    /// title row holds a whole button.
     #[test]
     fn the_band_is_zero_hidden_and_one_row_per_chip_shown() {
         assert_eq!(height(5, false, 20.0), 0.0);
         let empty = height(0, true, 20.0);
-        assert_eq!(empty, 20.0 + RULE_PX + 4.0, "the add row alone");
+        assert_eq!(
+            empty,
+            title_height(20.0) + RULE_PX + 4.0,
+            "the title row alone"
+        );
         assert_eq!(height(3, true, 20.0) - empty, 60.0);
+        let m = crate::controls::metrics(20.0);
+        assert!(
+            title_height(20.0) >= 20.0 + m.button_pad_y * 2.0,
+            "a button fits inside the title row"
+        );
     }
 }
