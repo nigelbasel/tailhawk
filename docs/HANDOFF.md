@@ -69,6 +69,36 @@ and `verify-uia.ps1` both pass live. **Not yet done:** panel visibility is not p
 (§12.4 says remembered — a `[window]`-adjacent key), and the status bar has no
 `n filters · k of m` chip yet; both fold into the status-chips step below.
 
+
+### ▶ IN FLIGHT — the real Win32 menu bar (owner's decision, 2026-08-25)
+
+The owner, after repeated drawn-chrome defects: menus must be the real thing. Chosen over
+rebuilt drawing when offered both. The conversion, exactly:
+
+- `menubar.rs` has `build_bar` (Item tree → `HMENU`, `\t` accelerators, `MF_GRAYED`/`MF_CHECKED`,
+  recursive popups) and `refill_popup` (WM_INITMENUPOPUP-time content refresh) — **done**.
+- `main()`: after `CreateWindowExW`, `SetMenu(hwnd, build_bar(&menu_bar(None, dark, &recent)))`.
+- `wndproc`: `WM_INITMENUPOPUP` — match the popup against `GetSubMenu(GetMenu(hwnd), i)`, build a
+  fresh tree from the live doc, `refill_popup`. `WM_COMMAND` (menu source) — `menu_choose(hwnd,
+  LOWORD(wparam))` then `run_pending_dialogs`, `InvalidateRect`.
+- Format: `Document::format_rows()` (labels + in-force from `format_menu_of`/`detection.accepted`,
+  `&` doubled), a radio-marked "&Log format" submenu under Format via `ID_FORMAT_BASE = 10_200`;
+  `menu_choose` resolves the index through `format_menu_of` and calls `run_format_action`.
+  `Command::FormatMenu` (enum/LISTED/run arm/match-list/menu entry) is deleted with the bespoke
+  dropdown (`draw_format_menu`, `format_menu`, `format_menu_key`, `format_hits`, `Hit::FormatChip`).
+- DELETE the drawn bar: `Shell::menu`, per-frame `menu.rebuild`, `menu_frame`/`menu_hits` on
+  Document and Welcome, `menubar::draw_bar`/`draw_open_list`/`hit_at`/`dump_hits`/`MenuFrame`/
+  `menu_frame_of`/`chosen_by_click`/`MenuHit` and their tests (content tests stay: register
+  round-trip, ids-in-register walk, mnemonic uniqueness, recents, format rows); the
+  `WM_SYSKEYDOWN` mnemonic block, `WM_KEYDOWN` `menu_key` block and Alt tracking (Windows owns
+  them); `TAILHAWK_DUMP_MENU_HITS` and the geometry halves of `verify-menus/dialogs/recent.ps1`
+  (drive natively: SendKeys `%f` etc.; native menus are UIA-visible).
+- DELETE the bar row with it: `►` prompt, find field, `Focus::Find` (enum shrinks to
+  Grid/NewChip), `Hit::Find`, UIA `Kind::Find`, `find_from_seed`'s field fallback, the
+  `TAILHAWK_SHOT_KEYS` "find" route; `chrome_px` becomes the tab strip alone (`Welcome`: zero —
+  its `draw_chrome`/`menu_hit_at` go entirely).
+- The status bar stays drawn (with the coming filter/match chips) — in-window surfaces use the
+  planned shared standard-controls module, the owner's second directive.
 ### Still owed on the conversion, in order
 
 - **Format ▸ Log format submenu** with radio-marked candidates, replacing the right-edge chip
