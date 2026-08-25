@@ -47,6 +47,13 @@ const ID_F_REGEX: u16 = 125;
 const ID_F_CASE: u16 = 126;
 const ID_F_EXPR: u16 = 127;
 const ID_F_STATUS: u16 = 128;
+/// The Filter dialog's grid, in dialog units. The label column is sized for the **longest** label
+/// — `Expression:` — so that every field can start in one place; sizing it for the shortest is
+/// what put the Expression box six units right of the Value box above it.
+const F_LABEL_X: i16 = 7;
+const F_LABEL_W: i16 = 40;
+const F_FIELD_X: i16 = 50;
+const F_RIGHT: i16 = 292;
 const ID_FIND_WHAT: u16 = 110;
 const ID_MATCH_CASE: u16 = 111;
 const ID_REGEX: u16 = 112;
@@ -1057,18 +1064,19 @@ unsafe extern "system" fn filter_proc(
     }
 }
 
-/// The Add / Edit Filter dialog — the powerful surface over §7.2: include/exclude, a column
-/// scope with operators, regex and case for whole-record matches, and the expression itself
-/// always visible and editable, validated live by the same parser that will run it.
-pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
+/// The Add / Edit Filter dialog's controls and where they sit, in dialog units — pure, so the
+/// one thing a template can get wrong and a test can see is testable.
+///
+/// **Every labelled field starts at [`F_FIELD_X`] and every full-width one ends at
+/// [`F_RIGHT`].** A dialog is read down its left edge, and a control that steps sideways from the
+/// one above it reads as a mistake even when nothing is wrong with it — which is precisely what
+/// the Expression box did, sitting six units right of the Value box above it because its label is
+/// the longest. The label column is sized for the longest label instead, and the fields keep one
+/// line.
+fn filter_dialog_items() -> Vec<Item> {
     const BS_AUTORADIOBUTTON: u32 = 0x0009;
     const WS_GROUP: u32 = 0x0002_0000;
-    let title = if data.expression.is_empty() {
-        "Add Filter"
-    } else {
-        "Edit Filter"
-    };
-    let items = [
+    vec![
         Item::new(
             Class::Button,
             "&Include rows that match",
@@ -1083,15 +1091,21 @@ pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
             (117, 7, 100, 10),
             BS_AUTORADIOBUTTON,
         ),
-        Item::new(Class::Static, "&Column:", 0xFFFF, (7, 27, 34, 8), 0),
+        Item::new(
+            Class::Static,
+            "&Column:",
+            0xFFFF,
+            (F_LABEL_X, 27, F_LABEL_W, 8),
+            0,
+        ),
         Item::new(
             Class::ComboBox,
             "",
             ID_F_SCOPE,
-            (44, 25, 104, 90),
+            (F_FIELD_X, 25, 98, 90),
             CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
         ),
-        Item::new(Class::Static, "&Match:", 0xFFFF, (156, 27, 28, 8), 0),
+        Item::new(Class::Static, "&Match:", 0xFFFF, (156, 27, 30, 8), 0),
         Item::new(
             Class::ComboBox,
             "",
@@ -1099,37 +1113,55 @@ pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
             (188, 25, 104, 90),
             CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
         ),
-        Item::new(Class::Static, "&Value:", 0xFFFF, (7, 45, 34, 8), 0),
+        Item::new(
+            Class::Static,
+            "&Value:",
+            0xFFFF,
+            (F_LABEL_X, 45, F_LABEL_W, 8),
+            0,
+        ),
         Item::new(
             Class::Edit,
             "",
             ID_F_VALUE,
-            (44, 43, 248, 12),
+            (F_FIELD_X, 43, F_RIGHT - F_FIELD_X, 12),
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
         ),
         Item::new(
             Class::Button,
             "&Regular expression",
             ID_F_REGEX,
-            (44, 61, 90, 10),
+            (F_FIELD_X, 61, 90, 10),
             WS_TABSTOP | BS_AUTOCHECKBOX,
         ),
         Item::new(
             Class::Button,
             "Match c&ase",
             ID_F_CASE,
-            (140, 61, 70, 10),
+            (146, 61, 70, 10),
             WS_TABSTOP | BS_AUTOCHECKBOX,
         ),
-        Item::new(Class::Static, "&Expression:", 0xFFFF, (7, 79, 40, 8), 0),
+        Item::new(
+            Class::Static,
+            "&Expression:",
+            0xFFFF,
+            (F_LABEL_X, 79, F_LABEL_W, 8),
+            0,
+        ),
         Item::new(
             Class::Edit,
             "",
             ID_F_EXPR,
-            (50, 77, 242, 12),
+            (F_FIELD_X, 77, F_RIGHT - F_FIELD_X, 12),
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
         ),
-        Item::new(Class::Static, "", ID_F_STATUS, (7, 95, 285, 18), 0),
+        Item::new(
+            Class::Static,
+            "",
+            ID_F_STATUS,
+            (F_LABEL_X, 95, F_RIGHT - F_LABEL_X, 18),
+            0,
+        ),
         Item::new(
             Class::Button,
             "OK",
@@ -1144,8 +1176,19 @@ pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
             (242, 117, 50, 14),
             WS_TABSTOP,
         ),
-    ];
-    let t = template(title, 299, 138, &items);
+    ]
+}
+
+/// The Add / Edit Filter dialog — the powerful surface over §7.2: include/exclude, a column
+/// scope with operators, regex and case for whole-record matches, and the expression itself
+/// always visible and editable, validated live by the same parser that will run it.
+pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
+    let title = if data.expression.is_empty() {
+        "Add Filter"
+    } else {
+        "Edit Filter"
+    };
+    let t = template(title, 299, 138, &filter_dialog_items());
     unsafe {
         DialogBoxIndirectParamW(
             None,
@@ -1168,6 +1211,32 @@ mod tests {
             Item::new(Class::Static, "&Theme:", 0xFFFF, (7, 9, 44, 8), 0),
             Item::new(Class::Button, "OK", IDOK, (105, 65, 50, 14), 1),
         ]
+    }
+
+    /// The Filter dialog reads down one left edge. Every labelled field starts in the same column
+    /// and every full-width one ends at the same right edge — the owner saw the Expression box
+    /// step sideways from the Value box above it, which is what a shared column is for.
+    #[test]
+    fn the_filter_dialogs_fields_share_one_column_and_one_right_edge() {
+        let items = filter_dialog_items();
+        let at = |id: u16| items.iter().find(|i| i.id == id).expect("control present");
+        for id in [ID_F_SCOPE, ID_F_VALUE, ID_F_REGEX, ID_F_EXPR] {
+            assert_eq!(
+                at(id).x,
+                F_FIELD_X,
+                "control {id} starts outside the field column"
+            );
+        }
+        for id in [ID_F_VALUE, ID_F_EXPR, ID_F_OP, ID_F_STATUS] {
+            let it = at(id);
+            assert_eq!(it.x + it.w, F_RIGHT, "control {id} ends off the right edge");
+        }
+        for id in [ID_F_SCOPE, ID_F_VALUE, ID_F_EXPR] {
+            assert!(
+                at(id).x >= F_LABEL_X + F_LABEL_W,
+                "control {id} overlaps its label"
+            );
+        }
     }
 
     /// The header carries the item count where Windows reads it, and the title where the caption

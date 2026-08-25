@@ -16,6 +16,7 @@
 
 mod about;
 mod controls;
+mod darkmode;
 mod dialog;
 mod filterpanel;
 mod icon;
@@ -111,17 +112,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     NONCLIENTMETRICSW, SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
     SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
     SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
-    SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP,
-    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
-    WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POINTERCAPTURECHANGED,
-    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
+    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL,
+    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
+    DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PT_PEN, PT_TOUCH, SM_REMOTESESSION,
@@ -9475,12 +9477,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 /// arm of [`handle`] takes its borrow inside its own `STATE::with` and has dropped it before
 /// reaching here. A message pumped out of a modal loop is an ordinary top-level message, not a
 /// nested handler, and handling it is the whole point.
-/// Dresses the **non-client** frame to match the theme: a dark title bar when the theme is dark,
-/// and §2.1's Mica backdrop behind it.
+/// Dresses everything **Windows** draws for this window to match the theme: the menus, then the
+/// title bar, then §2.1's Mica backdrop behind it.
 ///
 /// **The title bar is DWM's, not ours.** Everything else in this window is drawn by the app, which
 /// is why a dark theme could ship with a white title bar and nobody notice in code review — the
 /// mismatch only exists on screen. `DWMWA_USE_IMMERSIVE_DARK_MODE` is the whole fix.
+///
+/// **Since §2.2's resettlement the menus are Windows' too**, and they take two further levers.
+/// The mode itself is [`darkmode`]'s. The menu **bar's** own strip needs more than that: its theme
+/// is opened when the frame is built and cached there, so a mode change reaches the popups — themed
+/// as they open — and leaves the row of headings in the colours it was born with. Only a frame
+/// recalculation makes Windows open the theme again; `DrawMenuBar` alone redraws the old one
+/// faithfully, which is precisely the white bar under a dark theme the owner reported.
+///
+/// **The order of the three is not arbitrary, and cost two regressions to learn.** Both
+/// `AllowDarkModeForWindow` and the frame recalculation hand the window back to the *system's*
+/// immersive policy, which on a dark-themed desktop paints a dark caption over a light-themed app.
+/// The explicit DWM attribute must therefore be applied **last**. That is why this one function
+/// owns all three, and why nothing else calls any of them.
 ///
 /// Mica is scoped by `SPEC.md` §2.1 to "title bar, tab strip and side panels **only**": the grid
 /// renders to an opaque target and stays opaque, both for text antialiasing and because
@@ -9496,6 +9511,22 @@ fn dress_frame(hwnd: HWND, dark: bool) {
         DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
     };
+    darkmode::set_app_mode(dark);
+    darkmode::allow_for_window(hwnd, dark);
+    // SAFETY: a resize to nothing, moving nothing and reordering nothing — the flags say so — whose
+    // only effect is the frame recalculation.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let _ = DrawMenuBar(hwnd);
+    }
     let on = windows::Win32::Foundation::BOOL::from(dark);
     let backdrop = DWMSBT_MAINWINDOW;
     // SAFETY: both calls take a pointer to a value we own, sized by the length we pass, and DWM
@@ -10799,6 +10830,7 @@ fn main() -> Result<()> {
         )?
     };
     // §2.1: the frame follows the theme — a dark title bar under a dark theme, and Mica behind it.
+    // Called before `SetMenu` below, so the bar Windows builds is born in the right mode.
     dress_frame(hwnd, theme().dark);
 
     // §2.2 as resettled: the menu bar is Windows' own. Content is built once here; every popup is
