@@ -7,6 +7,18 @@ native modeless `#32770` (Find what, Match case, Regular expression, Find Next /
 Cancel), pumped through `IsDialogMessageW`, verified by the rewritten `tools/verify-find.ps1` and
 photographed for the owner. The command bar's old find field still draws; it leaves with the bar.
 
+**⚠ Before anything else: a parallel session left a live bug and its WIP in the tree.** Its
+`logs/agent.log` entry (2026-08-25T06:06:58) reports that **one `Ctrl+F` creates TWO Find
+dialogs** — `EnumWindows` counted two; Esc closes one and reveals the other, which is why Esc
+"stopped working" in its `verify-find.ps1` run (this session's own run passed, so the repro may
+depend on the input path). Its uncommitted changes in `main.rs`/`dialog.rs` are worth keeping:
+a `Finder::label` (typed form for the title, so an escaped query does not show as `a\.b`),
+`find_from_seed` (`F3` after `Esc` re-runs the dialog's last request), an empty-query guard, an
+`IN_WNDPROC` re-entry guard around `find_requested` (it hit a borrow panic from a synchronous
+message send — real), and `dialog::focus_find` for a second `Ctrl+F`. It also left three
+`th-find-debug.txt` debug writes that must come out before any commit. **Triage the
+double-dialog bug first, keep the good parts, strip the instrumentation.**
+
 ### The owner's decisions this stretch, in order — all recorded in `UI-DESIGN.md` §2.1 and `CLEANROOM.md`
 
 1. **The command bar goes entirely** ("Option C" of three mockups in
