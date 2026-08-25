@@ -58,16 +58,32 @@ options leaking into bar/UIA searches, a fused doc comment. The recipe as execut
   round-trip test. `find_requested` records each non-empty query.
 - Then re-run `tools/verify-find.ps1`, and extend it to tick Whole word once.
 
-### After that, still owed on the conversion
+### ✅ The docked filter panel — landed 2026-08-25 (`aea126c`, CI green)
 
-- **The docked filter panel** (replaces chips + the `Ctrl+L` field; View ▸ Filters; remembered
-  per §12.4; status-bar `n filters · k of m rows` chip that shows it).
-- **Format ▸ Log format submenu** with radio-marked candidates (replaces the right-edge chip
-  and `draw_format_menu`).
-- **Remove the command bar band** once all three replacements stand: `draw_chrome`'s prompt,
-  find field, chips, new-chip field, format chip; `Focus::Find`/`NewChip`; `Hit::Find`/`Chip*`/
-  `FormatChip`; the UIA provider's field/chip elements (native dialogs carry their own UIA);
-  `chrome_px` shrinks to menu + tabs; `verify-filter.ps1` rewrites against the panel.
+`filterpanel.rs` (pure rows/height, tested) + the band above the status bar in `draw_chrome`,
+targets by x **and** y in `Chrome::panel_hits`, the sign flips polarity (§5's edit, new), the add
+field moved out of the bar, `Ctrl+L`/View ▸ Filter panel/`--filter` all show it. Review caught
+and fixed: restored chips applied invisibly; chip drag-reorder dead against the moved hits (drop
+now resolves by row y); UIA phantom chip elements when hidden. `verify-filter.ps1` (modernised)
+and `verify-uia.ps1` both pass live. **Not yet done:** panel visibility is not persisted
+(§12.4 says remembered — a `[window]`-adjacent key), and the status bar has no
+`n filters · k of m` chip yet; both fold into the status-chips step below.
+
+### Still owed on the conversion, in order
+
+- **Format ▸ Log format submenu** with radio-marked candidates, replacing the right-edge chip
+  and `draw_format_menu`. Shape: a `Document` accessor exposes `format_menu_of(&detection, 0)`
+  rows as `(label, current)`; `menu_bar` builds them under a new `ID_FORMAT_BASE = 10_200`
+  range (the Open Recent pattern — the entries are data, not commands); `menu_choose` resolves
+  the index back through `format_menu_of` and dispatches the row's `FormatAction` through the
+  same code the bespoke menu's Enter uses today. `Command::FormatMenu` (palette) then opens the
+  bar's Format menu (`menu.open_top`) instead of the bespoke dropdown. Then delete
+  `draw_format_menu`, `format_menu`/`format_menu_key`/`format_hits`, `Hit::FormatChip`.
+- **Remove the command bar band**: `draw_chrome`'s `►` prompt and find field (already dead to
+  `Ctrl+F`), `Focus::Find`, `Hit::Find`, the UIA Find element (the native dialog carries its
+  own UIA); `chrome_px` shrinks to menu + tabs. `find_from_seed`'s field fallback goes with it.
+- **Status-bar chips**: `n filters · k of m rows` (click shows the panel), the match position,
+  and persisting the panel visibility.
 - **The menu review's known gap** (task 6): Open Recent's submenu opens in place of the File
   list — `MenuFrame` carries one open list, so a cascade replaces its parent. Standard is a
   flyout beside it. Also check hover-tracking across open headings, F10, Alt+Space.
