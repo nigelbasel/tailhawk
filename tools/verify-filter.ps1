@@ -33,12 +33,38 @@ try {
     $wsh = New-Object -ComObject WScript.Shell
 
     # §2.1 as resettled: Ctrl+L shows the docked filter panel with its add field focused; the
-    # typed text lives in the panel's field now, not echoed in the title — that echo belonged to
-    # the pre-widget stand-in this harness was written against.
+    # Ctrl+L opens the Filter dialog — a native #32770 — with focus in its Value box; typing
+    # composes the expression live and Enter is OK, which adds the filter and runs the pass.
+    Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class FilterDlg {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    public static IntPtr OfProcess(uint owner, string title) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (pid != owner) return true;
+            var c = new StringBuilder(64); GetClassNameW(h, c, 64);
+            var t = new StringBuilder(64); GetWindowTextW(h, t, 64);
+            if (c.ToString() == "#32770" && t.ToString() == title) { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}
+'@
     $wsh.SendKeys('^l')
-    Start-Sleep -Milliseconds 300
-    $wsh.SendKeys('error')
+    $null = Wait-For { [FilterDlg]::OfProcess($proc.Id, 'Add Filter') -ne [IntPtr]::Zero } 'the Filter dialog' 10
+    Write-Host 'the Filter dialog is a native #32770 window'
     Start-Sleep -Milliseconds 200
+    $wsh.SendKeys('error')
+    Start-Sleep -Milliseconds 300
     $wsh.SendKeys('{ENTER}')
     $null = Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match "$expected of $Lines" -and $proc.MainWindowTitle -notmatch 'scanning' } 'the pass to finish with the expected count'
     Start-Sleep -Milliseconds 600

@@ -4796,6 +4796,9 @@ struct Shell {
     pending_prefs: bool,
     /// §2.1 as resettled: `Ctrl+F` asks for the classic Find dialog, deferred the same way.
     pending_find: bool,
+    /// `Ctrl+L` / `Ctrl+Shift+L` ask for the Filter dialog with this polarity preset, deferred
+    /// the same way.
+    pending_filter: Option<Polarity>,
     /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
     /// through `IsDialogMessageW` and a second `Ctrl+F` focuses it instead of stacking another.
     find_dialog: HWND,
@@ -5597,13 +5600,12 @@ impl Shell {
             true
         } else if ctrl && key == VK_L.0 {
             doc.show_filters = true;
-            doc.chrome.focus = Focus::NewChip;
-            doc.chrome.chip_polarity = if shift {
+            doc.filtering.error = None;
+            self.pending_filter = Some(if shift {
                 Polarity::Exclude
             } else {
                 Polarity::Include
-            };
-            doc.filtering.error = None;
+            });
             true
         } else {
             match doc.chrome.focus {
@@ -6849,13 +6851,12 @@ impl Shell {
             Command::ClearSearch => doc.finder.clear(),
             Command::FilterInclude | Command::FilterExclude => {
                 doc.show_filters = true;
-                doc.chrome.focus = Focus::NewChip;
-                doc.chrome.chip_polarity = if command == Command::FilterInclude {
+                doc.filtering.error = None;
+                self.pending_filter = Some(if command == Command::FilterInclude {
                     Polarity::Include
                 } else {
                     Polarity::Exclude
-                };
-                doc.filtering.error = None;
+                });
             }
             Command::ToggleFilters => {
                 doc.show_filters = !doc.show_filters;
@@ -8582,6 +8583,70 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                     shell.find_dialog = hdlg;
                 }
             });
+        }
+        return true;
+    }
+    let filter = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|shell| shell.pending_filter.take())
+    });
+    if let Some(polarity) = filter {
+        let columns = STATE.with(|s| {
+            s.borrow().as_ref().and_then(|shell| {
+                shell.document.as_ref().map(|doc| {
+                    // The standard fields §7.2 always resolves, then the live format's own
+                    // columns — the dialog's scope combo is the format speaking.
+                    let mut columns: Vec<String> =
+                        ["level", "timestamp", "body", "source", "trace", "span"]
+                            .iter()
+                            .map(|s| (*s).to_owned())
+                            .collect();
+                    for column in doc.header_columns() {
+                        let title = column.title;
+                        if !title.is_empty()
+                            && !title.contains(' ')
+                            && !columns.iter().any(|c| c.eq_ignore_ascii_case(&title))
+                        {
+                            columns.push(title);
+                        }
+                    }
+                    columns
+                })
+            })
+        });
+        if let Some(columns) = columns {
+            let mut edit = dialog::FilterEdit {
+                columns,
+                include: polarity == Polarity::Include,
+                expression: String::new(),
+                manual: false,
+                accepted: false,
+            };
+            if dialog::show_filter_dialog(hwnd, &mut edit) {
+                let polarity = if edit.include {
+                    Polarity::Include
+                } else {
+                    Polarity::Exclude
+                };
+                let was = IN_WNDPROC.with(|flag| flag.replace(true));
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        if let Some(doc) = shell.document.as_mut() {
+                            doc.show_filters = true;
+                            doc.add_chip(&edit.expression, polarity);
+                            let rows = doc.view_rows();
+                            doc.view.grid_mut().set_total_rows(rows);
+                        }
+                        shell.sync_scrollbar(hwnd);
+                        shell.retitle(hwnd);
+                        unsafe {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                });
+                IN_WNDPROC.with(|flag| flag.set(was));
+            }
         }
         return true;
     }
@@ -10355,6 +10420,7 @@ fn main() -> Result<()> {
             pending_keymap: false,
             pending_prefs: false,
             pending_find: false,
+            pending_filter: None,
             find_dialog: HWND::default(),
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,

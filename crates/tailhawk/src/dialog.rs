@@ -38,6 +38,15 @@ const ID_THEME: u16 = 100;
 const ID_FACE: u16 = 101;
 const ID_SIZE: u16 = 102;
 const ID_MAP: u16 = 103;
+const ID_F_INCLUDE: u16 = 120;
+const ID_F_EXCLUDE: u16 = 121;
+const ID_F_SCOPE: u16 = 122;
+const ID_F_OP: u16 = 123;
+const ID_F_VALUE: u16 = 124;
+const ID_F_REGEX: u16 = 125;
+const ID_F_CASE: u16 = 126;
+const ID_F_EXPR: u16 = 127;
+const ID_F_STATUS: u16 = 128;
 const ID_FIND_WHAT: u16 = 110;
 const ID_MATCH_CASE: u16 = 111;
 const ID_REGEX: u16 = 112;
@@ -214,6 +223,83 @@ fn wsz(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The operators the Filter dialog offers over a column, in combo order. Each writes §7.2 text;
+/// the first and last two write the function forms, the middle the comparison forms.
+pub const FILTER_OPS: &[&str] = &[
+    "contains",
+    "equals",
+    "does not equal",
+    "less than",
+    "at most",
+    "greater than",
+    "at least",
+    "like",
+    "starts with",
+    "ends with",
+];
+
+/// One structured choice in the Filter dialog, composed into the §7.2 expression the model
+/// actually runs — the dialog is a friendly editor over the grammar, never a second language,
+/// so everything it writes can be hand-edited, saved, or passed as `--filter=`.
+///
+/// `column: None` is "Any column": the whole-record search, where regex and case have meaning.
+/// Scoped to a column, the grammar's own forms carry the case rules (`like` and the functions are
+/// case-insensitive by definition).
+pub fn compose_filter(
+    column: Option<&str>,
+    op: usize,
+    value: &str,
+    regex: bool,
+    match_case: bool,
+) -> String {
+    use tailhawk_core::filter::{Chip, Polarity, Predicate};
+    let value = value.trim();
+    let Some(column) = column else {
+        if regex {
+            return if match_case {
+                format!("/{value}/")
+            } else {
+                format!("/{value}/i")
+            };
+        }
+        if match_case {
+            // The grammar's only case-sensitive form is a regex without the `i` flag.
+            return format!("/{}/", tailhawk_core::search::Pattern::escape(value));
+        }
+        // Plain text — verbatim when the parser reads it as text, quoted when it would read as
+        // an expression, because "timeout" and "level >= Warning" must both mean their letters.
+        let as_typed = Chip::parse(value, Polarity::Include);
+        return match as_typed {
+            Ok(chip) if matches!(chip.predicate, Predicate::Text { .. }) => value.to_owned(),
+            _ => format!("\"{}\"", value.replace('"', "")),
+        };
+    };
+    // A column value: numbers and severity-looking names ride bare (severity banding needs the
+    // bare name), anything else is quoted.
+    let bare = value.parse::<f64>().is_ok()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info" | "information" | "warn" | "warning" | "error" | "fatal"
+        );
+    let formed = if bare {
+        value.to_owned()
+    } else {
+        format!("\"{}\"", value.replace('"', ""))
+    };
+    match op {
+        0 => format!("contains({column}, {formed})"),
+        1 => format!("{column} = {formed}"),
+        2 => format!("{column} != {formed}"),
+        3 => format!("{column} < {formed}"),
+        4 => format!("{column} <= {formed}"),
+        5 => format!("{column} > {formed}"),
+        6 => format!("{column} >= {formed}"),
+        7 => format!("{column} like {formed}"),
+        8 => format!("startsWith({column}, {formed})"),
+        _ => format!("endsWith({column}, {formed})"),
+    }
+}
+
 fn combo_fill(hdlg: HWND, id: u16, entries: &[String], selected: usize) {
     for entry in entries {
         let text = wsz(entry);
@@ -357,6 +443,7 @@ const WS_BORDER: u32 = 0x0080_0000;
 const ES_NUMBER: u32 = 0x2000;
 const ES_MULTILINE: u32 = 0x0004;
 const ES_READONLY: u32 = 0x0800;
+const ES_AUTOHSCROLL: u32 = 0x0080;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 
@@ -683,6 +770,377 @@ pub fn create_find_dialog(owner: HWND, seed: &FindSeed, history: &[String]) -> H
     hdlg
 }
 
+/// What the Filter dialog edits, in and out. `expression` seeds the box when editing an existing
+/// filter and carries the accepted §7.2 text back; `manual` records that the box is authoritative
+/// (an edit, or the user typed into it) until a structured control is touched again.
+pub struct FilterEdit {
+    pub columns: Vec<String>,
+    pub include: bool,
+    pub expression: String,
+    pub manual: bool,
+    pub accepted: bool,
+}
+
+/// The validation line: the model's own answer to the expression as it stands, plus §7.2's
+/// unknown-column warning checked against the live format's columns.
+fn filter_status(expression: &str, include: bool, columns: &[String]) -> String {
+    use tailhawk_core::filter::{Chip, Field, Polarity};
+    let expression = expression.trim();
+    if expression.is_empty() {
+        return "Type a filter, or build one above.".to_owned();
+    }
+    let polarity = if include {
+        Polarity::Include
+    } else {
+        Polarity::Exclude
+    };
+    match Chip::parse(expression, polarity) {
+        Err(e) => format!("Not a valid filter: {e}"),
+        Ok(chip) => {
+            for field in chip.predicate.fields() {
+                if let Field::Attribute(name) = field {
+                    if !columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                        return format!(
+                            "Warning: this format has no column named \"{name}\" — an include \
+                             with it matches nothing."
+                        );
+                    }
+                }
+            }
+            "OK.".to_owned()
+        }
+    }
+}
+
+fn read_dlg_text(hdlg: HWND, id: u16) -> String {
+    let mut buf = [0u16; 1024];
+    let len = unsafe { GetDlgItemTextW(hdlg, i32::from(id), &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..len.min(buf.len())])
+}
+
+struct FilterState {
+    edit: *mut FilterEdit,
+    busy: bool,
+}
+
+unsafe fn filter_recompose(hdlg: HWND, state: &mut FilterState) {
+    let edit = unsafe { &mut *state.edit };
+    let scope = unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_F_SCOPE),
+            CB_GETCURSEL,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .0
+    };
+    let op = unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(ID_F_OP), CB_GETCURSEL, WPARAM(0), LPARAM(0)).0
+    };
+    let checked = |id: u16| unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
+    };
+    let value = read_dlg_text(hdlg, ID_F_VALUE);
+    let column = if scope > 0 {
+        edit.columns.get(scope as usize - 1).map(String::as_str)
+    } else {
+        None
+    };
+    let expression = compose_filter(
+        column,
+        op.max(0) as usize,
+        &value,
+        checked(ID_F_REGEX),
+        checked(ID_F_CASE),
+    );
+    state.busy = true;
+    let text = wsz(&expression);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_EXPR), PCWSTR(text.as_ptr()));
+    }
+    state.busy = false;
+    unsafe { filter_validate(hdlg, state) };
+}
+
+unsafe fn filter_validate(hdlg: HWND, state: &FilterState) {
+    let edit = unsafe { &*state.edit };
+    let checked = |id: u16| unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
+    };
+    let status = filter_status(
+        &read_dlg_text(hdlg, ID_F_EXPR),
+        checked(ID_F_INCLUDE),
+        &edit.columns,
+    );
+    let text = wsz(&status);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_STATUS), PCWSTR(text.as_ptr()));
+    }
+}
+
+unsafe extern "system" fn filter_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    const EN_CHANGE: u32 = 0x0300;
+    const CBN_SELCHANGE: u32 = 1;
+    match msg {
+        WM_INITDIALOG => {
+            // The per-dialog state rides in a leaked box freed at WM_DESTROY; DWLP_USER carries
+            // it, exactly as the other dialogs carry theirs.
+            let edit = lparam.0 as *mut FilterEdit;
+            let state = Box::into_raw(Box::new(FilterState { edit, busy: false }));
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), state as isize);
+                let data = &*edit;
+                let any = wsz("(any column)");
+                SendDlgItemMessageW(
+                    hdlg,
+                    i32::from(ID_F_SCOPE),
+                    CB_ADDSTRING,
+                    WPARAM(0),
+                    LPARAM(any.as_ptr() as isize),
+                );
+                for column in &data.columns {
+                    let text = wsz(column);
+                    SendDlgItemMessageW(
+                        hdlg,
+                        i32::from(ID_F_SCOPE),
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(text.as_ptr() as isize),
+                    );
+                }
+                SendDlgItemMessageW(
+                    hdlg,
+                    i32::from(ID_F_SCOPE),
+                    CB_SETCURSEL,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+                for op in FILTER_OPS {
+                    let text = wsz(op);
+                    SendDlgItemMessageW(
+                        hdlg,
+                        i32::from(ID_F_OP),
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(text.as_ptr() as isize),
+                    );
+                }
+                SendDlgItemMessageW(hdlg, i32::from(ID_F_OP), CB_SETCURSEL, WPARAM(0), LPARAM(0));
+                let radio = if data.include {
+                    ID_F_INCLUDE
+                } else {
+                    ID_F_EXCLUDE
+                };
+                SendDlgItemMessageW(hdlg, i32::from(radio), BM_SETCHECK, WPARAM(1), LPARAM(0));
+                if !data.expression.is_empty() {
+                    let text = wsz(&data.expression);
+                    let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_EXPR), PCWSTR(text.as_ptr()));
+                }
+                filter_validate(hdlg, &*state);
+                // Focus lands in the Value box — typing a filter is what the dialog is for, and
+                // the default first-tabstop focus would land on the Include radio instead.
+                if let Ok(value) = GetDlgItem(hdlg, i32::from(ID_F_VALUE)) {
+                    let _ = SetFocus(value);
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let state = unsafe {
+                (GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) as *mut FilterState)
+                    .as_mut()
+            };
+            let Some(state) = state else {
+                return 0;
+            };
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            match (id, code) {
+                (IDOK, _) => {
+                    let expression = read_dlg_text(hdlg, ID_F_EXPR);
+                    let edit = unsafe { &mut *state.edit };
+                    let include = unsafe {
+                        SendDlgItemMessageW(
+                            hdlg,
+                            i32::from(ID_F_INCLUDE),
+                            BM_GETCHECK,
+                            WPARAM(0),
+                            LPARAM(0),
+                        )
+                        .0 == 1
+                    };
+                    let polarity = if include {
+                        tailhawk_core::filter::Polarity::Include
+                    } else {
+                        tailhawk_core::filter::Polarity::Exclude
+                    };
+                    if tailhawk_core::filter::Chip::parse(expression.trim(), polarity).is_err() {
+                        // The status line already says why; OK on an invalid filter keeps the
+                        // dialog up rather than swallowing the mistake.
+                        unsafe { filter_validate(hdlg, state) };
+                        return 1;
+                    }
+                    edit.expression = expression.trim().to_owned();
+                    edit.include = include;
+                    edit.accepted = true;
+                    unsafe {
+                        let _ = EndDialog(hdlg, 1);
+                    }
+                    1
+                }
+                (IDCANCEL, _) => {
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    1
+                }
+                (ID_F_EXPR, EN_CHANGE) => {
+                    if !state.busy {
+                        unsafe { &mut *state.edit }.manual = true;
+                        unsafe { filter_validate(hdlg, state) };
+                    }
+                    1
+                }
+                (ID_F_VALUE, EN_CHANGE) => {
+                    unsafe { &mut *state.edit }.manual = false;
+                    unsafe { filter_recompose(hdlg, state) };
+                    1
+                }
+                (ID_F_SCOPE | ID_F_OP, CBN_SELCHANGE) => {
+                    unsafe { &mut *state.edit }.manual = false;
+                    unsafe { filter_recompose(hdlg, state) };
+                    1
+                }
+                (ID_F_REGEX | ID_F_CASE | ID_F_INCLUDE | ID_F_EXCLUDE, 0) => {
+                    if !unsafe { &*state.edit }.manual {
+                        unsafe { filter_recompose(hdlg, state) };
+                    } else {
+                        unsafe { filter_validate(hdlg, state) };
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_DESTROY => {
+            let state = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) }
+                as *mut FilterState;
+            if !state.is_null() {
+                drop(unsafe { Box::from_raw(state) });
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// The Add / Edit Filter dialog — the powerful surface over §7.2: include/exclude, a column
+/// scope with operators, regex and case for whole-record matches, and the expression itself
+/// always visible and editable, validated live by the same parser that will run it.
+pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
+    const BS_AUTORADIOBUTTON: u32 = 0x0009;
+    const WS_GROUP: u32 = 0x0002_0000;
+    let title = if data.expression.is_empty() {
+        "Add Filter"
+    } else {
+        "Edit Filter"
+    };
+    let items = [
+        Item::new(
+            Class::Button,
+            "&Include rows that match",
+            ID_F_INCLUDE,
+            (7, 7, 100, 10),
+            WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "E&xclude rows that match",
+            ID_F_EXCLUDE,
+            (117, 7, 100, 10),
+            BS_AUTORADIOBUTTON,
+        ),
+        Item::new(Class::Static, "&Column:", 0xFFFF, (7, 27, 34, 8), 0),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_F_SCOPE,
+            (44, 25, 104, 90),
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
+        ),
+        Item::new(Class::Static, "&Match:", 0xFFFF, (156, 27, 28, 8), 0),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_F_OP,
+            (188, 25, 104, 90),
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+        ),
+        Item::new(Class::Static, "&Value:", 0xFFFF, (7, 45, 34, 8), 0),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_F_VALUE,
+            (44, 43, 248, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        Item::new(
+            Class::Button,
+            "&Regular expression",
+            ID_F_REGEX,
+            (44, 61, 90, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        Item::new(
+            Class::Button,
+            "Match c&ase",
+            ID_F_CASE,
+            (140, 61, 70, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        Item::new(Class::Static, "&Expression:", 0xFFFF, (7, 79, 40, 8), 0),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_F_EXPR,
+            (50, 77, 242, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        Item::new(Class::Static, "", ID_F_STATUS, (7, 95, 285, 18), 0),
+        Item::new(
+            Class::Button,
+            "OK",
+            IDOK,
+            (182, 117, 50, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (242, 117, 50, 14),
+            WS_TABSTOP,
+        ),
+    ];
+    let t = template(title, 299, 138, &items);
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            hwnd,
+            Some(filter_proc),
+            LPARAM(data as *mut FilterEdit as isize),
+        )
+    };
+    data.accepted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,6 +1235,69 @@ mod tests {
             !text.contains("\n\n"),
             "blank lines are CRLF too, or the edit control draws boxes"
         );
+    }
+
+    /// The Filter dialog's composition, row by row: every structured choice must round-trip
+    /// through `Chip::parse`, or the dialog would write expressions the model refuses.
+    #[test]
+    fn the_filter_dialog_writes_expressions_the_model_accepts() {
+        use tailhawk_core::filter::{Chip, Polarity};
+        let cases = [
+            (None, 0, "timeout", false, false, "timeout"),
+            // Text that reads as an expression is quoted so it means its letters.
+            (
+                None,
+                0,
+                "level >= Warning",
+                false,
+                false,
+                "\"level >= Warning\"",
+            ),
+            (None, 0, "Retry", false, true, "/Retry/"),
+            (None, 0, "a|b", true, false, "/a|b/i"),
+            (None, 0, "a|b", true, true, "/a|b/"),
+            (
+                Some("level"),
+                6,
+                "Warning",
+                false,
+                false,
+                "level >= Warning",
+            ),
+            (Some("elapsed"), 5, "300", false, false, "elapsed > 300"),
+            (
+                Some("source"),
+                8,
+                "Api",
+                false,
+                false,
+                "startsWith(source, \"Api\")",
+            ),
+            (
+                Some("message"),
+                0,
+                "dispatch",
+                false,
+                false,
+                "contains(message, \"dispatch\")",
+            ),
+            (
+                Some("source"),
+                7,
+                "api",
+                false,
+                false,
+                "source like \"api\"",
+            ),
+        ];
+        for (column, op, value, regex, case, want) in cases {
+            let got = compose_filter(column, op, value, regex, case);
+            assert_eq!(got, want, "compose({column:?}, {op}, {value:?})");
+            assert!(
+                Chip::parse(&got, Polarity::Include).is_ok(),
+                "{got:?} does not parse"
+            );
+        }
     }
 
     /// The dialog data: current selections found, and a face in use but not installed still shown.
