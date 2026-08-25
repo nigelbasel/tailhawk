@@ -82,6 +82,11 @@ const ID_W_SAVEAS: u16 = 151;
 const ID_W_TEST: u16 = 152;
 const ID_W_STATUS: u16 = 153;
 const ID_W_PREVIEW: u16 = 154;
+/// The Import Layout dialog — §6.3, the Define Format dialog's sibling over the same `Wizard`.
+const ID_I_LAYOUT: u16 = 160;
+const ID_I_RECOGNISED: u16 = 161;
+const ID_I_FOUND: u16 = 162;
+const ID_I_USE: u16 = 163;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -356,6 +361,48 @@ pub fn format_preview(test: &Test, samples: &[String], most: usize) -> Vec<Optio
                     })
                     .collect(),
             )
+        })
+        .collect()
+}
+
+/// §6.3's paste box before anything is in it. Not a fault: reporting "nothing pasted" in the error
+/// colour before the user has done anything reads as a failure they caused.
+pub const IMPORT_HINT: &str =
+    "paste a layout from your logging config — Serilog outputTemplate, NLog layout, log4net pattern";
+
+/// What the Import Layout dialog prints after "Recognised as" — the language, the hint on an empty
+/// box, or why the paste was not placed.
+pub fn recognised_label(layout: &str) -> String {
+    if layout.trim().is_empty() {
+        return IMPORT_HINT.to_owned();
+    }
+    match tailhawk_core::wizard::recognise(layout) {
+        Ok(language) => tailhawk_core::wizard::language_label(language).to_owned(),
+        Err(why) => why,
+    }
+}
+
+/// One row of the Import Layout dialog's findings list.
+pub struct ImportFoundRow {
+    /// The config file's own name — the path is context, the file is the identity.
+    pub file: String,
+    pub language: String,
+    pub layout: String,
+}
+
+/// §6.3's folder scan as the rows the list shows — the file, what language its layout is in, and
+/// the layout itself, so the choice is made by reading rather than by guessing from a filename.
+pub fn import_found_rows(found: &[tailhawk_core::template::Found]) -> Vec<ImportFoundRow> {
+    found
+        .iter()
+        .map(|f| ImportFoundRow {
+            file: f
+                .source
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            language: tailhawk_core::wizard::language_label(f.language).to_owned(),
+            layout: f.template.clone(),
         })
         .collect()
 }
@@ -1822,6 +1869,343 @@ fn lv_select(list: HWND, at: usize) {
     }
 }
 
+/// The Import Layout dialog's controls — §6.3 as [`format_dialog_items`]'s sibling, and shaped
+/// like it on purpose: the same pattern box, fault line, Save as, Test and preview in the same
+/// places, so the two doors to one artefact do not have to be learned twice.
+///
+/// Where §6.2 has an example line and a field list, §6.3 has a **paste box** and a list of what
+/// the folder scan found — because that is the whole difference between them.
+fn import_dialog_items() -> Vec<Item> {
+    const BS_GROUPBOX: u32 = 0x0007;
+    const ES_WANTRETURN: u32 = 0x1000;
+    let label =
+        |text: &str, at: (i16, i16, i16, i16)| Item::new(Class::Static, text, 0xFFFF, at, 0);
+    vec![
+        label(
+            "&Layout — paste the one from your logging config:",
+            (W_LEFT, 7, 300, 8),
+        ),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_I_LAYOUT,
+            (W_LEFT, 17, W_RIGHT - W_LEFT, 30),
+            WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_WANTRETURN,
+        ),
+        label("Recognised as:", (W_LEFT, 53, 56, 8)),
+        Item::new(
+            Class::Static,
+            "",
+            ID_I_RECOGNISED,
+            (66, 53, W_RIGHT - 66, 8),
+            0,
+        ),
+        label("F&ound beside this log:", (W_LEFT, 68, 100, 8)),
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_I_FOUND,
+            (W_LEFT, 78, W_BUTTON_X - W_LEFT - 6, 62),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        Item::new(
+            Class::Button,
+            "&Use this one",
+            ID_I_USE,
+            (W_BUTTON_X, 78, W_BUTTON_W, 14),
+            WS_TABSTOP,
+        ),
+        label("Pattern:", (W_LEFT, 146, 40, 8)),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_W_PATTERN,
+            (W_LEFT, 156, W_RIGHT - W_LEFT, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_READONLY,
+        ),
+        Item::new(
+            Class::Static,
+            "",
+            ID_W_ERROR,
+            (W_LEFT, 172, W_RIGHT - W_LEFT, 8),
+            0,
+        ),
+        label("&Save as:", (W_LEFT, 186, 34, 8)),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_W_SAVEAS,
+            (44, 184, 150, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        Item::new(
+            Class::Button,
+            "&Test",
+            ID_W_TEST,
+            (203, 184, 50, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Static,
+            "",
+            ID_W_STATUS,
+            (259, 186, W_RIGHT - 259, 8),
+            0,
+        ),
+        Item::new(
+            Class::Button,
+            "Pre&view",
+            0xFFFF,
+            (W_LEFT, 202, W_RIGHT - W_LEFT, 82),
+            BS_GROUPBOX,
+        ),
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_W_PREVIEW,
+            (W_LEFT + 6, 214, W_RIGHT - W_LEFT - 12, 64),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        Item::new(
+            Class::Button,
+            "Save",
+            IDOK,
+            (W_RIGHT - 110, 290, 50, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (W_RIGHT - 50, 290, 50, 14),
+            WS_TABSTOP,
+        ),
+    ]
+}
+
+/// §6.3's import as a **standard modal dialog**, for the reason §6.2's is one: it was the same
+/// drawn sheet, and the owner has already said what that is.
+///
+/// `found` is `template::scan`'s answer, listed under the paste box rather than behind a second
+/// command — taking one is a shortcut *into* the box, not a separate path, so whatever is imported
+/// went through the same door and can be edited before it is saved.
+pub fn show_import_dialog(
+    hwnd: HWND,
+    wizard: &mut Wizard,
+    found: &[tailhawk_core::template::Found],
+) -> bool {
+    let icc = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_LISTVIEW_CLASSES,
+    };
+    unsafe {
+        let _ = InitCommonControlsEx(&icc);
+    }
+    let mut state = ImportState {
+        wizard,
+        found: found.to_vec(),
+        accepted: false,
+    };
+    let t = template("Import Layout", 420, 311, &import_dialog_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            hwnd,
+            Some(import_proc),
+            LPARAM(&mut state as *mut ImportState as isize),
+        )
+    };
+    state.accepted
+}
+
+/// What [`import_proc`] works on for the life of the dialog.
+struct ImportState<'a> {
+    wizard: &'a mut Wizard,
+    found: Vec<tailhawk_core::template::Found>,
+    accepted: bool,
+}
+
+/// Puts the layout's consequences back on screen: what it was recognised as, the pattern, and the
+/// fault. The paste box itself is left alone — it is where the caret is.
+fn import_refresh(hdlg: HWND, state: &ImportState) {
+    let layout = read_dlg_text(hdlg, ID_I_LAYOUT);
+    let recognised = wsz(&recognised_label(&layout));
+    let pattern = wsz(&state.wizard.template());
+    // An empty box has not failed to compile; it has not been asked to.
+    let error = wsz(&if layout.trim().is_empty() {
+        String::new()
+    } else {
+        state.wizard.error().unwrap_or_default()
+    });
+    let status = wsz(&format_status(state.wizard.last_test()));
+    unsafe {
+        let _ = SetDlgItemTextW(
+            hdlg,
+            i32::from(ID_I_RECOGNISED),
+            PCWSTR(recognised.as_ptr()),
+        );
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_PATTERN), PCWSTR(pattern.as_ptr()));
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_ERROR), PCWSTR(error.as_ptr()));
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_STATUS), PCWSTR(status.as_ptr()));
+    }
+}
+
+/// The Import Layout dialog's proc.
+unsafe extern "system" fn import_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            let state = unsafe { &mut *(lparam.0 as *mut ImportState) };
+            for id in [ID_I_FOUND, ID_W_PREVIEW] {
+                if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
+                    unsafe {
+                        SendMessageW(
+                            list,
+                            LVM_SETEXTENDEDLISTVIEWSTYLE,
+                            WPARAM(0),
+                            LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                        );
+                    }
+                }
+            }
+            if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_I_FOUND)) } {
+                lv_reset(list);
+                lv_column(list, 0, "File", 110);
+                lv_column(list, 1, "Language", 120);
+                lv_column(list, 2, "Layout", 240);
+                let rows = import_found_rows(&state.found);
+                for (i, row) in rows.iter().enumerate() {
+                    lv_row(
+                        list,
+                        i as i32,
+                        &[row.file.clone(), row.language.clone(), row.layout.clone()],
+                    );
+                }
+                if !rows.is_empty() {
+                    lv_select(list, 0);
+                }
+            }
+            let seed = wsz(match state.wizard.source() {
+                tailhawk_core::wizard::Source::Layout { template, .. } => template.as_str(),
+                tailhawk_core::wizard::Source::Example { .. } => "",
+            });
+            let name = wsz(&state.wizard.name);
+            format_quietly(|| unsafe {
+                let _ = SetDlgItemTextW(hdlg, i32::from(ID_I_LAYOUT), PCWSTR(seed.as_ptr()));
+                let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_SAVEAS), PCWSTR(name.as_ptr()));
+            });
+            import_refresh(hdlg, state);
+            // §6.3 opens on the paste box, and **returning 0 without setting focus leaves it
+            // nowhere** — which is not merely untidy: the dialog then answers no mnemonic at all,
+            // so `Alt+U` for "Use this one" did nothing until this line existed.
+            if let Ok(box_) = unsafe { GetDlgItem(hdlg, i32::from(ID_I_LAYOUT)) } {
+                unsafe {
+                    let _ = SetFocus(box_);
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let state = unsafe {
+                (GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) as *mut ImportState)
+                    .as_mut()
+            };
+            let Some(state) = state else {
+                return 0;
+            };
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            if FORMAT_QUIET.with(|q| q.get()) && matches!(code, EN_CHANGE | CBN_SELCHANGE) {
+                return 0;
+            }
+            match (id, code) {
+                (IDOK, _) => {
+                    let name = read_dlg_text(hdlg, ID_W_SAVEAS);
+                    if name.trim().is_empty() {
+                        format_say(hdlg, "name the format before saving it");
+                    } else if read_dlg_text(hdlg, ID_I_LAYOUT).trim().is_empty() {
+                        format_say(hdlg, "paste a layout first");
+                    } else if let Some(why) = state.wizard.error() {
+                        format_say(hdlg, &why);
+                    } else {
+                        state.wizard.name = name;
+                        state.accepted = true;
+                        unsafe {
+                            let _ = EndDialog(hdlg, 1);
+                        }
+                    }
+                }
+                (IDCANCEL, _) => unsafe {
+                    let _ = EndDialog(hdlg, 0);
+                },
+                (ID_I_LAYOUT, EN_CHANGE) => {
+                    let text = read_dlg_text(hdlg, ID_I_LAYOUT);
+                    // A refusal keeps the model as it was and is *said* — the box keeps what was
+                    // typed while the model keeps what it will compile, and the two disagreeing
+                    // silently is how a save writes something the box was not showing.
+                    match state.wizard.repaste(&text) {
+                        Err(why) => format_say(hdlg, &why),
+                        Ok(()) => import_refresh(hdlg, state),
+                    }
+                }
+                (ID_I_USE, _) => {
+                    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_I_FOUND)) }) else {
+                        return 0;
+                    };
+                    match lv_selected(list).and_then(|at| state.found.get(at).map(|f| (at, f))) {
+                        None => format_say(hdlg, "choose one of the layouts found first"),
+                        Some((at, f)) => {
+                            let taken = Wizard::from_found(f, at);
+                            let layout = wsz(&taken.template());
+                            let name = wsz(&taken.name);
+                            let samples = state.wizard.samples().to_vec();
+                            *state.wizard = taken;
+                            state.wizard.set_samples(samples);
+                            format_quietly(|| unsafe {
+                                let _ = SetDlgItemTextW(
+                                    hdlg,
+                                    i32::from(ID_I_LAYOUT),
+                                    PCWSTR(layout.as_ptr()),
+                                );
+                                let _ = SetDlgItemTextW(
+                                    hdlg,
+                                    i32::from(ID_W_SAVEAS),
+                                    PCWSTR(name.as_ptr()),
+                                );
+                            });
+                            import_refresh(hdlg, state);
+                        }
+                    }
+                }
+                (ID_W_TEST, _) => {
+                    let mut borrowed = FormatState {
+                        wizard: state.wizard,
+                        accepted: false,
+                    };
+                    format_test(hdlg, &mut borrowed);
+                }
+                _ => return 0,
+            }
+            1
+        }
+        WM_DESTROY => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), 0);
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
 /// The Define Format dialog's proc. Every arm does the same three things: ask the model, report a
 /// refusal if it refused, refresh. Nothing here decides what a field may be — that is
 /// [`tailhawk_core::wizard`]'s, and it already says so in sentences.
@@ -2115,6 +2499,39 @@ mod tests {
         assert!(format_field_rows(&wizard).is_empty());
     }
 
+    /// "Recognised as" says the language, or the hint, or why — and an **empty** box gets the
+    /// hint rather than a refusal, because a box nobody has typed in has not failed at anything.
+    #[test]
+    fn the_recognised_line_hints_before_it_complains() {
+        assert_eq!(recognised_label(""), IMPORT_HINT);
+        assert_eq!(recognised_label("   \r\n "), IMPORT_HINT);
+        assert_eq!(
+            recognised_label("%date %level %logger %message"),
+            tailhawk_core::wizard::language_label(tailhawk_core::template::Language::Log4net)
+        );
+        let refused = recognised_label("this is not a layout at all");
+        assert!(
+            refused != IMPORT_HINT && !refused.is_empty(),
+            "an unrecognised paste says why: {refused}"
+        );
+    }
+
+    /// The findings list is read, not guessed at: each row carries the file, the language and the
+    /// layout itself.
+    #[test]
+    fn the_import_findings_carry_the_file_the_language_and_the_layout() {
+        let found = vec![tailhawk_core::template::Found {
+            language: tailhawk_core::template::Language::NLog,
+            template: "${longdate} ${level} ${message}".to_owned(),
+            source: std::path::PathBuf::from(r"C:\app\config\nlog.config"),
+        }];
+        let rows = import_found_rows(&found);
+        assert_eq!(rows[0].file, "nlog.config", "the file, not the whole path");
+        assert_eq!(rows[0].language, "NLog layout");
+        assert_eq!(rows[0].layout, "${longdate} ${level} ${message}");
+        assert!(import_found_rows(&[]).is_empty());
+    }
+
     /// The edit control counts UTF-16 units and the wizard counts UTF-8 bytes. On an ASCII line
     /// they agree, which is the trap; on a line with an em dash in it they do not, and every
     /// answer must still land on a character boundary.
@@ -2271,52 +2688,68 @@ mod tests {
     /// which is one word shorter or longer and therefore moves everything after it.
     #[test]
     fn every_item_is_dword_aligned_and_carries_its_class_ordinal_or_name() {
-        let mut items = two_items();
-        items.push(Item::new(
+        let mut synthetic = two_items();
+        synthetic.push(Item::new(
             Class::Named("SysListView32"),
             "",
             200,
             (7, 20, 80, 40),
             0,
         ));
-        let t = template("x", 100, 100, &items);
-        // Walk the template the way Windows does: header, then aligned items.
-        let mut at = 9; // style, exstyle, cdit, x, y, cx, cy
-        at += 2; // no menu, standard class — one ordinal word each
-        at += "x".encode_utf16().count() + 1; // caption
-        at += 1; // point size
-        at += "MS Shell Dlg".encode_utf16().count() + 1;
-        for item in &items {
-            if at % 2 == 1 {
+        // **The real dialogs are walked too, not only a made-up pair.** A template Windows will
+        // not open fails silently — `DialogBoxIndirectParamW` returns and nothing appears — so
+        // the shape of every template the app actually ships is checked here, where a miscount is
+        // an assertion rather than a dialog that never comes up.
+        for (name, items) in [
+            ("synthetic", synthetic),
+            ("Define Format", format_dialog_items()),
+            ("Import Layout", import_dialog_items()),
+            ("Filter", filter_dialog_items()),
+        ] {
+            let t = template("x", 100, 100, &items);
+            // Walk the template the way Windows does: header, then aligned items.
+            let mut at = 9; // style, exstyle, cdit, x, y, cx, cy
+            at += 2; // no menu, standard class — one ordinal word each
+            at += "x".encode_utf16().count() + 1; // caption
+            at += 1; // point size
+            at += "MS Shell Dlg".encode_utf16().count() + 1;
+            assert_eq!(t[4], items.len() as u16, "{name}: cdit counts the items");
+            for item in &items {
+                if at % 2 == 1 {
+                    at += 1;
+                }
+                assert_eq!(at % 2, 0, "{name}: item starts on a DWORD boundary");
+                let style = u32::from(t[at]) | (u32::from(t[at + 1]) << 16);
+                assert_eq!(
+                    style & 0x5000_0000,
+                    0x5000_0000,
+                    "{name}: WS_CHILD | WS_VISIBLE on every control"
+                );
+                assert_eq!(t[at + 8], item.id);
+                at += 9;
+                match item.class {
+                    Class::Named(class) => {
+                        let wide: Vec<u16> = class.encode_utf16().collect();
+                        assert_eq!(&t[at..at + wide.len()], &wide[..], "{name}: class by name");
+                        assert_eq!(t[at + wide.len()], 0, "{name}: and NUL-terminated");
+                        at += wide.len() + 1;
+                    }
+                    other => {
+                        assert_eq!(t[at], 0xFFFF, "{name}: ordinal class marker");
+                        assert_eq!(t[at + 1], other.ordinal().expect("an ordinal class"));
+                        at += 2;
+                    }
+                }
+                at += item.text.encode_utf16().count() + 1;
+                assert_eq!(t[at], 0, "{name}: no creation data");
                 at += 1;
             }
-            assert_eq!(at % 2, 0, "item starts on a DWORD boundary");
-            let style = u32::from(t[at]) | (u32::from(t[at + 1]) << 16);
             assert_eq!(
-                style & 0x5000_0000,
-                0x5000_0000,
-                "WS_CHILD | WS_VISIBLE on every control"
+                at,
+                t.len(),
+                "{name}: the walk consumed exactly the template"
             );
-            assert_eq!(t[at + 8], item.id);
-            at += 9;
-            match item.class {
-                Class::Named(name) => {
-                    let wide: Vec<u16> = name.encode_utf16().collect();
-                    assert_eq!(&t[at..at + wide.len()], &wide[..], "the class by name");
-                    assert_eq!(t[at + wide.len()], 0, "and NUL-terminated");
-                    at += wide.len() + 1;
-                }
-                other => {
-                    assert_eq!(t[at], 0xFFFF, "ordinal class marker");
-                    assert_eq!(t[at + 1], other.ordinal().expect("an ordinal class"));
-                    at += 2;
-                }
-            }
-            at += item.text.encode_utf16().count() + 1;
-            assert_eq!(t[at], 0, "no creation data");
-            at += 1;
         }
-        assert_eq!(at, t.len(), "the walk consumed exactly the template");
     }
 
     /// The flattening the keymap dialog shows: headings, tabbed rows, CRLF line ends.

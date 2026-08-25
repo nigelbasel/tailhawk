@@ -4884,6 +4884,8 @@ struct Shell {
     /// the same reason the others are: a modal dialog pumps its own loop, and no `STATE` borrow
     /// may be alive while it does.
     pending_format: bool,
+    /// Format ▸ Import layout asks for §6.3's dialog, the same way.
+    pending_import: bool,
     /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
     /// through `IsDialogMessageW` and a second `Ctrl+F` focuses it instead of stacking another.
     find_dialog: HWND,
@@ -6874,6 +6876,7 @@ impl Shell {
             }
             Command::ImportLayout => {
                 self.open_import();
+                self.pending_import = self.wizard.is_some();
                 return true;
             }
             Command::OpenRules => {
@@ -8959,6 +8962,44 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         }
         return true;
     }
+    let import = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_import))
+    });
+    if import {
+        // As the Define Format dialog does: the wizard leaves the shell for the length of the
+        // modal loop, and the findings go with it.
+        let taken = STATE.with(|s| {
+            s.borrow_mut().as_mut().and_then(|shell| {
+                let wizard = shell.wizard.take()?;
+                Some((wizard, std::mem::take(&mut shell.wizard_found)))
+            })
+        });
+        if let Some((mut wizard, found)) = taken {
+            let saved = dialog::show_import_dialog(hwnd, &mut wizard, &found);
+            let was = IN_WNDPROC.with(|flag| flag.replace(true));
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.wizard = Some(wizard);
+                    shell.wizard_editing = None;
+                    if saved {
+                        shell.save_format(hwnd);
+                        let reason = shell.file.clone();
+                        shell.close_wizard();
+                        shell.file = reason;
+                    } else {
+                        shell.close_wizard();
+                    }
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            });
+            IN_WNDPROC.with(|flag| flag.set(was));
+        }
+        return true;
+    }
     let format = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
@@ -10833,6 +10874,7 @@ fn main() -> Result<()> {
             pending_filter: None,
             pending_filter_edit: None,
             pending_format: false,
+            pending_import: false,
             find_dialog: HWND::default(),
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
