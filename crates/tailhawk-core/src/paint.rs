@@ -468,13 +468,18 @@ impl Painter {
             });
             total.quads += 1;
         }
-        // The command bar, if the source draws one — V14. Last, so its fills sit over whatever a
-        // partial top row put under them, and its text over its fills.
-        if view.chrome_px() > 0.0 {
-            self.spans = spans;
-            source.draw_chrome(self, view);
-            spans = std::mem::take(&mut self.spans);
-        }
+        // The source's chrome — last, so its fills sit over whatever a partial top row put under
+        // them, and its text over its fills.
+        //
+        // **Unconditionally, and the gate this replaces has now caused two defects.** It once kept
+        // `draw_chrome` from a welcome screen that needed its menu bar (the menu-bar-vanishes bug),
+        // and when the menu went native and the top band legitimately became zero, it silently
+        // skipped the *footer* — the filter panel and the status bar live in `draw_chrome` too,
+        // and a filter was changing the rows with no visible surface saying so. Each band guards
+        // itself; the painter does not second-guess which of them exist.
+        self.spans = spans;
+        source.draw_chrome(self, view);
+        spans = std::mem::take(&mut self.spans);
         self.spans = spans;
         Ok(total)
     }

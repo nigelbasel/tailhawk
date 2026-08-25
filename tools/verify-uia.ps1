@@ -35,17 +35,11 @@ try {
     foreach ($e in $kids) { Write-Host ("        {0,-10} | {1,-36} | {2,-22} | {3}" -f $e.Current.AutomationId, $e.Current.Name, $e.Current.ControlType.ProgrammaticName, $e.Current.BoundingRectangle) }
     Check 'every child has a name, a type and a rectangle' (($kids | Where-Object { -not $_.Current.Name -or $_.Current.BoundingRectangle.IsEmpty }).Count -eq 0)
 
-    $find = ById $root 'find'
-    Check 'the search field is a focusable Edit' ($find.Current.ControlType.ProgrammaticName -eq 'ControlType.Edit' -and $find.Current.IsKeyboardFocusable)
-    $vp = $find.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-    $vp.SetValue('log')
-    Start-Sleep -Milliseconds 800
-    Check 'SetValue on the search field is read back' ($vp.Current.Value -eq 'log')
-
+    # There is no in-window search field to drive any more: Ctrl+F is the classic Find dialog,
+    # which is a native window with Windows' own UIA — verify-find.ps1 covers it behaviourally.
     $status = ById $root 'status'
     $sv = $status.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     Check 'the status bar carries the status text' ($sv.Current.Value -match 'lines')
-    Check 'the status names the search' ($sv.Current.Value -match 'log')
 
     $chip = ById $root 'chip-0'
     Check 'the chip is a Button named for its text' ($chip.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $chip.Current.Name -eq 'include e')

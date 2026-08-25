@@ -445,7 +445,6 @@ pub fn fit_from_right<'a>(cells: &crate::cell::CellModel, text: &'a str, width: 
 pub enum Focus {
     #[default]
     Grid,
-    Find,
     NewChip,
 }
 

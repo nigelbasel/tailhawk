@@ -1975,20 +1975,13 @@ impl Document {
     /// full pass over 10 GB is 9.93 s and §11.3 forbids blocking a frame. See [`tailhawk_core::find`]
     /// for what the worker is given and why it cannot move under it.
     /// Seeds a fresh search from the Find dialog's last request — `F3` after `Esc` should look
-    /// for the thing, not do nothing — falling back to the bar's field while that still exists.
-    /// The field's old semantics were raw-regex and case-insensitive, and keep being.
+    /// for the thing, not do nothing. With no request yet, there is nothing to look for.
     fn find_from_seed(&mut self, seed: &dialog::FindSeed) {
-        let seed = if seed.query.is_empty() {
-            dialog::FindSeed {
-                query: self.chrome.find.text().to_owned(),
-                regex: true,
-                ..dialog::FindSeed::default()
-            }
-        } else {
-            seed.clone()
-        };
+        if seed.query.is_empty() {
+            return;
+        }
         self.finder.query = find_pattern(&seed.query, seed.regex, seed.whole_word);
-        self.finder.label = seed.query;
+        self.finder.label = seed.query.clone();
         self.finder.match_case = seed.match_case;
         self.finder.no_wrap = !seed.wrap;
         self.find();
@@ -3520,7 +3513,6 @@ impl Filtering {
 /// otherwise. What the bar shows is laid out in **cells** of the row grid — same shaper, same
 /// cell model — so its text lines up with the columns beneath and a click resolves to a cell.
 struct Chrome {
-    find: TextField,
     chip: TextField,
     /// The polarity the next chip will have — `Ctrl+L` include, `Ctrl+Shift+L` exclude.
     chip_polarity: Polarity,
@@ -4096,7 +4088,6 @@ enum BarDrag {
 /// What a click on the bar landed on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Hit {
-    Find,
     NewChip,
     /// A chip's body: toggles it.
     Chip(usize),
@@ -4252,7 +4243,6 @@ const CHIP_CELLS: usize = 24;
 impl Default for Chrome {
     fn default() -> Self {
         Self {
-            find: TextField::default(),
             chip: TextField::default(),
             chip_polarity: Polarity::Include,
             focus: Focus::Grid,
@@ -4271,7 +4261,6 @@ impl Chrome {
     /// The field that has the keyboard, if one does.
     fn focused(&mut self) -> Option<&mut TextField> {
         match self.focus {
-            Focus::Find => Some(&mut self.find),
             Focus::NewChip => Some(&mut self.chip),
             Focus::Grid => None,
         }
@@ -5629,15 +5618,6 @@ impl Shell {
                     match key {
                         k if k == VK_ESCAPE.0 => doc.chrome.focus = Focus::Grid,
                         k if k == VK_RETURN.0 => match focus {
-                            Focus::Find => {
-                                doc.finder.query = doc.chrome.find.text().to_owned();
-                                doc.finder.label = doc.finder.query.clone();
-                                // The bar's legacy semantics, not whatever the dialog last set —
-                                // a search from here must not inherit no-wrap or match-case.
-                                doc.finder.match_case = false;
-                                doc.finder.no_wrap = false;
-                                doc.find();
-                            }
                             Focus::NewChip => {
                                 let text = doc.chrome.chip.text().to_owned();
                                 let polarity = doc.chrome.chip_polarity;
@@ -7111,12 +7091,7 @@ impl Shell {
         if doc.chrome.focus == Focus::Grid {
             return false;
         }
-        let (find_origin, chip_origin) = doc.chrome.origins.get();
-        let origin = if doc.chrome.focus == Focus::Find {
-            find_origin
-        } else {
-            chip_origin
-        };
+        let (_, origin) = doc.chrome.origins.get();
         let cell_w = self.cell_w.max(1.0);
         let cells = *doc.view.cells();
         let Some(field) = doc.chrome.focused() else {
@@ -7299,7 +7274,7 @@ impl Shell {
                 .find(|(range, hit)| range.contains(&x) && matches!(hit, Hit::Tab(_)) == in_strip)
                 .map(|(_, hit)| *hit)
         });
-        let (find_origin, chip_origin) = doc.chrome.origins.get();
+        let (_, chip_origin) = doc.chrome.origins.get();
         let cell_w = self.cell_w.max(1.0);
         if let Some(Hit::Tab(i)) = hit {
             self.dragging_bar = Some((BarDrag::Tab, i));
@@ -7363,17 +7338,10 @@ impl Shell {
                     }
                 }
             }
-            Some(hit @ (Hit::Find | Hit::NewChip)) => {
-                let (origin, focus) = match hit {
-                    Hit::Find => (find_origin, Focus::Find),
-                    _ => (chip_origin, Focus::NewChip),
-                };
-                doc.chrome.focus = focus;
-                let width = if hit == Hit::Find {
-                    FIND_CELLS
-                } else {
-                    CHIP_CELLS
-                };
+            Some(Hit::NewChip) => {
+                let origin = chip_origin;
+                doc.chrome.focus = Focus::NewChip;
+                let width = CHIP_CELLS;
                 let cells = *doc.view.cells();
                 if let Some(field) = doc.chrome.focused() {
                     let display = field.display();
@@ -7621,7 +7589,6 @@ mod uia {
         Root,
         Tab(usize),
         Palette,
-        Find,
         NewChip,
         Chip(usize),
         Status,
@@ -7653,7 +7620,6 @@ mod uia {
         if doc.tab_strip.0.len() > 1 {
             out.extend((0..doc.tab_strip.0.len()).map(Kind::Tab));
         }
-        out.push(Kind::Find);
         // The filter panel's controls exist for the provider exactly when they exist on screen —
         // a tree element with no rect that types into an invisible field is the provider lying.
         if doc.filters_open() {
@@ -7710,7 +7676,6 @@ mod uia {
             match self.kind {
                 Kind::Root => "Tailhawk".to_owned(),
                 Kind::Palette => "Command palette".to_owned(),
-                Kind::Find => "Search".to_owned(),
                 Kind::NewChip => "Add filter".to_owned(),
                 Kind::Status => "Status".to_owned(),
                 Kind::Tab(i) => with_shell(|s| {
@@ -7739,7 +7704,6 @@ mod uia {
             match self.kind {
                 Kind::Root => "tailhawk".to_owned(),
                 Kind::Palette => "palette".to_owned(),
-                Kind::Find => "find".to_owned(),
                 Kind::NewChip => "new-chip".to_owned(),
                 Kind::Status => "status".to_owned(),
                 Kind::Tab(i) => format!("tab-{i}"),
@@ -7750,7 +7714,7 @@ mod uia {
         fn control_type(&self) -> i32 {
             match self.kind {
                 Kind::Root => UIA_PaneControlTypeId.0,
-                Kind::Palette | Kind::Find | Kind::NewChip => UIA_EditControlTypeId.0,
+                Kind::Palette | Kind::NewChip => UIA_EditControlTypeId.0,
                 Kind::Chip(_) => UIA_ButtonControlTypeId.0,
                 Kind::Tab(_) => UIA_TabItemControlTypeId.0,
                 Kind::Status => UIA_StatusBarControlTypeId.0,
@@ -7758,7 +7722,7 @@ mod uia {
         }
 
         fn is_focusable(&self) -> bool {
-            matches!(self.kind, Kind::Palette | Kind::Find | Kind::NewChip)
+            matches!(self.kind, Kind::Palette | Kind::NewChip)
         }
 
         fn has_focus(&self) -> bool {
@@ -7766,7 +7730,6 @@ mod uia {
                 let doc = s.document.as_ref()?;
                 Some(match self.kind {
                     Kind::Palette => doc.palette.is_open(),
-                    Kind::Find => !doc.palette.is_open() && doc.chrome.focus == Focus::Find,
                     Kind::NewChip => !doc.palette.is_open() && doc.chrome.focus == Focus::NewChip,
                     _ => false,
                 })
@@ -7816,10 +7779,6 @@ mod uia {
                     Kind::Tab(i) => {
                         let r = x_range(&|hit| *hit == Hit::Tab(i))?;
                         (r.start, 0.0, r.end - r.start, strip)
-                    }
-                    Kind::Find => {
-                        let r = x_range(&|hit| *hit == Hit::Find)?;
-                        (r.start, strip, r.end - r.start, bar_h)
                     }
                     Kind::NewChip => {
                         let (xr, yr) = panel_rect(&|hit| *hit == Hit::NewChip)?;
@@ -7871,7 +7830,6 @@ mod uia {
             match self.kind {
                 Kind::Root => 1,
                 Kind::Palette => 2,
-                Kind::Find => 3,
                 Kind::NewChip => 4,
                 Kind::Status => 5,
                 Kind::Tab(i) => 100 + i as i32,
@@ -7903,9 +7861,7 @@ mod uia {
 
         fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
             let supported = match self.kind {
-                Kind::Palette | Kind::Find | Kind::NewChip | Kind::Status => {
-                    pattern == UIA_ValuePatternId
-                }
+                Kind::Palette | Kind::NewChip | Kind::Status => pattern == UIA_ValuePatternId,
                 Kind::Chip(_) => pattern == UIA_InvokePatternId || pattern == UIA_TogglePatternId,
                 Kind::Tab(_) => pattern == UIA_SelectionItemPatternId,
                 Kind::Root => false,
@@ -7939,7 +7895,7 @@ mod uia {
                 p if p == UIA_IsControlElementPropertyId => VARIANT::from(true),
                 p if p == UIA_IsContentElementPropertyId => VARIANT::from(self.kind != Kind::Root),
                 p if p == UIA_ValueValuePropertyId => match self.kind {
-                    Kind::Status | Kind::Palette | Kind::Find | Kind::NewChip => {
+                    Kind::Status | Kind::Palette | Kind::NewChip => {
                         VARIANT::from(self.Value()?.to_string().as_str())
                     }
                     _ => VARIANT::default(),
@@ -8020,7 +7976,6 @@ mod uia {
             with_shell_mut(|s| {
                 let doc = s.document.as_mut()?;
                 match kind {
-                    Kind::Find => doc.chrome.focus = Focus::Find,
                     Kind::NewChip => {
                         doc.show_filters = true;
                         doc.chrome.focus = Focus::NewChip;
@@ -8074,7 +8029,6 @@ mod uia {
                     Some(Kind::Palette)
                 } else {
                     match doc.chrome.focus {
-                        Focus::Find => Some(Kind::Find),
                         Focus::NewChip => Some(Kind::NewChip),
                         Focus::Grid => None,
                     }
@@ -8096,14 +8050,6 @@ mod uia {
             let applied = with_shell_mut(|s| {
                 let doc = s.document.as_mut()?;
                 match kind {
-                    Kind::Find => {
-                        doc.chrome.find.set_text(&text);
-                        doc.finder.query = text.clone();
-                        doc.finder.label = text.clone();
-                        doc.finder.match_case = false;
-                        doc.finder.no_wrap = false;
-                        doc.find();
-                    }
                     Kind::NewChip => {
                         doc.chrome.chip.set_text(&text);
                         let polarity = doc.chrome.chip_polarity;
@@ -8129,7 +8075,6 @@ mod uia {
             let text = with_shell(|s| {
                 let doc = s.document.as_ref()?;
                 Some(match kind {
-                    Kind::Find => doc.chrome.find.text().to_owned(),
                     Kind::NewChip => doc.chrome.chip.text().to_owned(),
                     Kind::Palette => doc.palette.field.text().to_owned(),
                     Kind::Status => doc.status.clone(),
@@ -12596,8 +12541,8 @@ mod tests {
                 "chip" => filter_for(&mut doc, arg, Polarity::Include),
                 "xchip" => filter_for(&mut doc, arg, Polarity::Exclude),
                 "find" => {
-                    doc.chrome.find.set_text(arg);
                     doc.finder.query = arg.to_owned();
+                    doc.finder.label = arg.to_owned();
                     doc.find();
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                     while doc.finder.running.is_some() && std::time::Instant::now() < deadline {
@@ -12608,7 +12553,6 @@ mod tests {
                 }
                 "focus" => {
                     doc.chrome.focus = match arg {
-                        "find" => Focus::Find,
                         "chip" => Focus::NewChip,
                         _ => Focus::Grid,
                     }
