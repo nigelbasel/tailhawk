@@ -1,6 +1,65 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-24, session 23: the owner's standard-behaviour defects
+## ▶ Resume point — 2026-08-25, session 23 continued: the classic-dialogs conversion, mid-flight
+
+**Where master stands:** the classic **Find dialog is live and committed** — `Ctrl+F` opens a
+native modeless `#32770` (Find what, Match case, Regular expression, Find Next / Find Previous /
+Cancel), pumped through `IsDialogMessageW`, verified by the rewritten `tools/verify-find.ps1` and
+photographed for the owner. The command bar's old find field still draws; it leaves with the bar.
+
+### The owner's decisions this stretch, in order — all recorded in `UI-DESIGN.md` §2.1 and `CLEANROOM.md`
+
+1. **The command bar goes entirely** ("Option C" of three mockups in
+   `nimbalyst-local/mockups/tailhawk-command-bar-options.mockup.html`): classic dialogs, because
+   "a classic dialog gives more real estate for configuring … and then once it is active, the
+   dialog goes away and does not occupy real estate."
+2. **Filters become a docked bottom panel**, not a modal dialog — the owner pointed at Visual
+   Studio's tool windows; the settled shape is TextAnalysisTool.NET's checked filter list, fixed
+   (no floating, no drag-docking in v1), reusing the detail pane's band above the status bar.
+3. **The Find dialog adopts four Notepad++ options** (owner chose "all four"):
+   query **history dropdown** on Find what, **Match whole word only**, **Wrap around**
+   (default on), and a **live match-count line** in the dialog — Count for free, since the
+   streaming pass already counts everything.
+
+### Next work, exactly — the four Find options (started, reverted to keep the tree clean)
+
+The design is agreed; ~40 lines were written and deliberately taken back out rather than
+committed half-done. Recreate as follows, test-first:
+
+- `Finder`: add `no_wrap: bool` (inverted so derive(Default) = wrapping); `step()` returns
+  `None` at either end when set. Extend `stepping_starts_from_the_viewport_and_wraps_at_both_ends`
+  with the no-wrap case.
+- `Finder::dialog_status() -> String`: the count line — error text first (a refused pattern
+  reported where the user looks), then `searching…` / `no matches` / `n matches[ so far]`.
+  Pure; test it. Push it into the dialog from `Shell::poll_find` (before its early return) and
+  on each `find_requested`, via a `dialog::set_find_status(hdlg, &str)`.
+- `fn find_pattern(query, regex, whole_word) -> String` in `main.rs`: escaped unless regex,
+  wrapped `\b(?:…)\b` when whole-word. Pure; test escaping, grouping, both toggles.
+- `dialog.rs`: `FindRequest` gains `whole_word`/`wrap`; a `FindSeed` struct (manual Default with
+  `wrap: true`) replaces the shell's `last_find` tuple; `create_find_dialog` takes the seed plus
+  `history: &[String]`, the Find-what control becomes a `ComboBox` (`CBS_DROPDOWN | CBS_AUTOHSCROLL`,
+  seed selection via `CB_SETEDITSEL`), two more checkboxes (`W&hole word`, `W&rap around` — mind
+  mnemonic collisions with Find &Previous), and a hint-ink Static for the count line.
+- `settings.rs`: `find_queries: Vec<String>` persisted as `[find] queries = [...]`, capped 10,
+  exact-match dedupe (case matters in a query), `remember_query`, merge like `[recent]`;
+  round-trip test. `find_requested` records each non-empty query.
+- Then re-run `tools/verify-find.ps1`, and extend it to tick Whole word once.
+
+### After that, still owed on the conversion
+
+- **The docked filter panel** (replaces chips + the `Ctrl+L` field; View ▸ Filters; remembered
+  per §12.4; status-bar `n filters · k of m rows` chip that shows it).
+- **Format ▸ Log format submenu** with radio-marked candidates (replaces the right-edge chip
+  and `draw_format_menu`).
+- **Remove the command bar band** once all three replacements stand: `draw_chrome`'s prompt,
+  find field, chips, new-chip field, format chip; `Focus::Find`/`NewChip`; `Hit::Find`/`Chip*`/
+  `FormatChip`; the UIA provider's field/chip elements (native dialogs carry their own UIA);
+  `chrome_px` shrinks to menu + tabs; `verify-filter.ps1` rewrites against the panel.
+- **The menu review's known gap** (task 6): Open Recent's submenu opens in place of the File
+  list — `MenuFrame` carries one open list, so a cascade replaces its parent. Standard is a
+  flyout beside it. Also check hover-tracking across open headings, F10, Alt+Space.
+
+## ▶ Previous resume point — 2026-08-24, session 23: the owner's standard-behaviour defects
 
 **The owner tested and reported six defects, all variations on one theme: behave like a standard
 Windows application.** Four are fixed, committed, live-verified and pushed; two remain, and they
