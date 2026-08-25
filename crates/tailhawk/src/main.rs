@@ -23,8 +23,6 @@ mod menubar;
 mod prefs;
 mod version;
 
-use menubar::{menu_frame_of, MenuFrame, MenuHit};
-
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -94,9 +92,9 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
     VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G,
-    VK_H, VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_M, VK_MENU, VK_N, VK_NEXT, VK_O, VK_OEM_5,
-    VK_PRIOR, VK_R, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_V, VK_W,
-    VK_X, VK_Y, VK_Z,
+    VK_H, VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_M, VK_N, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_R,
+    VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y,
+    VK_Z,
 };
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::Shell::{
@@ -104,22 +102,22 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetScrollInfo, GetWindow, GetWindowPlacement, IsDialogMessageW,
-    IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetClassLongPtrW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, ASFW_ANY, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GCLP_HBRBACKGROUND, GW_OWNER, IDC_ARROW, MSG, NONCLIENTMETRICSW, SB_BOTTOM, SB_HORZ,
-    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
-    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
-    SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
-    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL,
-    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    GetClientRect, GetMenu, GetMessageW, GetScrollInfo, GetSubMenu, GetWindow, GetWindowPlacement,
+    IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, ASFW_ANY, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_ARROW, MSG,
+    NONCLIENTMETRICSW, SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
+    SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
+    SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
+    SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP,
+    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT,
+    WM_HSCROLL, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
+    WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POINTERCAPTURECHANGED,
+    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
@@ -257,18 +255,12 @@ struct Document {
     /// V9's format wizard as it should be drawn this frame — the shell's knowledge handed over
     /// exactly as [`Document::rules_overlay`] is.
     wizard_overlay: Option<WizardOverlay>,
-    /// §2.2's menu bar as it should be drawn this frame, handed over exactly as the two overlays
-    /// above are. The [`menu`](tailhawk_core::menu) tree itself is the shell's — one bar serves
-    /// every tab — and this is only its picture.
-    menu_frame: MenuFrame,
     /// The **chrome** face's line height, set by the shell before each frame as the overlays above
     /// are. The bands — command bar, tab strip, status — are sized from this and not from the
     /// grid's row height, because §1.1's chrome is drawn in the system UI font and that font is
     /// shorter than the grid's. Zero until the shell has said, and the helpers fall back to the
     /// grid's row height then, which is what keeps a `Document` usable in a test with no renderer.
     chrome_h: f32,
-    /// §6.1's chip menu as it should be drawn this frame, or `None` when it is not down.
-    format_menu: Option<Vec<FormatRow>>,
     /// The ad-hoc colour labels in force — `(n, text)` — mirrored as rules at the front of the
     /// highlighter's set. Kept here so they can be listed and saved.
     labels: Vec<(u8, String)>,
@@ -435,24 +427,16 @@ impl RowSource for Document {
         let mut hits = self.chrome.hits.borrow_mut();
         hits.clear();
 
-        painter.fill(0.0, 0.0, width, band, theme().chrome_bg);
-
-        // The tab strip, when there is more than one tab: each file's name on its own fill, the
-        // shown one lighter, and a click on one shows it (`Hit::Tab`). Above the bar.
+        // §2.2 as resettled: the menu bar is Windows' own, outside the client area, and the
+        // command-bar row is gone — search is the Find dialog, filters are the panel below,
+        // format is the Format menu. What remains of the top chrome is the tab strip.
         let chrome_h = painter.chrome_line_height();
         let pad = painter.chrome_measure("n").max(4.0);
-
-        // §2.2's menu bar, at the very top of the chrome. The **row** is drawn here so the strip
-        // and command bar below it are not painted over; the open list is drawn at the end of this
-        // method, over everything. See [`menubar::draw_bar`].
-        let mut menu_hits = self.chrome.menu_hits.borrow_mut();
-        let (menu, menu_open_x) =
-            menubar::draw_bar(painter, &self.menu_frame, &mut menu_hits, 0.0, width);
-
         let (labels, active) = &self.tab_strip;
-        let strip = if labels.len() > 1 {
+        if band > 0.0 && labels.len() > 1 {
+            painter.fill(0.0, 0.0, width, band, theme().chrome_bg);
             let strip_h = Chrome::strip_height(chrome_h);
-            let ty = menu + ((strip_h - chrome_h) / 2.0).floor();
+            let ty = ((strip_h - chrome_h) / 2.0).floor();
             let mut tx = pad * 0.5;
             for (i, label) in labels.iter().enumerate() {
                 let w = painter.chrome_measure(label);
@@ -461,7 +445,7 @@ impl RowSource for Document {
                 } else {
                     theme().tab_bg
                 };
-                painter.fill(tx - 2.0, menu + 1.0, w + pad * 2.0 + 4.0, strip_h - 2.0, bg);
+                painter.fill(tx - 2.0, 1.0, w + pad * 2.0 + 4.0, strip_h - 2.0, bg);
                 let ink = if i == *active {
                     theme().ink
                 } else {
@@ -471,82 +455,8 @@ impl RowSource for Document {
                 hits.push((tx..tx + w + pad * 2.0, Hit::Tab(i)));
                 tx += w + pad * 3.0;
             }
-            strip_h
-        } else {
-            0.0
-        };
-        let text_y = menu + strip + ((band - menu - strip - chrome_h) / 2.0).floor();
-        let mut x = pad * 0.5;
-
-        // §2.1's prompt and the find field.
-        //
-        // **U+25BA ►, not U+25B8 ▸.** Segoe UI Variable Text has none of ▸, ▾ or ▶ —
-        // `GetGlyphIndices` returns .notdef for all three, and this cache has one face with no
-        // per-glyph fallback, so each drew as a box. It does have ► and ▼, which say the same
-        // thing. `the_chrome_face_has_the_markers_the_chrome_draws` catches it before the window
-        // does; the first draft of this line picked two of the three missing ones.
-        x += painter.chrome_run("►", x, text_y, theme().header_ink) + pad;
-        // The fields keep a width in *ems* of the chrome face rather than a cell count: the point
-        // of `FIND_CELLS` was "wide enough for a real query", and that survives the face change.
-        let em = painter.chrome_measure("0").max(1.0);
-        let find_w = FIND_CELLS as f32 * em;
-        let find_focused = self.chrome.focus == Focus::Find;
-        painter.fill(
-            x - 2.0,
-            text_y - 2.0,
-            find_w + 4.0,
-            chrome_h + 4.0,
-            if find_focused {
-                theme().field_bg_focused
-            } else {
-                theme().field_bg
-            },
-        );
-        hits.push((x..x + find_w, Hit::Find));
-        let find_origin = x;
-        draw_field(
-            painter,
-            &self.chrome.find,
-            find_focused,
-            x,
-            text_y,
-            find_w,
-            "search (Ctrl+F)",
-        );
-        x += find_w + pad * 2.0;
-        let chip_w = CHIP_CELLS as f32 * em;
-        let _ = x;
-
-        // §6.1's format chip, at the right edge: the detection, a `▾`, and a click target.
-        //
-        // **Its colour is the trust model.** §6.1: a detection that clears neither 0.75 absolute
-        // nor a 15% margin renders as a warning rather than silently picking, because silent
-        // mis-columnising is worse than none. `describe` already says "format? … · …" in that
-        // case; drawing it in the ordinary ink would leave the warning to be read rather than seen.
-        if let Some(text) = self.detection.describe() {
-            let text = format!("{text} ▼");
-            // The warning form is the *longest* — `format? log4net 100% · timestamped text 100%` —
-            // so a chip drawn only when it fits whole is a chip that disappears in exactly the
-            // state §6.1 wants it seen. Fit it to the room instead, and give up only when there is
-            // none: the click target goes with it, and this is the door to every way back.
-            let room = width - x - chip_w - pad * 2.0;
-            let mut shown = text.clone();
-            while !shown.is_empty() && painter.chrome_measure(&shown) > room {
-                let cut = shown.char_indices().next_back().map_or(0, |(at, _)| at);
-                shown.truncate(cut);
-            }
-            let w = painter.chrome_measure(&shown);
-            if w >= FORMAT_CHIP_MIN_CELLS as f32 * em {
-                let fx = width - w - pad;
-                let ink = if self.detection.accepted.is_none() {
-                    theme().semantic.warn
-                } else {
-                    theme().header_ink
-                };
-                painter.chrome_run(&shown, fx, text_y, ink);
-                hits.push((fx..fx + w, Hit::FormatChip));
-            }
         }
+        let chip_w = CHIP_CELLS as f32 * painter.chrome_measure("0").max(1.0);
 
         // V10: the detail pane, above the status bar. The first line is the record's title; the
         // rest its fields, body and tail; a pane too short for them says how many are left.
@@ -669,7 +579,7 @@ impl RowSource for Document {
                     hint,
                 );
             }
-            self.chrome.origins.set((find_origin, chip_origin));
+            self.chrome.origins.set((0.0, chip_origin));
         }
 
         // The status bar, at the bottom: what the title says, where a user looks. Cut from the
@@ -698,7 +608,6 @@ impl RowSource for Document {
         // editor is up is still the thing on top.
         self.draw_rules(painter, view);
         self.draw_wizard(painter, view);
-        self.draw_format_menu(painter, view);
 
         // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
         // query on its first line, then the rows, the selected one filled. Rows are remembered by
@@ -748,18 +657,6 @@ impl RowSource for Document {
                 y += chrome_h;
             }
         }
-
-        // §2.2's open menu, last of all — over the strip, the bar, the grid and every overlay
-        // above. A menu that anything can be drawn on top of is not a menu.
-        menubar::draw_open_list(
-            painter,
-            &self.menu_frame,
-            &mut menu_hits,
-            menu_open_x,
-            menu,
-            width,
-        );
-        menubar::dump_hits(&menu_hits);
     }
 
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
@@ -921,47 +818,6 @@ impl Document {
             RULES_LEGEND,
             theme().field_hint,
         );
-    }
-
-    /// §6.1's chip menu, dropped from the chip at the right of the command bar.
-    fn draw_format_menu(&self, painter: &mut Painter, view: &View) {
-        let Some(rows) = self.format_menu.as_ref() else {
-            self.chrome.format_hits.borrow_mut().clear();
-            return;
-        };
-        let row_h = painter.chrome_line_height();
-        let pad = painter.chrome_measure("n").max(4.0);
-        let em = painter.chrome_measure("0").max(1.0);
-        let width = view.gutter_px() + view.hgrid().viewport_px();
-        let box_w = (FORMAT_MENU_CELLS as f32 * em).min(width).max(0.0);
-        // Under the chip, which is at the right edge — so the menu hangs from the right too.
-        let box_x = (width - box_w - pad).max(0.0);
-        let box_y = view.chrome_px();
-        let box_h = row_h * rows.len() as f32 + 8.0;
-        painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
-        let inner_x = box_x + pad;
-        let inner_w = (box_w - pad * 2.0).max(0.0);
-        let mut y = box_y + 4.0;
-        let mut hits = self.chrome.format_hits.borrow_mut();
-        hits.clear();
-        for (i, row) in rows.iter().enumerate() {
-            if row.selected {
-                painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
-            }
-            if row.action == FormatAction::Separator {
-                painter.fill(
-                    inner_x,
-                    y + (row_h * 0.5).floor(),
-                    inner_w,
-                    1.0,
-                    theme().pane_edge,
-                );
-            } else {
-                chrome_line(painter, inner_x, y, inner_w, &row.label, theme().ink);
-            }
-            hits.push((y..y + row_h, i));
-            y += row_h;
-        }
     }
 
     /// The line §6.2 defines a format from, and the lines it previews over: the top visible row
@@ -1300,8 +1156,6 @@ impl Document {
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             wizard_overlay: None,
-            menu_frame: MenuFrame::default(),
-            format_menu: None,
             chrome_h: 0.0,
             layout,
             presented: Vec::new(),
@@ -1363,8 +1217,6 @@ impl Document {
             palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             wizard_overlay: None,
-            menu_frame: MenuFrame::default(),
-            format_menu: None,
             chrome_h: 0.0,
             layout,
             presented: Vec::new(),
@@ -1409,18 +1261,18 @@ impl Document {
         // The command bar always, the tab strip when there is more than one tab; one row of header
         // when there are columns. Set after the viewport, which is what all three are subtracted from.
         let chrome_h = self.band_h(row_h);
+        // §2.2 as resettled: the menu bar is non-client and the command row is gone, so the top
+        // chrome is the tab strip alone — and nothing at all with a single tab, exactly as a
+        // standard tabbed application draws itself.
         let strip = if self.tab_strip.0.len() > 1 {
             Chrome::strip_height(chrome_h)
         } else {
             0.0
         };
-        let menu = self.menu_band(chrome_h);
-        self.view
-            .set_chrome_px(menu + strip + Chrome::height(chrome_h));
+        self.view.set_chrome_px(strip);
         // V10: the detail pane sits above the status bar, a third of the height at most, when open.
         let pane_rows = if self.detail.open {
-            let grid_rows =
-                ((size.1 as f32 - menu - strip - Chrome::height(chrome_h)) / row_h.max(1.0)) as u64;
+            let grid_rows = ((size.1 as f32 - strip) / row_h.max(1.0)) as u64;
             (grid_rows / 3).clamp(4, DETAIL_MAX_ROWS) as usize
         } else {
             0
@@ -1616,20 +1468,6 @@ impl Document {
         self.header.as_deref()
     }
 
-    /// §2.2's menu bar band, above everything else in the chrome, or zero when the shell has not
-    /// handed one over — which is every `Document` in a test with no window.
-    ///
-    /// **Only the bar row is reserved.** An open menu's list hangs *over* the grid; if it took
-    /// space the rows would jump down every time a menu opened and back up when it shut, which no
-    /// menu bar anywhere does.
-    fn menu_band(&self, chrome_h: f32) -> f32 {
-        if self.menu_frame.headings.is_empty() {
-            0.0
-        } else {
-            menubar::bar_height(chrome_h)
-        }
-    }
-
     /// Whether something is selected — a caret is not a selection, so `Copy` stays disabled at one.
     ///
     /// This and the six below are the questions §2.2's menu asks a document before it draws.
@@ -1666,6 +1504,24 @@ impl Document {
     /// The record detail pane is up.
     fn detail_open(&self) -> bool {
         self.detail.open
+    }
+
+    /// Format ▸ Log format's rows for the menu: label, whether it is the format in force, and
+    /// whether the row is a rule — in [`format_menu_of`]'s order, which is the order a chosen
+    /// `ID_FORMAT_BASE` index is resolved back through.
+    fn format_rows(&self) -> Vec<(String, bool, bool)> {
+        format_menu_of(&self.detection, 0)
+            .into_iter()
+            .map(|row| {
+                let current = match row.action {
+                    FormatAction::Adopt(format) => self.detection.accepted == Some(format),
+                    FormatAction::PlainText => self.detection.accepted.is_none(),
+                    _ => false,
+                };
+                let separator = matches!(row.action, FormatAction::Separator);
+                (row.label, current, separator)
+            })
+            .collect()
     }
 
     fn filters_open(&self) -> bool {
@@ -3684,15 +3540,10 @@ struct Chrome {
     /// on its first field.
     #[allow(clippy::type_complexity)]
     wizard_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, std::ops::Range<f32>, usize)>>,
-    /// §6.1's chip menu rows, by y.
-    format_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
     /// §2.1's filter panel, by x **and** y — it is a column of rows in the footer band, so x
     /// alone would resolve every row to the first, the lesson the menu's hits already learned.
     #[allow(clippy::type_complexity)]
     panel_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, std::ops::Range<f32>, Hit)>>,
-    /// §2.2's menu bar: the headings on the bar row and the open list's rows, each by x **and** y.
-    /// See [`menubar::MenuHits`] for why both axes.
-    menu_hits: std::cell::RefCell<menubar::MenuHits>,
 }
 
 /// V9's rules editor as one frame should draw it — see [`Document::rules_overlay`].
@@ -4070,7 +3921,6 @@ enum Command {
     EditRules,
     DefineFormat,
     ImportLayout,
-    FormatMenu,
     OpenRules,
     ReloadRules,
     GoToTop,
@@ -4168,7 +4018,6 @@ impl Command {
             "",
         ),
         (Command::EditRules, "Highlight rules…", "Ctrl+H"),
-        (Command::FormatMenu, "Format…", ""),
         (Command::DefineFormat, "Define format from a line…", ""),
         (Command::ImportLayout, "Import layout from config…", ""),
         (
@@ -4257,8 +4106,6 @@ enum Hit {
     /// which the bar's chips never offered.
     FilterPolarity(usize),
     Tab(usize),
-    /// §6.1's format chip, at the right of the bar: opens its menu.
-    FormatChip,
 }
 
 /// What choosing a row of §6.1's chip menu does.
@@ -4398,23 +4245,6 @@ fn format_menu_of(detection: &Detection, selected: usize) -> Vec<FormatRow> {
     rows
 }
 
-/// The first row of §6.1's menu that can be chosen, stepping by `by` from `from`.
-fn format_menu_step(rows: &[FormatRow], from: usize, by: isize) -> usize {
-    let mut at = from as isize;
-    for _ in 0..rows.len() {
-        at += by;
-        if at < 0 || at >= rows.len() as isize {
-            return from;
-        }
-        if rows[at as usize].action != FormatAction::Separator {
-            return at as usize;
-        }
-    }
-    from
-}
-
-/// The bar's geometry, in cells. The find field is wide enough for a real query; the new-chip
-/// field for a chip. Both scroll nothing — a query longer than the field is a rare event and the
 /// caret stays visible because the text is cut from the *left* when it overflows.
 const FIND_CELLS: usize = 36;
 const CHIP_CELLS: usize = 24;
@@ -4432,9 +4262,7 @@ impl Default for Chrome {
             palette_hits: std::cell::RefCell::new(Vec::new()),
             rules_hits: std::cell::RefCell::new(Vec::new()),
             wizard_hits: std::cell::RefCell::new(Vec::new()),
-            format_hits: std::cell::RefCell::new(Vec::new()),
             panel_hits: std::cell::RefCell::new(Vec::new()),
-            menu_hits: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -4721,12 +4549,6 @@ const PALETTE_CELLS: usize = 64;
 /// The rules editor box's width, in cells, and how much of it the pattern gets.
 const RULES_CELLS: usize = 120;
 const RULES_PATTERN_CELLS: usize = 40;
-
-/// The narrowest §6.1's chip is drawn at. Below this the bar has no room for it at all.
-const FORMAT_CHIP_MIN_CELLS: usize = 10;
-
-/// §6.1's chip menu, in cells.
-const FORMAT_MENU_CELLS: usize = 44;
 
 /// The format wizard box's width, in cells.
 const WIZARD_CELLS: usize = 132;
@@ -5027,12 +4849,6 @@ struct Shell {
     rules_tiers: Vec<PathBuf>,
     /// The rules that did not compile, by name — shown in the status bar.
     rules_failed: Vec<String>,
-    /// §2.2's menu bar. On the shell for the reason the rules editor is: there is **one** bar over
-    /// every tab, and which menu is open is a property of the window rather than of a document.
-    ///
-    /// Rebuilt from [`menubar::menu_bar`] whenever the bar is opened or the document's state could
-    /// have moved, because enablement is a property of the moment — see that function.
-    menu: tailhawk_core::menu::Menu,
     /// V9's rules editor — `UI-DESIGN.md` §5. On the shell rather than the document because the
     /// rules are the estate's, not one tab's; the palette is per-document because a query is.
     rules_editor: tailhawk_core::ruleset::Editor,
@@ -5045,8 +4861,6 @@ struct Shell {
     wizard_editing: Option<(WizardCell, TextField)>,
     /// §6.3's folder scan, while its findings are being chosen from.
     wizard_found: Vec<tailhawk_core::template::Found>,
-    /// §6.1's chip menu while it is down, and which row the keyboard is on.
-    format_menu: Option<usize>,
     /// Where `tailhawk.formats.toml` is looked for and written — `SPEC.md` §12.4's tiers.
     formats_tiers: Vec<PathBuf>,
     /// Rules from tiers the editor cannot write — a curated file beside the exe. Applied under
@@ -5385,17 +5199,6 @@ impl Shell {
         let status = self.status_text();
         let rules_overlay = self.rules_overlay();
         let wizard_overlay = self.wizard_overlay();
-        let format_menu = self.format_menu_rows();
-        // §2.2's bar, rebuilt against this frame's document so an item that cannot act is drawn
-        // disabled rather than offered — `menubar::menu_bar` explains why it is rebuilt and not
-        // cached. `Menu::rebuild` keeps the open path, so a menu does not shut under the user
-        // while a tail is arriving behind it.
-        self.menu.rebuild(menubar::menu_bar(
-            self.document.as_ref(),
-            theme().dark,
-            &self.settings.recent,
-        ));
-        let menu_frame = menu_frame_of(&self.menu);
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
@@ -5418,11 +5221,8 @@ impl Shell {
                         .take(6)
                         .map(|f| f.path.clone())
                         .collect();
-                    let mut welcome =
+                    let welcome =
                         Welcome::new(cell, (w, h), &recent, renderer.chrome_line_height()?);
-                    // The bar is the shell's — one bar per window, whatever is or is not open — and
-                    // this is the same handover `Document` gets a few lines below.
-                    welcome.menu_frame = menubar::menu_frame_of(&self.menu);
                     let laid = renderer.paint_rows(&welcome.view, &welcome)?;
                     rasterised = laid.rasterised;
                     self.welcome = Some(welcome);
@@ -5451,15 +5251,7 @@ impl Shell {
                     // whatever the split, and over the pane the user is looking at first.
                     doc.rules_overlay = if i == 0 { rules_overlay.clone() } else { None };
                     doc.wizard_overlay = if i == 0 { wizard_overlay.clone() } else { None };
-                    doc.format_menu = if i == 0 { format_menu.clone() } else { None };
 
-                    // The bar goes on the pane that carries the strip, for the reason the overlays
-                    // do: one bar per window, drawn once whatever the split.
-                    doc.menu_frame = if i == 0 {
-                        menu_frame.clone()
-                    } else {
-                        MenuFrame::default()
-                    };
                     doc.chrome_h = chrome_h;
                     doc.show_footer = i + 1 == pane_count;
                     doc.status = if doc.show_footer {
@@ -5982,7 +5774,6 @@ impl Shell {
         // resolved to today loses the instruction.
         self.theme_name = Some(name.to_owned());
         self.settings.theme = self.theme_name.clone();
-        self.menu = menubar::menu_bar(self.document.as_ref(), next.dark, &self.settings.recent);
         let specs = self.rule_specs.clone();
         for (_, doc) in self.document.all_mut() {
             rebuild_highlighter_with(doc, &specs);
@@ -6472,42 +6263,6 @@ impl Shell {
         self.rule_specs = specs;
         self.rules_failed = failed;
         self.retitle(hwnd);
-    }
-
-    /// §6.1's menu as this frame should draw it, or `None` when the chip is not open.
-    fn format_menu_rows(&self) -> Option<Vec<FormatRow>> {
-        let selected = self.format_menu?;
-        let doc = self.document.as_ref()?;
-        Some(format_menu_of(&doc.detection, selected))
-    }
-
-    /// §6.1's keys while the menu is down. Modal, as the palette is.
-    fn format_menu_key(&mut self, hwnd: HWND, key: u16) -> bool {
-        let Some(selected) = self.format_menu else {
-            return false;
-        };
-        let rows = match self.format_menu_rows() {
-            Some(rows) => rows,
-            None => {
-                self.format_menu = None;
-                return false;
-            }
-        };
-        match key {
-            k if k == VK_ESCAPE.0 => self.format_menu = None,
-            k if k == VK_UP.0 => self.format_menu = Some(format_menu_step(&rows, selected, -1)),
-            k if k == VK_DOWN.0 => self.format_menu = Some(format_menu_step(&rows, selected, 1)),
-            k if k == VK_RETURN.0 => {
-                let action = rows.get(selected).map(|row| row.action);
-                self.format_menu = None;
-                if let Some(action) = action {
-                    self.run_format_action(action);
-                }
-            }
-            // Every other key is swallowed: the menu is modal while it is down.
-            _ => {}
-        }
-        self.after_chrome_key(hwnd)
     }
 
     /// §6.1's choices: take a format, drop back to plain text, or open one of the wizard's doors.
@@ -7009,6 +6764,17 @@ impl Shell {
                 }
                 true
             }
+            id if (menubar::ID_FORMAT_BASE..menubar::ID_FORMAT_BASE + 64).contains(&id) => {
+                let at = (id - menubar::ID_FORMAT_BASE) as usize;
+                let action = self
+                    .document
+                    .as_ref()
+                    .and_then(|doc| format_menu_of(&doc.detection, 0).get(at).map(|r| r.action));
+                if let Some(action) = action {
+                    self.run_format_action(action);
+                }
+                true
+            }
             // Cut and Paste are permanently disabled — this is a viewer. If one is reached anyway
             // it does nothing, and says so by reporting `false`.
             menubar::ID_CUT | menubar::ID_PASTE | menubar::ID_UNLISTED => false,
@@ -7016,143 +6782,6 @@ impl Shell {
                 Some(command) => self.run(hwnd, command),
                 None => false,
             },
-        }
-    }
-
-    /// §2.2's keyboard: what the bar does with a key while it has the focus, and the one key that
-    /// gives it the focus in the first place.
-    ///
-    /// Reports whether the menu consumed the key. A `false` here means the key was never the
-    /// menu's and the grid's own handling must still run — so this is asked **first** and only
-    /// swallows what it actually used.
-    fn menu_key(&mut self, hwnd: HWND, key: u16) -> bool {
-        const LEFT: u16 = VK_LEFT.0;
-        const RIGHT: u16 = VK_RIGHT.0;
-        const UP: u16 = VK_UP.0;
-        const DOWN: u16 = VK_DOWN.0;
-        const RETURN: u16 = VK_RETURN.0;
-        const ESCAPE: u16 = VK_ESCAPE.0;
-
-        if !self.menu.is_focused() && !self.menu.is_open() {
-            return false;
-        }
-        let chosen = match key {
-            LEFT => {
-                self.menu.across(-1);
-                None
-            }
-            RIGHT => {
-                self.menu.across(1);
-                None
-            }
-            UP => {
-                self.menu.step(-1);
-                None
-            }
-            DOWN => {
-                // With the bar focused but nothing pulled down, `Down` is what opens the highlighted
-                // menu — the same as `Enter` on a heading, and what Windows' own bar does.
-                self.menu.step(1);
-                None
-            }
-            RETURN => self.menu.enter(),
-            ESCAPE => {
-                self.menu.escape();
-                None
-            }
-            _ => return false,
-        };
-        self.needs_frame = true;
-        if let Some(id) = chosen {
-            self.menu.close();
-            self.menu_choose(hwnd, id);
-        }
-        true
-    }
-
-    /// The pointer moving over §2.2's bar while a menu is down.
-    ///
-    /// **A menu tracks the pointer, and only a menu that is already open does.** With one heading
-    /// down, moving sideways along the bar opens each heading in turn without a click, and moving
-    /// down the list walks the highlight — which is what every menu bar on the system does, and
-    /// what a menu that needs a click for each step conspicuously does not. With nothing open the
-    /// bar ignores the pointer entirely, so merely crossing it on the way to the grid drops no
-    /// menu in front of the user.
-    ///
-    /// Reports whether the move **changed** anything, not merely whether it was over the menu:
-    /// `WM_MOUSEMOVE` arrives many times a second and a frame per message, for a highlight that has
-    /// not moved, is a redraw of the whole window for nothing.
-    /// What the bar has at `(x, y)`, asking whichever surface drew it this frame.
-    ///
-    /// **With a document that is `Chrome::menu_hits`; with none it is the welcome screen's.** Both
-    /// the hover and the click used to read only the document's, so once the last tab closed the bar
-    /// was drawn and could not be reached — the state in which `Open…` is the only thing a user
-    /// wants and the only thing they cannot get to.
-    fn menu_hit_at(&self, x: f32, y: f32) -> Option<menubar::MenuHit> {
-        match self.document.as_ref() {
-            Some(doc) => menubar::hit_at(&doc.chrome.menu_hits.borrow(), x, y),
-            None => menubar::hit_at(&self.welcome.as_ref()?.menu_hits.borrow(), x, y),
-        }
-    }
-
-    fn menu_hover(&mut self, x: f32, y: f32) -> bool {
-        if !self.menu.is_open() {
-            return false;
-        }
-        let hit = self.menu_hit_at(x, y);
-        let before = (
-            self.menu.open_path().to_vec(),
-            self.menu.selected().to_vec(),
-        );
-        match hit {
-            Some(MenuHit::Heading(i)) => self.menu.hover_top(i),
-            Some(MenuHit::Entry(i)) => {
-                let mut path = self.menu.open_path().to_vec();
-                path.push(i);
-                self.menu.hover(&path);
-            }
-            // Off the menu entirely: the open list stays as it is. Windows keeps the last
-            // highlight rather than clearing it, so a pointer that strays does not lose the row it
-            // was on.
-            None => return false,
-        }
-        let changed = before
-            != (
-                self.menu.open_path().to_vec(),
-                self.menu.selected().to_vec(),
-            );
-        if changed {
-            self.needs_frame = true;
-        }
-        changed
-    }
-
-    /// A click at `(x, y)` in the window, while §2.2's bar is drawn. Reports whether the menu took
-    /// it — including a click that only **shuts** the menu, which the grid must not also act on.
-    fn menu_click(&mut self, hwnd: HWND, x: f32, y: f32) -> bool {
-        let hit = self.menu_hit_at(x, y);
-        match hit {
-            // **What the click means is [`menubar::chosen_by_click`]'s to decide, not this
-            // function's.** It used to be decided inline here, where exercising it needed a window
-            // and a `Shell` — so it was never tested, and a defect lived in it: a click on a
-            // disabled item ran whatever the menu had highlighted. All that is left here is acting
-            // on the answer, which is the part that genuinely needs the shell.
-            Some(hit) => {
-                if let Some(id) = menubar::chosen_by_click(&mut self.menu, hit) {
-                    self.menu.close();
-                    self.menu_choose(hwnd, id);
-                }
-                self.needs_frame = true;
-                true
-            }
-            // A click anywhere else while a menu is down shuts it and is **swallowed** — the click
-            // that dismisses a menu should not also land on whatever was under it.
-            None if self.menu.is_open() || self.menu.is_focused() => {
-                self.menu.close();
-                self.needs_frame = true;
-                true
-            }
-            None => false,
         }
     }
 
@@ -7198,12 +6827,6 @@ impl Shell {
             }
             Command::ImportLayout => {
                 self.open_import();
-                return true;
-            }
-            // §6.1's menu is a click target on the chip; §13 wants a key to it too, and a
-            // control reachable only by mouse is one a screen reader cannot reach at all.
-            Command::FormatMenu => {
-                self.format_menu = Some(0);
                 return true;
             }
             Command::OpenRules => {
@@ -7345,7 +6968,6 @@ impl Shell {
             | Command::EditRules
             | Command::DefineFormat
             | Command::ImportLayout
-            | Command::FormatMenu
             | Command::OpenRules
             | Command::ReloadRules
             | Command::CloseTab => {}
@@ -7588,29 +7210,8 @@ impl Shell {
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
     /// chip is removed. Returns whether the click was the bar's.
     fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, extend: bool) -> bool {
-        // §6.1's menu is modal while it is down: a click on a row takes it, anywhere else closes.
-        if self.format_menu.is_some() {
-            let hit = self.document.as_ref().and_then(|doc| {
-                doc.chrome
-                    .format_hits
-                    .borrow()
-                    .iter()
-                    .find(|(range, _)| range.contains(&y))
-                    .map(|(_, row)| *row)
-            });
-            let action = hit.and_then(|row| {
-                self.format_menu_rows()
-                    .and_then(|rows| rows.get(row).map(|r| r.action))
-            });
-            self.format_menu = None;
-            if let Some(action) = action {
-                self.run_format_action(action);
-            }
-            return self.after_chrome_key(hwnd);
-        }
-        // §6.2's box is modal for the same reason §5's is: a click on the ruler picks a field, and
-        // a click anywhere else is swallowed rather than dragging a selection through log text
-        // the box is covering.
+        // §6.2's box is modal: a click on the ruler picks a field, and a click anywhere else is
+        // swallowed rather than dragging a selection through log text the box is covering.
         if self.wizard.is_some() {
             let hit = self.document.as_ref().and_then(|doc| {
                 doc.chrome
@@ -7716,21 +7317,6 @@ impl Shell {
         };
         match hit {
             Some(Hit::Tab(_)) => {}
-            // §6.1: the chip is the door to everything the format can be changed to. It opens on
-            // the row that is in force, so the first thing under the pointer is where you are.
-            Some(Hit::FormatChip) => {
-                let rows = format_menu_of(&doc.detection, 0);
-                let at = rows
-                    .iter()
-                    .position(|row| match row.action {
-                        FormatAction::Adopt(format) => doc.detection.accepted == Some(format),
-                        FormatAction::PlainText => doc.detection.accepted.is_none(),
-                        _ => false,
-                    })
-                    .unwrap_or(0);
-                self.format_menu = Some(at);
-                return self.after_chrome_key(hwnd);
-            }
             Some(Hit::Chip(i)) if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
                 doc.edit_chip(i);
             }
@@ -7917,14 +7503,6 @@ struct Welcome {
     /// The path a row opens when clicked, for the "Recent" rows.
     opens: Vec<Option<PathBuf>>,
     view: View,
-    /// §2.2's bar as it should be drawn this frame, handed over exactly as [`Document`] is handed
-    /// its own — because **the welcome screen needs the bar more than any other state does**. It is
-    /// what a user sees after closing the last tab, and `Open…` lives in that bar: without it there
-    /// is no way to open a file by mouse at all.
-    menu_frame: MenuFrame,
-    /// Where the bar drew its headings and items, so a click can be resolved. Same shape and same
-    /// purpose as `Chrome::menu_hits`.
-    menu_hits: std::cell::RefCell<menubar::MenuHits>,
 }
 
 impl Welcome {
@@ -7976,16 +7554,11 @@ impl Welcome {
         let mut view = View::new(cell_w, row_h);
         view.set_metrics(cell_w, row_h);
         view.set_viewport(size.0 as f32, size.1 as f32);
-        view.set_chrome_px(chrome_h + 6.0);
+        let _ = chrome_h;
+        view.set_chrome_px(0.0);
         view.grid_mut().set_total_rows(lines.len() as u64);
         view.hgrid_mut().set_columns(width_cells as u64 + 1);
-        Self {
-            lines,
-            opens,
-            view,
-            menu_frame: MenuFrame::default(),
-            menu_hits: std::cell::RefCell::new(Vec::new()),
-        }
+        Self { lines, opens, view }
     }
 
     /// The recent file a client `y` lands on, if any.
@@ -8002,26 +7575,6 @@ impl RowSource for Welcome {
 
     fn row_number(&self, _row: u64) -> Option<u64> {
         None
-    }
-
-    /// §2.2's bar, over the welcome text.
-    ///
-    /// Only the bar. There is no tab strip with no tabs, no command bar with nothing to search, and
-    /// no status bar with no file — drawing empty bands here would be chrome that lies about having
-    /// something in it. The bar is the exception because every one of its items is still reachable:
-    /// `Open…`, the keyboard map, About and Preferences all work with no document.
-    fn draw_chrome(&self, painter: &mut Painter, _view: &View) {
-        let width = self.view.gutter_px() + self.view.hgrid().viewport_px();
-        let mut hits = self.menu_hits.borrow_mut();
-        hits.clear();
-        let band = painter.chrome_line_height() + 6.0;
-        painter.fill(0.0, 0.0, width, band, theme().chrome_bg);
-        let (_, open_x) = menubar::draw_bar(painter, &self.menu_frame, &mut hits, 0.0, width);
-        menubar::draw_open_list(painter, &self.menu_frame, &mut hits, open_x, band, width);
-        // The harnesses aim at this window too — without the dump they click against whatever
-        // rects the previous instance left in the file, which is how verify-recent.ps1 first
-        // failed here.
-        menubar::dump_hits(&hits);
     }
 }
 
@@ -9867,59 +9420,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // system key; anything else with `Alt` stays the system's (the window menu, `Alt+F4`).
         WM_SYSKEYDOWN => {
             let key = wparam.0 as u16;
-            // §2.2: `Alt` alone focuses the bar and reveals the mnemonics; `Alt` again lets it go.
-            // It arrives as a system key, and swallowing it here is what stops Windows opening its
-            // own window menu underneath ours.
-            if key == VK_MENU.0 {
-                let took = STATE.with(|s| {
-                    s.borrow_mut().as_mut().is_some_and(|shell| {
-                        if shell.menu.is_focused() || shell.menu.is_open() {
-                            shell.menu.close();
-                        } else {
-                            shell.menu.focus();
-                        }
-                        shell.needs_frame = true;
-                        true
-                    })
-                });
-                if took {
-                    unsafe {
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
-                    return LRESULT(0);
-                }
-            }
-            // A mnemonic — `Alt+F` for File. Only while the bar is drawn, so `Alt`-chords the shell
-            // does not claim still reach the system.
-            if let Some(letter) = char::from_u32(key as u32).map(|c| c.to_ascii_lowercase()) {
-                let chosen = STATE.with(|s| {
-                    s.borrow_mut().as_mut().and_then(|shell| {
-                        let id = shell.menu.mnemonic(letter);
-                        // `mnemonic` returns `None` both for "no such mnemonic" and for "opened a
-                        // menu"; the open state is what tells them apart.
-                        let took = id.is_some() || shell.menu.is_open() || shell.menu.is_focused();
-                        took.then(|| {
-                            shell.needs_frame = true;
-                            id
-                        })
-                    })
-                });
-                if let Some(id) = chosen {
-                    if let Some(id) = id {
-                        STATE.with(|s| {
-                            if let Some(shell) = s.borrow_mut().as_mut() {
-                                shell.menu.close();
-                                shell.menu_choose(hwnd, id);
-                            }
-                        });
-                        // A command reached by mnemonic asks for its dialog exactly as one
-                        // reached by click does — without this, Alt+H,K sets the flag and the
-                        // dialog waits for whatever input happens next.
-                        run_pending_dialogs(hwnd);
-                    }
-                    return LRESULT(0);
-                }
-            }
+            // §2.2 as resettled: `Alt`, `F10` and the mnemonics belong to the real menu bar now —
+            // they fall through to `DefWindowProcW` below and Windows runs them. Only the chords
+            // the shell claims for itself are read here.
             if key == VK_LEFT.0 || key == VK_RIGHT.0 {
                 let moved = STATE.with(|s| {
                     s.borrow_mut().as_mut().is_some_and(|shell| {
@@ -9941,26 +9444,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         }
         WM_KEYDOWN => {
             let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-            // §2.2's bar takes the arrows, `Enter` and `Esc` **only while it has the focus**, and
-            // says so by reporting whether it used the key — so nothing below is shadowed when the
-            // menu is down.
-            if !ctrl {
-                let took = STATE.with(|s| {
-                    s.borrow_mut()
-                        .as_mut()
-                        .is_some_and(|shell| shell.menu_key(hwnd, wparam.0 as u16))
-                });
-                if took {
-                    // The window is otherwise idle; nothing else will ask for the frame that shows
-                    // the menu having moved. And Enter on a menu item may have queued a dialog,
-                    // which must open on this keystroke, not the next one.
-                    run_pending_dialogs(hwnd);
-                    unsafe {
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
-                    return LRESULT(0);
-                }
-            }
             // `VIRTUAL_KEY` is a newtype, so its constants cannot appear in a pattern — bare
             // `VK_UP` there binds a variable and matches everything, which compiles into a keyboard
             // where every key is `Up`. Comparing the raw code keeps them as patterns.
@@ -9997,8 +9480,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
-                    shell.format_menu_key(hwnd, wparam.0 as u16)
-                        || shell.wizard_key(hwnd, wparam.0 as u16, ctrl, shift)
+                    shell.wizard_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.rules_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.view_key(hwnd, wparam.0 as u16, ctrl)
@@ -10182,8 +9664,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 // which pane the contact is in, whether a second finger may take a pan in progress,
                 // whether the point is on rows rather than chrome, and whether a capture change is
                 // even about this contact.
-                let covered = shell.menu.is_open()
-                    || shell.rules_editor.is_open()
+                let covered = shell.rules_editor.is_open()
                     || shell.wizard.is_some()
                     || shell.document.as_ref().is_some_and(|d| d.palette.is_open());
                 let tops: Vec<f32> = shell.document.panes().iter().map(|d| d.pane_top).collect();
@@ -10273,25 +9754,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     }
                 }
                 let y = y - shell.document.as_ref().map_or(0.0, |d| d.pane_top);
-                // §2.2's bar, before anything else can claim the click. It is the topmost surface
-                // on the window, and a click it takes — including one that only dismisses an open
-                // menu — must not also reach the chrome or the grid underneath.
-                if msg == WM_LBUTTONDOWN && shell.menu_click(hwnd, x, y) {
-                    unsafe {
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
-                    return;
-                }
-                // An open menu tracks the pointer. It also **swallows** the move: while a list is
-                // down, the grid must not be hovering rows underneath it.
-                if msg == WM_MOUSEMOVE && shell.menu.is_open() {
-                    if shell.menu_hover(x, y) {
-                        unsafe {
-                            let _ = InvalidateRect(hwnd, None, false);
-                        }
-                    }
-                    return;
-                }
                 // No document: the welcome surface — a click on a recent file opens it.
                 if shell.document.panes().is_empty() {
                     if msg == WM_LBUTTONDOWN {
@@ -10435,6 +9897,46 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // A command reached from the **menu** asks for its dialog exactly as one reached from
             // the keyboard does, and this is the call that was missing.
             run_pending_dialogs(hwnd);
+            LRESULT(0)
+        }
+        WM_INITMENUPOPUP => {
+            // §2.2 as resettled: the popup about to show is refilled from the live document, so a
+            // real menu can never show stale enablement, a stale check, or last week's recents.
+            let popup = HMENU(wparam.0 as *mut _);
+            let bar = unsafe { GetMenu(hwnd) };
+            let top =
+                (0..16).find(|&i| unsafe { GetSubMenu(bar, i) }.0 == popup.0 && !popup.0.is_null());
+            if let Some(top) = top {
+                let tree = STATE.with(|s| {
+                    s.borrow().as_ref().map(|shell| {
+                        menubar::menu_bar(
+                            shell.document.as_ref(),
+                            theme().dark,
+                            &shell.settings.recent,
+                        )
+                    })
+                });
+                if let Some(tree) = tree {
+                    menubar::refill_popup(popup, &tree, top as usize);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_COMMAND if (wparam.0 >> 16) & 0xFFFF == 0 && lparam.0 == 0 => {
+            // The real menu chose an id; it routes through the same register and dispatch every
+            // other surface uses, and a chosen dialog opens on this message, not the next one.
+            let id = (wparam.0 & 0xFFFF) as u32;
+            let acted = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| shell.menu_choose(hwnd, id))
+            });
+            run_pending_dialogs(hwnd);
+            if acted {
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
             LRESULT(0)
         }
         WM_VSCROLL => {
@@ -10884,7 +10386,6 @@ fn main() -> Result<()> {
     }
 
     let chosen_face = settings.font.clone();
-    let menu = menubar::menu_bar(None, theme().dark, &settings.recent);
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
             cell_w: 0.0,
@@ -10921,14 +10422,12 @@ fn main() -> Result<()> {
             fling_on: None,
             dragging_bar: None,
             welcome: None,
-            menu,
             remembered,
             rules_editor: tailhawk_core::ruleset::Editor::default(),
             wizard: None,
             wizard_selected: 0,
             wizard_editing: None,
             wizard_found: Vec::new(),
-            format_menu: None,
             formats_tiers,
             rules_fixed: Vec::new(),
             rule_specs,
@@ -10958,6 +10457,22 @@ fn main() -> Result<()> {
     };
     // §2.1: the frame follows the theme — a dark title bar under a dark theme, and Mica behind it.
     dress_frame(hwnd, theme().dark);
+
+    // §2.2 as resettled: the menu bar is Windows' own. Content is built once here; every popup is
+    // refilled from the live document at the moment it opens, in `WM_INITMENUPOPUP`.
+    {
+        let recent = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|shell| shell.settings.recent.clone())
+                .unwrap_or_default()
+        });
+        if let Some(bar) = menubar::build_bar(&menubar::menu_bar(None, theme().dark, &recent)) {
+            unsafe {
+                let _ = SetMenu(hwnd, bar);
+            }
+        }
+    }
 
     unsafe {
         // The title bar's mark. The class carries the large icon, which is what the taskbar and
@@ -11155,15 +10670,10 @@ mod tests {
     fn navigating_moves_by_the_amounts_the_key_map_promises() {
         let path = scratch_log("tailhawk_nav_test.log", 5_000);
         let mut doc = Document::open(&path).expect("open the fixture");
-        // 20 rows of 10 px in a 200 px grid — plus the command bar's band above and the status
-        // bar's below.
-        doc.lay_out(
-            (8.0, 10.0),
-            (
-                800,
-                200 + Chrome::height(10.0) as u32 + Chrome::strip_height(10.0) as u32,
-            ),
-        );
+        // 20 rows of 10 px in a 200 px grid — plus the status bar's band below. The top carries
+        // nothing now: the menu is Windows' own outside the client area, the command bar is gone,
+        // and one tab draws no strip.
+        doc.lay_out((8.0, 10.0), (800, 200 + Chrome::strip_height(10.0) as u32));
         assert_eq!(doc.set.total_rows(), 5_000);
         // A tail tool opens at the tail, following.
         assert_eq!(doc.view.grid().scroll().row, 4_980);
@@ -13922,24 +13432,6 @@ mod tests {
             "§6.1 shows the runner-up under a 15% margin so a near-miss is visible"
         );
         assert!(close[1].label.contains("log4net"));
-    }
-
-    #[test]
-    fn stepping_the_chip_menu_skips_the_rule_between_its_groups() {
-        let rows = format_menu_of(&a_detection(true, false), 0);
-        let rule = rows
-            .iter()
-            .position(|r| r.action == FormatAction::Separator)
-            .expect("a separator");
-        assert_eq!(
-            format_menu_step(&rows, rule - 1, 1),
-            rule + 1,
-            "down from the last row of a group lands past the rule, not on it"
-        );
-        assert_eq!(format_menu_step(&rows, rule + 1, -1), rule - 1);
-        assert_eq!(format_menu_step(&rows, 0, -1), 0, "the top does not wrap");
-        let last = rows.len() - 1;
-        assert_eq!(format_menu_step(&rows, last, 1), last, "nor the bottom");
     }
 
     #[test]

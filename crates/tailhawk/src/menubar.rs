@@ -6,95 +6,85 @@
 //! menu knows is here: what the six menus contain, how a command's id relates to the register, and
 //! how the model becomes one frame's picture. Where the pixels go is `Document::draw_menu_bar`.
 
+use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreateMenu, CreatePopupMenu, DeleteMenu, GetMenuItemCount, HMENU, MF_BYPOSITION,
+    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+};
+
 use crate::{Command, Document};
 
-/// What a click on the menu bar landed on.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum MenuHit {
-    /// A heading on the bar row: opens it, or shuts it if it is already down.
-    Heading(usize),
-    /// An item of the open list.
-    Entry(usize),
+/// The bar's [`tailhawk_core::menu::Item`] tree as a **real Win32 menu** — §2.2 as resettled by
+/// the owner: Windows draws the menus, tracks the mouse, walks the keyboard and answers the
+/// screen reader; this maps the tested content into them and nothing more.
+pub fn build_bar(menu: &tailhawk_core::menu::Menu) -> Option<HMENU> {
+    let bar = unsafe { CreateMenu() }.ok()?;
+    for top in menu.items() {
+        append_item(bar, top);
+    }
+    Some(bar)
 }
 
-/// One heading of the bar, as a frame draws it.
-#[derive(Clone)]
-pub struct MenuHeading {
-    pub text: String,
-    /// Where the underline goes, as a **character** offset into `text`; `None` when the label marks
-    /// no mnemonic. Drawn only once `Alt` has been asked for, as Windows does.
-    pub mnemonic: Option<usize>,
-    pub open: bool,
-    pub enabled: bool,
-}
-
-/// One item of the list hanging below an open heading.
-#[derive(Clone)]
-pub struct MenuEntry {
-    pub text: String,
-    pub accelerator: String,
-    pub checked: bool,
-    pub submenu: bool,
-    pub separator: bool,
-    pub enabled: bool,
-    pub selected: bool,
-}
-
-/// §2.2's bar as one frame should draw it.
-#[derive(Clone, Default)]
-pub struct MenuFrame {
-    pub headings: Vec<MenuHeading>,
-    /// Which heading is down, when one is.
-    pub open: Option<usize>,
-    pub entries: Vec<MenuEntry>,
-    /// `Alt` has been pressed: the underlines appear, and not before.
-    pub show_mnemonics: bool,
-}
-
-/// The picture of `menu` for one frame.
-///
-/// Free rather than a method, for the reason `rules_overlay_of` is: it is pure mapping over the
-/// model, it can be tested with no window, and it is the one place the drawn menu's reading of the
-/// model is decided.
-pub fn menu_frame_of(menu: &tailhawk_core::menu::Menu) -> MenuFrame {
-    use tailhawk_core::menu::Kind;
-    let selected = menu.selected();
-    let open_top = menu.open_path().first().copied().filter(|_| menu.is_open());
-    MenuFrame {
-        headings: menu
-            .items()
-            .iter()
-            .enumerate()
-            .map(|(i, item)| MenuHeading {
-                text: item.text(),
-                mnemonic: item.mnemonic_at(),
-                open: open_top == Some(i),
-                enabled: item.selectable(),
-            })
-            .collect(),
-        open: open_top,
-        entries: match (menu.is_open(), menu.at(menu.open_path())) {
-            (true, Some(items)) => items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| MenuEntry {
-                    text: item.text(),
-                    accelerator: item.accelerator.clone(),
-                    checked: item.checked,
-                    submenu: item.kind == Kind::Submenu,
-                    separator: item.kind == Kind::Separator,
-                    enabled: item.enabled,
-                    selected: selected.len() == menu.open_path().len() + 1
-                        && selected.last() == Some(&i),
-                })
-                .collect(),
-            _ => Vec::new(),
-        },
-        // §2.2: `Alt` alone focuses the bar, and that is when the underlines appear.
-        show_mnemonics: menu.is_focused() || menu.is_open(),
+/// Replaces `popup`'s contents with the current tree's menu `top` — the `WM_INITMENUPOPUP`
+/// moment, which is how a real menu shows this instant's enablement, checks, recent files and
+/// format candidates without being rebuilt while it is on screen.
+pub fn refill_popup(popup: HMENU, menu: &tailhawk_core::menu::Menu, top: usize) {
+    unsafe {
+        while GetMenuItemCount(popup) > 0 {
+            let _ = DeleteMenu(popup, 0, MF_BYPOSITION);
+        }
+    }
+    if let Some(items) = menu.at(&[top]) {
+        for child in items {
+            append_item(popup, child);
+        }
     }
 }
 
+fn append_item(into: HMENU, item: &tailhawk_core::menu::Item) {
+    use tailhawk_core::menu::Kind;
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    unsafe {
+        match item.kind {
+            Kind::Separator => {
+                let _ = AppendMenuW(into, MF_SEPARATOR, 0, PCWSTR::null());
+            }
+            Kind::Submenu => {
+                let Ok(popup) = CreatePopupMenu() else { return };
+                for child in &item.items {
+                    append_item(popup, child);
+                }
+                let mut flags = MF_POPUP | MF_STRING;
+                if !item.enabled {
+                    flags |= MF_GRAYED;
+                }
+                let label = wide(&item.label);
+                let _ = AppendMenuW(into, flags, popup.0 as usize, PCWSTR(label.as_ptr()));
+            }
+            Kind::Command | Kind::Check => {
+                let mut flags = MF_STRING;
+                if !item.enabled {
+                    flags |= MF_GRAYED;
+                }
+                if item.checked {
+                    flags |= MF_CHECKED;
+                }
+                let label = if item.accelerator.is_empty() {
+                    item.label.clone()
+                } else {
+                    format!("{}\t{}", item.label, item.accelerator)
+                };
+                let label = wide(&label);
+                let _ = AppendMenuW(
+                    into,
+                    flags,
+                    item.id.unwrap_or(ID_UNLISTED) as usize,
+                    PCWSTR(label.as_ptr()),
+                );
+            }
+        }
+    }
+}
 /// A command's id inside a [`tailhawk_core::menu::Item`] — its index in `Command::LISTED`, the
 /// register the palette draws from too.
 ///
@@ -131,9 +121,12 @@ pub const ID_PASTE: u32 = 10_006;
 pub const ID_FONT: u32 = 10_007;
 pub const ID_PREFS: u32 = 10_008;
 pub const ID_CLEAR_RECENT: u32 = 10_009;
-/// File ▸ Open Recent's entries: `ID_RECENT_BASE + n` opens the n-th newest, for the shell to
-/// resolve against the list it passed in. A range, because the entries are data, not commands.
+/// File's recent entries: `ID_RECENT_BASE + n` opens the n-th newest, for the shell to resolve
+/// against the list it passed in. A range, because the entries are data, not commands.
 pub const ID_RECENT_BASE: u32 = 10_100;
+/// Format ▸ Log format's rows, the same way: `ID_FORMAT_BASE + n` is the n-th row of
+/// [`crate::format_menu_of`]'s answer, resolved back through it when chosen.
+pub const ID_FORMAT_BASE: u32 = 10_200;
 
 /// §2.2's seven menus, built from the command register each time the bar is opened.
 ///
@@ -300,7 +293,33 @@ pub fn menu_bar(
         Item::submenu(
             "F&ormat",
             vec![
-                on(cmd("&Log format…", "", Command::FormatMenu), open),
+                {
+                    // §6.1's format choices as a real radio-marked submenu — the right-edge chip
+                    // and its bespoke dropdown retire. Rows are data from the live detection, so
+                    // they carry range ids like the recent files do; a literal `&` in a format
+                    // name is doubled so it draws as itself.
+                    let rows: Vec<Item> = doc
+                        .map(|d| {
+                            d.format_rows()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (label, current, separator))| {
+                                    if separator {
+                                        Item::separator()
+                                    } else {
+                                        Item::check(
+                                            &label.replace('&', "&&"),
+                                            "",
+                                            ID_FORMAT_BASE + i as u32,
+                                            current,
+                                        )
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    on(Item::submenu("&Log format", rows), open)
+                },
                 on(cmd("&Define from a line…", "", Command::DefineFormat), open),
                 on(cmd("&Import layout…", "", Command::ImportLayout), open),
                 Item::separator(),
@@ -379,286 +398,6 @@ fn compact_path(path: &str, max: usize) -> String {
     let head: String = chars[..6].iter().collect();
     let tail: String = chars[chars.len() - (max - 7)..].iter().collect();
     format!("{head}…{tail}")
-}
-
-/// What was drawn where, so a click can be resolved: an x-range, a y-range, and what is there.
-///
-/// **Both axes, unlike the command bar's hits.** The bar is one row, so x alone tells you which
-/// heading was clicked — but the list below it is a *column* of rows that all share the same
-/// x-range, and an x-only hit would resolve every one of them to the first. §6.2's ruler learned
-/// the same lesson and carries both; this follows it.
-pub type MenuHits = Vec<(std::ops::Range<f32>, std::ops::Range<f32>, MenuHit)>;
-
-/// The bar row's height for a chrome line height.
-///
-/// Sized from the **chrome face** rather than the grid's row: §1.1 draws the chrome in the system
-/// UI font, so a bar measured in grid rows is a band too tall for the text sitting in it.
-pub fn bar_height(chrome_h: f32) -> f32 {
-    (chrome_h + 6.0).round()
-}
-
-/// Draws §2.2's bar row at `top`. Returns its height and the x the open heading sits at, which is
-/// where [`draw_open_list`] will hang the list from.
-///
-/// **The row and the list are two calls, and that is forced by paint order.** The list hangs down
-/// over the tab strip, the command bar and the grid; whatever is drawn after it covers it. So the
-/// caller draws this row first — it is part of the chrome band and the strip below it must not be
-/// painted over — then everything else, then the list last of all.
-pub fn draw_bar(
-    painter: &mut tailhawk_core::paint::Painter,
-    frame: &MenuFrame,
-    hits: &mut MenuHits,
-    top: f32,
-    width: f32,
-) -> (f32, f32) {
-    use tailhawk_core::theme::theme;
-
-    hits.clear();
-    if frame.headings.is_empty() {
-        return (0.0, 0.0);
-    }
-    let chrome_h = painter.chrome_line_height();
-    let pad = painter.chrome_measure("n").max(4.0);
-    let bar_h = bar_height(chrome_h);
-    let text_y = top + ((bar_h - chrome_h) * 0.5).floor();
-
-    painter.fill(0.0, top, width, bar_h, theme().chrome_bg);
-
-    let mut x = pad * 0.5;
-    let mut open_x = x;
-    for (i, head) in frame.headings.iter().enumerate() {
-        let label_w = painter.chrome_measure(&head.text);
-        let box_w = label_w + pad * 2.0;
-        if head.open {
-            painter.fill(x, top, box_w, bar_h, theme().palette_selected_bg);
-            open_x = x;
-        }
-        let ink = if head.enabled {
-            theme().ink
-        } else {
-            theme().field_hint
-        };
-        painter.chrome_run(&head.text, x + pad, text_y, ink);
-        // §2.2: the underlines appear once `Alt` has been asked for, and not before — a bar that
-        // shows them always is noisier than the system's own and teaches nothing extra.
-        if frame.show_mnemonics {
-            if let Some(at) = head.mnemonic {
-                let before: String = head.text.chars().take(at).collect();
-                let letter: String = head.text.chars().skip(at).take(1).collect();
-                let ux = x + pad + painter.chrome_measure(&before);
-                let uw = painter.chrome_measure(&letter);
-                painter.fill(ux, text_y + chrome_h - 1.0, uw, 1.0, ink);
-            }
-        }
-        hits.push((x..x + box_w, top..top + bar_h, MenuHit::Heading(i)));
-        x += box_w;
-    }
-
-    (bar_h, open_x)
-}
-
-/// The list under the open heading, if one is open. Drawn **last in the frame**, over everything
-/// the chrome and the grid have put down — see [`draw_bar`].
-pub fn draw_open_list(
-    painter: &mut tailhawk_core::paint::Painter,
-    frame: &MenuFrame,
-    hits: &mut MenuHits,
-    open_x: f32,
-    top: f32,
-    width: f32,
-) {
-    if frame.open.is_none() || frame.entries.is_empty() {
-        return;
-    }
-    let chrome_h = painter.chrome_line_height();
-    let pad = painter.chrome_measure("n").max(4.0);
-    draw_list(painter, frame, hits, open_x, top, width, chrome_h, pad);
-}
-
-/// The list hanging below an open heading.
-///
-/// The three columns — tick gutter, label, accelerator — are each measured across **every** entry
-/// and then shared, so the accelerators line up down the menu instead of ragging against their
-/// labels. §1.2's learnability rule is what wants that: an accelerator is only teachable if it
-/// reads as a column.
-#[allow(clippy::too_many_arguments)]
-fn draw_list(
-    painter: &mut tailhawk_core::paint::Painter,
-    frame: &MenuFrame,
-    hits: &mut MenuHits,
-    x: f32,
-    top: f32,
-    width: f32,
-    chrome_h: f32,
-    pad: f32,
-) {
-    use tailhawk_core::theme::theme;
-
-    let row_h = (chrome_h + 4.0).round();
-    let rule_h = (row_h * 0.5).round();
-    // **U+25CF, not U+2713.** The chrome face is Segoe UI Variable Text, which has no check mark:
-    // `the_chrome_face_has_the_markers_the_chrome_draws` fails on it, and a face with no per-glyph
-    // fallback draws a missing glyph as a box. The rules editor reached the same dot for the same
-    // reason.
-    let tick = "\u{25CF}";
-    let arrow = "\u{25BA}";
-    let tick_w = painter
-        .chrome_measure(tick)
-        .max(painter.chrome_measure(arrow));
-    let label_w = frame
-        .entries
-        .iter()
-        .map(|e| painter.chrome_measure(&e.text))
-        .fold(0.0f32, f32::max);
-    let key_w = frame
-        .entries
-        .iter()
-        .map(|e| painter.chrome_measure(&e.accelerator))
-        .fold(0.0f32, f32::max);
-
-    let box_w = (pad + tick_w + pad + label_w + pad * 3.0 + key_w + pad).min(width);
-    // A menu opened under the rightmost heading would otherwise run off the edge; the system
-    // slides it left until it fits, and so does this.
-    let box_x = x.min((width - box_w).max(0.0));
-    let box_h = frame
-        .entries
-        .iter()
-        .map(|e| if e.separator { rule_h } else { row_h })
-        .sum::<f32>()
-        + 6.0;
-
-    painter.fill(box_x, top, box_w, box_h, theme().palette_bg);
-    // The command bar sits directly under this box and its text is already queued. Chrome text is
-    // composited over every fill, so without this the search field's placeholder reads straight
-    // through the open menu — see [`Painter::occlude_chrome`].
-    painter.occlude_chrome(box_x, top, box_w, box_h);
-    painter.fill(box_x, top, box_w, 1.0, theme().pane_edge);
-    painter.fill(box_x, top + box_h - 1.0, box_w, 1.0, theme().pane_edge);
-    painter.fill(box_x, top, 1.0, box_h, theme().pane_edge);
-    painter.fill(box_x + box_w - 1.0, top, 1.0, box_h, theme().pane_edge);
-
-    let mut y = top + 3.0;
-    for (i, entry) in frame.entries.iter().enumerate() {
-        if entry.separator {
-            painter.fill(
-                box_x + pad,
-                y + (rule_h * 0.5).floor(),
-                box_w - pad * 2.0,
-                1.0,
-                theme().pane_edge,
-            );
-            // A separator is still given a rect. It is not selectable, but a click that lands on
-            // one must be swallowed by the menu rather than falling through to the grid behind it.
-            hits.push((box_x..box_x + box_w, y..y + rule_h, MenuHit::Entry(i)));
-            y += rule_h;
-            continue;
-        }
-        if entry.selected {
-            painter.fill(box_x, y, box_w, row_h, theme().palette_selected_bg);
-        }
-        let ink = if entry.enabled {
-            theme().ink
-        } else {
-            theme().field_hint
-        };
-        let text_y = y + ((row_h - chrome_h) * 0.5).floor();
-        if entry.checked {
-            painter.chrome_run(tick, box_x + pad, text_y, ink);
-        }
-        painter.chrome_run(&entry.text, box_x + pad + tick_w + pad, text_y, ink);
-        if entry.submenu {
-            let ax = box_x + box_w - pad - painter.chrome_measure(arrow);
-            painter.chrome_run(arrow, ax, text_y, theme().field_hint);
-        } else if !entry.accelerator.is_empty() {
-            let kx = box_x + box_w - pad - painter.chrome_measure(&entry.accelerator);
-            // The accelerator is always the hint ink, even on a disabled row: it is teaching the
-            // key, not offering the action.
-            painter.chrome_run(&entry.accelerator, kx, text_y, theme().field_hint);
-        }
-        hits.push((box_x..box_x + box_w, y..y + row_h, MenuHit::Entry(i)));
-        y += row_h;
-    }
-}
-
-/// What a click on `hit` does to the menu, and the command id it chose if it chose one.
-///
-/// **The decision lives here, apart from the shell, so it can be tested.** It used to be inline in
-/// `Shell::menu_click`, where it needed a window and a `Shell` to exercise and so was never tested
-/// at all — which is how the defect below survived being written.
-///
-/// A click on an item that cannot be chosen — disabled, or a separator — **does nothing**. That is
-/// §1.1's rule and it is not automatic: `Menu::hover` declines to move onto a non-selectable item,
-/// which is right on its own, but a handler that hovers and then calls `Menu::enter` inherits the
-/// selection hover left alone and runs *that*. §2.2's Settings menu opens with `Dark theme`
-/// highlighted, so clicking the greyed `Preferences…` toggled the theme. Every disabled item in
-/// every menu carried the same hazard.
-pub fn chosen_by_click(menu: &mut tailhawk_core::menu::Menu, hit: MenuHit) -> Option<u32> {
-    match hit {
-        MenuHit::Heading(i) => {
-            // A second click on the open heading shuts it, as every menu bar does.
-            if menu.is_open() && menu.open_path().first() == Some(&i) {
-                menu.close();
-            } else {
-                menu.open_top(i);
-            }
-            None
-        }
-        MenuHit::Entry(i) => {
-            let mut path = menu.open_path().to_vec();
-            path.push(i);
-            // The guard the defect above needs. Without it `hover` declines, the old selection
-            // stands, and `enter` runs it.
-            if !menu
-                .item(&path)
-                .is_some_and(tailhawk_core::menu::Item::selectable)
-            {
-                return None;
-            }
-            menu.hover(&path);
-            menu.enter()
-        }
-    }
-}
-
-/// The hit a click at `(x, y)` landed on, if any.
-///
-/// Searched **last to first** so the open list wins over the bar row it overlaps. Nothing else
-/// depends on the order the rects were pushed in.
-/// Writes where the bar drew every heading and item, for `tools/verify-menus.ps1`.
-///
-/// **Only when `TAILHAWK_DUMP_MENU_HITS` names a file**, and it exists because a harness that clicks
-/// menu items has to know where they are. Guessing a uniform row pitch does not work: a separator is
-/// drawn shorter than an item, so the error accumulates down the list and the sweep ends up clicking
-/// something other than what it reports. It clicked `Exit` while believing it had clicked a
-/// separator, which is exactly the sort of false finding a sweep exists to avoid.
-///
-/// One line per rect: `kind index x0 y0 x1 y1`, client coordinates.
-pub fn dump_hits(hits: &MenuHits) {
-    let Some(path) = std::env::var_os("TAILHAWK_DUMP_MENU_HITS") else {
-        return;
-    };
-    use std::io::Write;
-    let Ok(mut f) = std::fs::File::create(path) else {
-        return;
-    };
-    for (xs, ys, hit) in hits {
-        let (kind, i) = match hit {
-            MenuHit::Heading(i) => ("heading", *i),
-            MenuHit::Entry(i) => ("entry", *i),
-        };
-        let _ = writeln!(
-            f,
-            "{kind} {i} {} {} {} {}",
-            xs.start, ys.start, xs.end, ys.end
-        );
-    }
-}
-
-pub fn hit_at(hits: &MenuHits, x: f32, y: f32) -> Option<MenuHit> {
-    hits.iter()
-        .rev()
-        .find(|(xs, ys, _)| xs.contains(&x) && ys.contains(&y))
-        .map(|(_, _, hit)| *hit)
 }
 
 #[cfg(test)]
@@ -746,121 +485,9 @@ mod tests {
                 }
             }
         }
-        assert!(bare.is_empty(), "these items mark no mnemonic: {bare:#?}");
-    }
-
-    /// **An open menu survives the per-frame rebuild.** This is the exact sequence the shell runs:
-    /// a click opens a heading, and then the very next frame rebuilds the tree from the register.
-    /// If the rebuild dropped the open path the menu would shut within milliseconds of being
-    /// opened — and on a tailing file, frames never stop, so it would never appear at all.
-    #[test]
-    fn an_open_menu_survives_the_rebuild_the_next_frame_does() {
-        let mut menu = menu_bar(None, false, &[]);
-        menu.open_top(0);
-        assert!(menu.is_open(), "open_top did not open the menu");
-
-        for _ in 0..5 {
-            menu.rebuild(menu_bar(None, false, &[]));
-        }
-        assert!(menu.is_open(), "the rebuild shut the menu");
-
-        let frame = menu_frame_of(&menu);
-        assert_eq!(frame.open, Some(0), "the frame lost which menu is down");
-        assert!(!frame.entries.is_empty(), "the frame drew an empty list");
-    }
-
-    /// The same for `Alt` alone: focus is a state the rebuild must carry, or the mnemonics flash
-    /// for one frame and vanish.
-    #[test]
-    fn alt_focus_survives_the_rebuild_the_next_frame_does() {
-        let mut menu = menu_bar(None, false, &[]);
-        menu.focus();
-        assert!(menu.is_focused(), "focus() did not focus the bar");
-
-        for _ in 0..5 {
-            menu.rebuild(menu_bar(None, false, &[]));
-        }
-        assert!(menu.is_focused(), "the rebuild dropped the focus");
-        assert!(menu_frame_of(&menu).show_mnemonics);
-    }
-
-    /// **Clicking a disabled item chooses nothing — in every menu, not just the one reported.**
-    ///
-    /// The owner found that clicking the greyed `Preferences…` in Settings toggled the theme. The
-    /// cause is a trap in composing two correct pieces: `Menu::hover` declines to move onto a
-    /// non-selectable item, and a handler that then calls `Menu::enter` runs whatever was
-    /// highlighted instead. Settings opens with `Dark theme` highlighted.
-    ///
-    /// This drives [`chosen_by_click`] — the real decision the shell makes — rather than a
-    /// predicate invented alongside the fix. Remove the guard from that function and this fails.
-    #[test]
-    fn clicking_a_disabled_item_chooses_nothing() {
-        let reference = menu_bar(None, false, &[]);
-        for top in 0..reference.items().len() {
-            let Some(items) = reference.at(&[top]).map(<[_]>::to_vec) else {
-                continue;
-            };
-            for (i, item) in items.iter().enumerate() {
-                if item.selectable() {
-                    continue;
-                }
-                let mut menu = menu_bar(None, false, &[]);
-                menu.open_top(top);
-                let chosen = chosen_by_click(&mut menu, MenuHit::Entry(i));
-                assert_eq!(
-                    chosen,
-                    None,
-                    "clicking the disabled {:?} in {:?} chose a command",
-                    item.text(),
-                    reference.items()[top].text()
-                );
-            }
-        }
-    }
-
-    /// The exact case the owner reported, named so a regression is recognisable rather than merely
-    /// a failing assertion.
-    ///
-    /// **Originally written against the greyed `Preferences`**, which used to toggle the theme when
-    /// clicked because the menu ran whatever it had highlighted rather than what was under the
-    /// pointer. `Preferences` is built now, so the guard moved.
-    ///
-    /// **It moved to Rules and not to Edit, and the difference is whether the test can fail.** The
-    /// bug ran the menu's *highlighted* entry, which is the first selectable one — so a menu whose
-    /// every entry is disabled cannot exhibit it, and with no document open that is exactly what
-    /// Edit is. Rules opens with `Highlight rules…` enabled above a disabled `Clear labels`, so
-    /// removing the guard makes this return `EditRules`. Verified by doing that.
-    #[test]
-    fn clicking_a_greyed_item_chooses_nothing() {
-        let mut menu = menu_bar(None, false, &[]);
-        let rules = menu
-            .items()
-            .iter()
-            .position(|i| i.text() == "Rules")
-            .expect("a Rules menu");
-        menu.open_top(rules);
-
-        let items = menu.at(&[rules]).expect("Rules has items").to_vec();
         assert!(
-            items
-                .iter()
-                .any(|i| i.selectable() && i.text().starts_with("Highlight rules")),
-            "the test needs an enabled entry for the bug to have something to run"
-        );
-        let greyed = items
-            .iter()
-            .position(|i| i.text().starts_with("Clear labels"))
-            .expect("a Clear labels item");
-        assert!(
-            !items[greyed].selectable(),
-            "Clear labels needs a document, so with none it is greyed"
-        );
-
-        assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(greyed)),
-            None,
-            "a greyed item chose a command — without the guard this returns EditRules, the first \
-             selectable entry, which is what the menu had highlighted"
+            bare.is_empty(),
+            "choosable items with no mnemonic: {bare:?}"
         );
     }
 
@@ -890,57 +517,6 @@ mod tests {
                 "{label} is built now and must be reachable with no document open"
             );
         }
-    }
-
-    /// The other half: an enabled item still chooses its command, or the guard would deaden the
-    /// whole menu and the first test would pass for the wrong reason.
-    #[test]
-    fn clicking_an_enabled_item_still_chooses_it() {
-        let mut menu = menu_bar(None, false, &[]);
-        menu.open_top(0); // File — `Open…` is never disabled.
-        assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(0)),
-            Some(command_id(Command::OpenFile))
-        );
-    }
-
-    /// A recent entry is chosen like any other item — flat, no descent — and Clear rides with it.
-    #[test]
-    fn clicking_a_recent_entry_chooses_its_file() {
-        let paths = vec![r"C:\logs\a.log".to_owned()];
-        let mut menu = menu_bar(None, false, &paths);
-        menu.open_top(0);
-        let file = menu.at(&[0]).expect("File opens").to_vec();
-        let entry = file
-            .iter()
-            .position(|i| i.text().ends_with("a.log"))
-            .expect("the file is an entry of File");
-        assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(entry)),
-            Some(ID_RECENT_BASE),
-            "the newest file is chosen directly"
-        );
-        let mut menu = menu_bar(None, false, &paths);
-        menu.open_top(0);
-        assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(entry + 1)),
-            Some(ID_CLEAR_RECENT)
-        );
-    }
-
-    /// A click on a heading opens it, and a second click shuts it.
-    #[test]
-    fn clicking_a_heading_opens_it_and_clicking_again_shuts_it() {
-        let mut menu = menu_bar(None, false, &[]);
-        assert_eq!(chosen_by_click(&mut menu, MenuHit::Heading(1)), None);
-        assert!(menu.is_open());
-        assert_eq!(menu.open_path().first(), Some(&1));
-
-        assert_eq!(chosen_by_click(&mut menu, MenuHit::Heading(1)), None);
-        assert!(
-            !menu.is_open(),
-            "a second click on the open heading shuts it"
-        );
     }
 
     /// The id a command is given round-trips back to the same command — the whole basis of routing
@@ -1038,45 +614,20 @@ mod tests {
         assert!(recent_label(0, r"C:\a&b.log").contains("&&"));
     }
 
-    /// A closed bar draws its headings and no entries; the mnemonics stay hidden until `Alt`.
-    #[test]
-    fn a_closed_bar_draws_headings_and_no_list() {
-        let frame = menu_frame_of(&menu_bar(None, false, &[]));
-        assert_eq!(frame.headings.len(), 7);
-        assert!(frame.entries.is_empty());
-        assert!(frame.open.is_none());
-        assert!(!frame.show_mnemonics);
-        // The `&` markers are consumed into the mnemonic offset, never drawn.
-        for head in &frame.headings {
-            assert!(!head.text.contains('&'), "{} kept its marker", head.text);
-            assert!(head.mnemonic.is_some(), "{} marks no mnemonic", head.text);
-        }
-    }
-
-    /// Opening a heading fills the list from it, and asking for `Alt` reveals the underlines.
-    #[test]
-    fn opening_a_heading_fills_the_list_and_reveals_the_mnemonics() {
-        let mut menu = menu_bar(None, false, &[]);
-        menu.open_top(0);
-        let frame = menu_frame_of(&menu);
-        assert_eq!(frame.open, Some(0));
-        assert!(!frame.entries.is_empty());
-        assert!(frame.show_mnemonics);
-        assert!(frame.headings[0].open);
-    }
-
     /// With no document open, everything that needs one is disabled — and `Open…` is not, or the
     /// menu would offer no way back.
     #[test]
     fn with_no_document_the_file_menu_still_offers_open() {
-        let mut menu = menu_bar(None, false, &[]);
-        menu.open_top(0);
-        let frame = menu_frame_of(&menu);
-        let open = &frame.entries[0];
-        assert!(open.text.starts_with("Open"), "got {:?}", open.text);
-        assert!(open.enabled, "Open… must never be disabled");
+        let menu = menu_bar(None, false, &[]);
+        let file = menu.at(&[0]).expect("File").to_vec();
         assert!(
-            frame.entries.iter().any(|e| !e.enabled),
+            file[0].text().starts_with("Open"),
+            "got {:?}",
+            file[0].text()
+        );
+        assert!(file[0].selectable(), "Open… must never be disabled");
+        assert!(
+            file.iter().any(|i| !i.selectable() && !i.text().is_empty()),
             "with no document, something should be disabled"
         );
     }
@@ -1086,54 +637,14 @@ mod tests {
     #[test]
     fn the_theme_item_is_ticked_to_match_the_theme() {
         for dark in [true, false] {
-            let mut menu = menu_bar(None, dark, &[]);
+            let menu = menu_bar(None, dark, &[]);
             // Settings is the sixth heading.
-            menu.open_top(5);
-            let frame = menu_frame_of(&menu);
-            let theme_item = frame
-                .entries
+            let settings = menu.at(&[5]).expect("Settings").to_vec();
+            let theme_item = settings
                 .iter()
-                .find(|e| e.text.contains("Dark theme"))
+                .find(|i| i.text().contains("Dark theme"))
                 .expect("the Settings menu carries the theme toggle");
             assert_eq!(theme_item.checked, dark);
-        }
-    }
-
-    /// A click resolves by **both** axes: rows of the open list share an x-range, so an x-only
-    /// search would answer the first of them for a click on any.
-    #[test]
-    fn a_click_on_a_list_row_resolves_to_that_row_and_not_the_first() {
-        let hits: MenuHits = vec![
-            (0.0..40.0, 0.0..20.0, MenuHit::Heading(0)),
-            (0.0..120.0, 20.0..40.0, MenuHit::Entry(0)),
-            (0.0..120.0, 40.0..60.0, MenuHit::Entry(1)),
-            (0.0..120.0, 60.0..80.0, MenuHit::Entry(2)),
-        ];
-        assert_eq!(hit_at(&hits, 10.0, 10.0), Some(MenuHit::Heading(0)));
-        assert_eq!(hit_at(&hits, 10.0, 30.0), Some(MenuHit::Entry(0)));
-        assert_eq!(hit_at(&hits, 10.0, 50.0), Some(MenuHit::Entry(1)));
-        assert_eq!(hit_at(&hits, 10.0, 70.0), Some(MenuHit::Entry(2)));
-        assert_eq!(hit_at(&hits, 200.0, 30.0), None);
-        assert_eq!(hit_at(&hits, 10.0, 200.0), None);
-    }
-
-    /// The open list is searched before the bar row it hangs from, so a list that overlaps the bar
-    /// still takes the click.
-    #[test]
-    fn the_open_list_wins_over_the_bar_row_it_overlaps() {
-        let hits: MenuHits = vec![
-            (0.0..40.0, 0.0..20.0, MenuHit::Heading(0)),
-            (0.0..120.0, 10.0..30.0, MenuHit::Entry(4)),
-        ];
-        assert_eq!(hit_at(&hits, 10.0, 15.0), Some(MenuHit::Entry(4)));
-    }
-
-    /// The bar's height follows the chrome face, so it is right at any DPI — and is always at
-    /// least tall enough for the text in it.
-    #[test]
-    fn the_bar_is_always_taller_than_its_own_text() {
-        for chrome_h in [10.0, 12.5, 16.0, 24.0, 33.0] {
-            assert!(bar_height(chrome_h) > chrome_h);
         }
     }
 }
