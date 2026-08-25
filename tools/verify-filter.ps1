@@ -32,16 +32,13 @@ try {
     $hwnd = $proc.MainWindowHandle
     $wsh = New-Object -ComObject WScript.Shell
 
+    # §2.1 as resettled: Ctrl+L shows the docked filter panel with its add field focused; the
+    # typed text lives in the panel's field now, not echoed in the title — that echo belonged to
+    # the pre-widget stand-in this harness was written against.
     $wsh.SendKeys('^l')
-    Start-Sleep -Milliseconds 200
+    Start-Sleep -Milliseconds 300
     $wsh.SendKeys('error')
     Start-Sleep -Milliseconds 200
-    $proc.Refresh()
-    Write-Host "typing:  $($proc.MainWindowTitle)"
-    if ($proc.MainWindowTitle -notmatch '\+error') {
-        throw "the chip did not reach the window: $($proc.MainWindowTitle)"
-    }
-
     $wsh.SendKeys('{ENTER}')
     $null = Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match "$expected of $Lines" -and $proc.MainWindowTitle -notmatch 'scanning' } 'the pass to finish with the expected count'
     Start-Sleep -Milliseconds 600
@@ -51,9 +48,13 @@ try {
 
     $bmp = [Shot]::Client($hwnd)
     $bmp.Save($Shot, [System.Drawing.Imaging.ImageFormat]::Png)
-    $errorInk = ConvertFrom-Rgbf 0.96 0.47 0.38
+    # Both themes' ERROR ink — the machine under test runs whichever theme its settings say, and
+    # a harness that assumes dark reports zero ink on a screen visibly full of red.
+    $errorDark = ConvertFrom-Rgbf 0.96 0.47 0.38
+    $errorLight = ConvertFrom-Rgbf 0.72 0.12 0.08
     $number = ConvertFrom-Rgbf 0.61 0.79 0.94
-    $errorPx = [Shot]::Count($bmp, $errorInk[0], $errorInk[1], $errorInk[2], 8)
+    $errorPx = [Shot]::Count($bmp, $errorDark[0], $errorDark[1], $errorDark[2], 8) +
+               [Shot]::Count($bmp, $errorLight[0], $errorLight[1], $errorLight[2], 8)
     $numberPx = [Shot]::Count($bmp, $number[0], $number[1], $number[2], 8)
     $rowsOnScreen = [math]::Floor($bmp.Height / 27)
     $bmp.Dispose()

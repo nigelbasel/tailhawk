@@ -16,6 +16,7 @@
 
 mod about;
 mod dialog;
+mod filterpanel;
 mod icon;
 mod keymap;
 mod menubar;
@@ -279,6 +280,9 @@ struct Document {
     tee: Option<Tee>,
     /// Whether this pane draws the status bar — the bottom pane of a split does, the top does not.
     show_footer: bool,
+    /// §2.1's docked filter panel: shown by `Ctrl+L`, adding a chip, or View ▸ Filter panel, and
+    /// hideable — the VS tool-window posture, fixed rather than floating.
+    show_filters: bool,
     /// Where this pane's top edge is in the client, so a click can be made pane-relative.
     pane_top: f32,
     /// Whether the producer had closed its end as of the last tick.
@@ -510,65 +514,8 @@ impl RowSource for Document {
             "search (Ctrl+F)",
         );
         x += find_w + pad * 2.0;
-
-        // ▼ and the chips.
-        x += painter.chrome_run("▼", x, text_y, theme().header_ink) + pad;
-        for (i, chip) in self.filtering.chips.chips.iter().enumerate() {
-            let sign = match chip.polarity {
-                Polarity::Include => "+",
-                Polarity::Exclude => "−",
-            };
-            let label = format!("{sign}{}", chip.source);
-            let w = painter.chrome_measure(&label);
-            // The body toggles, the `×` after it removes; a disabled chip is drawn dim on its fill.
-            let close_w = painter.chrome_measure("×") + pad;
-            let bg = match (chip.polarity, chip.enabled) {
-                (Polarity::Include, true) => theme().chip_include_bg,
-                (Polarity::Exclude, true) => theme().chip_exclude_bg,
-                (_, false) => theme().field_bg,
-            };
-            painter.fill(x - 2.0, text_y - 2.0, w + close_w + 4.0, chrome_h + 4.0, bg);
-            let ink = if chip.enabled {
-                theme().ink
-            } else {
-                theme().field_hint
-            };
-            painter.chrome_run(&label, x, text_y, ink);
-            painter.chrome_run("×", x + w + pad * 0.5, text_y, theme().field_hint);
-            hits.push((x..x + w, Hit::Chip(i)));
-            hits.push((x + w..x + w + close_w, Hit::ChipClose(i)));
-            x += w + close_w + pad * 1.5;
-        }
-        // The new-chip field.
         let chip_w = CHIP_CELLS as f32 * em;
-        let chip_focused = self.chrome.focus == Focus::NewChip;
-        painter.fill(
-            x - 2.0,
-            text_y - 2.0,
-            chip_w + 4.0,
-            row_h + 4.0,
-            if chip_focused {
-                theme().field_bg_focused
-            } else {
-                theme().field_bg
-            },
-        );
-        hits.push((x..x + chip_w, Hit::NewChip));
-        let chip_origin = x;
-        let hint = match self.chrome.chip_polarity {
-            Polarity::Include => "+ filter (Ctrl+L)",
-            Polarity::Exclude => "− exclude (Ctrl+Shift+L)",
-        };
-        draw_field(
-            painter,
-            &self.chrome.chip,
-            chip_focused,
-            x,
-            text_y,
-            chip_w,
-            hint,
-        );
-        self.chrome.origins.set((find_origin, chip_origin));
+        let _ = x;
 
         // §6.1's format chip, at the right edge: the detection, a `▾`, and a click target.
         //
@@ -612,9 +559,15 @@ impl RowSource for Document {
         } else {
             0.0
         };
+        let panel_row = self.band_h(row_h);
+        let panel_h = filterpanel::height(
+            self.filtering.chips.chips.len(),
+            self.show_filters,
+            panel_row,
+        );
         if self.detail.open && self.detail.rows > 0 && !self.detail.lines.is_empty() {
             let pane_h = DetailPane::height(self.detail.rows, row_h);
-            let top = view.height_px() - strip - pane_h;
+            let top = view.height_px() - strip - panel_h - pane_h;
             painter.fill(0.0, top, width, pane_h, theme().pane_bg);
             painter.fill(0.0, top, width, 1.0, theme().pane_edge);
             let shown = self.detail.rows.min(self.detail.lines.len());
@@ -633,6 +586,90 @@ impl RowSource for Document {
                 let _ = painter.lay_out_at(view, cell_w, y, text, Colours::plain(ink));
                 y += row_h;
             }
+        }
+
+        // §2.1's docked filter panel, above the status bar — the VS tool-window posture, fixed.
+        // Every row's targets go by x and y into `panel_hits`; the add field is the same widget
+        // the bar used to carry, moved home.
+        {
+            let mut panel_hits = self.chrome.panel_hits.borrow_mut();
+            panel_hits.clear();
+            let mut chip_origin = 0.0;
+            if panel_h > 0.0 {
+                let top = view.height_px() - strip - panel_h;
+                painter.fill(0.0, top, width, panel_h, theme().pane_bg);
+                painter.fill(0.0, top, width, filterpanel::RULE_PX, theme().pane_edge);
+                let mut y = top + filterpanel::RULE_PX + 2.0;
+                for (i, row) in filterpanel::rows_of(&self.filtering.chips.chips)
+                    .iter()
+                    .enumerate()
+                {
+                    let ty = y + ((panel_row - chrome_h) * 0.5).floor();
+                    let enabled = row.mark == "[x]";
+                    let ink = if enabled {
+                        theme().ink
+                    } else {
+                        theme().field_hint
+                    };
+                    let mut x = pad;
+                    let mark_w = painter.chrome_run(row.mark, x, ty, ink);
+                    panel_hits.push((x..x + mark_w + pad, y..y + panel_row, Hit::Chip(i)));
+                    x += mark_w + pad;
+                    // The sign wears the chip's colour, so include and exclude read at a glance
+                    // as the bar's chips did; clicking it flips the polarity — §5's edit.
+                    let sign = row.sign.to_string();
+                    let sign_w = painter.chrome_measure(&sign);
+                    let bg = match (row.sign, enabled) {
+                        ('+', true) => theme().chip_include_bg,
+                        (_, true) => theme().chip_exclude_bg,
+                        (_, false) => theme().field_bg,
+                    };
+                    painter.fill(x - 2.0, ty - 2.0, sign_w + 4.0, chrome_h + 4.0, bg);
+                    painter.chrome_run(&sign, x, ty, ink);
+                    panel_hits.push((
+                        x - 2.0..x + sign_w + 2.0,
+                        y..y + panel_row,
+                        Hit::FilterPolarity(i),
+                    ));
+                    x += sign_w + pad;
+                    let text_w = painter.chrome_run(&row.text, x, ty, ink);
+                    panel_hits.push((x..x + text_w + pad, y..y + panel_row, Hit::Chip(i)));
+                    x += text_w + pad * 1.5;
+                    let close_w = painter.chrome_run("×", x, ty, theme().field_hint);
+                    panel_hits.push((x..x + close_w + pad, y..y + panel_row, Hit::ChipClose(i)));
+                    y += panel_row;
+                }
+                let ty = y + ((panel_row - chrome_h) * 0.5).floor();
+                let x = pad;
+                let chip_focused = self.chrome.focus == Focus::NewChip;
+                painter.fill(
+                    x - 2.0,
+                    ty - 2.0,
+                    chip_w + 4.0,
+                    chrome_h + 4.0,
+                    if chip_focused {
+                        theme().field_bg_focused
+                    } else {
+                        theme().field_bg
+                    },
+                );
+                panel_hits.push((x..x + chip_w, y..y + panel_row, Hit::NewChip));
+                chip_origin = x;
+                let hint = match self.chrome.chip_polarity {
+                    Polarity::Include => "+ Add filter (Ctrl+L)",
+                    Polarity::Exclude => "− Add exclude (Ctrl+Shift+L)",
+                };
+                draw_field(
+                    painter,
+                    &self.chrome.chip,
+                    chip_focused,
+                    x,
+                    ty,
+                    chip_w,
+                    hint,
+                );
+            }
+            self.chrome.origins.set((find_origin, chip_origin));
         }
 
         // The status bar, at the bottom: what the title says, where a user looks. Cut from the
@@ -1275,6 +1312,7 @@ impl Document {
             detail: DetailPane::default(),
             tee: None,
             show_footer: true,
+            show_filters: false,
             pane_top: 0.0,
             pump: None,
             stream_done: false,
@@ -1337,6 +1375,7 @@ impl Document {
             detail: DetailPane::default(),
             tee: None,
             show_footer: true,
+            show_filters: false,
             pane_top: 0.0,
             pump: Some(pump),
             stream_done: false,
@@ -1392,8 +1431,13 @@ impl Document {
         } else {
             0.0
         };
+        let panel = filterpanel::height(
+            self.filtering.chips.chips.len(),
+            self.show_filters,
+            self.band_h(row_h),
+        );
         self.view
-            .set_footer_px(footer + DetailPane::height(pane_rows, row_h));
+            .set_footer_px(footer + DetailPane::height(pane_rows, row_h) + panel);
         self.view
             .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
         {
@@ -1624,6 +1668,10 @@ impl Document {
         self.detail.open
     }
 
+    fn filters_open(&self) -> bool {
+        self.show_filters
+    }
+
     /// Whether the chips or the collapse are narrowing the rows — what `Clear filters` acts on.
     fn is_filtered(&self) -> bool {
         self.filtering.filtered()
@@ -1696,6 +1744,12 @@ impl Document {
             if let Ok(chip) = Chip::parse(text, polarity) {
                 self.filtering.chips.chips.push(chip);
             }
+        }
+        // Chips that arrive without a keystroke — `--filter=`, a file's remembered state — must
+        // bring their panel with them: filters in force with no UI saying so is the invisible
+        // state §1.1 forbids, and the bar that used to always show them is gone.
+        if !self.filtering.chips.chips.is_empty() {
+            self.show_filters = true;
         }
         self.filtering.records_only = state.collapse && self.detection.accepted.is_some();
         self.filtering.error = None;
@@ -3632,6 +3686,10 @@ struct Chrome {
     wizard_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, std::ops::Range<f32>, usize)>>,
     /// §6.1's chip menu rows, by y.
     format_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
+    /// §2.1's filter panel, by x **and** y — it is a column of rows in the footer band, so x
+    /// alone would resolve every row to the first, the lesson the menu's hits already learned.
+    #[allow(clippy::type_complexity)]
+    panel_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, std::ops::Range<f32>, Hit)>>,
     /// §2.2's menu bar: the headings on the bar row and the open list's rows, each by x **and** y.
     /// See [`menubar::MenuHits`] for why both axes.
     menu_hits: std::cell::RefCell<menubar::MenuHits>,
@@ -3985,6 +4043,7 @@ enum Command {
     ClearSearch,
     FilterInclude,
     FilterExclude,
+    ToggleFilters,
     ClearFilter,
     ToggleCollapse,
     RevealInvisibles,
@@ -4038,6 +4097,7 @@ impl Command {
         (Command::ClearSearch, "Clear search", "Esc"),
         (Command::FilterInclude, "Add include filter", "Ctrl+L"),
         (Command::FilterExclude, "Add exclude filter", "Ctrl+Shift+L"),
+        (Command::ToggleFilters, "Filter panel", ""),
         (Command::ClearFilter, "Clear filters", "Esc"),
         (
             Command::ToggleCollapse,
@@ -4193,6 +4253,9 @@ enum Hit {
     Chip(usize),
     /// A chip's `×`: removes it.
     ChipClose(usize),
+    /// A chip's `+`/`−` sign in the filter panel: flips its polarity — §5's most common edit,
+    /// which the bar's chips never offered.
+    FilterPolarity(usize),
     Tab(usize),
     /// §6.1's format chip, at the right of the bar: opens its menu.
     FormatChip,
@@ -4370,6 +4433,7 @@ impl Default for Chrome {
             rules_hits: std::cell::RefCell::new(Vec::new()),
             wizard_hits: std::cell::RefCell::new(Vec::new()),
             format_hits: std::cell::RefCell::new(Vec::new()),
+            panel_hits: std::cell::RefCell::new(Vec::new()),
             menu_hits: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -5751,6 +5815,7 @@ impl Shell {
             self.pending_find = true;
             true
         } else if ctrl && key == VK_L.0 {
+            doc.show_filters = true;
             doc.chrome.focus = Focus::NewChip;
             doc.chrome.chip_polarity = if shift {
                 Polarity::Exclude
@@ -5951,23 +6016,40 @@ impl Shell {
 
     /// Ends a bar drag at `x`: the tab or chip is moved to the slot under the pointer, if it is
     /// over another of its kind. Reports whether the order changed.
-    fn drop_bar_drag(&mut self, x: f32) -> bool {
+    fn drop_bar_drag(&mut self, x: f32, y: f32) -> bool {
         let Some((kind, from)) = self.dragging_bar.take() else {
             return false;
         };
         let Some(doc) = self.document.as_ref() else {
             return false;
         };
-        let target = doc
-            .chrome
-            .hits
-            .borrow()
-            .iter()
-            .find_map(|(range, hit)| match (kind, hit) {
-                (BarDrag::Tab, Hit::Tab(i)) if range.contains(&x) => Some(*i),
-                (BarDrag::Chip, Hit::Chip(i) | Hit::ChipClose(i)) if range.contains(&x) => Some(*i),
-                _ => None,
-            });
+        let target = match kind {
+            BarDrag::Tab => doc
+                .chrome
+                .hits
+                .borrow()
+                .iter()
+                .find_map(|(range, hit)| match hit {
+                    Hit::Tab(i) if range.contains(&x) => Some(*i),
+                    _ => None,
+                }),
+            // The panel is a column, so the row under the pointer is the target — y decides, and
+            // anywhere along the row's width counts, which is how a vertical list reorders.
+            BarDrag::Chip => {
+                doc.chrome
+                    .panel_hits
+                    .borrow()
+                    .iter()
+                    .find_map(|(_, yr, hit)| match hit {
+                        Hit::Chip(i) | Hit::ChipClose(i) | Hit::FilterPolarity(i)
+                            if yr.contains(&y) =>
+                        {
+                            Some(*i)
+                        }
+                        _ => None,
+                    })
+            }
+        };
         let Some(to) = target else {
             return false;
         };
@@ -7163,6 +7245,7 @@ impl Shell {
             }
             Command::ClearSearch => doc.finder.clear(),
             Command::FilterInclude | Command::FilterExclude => {
+                doc.show_filters = true;
                 doc.chrome.focus = Focus::NewChip;
                 doc.chrome.chip_polarity = if command == Command::FilterInclude {
                     Polarity::Include
@@ -7170,6 +7253,12 @@ impl Shell {
                     Polarity::Exclude
                 };
                 doc.filtering.error = None;
+            }
+            Command::ToggleFilters => {
+                doc.show_filters = !doc.show_filters;
+                if !doc.show_filters && doc.chrome.focus == Focus::NewChip {
+                    doc.chrome.focus = Focus::Grid;
+                }
             }
             Command::ClearFilter => doc.clear_filter(),
             Command::ResetColumns => {
@@ -7581,7 +7670,16 @@ impl Shell {
             }
             return self.after_chrome_key(hwnd);
         }
-        if y >= doc.view.chrome_px() {
+        // §2.1's filter panel lives in the footer band, below the grid — its targets carry both
+        // axes, so they are checked before the bar gate turns a footer click into a grid click.
+        let panel_hit = doc
+            .chrome
+            .panel_hits
+            .borrow()
+            .iter()
+            .find(|(xr, yr, _)| xr.contains(&x) && yr.contains(&y))
+            .map(|(_, _, hit)| *hit);
+        if panel_hit.is_none() && y >= doc.view.chrome_px() {
             if doc.chrome.focus != Focus::Grid {
                 doc.chrome.focus = Focus::Grid;
                 unsafe {
@@ -7592,13 +7690,14 @@ impl Shell {
         }
         // The strip is the top band; a click there is a tab, and only a tab.
         let in_strip = doc.tab_strip.0.len() > 1 && y < Chrome::strip_height(self.cell_h.max(1.0));
-        let hit = doc
-            .chrome
-            .hits
-            .borrow()
-            .iter()
-            .find(|(range, hit)| range.contains(&x) && matches!(hit, Hit::Tab(_)) == in_strip)
-            .map(|(_, hit)| *hit);
+        let hit = panel_hit.or_else(|| {
+            doc.chrome
+                .hits
+                .borrow()
+                .iter()
+                .find(|(range, hit)| range.contains(&x) && matches!(hit, Hit::Tab(_)) == in_strip)
+                .map(|(_, hit)| *hit)
+        });
         let (find_origin, chip_origin) = doc.chrome.origins.get();
         let cell_w = self.cell_w.max(1.0);
         if let Some(Hit::Tab(i)) = hit {
@@ -7654,6 +7753,22 @@ impl Shell {
                 if i < doc.filtering.chips.chips.len() {
                     doc.remember();
                     doc.filtering.chips.chips.remove(i);
+                    doc.filtering.clear_results();
+                    doc.refilter();
+                    {
+                        let rows = doc.view_rows();
+                        doc.view.grid_mut().set_total_rows(rows);
+                    }
+                }
+            }
+            Some(Hit::FilterPolarity(i)) => {
+                if i < doc.filtering.chips.chips.len() {
+                    doc.remember();
+                    let chip = &mut doc.filtering.chips.chips[i];
+                    chip.polarity = match chip.polarity {
+                        Polarity::Include => Polarity::Exclude,
+                        Polarity::Exclude => Polarity::Include,
+                    };
                     doc.filtering.clear_results();
                     doc.refilter();
                     {
@@ -7986,8 +8101,12 @@ mod uia {
             out.extend((0..doc.tab_strip.0.len()).map(Kind::Tab));
         }
         out.push(Kind::Find);
-        out.push(Kind::NewChip);
-        out.extend((0..doc.filtering.chips.chips.len()).map(Kind::Chip));
+        // The filter panel's controls exist for the provider exactly when they exist on screen —
+        // a tree element with no rect that types into an invisible field is the provider lying.
+        if doc.filters_open() {
+            out.push(Kind::NewChip);
+            out.extend((0..doc.filtering.chips.chips.len()).map(Kind::Chip));
+        }
         out.push(Kind::Status);
         out
     }
@@ -8128,6 +8247,16 @@ mod uia {
                         .find(|(_, hit)| wanted(hit))
                         .map(|(r, _)| r.clone())
                 };
+                // The filter panel's targets carry both axes, so its elements answer with real
+                // rects rather than a band guess.
+                let panel_rect = |wanted: &dyn Fn(&Hit) -> bool| {
+                    doc.chrome
+                        .panel_hits
+                        .borrow()
+                        .iter()
+                        .find(|(_, _, hit)| wanted(hit))
+                        .map(|(xr, yr, _)| (xr.clone(), yr.clone()))
+                };
                 Some(match self.kind {
                     Kind::Root => (0.0, 0.0, w, h),
                     Kind::Palette => (0.0, strip + bar_h, w, row_h + 8.0),
@@ -8140,12 +8269,28 @@ mod uia {
                         (r.start, strip, r.end - r.start, bar_h)
                     }
                     Kind::NewChip => {
-                        let r = x_range(&|hit| *hit == Hit::NewChip)?;
-                        (r.start, strip, r.end - r.start, bar_h)
+                        let (xr, yr) = panel_rect(&|hit| *hit == Hit::NewChip)?;
+                        (xr.start, yr.start, xr.end - xr.start, yr.end - yr.start)
                     }
                     Kind::Chip(i) => {
-                        let r = x_range(&|hit| *hit == Hit::Chip(i))?;
-                        (r.start, strip, r.end - r.start, bar_h)
+                        // The row has several targets carrying this chip's index — checkbox,
+                        // text — and the element is the whole row, so the rect is their union.
+                        let hits = doc.chrome.panel_hits.borrow();
+                        let mut spanning: Option<(std::ops::Range<f32>, std::ops::Range<f32>)> =
+                            None;
+                        for (xr, yr, hit) in hits.iter() {
+                            if *hit == Hit::Chip(i) {
+                                spanning = Some(match spanning {
+                                    None => (xr.clone(), yr.clone()),
+                                    Some((sx, sy)) => (
+                                        sx.start.min(xr.start)..sx.end.max(xr.end),
+                                        sy.start.min(yr.start)..sy.end.max(yr.end),
+                                    ),
+                                });
+                            }
+                        }
+                        let (xr, yr) = spanning?;
+                        (xr.start, yr.start, xr.end - xr.start, yr.end - yr.start)
                     }
                     Kind::Status => {
                         let footer = Chrome::strip_height(band);
@@ -8323,7 +8468,10 @@ mod uia {
                 let doc = s.document.as_mut()?;
                 match kind {
                     Kind::Find => doc.chrome.focus = Focus::Find,
-                    Kind::NewChip => doc.chrome.focus = Focus::NewChip,
+                    Kind::NewChip => {
+                        doc.show_filters = true;
+                        doc.chrome.focus = Focus::NewChip;
+                    }
                     Kind::Palette => doc.palette.open(),
                     _ => return None,
                 }
@@ -10159,7 +10307,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         unsafe {
                             let _ = ReleaseCapture();
                         }
-                        if shell.drop_bar_drag(x) {
+                        if shell.drop_bar_drag(x, y) {
                             shell.retitle(hwnd);
                         }
                         unsafe {
