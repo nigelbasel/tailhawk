@@ -197,29 +197,30 @@ another window merges. `+` opens a file, a file set, or a watched folder.
 **primary** interface per §1.1: every feature is reachable by mouse from one of them, and the palette
 is an accelerator over the top rather than the only door.
 
-**Command bar.** Search on the left; a **filter chip row** on the right; rules button.
+**There is no command bar row.** *(Settled 2026-08-24, reversing this section's earlier shape — the
+owner tested the interim row and chose the classic form from three mocked alternatives: "the search,
+filter and format drop downs on the row below the menu are confusing and non standard".)* Search,
+filter and format are reached the way the standard Windows applications reach them:
 
-**The filter surface is a row of chips, not a text field.** An earlier draft drew a single box, which
-cannot express three of the owner's five daily-use features — include filters, exclude filters, and
-multiple composing text filters. Each chip is one independent predicate object per the grammar in
-`SPEC.md` §7.2:
+- **Find is the standard modeless Find dialog** — comdlg32's `FindTextW`, the dialog Notepad shows —
+  opened by `Ctrl+F` or Edit ▸ Find…. `F3`/`Shift+F3` walk matches with the dialog open or closed,
+  exactly as before. The match position (`3 of 41`) and the query live in the **status bar** while a
+  search is active; the scrollbar's density marks are unchanged. Plain text by default; a
+  "Regular expression" checkbox in the dialog replaces the `.*` toggle.
+- **Filters are managed in a Filters dialog** — `Ctrl+L` or View ▸ Filters… — a native modal dialog
+  listing the chips as a checked list (check = enabled), with Add, Remove, and include/exclude on
+  each row. The *model* keeps `SPEC.md` §7.2's grammar unchanged: each entry is one independent
+  predicate, includes before excludes, unknown fields warn rather than silently matching nothing.
+  While filters are active the **status bar** carries a live `2 filters · 1,204 of 5,000 rows` chip;
+  clicking it reopens the dialog.
+- **The format picker is a submenu of the Format menu** — Format ▸ Log format lists the detected
+  candidates with a radio mark on the one in force, where the old right-edge chip opened a bespoke
+  dropdown. Parse health stays visible in the status bar's format chip, which also opens the menu.
 
-```
-  ⊕ level >= Warning     include chip, comparison predicate
-  ⊗ /healthz/            exclude chip, regex predicate
-  ⊕ Ab timeout           include chip, plain-text predicate ("Ab" = literal, ".*" = regex)
-  + Filter               add a new chip
-```
-
-- **Click the ⊕/⊗ glyph** to flip a chip between include and exclude — the single most common edit.
-- **Click the chip body** to edit it inline as text; it expands into a field with live validation.
-- **Middle-click or ✕** removes it. Chips are draggable to reorder for readability only; order does
-  not affect the result.
-- A chip naming a column the current format lacks renders in a **warning state** naming the missing
-  field, per §7.2's unknown-field rule — it does not silently match nothing.
-- Chips overflow into a `⋯ +3` affordance rather than wrapping the command bar.
-
-Search remains a single field and accepts plain text or regex via a `.*` toggle. No modal find dialog.
+The earlier chip-row prose (inline chip editing, drag-reorder, overflow `⋯ +n`) is superseded with
+this; the chip row's daily-use argument — several composing include/exclude predicates visible at
+once — is answered by the status chip and the dialog's list rather than by a permanent row of
+controls the owner found unreadable.
 
 **Column header.** Real, resizable, reorderable, hideable columns — not monospace padding. Sortable
 headers show the sort affordance **only when sorting is eligible** (§11.4 of SPEC: filtered set
