@@ -33,10 +33,11 @@ double-dialog bug first, keep the good parts, strip the instrumentation.**
    (default on), and a **live match-count line** in the dialog — Count for free, since the
    streaming pass already counts everything.
 
-### Next work, exactly — the four Find options (started, reverted to keep the tree clean)
+### ✅ The four Find options — landed 2026-08-25 (`3378065`, CI green)
 
-The design is agreed; ~40 lines were written and deliberately taken back out rather than
-committed half-done. Recreate as follows, test-first:
+Rebuilt from this recipe test-first, live-verified by verify-find.ps1 including a whole-word
+exclusion. Review caught and fixed: the first locate ignoring no-wrap (teleport to top), dialog
+options leaking into bar/UIA searches, a fused doc comment. The recipe as executed:
 
 - `Finder`: add `no_wrap: bool` (inverted so derive(Default) = wrapping); `step()` returns
   `None` at either end when set. Extend `stepping_starts_from_the_viewport_and_wraps_at_both_ends`
