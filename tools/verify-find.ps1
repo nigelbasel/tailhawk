@@ -40,19 +40,33 @@ try {
     $hwnd = $proc.MainWindowHandle
     $wsh = New-Object -ComObject WScript.Shell
 
+    # §2.1 as resettled: Ctrl+F opens the classic modeless Find dialog. The query is typed into
+    # the dialog's own edit control, and Enter is Find Next, its default button.
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class FindDlg {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindowW(string cls, string title);
+}
+'@
     $wsh.SendKeys('^f')
+    $null = Wait-For { [FindDlg]::FindWindowW('#32770', 'Find') -ne [IntPtr]::Zero } 'the Find dialog' 10
+    Write-Host 'the Find dialog is a native #32770 window'
     Start-Sleep -Milliseconds 200
     $wsh.SendKeys((ConvertTo-SendKeys $Query))
     Start-Sleep -Milliseconds 200
-    $proc.Refresh()
-    Write-Host "typing:  $($proc.MainWindowTitle)"
-    if ($proc.MainWindowTitle -notmatch [regex]::Escape($Query)) {
-        throw "the query did not reach the window: $($proc.MainWindowTitle)"
-    }
 
     $wsh.SendKeys('{ENTER}')
     Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match 'of \d' -or $proc.MainWindowTitle -match 'no matches' } 'the search to report'
     Start-Sleep -Milliseconds 600
+    # Esc closes the dialog before the screenshot, so the grid is what is photographed — and
+    # proves the dialog dismisses the way the standard one does.
+    $wsh.SendKeys('{ESC}')
+    Start-Sleep -Milliseconds 400
+    if ([FindDlg]::FindWindowW('#32770', 'Find') -ne [IntPtr]::Zero) {
+        throw 'Esc did not close the Find dialog'
+    }
     $proc.Refresh()
     $title = $proc.MainWindowTitle
     Write-Host "found:   $title"

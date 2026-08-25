@@ -103,18 +103,19 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetScrollInfo, GetWindowPlacement, KillTimer, LoadCursorW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetClassLongPtrW, SetForegroundWindow, SetTimer,
-    SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, ASFW_ANY,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, IDC_ARROW, MSG, NONCLIENTMETRICSW,
-    SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION,
-    SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE,
-    SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    GetClientRect, GetMessageW, GetScrollInfo, GetWindow, GetWindowPlacement, IsDialogMessageW,
+    IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetClassLongPtrW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, ASFW_ANY, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GCLP_HBRBACKGROUND, GW_OWNER, IDC_ARROW, MSG, NONCLIENTMETRICSW, SB_BOTTOM, SB_HORZ,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
+    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
+    SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
     WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON,
     WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL,
     WS_OVERLAPPEDWINDOW, WS_VSCROLL,
@@ -2076,7 +2077,7 @@ impl Document {
             .unwrap_or(0);
         match find::start(
             &self.finder.query,
-            true,
+            !self.finder.match_case,
             self.set.snapshot(),
             SearchOptions::default(),
         ) {
@@ -2898,6 +2899,9 @@ enum Navigate {
 /// toggle.
 #[derive(Default)]
 struct Finder {
+    /// The Find dialog's "Match case" — false is the insensitive default the module note argues
+    /// for, and the dialog is the toggle that note said did not exist yet.
+    match_case: bool,
     /// The query the current results are for — what the find field held when `Enter` was pressed.
     /// The field itself lives in [`Chrome`]; this is what the title and the pass use.
     query: String,
@@ -4840,6 +4844,14 @@ struct Shell {
     pending_keymap: bool,
     /// §2.2's Preferences — `dialog::show_prefs`, deferred the same way.
     pending_prefs: bool,
+    /// §2.1 as resettled: `Ctrl+F` asks for the classic Find dialog, deferred the same way.
+    pending_find: bool,
+    /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
+    /// through `IsDialogMessageW` and a second `Ctrl+F` focuses it instead of stacking another.
+    find_dialog: HWND,
+    /// What the Find dialog last held, in the form the user typed — the escaped form the engine
+    /// runs is not something to hand back to a person. Seeds the dialog when it reopens.
+    last_find: (String, bool, bool),
     /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
     wheel_remaining: f32,
     /// §12.4's `[appearance] theme`, as chosen — `dark`, `light`, `system`, or nothing if the user
@@ -5660,9 +5672,8 @@ impl Shell {
             return false;
         };
         let handled = if ctrl && key == VK_F.0 {
-            doc.chrome.focus = Focus::Find;
-            doc.chrome.find.select_all();
             doc.finder.error = None;
+            self.pending_find = true;
             true
         } else if ctrl && key == VK_L.0 {
             doc.chrome.focus = Focus::NewChip;
@@ -7058,9 +7069,8 @@ impl Shell {
         };
         match command {
             Command::Find => {
-                doc.chrome.focus = Focus::Find;
-                doc.chrome.find.select_all();
                 doc.finder.error = None;
+                self.pending_find = true;
             }
             Command::FindNext | Command::FindPrevious => {
                 if doc.finder.matches.is_empty() && doc.finder.running.is_none() {
@@ -8804,6 +8814,38 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         }
         return true;
     }
+    let find = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_find))
+    });
+    if find {
+        let existing = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map_or(HWND::default(), |shell| shell.find_dialog)
+        });
+        if !existing.is_invalid() && unsafe { IsWindow(existing) }.as_bool() {
+            // A second Ctrl+F focuses the dialog that is already up, as the standard one does.
+            unsafe {
+                let _ = SetForegroundWindow(existing);
+            }
+        } else {
+            let seed = STATE.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .map(|shell| shell.last_find.clone())
+                    .unwrap_or_default()
+            });
+            let hdlg = dialog::create_find_dialog(hwnd, &seed.0, seed.1, seed.2);
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.find_dialog = hdlg;
+                }
+            });
+        }
+        return true;
+    }
     let keymap = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
@@ -8849,6 +8891,64 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
 /// an OK button and Esc to dismiss. Modal like [`ask_for_file`], and dispatched the same way.
 /// Everything it says comes through [`about::dialog_content`] from the tested mapping, so the
 /// native surface cannot disagree with the model.
+/// The Find dialog pressed Find Next or Find Previous. Called from the dialog's own proc, which
+/// runs from the message loop — no `STATE` borrow is held when it fires.
+///
+/// A request matching the search already standing steps through it; anything else — new text, a
+/// flipped checkbox — starts afresh. The engine is handed the typed text escaped unless the
+/// dialog said it is a regular expression, per §7.4's engine policy.
+pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
+    let owner = unsafe { GetWindow(hdlg, GW_OWNER) };
+    let Ok(owner) = owner else {
+        return;
+    };
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let Some(shell) = state.as_mut() else {
+            return;
+        };
+        shell.last_find = (request.query.clone(), request.match_case, request.regex);
+        let Some(doc) = shell.document.as_mut() else {
+            return;
+        };
+        let pattern = if request.regex {
+            request.query.clone()
+        } else {
+            tailhawk_core::search::Pattern::escape(&request.query)
+        };
+        let unchanged = doc.finder.query == pattern
+            && doc.finder.match_case == request.match_case
+            && (!doc.finder.matches.is_empty() || doc.finder.running.is_some());
+        let moved = if unchanged {
+            doc.find_step(request.forwards)
+        } else {
+            doc.finder.query = pattern;
+            doc.finder.match_case = request.match_case;
+            doc.find();
+            false
+        };
+        if moved {
+            shell.sync_scrollbar(owner);
+        }
+        shell.retitle(owner);
+        unsafe {
+            let _ = InvalidateRect(owner, None, false);
+        }
+    });
+}
+
+/// The modeless Find dialog went away — Esc, Cancel, or the window closing under it. Forget the
+/// handle so the message loop stops routing keys to a window that is gone.
+pub fn find_dialog_closed(hdlg: HWND) {
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            if shell.find_dialog == hdlg {
+                shell.find_dialog = HWND::default();
+            }
+        }
+    });
+}
+
 fn show_about(hwnd: HWND, sheet: &about::AboutSheet) {
     let title = wide("About Tailhawk");
     let instruction = wide(&sheet.title);
@@ -10532,6 +10632,9 @@ fn main() -> Result<()> {
             pending_font: false,
             pending_keymap: false,
             pending_prefs: false,
+            pending_find: false,
+            find_dialog: HWND::default(),
+            last_find: (String::new(), false, false),
             wheel_remaining: 0.0,
             theme_name: asked.clone(),
             grid_face: chosen_face,
@@ -10611,6 +10714,18 @@ fn main() -> Result<()> {
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        // The modeless Find dialog's keyboard — Tab between its controls, Enter as Find Next,
+        // Esc as Cancel — only works if the loop offers it the message first, which is the
+        // documented contract of a modeless dialog. The handle is copied out so no borrow is
+        // held while the dialog's proc runs.
+        let find = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map_or(HWND::default(), |shell| shell.find_dialog)
+        });
+        if !find.is_invalid() && unsafe { IsDialogMessageW(find, &msg) }.as_bool() {
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);

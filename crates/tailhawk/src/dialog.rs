@@ -18,10 +18,13 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DialogBoxIndirectParamW, EndDialog, GetDlgItemInt, GetWindowLongPtrW, SendDlgItemMessageW,
-    SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW, DLGTEMPLATE, WINDOW_LONG_PTR_INDEX,
-    WM_COMMAND, WM_INITDIALOG,
+    CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetDlgItem,
+    GetDlgItemInt, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SetDlgItemInt,
+    SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, DLGTEMPLATE, SW_SHOW, WINDOW_LONG_PTR_INDEX,
+    WM_COMMAND, WM_DESTROY, WM_INITDIALOG,
 };
+
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 
 use crate::keymap::KeymapSheet;
 use crate::prefs;
@@ -30,11 +33,15 @@ use crate::prefs;
 pub const IDOK: u16 = 1;
 pub const IDCANCEL: u16 = 2;
 
-/// Control ids, shared across both dialogs — they are never up at once.
+/// Control ids, shared across the dialogs — no two of these are up at once.
 const ID_THEME: u16 = 100;
 const ID_FACE: u16 = 101;
 const ID_SIZE: u16 = 102;
 const ID_MAP: u16 = 103;
+const ID_FIND_WHAT: u16 = 110;
+const ID_MATCH_CASE: u16 = 111;
+const ID_REGEX: u16 = 112;
+const ID_FIND_PREV: u16 = 113;
 
 /// `DWLP_USER` — the per-dialog slot the data pointer rides in. Both targets are 64-bit, so the
 /// two slots before it are eight bytes each.
@@ -44,6 +51,8 @@ const CB_ADDSTRING: u32 = 0x0143;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
 const EM_SETTABSTOPS: u32 = 0x00CB;
+const BM_GETCHECK: u32 = 0x00F0;
+const BM_SETCHECK: u32 = 0x00F1;
 
 /// The predefined dialog control classes, by the ordinals `DLGTEMPLATE` names them with.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -345,7 +354,9 @@ const WS_BORDER: u32 = 0x0080_0000;
 const ES_NUMBER: u32 = 0x2000;
 const ES_MULTILINE: u32 = 0x0004;
 const ES_READONLY: u32 = 0x0800;
+const ES_AUTOHSCROLL: u32 = 0x0080;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
+const BS_AUTOCHECKBOX: u32 = 0x0003;
 
 /// §2.2's Preferences as a modal dialog: theme and font in drop-down lists, the size in a numeric
 /// field, OK and Cancel. Returns whether OK was chosen; `data` then carries the selections.
@@ -433,6 +444,162 @@ pub fn show_keymap(hwnd: HWND, text: &String) {
             LPARAM(text as *const String as isize),
         )
     };
+}
+
+/// What the Find dialog asked for, read at the moment Find Next or Find Previous was pressed.
+pub struct FindRequest {
+    pub query: String,
+    pub match_case: bool,
+    pub regex: bool,
+    pub forwards: bool,
+}
+
+fn read_find_request(hdlg: HWND, forwards: bool) -> FindRequest {
+    let mut buf = [0u16; 1024];
+    let len = unsafe { GetDlgItemTextW(hdlg, i32::from(ID_FIND_WHAT), &mut buf) } as usize;
+    let query = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
+    let checked = |id: u16| unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
+    };
+    FindRequest {
+        query,
+        match_case: checked(ID_MATCH_CASE),
+        regex: checked(ID_REGEX),
+        forwards,
+    }
+}
+
+unsafe extern "system" fn find_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    _lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_INITDIALOG => 1,
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            match id {
+                IDOK => {
+                    crate::find_requested(hdlg, read_find_request(hdlg, true));
+                    1
+                }
+                ID_FIND_PREV => {
+                    crate::find_requested(hdlg, read_find_request(hdlg, false));
+                    1
+                }
+                IDCANCEL => {
+                    unsafe {
+                        let _ = DestroyWindow(hdlg);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_DESTROY => {
+            crate::find_dialog_closed(hdlg);
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// §2.1 as resettled: the classic Find dialog, **modeless** as the standard one is — the document
+/// scrolls, tails and follows underneath it, and Esc or Cancel dismisses it. The owner's message
+/// loop pumps it through `IsDialogMessageW`; pressing Enter is Find Next, the default button.
+///
+/// Seeded with the last search so reopening continues rather than restarts — `query` arrives in
+/// the form the user typed, not the escaped form the engine was handed.
+pub fn create_find_dialog(owner: HWND, query: &str, match_case: bool, regex: bool) -> HWND {
+    const EM_SETSEL: u32 = 0x00B1;
+    let items = [
+        Item::new(Class::Static, "Fi&nd what:", 0xFFFF, (7, 9, 40, 8), 0),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_FIND_WHAT,
+            (50, 7, 150, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        Item::new(
+            Class::Button,
+            "Match &case",
+            ID_MATCH_CASE,
+            (50, 26, 80, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        Item::new(
+            Class::Button,
+            "Regular e&xpression",
+            ID_REGEX,
+            (50, 40, 90, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        Item::new(
+            Class::Button,
+            "&Find Next",
+            IDOK,
+            (210, 7, 60, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Find &Previous",
+            ID_FIND_PREV,
+            (210, 25, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (210, 43, 60, 14),
+            WS_TABSTOP,
+        ),
+    ];
+    let t = template("Find", 277, 62, &items);
+    let created = unsafe {
+        CreateDialogIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            owner,
+            Some(find_proc),
+            LPARAM(0),
+        )
+    };
+    let Ok(hdlg) = created else {
+        return HWND::default();
+    };
+    let seed = wsz(query);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_FIND_WHAT), PCWSTR(seed.as_ptr()));
+        let check = |id: u16, on: bool| {
+            SendDlgItemMessageW(
+                hdlg,
+                i32::from(id),
+                BM_SETCHECK,
+                WPARAM(usize::from(on)),
+                LPARAM(0),
+            );
+        };
+        check(ID_MATCH_CASE, match_case);
+        check(ID_REGEX, regex);
+        let _ = ShowWindow(hdlg, SW_SHOW);
+        // Focus lands in the field with the old query selected, so typing replaces it — the
+        // standard dialog's own behaviour.
+        if let Ok(edit) = GetDlgItem(hdlg, i32::from(ID_FIND_WHAT)) {
+            let _ = SetFocus(edit);
+        }
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_FIND_WHAT),
+            EM_SETSEL,
+            WPARAM(0),
+            LPARAM(-1),
+        );
+    }
+    hdlg
 }
 
 #[cfg(test)]
