@@ -106,15 +106,24 @@ this was written; every earlier push this session is green).
 
 ### The two defects still open, in the owner's words
 
-5. **"The search, filter and format drop downs on the row below the menu are confusing and
-   non-standard… don't work the way any windows app I have ever looked at works."** Untouched
-   this session. What is there: a decorative `►` prompt, the find field, a decorative `▼`
-   that looks like a dropdown control but has no hit target, filter chips, the new-chip
-   field, and the format chip at the right edge. The plan: label the fields as fields
-   (borders exist; hints exist), remove or make functional the decorative glyphs, and make
-   the format chip read as the dropdown button it actually is. Read `UI-DESIGN.md` §2.1 and
-   §5 first — the bar's shape is specified there, and the spec may need the owner's sign-off
-   on a revised §2.1 before code moves.
+5. **The command bar — decided, and half built.** The owner chose from three mocked shapes
+   (`nimbalyst-local/mockups/tailhawk-command-bar-options.mockup.html`): **the classic
+   dialogs** — "a classic dialog gives more real estate for configuring… and then the dialog
+   goes away" — then refined filters to a **docked panel** after raising VS tool windows:
+   toggling is constant, so non-modal wins there. `UI-DESIGN.md` §2.1 is rewritten and both
+   decisions are committed. **Landed (`8384b5c`, CI green): the classic Find dialog** —
+   modeless `CreateDialogIndirectParamW` from `dialog.rs`, match-case and regex checkboxes,
+   `IsDialogMessageW` in the message loop, F3 seeding from `Shell::last_find`,
+   `verify-find.ps1` proving the whole flow (and now scoped to the app's pid — its first
+   failure was faithfully reporting some *other* application's Find dialog). **Still to
+   build, in order:** (a) the **docked filter panel** — TextAnalysisTool shape, fixed band
+   above the status bar reusing the detail pane's seam, checkbox per chip, `Ctrl+L` /
+   View ▸ Filters toggles it, state remembered; (b) **remove the command bar row entirely**
+   — the `►` prompt, find field, chips, new-chip field and format chip in
+   `Document::draw_chrome`, plus `Focus::Find`/`NewChip` plumbing, the UIA field elements,
+   and `verify-filter.ps1`'s field-driven flow; (c) **the format picker into the Format
+   menu** as radio-marked entries, replacing `draw_format_menu` and `Hit::FormatChip`;
+   (d) the status bar inherits the match position and a live filter chip.
 6. **"Review the behaviour of every single menu and make sure they behave in a standard
    way."** Partly done by conversion (dialogs, modality) and the earlier 62-item sweep. The
    known remaining gap is new: **Open Recent's submenu opens *in place of* the File list
