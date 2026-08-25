@@ -207,12 +207,18 @@ filter and format are reached the way the standard Windows applications reach th
   exactly as before. The match position (`3 of 41`) and the query live in the **status bar** while a
   search is active; the scrollbar's density marks are unchanged. Plain text by default; a
   "Regular expression" checkbox in the dialog replaces the `.*` toggle.
-- **Filters are managed in a Filters dialog** — `Ctrl+L` or View ▸ Filters… — a native modal dialog
-  listing the chips as a checked list (check = enabled), with Add, Remove, and include/exclude on
-  each row. The *model* keeps `SPEC.md` §7.2's grammar unchanged: each entry is one independent
-  predicate, includes before excludes, unknown fields warn rather than silently matching nothing.
-  While filters are active the **status bar** carries a live `2 filters · 1,204 of 5,000 rows` chip;
-  clicking it reopens the dialog.
+- **Filters live in a docked panel** — *(refined 2026-08-24, the owner pointing at Visual Studio's
+  tool windows: filters are toggled constantly while reading, so a modal dialog would make every
+  toggle a round trip)*. A **fixed bottom panel**, TextAnalysisTool.NET's shape — the tool §7.3
+  already names as the model: one row per filter with a checkbox (checked = enabled), its
+  include/exclude polarity, and its text; an add field; remove in place. `Ctrl+L` or
+  View ▸ Filters shows it; it is hideable and its state is remembered per §12.4. It reuses the
+  record-detail pane's band above the status bar. **No drag-docking, no floating, no tab groups in
+  v1** — that is a milestone of chrome for a single-document tool; the fixed panel buys the
+  daily-use value without it. The *model* keeps `SPEC.md` §7.2's grammar unchanged: each entry is
+  one independent predicate, includes before excludes, unknown fields warn rather than silently
+  matching nothing. While filters are active the **status bar** carries a live
+  `2 filters · 1,204 of 5,000 rows` chip; clicking it shows the panel.
 - **The format picker is a submenu of the Format menu** — Format ▸ Log format lists the detected
   candidates with a radio mark on the one in force, where the old right-edge chip opened a bespoke
   dropdown. Parse health stays visible in the status bar's format chip, which also opens the menu.
