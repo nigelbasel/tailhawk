@@ -7,9 +7,11 @@
 //! how the model becomes one frame's picture. Where the pixels go is `Document::draw_menu_bar`.
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, DeleteMenu, GetMenuItemCount, HMENU, MF_BYPOSITION,
-    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    AppendMenuW, CreateMenu, CreatePopupMenu, DeleteMenu, DestroyMenu, GetMenuItemCount,
+    TrackPopupMenu, HMENU, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS,
 };
 
 use crate::{Command, Document};
@@ -39,6 +41,38 @@ pub fn refill_popup(popup: HMENU, menu: &tailhawk_core::menu::Menu, top: usize) 
             append_item(popup, child);
         }
     }
+}
+
+/// §2.4's context menus, as the real thing: the same `Item` tree tracked by `TrackPopupMenu` at
+/// screen `(x, y)`, returning the chosen id directly — `TPM_RETURNCMD`, so the caller dispatches
+/// without a `WM_COMMAND` round-trip. The menu pumps its own modal loop; the caller must hold no
+/// borrow across this call.
+pub fn track_context(
+    hwnd: HWND,
+    items: &[tailhawk_core::menu::Item],
+    x: i32,
+    y: i32,
+) -> Option<u32> {
+    let popup = unsafe { CreatePopupMenu() }.ok()?;
+    for item in items {
+        append_item(popup, item);
+    }
+    let chosen = unsafe {
+        TrackPopupMenu(
+            popup,
+            TRACK_POPUP_MENU_FLAGS(TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0),
+            x,
+            y,
+            0,
+            hwnd,
+            None,
+        )
+    };
+    unsafe {
+        let _ = DestroyMenu(popup);
+    }
+    let id = chosen.0 as u32;
+    (id != 0).then_some(id)
 }
 
 fn append_item(into: HMENU, item: &tailhawk_core::menu::Item) {
@@ -127,6 +161,120 @@ pub const ID_RECENT_BASE: u32 = 10_100;
 /// Format ▸ Log format's rows, the same way: `ID_FORMAT_BASE + n` is the n-th row of
 /// [`crate::format_menu_of`]'s answer, resolved back through it when chosen.
 pub const ID_FORMAT_BASE: u32 = 10_200;
+/// §2.4's context-menu items — the ones whose subject is *where the menu was summoned* (a column,
+/// a selection, a panel row) rather than anything the id alone could name. The caller resolves the
+/// subject before tracking and dispatches these against it.
+pub const ID_CTX_SORT_ASC: u32 = 10_300;
+pub const ID_CTX_SORT_DESC: u32 = 10_301;
+pub const ID_CTX_TOP_N: u32 = 10_302;
+pub const ID_CTX_FILTER_COLUMN: u32 = 10_303;
+pub const ID_CTX_FILTER_TO: u32 = 10_304;
+pub const ID_CTX_FILTER_OUT: u32 = 10_305;
+pub const ID_CTX_CHIP_EDIT: u32 = 10_306;
+pub const ID_CTX_CHIP_POLARITY: u32 = 10_307;
+pub const ID_CTX_CHIP_TOGGLE: u32 = 10_308;
+pub const ID_CTX_CHIP_REMOVE: u32 = 10_309;
+
+/// The header's right-click menu for one column: sorting, the top-N cut, and the §7.2 route —
+/// "Filter on this column…" opens the Filter dialog already scoped. `sort_here` is this column's
+/// active direction; commands the register already lists dispatch by their register id, so a
+/// context menu never grows a second name for the same act.
+pub fn header_context(
+    title: &str,
+    sort_here: Option<bool>,
+    any_sort: bool,
+) -> Vec<tailhawk_core::menu::Item> {
+    use tailhawk_core::menu::Item;
+    let on = |item: Item, yes: bool| if yes { item } else { item.disabled() };
+    vec![
+        Item::check(
+            "Sort &ascending",
+            "",
+            ID_CTX_SORT_ASC,
+            sort_here == Some(false),
+        ),
+        Item::check(
+            "Sort &descending",
+            "",
+            ID_CTX_SORT_DESC,
+            sort_here == Some(true),
+        ),
+        Item::command(
+            &format!("&Top {} by {title}", crate::TOP_N),
+            "",
+            ID_CTX_TOP_N,
+        ),
+        on(
+            Item::command("Clear s&ort", "", command_id(Command::ClearSort)),
+            any_sort,
+        ),
+        Item::separator(),
+        Item::command(&format!("&Filter on {title}…"), "", ID_CTX_FILTER_COLUMN),
+        Item::separator(),
+        Item::command("&Reset columns", "", command_id(Command::ResetColumns)),
+    ]
+}
+
+/// A grid line's right-click menu: the selection's acts first, then the row's. Everything with a
+/// selection subject is disabled without one — disabled, not hidden, per §1.1.
+pub fn grid_context(has_selection: bool, detail: bool) -> Vec<tailhawk_core::menu::Item> {
+    use tailhawk_core::menu::Item;
+    let on = |item: Item, yes: bool| if yes { item } else { item.disabled() };
+    vec![
+        on(
+            Item::command("&Copy", "Ctrl+C", command_id(Command::Copy)),
+            has_selection,
+        ),
+        on(
+            Item::command("Copy as TS&V", "Ctrl+Shift+C", command_id(Command::CopyTsv)),
+            has_selection,
+        ),
+        Item::separator(),
+        on(
+            Item::command("Filter &to this text", "", ID_CTX_FILTER_TO),
+            has_selection,
+        ),
+        on(
+            Item::command("Filter &out this text", "", ID_CTX_FILTER_OUT),
+            has_selection,
+        ),
+        Item::separator(),
+        Item::command("&Bookmark", "Ctrl+D", command_id(Command::ToggleBookmark)),
+        Item::check(
+            "&Record detail",
+            "Ctrl+Enter",
+            command_id(Command::ToggleDetail),
+            detail,
+        ),
+        Item::separator(),
+        Item::command(
+            "&Define format from this line…",
+            "",
+            command_id(Command::DefineFormat),
+        ),
+    ]
+}
+
+/// A filter row's right-click menu in the panel — §2.4's per-chip acts, the same four the title
+/// row's buttons and the chip's own glyphs offer, gathered where the pointer already is.
+pub fn panel_row_context(enabled: bool, include: bool) -> Vec<tailhawk_core::menu::Item> {
+    use tailhawk_core::menu::Item;
+    vec![
+        Item::command("&Edit…", "", ID_CTX_CHIP_EDIT),
+        Item::command(
+            if include {
+                "Make e&xcluding"
+            } else {
+                "Make &including"
+            },
+            "",
+            ID_CTX_CHIP_POLARITY,
+        ),
+        Item::check("Ena&bled", "", ID_CTX_CHIP_TOGGLE, enabled),
+        Item::separator(),
+        Item::command("&Remove", "", ID_CTX_CHIP_REMOVE),
+    ]
+}
 
 /// §2.2's seven menus, built from the command register each time the bar is opened.
 ///
@@ -403,6 +551,93 @@ fn compact_path(path: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header menu's facts: the active direction is the ticked one, Clear sort is dead
+    /// without a sort anywhere, and the column's own name is in the items that act on it.
+    #[test]
+    fn the_header_context_reflects_the_columns_sort_and_names_it() {
+        let items = header_context("level", Some(false), true);
+        assert!(items[0].checked, "ascending is the active direction");
+        assert!(!items[1].checked);
+        assert!(items[2].label.contains("level"), "Top-N names the column");
+        assert!(items[3].enabled, "a sort exists, so Clear sort can act");
+        assert!(
+            items.iter().any(|i| i.label == "&Filter on level…"),
+            "the §7.2 route names the column"
+        );
+        let idle = header_context("level", None, false);
+        assert!(!idle[0].checked && !idle[1].checked);
+        assert!(!idle[3].enabled, "nothing to clear");
+    }
+
+    /// The grid menu's one gate: every item whose subject is the selection dies with it.
+    ///
+    /// Separators are skipped throughout — [`Item::separator`] is born `enabled: false`, since
+    /// there is nothing there to choose, and that is not the greying this test is about.
+    #[test]
+    fn the_grid_context_disables_selection_acts_without_a_selection() {
+        use tailhawk_core::menu::Kind;
+        let choosable = |items: Vec<tailhawk_core::menu::Item>| {
+            items
+                .into_iter()
+                .filter(|i| i.kind != Kind::Separator)
+                .collect::<Vec<_>>()
+        };
+        let without = choosable(grid_context(false, false));
+        let dead: Vec<&str> = without
+            .iter()
+            .filter(|i| !i.enabled)
+            .map(|i| i.label.as_str())
+            .collect();
+        assert_eq!(
+            dead,
+            [
+                "&Copy",
+                "Copy as TS&V",
+                "Filter &to this text",
+                "Filter &out this text"
+            ],
+            "exactly the selection's acts, nothing else"
+        );
+        assert!(choosable(grid_context(true, false))
+            .iter()
+            .all(|i| i.enabled));
+        assert!(
+            grid_context(true, true)
+                .iter()
+                .any(|i| i.label == "&Record detail" && i.checked),
+            "the detail pane's state shows as its tick"
+        );
+    }
+
+    /// The chip menu mirrors its chip: the tick is the enabled state, and the polarity item
+    /// offers the *other* polarity, which is the only one worth offering.
+    #[test]
+    fn the_panel_row_context_mirrors_its_chip() {
+        let include = panel_row_context(true, true);
+        assert!(include.iter().any(|i| i.label == "Ena&bled" && i.checked));
+        assert!(include.iter().any(|i| i.label == "Make e&xcluding"));
+        let exclude = panel_row_context(false, false);
+        assert!(exclude.iter().any(|i| i.label == "Ena&bled" && !i.checked));
+        assert!(exclude.iter().any(|i| i.label == "Make &including"));
+    }
+
+    /// No two items of one context menu share a mnemonic — the same rule the bar's menus keep,
+    /// for the same reason: the second claimant is unreachable by the key drawn under it.
+    #[test]
+    fn no_two_items_in_one_context_menu_share_a_mnemonic() {
+        for (name, items) in [
+            ("header", header_context("level", None, true)),
+            ("grid", grid_context(true, true)),
+            ("panel row", panel_row_context(true, true)),
+        ] {
+            let mut seen = Vec::new();
+            for m in items.iter().filter_map(|i| i.mnemonic()) {
+                assert!(!seen.contains(&m), "{name}: two items claim '{m}'");
+                seen.push(m);
+            }
+        }
+    }
 
     /// `UI-DESIGN.md` §1.2's discoverability rule, as a test rather than an intention: **every
     /// command in the register appears in at least one menu.**

@@ -776,6 +776,8 @@ pub fn create_find_dialog(owner: HWND, seed: &FindSeed, history: &[String]) -> H
 pub struct FilterEdit {
     pub columns: Vec<String>,
     pub include: bool,
+    /// A column to open pre-scoped to — the header's "Filter on this column…" route.
+    pub scope: Option<String>,
     pub expression: String,
     pub manual: bool,
     pub accepted: bool,
@@ -938,6 +940,21 @@ unsafe extern "system" fn filter_proc(
                     ID_F_EXCLUDE
                 };
                 SendDlgItemMessageW(hdlg, i32::from(radio), BM_SETCHECK, WPARAM(1), LPARAM(0));
+                if let Some(scope) = data.scope.as_deref() {
+                    if let Some(at) = data
+                        .columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(scope))
+                    {
+                        SendDlgItemMessageW(
+                            hdlg,
+                            i32::from(ID_F_SCOPE),
+                            CB_SETCURSEL,
+                            WPARAM(at + 1),
+                            LPARAM(0),
+                        );
+                    }
+                }
                 if !data.expression.is_empty() {
                     let text = wsz(&data.expression);
                     let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_EXPR), PCWSTR(text.as_ptr()));

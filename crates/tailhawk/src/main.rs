@@ -113,8 +113,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
     SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP,
-    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT,
-    WM_HSCROLL, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
+    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POINTERCAPTURECHANGED,
     WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
@@ -2130,6 +2130,38 @@ impl Document {
         }
     }
 
+    /// Flips chip `i`'s enabled mark and reruns the sieve — the panel's `[x]` and the row menu's
+    /// Enabled item, one decision.
+    fn flip_chip_enabled(&mut self, i: usize) {
+        if i >= self.filtering.chips.chips.len() {
+            return;
+        }
+        self.remember();
+        let chip = &mut self.filtering.chips.chips[i];
+        chip.enabled = !chip.enabled;
+        self.filtering.clear_results();
+        self.refilter();
+        let rows = self.view_rows();
+        self.view.grid_mut().set_total_rows(rows);
+    }
+
+    /// Flips chip `i`'s polarity the same way — the panel's sign and the row menu's item.
+    fn flip_chip_polarity(&mut self, i: usize) {
+        if i >= self.filtering.chips.chips.len() {
+            return;
+        }
+        self.remember();
+        let chip = &mut self.filtering.chips.chips[i];
+        chip.polarity = match chip.polarity {
+            Polarity::Include => Polarity::Exclude,
+            Polarity::Exclude => Polarity::Include,
+        };
+        self.filtering.clear_results();
+        self.refilter();
+        let rows = self.view_rows();
+        self.view.grid_mut().set_total_rows(rows);
+    }
+
     fn clear_filter(&mut self) {
         if !self.filtering.filtered() {
             return;
@@ -2683,6 +2715,30 @@ impl Document {
         let cell_w = self.view.hgrid().cell_width().max(1.0);
         ((x - self.view.gutter_px()) / cell_w).max(0.0) as usize
             + self.view.hgrid().visible_columns().start
+    }
+
+    /// The format column a header **context menu** at `cell` is about: the column under it, the
+    /// one whose trailing gap it sits in, or — past every shown column — the message column, which
+    /// [`column_at_cell`](Self::column_at_cell) cannot answer because the free remainder has no
+    /// width to walk. A right-click is a coarser pointer than a resize, so this snaps where that
+    /// rejects.
+    fn context_column(&self, cell: usize) -> Option<usize> {
+        let layout = self.layout.as_ref()?;
+        if layout.format.columns.is_empty() {
+            return None;
+        }
+        let mut at = 0usize;
+        for &i in layout.shown_order() {
+            let w = layout.widths[i];
+            if w == 0 {
+                continue;
+            }
+            if cell < at + w + tailhawk_core::columns::GAP {
+                return Some(i);
+            }
+            at += w + tailhawk_core::columns::GAP;
+        }
+        Some(layout.widths.len().saturating_sub(1))
     }
 
     /// Drops the column being moved at the display slot under `x`. Reports a change.
@@ -4819,7 +4875,7 @@ struct Shell {
     pending_find: bool,
     /// `Ctrl+L` / `Ctrl+Shift+L` ask for the Filter dialog with this polarity preset, deferred
     /// the same way.
-    pending_filter: Option<Polarity>,
+    pending_filter: Option<(Polarity, Option<String>)>,
     /// The panel's Edit… asks for the Filter dialog seeded with this chip, deferred the same way.
     pending_filter_edit: Option<usize>,
     /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
@@ -5624,11 +5680,14 @@ impl Shell {
         } else if ctrl && key == VK_L.0 {
             doc.show_filters = true;
             doc.filtering.error = None;
-            self.pending_filter = Some(if shift {
-                Polarity::Exclude
-            } else {
-                Polarity::Include
-            });
+            self.pending_filter = Some((
+                if shift {
+                    Polarity::Exclude
+                } else {
+                    Polarity::Include
+                },
+                None,
+            ));
             true
         } else {
             false
@@ -6851,11 +6910,14 @@ impl Shell {
             Command::FilterInclude | Command::FilterExclude => {
                 doc.show_filters = true;
                 doc.filtering.error = None;
-                self.pending_filter = Some(if command == Command::FilterInclude {
-                    Polarity::Include
-                } else {
-                    Polarity::Exclude
-                });
+                self.pending_filter = Some((
+                    if command == Command::FilterInclude {
+                        Polarity::Include
+                    } else {
+                        Polarity::Exclude
+                    },
+                    None,
+                ));
             }
             Command::ToggleFilters => {
                 doc.show_filters = !doc.show_filters;
@@ -7294,41 +7356,20 @@ impl Shell {
                 if i < doc.filtering.chips.chips.len() {
                     self.dragging_bar = Some((BarDrag::Chip, i));
                     unsafe { SetCapture(hwnd) };
-                    doc.remember();
-                    let chip = &mut doc.filtering.chips.chips[i];
-                    chip.enabled = !chip.enabled;
-                    doc.filtering.clear_results();
-                    doc.refilter();
-                    {
-                        let rows = doc.view_rows();
-                        doc.view.grid_mut().set_total_rows(rows);
-                    }
+                    doc.flip_chip_enabled(i);
                 }
             }
             Some(Hit::ChipClose(i)) => {
                 doc.remove_chip(i);
             }
             Some(Hit::FilterPolarity(i)) => {
-                if i < doc.filtering.chips.chips.len() {
-                    doc.remember();
-                    let chip = &mut doc.filtering.chips.chips[i];
-                    chip.polarity = match chip.polarity {
-                        Polarity::Include => Polarity::Exclude,
-                        Polarity::Exclude => Polarity::Include,
-                    };
-                    doc.filtering.clear_results();
-                    doc.refilter();
-                    {
-                        let rows = doc.view_rows();
-                        doc.view.grid_mut().set_total_rows(rows);
-                    }
-                }
+                doc.flip_chip_polarity(i);
             }
             Some(Hit::FilterSelect(i)) => {
                 doc.filter_selected = (i < doc.filtering.chips.chips.len()).then_some(i);
             }
             Some(Hit::FilterAdd) => {
-                self.pending_filter = Some(Polarity::Include);
+                self.pending_filter = Some((Polarity::Include, None));
             }
             Some(Hit::FilterEdit) => {
                 if let Some(i) = doc.filter_selected {
@@ -8097,7 +8138,7 @@ mod uia {
                         if let Some(doc) = s.document.as_mut() {
                             doc.show_filters = true;
                         }
-                        s.pending_filter = Some(Polarity::Include);
+                        s.pending_filter = Some((Polarity::Include, None));
                         Some(())
                     });
                     unsafe {
@@ -8470,6 +8511,220 @@ fn monospace_faces() -> Vec<String> {
     found
 }
 
+/// What sits under a right-click, resolved before its menu is built: the subject a context
+/// menu's items act on, carried past the tracking call because the menu's modal loop must run
+/// with no `STATE` borrow held.
+enum Under {
+    Header {
+        column: usize,
+        title: String,
+        sort_here: Option<bool>,
+        any_sort: bool,
+    },
+    Grid {
+        has_selection: bool,
+        detail: bool,
+    },
+    ChipRow {
+        at: usize,
+        enabled: bool,
+        include: bool,
+    },
+}
+
+/// §2.4's context menus: a right-click asks what is under it — a header column, a grid line, a
+/// filter row — and gets that subject's menu, tracked by Windows itself. Three borrows, none held
+/// across the menu: resolve the subject, track, dispatch the choice through the same paths every
+/// other surface uses.
+///
+/// Two conventions the grid inherits rather than invents. A keyboard summons — `Shift+F10`, the
+/// menu key — arrives as `(-1, -1)`: it means the grid's menu for the current selection, anchored
+/// at the grid's top-left corner, with the caret left where it is. And a right-click *outside* the
+/// selection moves the caret to the line clicked, where one inside it leaves the selection alone,
+/// because there the selection is the subject.
+fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+
+    let keyboard = sx == -1 && sy == -1;
+    let mut point = POINT { x: sx, y: sy };
+    if !keyboard {
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut point);
+        }
+    }
+    let resolved = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let shell = state.as_mut()?;
+        let doc = shell.document.as_mut()?;
+        let (x, y) = if keyboard {
+            (
+                doc.view.gutter_px() + 1.0,
+                doc.view.chrome_px() + doc.view.header_px() + 1.0,
+            )
+        } else {
+            (point.x as f32, point.y as f32 - doc.pane_top)
+        };
+        let row = doc
+            .chrome
+            .panel_hits
+            .borrow()
+            .iter()
+            .find_map(|(xr, yr, hit)| {
+                if !yr.contains(&y) || !xr.contains(&x) {
+                    return None;
+                }
+                match hit {
+                    Hit::Chip(i)
+                    | Hit::ChipClose(i)
+                    | Hit::FilterPolarity(i)
+                    | Hit::FilterSelect(i) => Some(*i),
+                    _ => None,
+                }
+            });
+        let under = if let Some(at) = row.filter(|&i| i < doc.filtering.chips.chips.len()) {
+            doc.filter_selected = Some(at);
+            let chip = &doc.filtering.chips.chips[at];
+            Under::ChipRow {
+                at,
+                enabled: chip.enabled,
+                include: chip.polarity == Polarity::Include,
+            }
+        } else if doc.header_hit(x, y).is_some() {
+            let column = doc.context_column(doc.header_cell(x))?;
+            let layout = doc.layout.as_ref()?;
+            Under::Header {
+                column,
+                title: layout.title(column).to_owned(),
+                sort_here: layout.sort.and_then(|(c, d)| (c == column).then_some(d)),
+                any_sort: layout.sort.is_some(),
+            }
+        } else {
+            let at = doc.view.position_at(x, y)?;
+            let inside = doc.selection.is_some_and(|sel| {
+                !sel.is_empty() && sel.first_row() <= at.row && at.row <= sel.last_row()
+            });
+            if !inside && !keyboard {
+                doc.selection = Some(Selection::at(at));
+            }
+            Under::Grid {
+                has_selection: doc.has_selection(),
+                detail: doc.detail_open(),
+            }
+        };
+        Some((under, (x, y + doc.pane_top)))
+    });
+    let Some((under, anchor)) = resolved else {
+        return;
+    };
+    let items = match &under {
+        Under::Header {
+            title,
+            sort_here,
+            any_sort,
+            ..
+        } => menubar::header_context(title, *sort_here, *any_sort),
+        Under::Grid {
+            has_selection,
+            detail,
+        } => menubar::grid_context(*has_selection, *detail),
+        Under::ChipRow {
+            enabled, include, ..
+        } => menubar::panel_row_context(*enabled, *include),
+    };
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+    let mut screen = POINT {
+        x: anchor.0 as i32,
+        y: anchor.1 as i32,
+    };
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut screen);
+    }
+    let Some(id) = menubar::track_context(hwnd, &items, screen.x, screen.y) else {
+        return;
+    };
+    let acted = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let Some(shell) = state.as_mut() else {
+            return false;
+        };
+        match (id, &under) {
+            (menubar::ID_CTX_SORT_ASC, Under::Header { column, .. }) => {
+                shell.run(hwnd, Command::SortBy(*column, false))
+            }
+            (menubar::ID_CTX_SORT_DESC, Under::Header { column, .. }) => {
+                shell.run(hwnd, Command::SortBy(*column, true))
+            }
+            (menubar::ID_CTX_TOP_N, Under::Header { column, .. }) => {
+                shell.run(hwnd, Command::TopN(*column))
+            }
+            (menubar::ID_CTX_FILTER_COLUMN, Under::Header { title, .. }) => {
+                if let Some(doc) = shell.document.as_mut() {
+                    doc.show_filters = true;
+                    doc.filtering.error = None;
+                }
+                shell.pending_filter = Some((Polarity::Include, Some(title.clone())));
+                true
+            }
+            (menubar::ID_CTX_FILTER_TO | menubar::ID_CTX_FILTER_OUT, Under::Grid { .. }) => {
+                let polarity = if id == menubar::ID_CTX_FILTER_TO {
+                    Polarity::Include
+                } else {
+                    Polarity::Exclude
+                };
+                let Some(doc) = shell.document.as_mut() else {
+                    return false;
+                };
+                let Some(text) = doc.copy_text() else {
+                    return false;
+                };
+                let Some(line) = text.lines().next().map(str::trim).filter(|l| !l.is_empty())
+                else {
+                    return false;
+                };
+                let expression = dialog::compose_filter(None, 0, line, false, false);
+                doc.show_filters = true;
+                doc.add_chip(&expression, polarity);
+                let rows = doc.view_rows();
+                doc.view.grid_mut().set_total_rows(rows);
+                shell.sync_scrollbar(hwnd);
+                shell.retitle(hwnd);
+                true
+            }
+            (menubar::ID_CTX_CHIP_EDIT, Under::ChipRow { at, .. }) => {
+                shell.pending_filter_edit = Some(*at);
+                true
+            }
+            (menubar::ID_CTX_CHIP_POLARITY, Under::ChipRow { at, .. }) => {
+                if let Some(doc) = shell.document.as_mut() {
+                    doc.flip_chip_polarity(*at);
+                }
+                true
+            }
+            (menubar::ID_CTX_CHIP_TOGGLE, Under::ChipRow { at, .. }) => {
+                if let Some(doc) = shell.document.as_mut() {
+                    doc.flip_chip_enabled(*at);
+                }
+                true
+            }
+            (menubar::ID_CTX_CHIP_REMOVE, Under::ChipRow { at, .. }) => {
+                if let Some(doc) = shell.document.as_mut() {
+                    doc.remove_chip(*at);
+                }
+                true
+            }
+            _ => shell.menu_choose(hwnd, id),
+        }
+    });
+    run_pending_dialogs(hwnd);
+    if acted {
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+}
+
 /// Run whatever common dialog the last command asked for, and report whether one was shown.
 ///
 /// **Every path that can run a `Command` has to call this, and for a month only the keyboard did.**
@@ -8584,7 +8839,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             .as_mut()
             .and_then(|shell| shell.pending_filter.take())
     });
-    if let Some(polarity) = filter {
+    if let Some((polarity, scope)) = filter {
         let columns = STATE.with(|s| {
             s.borrow()
                 .as_ref()
@@ -8594,6 +8849,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             let mut edit = dialog::FilterEdit {
                 columns,
                 include: polarity == Polarity::Include,
+                scope,
                 expression: String::new(),
                 manual: false,
                 accepted: false,
@@ -8648,6 +8904,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             let mut edit = dialog::FilterEdit {
                 columns,
                 include,
+                scope: None,
                 expression,
                 manual: true,
                 accepted: false,
@@ -10015,6 +10272,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
+            LRESULT(0)
+        }
+        WM_CONTEXTMENU => {
+            let sx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            context_menu(hwnd, sx, sy);
             LRESULT(0)
         }
         WM_VSCROLL => {
