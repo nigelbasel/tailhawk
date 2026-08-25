@@ -70,7 +70,7 @@ and `verify-uia.ps1` both pass live. **Not yet done:** panel visibility is not p
 `n filters · k of m` chip yet; both fold into the status-chips step below.
 
 
-### ▶ IN FLIGHT — the real Win32 menu bar (owner's decision, 2026-08-25)
+### ✅ The real Win32 menu bar — landed 2026-08-25 (`6c61390`, CI green, 1,247 lines of drawn chrome deleted)
 
 The owner, after repeated drawn-chrome defects: menus must be the real thing. Chosen over
 rebuilt drawing when offered both. The conversion, exactly:
@@ -100,6 +100,14 @@ rebuilt drawing when offered both. The conversion, exactly:
 - The status bar stays drawn (with the coming filter/match chips) — in-window surfaces use the
   planned shared standard-controls module, the owner's second directive.
 ### Still owed on the conversion, in order
+
+- **Follow-ups from the native-menu milestone**: purge the inert `Focus::Find`/`Hit::Find`/`Kind::Find`
+and the chrome find `TextField` (nothing draws or constructs them; UIA still lists a phantom
+Find element); confirm the status bar drew after `SetMenu` shrank the client (one screenshot
+showed the band empty — may be capture clipping, must be checked); rework `verify-menus.ps1`,
+`verify-dialogs.ps1` and `verify-recent.ps1` to drive the native menus (SendKeys mnemonics —
+Alt+F, Alt+H — or UIA, which real menus support natively; TAILHAWK_DUMP_MENU_HITS is gone);
+delete core `menu.rs`'s now-unused navigation half or record it as legacy.
 
 - **Format ▸ Log format submenu** with radio-marked candidates, replacing the right-edge chip
   and `draw_format_menu`. Shape: a `Document` accessor exposes `format_menu_of(&detection, 0)`
