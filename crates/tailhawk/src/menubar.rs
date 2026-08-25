@@ -165,21 +165,31 @@ pub fn menu_bar(
     let filtered = doc.is_some_and(|d| d.is_filtered());
     let saving = doc.is_some_and(|d| d.is_saving());
 
+    // The recent files are entries of the File menu itself — the owner's choice of the
+    // Notepad++ model over a submenu: numbered, newest first, just above Exit, and simply absent
+    // when there is no history rather than greyed.
+    let mut file_items = vec![
+        cmd("&Open…", "Ctrl+O", Command::OpenFile),
+        on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
+        Item::separator(),
+        on(cmd("&Export view…", "", Command::Export), open),
+        on(cmd("&Keep saving…", "", Command::Tee), open),
+        on(cmd("Stop sa&ving", "", Command::StopTee), saving),
+        Item::separator(),
+    ];
+    if !recent.is_empty() {
+        file_items.extend(
+            recent.iter().enumerate().map(|(n, path)| {
+                Item::command(&recent_label(n, path), "", ID_RECENT_BASE + n as u32)
+            }),
+        );
+        file_items.push(Item::command("&Clear recent files", "", ID_CLEAR_RECENT));
+        file_items.push(Item::separator());
+    }
+    file_items.push(Item::command("E&xit", "Alt+F4", ID_EXIT));
+
     Menu::bar(vec![
-        Item::submenu(
-            "&File",
-            vec![
-                cmd("&Open…", "Ctrl+O", Command::OpenFile),
-                recent_menu(recent),
-                on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
-                Item::separator(),
-                on(cmd("&Export view…", "", Command::Export), open),
-                on(cmd("&Keep saving…", "", Command::Tee), open),
-                on(cmd("Stop sa&ving", "", Command::StopTee), saving),
-                Item::separator(),
-                Item::command("E&xit", "Alt+F4", ID_EXIT),
-            ],
-        ),
+        Item::submenu("&File", file_items),
         Item::submenu(
             "&Edit",
             vec![
@@ -345,25 +355,7 @@ pub fn menu_bar(
     ])
 }
 
-/// File ▸ Open Recent: numbered entries newest first, then *Clear recent files* — and greyed
-/// outright when there is no history, because an empty submenu is a dead end and a vanished one
-/// breaks §1.2's memorability.
-fn recent_menu(recent: &[String]) -> tailhawk_core::menu::Item {
-    use tailhawk_core::menu::Item;
-    if recent.is_empty() {
-        return Item::submenu("Open &Recent", Vec::new()).disabled();
-    }
-    let mut items: Vec<Item> = recent
-        .iter()
-        .enumerate()
-        .map(|(n, path)| Item::command(&recent_label(n, path), "", ID_RECENT_BASE + n as u32))
-        .collect();
-    items.push(Item::separator());
-    items.push(Item::command("&Clear recent files", "", ID_CLEAR_RECENT));
-    Item::submenu("Open &Recent", items)
-}
-
-/// One Open Recent entry: the customary numbered mnemonic — `&1` through `&9`, then `1&0` — and
+/// One recent-file entry: the customary numbered mnemonic — `&1` through `&9`, then `1&0` — and
 /// the path. A literal `&` in the path is doubled so it draws as itself instead of underlining
 /// the next letter.
 fn recent_label(n: usize, path: &str) -> String {
@@ -912,43 +904,26 @@ mod tests {
         );
     }
 
-    /// A click on Open Recent descends into it — and the per-frame rebuild does not throw the
-    /// open submenu away, which is exactly how the live harness first saw this fail.
+    /// A recent entry is chosen like any other item — flat, no descent — and Clear rides with it.
     #[test]
-    fn clicking_open_recent_descends_and_survives_the_rebuild() {
+    fn clicking_a_recent_entry_chooses_its_file() {
         let paths = vec![r"C:\logs\a.log".to_owned()];
         let mut menu = menu_bar(None, false, &paths);
         menu.open_top(0);
+        let file = menu.at(&[0]).expect("File opens").to_vec();
+        let entry = file
+            .iter()
+            .position(|i| i.text().ends_with("a.log"))
+            .expect("the file is an entry of File");
         assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(1)),
-            None,
-            "a submenu opens rather than choosing"
-        );
-        assert_eq!(
-            menu.open_path(),
-            &[0, 1],
-            "the submenu is the open list now"
-        );
-        let entries = menu.at(menu.open_path()).expect("the child list");
-        assert!(entries[0].text().ends_with("a.log"));
-
-        menu.rebuild(menu_bar(None, false, &paths));
-        assert_eq!(
-            menu.open_path(),
-            &[0, 1],
-            "the every-frame rebuild kept the open submenu"
-        );
-        let clear = menu.at(&[0, 1]).expect("child list").len() - 1;
-        assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(0)),
+            chosen_by_click(&mut menu, MenuHit::Entry(entry)),
             Some(ID_RECENT_BASE),
-            "the first entry chooses the newest file"
+            "the newest file is chosen directly"
         );
         let mut menu = menu_bar(None, false, &paths);
         menu.open_top(0);
-        let _ = chosen_by_click(&mut menu, MenuHit::Entry(1));
         assert_eq!(
-            chosen_by_click(&mut menu, MenuHit::Entry(clear)),
+            chosen_by_click(&mut menu, MenuHit::Entry(entry + 1)),
             Some(ID_CLEAR_RECENT)
         );
     }
@@ -1002,19 +977,20 @@ mod tests {
         }
     }
 
-    /// File ▸ Open Recent: greyed with no history, and with history it lists the files newest
-    /// first under numbered mnemonics with *Clear recent files* at the bottom.
+    /// The Notepad++ model, the owner's choice: recent files are numbered entries of the File
+    /// menu itself, newest first, just above Exit, *Clear recent files* beneath them — and with
+    /// no history there is simply nothing, not a greyed stub.
     #[test]
-    fn the_file_menu_offers_recent_files_and_greys_the_empty_list() {
+    fn recent_files_are_entries_of_the_file_menu_itself() {
         let menu = menu_bar(None, false, &[]);
         let file = menu.at(&[0]).expect("File opens").to_vec();
-        let recent = file
-            .iter()
-            .find(|i| i.text().starts_with("Open Recent"))
-            .expect("an Open Recent entry under File");
         assert!(
-            !recent.selectable(),
-            "an empty history is greyed, not a dead end"
+            !file.iter().any(|i| i.text().contains("Clear recent")),
+            "no history, no entries"
+        );
+        assert!(
+            !file.iter().any(|i| i.text().contains("Open Recent")),
+            "the submenu is gone"
         );
 
         let paths = vec![
@@ -1022,26 +998,24 @@ mod tests {
             r"C:\logs\older.log".to_owned(),
         ];
         let menu = menu_bar(None, false, &paths);
-        let at = menu
-            .at(&[0])
-            .expect("File opens")
+        let file = menu.at(&[0]).expect("File opens").to_vec();
+        let first = file
             .iter()
-            .position(|i| i.text().starts_with("Open Recent"))
-            .expect("the entry is still where it was — §1.2's memorability");
-        let entries = menu.at(&[0, at]).expect("the submenu opens").to_vec();
+            .position(|i| i.text().ends_with("newest.log"))
+            .expect("the newest file is an entry of File directly");
         assert!(
-            entries[0].text().starts_with("1 ") && entries[0].text().ends_with("newest.log"),
-            "the newest file is entry 1: {}",
-            entries[0].text()
+            file[first].text().starts_with("1 "),
+            "numbered, newest first: {}",
+            file[first].text()
         );
-        assert!(entries[1].text().ends_with("older.log"));
+        assert!(file[first + 1].text().ends_with("older.log"));
         assert!(
-            entries
-                .last()
-                .expect("entries")
-                .text()
-                .contains("Clear recent files"),
-            "the customary way out lives at the bottom"
+            file[first + 2].text().contains("Clear recent files"),
+            "the customary way out sits beneath the entries"
+        );
+        assert!(
+            file.last().expect("items").text().contains("Exit"),
+            "and Exit stays the menu's last word"
         );
     }
 
