@@ -15,19 +15,24 @@
 //! inputs, no window anywhere, tested below. [`show_keymap`] and [`show_prefs`] are the view: they
 //! hand the finished template to Windows and copy control state in and out, deciding nothing.
 
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMHDR,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetDlgItem,
-    GetDlgItemInt, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SetDlgItemInt,
-    SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, DLGTEMPLATE, SW_SHOW, WINDOW_LONG_PTR_INDEX,
-    WM_COMMAND, WM_DESTROY, WM_INITDIALOG,
+    GetDlgItemInt, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SendMessageW,
+    SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, DLGTEMPLATE, SW_SHOW,
+    WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NOTIFY,
 };
 
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 
 use crate::keymap::KeymapSheet;
 use crate::prefs;
+use tailhawk_core::wizard::{Edge, Role, Test, Wizard};
 
 /// The dialog-manager button ids every dialog shares.
 pub const IDOK: u16 = 1;
@@ -61,6 +66,31 @@ const ID_FIND_PREV: u16 = 113;
 const ID_FIND_WHOLE: u16 = 114;
 const ID_FIND_WRAP: u16 = 115;
 const ID_FIND_STATUS: u16 = 116;
+/// The Define Format dialog — §6.2 as a real dialog rather than a sheet over the grid.
+const ID_W_EXAMPLE: u16 = 140;
+const ID_W_FIELDS: u16 = 141;
+const ID_W_ROLE: u16 = 142;
+const ID_W_NAME: u16 = 143;
+const ID_W_BOUNDS: u16 = 144;
+const ID_W_SPLIT: u16 = 145;
+const ID_W_ADD: u16 = 146;
+const ID_W_MERGE: u16 = 147;
+const ID_W_REMOVE: u16 = 148;
+const ID_W_PATTERN: u16 = 149;
+const ID_W_ERROR: u16 = 150;
+const ID_W_SAVEAS: u16 = 151;
+const ID_W_TEST: u16 = 152;
+const ID_W_STATUS: u16 = 153;
+const ID_W_PREVIEW: u16 = 154;
+/// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
+/// Filter dialog's.
+const W_LEFT: i16 = 7;
+const W_RIGHT: i16 = 413;
+const W_BUTTON_X: i16 = 313;
+const W_BUTTON_W: i16 = 100;
+/// The most preview rows the dialog lists. `MAX_SAMPLES` is 200; a list view holds them all
+/// without complaint, and the scrollbar is the honest way to say how many there are.
+const W_PREVIEW_ROWS: usize = tailhawk_core::wizard::MAX_SAMPLES;
 
 /// `DWLP_USER` — the per-dialog slot the data pointer rides in. Both targets are 64-bit, so the
 /// two slots before it are eight bytes each.
@@ -76,10 +106,26 @@ const BM_SETCHECK: u32 = 0x00F1;
 /// The predefined dialog control classes, by the ordinals `DLGTEMPLATE` names them with.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Class {
-    Button = 0x0080,
-    Edit = 0x0081,
-    Static = 0x0082,
-    ComboBox = 0x0085,
+    Button,
+    Edit,
+    Static,
+    ComboBox,
+    /// A window class by **name**. The four above are the pre-defined dialog classes and have
+    /// ordinals; the common controls — a list view, say — have none, and a template names them.
+    Named(&'static str),
+}
+
+impl Class {
+    /// The pre-defined ordinal, or `None` for a class the template must spell out.
+    fn ordinal(self) -> Option<u16> {
+        match self {
+            Class::Button => Some(0x0080),
+            Class::Edit => Some(0x0081),
+            Class::Static => Some(0x0082),
+            Class::ComboBox => Some(0x0085),
+            Class::Named(_) => None,
+        }
+    }
 }
 
 /// One control in a template: geometry in dialog units, and the style bits beyond
@@ -159,8 +205,17 @@ pub fn template(title: &str, w: i16, h: i16, items: &[Item]) -> Vec<u16> {
         t.push(item.w as u16);
         t.push(item.h as u16);
         t.push(item.id);
-        t.push(0xFFFF);
-        t.push(item.class as u16);
+        match item.class {
+            Class::Named(name) => push_wsz(&mut t, name),
+            other => {
+                t.push(0xFFFF);
+                t.push(
+                    other
+                        .ordinal()
+                        .expect("a class with no name has an ordinal"),
+                );
+            }
+        }
         push_wsz(&mut t, &item.text);
         t.push(0); // no creation data
     }
@@ -228,6 +283,119 @@ impl PrefsChoice {
 
 fn wsz(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The roles the Define Format dialog offers, in combo order — §6.2's `Roles` row as a list a
+/// standard control can show. `Named` last, because it is the one that needs the Name box beside
+/// it and the order should not make that a surprise.
+pub const FORMAT_ROLES: &[(&str, Role)] = &[
+    ("Timestamp", Role::Timestamp),
+    ("Severity", Role::Severity),
+    ("Message", Role::Message),
+    ("Ignore", Role::Discard),
+    ("Column…", Role::Named),
+];
+
+/// The label a role carries in the dialog, and in the field list's Role column.
+pub fn role_label(role: Role) -> &'static str {
+    FORMAT_ROLES
+        .iter()
+        .find(|(_, r)| *r == role)
+        .map_or("Column…", |(label, _)| label)
+}
+
+/// One row of the Define Format dialog's field list.
+pub struct FormatFieldRow {
+    /// The span of the example this field covers, shown literally — a field the user cannot read
+    /// is a field they cannot judge, and the example above is too wide to count characters in.
+    pub text: String,
+    pub role: String,
+    /// The DSL token this field becomes: `<ts>`, `<level>`, `<message>`, `<_>`, or `<name>`.
+    pub token: String,
+}
+
+/// §6.2's fields as the rows the list shows — **pure**, so the one mapping the whole dialog rests
+/// on is testable without a window.
+///
+/// A wizard built from a pasted layout has no example and therefore no fields; it answers with an
+/// empty list rather than a wrong one.
+pub fn format_field_rows(wizard: &Wizard) -> Vec<FormatFieldRow> {
+    let Some(example) = wizard.example() else {
+        return Vec::new();
+    };
+    wizard
+        .fields()
+        .iter()
+        .map(|f| FormatFieldRow {
+            text: example
+                .get(f.start..f.end)
+                .unwrap_or_default()
+                .replace('\t', "→"),
+            role: role_label(f.role).to_owned(),
+            token: f.token(),
+        })
+        .collect()
+}
+
+/// The preview grid as text: the tested column titles, then one row per sample — `None` where the
+/// format did not match that line, which the dialog shows as a struck-through row rather than
+/// silently skipping it.
+pub fn format_preview(test: &Test, samples: &[String], most: usize) -> Vec<Option<Vec<String>>> {
+    test.rows
+        .iter()
+        .enumerate()
+        .take(most)
+        .map(|(i, row)| {
+            let line = samples.get(i)?;
+            Some(
+                row.as_ref()?
+                    .iter()
+                    .map(|span| {
+                        span.as_ref()
+                            .map_or(String::new(), |s| line[s.clone()].to_owned())
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The byte offset into `s` that a Win32 edit control's caret position names.
+///
+/// **The two count different things.** `EM_GETSEL` answers in UTF-16 code units, because that is
+/// what the control holds; [`Wizard`] takes byte offsets into UTF-8, and insists they land on a
+/// character boundary. On an ASCII log line the two are the same number, which is exactly why this
+/// is a function with a test rather than a cast — the first line with an em dash in it would
+/// otherwise put a field boundary in the middle of a character and be refused with a message about
+/// character boundaries that names nothing the user did.
+///
+/// A position past the end clamps to the end, as a caret at the end of the text does.
+pub fn byte_at_utf16(s: &str, units: usize) -> usize {
+    let mut seen = 0usize;
+    for (at, ch) in s.char_indices() {
+        if seen >= units {
+            return at;
+        }
+        seen += ch.len_utf16();
+    }
+    s.len()
+}
+
+/// The line above the preview: why nothing compiled, or how much of the sample matched.
+pub fn format_status(test: Option<&Test>) -> String {
+    match test {
+        None => "not tested yet — Test previews the next 200 lines".to_owned(),
+        Some(t) => match (&t.error, t.rate()) {
+            (Some(why), _) => why.clone(),
+            (None, None) => "no sample lines to preview".to_owned(),
+            (None, Some(rate)) => format!(
+                "{} of {} matched ({:.0}%)",
+                t.matched,
+                t.rows.len(),
+                rate * 100.0
+            ),
+        },
+    }
 }
 
 /// The operators the Filter dialog offers over a column, in combo order. Each writes §7.2 text;
@@ -453,6 +621,31 @@ const ES_READONLY: u32 = 0x0800;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
+const EN_CHANGE: u32 = 0x0300;
+const CBN_SELCHANGE: u32 = 1;
+const EM_GETSEL: u32 = 0x00B0;
+
+/// The list-view styles and messages the Define Format dialog uses. The `windows` crate types the
+/// structures; these are the plain integers beside them.
+const LVS_REPORT: u32 = 0x0001;
+const LVS_SINGLESEL: u32 = 0x0004;
+const LVS_SHOWSELALWAYS: u32 = 0x0008;
+const LVS_EX_GRIDLINES: u32 = 0x0001;
+const LVS_EX_FULLROWSELECT: u32 = 0x0020;
+const LVM_FIRST: u32 = 0x1000;
+const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
+const LVM_GETNEXTITEM: u32 = LVM_FIRST + 12;
+const LVM_DELETECOLUMN: u32 = LVM_FIRST + 28;
+const LVM_SETITEMSTATE: u32 = LVM_FIRST + 43;
+const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = LVM_FIRST + 54;
+const LVM_INSERTITEMW: u32 = LVM_FIRST + 77;
+const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
+const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
+const LVNI_SELECTED: u32 = 0x0002;
+const LVIS_FOCUSED: u32 = 0x0001;
+const LVIS_SELECTED: u32 = 0x0002;
+/// `LVN_FIRST - 1`, and `LVN_FIRST` is `-100` — so this is the wrapped `u32` Windows sends.
+const LVN_ITEMCHANGED: u32 = (-101_i32) as u32;
 
 /// §2.2's Preferences as a modal dialog: theme and font in drop-down lists, the size in a numeric
 /// field, OK and Cancel. Returns whether OK was chosen; `data` then carries the selections.
@@ -894,8 +1087,6 @@ unsafe extern "system" fn filter_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
-    const EN_CHANGE: u32 = 0x0300;
-    const CBN_SELCHANGE: u32 = 1;
     match msg {
         WM_INITDIALOG => {
             // The per-dialog state rides in a leaked box freed at WM_DESTROY; DWLP_USER carries
@@ -1201,6 +1392,684 @@ pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
     data.accepted
 }
 
+/// The Define Format dialog's controls and where they sit, in dialog units — pure, like
+/// [`filter_dialog_items`], and held to the same rule: one left edge, one right edge.
+///
+/// **The shape is §6.2's, not the overlay's.** The example line at the top, the fields under it as
+/// a list with its verbs beside it, the pattern the fields compose into, then Test and what Test
+/// found. What the overlay expressed as a strip of key hints — `←→ field`, `R role`, `Tab name` —
+/// is here what it should have been: a list you click and buttons that say what they do.
+fn format_dialog_items() -> Vec<Item> {
+    const BS_GROUPBOX: u32 = 0x0007;
+    let label =
+        |text: &str, at: (i16, i16, i16, i16)| Item::new(Class::Static, text, 0xFFFF, at, 0);
+    let button = |text: &str, id: u16, at: (i16, i16, i16, i16)| {
+        Item::new(Class::Button, text, id, at, WS_TABSTOP)
+    };
+    let verb = |text: &str, id: u16, row: i16| {
+        button(text, id, (W_BUTTON_X, 44 + row * 17, W_BUTTON_W, 14))
+    };
+    let list = |id: u16, at: (i16, i16, i16, i16)| {
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            id,
+            at,
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        )
+    };
+    vec![
+        label(
+            "&Example line — select in it to set a field's bounds:",
+            (W_LEFT, 7, 300, 8),
+        ),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_W_EXAMPLE,
+            (W_LEFT, 17, W_RIGHT - W_LEFT, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_READONLY,
+        ),
+        label("&Fields:", (W_LEFT, 34, 40, 8)),
+        list(ID_W_FIELDS, (W_LEFT, 44, W_BUTTON_X - W_LEFT - 6, 72)),
+        verb("Set &bounds from selection", ID_W_BOUNDS, 0),
+        verb("S&plit at selection", ID_W_SPLIT, 1),
+        verb("&Add from selection", ID_W_ADD, 2),
+        verb("&Merge with next", ID_W_MERGE, 3),
+        verb("&Remove", ID_W_REMOVE, 4),
+        label("R&ole:", (W_LEFT, 124, 22, 8)),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_W_ROLE,
+            (32, 122, 80, 90),
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+        ),
+        label("&Name:", (120, 124, 24, 8)),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_W_NAME,
+            (146, 122, 100, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        label("Pattern:", (W_LEFT, 142, 40, 8)),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_W_PATTERN,
+            (W_LEFT, 152, W_RIGHT - W_LEFT, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_READONLY,
+        ),
+        label("", (W_LEFT, 168, W_RIGHT - W_LEFT, 8)),
+        Item::new(
+            Class::Static,
+            "",
+            ID_W_ERROR,
+            (W_LEFT, 168, W_RIGHT - W_LEFT, 8),
+            0,
+        ),
+        label("&Save as:", (W_LEFT, 182, 34, 8)),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_W_SAVEAS,
+            (44, 180, 150, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        button("&Test", ID_W_TEST, (203, 180, 50, 14)),
+        Item::new(
+            Class::Static,
+            "",
+            ID_W_STATUS,
+            (259, 182, W_RIGHT - 259, 8),
+            0,
+        ),
+        Item::new(
+            Class::Button,
+            "Pre&view",
+            0xFFFF,
+            (W_LEFT, 198, W_RIGHT - W_LEFT, 82),
+            BS_GROUPBOX,
+        ),
+        list(ID_W_PREVIEW, (W_LEFT + 6, 210, W_RIGHT - W_LEFT - 12, 64)),
+        Item::new(
+            Class::Button,
+            "Save",
+            IDOK,
+            (W_RIGHT - 110, 286, 50, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (W_RIGHT - 50, 286, 50, 14),
+            WS_TABSTOP,
+        ),
+    ]
+}
+
+/// §6.2's wizard as a **standard modal dialog** — the owner's direction, 2026-08-25: "Format ▸
+/// define from a line is yet another terrible UI. Needs a proper dialog."
+///
+/// It edits `wizard` in place and answers whether Save was pressed. Everything it decides, it
+/// decides by calling the model; everything it shows, it shows through [`format_field_rows`],
+/// [`format_preview`] and [`format_status`], which are pure and tested.
+pub fn show_format_dialog(hwnd: HWND, wizard: &mut Wizard) -> bool {
+    // The list views are common controls, and a template that names a class nobody registered
+    // opens as a dialog with a hole in it.
+    let icc = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_LISTVIEW_CLASSES,
+    };
+    unsafe {
+        let _ = InitCommonControlsEx(&icc);
+    }
+    let mut state = FormatState {
+        wizard,
+        accepted: false,
+    };
+    let t = template("Define Format", 420, 307, &format_dialog_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            hwnd,
+            Some(format_proc),
+            LPARAM(&mut state as *mut FormatState as isize),
+        )
+    };
+    state.accepted
+}
+
+/// What [`format_proc`] works on for the life of the dialog.
+struct FormatState<'a> {
+    wizard: &'a mut Wizard,
+    accepted: bool,
+}
+
+thread_local! {
+    /// True while the Define Format dialog is writing its own controls.
+    ///
+    /// **An edit control cannot tell a typist from a `SetDlgItemTextW`** — both arrive as
+    /// `EN_CHANGE` — and the dialog fills the Name box every time the selection moves. Without
+    /// this, showing a Timestamp field put its token `ts` into the Name box, which came straight
+    /// back as "set this field's name to ts" and was refused: the dialog opened reporting a fault
+    /// it had caused itself, against a pattern that was perfectly good.
+    ///
+    /// **It lives here rather than in [`FormatState`], and that is the second version of this
+    /// fix.** The flag has to be written before an FFI call and read inside the message that call
+    /// dispatches — but the writer holds `&mut FormatState` and the reader takes its own from
+    /// `DWLP_USER`, so the two alias, and a `&mut` promises the compiler that nothing else can
+    /// observe what it writes. The store was simply gone from the optimised build: the guard read
+    /// `false` every time and the dialog still opened accusing itself. A `Cell` in thread-local
+    /// storage makes no such promise, and the dialog is modal on one thread by construction.
+    static FORMAT_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `write`, with every `EN_CHANGE` and `CBN_SELCHANGE` it provokes marked as the dialog's own.
+fn format_quietly<R>(write: impl FnOnce() -> R) -> R {
+    FORMAT_QUIET.with(|q| q.set(true));
+    let out = write();
+    FORMAT_QUIET.with(|q| q.set(false));
+    out
+}
+
+/// Adds one column to a report-view list.
+fn lv_column(list: HWND, at: i32, title: &str, width: i32) {
+    let mut text = wsz(title);
+    let mut col = LVCOLUMNW {
+        mask: LVCF_TEXT | LVCF_WIDTH,
+        cx: width,
+        pszText: PWSTR(text.as_mut_ptr()),
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_INSERTCOLUMNW,
+            WPARAM(at as usize),
+            LPARAM(&mut col as *mut LVCOLUMNW as isize),
+        );
+    }
+}
+
+/// Clears a report-view list's rows **and** its columns, so a second Test does not inherit the
+/// first's headings.
+fn lv_reset(list: HWND) {
+    unsafe {
+        SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
+        while SendMessageW(list, LVM_DELETECOLUMN, WPARAM(0), LPARAM(0)).0 != 0 {}
+    }
+}
+
+/// Appends one row of text to a report-view list.
+fn lv_row(list: HWND, at: i32, cells: &[String]) {
+    let Some((first, rest)) = cells.split_first() else {
+        return;
+    };
+    let mut text = wsz(first);
+    let mut item = LVITEMW {
+        mask: LVIF_TEXT,
+        iItem: at,
+        pszText: PWSTR(text.as_mut_ptr()),
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_INSERTITEMW,
+            WPARAM(0),
+            LPARAM(&mut item as *mut LVITEMW as isize),
+        );
+    }
+    for (i, cell) in rest.iter().enumerate() {
+        let mut text = wsz(cell);
+        let mut sub = LVITEMW {
+            mask: LVIF_TEXT,
+            iItem: at,
+            iSubItem: i as i32 + 1,
+            pszText: PWSTR(text.as_mut_ptr()),
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_SETITEMTEXTW,
+                WPARAM(at as usize),
+                LPARAM(&mut sub as *mut LVITEMW as isize),
+            );
+        }
+    }
+}
+
+/// The example edit's selection, as byte offsets into the example — the one gesture the dialog
+/// replaces the overlay's invisible drag handles with.
+///
+/// `None` when nothing is selected: a caret is a point, and every verb that uses this wants a
+/// span. Callers say so rather than guessing at one.
+fn format_selection(hdlg: HWND, example: &str) -> Option<std::ops::Range<usize>> {
+    let mut start = 0u32;
+    let mut end = 0u32;
+    unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_W_EXAMPLE),
+            EM_GETSEL,
+            WPARAM(&mut start as *mut u32 as usize),
+            LPARAM(&mut end as *mut u32 as isize),
+        );
+    }
+    let from = byte_at_utf16(example, start as usize);
+    let to = byte_at_utf16(example, end as usize);
+    (from < to).then_some(from..to)
+}
+
+/// Puts the whole of `wizard` back on screen — fields, pattern, fault, and the readout — after
+/// anything at all changes it. **One refresh, called from every verb**, because the alternative is
+/// a dialog where four of five buttons update the pattern and the fifth is the one that ships.
+fn format_refresh(hdlg: HWND, state: &mut FormatState, keep: Option<usize>) {
+    let Ok(fields) = (unsafe { GetDlgItem(hdlg, i32::from(ID_W_FIELDS)) }) else {
+        return;
+    };
+    let rows = format_field_rows(state.wizard);
+    lv_reset(fields);
+    lv_column(fields, 0, "Text", 150);
+    lv_column(fields, 1, "Role", 70);
+    lv_column(fields, 2, "Becomes", 80);
+    for (i, row) in rows.iter().enumerate() {
+        lv_row(
+            fields,
+            i as i32,
+            &[row.text.clone(), row.role.clone(), row.token.clone()],
+        );
+    }
+    if let Some(at) = keep.filter(|&a| a < rows.len()) {
+        lv_select(fields, at);
+    }
+    let pattern = wsz(&state.wizard.template());
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_PATTERN), PCWSTR(pattern.as_ptr()));
+    }
+    let error = wsz(&state.wizard.error().unwrap_or_default());
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_ERROR), PCWSTR(error.as_ptr()));
+    }
+    let status = wsz(&format_status(state.wizard.last_test()));
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_STATUS), PCWSTR(status.as_ptr()));
+    }
+    format_show_role(hdlg, state, keep);
+}
+
+/// Points the Role combo and Name box at the selected field, and greys them when nothing is
+/// selected — the §1.1 rule the menus keep, applied to the two controls that have a subject.
+fn format_show_role(hdlg: HWND, state: &mut FormatState, at: Option<usize>) {
+    let field = at.and_then(|i| state.wizard.fields().get(i));
+    let on = field.is_some();
+    for id in [
+        ID_W_ROLE,
+        ID_W_NAME,
+        ID_W_BOUNDS,
+        ID_W_SPLIT,
+        ID_W_MERGE,
+        ID_W_REMOVE,
+    ] {
+        if let Ok(control) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
+            unsafe {
+                let _ = EnableWindow(control, on);
+            }
+        }
+    }
+    let Some(field) = field else {
+        return;
+    };
+    let chosen = FORMAT_ROLES
+        .iter()
+        .position(|(_, r)| *r == field.role)
+        .unwrap_or(0);
+    let name = wsz(&field.name);
+    format_quietly(|| unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_W_ROLE),
+            CB_SETCURSEL,
+            WPARAM(chosen),
+            LPARAM(0),
+        );
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_NAME), PCWSTR(name.as_ptr()));
+    });
+}
+
+/// Reports a refusal from the model where the user is looking. The wizard's own errors are
+/// sentences — "that crosses the field before it" — and they belong on the fault line, not in a
+/// message box that has to be dismissed before the next attempt.
+fn format_say(hdlg: HWND, why: &str) {
+    let text = wsz(why);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_ERROR), PCWSTR(text.as_ptr()));
+    }
+}
+
+/// Runs §6.2's **Test** and fills the preview from what came back.
+fn format_test(hdlg: HWND, state: &mut FormatState) {
+    let (columns, rows) = {
+        let test = state.wizard.test().clone();
+        let samples = state.wizard.samples().to_vec();
+        (
+            test.columns.clone(),
+            format_preview(&test, &samples, W_PREVIEW_ROWS),
+        )
+    };
+    let Ok(preview) = (unsafe { GetDlgItem(hdlg, i32::from(ID_W_PREVIEW)) }) else {
+        return;
+    };
+    lv_reset(preview);
+    if columns.is_empty() {
+        lv_column(preview, 0, "Preview", 380);
+    } else {
+        for (i, title) in columns.iter().enumerate() {
+            lv_column(preview, i as i32, title, 100);
+        }
+    }
+    for (i, row) in rows.iter().enumerate() {
+        // An unmatched sample is shown as such rather than dropped: §1.1's "never silently drop",
+        // and the row the user most wants to see when the rate is not 100%.
+        let cells = row.clone().unwrap_or_else(|| {
+            let mut cells = vec!["— did not match —".to_owned()];
+            cells.extend(std::iter::repeat_n(
+                String::new(),
+                columns.len().saturating_sub(1),
+            ));
+            cells
+        });
+        lv_row(preview, i as i32, &cells);
+    }
+    let status = wsz(&format_status(state.wizard.last_test()));
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_STATUS), PCWSTR(status.as_ptr()));
+    }
+}
+
+/// The selected row of a report-view list, or `None`.
+fn lv_selected(list: HWND) -> Option<usize> {
+    let found = unsafe {
+        SendMessageW(
+            list,
+            LVM_GETNEXTITEM,
+            WPARAM(usize::MAX),
+            LPARAM(LVNI_SELECTED as isize),
+        )
+    };
+    usize::try_from(found.0).ok()
+}
+
+/// Selects row `at`, so an edit that reorders the fields leaves the pointer somewhere sensible.
+fn lv_select(list: HWND, at: usize) {
+    let item = LVITEMW {
+        state: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED | LVIS_FOCUSED),
+        stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED | LVIS_FOCUSED),
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_SETITEMSTATE,
+            WPARAM(at),
+            LPARAM(&item as *const LVITEMW as isize),
+        );
+    }
+}
+
+/// The Define Format dialog's proc. Every arm does the same three things: ask the model, report a
+/// refusal if it refused, refresh. Nothing here decides what a field may be — that is
+/// [`tailhawk_core::wizard`]'s, and it already says so in sentences.
+unsafe extern "system" fn format_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            let state = unsafe { &mut *(lparam.0 as *mut FormatState) };
+            for (label, _) in FORMAT_ROLES {
+                let text = wsz(label);
+                unsafe {
+                    SendDlgItemMessageW(
+                        hdlg,
+                        i32::from(ID_W_ROLE),
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(text.as_ptr() as isize),
+                    );
+                }
+            }
+            let example = wsz(state.wizard.example().unwrap_or_default());
+            let name = wsz(&state.wizard.name);
+            unsafe {
+                let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_EXAMPLE), PCWSTR(example.as_ptr()));
+                let _ = SetDlgItemTextW(hdlg, i32::from(ID_W_SAVEAS), PCWSTR(name.as_ptr()));
+            }
+            for id in [ID_W_FIELDS, ID_W_PREVIEW] {
+                if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
+                    unsafe {
+                        SendMessageW(
+                            list,
+                            LVM_SETEXTENDEDLISTVIEWSTYLE,
+                            WPARAM(0),
+                            LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                        );
+                    }
+                }
+            }
+            format_refresh(hdlg, state, Some(0));
+            // The field list is what the dialog is about, and every verb beside it acts on the
+            // row selected there — so that is where the keyboard starts, not on the last button
+            // Windows happens to reach.
+            if let Ok(fields) = unsafe { GetDlgItem(hdlg, i32::from(ID_W_FIELDS)) } {
+                unsafe {
+                    let _ = SetFocus(fields);
+                }
+            }
+            0
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == ID_W_FIELDS as usize && header.code == LVN_ITEMCHANGED {
+                if let Some(state) = format_state(hdlg) {
+                    if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_W_FIELDS)) } {
+                        format_show_role(hdlg, state, lv_selected(list));
+                    }
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let Some(state) = format_state(hdlg) else {
+                return 0;
+            };
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_W_FIELDS)) }) else {
+                return 0;
+            };
+            if FORMAT_QUIET.with(|q| q.get()) && matches!(code, EN_CHANGE | CBN_SELCHANGE) {
+                return 0;
+            }
+            let at = lv_selected(list);
+            let example = state.wizard.example().unwrap_or_default().to_owned();
+            match (id, code) {
+                (IDOK, _) => {
+                    // **Save refuses here, where the user is looking.** Letting a nameless or
+                    // uncompilable format close the dialog and fail in the status bar would put
+                    // the reason a long way from the controls that fix it — and would leave the
+                    // shell holding a wizard it must then either drop or draw.
+                    let name = read_dlg_text(hdlg, ID_W_SAVEAS);
+                    if name.trim().is_empty() {
+                        format_say(hdlg, "name the format before saving it");
+                        if let Ok(box_) = unsafe { GetDlgItem(hdlg, i32::from(ID_W_SAVEAS)) } {
+                            unsafe {
+                                let _ = SetFocus(box_);
+                            }
+                        }
+                    } else if let Some(why) = state.wizard.error() {
+                        format_say(hdlg, &why);
+                    } else {
+                        state.wizard.name = name;
+                        state.accepted = true;
+                        unsafe {
+                            let _ = EndDialog(hdlg, 1);
+                        }
+                    }
+                }
+                (IDCANCEL, _) => unsafe {
+                    let _ = EndDialog(hdlg, 0);
+                },
+                (ID_W_TEST, _) => format_test(hdlg, state),
+                (ID_W_ROLE, CBN_SELCHANGE) => {
+                    let chosen = unsafe {
+                        SendDlgItemMessageW(
+                            hdlg,
+                            i32::from(ID_W_ROLE),
+                            CB_GETCURSEL,
+                            WPARAM(0),
+                            LPARAM(0),
+                        )
+                        .0
+                    };
+                    if let (Some(at), Some((_, role))) = (
+                        at,
+                        usize::try_from(chosen)
+                            .ok()
+                            .and_then(|c| FORMAT_ROLES.get(c)),
+                    ) {
+                        if let Err(why) = state.wizard.set_role(at, *role) {
+                            format_say(hdlg, &why);
+                        } else {
+                            format_refresh(hdlg, state, Some(at));
+                        }
+                    }
+                }
+                (ID_W_NAME, EN_CHANGE) => {
+                    if let Some(at) = at {
+                        let name = read_dlg_text(hdlg, ID_W_NAME);
+                        if let Err(why) = state.wizard.set_name(at, &name) {
+                            format_say(hdlg, &why);
+                        } else {
+                            // The list and the pattern follow the name, but the Name box must not
+                            // be rewritten from under the caret while it is being typed in.
+                            let rows = format_field_rows(state.wizard);
+                            if let Some(row) = rows.get(at) {
+                                let token = wsz(&row.token);
+                                unsafe {
+                                    SendMessageW(
+                                        list,
+                                        LVM_SETITEMTEXTW,
+                                        WPARAM(at),
+                                        LPARAM(&mut LVITEMW {
+                                            mask: LVIF_TEXT,
+                                            iItem: at as i32,
+                                            iSubItem: 2,
+                                            pszText: PWSTR(token.as_ptr() as *mut u16),
+                                            ..Default::default()
+                                        }
+                                            as *mut LVITEMW
+                                            as isize),
+                                    );
+                                }
+                            }
+                            let pattern = wsz(&state.wizard.template());
+                            unsafe {
+                                let _ = SetDlgItemTextW(
+                                    hdlg,
+                                    i32::from(ID_W_PATTERN),
+                                    PCWSTR(pattern.as_ptr()),
+                                );
+                            }
+                        }
+                    }
+                }
+                (ID_W_BOUNDS, _) => match (at, format_selection(hdlg, &example)) {
+                    (Some(at), Some(span)) => {
+                        // The end first: moving the start past the old end would be refused as an
+                        // empty field, and a two-step edit must not fail on its own first half.
+                        let widen = span.end >= state.wizard.fields()[at].end;
+                        let order = if widen {
+                            [(Edge::End, span.end), (Edge::Start, span.start)]
+                        } else {
+                            [(Edge::Start, span.start), (Edge::End, span.end)]
+                        };
+                        let mut failed = None;
+                        for (edge, to) in order {
+                            if let Err(why) = state.wizard.move_boundary(at, edge, to) {
+                                failed = Some(why);
+                                break;
+                            }
+                        }
+                        match failed {
+                            Some(why) => format_say(hdlg, &why),
+                            None => format_refresh(hdlg, state, Some(at)),
+                        }
+                    }
+                    (None, _) => format_say(hdlg, "select a field first"),
+                    (_, None) => format_say(hdlg, "select part of the example line first"),
+                },
+                (ID_W_SPLIT, _) => match (at, format_selection(hdlg, &example)) {
+                    (Some(at), Some(span)) => match state.wizard.split(at, span.start) {
+                        Err(why) => format_say(hdlg, &why),
+                        Ok(()) => format_refresh(hdlg, state, Some(at)),
+                    },
+                    (None, _) => format_say(hdlg, "select a field first"),
+                    (_, None) => format_say(hdlg, "select where in the example to split it"),
+                },
+                (ID_W_ADD, _) => match format_selection(hdlg, &example) {
+                    Some(span) => match state.wizard.add_field(span, Role::Named, "column") {
+                        Err(why) => format_say(hdlg, &why),
+                        Ok(added) => format_refresh(hdlg, state, Some(added)),
+                    },
+                    None => format_say(hdlg, "select the part of the example to make a field"),
+                },
+                (ID_W_MERGE, _) => match at {
+                    Some(at) => match state.wizard.merge(at) {
+                        Err(why) => format_say(hdlg, &why),
+                        Ok(()) => format_refresh(hdlg, state, Some(at)),
+                    },
+                    None => format_say(hdlg, "select a field first"),
+                },
+                (ID_W_REMOVE, _) => match at {
+                    Some(at) => match state.wizard.remove_field(at) {
+                        Err(why) => format_say(hdlg, &why),
+                        Ok(()) => format_refresh(hdlg, state, Some(at.saturating_sub(1))),
+                    },
+                    None => format_say(hdlg, "select a field first"),
+                },
+                _ => return 0,
+            }
+            1
+        }
+        WM_DESTROY => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), 0);
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// The dialog's state, or `None` before `WM_INITDIALOG` has stored it — which is a real moment,
+/// since Windows sends a control's messages before then.
+fn format_state<'a>(hdlg: HWND) -> Option<&'a mut FormatState<'a>> {
+    unsafe {
+        (GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) as *mut FormatState).as_mut()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,6 +2080,146 @@ mod tests {
             Item::new(Class::Static, "&Theme:", 0xFFFF, (7, 9, 44, 8), 0),
             Item::new(Class::Button, "OK", IDOK, (105, 65, 50, 14), 1),
         ]
+    }
+
+    /// The field list shows the example's own text, so a row can be judged by reading it — and
+    /// the token beside it is what that row will become in the pattern.
+    #[test]
+    fn the_format_field_rows_carry_the_examples_text_and_the_token_it_becomes() {
+        let mut wizard = Wizard::from_example("2026-08-07 07:50:45 INFO hello world");
+        let rows = format_field_rows(&wizard);
+        assert!(!rows.is_empty(), "a proposal splits the line");
+        assert!(
+            rows.iter().any(|r| r.token == "<ts>"),
+            "the timestamp is proposed"
+        );
+        for row in &rows {
+            assert!(!row.text.is_empty(), "no field is empty");
+            assert!(row.token.starts_with('<') && row.token.ends_with('>'));
+        }
+        wizard.set_role(0, Role::Discard).expect("role");
+        let after = format_field_rows(&wizard);
+        assert_eq!(after[0].role, "Ignore");
+        assert_eq!(after[0].token, "<_>");
+        assert_eq!(
+            after[0].text, rows[0].text,
+            "a role change does not move the span"
+        );
+    }
+
+    /// A wizard from a pasted layout has no example, so it has no rows — an empty list, never a
+    /// list of wrong ones.
+    #[test]
+    fn a_pasted_layout_has_no_field_rows() {
+        let wizard = Wizard::from_layout(tailhawk_core::template::Language::Log4net, "%d %m");
+        assert!(format_field_rows(&wizard).is_empty());
+    }
+
+    /// The edit control counts UTF-16 units and the wizard counts UTF-8 bytes. On an ASCII line
+    /// they agree, which is the trap; on a line with an em dash in it they do not, and every
+    /// answer must still land on a character boundary.
+    #[test]
+    fn a_carets_position_becomes_a_byte_offset_on_a_character_boundary() {
+        let ascii = "2026-08-07 INFO hello";
+        for units in 0..=ascii.chars().count() {
+            assert_eq!(byte_at_utf16(ascii, units), units, "ASCII counts alike");
+        }
+        let wide = "a — b 😀 c";
+        for units in 0..=wide.encode_utf16().count() {
+            let at = byte_at_utf16(wide, units);
+            assert!(wide.is_char_boundary(at), "{units} landed mid-character");
+        }
+        assert_eq!(byte_at_utf16(wide, 0), 0);
+        assert_eq!(
+            byte_at_utf16(wide, 2),
+            "a ".len(),
+            "the em dash starts here"
+        );
+        assert_eq!(byte_at_utf16(wide, 3), "a — ".len() - 1);
+        assert_eq!(
+            byte_at_utf16(wide, 9_999),
+            wide.len(),
+            "past the end is the end"
+        );
+    }
+
+    /// The status line above the preview is the whole readout: untested, uncompilable, or the
+    /// match rate — and the untested case must not read as a failure.
+    #[test]
+    fn the_format_status_reads_as_progress_rather_than_failure() {
+        assert!(format_status(None).contains("not tested yet"));
+        let broken = Test {
+            error: Some("no such token".to_owned()),
+            ..Test::default()
+        };
+        assert_eq!(format_status(Some(&broken)), "no such token");
+        let tested = Test {
+            columns: vec!["ts".to_owned()],
+            rows: vec![None, Some(vec![Some(0..4)])],
+            matched: 1,
+            error: None,
+        };
+        assert_eq!(format_status(Some(&tested)), "1 of 2 matched (50%)");
+    }
+
+    /// The preview turns the model's spans into the sample's own text, and keeps the unmatched
+    /// rows as `None` so the dialog can show them for what they are.
+    #[test]
+    fn the_format_preview_cuts_each_sample_by_its_own_spans() {
+        let samples = vec!["alpha beta".to_owned(), "nope".to_owned()];
+        let test = Test {
+            columns: vec!["one".to_owned(), "two".to_owned()],
+            rows: vec![Some(vec![Some(0..5), Some(6..10)]), None],
+            matched: 1,
+            error: None,
+        };
+        let rows = format_preview(&test, &samples, 10);
+        assert_eq!(
+            rows[0].as_deref(),
+            Some(["alpha".to_owned(), "beta".to_owned()].as_slice())
+        );
+        assert!(rows[1].is_none(), "an unmatched sample stays unmatched");
+        assert_eq!(format_preview(&test, &samples, 1).len(), 1, "the cap holds");
+    }
+
+    /// No two controls of one dialog claim the same mnemonic — the rule the menus keep, for the
+    /// same reason: the second claimant is unreachable by the key drawn under it. `Pa&ttern` and
+    /// `&Test` both wanted `t`, and the pattern box is read-only, so it gave the letter up.
+    #[test]
+    fn no_two_controls_of_a_dialog_share_a_mnemonic() {
+        for (name, items) in [
+            ("Define Format", format_dialog_items()),
+            ("Filter", filter_dialog_items()),
+        ] {
+            let mut seen = Vec::new();
+            for item in &items {
+                let mut chars = item.text.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c != '&' {
+                        continue;
+                    }
+                    match chars.peek() {
+                        Some('&') => {
+                            chars.next();
+                        }
+                        Some(m) => {
+                            let m = m.to_ascii_lowercase();
+                            assert!(
+                                !seen.contains(&m),
+                                "{name}: two controls claim '{m}' — the second is unreachable"
+                            );
+                            seen.push(m);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            assert!(
+                !seen.is_empty(),
+                "{name}: a dialog with no mnemonics at all"
+            );
+        }
     }
 
     /// The Filter dialog reads down one left edge. Every labelled field starts in the same column
@@ -1257,10 +2266,19 @@ mod tests {
     }
 
     /// Every item begins on a DWORD boundary — the alignment rule whose violation Windows answers
-    /// with a dialog that simply does not open.
+    /// with a dialog that simply does not open. And a class is written one of two ways: the
+    /// `0xFFFF` marker and an ordinal for the pre-defined four, the **name** for anything else,
+    /// which is one word shorter or longer and therefore moves everything after it.
     #[test]
-    fn every_item_is_dword_aligned_and_carries_its_class_ordinal() {
-        let items = two_items();
+    fn every_item_is_dword_aligned_and_carries_its_class_ordinal_or_name() {
+        let mut items = two_items();
+        items.push(Item::new(
+            Class::Named("SysListView32"),
+            "",
+            200,
+            (7, 20, 80, 40),
+            0,
+        ));
         let t = template("x", 100, 100, &items);
         // Walk the template the way Windows does: header, then aligned items.
         let mut at = 9; // style, exstyle, cdit, x, y, cx, cy
@@ -1280,9 +2298,20 @@ mod tests {
                 "WS_CHILD | WS_VISIBLE on every control"
             );
             assert_eq!(t[at + 8], item.id);
-            assert_eq!(t[at + 9], 0xFFFF, "ordinal class marker");
-            assert_eq!(t[at + 10], item.class as u16);
-            at += 11;
+            at += 9;
+            match item.class {
+                Class::Named(name) => {
+                    let wide: Vec<u16> = name.encode_utf16().collect();
+                    assert_eq!(&t[at..at + wide.len()], &wide[..], "the class by name");
+                    assert_eq!(t[at + wide.len()], 0, "and NUL-terminated");
+                    at += wide.len() + 1;
+                }
+                other => {
+                    assert_eq!(t[at], 0xFFFF, "ordinal class marker");
+                    assert_eq!(t[at + 1], other.ordinal().expect("an ordinal class"));
+                    at += 2;
+                }
+            }
             at += item.text.encode_utf16().count() + 1;
             assert_eq!(t[at], 0, "no creation data");
             at += 1;

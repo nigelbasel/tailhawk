@@ -4880,6 +4880,10 @@ struct Shell {
     pending_filter: Option<(Polarity, Option<String>)>,
     /// The panel's Edit… asks for the Filter dialog seeded with this chip, deferred the same way.
     pending_filter_edit: Option<usize>,
+    /// Format ▸ Define format from a line asks for §6.2's dialog, deferred the same way — and for
+    /// the same reason the others are: a modal dialog pumps its own loop, and no `STATE` borrow
+    /// may be alive while it does.
+    pending_format: bool,
     /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
     /// through `IsDialogMessageW` and a second `Ctrl+F` focuses it instead of stacking another.
     find_dialog: HWND,
@@ -6865,6 +6869,7 @@ impl Shell {
             }
             Command::DefineFormat => {
                 self.open_wizard();
+                self.pending_format = self.wizard.is_some();
                 return true;
             }
             Command::ImportLayout => {
@@ -8954,6 +8959,49 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         }
         return true;
     }
+    let format = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_format))
+    });
+    if format {
+        // The wizard is **taken out** of the shell for the length of the dialog, not borrowed
+        // through it: the dialog pumps its own message loop, and a `STATE` borrow alive across
+        // that is the borrow panic every other modal surface here has already earned once.
+        let taken = STATE.with(|s| {
+            s.borrow_mut()
+                .as_mut()
+                .and_then(|shell| shell.wizard.take())
+        });
+        if let Some(mut wizard) = taken {
+            let saved = dialog::show_format_dialog(hwnd, &mut wizard);
+            let was = IN_WNDPROC.with(|flag| flag.replace(true));
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.wizard = Some(wizard);
+                    shell.wizard_editing = None;
+                    // **Whatever happened, the drawn overlay does not come back.** `save_format`
+                    // clears the wizard when it succeeds; the path where it does not — a profile
+                    // that cannot be written — would otherwise answer a failed save by painting
+                    // §6.2's old sheet over the grid. Its reason outlives the wizard it was about,
+                    // so it is carried past the close rather than replaced by "nothing saved".
+                    if saved {
+                        shell.save_format(hwnd);
+                        let reason = shell.file.clone();
+                        shell.close_wizard();
+                        shell.file = reason;
+                    } else {
+                        shell.close_wizard();
+                    }
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            });
+            IN_WNDPROC.with(|flag| flag.set(was));
+        }
+        return true;
+    }
     let keymap = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
@@ -10784,6 +10832,7 @@ fn main() -> Result<()> {
             pending_find: false,
             pending_filter: None,
             pending_filter_edit: None,
+            pending_format: false,
             find_dialog: HWND::default(),
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
