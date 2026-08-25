@@ -1,23 +1,59 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-25, session 23 continued: the classic-dialogs conversion, mid-flight
+## ▶ Resume point — 2026-08-25, session 25: the drawn chrome is gone, and the owner is dogfooding
 
-**Where master stands:** the classic **Find dialog is live and committed** — `Ctrl+F` opens a
-native modeless `#32770` (Find what, Match case, Regular expression, Find Next / Find Previous /
-Cancel), pumped through `IsDialogMessageW`, verified by the rewritten `tools/verify-find.ps1` and
-photographed for the owner. The command bar's old find field still draws; it leaves with the bar.
+**Where master stands.** Everything below is committed, pushed, and green on CI. The session
+resumed a predecessor that a Nimbalyst crash had cut off mid-flight — its step-3 work was intact in
+the tree and is now landed — and then took three bugs the owner reported while running the app.
 
-**⚠ Before anything else: a parallel session left a live bug and its WIP in the tree.** Its
-`logs/agent.log` entry (2026-08-25T06:06:58) reports that **one `Ctrl+F` creates TWO Find
-dialogs** — `EnumWindows` counted two; Esc closes one and reveals the other, which is why Esc
-"stopped working" in its `verify-find.ps1` run (this session's own run passed, so the repro may
-depend on the input path). Its uncommitted changes in `main.rs`/`dialog.rs` are worth keeping:
-a `Finder::label` (typed form for the title, so an escaped query does not show as `a\.b`),
-`find_from_seed` (`F3` after `Esc` re-runs the dialog's last request), an empty-query guard, an
-`IN_WNDPROC` re-entry guard around `find_requested` (it hit a borrow panic from a synchronous
-message send — real), and `dialog::focus_find` for a second `Ctrl+F`. It also left three
-`th-find-debug.txt` debug writes that must come out before any commit. **Triage the
-double-dialog bug first, keep the good parts, strip the instrumentation.**
+| Landed this session | Commit |
+|---|---|
+| §2.4's **native context menus** — header, grid line, filter row, via `TrackPopupMenu` | `7b160b7` |
+| The **Filter dialog's alignment** and **dark mode for the native menus** | `1267edb` |
+| **Define Format as a real dialog**, replacing §6.2's drawn sheet | `4f2bbc1` |
+
+**What the owner reported, and what it turned out to be.** All three were only visible on screen,
+and all three were found or confirmed by *photographing the running app* — none of them could have
+been reasoned out, and two of them had passing tests either side.
+
+1. *"The expression text box is not lined up with other controls."* The Filter dialog's label
+   column was sized for `Column:`, so `Expression:` pushed its field six units right of the one
+   above it. The layout is now `filter_dialog_items` — pure, with a test that was **watched failing
+   on the real layout** before the fix.
+2. *"When switching to dark mode, the menu stays white."* Since §2.2's resettlement the menus are
+   Windows' to paint and nothing told Windows. `darkmode.rs` now quarantines the undocumented
+   `uxtheme` ordinals. **Two ordering regressions came out of it**, both caught by photographs:
+   light theme came up with a dark title bar, and the toggle left the menu *bar's* strip white
+   because its theme is opened when the frame is built and cached there. `dress_frame` now owns all
+   three levers in the one order that works — mode, frame recalculation, DWM attribute last.
+3. *"Format ▸ define from a line is yet another terrible UI. Needs a proper dialog."* It was §6.2
+   drawn over the grid with a strip of key hints for a legend. It is now a modal `#32770` with two
+   list views; the drag handles became **select-then-press-the-verb**.
+
+### ⏭ What is next, in the order it should be taken
+
+1. **Import layout (§6.3) is still the drawn overlay.** `Command::ImportLayout` → `open_import` →
+   `wizard_overlay_of`. It is the *same* sheet the owner just rejected for Define format, so it is
+   next by the owner's own standard rather than by request. The `Wizard` model already serves both
+   (`Source::Layout`, `recognise`, `template::Found`), so this is a second dialog over the same
+   half of `wizard.rs`, not new machinery.
+2. **Then delete the drawn wizard.** `WizardOverlay`, `wizard_overlay_of`, `WizardCell`,
+   `wizard_key`, `begin_wizard_edit` / `commit_wizard_edit` / `wizard_editing_next`, the ruler and
+   its marks, and the hit rects — roughly the same shape of deletion as the menu bar's 1,247 lines,
+   and it cannot start until (1) lands, because Import is its last caller.
+3. **The stale harnesses.** `verify-dialogs.ps1`, `verify-menus.ps1` and `verify-recent.ps1` all
+   drive the deleted drawn bar through `TAILHAWK_DUMP_MENU_HITS` and fail with *"menu drew no
+   entries"*. They test nothing today. Rework them to drive the native menus, or retire them —
+   but do not leave three red harnesses in the tree pretending to be coverage.
+4. **Still outstanding from earlier stretches:** filter-panel visibility is not persisted
+   (§12.4 says remembered), and the status bar has no `n filters · k of m` chip.
+
+**One thing to know before driving the app from a script.** `tools/Screen.ps1`'s `Wait-For` runs its
+condition in its own scope, so `$x = ...` inside the scriptblock does **not** reach the caller —
+wait on the condition, then assign after it. And `shot-window.ps1` pins the *main* window topmost,
+which hides a modal dialog behind it: capture a dialog by its own `GetWindowRect`. Both cost time
+this session. Also: SendKeys automation steals the owner's focus. Ask before driving the desktop if
+they are at the machine.
 
 ### The owner's decisions this stretch, in order — all recorded in `UI-DESIGN.md` §2.1 and `CLEANROOM.md`
 
