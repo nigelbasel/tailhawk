@@ -103,6 +103,20 @@ public static class FindDlg {
     Write-Host "other-match px:    $other"
     Write-Host "matches expected:  $expected"
 
+    # One of the four options exercised end to end: Whole word turns a partial token into no
+    # matches — ERRO is inside every ERROR, and the boundary is what keeps it from counting.
+    $wsh.SendKeys('^f')
+    $null = Wait-For { [FindDlg]::OfProcess($proc.Id) -ne [IntPtr]::Zero } 'the Find dialog again' 10
+    Start-Sleep -Milliseconds 250
+    $wsh.SendKeys('ERRO')
+    $wsh.SendKeys('%w')
+    Start-Sleep -Milliseconds 150
+    $wsh.SendKeys('{ENTER}')
+    $null = Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match 'no matches' } 'whole word to exclude the partial token' 10
+    Write-Host 'whole word: the partial token finds nothing, as it should'
+    $wsh.SendKeys('{ESC}')
+    Start-Sleep -Milliseconds 300
+
     $failures = @()
     if ($title -notmatch "of $expected\b") { $failures += "the title should say 'of $expected'" }
     if ($current -lt 100) { $failures += 'the current match is not painted in its own colour' }

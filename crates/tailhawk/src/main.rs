@@ -2067,19 +2067,20 @@ impl Document {
     /// Seeds a fresh search from the Find dialog's last request — `F3` after `Esc` should look
     /// for the thing, not do nothing — falling back to the bar's field while that still exists.
     /// The field's old semantics were raw-regex and case-insensitive, and keep being.
-    fn find_from_seed(&mut self, seed: &(String, bool, bool)) {
-        let (raw, match_case, regex) = if seed.0.is_empty() {
-            (self.chrome.find.text().to_owned(), false, true)
+    fn find_from_seed(&mut self, seed: &dialog::FindSeed) {
+        let seed = if seed.query.is_empty() {
+            dialog::FindSeed {
+                query: self.chrome.find.text().to_owned(),
+                regex: true,
+                ..dialog::FindSeed::default()
+            }
         } else {
             seed.clone()
         };
-        self.finder.query = if regex {
-            raw.clone()
-        } else {
-            tailhawk_core::search::Pattern::escape(&raw)
-        };
-        self.finder.label = raw;
-        self.finder.match_case = match_case;
+        self.finder.query = find_pattern(&seed.query, seed.regex, seed.whole_word);
+        self.finder.label = seed.query;
+        self.finder.match_case = seed.match_case;
+        self.finder.no_wrap = !seed.wrap;
         self.find();
     }
 
@@ -2921,6 +2922,9 @@ struct Finder {
     /// The Find dialog's "Match case" — false is the insensitive default the module note argues
     /// for, and the dialog is the toggle that note said did not exist yet.
     match_case: bool,
+    /// The Find dialog's "Wrap around", inverted so `derive(Default)` means wrapping — the
+    /// dialog's own default. Set, [`Finder::step`] stops at either end instead of coming round.
+    no_wrap: bool,
     /// The query as the user typed it — what the title shows. [`Finder::query`] is the engine
     /// form, which for a non-regex search is the same text escaped, and `a\.b\ \(1\)` in a title
     /// is not something to show a person.
@@ -2948,6 +2952,36 @@ struct Finder {
 }
 
 impl Finder {
+    /// The Find dialog's count line — what the streaming pass knows right now, said where the
+    /// user is looking. A refused pattern is reported here first, because the title is behind
+    /// the dialog when the mistake is made.
+    fn dialog_status(&self) -> String {
+        Self::status_line(
+            self.error.as_deref(),
+            self.query.is_empty(),
+            self.matches.len(),
+            self.running.is_some(),
+        )
+    }
+
+    /// [`Finder::dialog_status`]'s decision, free of the worker handle so a test can reach every
+    /// arm.
+    fn status_line(error: Option<&str>, no_query: bool, matches: usize, running: bool) -> String {
+        if let Some(error) = error {
+            return error.to_owned();
+        }
+        if no_query {
+            return String::new();
+        }
+        match (matches, running) {
+            (0, true) => "searching…".to_owned(),
+            (0, false) => "no matches".to_owned(),
+            (1, false) => "1 match".to_owned(),
+            (n, true) => format!("{n} matches so far"),
+            (n, false) => format!("{n} matches"),
+        }
+    }
+
     /// What the title shows for the query: the typed form when there is one, the engine form
     /// when a path that predates the dialog set only that.
     fn shown(&self) -> &str {
@@ -3006,19 +3040,27 @@ impl Finder {
         let at = self.matches.partition_point(|m| m.line < self.from_row);
         if at < self.matches.len() {
             Some(at)
+        } else if self.no_wrap {
+            // Wrap around unticked covers the first locate too: a fresh search from below the
+            // last match says "no further matches" rather than teleporting to the top —
+            // Notepad++'s own answer with wrap off.
+            None
         } else {
             (!self.matches.is_empty()).then_some(0)
         }
     }
 
-    /// Steps to the next or previous match, wrapping. Returns the row to show.
+    /// Steps to the next or previous match, wrapping unless the dialog unticked Wrap around.
+    /// Returns the row to show; `None` past an end leaves the cursor where it stands.
     fn step(&mut self, forward: bool) -> Option<u64> {
         if self.matches.is_empty() {
             return None;
         }
         let next = match (self.current, forward) {
             (None, _) => self.first_worth_showing()?,
+            (Some(at), true) if at + 1 == self.matches.len() && self.no_wrap => return None,
             (Some(at), true) => (at + 1) % self.matches.len(),
+            (Some(0), false) if self.no_wrap => return None,
             (Some(0), false) => self.matches.len() - 1,
             (Some(at), false) => at - 1,
         };
@@ -4884,7 +4926,7 @@ struct Shell {
     find_dialog: HWND,
     /// What the Find dialog last held, in the form the user typed — the escaped form the engine
     /// runs is not something to hand back to a person. Seeds the dialog when it reopens.
-    last_find: (String, bool, bool),
+    last_find: dialog::FindSeed,
     /// V12: wheel distance not yet scrolled, in px; the smooth timer drains it.
     wheel_remaining: f32,
     /// §12.4's `[appearance] theme`, as chosen — `dark`, `light`, `system`, or nothing if the user
@@ -5733,6 +5775,10 @@ impl Shell {
                             Focus::Find => {
                                 doc.finder.query = doc.chrome.find.text().to_owned();
                                 doc.finder.label = doc.finder.query.clone();
+                                // The bar's legacy semantics, not whatever the dialog last set —
+                                // a search from here must not inherit no-wrap or match-case.
+                                doc.finder.match_case = false;
+                                doc.finder.no_wrap = false;
                                 doc.find();
                             }
                             Focus::NewChip => {
@@ -7669,6 +7715,13 @@ impl Shell {
         for doc in self.document.panes_mut() {
             changed |= doc.poll_find();
         }
+        // The dialog's count line follows the streaming pass — `41 matches so far` ticking up is
+        // the Count button's answer for free, and it has to move before the early return below.
+        if changed && !self.find_dialog.is_invalid() {
+            if let Some(doc) = self.document.as_ref() {
+                dialog::set_find_status(self.find_dialog, &doc.finder.dialog_status());
+            }
+        }
         if !changed {
             return;
         }
@@ -8345,6 +8398,9 @@ mod uia {
                     Kind::Find => {
                         doc.chrome.find.set_text(&text);
                         doc.finder.query = text.clone();
+                        doc.finder.label = text.clone();
+                        doc.finder.match_case = false;
+                        doc.finder.no_wrap = false;
                         doc.find();
                     }
                     Kind::NewChip => {
@@ -8868,13 +8924,13 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             }
             dialog::focus_find(existing);
         } else {
-            let seed = STATE.with(|s| {
+            let (seed, history) = STATE.with(|s| {
                 s.borrow()
                     .as_ref()
-                    .map(|shell| shell.last_find.clone())
+                    .map(|shell| (shell.last_find.clone(), shell.settings.find_queries.clone()))
                     .unwrap_or_default()
             });
-            let hdlg = dialog::create_find_dialog(hwnd, &seed.0, seed.1, seed.2);
+            let hdlg = dialog::create_find_dialog(hwnd, &seed, &history);
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.find_dialog = hdlg;
@@ -8924,10 +8980,22 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
     false
 }
 
-/// §2.2's About as the standard modal About box — `TaskDialogIndirect` with the product's icon,
-/// an OK button and Esc to dismiss. Modal like [`ask_for_file`], and dispatched the same way.
-/// Everything it says comes through [`about::dialog_content`] from the tested mapping, so the
-/// native surface cannot disagree with the model.
+/// The engine form of a Find request: escaped unless the dialog said regular expression, and
+/// bounded to whole words when it asked for that — grouped, so an alternation cannot leak its
+/// branches past the boundaries.
+fn find_pattern(query: &str, regex: bool, whole_word: bool) -> String {
+    let core = if regex {
+        query.to_owned()
+    } else {
+        tailhawk_core::search::Pattern::escape(query)
+    };
+    if whole_word {
+        format!(r"\b(?:{core})\b")
+    } else {
+        core
+    }
+}
+
 /// The Find dialog pressed Find Next or Find Previous. Called from the dialog's own proc, which
 /// runs from the message loop — no `STATE` borrow is held when it fires.
 ///
@@ -8954,15 +9022,21 @@ pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
         let Some(shell) = state.as_mut() else {
             return;
         };
-        shell.last_find = (request.query.clone(), request.match_case, request.regex);
+        shell.last_find = dialog::FindSeed {
+            query: request.query.clone(),
+            match_case: request.match_case,
+            regex: request.regex,
+            whole_word: request.whole_word,
+            wrap: request.wrap,
+        };
+        shell.settings.remember_query(&request.query);
         let Some(doc) = shell.document.as_mut() else {
             return;
         };
-        let pattern = if request.regex {
-            request.query.clone()
-        } else {
-            tailhawk_core::search::Pattern::escape(&request.query)
-        };
+        let pattern = find_pattern(&request.query, request.regex, request.whole_word);
+        // Wrap is a stepping rule, not part of the search — toggling it must take effect on the
+        // very next Find Next without a re-search.
+        doc.finder.no_wrap = !request.wrap;
         let unchanged = doc.finder.query == pattern
             && doc.finder.match_case == request.match_case
             && (!doc.finder.matches.is_empty() || doc.finder.running.is_some());
@@ -8975,6 +9049,7 @@ pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
             doc.find();
             false
         };
+        dialog::set_find_status(hdlg, &doc.finder.dialog_status());
         if moved {
             shell.sync_scrollbar(owner);
         }
@@ -8998,6 +9073,10 @@ pub fn find_dialog_closed(hdlg: HWND) {
     });
 }
 
+/// §2.2's About as the standard modal About box — `TaskDialogIndirect` with the product's icon,
+/// an OK button and Esc to dismiss. Modal like [`ask_for_file`], and dispatched the same way.
+/// Everything it says comes through [`about::dialog_content`] from the tested mapping, so the
+/// native surface cannot disagree with the model.
 fn show_about(hwnd: HWND, sheet: &about::AboutSheet) {
     let title = wide("About Tailhawk");
     let instruction = wide(&sheet.title);
@@ -10683,7 +10762,7 @@ fn main() -> Result<()> {
             pending_prefs: false,
             pending_find: false,
             find_dialog: HWND::default(),
-            last_find: (String::new(), false, false),
+            last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
             theme_name: asked.clone(),
             grid_face: chosen_face,
@@ -11144,6 +11223,72 @@ mod tests {
             None,
             "no matches, no movement"
         );
+
+        // The dialog's Wrap around, unticked: either end is the end, and the cursor stays on it
+        // rather than teleporting — Notepad++'s own behaviour with wrap off.
+        let mut pinned = Finder {
+            no_wrap: true,
+            ..Finder::default()
+        };
+        pinned.absorb(vec![hit(10, 0), hit(20, 0)]);
+        assert_eq!(pinned.step(true), Some(10));
+        assert_eq!(pinned.step(true), Some(20));
+        assert_eq!(
+            pinned.step(true),
+            None,
+            "no wrap: the last match is the end"
+        );
+        assert_eq!(pinned.current, Some(1), "and the cursor holds its place");
+        assert_eq!(pinned.step(false), Some(10));
+        assert_eq!(
+            pinned.step(false),
+            None,
+            "no wrap: the first match is the start"
+        );
+        assert_eq!(pinned.current, Some(0));
+
+        // And the first locate honours it too: a fresh no-wrap search from below the last match
+        // reports nothing rather than teleporting to the top.
+        let mut below = Finder {
+            no_wrap: true,
+            from_row: 9_000,
+            ..Finder::default()
+        };
+        below.absorb(vec![hit(10, 0), hit(20, 0)]);
+        assert_eq!(
+            below.step(true),
+            None,
+            "no wrap: nothing at or after the view"
+        );
+    }
+
+    /// The dialog's count line, arm by arm: the error outranks everything, an empty query says
+    /// nothing, and a running pass says its count is a floor.
+    #[test]
+    fn the_dialogs_count_line_reports_the_pass_as_it_stands() {
+        assert_eq!(
+            Finder::status_line(Some("pattern refused"), false, 0, false),
+            "pattern refused"
+        );
+        assert_eq!(Finder::status_line(None, true, 0, false), "");
+        assert_eq!(Finder::status_line(None, false, 0, true), "searching…");
+        assert_eq!(Finder::status_line(None, false, 0, false), "no matches");
+        assert_eq!(Finder::status_line(None, false, 1, false), "1 match");
+        assert_eq!(
+            Finder::status_line(None, false, 41, true),
+            "41 matches so far"
+        );
+        assert_eq!(Finder::status_line(None, false, 41, false), "41 matches");
+    }
+
+    /// The four ways a query reaches the engine: literal, regex, and each with whole-word
+    /// boundaries — grouped, or `a|b` would read as `\ba` or `b\b`.
+    #[test]
+    fn a_find_request_becomes_the_right_engine_pattern() {
+        assert_eq!(find_pattern("a.b", false, false), r"a\.b");
+        assert_eq!(find_pattern("a.b", true, false), "a.b");
+        assert_eq!(find_pattern("job", false, true), r"\b(?:job)\b");
+        assert_eq!(find_pattern("a|b", true, true), r"\b(?:a|b)\b");
     }
 
     /// The current match is a different colour from the rest, which is the whole of stepping being

@@ -66,10 +66,14 @@ pub struct Settings {
     pub font_size: Option<u16>,
     /// File ▸ Open Recent, newest first, at most [`RECENT_MAX`].
     pub recent: Vec<String>,
+    /// The Find dialog's query history, newest first, at most [`FIND_MAX`].
+    pub find_queries: Vec<String>,
 }
 
 /// How many files Open Recent keeps — the platform's customary MRU depth.
 pub const RECENT_MAX: usize = 10;
+/// How many queries the Find dialog's history holds.
+pub const FIND_MAX: usize = 10;
 
 impl Settings {
     /// The state for `path`, if any was kept.
@@ -99,6 +103,15 @@ impl Settings {
         }
     }
 
+    /// Puts `query` at the front of the Find history, moving it there if it is already present —
+    /// compared exactly, because case matters in a query — and dropping the oldest past
+    /// [`FIND_MAX`].
+    pub fn remember_query(&mut self, query: &str) {
+        self.find_queries.retain(|q| q != query);
+        self.find_queries.insert(0, query.to_owned());
+        self.find_queries.truncate(FIND_MAX);
+    }
+
     /// Puts `path` at the front of the recent list, moving it there if it is already present —
     /// compared case-insensitively, as Windows paths are — and dropping the oldest past
     /// [`RECENT_MAX`].
@@ -121,6 +134,10 @@ impl Settings {
         if !over.recent.is_empty() {
             self.recent = over.recent;
             self.recent.truncate(RECENT_MAX);
+        }
+        if !over.find_queries.is_empty() {
+            self.find_queries = over.find_queries;
+            self.find_queries.truncate(FIND_MAX);
         }
         for f in over.files {
             self.set_file(f);
@@ -150,6 +167,10 @@ impl Settings {
         if !self.recent.is_empty() {
             let files: Vec<String> = self.recent.iter().map(|p| quote(p)).collect();
             out.push_str(&format!("\n[recent]\nfiles = [{}]\n", files.join(", ")));
+        }
+        if !self.find_queries.is_empty() {
+            let queries: Vec<String> = self.find_queries.iter().map(|q| quote(q)).collect();
+            out.push_str(&format!("\n[find]\nqueries = [{}]\n", queries.join(", ")));
         }
         if let Some(w) = &self.window {
             out.push_str("\n[window]\n");
@@ -222,6 +243,7 @@ impl Settings {
                     }
                     "appearance" => Section::Appearance,
                     "recent" => Section::Recent,
+                    "find" => Section::Find,
                     _ => Section::Other,
                 };
                 continue;
@@ -241,6 +263,12 @@ impl Settings {
                     if key == "files" {
                         settings.recent = array(value);
                         settings.recent.truncate(RECENT_MAX);
+                    }
+                }
+                Section::Find => {
+                    if key == "queries" {
+                        settings.find_queries = array(value);
+                        settings.find_queries.truncate(FIND_MAX);
                     }
                 }
                 Section::Window => match key {
@@ -287,6 +315,7 @@ enum Section {
     Window,
     Appearance,
     Recent,
+    Find,
     File,
     Other,
 }
@@ -466,6 +495,37 @@ mod tests {
         assert!(!s.recent.contains(&r"C:\logs\1.log".to_owned()));
     }
 
+    /// The Find dialog's history: newest first, deduplicated **exactly** — case matters in a
+    /// query in a way it does not in a Windows path — and capped like the recent files are.
+    #[test]
+    fn the_find_history_round_trips_and_dedupes_exactly() {
+        let mut s = Settings::default();
+        s.remember_query("Error");
+        s.remember_query("timeout");
+        s.remember_query("Error");
+        assert_eq!(
+            s.find_queries,
+            vec!["Error".to_owned(), "timeout".to_owned()],
+            "re-searching moves the query to the front, once"
+        );
+        s.remember_query("error");
+        assert_eq!(
+            s.find_queries.len(),
+            3,
+            "a different case is a different query"
+        );
+        let read = Settings::from_toml(&s.to_toml());
+        assert_eq!(
+            read.find_queries, s.find_queries,
+            "the history survives the file"
+        );
+        for i in 0..12 {
+            s.remember_query(&format!("q{i}"));
+        }
+        assert_eq!(s.find_queries.len(), FIND_MAX);
+        assert_eq!(s.find_queries[0], "q11");
+    }
+
     /// §12.4's per-key tier merge covers the list: an earlier tier's list wins whole.
     #[test]
     fn the_recent_list_merges_as_one_key() {
@@ -497,6 +557,7 @@ mod tests {
             font: Some("Cascadia Mono".to_owned()),
             font_size: Some(18),
             recent: vec![r"C:\logs\app.log".to_owned()],
+            find_queries: vec!["ERROR".to_owned(), r"time\d+".to_owned()],
         };
         s.set_file(FileState {
             path: r"C:\logs\app.log".to_owned(),

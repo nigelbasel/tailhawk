@@ -42,6 +42,9 @@ const ID_FIND_WHAT: u16 = 110;
 const ID_MATCH_CASE: u16 = 111;
 const ID_REGEX: u16 = 112;
 const ID_FIND_PREV: u16 = 113;
+const ID_FIND_WHOLE: u16 = 114;
+const ID_FIND_WRAP: u16 = 115;
+const ID_FIND_STATUS: u16 = 116;
 
 /// `DWLP_USER` — the per-dialog slot the data pointer rides in. Both targets are 64-bit, so the
 /// two slots before it are eight bytes each.
@@ -354,7 +357,6 @@ const WS_BORDER: u32 = 0x0080_0000;
 const ES_NUMBER: u32 = 0x2000;
 const ES_MULTILINE: u32 = 0x0004;
 const ES_READONLY: u32 = 0x0800;
-const ES_AUTOHSCROLL: u32 = 0x0080;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 
@@ -451,7 +453,33 @@ pub struct FindRequest {
     pub query: String,
     pub match_case: bool,
     pub regex: bool,
+    pub whole_word: bool,
+    pub wrap: bool,
     pub forwards: bool,
+}
+
+/// What seeds the dialog when it opens: the last request, or — the manual `Default` — nothing,
+/// with Wrap around on, because a search that silently stops at the bottom of a log being read
+/// from the middle is the surprising one.
+#[derive(Clone)]
+pub struct FindSeed {
+    pub query: String,
+    pub match_case: bool,
+    pub regex: bool,
+    pub whole_word: bool,
+    pub wrap: bool,
+}
+
+impl Default for FindSeed {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            match_case: false,
+            regex: false,
+            whole_word: false,
+            wrap: true,
+        }
+    }
 }
 
 fn read_find_request(hdlg: HWND, forwards: bool) -> FindRequest {
@@ -465,7 +493,19 @@ fn read_find_request(hdlg: HWND, forwards: bool) -> FindRequest {
         query,
         match_case: checked(ID_MATCH_CASE),
         regex: checked(ID_REGEX),
+        whole_word: checked(ID_FIND_WHOLE),
+        wrap: checked(ID_FIND_WRAP),
         forwards,
+    }
+}
+
+/// The dialog's live count line — `41 matches so far`, `no matches`, a refused pattern — pushed
+/// by the shell as the streaming pass reports. Free text on a static control; the dialog decides
+/// nothing about it.
+pub fn set_find_status(hdlg: HWND, text: &str) {
+    let text = wsz(text);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_FIND_STATUS), PCWSTR(text.as_ptr()));
     }
 }
 
@@ -508,17 +548,19 @@ unsafe extern "system" fn find_proc(
 /// A second `Ctrl+F` while the dialog is up: bring it forward with the query selected, ready to
 /// be retyped — the standard dialog's own behaviour rather than stacking a twin.
 pub fn focus_find(hdlg: HWND) {
-    const EM_SETSEL: u32 = 0x00B1;
+    /// `CB_SETEDITSEL` — the combo's own select-a-range; `EM_SETSEL` does not reach the edit
+    /// inside it. Start in the low word, end in the high; `0xFFFF` as the end selects to the end.
+    const CB_SETEDITSEL: u32 = 0x0142;
     unsafe {
-        if let Ok(edit) = GetDlgItem(hdlg, i32::from(ID_FIND_WHAT)) {
-            let _ = SetFocus(edit);
+        if let Ok(combo) = GetDlgItem(hdlg, i32::from(ID_FIND_WHAT)) {
+            let _ = SetFocus(combo);
         }
         SendDlgItemMessageW(
             hdlg,
             i32::from(ID_FIND_WHAT),
-            EM_SETSEL,
+            CB_SETEDITSEL,
             WPARAM(0),
-            LPARAM(-1),
+            LPARAM(0xFFFF_0000u32 as isize),
         );
     }
 }
@@ -529,31 +571,49 @@ pub fn focus_find(hdlg: HWND) {
 ///
 /// Seeded with the last search so reopening continues rather than restarts — `query` arrives in
 /// the form the user typed, not the escaped form the engine was handed.
-pub fn create_find_dialog(owner: HWND, query: &str, match_case: bool, regex: bool) -> HWND {
-    const EM_SETSEL: u32 = 0x00B1;
+pub fn create_find_dialog(owner: HWND, seed: &FindSeed, history: &[String]) -> HWND {
+    const CBS_DROPDOWN: u32 = 0x0002;
+    const CBS_AUTOHSCROLL: u32 = 0x0040;
     let items = [
         Item::new(Class::Static, "Fi&nd what:", 0xFFFF, (7, 9, 40, 8), 0),
+        // A drop-down combo rather than an edit: the history rides in it, which is how the
+        // standard Find remembers what was searched.
         Item::new(
-            Class::Edit,
+            Class::ComboBox,
             "",
             ID_FIND_WHAT,
-            (50, 7, 150, 12),
-            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+            (50, 7, 150, 64),
+            CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP,
         ),
         Item::new(
             Class::Button,
             "Match &case",
             ID_MATCH_CASE,
-            (50, 26, 80, 10),
+            (50, 26, 90, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        Item::new(
+            Class::Button,
+            "Match &whole word only",
+            ID_FIND_WHOLE,
+            (50, 38, 100, 10),
             WS_TABSTOP | BS_AUTOCHECKBOX,
         ),
         Item::new(
             Class::Button,
             "Regular e&xpression",
             ID_REGEX,
-            (50, 40, 90, 10),
+            (50, 50, 90, 10),
             WS_TABSTOP | BS_AUTOCHECKBOX,
         ),
+        Item::new(
+            Class::Button,
+            "W&rap around",
+            ID_FIND_WRAP,
+            (50, 62, 90, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        Item::new(Class::Static, "", ID_FIND_STATUS, (7, 80, 196, 8), 0),
         Item::new(
             Class::Button,
             "&Find Next",
@@ -576,7 +636,7 @@ pub fn create_find_dialog(owner: HWND, query: &str, match_case: bool, regex: boo
             WS_TABSTOP,
         ),
     ];
-    let t = template("Find", 277, 62, &items);
+    let t = template("Find", 277, 94, &items);
     let created = unsafe {
         CreateDialogIndirectParamW(
             None,
@@ -589,9 +649,19 @@ pub fn create_find_dialog(owner: HWND, query: &str, match_case: bool, regex: boo
     let Ok(hdlg) = created else {
         return HWND::default();
     };
-    let seed = wsz(query);
     unsafe {
-        let _ = SetDlgItemTextW(hdlg, i32::from(ID_FIND_WHAT), PCWSTR(seed.as_ptr()));
+        for query in history {
+            let text = wsz(query);
+            SendDlgItemMessageW(
+                hdlg,
+                i32::from(ID_FIND_WHAT),
+                CB_ADDSTRING,
+                WPARAM(0),
+                LPARAM(text.as_ptr() as isize),
+            );
+        }
+        let text = wsz(&seed.query);
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_FIND_WHAT), PCWSTR(text.as_ptr()));
         let check = |id: u16, on: bool| {
             SendDlgItemMessageW(
                 hdlg,
@@ -601,22 +671,15 @@ pub fn create_find_dialog(owner: HWND, query: &str, match_case: bool, regex: boo
                 LPARAM(0),
             );
         };
-        check(ID_MATCH_CASE, match_case);
-        check(ID_REGEX, regex);
+        check(ID_MATCH_CASE, seed.match_case);
+        check(ID_REGEX, seed.regex);
+        check(ID_FIND_WHOLE, seed.whole_word);
+        check(ID_FIND_WRAP, seed.wrap);
         let _ = ShowWindow(hdlg, SW_SHOW);
-        // Focus lands in the field with the old query selected, so typing replaces it — the
-        // standard dialog's own behaviour.
-        if let Ok(edit) = GetDlgItem(hdlg, i32::from(ID_FIND_WHAT)) {
-            let _ = SetFocus(edit);
-        }
-        SendDlgItemMessageW(
-            hdlg,
-            i32::from(ID_FIND_WHAT),
-            EM_SETSEL,
-            WPARAM(0),
-            LPARAM(-1),
-        );
     }
+    // Focus lands in the box with the old query selected, so typing replaces it — the standard
+    // dialog's own behaviour.
+    focus_find(hdlg);
     hdlg
 }
 
