@@ -58,18 +58,26 @@ been reasoned out, and two of them had passing tests either side.
 
 ### ⏭ What is next, in the order it should be taken
 
-1. **A `README.md`.** The repository is public now and has none, so the front page is a file
-   listing. `SPEC.md` §1 and `CLEANROOM.md` between them already say what Tailhawk is and how it
-   is built — this is a page that points at them, not new prose.
-2. **The stale harnesses.** `verify-dialogs.ps1`, `verify-menus.ps1` and `verify-recent.ps1` all
+1. ~~**A `README.md`.**~~ **Done** — the front page points at `SPEC.md` §1, the build and its
+   gates, the seven documents and `CLEANROOM.md`, and states plainly that there is no release.
+   It corrects one thing on the way: an ARM64 claim has to say *best-effort*, because §2.1 says
+   x64 is the only shipped and supported architecture.
+2. **`USING.md` is stale, and the README now advertises it.** It was written against the drawn
+   chrome and still describes what the last two sessions deleted: `Ctrl+L` adding a chip inline,
+   chips that drag to reorder and take a `Ctrl+click` to edit, a find *field*. The panel is
+   standard controls with Add/Edit/Remove buttons, `Ctrl+L` opens the Filter dialog, and Find is
+   a modeless `#32770`. On a private repo this was an internal note; on a public one, linked from
+   the front page as *the* user guide, it is a document that lies. Re-walk it against the running
+   app — the keys table and the Filters section are the two that have moved.
+3. **The stale harnesses.** `verify-dialogs.ps1`, `verify-menus.ps1` and `verify-recent.ps1` all
    drive the deleted drawn bar through `TAILHAWK_DUMP_MENU_HITS` and fail with *"menu drew no
    entries"*. They test nothing today. Rework them to drive the native menus, or retire them —
    but do not leave three red harnesses in the tree pretending to be coverage. There is no
    `verify-format.ps1` either, and both new dialogs deserve one: the capture scripts written this
    session (in the session scratchpad) are most of it already.
-3. **Still outstanding from earlier stretches:** filter-panel visibility is not persisted
+4. **Still outstanding from earlier stretches:** filter-panel visibility is not persisted
    (§12.4 says remembered), and the status bar has no `n filters · k of m` chip.
-4. **The remaining drawn overlays**, now that the wizard has gone: §5's `RulesOverlay` and the
+5. **The remaining drawn overlays**, now that the wizard has gone: §5's `RulesOverlay` and the
    command palette are the last two surfaces the app draws itself. The owner has not asked about
    either, and the palette is arguably right as it is — but the rules editor is the same kind of
    sheet, and the same objection would apply the moment they open it.
