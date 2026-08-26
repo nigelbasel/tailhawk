@@ -3846,6 +3846,9 @@ struct Shell {
     /// What just happened, as against what the document *is* — see [`status_line`]. Shown beside
     /// the description rather than instead of it, and replaced by the next notice.
     notice: Option<String>,
+    /// What the title last said about following, so [`Shell::retitle_if_follow_turned_over`] can
+    /// tell a state that has changed from one that merely keeps being true.
+    titled_following: Option<bool>,
     /// What the Find dialog last held, in the form the user typed — the escaped form the engine
     /// runs is not something to hand back to a person. Seeds the dialog when it reopens.
     last_find: dialog::FindSeed,
@@ -4213,7 +4216,34 @@ impl Shell {
         let began = std::time::Instant::now();
         let painted = self.paint_inner(hwnd);
         self.frames.record(began.elapsed());
+        self.retitle_if_follow_turned_over(hwnd);
         painted
+    }
+
+    /// Rebuilds the title when the **follow state** has turned over since the title last said it.
+    ///
+    /// §12 calls pause-on-scroll and its affordance to resume "the single most-wanted behaviour in
+    /// every tail tool", and getting it wrong "is very visible" — so it is worth one comparison a
+    /// frame. Every path that moves the view invalidates, so this is the one place that sees them
+    /// all: the arrows, the pages, the wheel, the scrollbar, a jump, and the document landing.
+    ///
+    /// **Two ways it was wrong, and neither was the fragment's own doing.** `Shell::navigate` moved
+    /// the view and asked for a frame without ever asking for a title, so a window scrolled up went
+    /// on saying `● following` and one scrolled back went on saying `‖ paused`. And a title built
+    /// as the document landed was built before the grid had been told how many rows it had, so
+    /// `is_following` answered *false* and a freshly opened file claimed to be paused with its last
+    /// line on screen. A file that was growing hid both, because the follow poll retitles anyway; a
+    /// static file showed the wrong word indefinitely.
+    ///
+    /// The menu's tick never had either bug — `WM_INITMENUPOPUP` rebuilds it from the live
+    /// document — so the tick and the status bar contradicted each other on the same frame, which
+    /// is exactly how `tools/verify-menus.ps1` found this.
+    fn retitle_if_follow_turned_over(&mut self, hwnd: HWND) {
+        let following = self.document.as_ref().map(Document::is_following);
+        if following != self.titled_following {
+            self.titled_following = following;
+            self.retitle(hwnd);
+        }
     }
 
     fn paint_inner(&mut self, hwnd: HWND) -> bool {
@@ -9231,6 +9261,7 @@ fn main() -> Result<()> {
             find_dialog: HWND::default(),
             rules_dialog: HWND::default(),
             notice: None,
+            titled_following: None,
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
             theme_name: asked.clone(),
