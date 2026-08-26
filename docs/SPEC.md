@@ -1423,15 +1423,23 @@ and session IDs.
   user explicitly opens a remote source. This is a **testable assertion** in CI and a competitive
   claim worth making.
 
-  > **The assertion does not exist yet, and saying so here is the point.** Checked 2026-08-27: CI
-  > asserts the binary carries no runtime shader compiler and no CRT redistributable, and nothing
-  > about sockets. The claim above has been true by construction — no HTTP code has ever been
-  > written — and construction stops being a guarantee the moment the Loki source lands. **Writing
-  > the test is therefore a prerequisite of the first HTTP call, not a follow-up to it**, and it is
-  > the only thing that keeps the *conditional* form of this claim ("unless the user explicitly
-  > opens a remote source") checkable rather than merely asserted. `LOKI.md` §13.2 carries the
-  > shape: a run over a local file must open no socket, and the network path must be reachable only
-  > from an explicitly configured source.
+  > **The assertion did not exist for the first month this line claimed it did.** Checked
+  > 2026-08-27: CI asserted no runtime shader compiler and no CRT redistributable, and nothing
+  > whatever about sockets. The claim was true only by construction — no HTTP code had ever been
+  > written — and construction stops being a guarantee the moment the Loki source lands.
+  >
+  > **It exists now**, as CI's *Assert no network capability* step: a process cannot open a socket
+  > without importing one of the transport DLLs, and import names are plain ASCII in the image, so
+  > the absence of the string is the absence of the capability. Today it reports *"zero network: no
+  > transport DLL is imported at all"*, which is the strongest form this claim will ever have.
+  >
+  > **The step is written to make weakening it deliberate.** Its allow-list is empty; adding
+  > `winhttp.dll` for the Loki source is a reviewable one-line change to the privacy claim, and
+  > the step's own comment binds that edit to two conditions — this section is reworded in the same
+  > commit, and the transport is **delay-loaded** so that CI can go on asserting the *conditional*
+  > form: after a run over a local file, `winhttp.dll` is absent from the process module list.
+  > That last point is a design constraint on the Loki client, not an afterthought: load WinHTTP on
+  > first use of an explicitly configured remote source, never at startup.
 - **No conventional crash reporter.** A minidump would exfiltrate customer log content. If crash
   reporting exists, it is **local-file only**, user-initiated, with a **visible preview of exactly what
   will be sent**, and never contains buffered log content or full file paths without redaction.

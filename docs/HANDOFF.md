@@ -37,12 +37,20 @@ That is a pane you can watch move.
 
 ### Two things land before the first HTTP call, and both are prerequisites rather than delays
 
-- **The §13.2 zero-network CI assertion, which does not exist.** Checked today: CI asserts no
-  runtime shader compiler and no CRT redistributable, and nothing whatever about sockets. `SPEC.md`
-  has claimed a "**testable assertion** in CI" for a month; the claim has been true only by
-  construction, because no HTTP code was ever written. Construction stops being a guarantee on the
-  day this work starts. Both documents now say the assertion is missing — write it first, and write
-  it to check the *conditional* form: a run over a local file opens no socket.
+- ~~**The §13.2 zero-network CI assertion, which does not exist.**~~ **Done** — CI's *Assert no
+  network capability* step. It had been claimed in `SPEC.md` as a "testable assertion in CI" for a
+  month and was never written; the claim was true only because no HTTP code existed, which is
+  construction rather than a guarantee. The step scans the image for transport DLL imports against
+  an empty allow-list, and today reports *"zero network: no transport DLL is imported at all"*. It
+  was checked against `curl.exe` and `ping.exe` to confirm it fails for the right reason rather
+  than passing by accident.
+
+  > **It carries a design constraint into the Loki work, and this is the part to remember.**
+  > Adding `winhttp.dll` to that allow-list weakens the step from proof to permission, so the
+  > transport must be **delay-loaded** — WinHTTP is loaded on first use of an explicitly configured
+  > remote source, never at startup — and CI then asserts the conditional form: after a run over a
+  > local file, `winhttp.dll` is absent from the process module list. Design for that from the
+  > first line rather than retrofitting it.
 - **`LOKI.md` §7's request-level controls**, all of which are required from the first call and none
   of which are the credential *store*: the compiled-in endpoint path allowlist, the SSRF defence (no
   DNS before confirmation, deny loopback/link-local/IMDS, address re-checked against rebinding),

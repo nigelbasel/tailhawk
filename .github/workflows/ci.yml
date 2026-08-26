@@ -139,6 +139,39 @@ jobs:
           if ($ascii -match 'd3dcompiler') { throw "d3dcompiler is imported - a shader is being compiled at runtime" }
           "no d3dcompiler import"
 
+      # SPEC.md §13.2 has claimed since 2026-07 that "no outbound connection of any kind" is a
+      # "testable assertion in CI". Until now it was not tested at all - it was true only because
+      # no HTTP code had ever been written, and construction is not a guarantee. This is the test.
+      #
+      # A process cannot open a socket without one of these DLLs, and import names are stored as
+      # plain ASCII, so the absence of the string is the absence of the capability.
+      #
+      # $allowed is the policy, and it is deliberately a list rather than a condition. LOKI.md
+      # stages a Loki source built on WinHTTP; the day it lands, winhttp.dll belongs here and the
+      # diff that adds it is a visible, reviewable change to the privacy claim rather than a
+      # silent one. Two rules govern that edit, and neither is optional:
+      #
+      #   1. Nothing is added to $allowed until SPEC.md §13.2's wording is amended in the same
+      #      commit to describe what the binary may now do.
+      #   2. Adding a transport here weakens this step from proof to permission, so it must be
+      #      paired with the behavioural half: WinHTTP is loaded lazily, on the first use of an
+      #      explicitly configured remote source, and CI asserts that a run over a local file
+      #      leaves winhttp.dll absent from the process module list. That is what keeps the
+      #      *conditional* form of the claim - "unless the user explicitly opens a remote source"
+      #      - checkable rather than merely asserted.
+      - name: Assert no network capability
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/tailhawk.exe"
+          $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          $dlls = [regex]::Matches($ascii, '[A-Za-z0-9_\-\.]+\.dll') | ForEach-Object { $_.Value.ToLower() } | Sort-Object -Unique
+          $transports = 'winhttp|wininet|urlmon|ws2_32|wsock32|mswsock|winsock|dnsapi|httpapi|webservices|winnetwk'
+          $allowed = @()
+          $found = $dlls | Where-Object { $_ -match $transports } | Where-Object { $allowed -notcontains $_ }
+          if ($found) { throw "SPEC.md 13.2: binary can open a network connection via $($found -join ', ')" }
+          if ($allowed.Count -eq 0) { "zero network: no transport DLL is imported at all" }
+          else { "network capability limited to the reviewed allow-list: $($allowed -join ', ')" }
+
       # SPEC.md §2's copy-and-run promise. The static build must name only OS DLLs; an import of
       # vcruntime140.dll or the CRT api-sets means it needs a redistributable installed.
       - name: Assert no CRT redistributable dependency
