@@ -740,6 +740,16 @@ pub fn create_rules_dialog(owner: HWND) -> HWND {
 /// **One refresh, called by every verb.** Define Format's comment makes the argument and it holds
 /// here: the alternative is a dialog where four of the six buttons update the screen and the fifth
 /// ships broken.
+/// Folds a message onto one line, collapsing the runs of whitespace that held its shape.
+///
+/// A `Static` is one line high and a list-view cell has no lines at all, so a message written for
+/// a terminal arrives at both of them with its tail cut off. `regex`'s parse errors are the case
+/// that matters here: four lines with a caret diagram in the middle and the actual complaint —
+/// `error: unclosed group` — on the last of them.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// One list row per rule: **On, Pattern, Kind, Colour, Problem**.
 ///
 /// Pure, and separately, because three of the things it decides are requirements rather than
@@ -774,32 +784,44 @@ pub fn rules_row_cells(editor: &tailhawk_core::ruleset::Editor) -> Vec<[String; 
                 },
                 if row.literal { "Ab" } else { ".*" }.to_owned(),
                 colour,
-                row.error.unwrap_or_default().to_owned(),
+                one_line(row.error.unwrap_or_default()),
             ]
         })
         .collect()
 }
 
-fn rules_refresh(hdlg: HWND, keep: Option<usize>) {
+/// Rebuilds the list rows and nothing else.
+///
+/// **Quiet throughout, because `lv_select` raises `LVN_ITEMCHANGED` synchronously** — the same
+/// notification a user's click raises. Without the guard the dialog would answer its own
+/// bookkeeping as though someone had clicked a row, and re-point every field from it.
+fn rules_fill_list(hdlg: HWND, keep: Option<usize>) {
     let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_R_LIST)) }) else {
         return;
     };
     let Some(rows) = crate::rules_read(rules_row_cells) else {
         return;
     };
+    rules_quietly(|| {
+        lv_reset(list);
+        // Widths are **pixels**, so they are read against the system font rather than the
+        // dialog's units: `Kind` needs more than the four characters of its own title suggest.
+        lv_column(list, 0, "On", 40);
+        lv_column(list, 1, "Pattern", 190);
+        lv_column(list, 2, "Kind", 56);
+        lv_column(list, 3, "Colour", 130);
+        lv_column(list, 4, "Problem", 200);
+        for (i, cells) in rows.iter().enumerate() {
+            lv_row(list, i as i32, cells);
+        }
+        if let Some(at) = keep.filter(|&a| a < rows.len()) {
+            lv_select(list, at);
+        }
+    });
+}
 
-    lv_reset(list);
-    lv_column(list, 0, "On", 34);
-    lv_column(list, 1, "Pattern", 190);
-    lv_column(list, 2, "Kind", 40);
-    lv_column(list, 3, "Colour", 130);
-    lv_column(list, 4, "Problem", 200);
-    for (i, cells) in rows.iter().enumerate() {
-        lv_row(list, i as i32, cells);
-    }
-    if let Some(at) = keep.filter(|&a| a < rows.len()) {
-        lv_select(list, at);
-    }
+fn rules_refresh(hdlg: HWND, keep: Option<usize>) {
+    rules_fill_list(hdlg, keep);
     rules_show_selected(hdlg);
 }
 
@@ -819,7 +841,7 @@ fn rules_show_selected(hdlg: HWND) {
                 row.whole_line,
                 row.case_insensitive,
                 row.literal,
-                row.error.unwrap_or_default().to_owned(),
+                one_line(row.error.unwrap_or_default()),
             )
         })
     }) else {
@@ -953,6 +975,12 @@ unsafe extern "system" fn rules_proc(
             1
         }
         WM_NOTIFY => {
+            // A selection the *dialog* made while rebuilding the list is not a selection the user
+            // made, and answering it as one would re-point every field — including the one being
+            // typed into. `rules_fill_list` holds the guard for exactly this.
+            if RULES_QUIET.with(|q| q.get()) {
+                return 0;
+            }
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
             if header.idFrom == usize::from(ID_R_LIST) && header.code == LVN_ITEMCHANGED {
                 if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_R_LIST)) } {
@@ -1079,11 +1107,14 @@ unsafe extern "system" fn rules_proc(
 
 /// Rewrites the list rows without touching the fields — what an `EN_CHANGE` wants, because the
 /// field it came from is being typed into.
+///
+/// **Rewriting an edit control moves its caret to the start, and that is a defect you can only see
+/// by typing two characters.** The first draft called `rules_refresh` here, which repoints every
+/// field from the model; typing `(` and then `)` into an empty pattern produced `)(`, because the
+/// second keystroke landed at position 0. Define Format's own `EN_CHANGE` arm carries the same
+/// warning about its Name box, and this is that warning ignored one file away.
 fn rules_relist(hdlg: HWND, keep: Option<usize>) {
-    let quiet = RULES_QUIET.with(|q| q.get());
-    RULES_QUIET.with(|q| q.set(true));
-    rules_refresh(hdlg, keep);
-    RULES_QUIET.with(|q| q.set(quiet));
+    rules_fill_list(hdlg, keep);
 }
 
 /// Writes the selected rule's error, or clears the line.
@@ -1092,7 +1123,7 @@ fn rules_say_error(hdlg: HWND) {
         editor
             .rows()
             .get(editor.selected())
-            .and_then(|row| row.error.map(str::to_owned))
+            .and_then(|row| row.error.map(one_line))
             .unwrap_or_default()
     })
     .unwrap_or_default();
@@ -3248,6 +3279,34 @@ mod tests {
             Item::new(Class::Static, "&Theme:", 0xFFFF, (7, 9, 44, 8), 0),
             Item::new(Class::Button, "OK", IDOK, (105, 65, 50, 14), 1),
         ]
+    }
+
+    /// A rule's error is folded onto one line, because the line it is shown on is one line high.
+    ///
+    /// **The part that matters is the last part.** `regex`'s parse errors are laid out over four
+    /// lines with a caret diagram in the middle, and a single-line `Static` shows the first of
+    /// them — `exception: regex parse error:` — which says only that something is wrong, not what.
+    /// Folding puts `error: unclosed group` back on screen.
+    #[test]
+    fn a_rules_error_is_folded_onto_the_one_line_it_is_shown_on() {
+        let sprawling =
+            "exception: regex parse error:\n    ERROR(\n         ^\nerror: unclosed group";
+        let folded = one_line(sprawling);
+        assert!(!folded.contains('\n'), "no newlines survive: {folded}");
+        assert!(
+            folded.contains("unclosed group"),
+            "the part that says what is wrong survives: {folded}"
+        );
+        assert!(
+            folded.starts_with("exception: regex parse error"),
+            "and it still starts with the rule it belongs to: {folded}"
+        );
+        assert!(
+            !folded.contains("  "),
+            "the caret diagram's indentation is not carried across: {folded}"
+        );
+        assert_eq!(one_line("already one line"), "already one line");
+        assert_eq!(one_line(""), "");
     }
 
     /// What the Go to line box makes of what is in it, including the two cases a naive reading

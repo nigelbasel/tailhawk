@@ -9165,6 +9165,27 @@ fn spawn_open(
 }
 
 fn main() -> Result<()> {
+    // **A panic inside a window procedure never reaches a console, and this is how it is read.**
+    // Windows calls a window proc from kernel mode; an exception that escapes one is turned into
+    // `STATUS_FATAL_USER_CALLBACK_EXCEPTION` (`0xC000041D`) and the process is killed *before* the
+    // default hook's message can be flushed — so a panic in a dialog's proc looks exactly like a
+    // silent crash in `comctl32.dll`, which is where the Application event log points the finger.
+    // A file is the only sink that survives it. Set only when `TAILHAWK_PANIC_LOG` names one, so
+    // this costs a shipped run nothing.
+    if let Ok(path) = std::env::var("TAILHAWK_PANIC_LOG") {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(file, "{info}");
+            }
+            previous(info);
+        }));
+    }
     // **Before anything else, and certainly before any window exists.** `SPEC.md` §3.1 requires
     // per-monitor-V2; without it Windows bitmap-stretches the client area on a non-96-DPI monitor,
     // which for a text viewer means every glyph is resampled and blurry — the one thing this whole
