@@ -87,6 +87,9 @@ const ID_I_LAYOUT: u16 = 160;
 const ID_I_RECOGNISED: u16 = 161;
 const ID_I_FOUND: u16 = 162;
 const ID_I_USE: u16 = 163;
+
+const ID_G_LINE: u16 = 170;
+const ID_G_STATUS: u16 = 171;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -474,6 +477,192 @@ pub const FILTER_OPS: &[&str] = &[
     "starts with",
     "ends with",
 ];
+
+/// What the Go to line dialog makes of what has been typed, before anything is jumped to.
+///
+/// **`Ctrl+G` had no surface of its own until this dialog.** It opened the command palette and
+/// leaned on that palette's rule that a query of only digits offers *Go to line N* — so the
+/// binding lived inside a surface whose whole purpose was something else, and when the palette
+/// was deleted go-to-line would have gone silently with it. `UI-DESIGN.md` §2.2 had listed
+/// `Go to line…  Ctrl+G` as a menu entry with an ellipsis all along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoTo {
+    /// Nothing typed yet: *Go* is disabled, and there is nothing to complain about.
+    Empty,
+    /// Not a number.
+    NotANumber,
+    /// Zero. Lines are numbered from one, and saying so is more use than refusing.
+    BelowFirst,
+    /// Past the end, carrying the last line there is — *Go* offers that rather than refusing,
+    /// which is what `Document::go_to_line`'s own clamp already does.
+    Beyond(u64),
+    /// A line the file has.
+    At(u64),
+}
+
+/// Reads the box. `total` is the file's line count.
+pub fn go_to_target(text: &str, total: u64) -> GoTo {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return GoTo::Empty;
+    }
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return GoTo::NotANumber;
+    }
+    // Digits that overflow a `u64` are not gibberish — they are a number past the end, and
+    // answering `NotANumber` for a line of nines would be the dialog lying about what was typed.
+    match trimmed.parse::<u64>() {
+        Ok(0) => GoTo::BelowFirst,
+        Ok(n) if n > total => GoTo::Beyond(total),
+        Ok(n) => GoTo::At(n),
+        Err(_) => GoTo::Beyond(total),
+    }
+}
+
+/// The line *Go* would jump to, or `None` when there is nothing to jump to.
+pub fn go_to_line_of(target: GoTo) -> Option<u64> {
+    match target {
+        GoTo::At(n) => Some(n),
+        GoTo::Beyond(last) if last > 0 => Some(last),
+        _ => None,
+    }
+}
+
+/// The line under the box. Empty when there is nothing worth saying — a dialog that comments on
+/// every keystroke teaches the user to stop reading it.
+pub fn go_to_status(target: GoTo, total: u64) -> String {
+    match target {
+        GoTo::Empty | GoTo::At(_) => String::new(),
+        GoTo::NotANumber => "Type a line number.".to_owned(),
+        GoTo::BelowFirst => "Lines are numbered from 1.".to_owned(),
+        GoTo::Beyond(0) => "The file has no lines.".to_owned(),
+        GoTo::Beyond(last) => format!("The file ends at line {last}, and Go will jump there. (Typed a line past the end of {total}.)"),
+    }
+}
+
+/// What the Go to line dialog is asked and what it answers with.
+pub struct GoToChoice {
+    /// The file's line count, for the label's range and the clamp.
+    pub total: u64,
+    /// The line chosen, once *Go* has been pressed.
+    pub line: Option<u64>,
+}
+
+/// The Go to line dialog's layout, pure so the template walk can check it without a window.
+fn goto_dialog_items(total: u64) -> Vec<Item> {
+    let label = format!("&Line number (1 - {total}):");
+    vec![
+        Item::new(Class::Static, &label, 0xFFFF, (7, 9, 96, 8), 0),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_G_LINE,
+            (106, 7, 70, 12),
+            WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
+        ),
+        Item::new(Class::Static, "", ID_G_STATUS, (7, 26, 169, 16), 0),
+        Item::new(
+            Class::Button,
+            "&Go",
+            IDOK,
+            (66, 46, 50, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (121, 46, 50, 14),
+            WS_TABSTOP,
+        ),
+    ]
+}
+
+/// §12's `Ctrl+G` as a dialog of its own, which is what `UI-DESIGN.md` §2.2 asked for with the
+/// ellipsis on `Go to line…` — and what the command palette had been standing in for.
+pub fn show_goto_dialog(hwnd: HWND, data: &mut GoToChoice) -> bool {
+    let t = template("Go to line", 183, 67, &goto_dialog_items(data.total));
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            hwnd,
+            Some(goto_proc),
+            LPARAM(data as *mut GoToChoice as isize),
+        )
+    };
+    data.line.is_some()
+}
+
+fn goto_state(hdlg: HWND) -> Option<&'static mut GoToChoice> {
+    let at = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) };
+    // Windows sends a control message or two before `WM_INITDIALOG`, so the slot can be empty.
+    (at != 0).then(|| unsafe { &mut *(at as *mut GoToChoice) })
+}
+
+unsafe extern "system" fn goto_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            // Focus goes to the box rather than to whichever button Windows would have picked,
+            // so the dialog is ready to be typed into. Returning 0 says the focus is already set.
+            unsafe {
+                let _ = SetFocus(GetDlgItem(hdlg, i32::from(ID_G_LINE)).unwrap_or_default());
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = (wparam.0 >> 16) as u16;
+            let Some(state) = goto_state(hdlg) else {
+                return 0;
+            };
+            match (id, code) {
+                (ID_G_LINE, c) if u32::from(c) == EN_CHANGE => {
+                    let target = go_to_target(&read_dlg_text(hdlg, ID_G_LINE), state.total);
+                    let text = wsz(&go_to_status(target, state.total));
+                    unsafe {
+                        let _ =
+                            SetDlgItemTextW(hdlg, i32::from(ID_G_STATUS), PCWSTR(text.as_ptr()));
+                        // *Go* is disabled rather than left to fail: §1.1's "a control that
+                        // invites a click it will decline fails 'never lie'".
+                        let _ = EnableWindow(
+                            GetDlgItem(hdlg, i32::from(IDOK)).unwrap_or_default(),
+                            go_to_line_of(target).is_some(),
+                        );
+                    }
+                    1
+                }
+                (IDOK, _) => {
+                    let target = go_to_target(&read_dlg_text(hdlg, ID_G_LINE), state.total);
+                    if let Some(line) = go_to_line_of(target) {
+                        state.line = Some(line);
+                        unsafe {
+                            let _ = EndDialog(hdlg, 1);
+                        }
+                    }
+                    1
+                }
+                (IDCANCEL, _) => {
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_DESTROY => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), 0);
+            }
+            0
+        }
+        _ => 0,
+    }
+}
 
 /// One structured choice in the Filter dialog, composed into the §7.2 expression the model
 /// actually runs — the dialog is a friendly editor over the grammar, never a second language,
@@ -2489,6 +2678,63 @@ mod tests {
             Item::new(Class::Static, "&Theme:", 0xFFFF, (7, 9, 44, 8), 0),
             Item::new(Class::Button, "OK", IDOK, (105, 65, 50, 14), 1),
         ]
+    }
+
+    /// What the Go to line box makes of what is in it, including the two cases a naive reading
+    /// gets wrong: a line past the end is *offered the last line*, not refused, because
+    /// `Document::go_to_line` clamps anyway and a dialog that refuses what the command would have
+    /// accepted is lying about the command; and a run of digits too long for a `u64` is a number
+    /// past the end rather than gibberish, because that is what the user typed.
+    #[test]
+    fn the_go_to_box_reads_a_line_number_and_says_what_is_wrong_with_it() {
+        assert_eq!(go_to_target("", 500), GoTo::Empty);
+        assert_eq!(
+            go_to_target("   ", 500),
+            GoTo::Empty,
+            "whitespace is nothing"
+        );
+        assert_eq!(go_to_target("42", 500), GoTo::At(42));
+        assert_eq!(go_to_target("  42  ", 500), GoTo::At(42), "trimmed");
+        assert_eq!(go_to_target("500", 500), GoTo::At(500), "the last line");
+        assert_eq!(go_to_target("0", 500), GoTo::BelowFirst);
+        assert_eq!(go_to_target("4x", 500), GoTo::NotANumber);
+        assert_eq!(
+            go_to_target("-3", 500),
+            GoTo::NotANumber,
+            "the sign is not a digit"
+        );
+        assert_eq!(go_to_target("501", 500), GoTo::Beyond(500));
+        assert_eq!(
+            go_to_target("99999999999999999999999999", 500),
+            GoTo::Beyond(500),
+            "too long for a u64 is still past the end, not gibberish"
+        );
+
+        assert_eq!(go_to_line_of(GoTo::At(42)), Some(42));
+        assert_eq!(
+            go_to_line_of(GoTo::Beyond(500)),
+            Some(500),
+            "Go jumps to the last line rather than doing nothing"
+        );
+        assert_eq!(
+            go_to_line_of(GoTo::Beyond(0)),
+            None,
+            "an empty file has none"
+        );
+        assert_eq!(go_to_line_of(GoTo::Empty), None);
+        assert_eq!(go_to_line_of(GoTo::NotANumber), None);
+        assert_eq!(go_to_line_of(GoTo::BelowFirst), None);
+
+        assert!(
+            go_to_status(GoTo::Empty, 500).is_empty(),
+            "an empty box is not an error"
+        );
+        assert!(
+            go_to_status(GoTo::At(42), 500).is_empty(),
+            "nor is a line that exists — a dialog that comments on every keystroke is not read"
+        );
+        assert!(go_to_status(GoTo::BelowFirst, 500).contains('1'));
+        assert!(go_to_status(GoTo::Beyond(500), 500).contains("500"));
     }
 
     /// The field list shows the example's own text, so a row can be judged by reading it — and

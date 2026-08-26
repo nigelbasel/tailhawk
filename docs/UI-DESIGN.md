@@ -52,7 +52,7 @@ contact. Everything else follows from seven principles:
 |---|---|
 | MDI child windows with their own title bars | Flat tab strip, drag-to-reorder, drag-out-to-split |
 | Grey 3D-bevelled Win32 chrome | Flat surfaces, Windows 11 Mica on chrome, opaque grid |
-| Toolbar of ambiguous 16×16 icons | **A menu bar and a toolbar**, primary; the command palette (`Ctrl+K`) as an extra |
+| Toolbar of ambiguous 16×16 icons | **A menu bar and a toolbar**, primary. (A command palette was tried as an extra and removed — §9.) |
 | Modal config dialogs per feature | Inline editors with live preview over real data |
 | Settings spread across 6 tabbed property sheets | One searchable settings surface |
 | Fixed-function status bar | Status bar as a row of **live, clickable chips** |
@@ -279,10 +279,10 @@ competing with it; an item with no accelerator has none rather than a blank colu
 ```
  File            Edit                  View               Format            Rules             Help
  ─────────────── ───────────────────── ────────────────── ───────────────── ───────────────── ──────────────
- Open…    Ctrl+O Copy           Ctrl+C Follow tail      F Format…           Highlight rules…  Command palette
- Open set…  ^⇧O  Copy as TSV   Ctrl+⇧C Collapse    Ctrl+E   ✓ Serilog 99%     …………… Ctrl+H    ………… Ctrl+K
- ─────────────── ───────────────────── Invisibles  Ctrl+I   Plain text      Open rules file   Keyboard map
- Export view…    Find…          Ctrl+F Record detail ^⏎    ───────────────── Reload rules     About Tailhawk
+ Open…    Ctrl+O Copy           Ctrl+C Follow tail      F Format…           Highlight rules…  Keyboard map
+ Open set…  ^⇧O  Copy as TSV   Ctrl+⇧C Collapse    Ctrl+E   ✓ Serilog 99%     …………… Ctrl+H    ──────────────
+ ─────────────── ───────────────────── Invisibles  Ctrl+I   Plain text      Open rules file   About Tailhawk
+ Export view…    Find…          Ctrl+F Record detail ^⏎    ───────────────── Reload rules
  Keep saving…    Find next          F3 ────────────────── Define from a line…
  ─────────────── Find previous    ⇧+F3 Split pane   Ctrl+\ Import layout…
  Close tab Ctrl+W Go to line…   Ctrl+G Next tab   Ctrl+Tab ─────────────────
@@ -783,26 +783,26 @@ For a truncated long line the Body area shows the cap and the escape:
 
 ---
 
-## 9. Command palette
+## 9. Command palette — removed 2026-08-26
 
-`Ctrl+K`. The single discovery surface, which is why the chrome can stay thin.
+`Ctrl+K` listed every command by name with its key beside it, matched a typed subsequence, and
+turned a query of only digits into *go to line*. **It is gone, and the reasoning is §1's rather
+than a change of mind.**
 
-```
-┌───────────────────────────────────────────────────────────────────────┐
-│ ⌘ merge                                                               │
-├───────────────────────────────────────────────────────────────────────┤
-│  ⊞  Merge open files by timestamp                                     │
-│  ⊞  Merge selected tabs…                                              │
-│  ⏱  Set reorder window…                                    2s         │
-│  ─────────────────────────────────────────────────────────────────    │
-│  Recent                                                               │
-│  ⌕  Filter: level >= Warning                                          │
-│  📁 Open file set: App production                                     │
-└───────────────────────────────────────────────────────────────────────┘
-```
+That table reversed itself on 2026-08-19: *"menus and the toolbar are the primary interface. The
+palette is an additional option, not the answer… the palette must not be the only way to reach
+anything."* Once the menu bar was real, every command in the register was guaranteed by test to
+appear under one of them (`every_listed_command_appears_in_at_least_one_menu`), and §2.5's note
+that *"Top-N is reachable only as three palette entries per column"* was answered by the header's
+own context menu. What was left was a second, bespoke-drawn surface duplicating the menus — and
+the owner's judgement, 2026-08-26, was that it did not look or feel like the rest of the
+application and should go rather than be converted.
 
-Everything reachable by menu is reachable here, plus file sets, watched folders, saved filters and rule
-sets by name.
+**Its one exclusive became a dialog first.** `Ctrl+G` had no implementation outside the palette,
+so *Go to line…* is now a small modal of its own under **View**, which is what §2.2's menu sketch
+had shown all along. Nothing else was lost: subsequence search over command names, and the keys
+listed beside them, are what **Help ▸ Keyboard map** is for.
+
 
 ---
 
@@ -922,7 +922,6 @@ conflict.
 | Key | Action |
 |---|---|
 | `Alt` | Focus the menu bar; `Alt+F`, `Alt+E`, `Alt+V`, `Alt+O`, `Alt+R`, `Alt+H` open a menu directly (§2.2) |
-| `Ctrl+K` | Command palette |
 | `Ctrl+O` / `Ctrl+Shift+O` | Open file / open file set |
 | `Ctrl+F` / `F3` / `Shift+F3` | Search / next / previous |
 | `Ctrl+L` | Focus filter |

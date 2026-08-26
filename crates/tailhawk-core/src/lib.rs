@@ -29,7 +29,6 @@ pub mod index;
 pub mod indexer;
 pub mod lines;
 pub mod menu;
-pub mod palette;
 pub mod pattern;
 pub mod record;
 pub mod rows;

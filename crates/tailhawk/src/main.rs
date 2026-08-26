@@ -40,7 +40,6 @@ use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::fling::{self, TouchAction, TouchPhase};
 use tailhawk_core::highlight::{Highlighter, Rule, Span};
 use tailhawk_core::paint::{Colours, Painter};
-use tailhawk_core::palette::{Choice, Entry, Palette};
 use tailhawk_core::search::{Match, Pattern, SearchOptions};
 use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
@@ -94,8 +93,8 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_B, VK_BACK, VK_C,
     VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G,
-    VK_H, VK_HOME, VK_I, VK_K, VK_L, VK_LEFT, VK_N, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_R,
-    VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z,
+    VK_H, VK_HOME, VK_I, VK_L, VK_LEFT, VK_N, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_R, VK_RETURN,
+    VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_W, VK_X, VK_Y, VK_Z,
 };
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::Shell::{
@@ -247,9 +246,6 @@ struct Document {
     /// bookmark, and clearing the filter shows it again. Toggled by `Ctrl+D` on the caret's row (or
     /// the top row with no caret); `F2` / `Shift+F2` step through them; the gutter marks them.
     bookmarks: std::collections::BTreeSet<u64>,
-    /// `Ctrl+K`'s command palette — `UI-DESIGN.md` §9. Per document, so a tab switch keeps its
-    /// query; every one lists the same commands.
-    palette: Palette,
     /// V9's rules editor as it should be drawn this frame — the shell's knowledge, handed to the
     /// document that draws it, exactly as [`Document::tab_strip`] and [`Document::status`] are.
     /// The editor itself is the shell's; this is only its picture.
@@ -614,58 +610,8 @@ impl RowSource for Document {
             painter.chrome_run(&shown, cell_w * 0.5, ty, theme().header_ink);
         }
 
-        // V9's rules editor, under the palette — §5. Before it, so a palette opened while the
-        // editor is up is still the thing on top.
+        // V9's rules editor — §5.
         self.draw_rules(painter, view);
-
-        // The command palette, over everything — `UI-DESIGN.md` §9. A box under the bar: the
-        // query on its first line, then the rows, the selected one filled. Rows are remembered by
-        // their y for the click.
-        self.chrome.palette_hits.borrow_mut().clear();
-        if self.palette.is_open() {
-            let chrome_h = painter.chrome_line_height();
-            let pad = painter.chrome_measure("n").max(4.0);
-            let em = painter.chrome_measure("0").max(1.0);
-            let box_x = view.gutter_px() + pad;
-            let box_w = (PALETTE_CELLS as f32 * em).min(width - box_x - pad);
-            let rows = self.palette.rows();
-            let box_h = chrome_h * (rows.len() + 1) as f32 + 8.0;
-            let box_y = band;
-            painter.fill(box_x, box_y, box_w, box_h, theme().palette_bg);
-            let inner_x = box_x + pad;
-            let mut y = box_y + 4.0;
-            let prompt = painter.chrome_run("►", inner_x, y, theme().field_hint);
-            let field_x = inner_x + prompt + pad * 0.5;
-            draw_field(
-                painter,
-                &self.palette.field,
-                true,
-                field_x,
-                y,
-                (box_x + box_w - pad - field_x).max(0.0),
-                "type a command, or a line number",
-            );
-            y += chrome_h;
-            let mut hits = self.chrome.palette_hits.borrow_mut();
-            for (i, row) in rows.iter().enumerate() {
-                if row.selected {
-                    painter.fill(box_x, y, box_w, chrome_h, theme().palette_selected_bg);
-                }
-                // The accelerator is right-aligned against the box's edge, so the label's room is
-                // whatever is left — measured, because a proportional key column has no width in
-                // cells.
-                let key_w = painter.chrome_measure(row.key);
-                let label_x = inner_x + pad;
-                let label_w = (box_x + box_w - pad - key_w - pad - label_x).max(0.0);
-                chrome_line(painter, label_x, y, label_w, &row.label, theme().ink);
-                if !row.key.is_empty() {
-                    let kx = box_x + box_w - key_w - pad;
-                    painter.chrome_run(row.key, kx, y, theme().field_hint);
-                }
-                hits.push((y..y + chrome_h, i));
-                y += chrome_h;
-            }
-        }
     }
 
     fn row_spans(&self, row: u64, out: &mut Vec<Span>) {
@@ -706,8 +652,7 @@ impl RowSource for Document {
 }
 
 impl Document {
-    /// V9's rules editor over the grid — `UI-DESIGN.md` §5. Drawn after the palette's box so the
-    /// palette, which can be opened over anything, stays on top of it.
+    /// V9's rules editor over the grid — `UI-DESIGN.md` §5.
     ///
     /// The rows behind this box are the live preview: the shell has already rebuilt the
     /// highlighter from the set under edit, so there is nothing to draw here for it.
@@ -859,7 +804,6 @@ impl Document {
         self.header = None;
         self.column_defaults = None;
         self.filtering.sort = None;
-        self.palette = Palette::new(Command::entries_for(None));
         self.presented.clear();
     }
 
@@ -879,10 +823,9 @@ impl Document {
         let layout = Layout::from_sample(format, &lines);
         self.header = Some(layout.header());
         self.column_defaults = Some(layout.widths.clone());
-        // A sort in force is keyed on a column of the layout that is going away, and the palette
+        // A sort in force is keyed on a column of the layout that is going away, and the menu
         // lists that layout's columns to sort by. Both belong to the format, so both go with it.
         self.filtering.sort = None;
-        self.palette = Palette::new(Command::entries_for(Some(&layout)));
         self.layout = Some(layout);
         self.presented.clear();
     }
@@ -941,7 +884,6 @@ impl Document {
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
             moving: None,
-            palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             chrome_h: 0.0,
             layout,
@@ -1002,7 +944,6 @@ impl Document {
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
             moving: None,
-            palette: Palette::new(Command::entries_for(layout.as_ref())),
             rules_overlay: None,
             chrome_h: 0.0,
             layout,
@@ -1508,7 +1449,7 @@ impl Document {
         true
     }
 
-    /// The name of column `i` as the header shows it, for the status bar and the palette.
+    /// The name of column `i` as the header shows it, for the status bar and the menus.
     fn column_name(&self, i: usize) -> String {
         let Some(layout) = self.layout.as_ref() else {
             return String::new();
@@ -3123,7 +3064,7 @@ struct Sorting {
 /// §11.4's cap on a whole sort, in rows of the set being sorted.
 const SORT_CAP: u64 = 2_000_000;
 
-/// How many rows a top-N from the palette keeps — "the hundred slowest requests".
+/// How many rows a top-N keeps — "the hundred slowest requests".
 const TOP_N: usize = 100;
 
 impl Filtering {
@@ -3301,8 +3242,6 @@ struct Chrome {
     hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, Hit)>>,
     /// The x each field's text starts at, for placing a caret from a click.
     origins: std::cell::Cell<(f32, f32)>,
-    /// The palette's rows by their y, for a click on one.
-    palette_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
     /// The rules editor's rows by their y, for a click on one.
     rules_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
     /// §2.1's filter panel, by x **and** y — it is a column of rows in the footer band, so x
@@ -3478,8 +3417,8 @@ const HISTORY_DEPTH: usize = 64;
 /// threshold, not a limit on filters.
 const NAMED_CHIPS: usize = 3;
 
-/// Every command the shell has, by name — what the palette lists and what the keys dispatch, so a
-/// binding and a palette entry cannot disagree about what a name does.
+/// Every command the shell has, by name — what the menus list and what the keys dispatch, so a
+/// binding and a menu entry cannot disagree about what a name does.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Command {
     OpenFile,
@@ -3532,8 +3471,8 @@ enum Command {
 }
 
 impl Command {
-    /// The palette's list: label and key, in the order a user learns them. `GoToLine` is not here
-    /// — the palette makes one from a typed number.
+    /// The register: label and key, in the order a user learns them. `GoToLine` is not here — it
+    /// carries the line it goes to, and the register lists commands by value.
     const LISTED: &'static [(Command, &'static str, &'static str)] = &[
         (Command::OpenFile, "Open file…", "Ctrl+O"),
         (Command::Find, "Search", "Ctrl+F"),
@@ -3633,52 +3572,6 @@ impl Command {
             "Esc",
         ),
     ];
-
-    fn entries() -> Vec<Entry> {
-        Self::LISTED
-            .iter()
-            .enumerate()
-            .map(|(i, (_, label, key))| Entry::new(i, label, key))
-            .collect()
-    }
-
-    /// The listed commands and, after them, E22's three per column of `layout` — sort ascending,
-    /// sort descending, top-N — with ids that [`from_choice`](Self::from_choice) decodes.
-    fn entries_for(layout: Option<&Layout>) -> Vec<Entry> {
-        let mut entries = Self::entries();
-        let Some(layout) = layout else {
-            return entries;
-        };
-        let mut id = Self::LISTED.len();
-        for i in 0..layout.format.columns.len() {
-            let title = layout.title(i);
-            entries.push(Entry::new(id, &format!("Sort by {title}, ascending"), ""));
-            entries.push(Entry::new(
-                id + 1,
-                &format!("Sort by {title}, descending"),
-                "",
-            ));
-            entries.push(Entry::new(id + 2, &format!("Top {TOP_N} by {title}"), ""));
-            id += 3;
-        }
-        entries
-    }
-
-    /// The command a palette choice names.
-    fn from_choice(choice: Choice) -> Option<Command> {
-        match choice {
-            Choice::GoToLine(n) => Some(Command::GoToLine(n)),
-            Choice::Command(id) if id >= Self::LISTED.len() => {
-                let k = id - Self::LISTED.len();
-                Some(match k % 3 {
-                    0 => Command::SortBy(k / 3, false),
-                    1 => Command::SortBy(k / 3, true),
-                    _ => Command::TopN(k / 3),
-                })
-            }
-            Choice::Command(id) => Self::LISTED.get(id).map(|(c, _, _)| *c),
-        }
-    }
 }
 
 /// What is being dragged along the bar to reorder it.
@@ -3856,7 +3749,6 @@ impl Default for Chrome {
             pending_high: None,
             hits: std::cell::RefCell::new(Vec::new()),
             origins: std::cell::Cell::new((0.0, 0.0)),
-            palette_hits: std::cell::RefCell::new(Vec::new()),
             rules_hits: std::cell::RefCell::new(Vec::new()),
             panel_hits: std::cell::RefCell::new(Vec::new()),
         }
@@ -3869,15 +3761,6 @@ impl Chrome {
         match self.focus {
             Focus::Grid => None,
         }
-    }
-
-    /// The bar's height for a row height: the row plus a little air, so the fields read as
-    /// fields and not as a first row.
-    /// The command bar's height. Takes the **chrome** face's line height — §1.1's bar is drawn
-    /// in the system UI font, so sizing it by the grid's row height left a band too tall for the
-    /// text in it.
-    fn height(chrome_h: f32) -> f32 {
-        (chrome_h + 8.0).round()
     }
 
     /// The tab strip's height, when it is drawn.
@@ -4137,18 +4020,15 @@ impl Watch {
     }
 }
 
-/// The palette box's width, in cells.
-const PALETTE_CELLS: usize = 64;
-
 /// The rules editor box's width, in cells, and how much of it the pattern gets.
 const RULES_CELLS: usize = 120;
 const RULES_PATTERN_CELLS: usize = 40;
 
 /// The keys the rules editor answers to, along its bottom edge — §5 has no buttons, and the
-/// palette's habit of teaching its keys beside the thing they do applies here too.
+/// menus' habit of teaching their keys beside the thing they do applies here too.
 /// §5's enable checkbox. The mock draws `☑` / `☐`, and those fell back to a missing-glyph box on
 /// the shipped font — an enabled rule looked disabled, which is the one thing this control must
-/// never do. These are from the geometric block the gutter's `▲` and the palette's `▸` already
+/// never do. These are from the geometric block the gutter's `▲` already
 /// prove renders.
 const RULE_ON: &str = "●";
 const RULE_OFF: &str = "○";
@@ -4297,9 +4177,9 @@ struct Shell {
     /// When and where the last double-click landed, so the next click can be read as a triple.
     last_double: Option<(u32, f32, f32)>,
     needs_frame: bool,
-    /// The palette chose "Open file…": `wndproc` shows the dialog once this borrow is released.
+    /// Something chose "Open file…": `wndproc` shows the dialog once this borrow is released.
     pending_open: bool,
-    /// The palette chose an export or a tee (`Some(live)`): `wndproc` shows the Save dialog once
+    /// Something chose an export or a tee (`Some(live)`): `wndproc` shows the Save dialog once
     /// this borrow is released.
     pending_save: Option<bool>,
     /// §2.2's About — a native `TaskDialogIndirect`, deferred to `wndproc` exactly as the file
@@ -4324,6 +4204,10 @@ struct Shell {
     pending_format: bool,
     /// Format ▸ Import layout asks for §6.3's dialog, the same way.
     pending_import: bool,
+    /// `Go to line…` asks for its own small dialog. `Ctrl+G` had no surface of its own until the
+    /// command palette went — it opened the palette and leaned on a digits-only query meaning a
+    /// line — while `UI-DESIGN.md` §2.2 had listed `Go to line…` with an ellipsis all along.
+    pending_goto: bool,
     /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
     /// through `IsDialogMessageW` and a second `Ctrl+F` focuses it instead of stacking another.
     find_dialog: HWND,
@@ -4367,7 +4251,7 @@ struct Shell {
     /// The rules that did not compile, by name — shown in the status bar.
     rules_failed: Vec<String>,
     /// V9's rules editor — `UI-DESIGN.md` §5. On the shell rather than the document because the
-    /// rules are the estate's, not one tab's; the palette is per-document because a query is.
+    /// rules are the estate's, not one tab's.
     rules_editor: tailhawk_core::ruleset::Editor,
     /// V9's format wizard — `UI-DESIGN.md` §6.2. On the shell for the reason the rules editor is:
     /// a format definition outlives the tab that prompted it. `None` when the box is not up.
@@ -4971,8 +4855,8 @@ impl Shell {
     ///
     /// `Ctrl+O` is §12's open file — brought forward from M7's shell because a file that can only
     /// be opened from a command line is not a tool the owner can reach for. `Ctrl+I` is §13.4's
-    /// **reveal invisibles** — a key of our choosing, because §12 gives the toggle no binding and
-    /// the command palette that would carry it is M7. Recorded as provisional in `CLEANROOM.md`.
+    /// **reveal invisibles** — a key of our choosing, because §12 gives the toggle no binding.
+    /// Recorded as provisional in `CLEANROOM.md`.
     fn view_key(&mut self, hwnd: HWND, key: u16, ctrl: bool) -> bool {
         if !ctrl {
             return false;
@@ -5119,6 +5003,9 @@ impl Shell {
         let handled = if ctrl && key == VK_F.0 {
             doc.finder.error = None;
             self.pending_find = true;
+            true
+        } else if ctrl && key == VK_G.0 {
+            self.pending_goto = true;
             true
         } else if ctrl && key == VK_L.0 {
             doc.show_filters = true;
@@ -5567,8 +5454,8 @@ impl Shell {
         true
     }
 
-    /// V9's rules editor keys — `UI-DESIGN.md` §5 — offered before the palette's, and modal while
-    /// it is up for the palette's reason: a half-typed regex wants the same keys the grid does.
+    /// V9's rules editor keys — `UI-DESIGN.md` §5 — offered first and modal while the editor is
+    /// up: a half-typed regex wants the same keys the grid does.
     ///
     /// `Esc` unwinds one level at a time, the cell under edit before the editor itself, so an
     /// abandoned edit never costs the set. Every mutation ends in
@@ -5885,61 +5772,16 @@ impl Shell {
         self.retitle(hwnd);
     }
 
-    /// The palette's keys, offered before anything else while it is open: `Ctrl+K` opens and
-    /// closes it (`Ctrl+G` opens it too — a typed number is "go to line"), `Up`/`Down` move,
-    /// `Enter` runs the selection, `Esc` closes, and the editing keys are the query field's.
-    fn palette_key(&mut self, hwnd: HWND, key: u16, ctrl: bool, shift: bool) -> bool {
-        let Some(doc) = self.document.as_mut() else {
-            return false;
-        };
-        if ctrl && (key == VK_K.0 || key == VK_G.0) {
-            if doc.palette.is_open() && key == VK_K.0 {
-                doc.palette.close();
-            } else {
-                doc.palette.open();
-                doc.chrome.focus = Focus::Grid;
-            }
-            return self.after_chrome_key(hwnd);
-        }
-        if !doc.palette.is_open() {
-            return false;
-        }
-        match key {
-            k if k == VK_ESCAPE.0 => doc.palette.close(),
-            k if k == VK_UP.0 => doc.palette.move_selection(-1),
-            k if k == VK_DOWN.0 => doc.palette.move_selection(1),
-            k if k == VK_RETURN.0 => {
-                let choice = doc.palette.choice();
-                doc.palette.close();
-                if let Some(command) = choice.and_then(Command::from_choice) {
-                    self.run(hwnd, command);
-                }
-            }
-            k if field_edit(&mut doc.palette.field, k, ctrl, shift) => doc.palette.refresh(),
-            // Every other key is swallowed: the palette is modal while it is up.
-            _ => {}
-        }
-        self.after_chrome_key(hwnd)
-    }
-
     /// Acts on the id §2.2's menu just chose. Reports whether anything happened.
     ///
     /// Most ids **are** positions in the command register, so they turn straight back into a
-    /// [`Command`] and go through [`run`](Self::run) — the same door the palette and the keystroke
+    /// [`Command`] and go through [`run`](Self::run) — the same door the keystroke and the context
     /// use. §1.2's memorability rule is what wants that: one command, one name, one path, whichever
     /// surface reached it. The handful the register cannot express are the menu's own.
     fn menu_choose(&mut self, hwnd: HWND, id: u32) -> bool {
         match id {
             menubar::ID_EXIT => {
                 let _ = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
-                true
-            }
-            menubar::ID_PALETTE => {
-                let Some(doc) = self.document.as_mut() else {
-                    return false;
-                };
-                doc.palette.open();
-                self.needs_frame = true;
                 true
             }
             menubar::ID_ABOUT => {
@@ -5963,6 +5805,10 @@ impl Shell {
             menubar::ID_CLEAR_RECENT => {
                 self.settings.recent.clear();
                 self.save_settings(hwnd);
+                true
+            }
+            menubar::ID_GOTO => {
+                self.pending_goto = true;
                 true
             }
             id if (menubar::ID_RECENT_BASE
@@ -5996,7 +5842,7 @@ impl Shell {
         }
     }
 
-    /// Runs a command by name — the palette's `Enter`, and what a binding could dispatch through.
+    /// Runs a command by name — what a menu, a keystroke or a context menu all dispatch through.
     /// `OpenFile` is deferred to `wndproc`, which must not be inside this borrow when the dialog
     /// pumps messages. Reports whether the command applied.
     fn run(&mut self, hwnd: HWND, command: Command) -> bool {
@@ -6262,17 +6108,14 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        if doc.chrome.focus == Focus::Grid && !doc.palette.is_open() {
+        if doc.chrome.focus == Focus::Grid {
             return false;
         }
         let mut text = String::new();
         if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
             return false;
         }
-        if doc.palette.is_open() {
-            doc.palette.field.insert(&text);
-            doc.palette.refresh();
-        } else if let Some(field) = doc.chrome.focused() {
+        if let Some(field) = doc.chrome.focused() {
             field.insert(&text);
         }
         unsafe {
@@ -6408,25 +6251,6 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        if doc.palette.is_open() {
-            // A click on a row runs it; anywhere else closes the palette and goes no further.
-            let hit = doc
-                .chrome
-                .palette_hits
-                .borrow()
-                .iter()
-                .find(|(range, _)| range.contains(&y))
-                .map(|(_, row)| *row);
-            let command = hit.and_then(|row| {
-                doc.palette.select(row);
-                doc.palette.choice().and_then(Command::from_choice)
-            });
-            doc.palette.close();
-            if let Some(command) = command {
-                self.run(hwnd, command);
-            }
-            return self.after_chrome_key(hwnd);
-        }
         // §2.1's filter panel lives in the footer band, below the grid — its targets carry both
         // axes, so they are checked before the bar gate turns a footer click into a grid click.
         let panel_hit = doc
@@ -6657,7 +6481,7 @@ impl Welcome {
         for text in [
             "Watch your logs like a hawk",
             "",
-            "Drop a log file here, or press Ctrl+O   (once a file is open, Ctrl+K lists every command)",
+            "Drop a log file here, or press Ctrl+O   (the menus above list everything Tailhawk does)",
             "",
         ] {
             lines.push(centre(text));
@@ -6706,7 +6530,7 @@ impl RowSource for Welcome {
 
 /// V15 — `UI-DESIGN.md` §13's minimal UIA chrome provider: the window answers `WM_GETOBJECT` with
 /// a fragment root whose children are the controls the bar draws — tabs, the two fields, the
-/// chips, the status bar, the palette's query while it is up — with names, control types,
+/// chips, the status bar — with names, control types,
 /// bounds, focus and the patterns a test drives them by. **The provider reads what the mouse
 /// reads**: `Chrome::hits` and the fields, so it cannot say something the screen does not show.
 ///
@@ -6730,12 +6554,12 @@ mod uia {
         ProviderOptions, ProviderOptions_ServerSideProvider, ProviderOptions_UseComThreading,
         ToggleState, ToggleState_Off, ToggleState_On, UIA_AutomationIdPropertyId,
         UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
-        UIA_EditControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId,
-        UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId,
-        UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PaneControlTypeId,
-        UIA_SelectionItemPatternId, UIA_StatusBarControlTypeId, UIA_TabItemControlTypeId,
-        UIA_TogglePatternId, UIA_ValuePatternId, UIA_ValueValuePropertyId, UiaHostProviderFromHwnd,
-        UiaRect, UiaReturnRawElementProvider, UiaRootObjectId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+        UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsContentElementPropertyId,
+        UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
+        UIA_NamePropertyId, UIA_PaneControlTypeId, UIA_SelectionItemPatternId,
+        UIA_StatusBarControlTypeId, UIA_TabItemControlTypeId, UIA_TogglePatternId,
+        UIA_ValuePatternId, UIA_ValueValuePropertyId, UiaHostProviderFromHwnd, UiaRect,
+        UiaReturnRawElementProvider, UiaRootObjectId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
     };
 
     /// `UiaAppendRuntimeId`: the first element of a fragment's runtime id, per the UIA docs.
@@ -6746,7 +6570,6 @@ mod uia {
     pub enum Kind {
         Root,
         Tab(usize),
-        Palette,
         NewChip,
         Chip(usize),
         Status,
@@ -6772,9 +6595,6 @@ mod uia {
         let Some(doc) = shell.document.as_ref() else {
             return out;
         };
-        if doc.palette.is_open() {
-            out.push(Kind::Palette);
-        }
         if doc.tab_strip.0.len() > 1 {
             out.extend((0..doc.tab_strip.0.len()).map(Kind::Tab));
         }
@@ -6833,7 +6653,6 @@ mod uia {
         fn name(&self) -> String {
             match self.kind {
                 Kind::Root => "Tailhawk".to_owned(),
-                Kind::Palette => "Command palette".to_owned(),
                 Kind::NewChip => "Add filter".to_owned(),
                 Kind::Status => "Status".to_owned(),
                 Kind::Tab(i) => with_shell(|s| {
@@ -6861,7 +6680,6 @@ mod uia {
         fn automation_id(&self) -> String {
             match self.kind {
                 Kind::Root => "tailhawk".to_owned(),
-                Kind::Palette => "palette".to_owned(),
                 Kind::NewChip => "new-chip".to_owned(),
                 Kind::Status => "status".to_owned(),
                 Kind::Tab(i) => format!("tab-{i}"),
@@ -6872,26 +6690,23 @@ mod uia {
         fn control_type(&self) -> i32 {
             match self.kind {
                 Kind::Root => UIA_PaneControlTypeId.0,
-                Kind::Palette => UIA_EditControlTypeId.0,
                 Kind::NewChip | Kind::Chip(_) => UIA_ButtonControlTypeId.0,
                 Kind::Tab(_) => UIA_TabItemControlTypeId.0,
                 Kind::Status => UIA_StatusBarControlTypeId.0,
             }
         }
 
+        /// **Nothing in this tree takes the keyboard, and that is now true rather than a gap.**
+        /// The command palette was the one focusable element here, and it is gone; everything the
+        /// window still draws for itself — the tabs, the chips, the status bar — is read or
+        /// clicked, never typed into. What *is* typed into is a real dialog, and Windows provides
+        /// those elements without this provider's help.
         fn is_focusable(&self) -> bool {
-            matches!(self.kind, Kind::Palette)
+            false
         }
 
         fn has_focus(&self) -> bool {
-            with_shell(|s| {
-                let doc = s.document.as_ref()?;
-                Some(match self.kind {
-                    Kind::Palette => doc.palette.is_open(),
-                    _ => false,
-                })
-            })
-            .unwrap_or(false)
+            false
         }
 
         /// The element's client-relative rectangle, from what the frame drew.
@@ -6907,7 +6722,6 @@ mod uia {
                 } else {
                     0.0
                 };
-                let bar_h = Chrome::height(band);
                 let (w, h) = (
                     doc.view.gutter_px() + doc.view.hgrid().viewport_px(),
                     doc.view.height_px(),
@@ -6932,7 +6746,6 @@ mod uia {
                 };
                 Some(match self.kind {
                     Kind::Root => (0.0, 0.0, w, h),
-                    Kind::Palette => (0.0, strip + bar_h, w, row_h + 8.0),
                     Kind::Tab(i) => {
                         let r = x_range(&|hit| *hit == Hit::Tab(i))?;
                         (r.start, 0.0, r.end - r.start, strip)
@@ -6987,7 +6800,6 @@ mod uia {
         fn runtime_key(&self) -> i32 {
             match self.kind {
                 Kind::Root => 1,
-                Kind::Palette => 2,
                 Kind::NewChip => 4,
                 Kind::Status => 5,
                 Kind::Tab(i) => 100 + i as i32,
@@ -7019,7 +6831,7 @@ mod uia {
 
         fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
             let supported = match self.kind {
-                Kind::Palette | Kind::Status => pattern == UIA_ValuePatternId,
+                Kind::Status => pattern == UIA_ValuePatternId,
                 Kind::NewChip => pattern == UIA_InvokePatternId,
                 Kind::Chip(_) => pattern == UIA_InvokePatternId || pattern == UIA_TogglePatternId,
                 Kind::Tab(_) => pattern == UIA_SelectionItemPatternId,
@@ -7054,9 +6866,7 @@ mod uia {
                 p if p == UIA_IsControlElementPropertyId => VARIANT::from(true),
                 p if p == UIA_IsContentElementPropertyId => VARIANT::from(self.kind != Kind::Root),
                 p if p == UIA_ValueValuePropertyId => match self.kind {
-                    Kind::Status | Kind::Palette => {
-                        VARIANT::from(self.Value()?.to_string().as_str())
-                    }
+                    Kind::Status => VARIANT::from(self.Value()?.to_string().as_str()),
                     _ => VARIANT::default(),
                 },
                 p if p == UIA_BoundingRectanglePropertyId => VARIANT::default(),
@@ -7130,17 +6940,10 @@ mod uia {
             none()
         }
 
+        /// Nothing here takes the keyboard — see [`Element::is_focusable`] — so this succeeds
+        /// without doing anything. `Ok(())` rather than a failure because the interface requires
+        /// it and a caller has asked for nothing unreasonable.
         fn SetFocus(&self) -> Result<()> {
-            let kind = self.kind;
-            with_shell_mut(|s| {
-                let doc = s.document.as_mut()?;
-                match kind {
-                    Kind::Palette => doc.palette.open(),
-                    _ => return None,
-                }
-                Some(())
-            });
-            self.repaint();
             Ok(())
         }
 
@@ -7177,45 +6980,23 @@ mod uia {
             none()
         }
 
+        /// No element of this tree can hold the keyboard, so none is ever the focused one. When
+        /// the keyboard is somewhere in this application it is in a dialog, and that dialog's
+        /// elements are Windows', reported by Windows.
         fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
-            let focused = with_shell(|s| {
-                let doc = s.document.as_ref()?;
-                Some(if doc.palette.is_open() {
-                    Some(Kind::Palette)
-                } else {
-                    match doc.chrome.focus {
-                        Focus::Grid => None,
-                    }
-                })
-            })
-            .flatten();
-            match focused {
-                Some(kind) => Ok(self.make(kind)),
-                None => none(),
-            }
+            none()
         }
     }
 
     impl IValueProvider_Impl for Element_Impl {
-        fn SetValue(&self, value: &PCWSTR) -> Result<()> {
-            let text = unsafe { value.to_string() }.unwrap_or_default();
-            let kind = self.kind;
-            let hwnd = self.hwnd;
-            let applied = with_shell_mut(|s| {
-                let doc = s.document.as_mut()?;
-                match kind {
-                    Kind::Palette => {
-                        doc.palette.field.set_text(&text);
-                        doc.palette.refresh();
-                    }
-                    _ => return None,
-                }
-                s.sync_scrollbar(hwnd);
-                s.retitle(hwnd);
-                Some(())
-            });
-            self.repaint();
-            applied.map_or_else(|| Err(Error::from_hresult(E_FAIL)), |()| Ok(()))
+        /// **Nothing this provider exposes is writable, and refusing is the honest answer.** The
+        /// palette's query was the only value a caller could set; the status bar carries the
+        /// pattern so its text can be *read*, and says so through
+        /// [`IsReadOnly`](Self::IsReadOnly). A provider that accepted a write it would then drop
+        /// would be §1.1's "never lie" broken through the accessibility API rather than the
+        /// screen.
+        fn SetValue(&self, _value: &PCWSTR) -> Result<()> {
+            Err(Error::from_hresult(E_FAIL))
         }
 
         fn Value(&self) -> Result<BSTR> {
@@ -7223,7 +7004,6 @@ mod uia {
             let text = with_shell(|s| {
                 let doc = s.document.as_ref()?;
                 Some(match kind {
-                    Kind::Palette => doc.palette.field.text().to_owned(),
                     Kind::Status => doc.status.clone(),
                     _ => String::new(),
                 })
@@ -7854,7 +7634,7 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
 /// panics on the `RefCell`. So they set a flag and the message loop shows the dialog once the borrow
 /// is released — which works only if the arm that ran the command remembers to ask. The menu bar's
 /// click path did not, so **File ▸ Open…, Export view… and Keep saving… silently did nothing when
-/// clicked**, while the same three worked from the keyboard and the palette.
+/// clicked**, while the same three worked from the keyboard.
 fn run_pending_dialogs(hwnd: HWND) -> bool {
     let open = STATE.with(|s| {
         s.borrow_mut()
@@ -7898,6 +7678,42 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         let sheet = STATE.with(|s| s.borrow().as_ref().map(|shell| shell.about_sheet()));
         if let Some(sheet) = sheet {
             show_about(hwnd, &sheet);
+        }
+        return true;
+    }
+    let goto = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_goto))
+    });
+    if goto {
+        // The row count is read, the dialog is shown with no borrow alive, and only then is the
+        // jump made — the same three-step every modal here follows, because a dialog pumps its
+        // own message loop and a live `STATE` borrow across it is the borrow panic this file has
+        // already earned once.
+        let total = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.document.as_ref())
+                .map_or(0, |doc| doc.set.total_rows())
+        });
+        if total > 0 {
+            let mut choice = dialog::GoToChoice { total, line: None };
+            if dialog::show_goto_dialog(hwnd, &mut choice) {
+                if let Some(line) = choice.line {
+                    // Through `run`, not straight at the document: §1.2 wants one command with
+                    // one path however it was reached, and `Command::GoToLine` is that path. The
+                    // dialog decided *which* line; it does not also get to decide what happens
+                    // next.
+                    let was = IN_WNDPROC.with(|flag| flag.replace(true));
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            shell.run(hwnd, Command::GoToLine(line));
+                        }
+                    });
+                    IN_WNDPROC.with(|flag| flag.set(was));
+                }
+            }
         }
         return true;
     }
@@ -9040,13 +8856,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let consumed = STATE.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|shell| {
                     shell.rules_key(hwnd, wparam.0 as u16, ctrl, shift)
-                        || shell.palette_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.view_key(hwnd, wparam.0 as u16, ctrl)
                         || shell.chrome_key(hwnd, wparam.0 as u16, ctrl, shift)
                         || shell.find_key(hwnd, wparam.0 as u16, ctrl, shift)
                 })
             });
-            // The palette's "Open file…" runs here, outside the borrow, for the reason `Ctrl+O` does.
+            // A menu's "Open file…" runs here, outside the borrow, for the reason `Ctrl+O` does.
             if run_pending_dialogs(hwnd) {
                 return LRESULT(0);
             }
@@ -9130,7 +8945,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         }
         // §2.5: the pointer says what the column boundary does. Until this existed, resize was a
         // gesture with no sign of itself anywhere on screen — the only place it was written down
-        // was a palette description.
+        // was a command's name in a list.
         //
         // **`lParam` does not carry the pointer here**, unlike every other mouse message; its low
         // word is a hit-test code. The position has to be asked for, which is the classic way this
@@ -9222,9 +9037,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 // which pane the contact is in, whether a second finger may take a pan in progress,
                 // whether the point is on rows rather than chrome, and whether a capture change is
                 // even about this contact.
-                let covered = shell.rules_editor.is_open()
-                    || shell.wizard.is_some()
-                    || shell.document.as_ref().is_some_and(|d| d.palette.is_open());
+                let covered = shell.rules_editor.is_open() || shell.wizard.is_some();
                 let tops: Vec<f32> = shell.document.panes().iter().map(|d| d.pane_top).collect();
                 let Some(first) = shell.document.panes().first() else {
                     return false;
@@ -9982,6 +9795,7 @@ fn main() -> Result<()> {
             pending_filter_edit: None,
             pending_format: false,
             pending_import: false,
+            pending_goto: false,
             find_dialog: HWND::default(),
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
@@ -10822,9 +10636,10 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The palette's two kinds of choice reach the document: a listed command by its id, and a
-    /// typed number as a physical line — one-based, clamped, shown with the caret on it, and
-    /// under a filter landing on the survivor after a hidden line.
+    /// A typed line number reaches the document as a **physical** line — one-based, clamped,
+    /// shown with the caret on it, and under a filter landing on the survivor after a hidden
+    /// line. What the Go to line dialog makes of the text before this point is
+    /// [`dialog::go_to_target`]'s, and is tested there.
     #[test]
     fn go_to_line_is_physical_one_based_and_clamped() {
         let path = scratch_log("tailhawk_goto_test.log", 500);
@@ -10861,36 +10676,6 @@ mod tests {
             "line 1 is hidden; its slot is line 8"
         );
 
-        assert_eq!(
-            Command::from_choice(Choice::GoToLine(12)),
-            Some(Command::GoToLine(12))
-        );
-        assert_eq!(
-            Command::from_choice(Choice::Command(0)),
-            Some(Command::OpenFile)
-        );
-        // E22: ids past the list are the per-column entries, three a column.
-        let n = Command::LISTED.len();
-        assert_eq!(
-            Command::from_choice(Choice::Command(n)),
-            Some(Command::SortBy(0, false))
-        );
-        assert_eq!(
-            Command::from_choice(Choice::Command(n + 4)),
-            Some(Command::SortBy(1, true))
-        );
-        assert_eq!(
-            Command::from_choice(Choice::Command(n + 5)),
-            Some(Command::TopN(1))
-        );
-        assert_eq!(Command::entries_for(None).len(), n);
-        let entries = Command::entries();
-        assert_eq!(entries.len(), Command::LISTED.len());
-        assert!(entries.iter().all(|e| !e.label.is_empty()));
-        assert!(
-            entries.iter().filter(|e| e.key.is_empty()).count() < entries.len() / 3,
-            "palette-only commands are the exception"
-        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -12185,7 +11970,7 @@ mod tests {
     }
     /// A headless screenshot: opens `TAILHAWK_SHOT_FILE`, applies `TAILHAWK_SHOT_KEYS` (a `;`-separated
     /// script of `chip:<text>`, `xchip:<text>`, `find:<text>`, `focus:find|chip|grid`, `type:<text>`,
-    /// `bookmark:<view row>`, `palette:<query>`, `label:<n>:<text>`, `detail[:pretty]` (row from `TAILHAWK_SHOT_ROW`), `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
+    /// `bookmark:<view row>`, `label:<n>:<text>`, `detail[:pretty]` (row from `TAILHAWK_SHOT_ROW`), `collapse`) and writes the frame the shell would draw to `TAILHAWK_SHOT_OUT` as a BMP. For a
     /// harness that has no desktop to capture — the offscreen target is the whole point.
     ///
     /// ```text
@@ -12306,11 +12091,6 @@ mod tests {
                         },
                     );
                     assert!(doc.filtering.sorted().is_some(), "{}", doc.describe());
-                }
-                "palette" => {
-                    doc.palette.open();
-                    doc.palette.field.insert(arg);
-                    doc.palette.refresh();
                 }
                 "label" => {
                     let (n, text) = arg.split_once(':').expect("label:<n>:<text>");

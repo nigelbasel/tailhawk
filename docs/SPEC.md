@@ -1469,7 +1469,7 @@ and deferred all of it to v2:**
 
 | Part | Scope | Phase |
 |---|---|---|
-| **Chrome provider** | `IRawElementProviderSimple` over tabs, buttons, status chips, text fields, palette, dialogs — enough for names, values, focus order and **automated interaction testing** | **v1**, ~1.5–2.0 weeks, in M7 |
+| **Chrome provider** | `IRawElementProviderSimple` over tabs, buttons, status chips, filter-panel controls, dialogs — enough for names, values, focus order and **automated interaction testing** | **v1**, ~1.5–2.0 weeks, in M7 |
 | **Grid text provider** | Virtualised `ITextProvider`/`ITextRangeProvider`/`IScrollProvider` with caret and selection eventing over tens of millions of rows | **v2**, 6–10 weeks |
 
 Without the v1 half, the largest hand-written subsystem in the product — tabs, drag-out-to-split,

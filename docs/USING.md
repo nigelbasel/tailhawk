@@ -2,13 +2,13 @@
 
 A one-page guide to the viewer as it runs today. Windows only.
 
-There are three ways to reach a command, and they are not equivalent. The **menu bar** is the one
-that holds everything — seven menus, and a test asserts that every command in the register appears
-under one of them. The **command palette** (`Ctrl+K`) lists commands by name with their keys and is
-the fastest route once you know what a thing is called, but some acts are menu-only: Exit,
-Preferences, Font, the recent files, the log-format choice, and the keyboard map. And **right-click
-knows where you are** — a column header, a line of the grid and a filter row each have their own
-menu, offering things that are awkward to reach any other way.
+There are two ways to reach a command. The **menu bar** holds everything — seven menus, and a test
+asserts that every command in the register appears under one of them, so nothing is reachable only
+by a keystroke you would have to already know. And **right-click knows where you are**: a column
+header, a line of the grid and a filter row each have their own menu, offering things that are
+awkward to reach any other way.
+
+Every menu item names its key beside it, and **Help ▸ Keyboard map** lists them all on one page.
 
 ## Running it
 
@@ -42,7 +42,7 @@ session); dropping a file on the window does the same; `Ctrl+O` asks for one.
 | Key | What |
 |---|---|
 | `Alt`, `F10` | The menu bar, with its mnemonics underlined |
-| `Ctrl+K` | Command palette — commands by name and key; type a number for *go to line* (`Ctrl+G`) |
+| `Ctrl+G` | Go to line… |
 | `Ctrl+O` | Open file… (a new tab) |
 | `Ctrl+F` | Find — the standard modeless dialog: match case, whole word, regular expression, wrap |
 | `F3` / `Shift+F3` | Next / previous match; with no results it re-runs the last query |
@@ -158,7 +158,7 @@ themes, rules are suppressed and the status bar says so.
 
 ## Export and keep saving
 
-From **File**, or the palette: **Export view…** writes what the view shows (the filter's survivors,
+From **File**: **Export view…** writes what the view shows (the filter's survivors,
 or everything) as UTF-8 text with `\r\n`. **Keep saving…** does the same and then appends each new
 line that passes the filter as it arrives; **Stop saving** stops it. The status bar carries the
 count, and says so if a write fails.

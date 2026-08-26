@@ -120,7 +120,7 @@ fn append_item(into: HMENU, item: &tailhawk_core::menu::Item) {
     }
 }
 /// A command's id inside a [`tailhawk_core::menu::Item`] — its index in `Command::LISTED`, the
-/// register the palette draws from too.
+/// register the keyboard map is generated from too.
 ///
 /// **The register is the single source, and that is §1.2's memorability rule.** One command has one
 /// name wherever it appears, and an id that *is* a position in that list is what lets `Menu::ids()`
@@ -144,7 +144,6 @@ pub const ID_UNLISTED: u32 = 9_000;
 
 /// Ids for the menu's own items, the ones no other surface can reach. Above every register id.
 pub const ID_EXIT: u32 = 10_001;
-pub const ID_PALETTE: u32 = 10_002;
 pub const ID_KEYMAP: u32 = 10_003;
 pub const ID_ABOUT: u32 = 10_004;
 /// Shown so the Edit menu reads as an Edit menu, and permanently disabled: Tailhawk is a viewer
@@ -155,6 +154,9 @@ pub const ID_PASTE: u32 = 10_006;
 pub const ID_FONT: u32 = 10_007;
 pub const ID_PREFS: u32 = 10_008;
 pub const ID_CLEAR_RECENT: u32 = 10_009;
+/// `Go to line…`. Not a register position, because [`Command::GoToLine`] carries the line it goes
+/// to and the register lists commands by value — the same reason `ID_UNLISTED` exists.
+pub const ID_GOTO: u32 = 10_010;
 /// File's recent entries: `ID_RECENT_BASE + n` opens the n-th newest, for the shell to resolve
 /// against the list it passed in. A range, because the entries are data, not commands.
 pub const ID_RECENT_BASE: u32 = 10_100;
@@ -424,6 +426,7 @@ pub fn menu_bar(
                 ),
                 Item::separator(),
                 on(cmd("Go to &top", "Ctrl+Home", Command::GoToTop), open),
+                on(Item::command("&Go to line…", "Ctrl+G", ID_GOTO), open),
                 on(cmd("&Split pane", "Ctrl+\\", Command::Split), open),
                 on(
                     cmd("Focus other pa&ne", "F6", Command::FocusOtherPane),
@@ -510,10 +513,6 @@ pub fn menu_bar(
         Item::submenu(
             "&Help",
             vec![
-                on(
-                    Item::command("&Command palette", "Ctrl+K", ID_PALETTE),
-                    open,
-                ),
                 // Both are available with no document open: a user who cannot remember how to open
                 // a file is exactly the user who needs the keyboard map.
                 Item::command("&Keyboard map", "", ID_KEYMAP),
@@ -786,7 +785,6 @@ mod tests {
     fn the_menus_own_ids_are_not_register_positions() {
         for id in [
             ID_EXIT,
-            ID_PALETTE,
             ID_KEYMAP,
             ID_ABOUT,
             ID_CUT,

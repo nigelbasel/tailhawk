@@ -46,6 +46,7 @@ $CASES = @(
     @{ Menu = 'Format';   Item = 'Import layout';   Title = 'Import Layout' }
     @{ Menu = 'Edit';     Item = 'Filter: include'; Title = 'Add Filter' }
     @{ Menu = 'Edit';     Item = 'Find';            Title = 'Find' }
+    @{ Menu = 'View';     Item = 'Go to line';      Title = 'Go to line' }
 )
 
 if (-not (Test-Path $Log)) {
