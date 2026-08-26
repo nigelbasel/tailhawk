@@ -1,6 +1,66 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-26, session 26: the repository has a front page, and the harnesses work again
+## ▶ Resume point — 2026-08-26, session 27: the last drawn surfaces are gone, unverified
+
+**Read this first: the rules dialog has never been opened.** Everything below is committed, pushed,
+and green on all three local gates — 817 tests, clippy, fmt — but `afe8686` converts §5's rules
+editor to a modeless dialog and **no one has looked at it running**. The session ended before that
+could happen. Assume it has defects the compiler cannot see; the last three conversions each had
+two or three found only by photographing them.
+
+| Landed | Commit |
+|---|---|
+| The command palette **deleted**, and `Go to line…` given the dialog it had been standing in for | `92eccf8` |
+| §5's rules editor as a **modeless** dialog; the drawn overlay deleted | `afe8686` |
+
+**The owner's decision, 2026-08-26.** They looked at the two surfaces Tailhawk still drew for
+itself and judged both inconsistent with the rest of the application. The palette was **deleted
+rather than converted** — `UI-DESIGN.md` had already demoted it on 2026-08-19 to "an additional
+option, not the answer", every command is guaranteed by test to appear in a menu, and its one
+remaining exclusive (Top-N per column) had been answered by the header's context menu. §9 is now a
+removal record rather than a deleted section.
+
+**Why the rules dialog is modeless where Define Format and Import Layout are modal.** §5 asks for
+"inline, non-modal, live preview over the real file", and the grid behind the box *is* that
+preview: `rules_apply` recompiles the set and repaints the log on every keystroke. A modal would
+have covered the only thing worth previewing. `create_find_dialog` was the template.
+
+### ⏭ Do these first, in this order
+
+1. **Open the rules dialog and photograph it.** `Ctrl+H`, or **Rules ▸ Highlight rules…**. Check:
+   the list fills; selecting a row fills the four fields and the check boxes; typing in *Pattern*
+   recolours the grid behind and shows an error inline for a bad regex without the caret jumping;
+   Add/Remove/Move up/Move down; both colour buttons open `ChooseColorW` and write `#rrggbb`; Save
+   writes the personal tier; Close leaves the on-disk rules in force and says so if unsaved.
+   `tools/verify-dialogs.ps1` is the harness and needs no foreground — but it only proves a
+   `#32770` appeared, so the rest is eyes.
+2. **A live check that `Go to line…` works** — same harness; the case is already in its table.
+3. **`Ctrl+H` while the dialog is up should close it.** That path is written (`pending_rules` sees
+   a live `rules_dialog` and destroys it) and never run.
+
+### Known-unfinished, deliberately
+
+- `Editor::begin_edit` / `commit_edit` / `preview_edit` / `cancel_edit` / `field` are now **dead
+  API** in the core: the drawn editor was their only caller. They are left in place rather than
+  removed in the same commit as the conversion, so the dialog can be judged before the model is
+  cut down. Delete them once it is verified — with their tests, which test nothing that ships.
+- The `Rules` menu still offers **Open rules file** and **Reload rules**, which now overlap the
+  dialog. Probably right to keep, but nobody has decided.
+
+### Two findings from dogfooding, both real and neither started
+
+- **`--column-pattern` cannot express a literal `<`.** `template.rs`'s `dsl()` treats `<` as always
+  opening a token, with no escape, so a console template like `[{Timestamp}] <{Instance}> [{Level}]`
+  — which is what the NDC containers emit — cannot be described by hand. An escape (`<<`) would fix
+  it. The Serilog-template path is unaffected: there `<` and `>` are ordinary literals.
+- **Serilog's `preserveLogFilename: true` rolling shape is not recognised as a set.** Opening
+  `Nurtur.Contact.Api.log` reports "1 file" with `_001` and `_002` sitting beside it. The active
+  file carries no numeric field, so §5.5b's inference has no anchor — the same family as log4net's
+  rename-based backups, which §5.5b *does* name. This is the owner's own logging convention.
+
+---
+
+## Resume point — 2026-08-26, session 26: the repository has a front page, and the harnesses work again
 
 **Where master stands.** Everything below is committed, pushed and green. The session picked up a
 machine shutdown that had cut session 25 off at a clean point — nothing was lost — and then took
