@@ -51,6 +51,13 @@ otherwise.
   uncorrected for a month because `LOKI.md` was never folded back into this document, and it has
   since been quoted *to the owner* as though it were the current position. It is not.
 
+  **Sharpened again on 2026-08-27, by the owner, after asking repeatedly: Tailhawk must be able to
+  *tail* Loki, and that is the priority — ahead of §8.3's merged view.** `LOKI.md` §8 had recorded
+  a merge-first ordering with the tail last of all, and a session reading it faithfully re-derives
+  that ordering and offers it back; that has now happened more than once. Following is not a
+  late-stage refinement here. A remote source you cannot watch live is not the thing that was
+  asked for.
+
   **What still holds.** §13.2's zero-network guarantee applies to everything Tailhawk does on its
   own account — no telemetry, no update ping, no font or CDN fetch. A Loki source is an outbound
   connection **the user has explicitly configured and named**, which is a different thing, and
@@ -1415,6 +1422,16 @@ and session IDs.
 - **No telemetry. No update ping. No font or CDN fetch. No outbound connection of any kind** unless the
   user explicitly opens a remote source. This is a **testable assertion** in CI and a competitive
   claim worth making.
+
+  > **The assertion does not exist yet, and saying so here is the point.** Checked 2026-08-27: CI
+  > asserts the binary carries no runtime shader compiler and no CRT redistributable, and nothing
+  > about sockets. The claim above has been true by construction — no HTTP code has ever been
+  > written — and construction stops being a guarantee the moment the Loki source lands. **Writing
+  > the test is therefore a prerequisite of the first HTTP call, not a follow-up to it**, and it is
+  > the only thing that keeps the *conditional* form of this claim ("unless the user explicitly
+  > opens a remote source") checkable rather than merely asserted. `LOKI.md` §13.2 carries the
+  > shape: a run over a local file must open no socket, and the network path must be reachable only
+  > from an explicitly configured source.
 - **No conventional crash reporter.** A minidump would exfiltrate customer log content. If crash
   reporting exists, it is **local-file only**, user-initiated, with a **visible preview of exactly what
   will be sent**, and never contains buffered log content or full file paths without redaction.

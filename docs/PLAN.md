@@ -154,7 +154,8 @@ alone is 6–10.
 
 > **⚠ The v2 budget does not yet cost the Loki source, and `LOKI.md` §8 says the reconciliation is
 > still owed to this document.** The owner settled on 2026-07-29 that Tailhawk **is** a Loki client,
-> staged client-lite first, sequenced after §8.3's merged view. `LOKI.md`'s two costings disagree by
+> staged client-lite first, sequenced after §8.3's merged view — **and on 2026-08-27 moved it to the
+> front, tail included** (`LOKI.md` §8, superseded-order note). `LOKI.md`'s two costings disagree by
 > 2x — 14–18 PW against 26–38 PW — and at the higher figure the Loki source is **86–110% of the
 > entire v2 budget on its own**. Two structural findings go with it: the timeline histogram (today
 > v3) becomes load-bearing, because it is the only navigation affordance a time-primary source has;
@@ -175,15 +176,21 @@ does not bind. A number is owed here so the plan is honest — it does not autho
    with `panic=abort`, against a 15 MB gate. The hand-written WinHTTP path round 2 costed at
    +1.5 PW exists only to save bytes that are not at risk.
 2. **Round 2 costs the whole client; the decision is staged.** Its 26–38 PW spans all three stages
-   plus the timeline histogram. Stage 1 — client-lite — explicitly excludes the credential store,
-   chip pushdown, follow, the tail WebSocket, the histogram and the label browser, so round 2's
+   plus the timeline histogram. Stage 1 — client-lite — excludes the credential store,
+   chip pushdown, the histogram and the label browser, so round 2's
    figure is not the number that gates starting.
+
+   > **Amended 2026-08-27.** Follow and the tail WebSocket were on that exclusion list and are no
+   > longer: the owner has made **tailing the first thing the Loki source must do**, so it is inside
+   > stage 1 by definition. Round 2 costed the WebSocket path at roughly **+2–3 PW**, which lands on
+   > the band below and is the honest price of the reordering. Polled re-query is the cheaper
+   > fallback if the socket proves troublesome, and is a *fallback*, not the plan.
 3. **The timeline histogram is the largest single deferred item, and it is stage 2.** It is a v3
    item today, and `LOKI.md` §8 finds it load-bearing because it is the only navigation affordance a
    time-primary source has. **It moves to v2 alongside Loki stage 2.** That is the answer to the open
    histogram question, and it leaves stage 1 untouched.
 
-**Stage 1 (client-lite), first pass: ≈ 13–18 PW A.** The research's own "~11 PW read-only window",
+**Stage 1 (client-lite **plus the tail**), first pass: ≈ 15–21 PW A.** The research's own "~11 PW read-only window",
 plus the stage-1 share of the six items round 1 omitted — the materialised window over the CLEF
 spill, per-partition format detection, the interning parser, cost guardrails and the §13.2 CI-test
 rewrite — less the 1.5 PW the size measurement kills. §7's **request-level** controls are inside this

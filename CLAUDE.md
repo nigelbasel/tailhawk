@@ -13,6 +13,23 @@ renderer. `SPEC.md` §2.1 scopes v1 to Windows 10 1809+ — **Linux and macOS ar
 | `docs/UI-DESIGN.md` | The screen: layout, keys, the surfaces V-numbers refer to. |
 | `docs/PLAN.md` / `docs/EFFORT.md` | Estimates, and actuals scored against them. |
 
+## The standing instruction the docs kept talking you out of
+
+**Tailhawk must be able to tail Loki logs, in the app, and that is the priority.** The owner has
+asked for this repeatedly. It keeps being lost the same way every time: `docs/LOKI.md` §8 recorded
+an ordering that put a merged view of local files first and the Loki tail last of three stages, and
+a session reading it faithfully re-derives that ordering and offers it back as a recommendation.
+The documents were corrected on 2026-08-27 — but if any of them ever disagree with this paragraph
+again, **this paragraph wins and the document gets fixed.**
+
+**Never `logcli`.** `logcli query --tail | tailhawk -` works today through the stdin pump and is not
+an answer to the request. Do not offer it as one.
+
+What is *not* overridden, because it is about doing it correctly rather than about when: `LOKI.md`
+§7's request-level controls are required from the first HTTP call, and `SPEC.md` §13.2's
+zero-network CI assertion — claimed for a month, **absent from CI**, true so far only because no
+HTTP code exists — is written before the first one lands.
+
 ## The rules that have actually been broken
 
 **Log before you code.** `CLEANROOM.md` §1.5: the §5 provenance entry for a new core module is

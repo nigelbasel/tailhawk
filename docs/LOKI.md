@@ -325,9 +325,23 @@ part that was found unsound.
 
 | Stage | In | Out |
 |---|---|---|
-| **1 — client-lite** | `query_range` GET; hand-typed stream selector; one materialised window to a CLEF spill driven by the existing index and grid; `ExtentState` load-older/load-newer; time range (relative presets + absolute); all chips client-side; token from env var or `--token-from-file`, **memory only, never persisted** | Credential store, pushdown, follow, tail WebSocket, histogram, label browser |
-| **2** | Credential subsystem on the §7 rules (origin-keyed, Credential Manager, no file); poll-based follow with the settling band; timeline histogram | Tail WebSocket |
-| **3** | Chip pushdown with the pushdown/residual split; label and field browser; `index/stats` pre-flight; tail WebSocket with poll reconciliation | — |
+| **1 — client-lite, tail included** | `query_range` GET; hand-typed stream selector; one materialised window to a CLEF spill driven by the existing index and grid; `ExtentState` load-older/load-newer; time range (relative presets + absolute); all chips client-side; token from env var or `--token-from-file`, **memory only, never persisted**; **poll-based follow with the settling band** | Credential store, pushdown, tail WebSocket, histogram, label browser |
+| **2** | Credential subsystem on the §7 rules (origin-keyed, Credential Manager, no file); timeline histogram; **tail WebSocket as an accelerator over the poll** | — |
+| **3** | Chip pushdown with the pushdown/residual split; label and field browser; `index/stats` pre-flight | — |
+
+> **Amended 2026-08-27 — see the superseded-order note in §8 below.** Follow moved from stage 2 into
+> stage 1 and the WebSocket from stage 3 to stage 2, because the owner has made tailing the point of
+> the exercise rather than a refinement of it.
+>
+> **Follow arrives as a poll, and that is the design, not a shortcut.** §6 already settles it:
+> polling is the correctness mechanism and the tail WebSocket is an accelerator *allowed to fail* —
+> `/tail` drops entries under load with a documented admission of loss, `max_concurrent_tail_requests`
+> defaults to 10 per tenant so a few workstation tabs can starve a colleague's live tail, long-lived
+> sockets die silently on proxy idle timeouts, and out-of-order ingestion lands records behind the
+> tail cursor. A poll on the settling band is what makes the pane *correct*; the socket only makes it
+> *quicker*. §9 also records that nobody has established whether the Grafana datasource proxy
+> forwards a WebSocket upgrade at all — so a stage 1 that depended on the socket would be a stage 1
+> that might not work.
 
 **Client-lite is not "security later".** Only the *storage* controls defer, because there is no
 stored secret to protect. Everything in §7 that governs the request itself is required from the
@@ -337,14 +351,40 @@ handling with no credential across an origin change, TLS posture with no insecur
 TOML, and the response-parse caps. The §13.2 zero-network CI test must be rewritten **before** the
 first HTTP code lands, not after.
 
-**Order within v2 — the merged view first, then Loki.** Owner delegated the choice 2026-07-29.
+### Order — **superseded 2026-08-27 by the owner: Loki tailing comes first**
 
-1. **§8.3 merged-by-timestamp view**, local sources only
-2. **Loki client-lite** (stage 1 above)
-3. **§9 trace and identifier correlation**
-4. **Loki stages 2–3**
+**Tailing Loki is the priority, ahead of §8.3's merged view.** The owner has asked for this
+repeatedly and it has been lost repeatedly, because the ordering recorded below argued the opposite
+and any session reading this file faithfully re-derived it and handed it back as a recommendation.
+That is what happened on the morning of 2026-08-27. **This heading is now the answer; the reasoning
+kept beneath it is history, not instruction.**
 
-Four reasons:
+Two things follow from the override:
+
+- **Following is not a stage-3 luxury.** The staging table above lists *follow* and *tail* as out of
+  client-lite. That is reversed: **a source you cannot watch live is not the feature that was
+  asked for.** The first useful slice is "point Tailhawk at a Loki selector and watch lines
+  arrive", and everything else — the label browser, pushdown, the histogram, `index/stats` —
+  ranks behind it.
+- **`logcli` remains rejected, and is not a stepping stone.** `logcli query --tail | tailhawk -`
+  works today through the stdin pump and is *not* an answer to this request. Do not offer it as
+  one.
+
+**What is unchanged, because it is about doing it correctly rather than about when.** §7's
+request-level controls are required from the first HTTP call — the endpoint allowlist, the SSRF
+defence, redirect handling with no credential across an origin change, the TLS posture with no
+insecure toggle in the TOML, and the response-parse caps. And `SPEC.md` §13.2 claims the
+zero-network guarantee is "a **testable assertion** in CI"; **it is not — no such assertion exists
+today**, and writing it is a prerequisite rather than a delay, because it is what makes the
+conditional form of the claim ("no connection unless the user opened a remote source") checkable
+at all.
+
+<details>
+<summary>The superseded ordering and its four reasons, kept as the record of what was decided on
+2026-07-29 and why it was overridden.</summary>
+
+The order was: §8.3 merged view (local only), then Loki client-lite, then §9 trace correlation,
+then Loki stages 2–3. The reasons were:
 
 - **It keeps the strong privacy claim alive longer.** While no HTTP code exists, §13.2's CI
   assertion is maximally strong — the process opens no sockets, ever. The first HTTP call weakens it
@@ -361,9 +401,14 @@ Four reasons:
   local is a 1000:1 drowning ratio needing per-source quotas — far easier to reason about once the
   engine exists and can be measured.
 
-§9 sits *after* client-lite rather than before it because `trace_id` is sparse in local files and
-Loki is where distributed traces actually live — building §9 first means building a feature that
-cannot be dogfooded.
+The first reason is the one worth answering rather than dismissing: the privacy claim *is* a
+one-way door. The answer is that the door is opened deliberately and the CI assertion is written
+to match — see the note above — rather than left unopened to keep an assertion easy.
+
+§9 was placed after client-lite because `trace_id` is sparse in local files and Loki is where
+distributed traces actually live. That reasoning survives; §9 still follows.
+
+</details>
 
 The research's original argument for Loki-first (`ExtentState` is a §8.3 prerequisite) is spent:
 `ExtentState` lands in v1 regardless (§4), and the spill already exists for stdin, so v1 validates

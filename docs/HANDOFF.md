@@ -1,6 +1,67 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-27, session 28: the sweep proved itself and found one more
+## ▶ Resume point — 2026-08-27, session 29: **tail Loki. That is the work.**
+
+**Read this before `SPEC.md`, `LOKI.md` or `PLAN.md`, because until today all three would have sent
+you somewhere else.** The owner has asked, in his words, "numerous times" to be able to tail Loki
+logs from inside Tailhawk. Each time, a session read `LOKI.md` §8, found an ordering that put a
+merged-by-timestamp view of *local* files first and the Loki tail last of three stages, re-derived
+it faithfully, and handed it back as a recommendation. It happened again this morning. The docs
+were doing what they were written to do; they were simply wrong.
+
+**Settled, and not open:**
+
+1. **Tailing Loki comes first** — ahead of §8.3's merged view, ahead of §9 trace correlation.
+2. **Built into Tailhawk.** Not `logcli`. `logcli query --tail | tailhawk -` works today through the
+   stdin pump and is **not** an answer to this request; do not offer it as one. A single
+   self-contained exe is product identity, not a preference.
+
+All four documents now say so: `LOKI.md` §8 carries the superseded-order note with the old reasoning
+collapsed beneath it, its staging table moves follow into stage 1 and the WebSocket into stage 2,
+`SPEC.md` §1.3 records the sharpening, and `PLAN.md` §2.4b re-bands stage 1 at **15–21 PW A** to pay
+for it honestly.
+
+### What the first slice is
+
+**Follow arrives as a poll, and that is the design rather than a shortcut.** `LOKI.md` §6 settles
+it: polling is the correctness mechanism, the `/tail` WebSocket is an accelerator *allowed to fail*.
+`/tail` drops entries under load by documented admission; `max_concurrent_tail_requests` defaults to
+10 per tenant, so a few workstation tabs can starve a colleague's live tail in Grafana; long-lived
+sockets die silently on proxy idle timeouts. And §9's first open question is still open — nobody has
+established whether Grafana's datasource proxy forwards a WebSocket upgrade at all. A stage 1 that
+depended on the socket would be a stage 1 that might not work.
+
+So: `query_range` GET, a hand-typed selector, the window materialised to the CLEF spill the existing
+index and grid already read, and a repeating query on the settling band that appends what is new.
+That is a pane you can watch move.
+
+### Two things land before the first HTTP call, and both are prerequisites rather than delays
+
+- **The §13.2 zero-network CI assertion, which does not exist.** Checked today: CI asserts no
+  runtime shader compiler and no CRT redistributable, and nothing whatever about sockets. `SPEC.md`
+  has claimed a "**testable assertion** in CI" for a month; the claim has been true only by
+  construction, because no HTTP code was ever written. Construction stops being a guarantee on the
+  day this work starts. Both documents now say the assertion is missing — write it first, and write
+  it to check the *conditional* form: a run over a local file opens no socket.
+- **`LOKI.md` §7's request-level controls**, all of which are required from the first call and none
+  of which are the credential *store*: the compiled-in endpoint path allowlist, the SSRF defence (no
+  DNS before confirmation, deny loopback/link-local/IMDS, address re-checked against rebinding),
+  explicit redirect handling with no credential carried across an origin change, a TLS posture with
+  no insecure toggle reachable from a TOML file, and the response-parse caps. The token comes from
+  an env var or `--token-from-file`, lives in memory, and is never persisted.
+
+### One finding worth keeping, from measuring rather than guessing
+
+**WinHTTP through the `windows` crate already in the tree does both HTTPS and WebSockets**
+(`WinHttpWebSocketCompleteUpgrade`), so the whole client — tail included — can be built with **zero
+new dependencies**. `LOKI.md` §5 measured the `reqwest + tokio + tokio-tungstenite` alternative at
++1.68 MB against a 15 MB gate, so this is no longer a size argument; it is the CLEANROOM §7
+dependency allow-list and the no-runtime-deps promise. Decide it deliberately, but that is the
+grain of the project.
+
+---
+
+## Resume point — 2026-08-27, session 28: the sweep proved itself and found one more
 
 **The full menu sweep ran on a quiet desktop and did its job twice over.** The retry branch fired
 and is proven — `Follow tail` reported *"nothing observable changed, in two windows"*. And chasing
