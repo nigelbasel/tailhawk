@@ -22,13 +22,14 @@
 # grows this sweep with it, and the old hazard of clicking `Exit` while reporting a separator
 # cannot arise: separators are marked as such by `GetMenuState`.
 #
-# **A known limitation, measured rather than assumed.** The client area is captured *off the
-# screen*, so a window that something else overlaps for the moment of the capture reads as
-# unchanged. That only matters for commands whose whole effect is drawn - the command palette and
-# the rules editor - and it is why two consecutive runs on 2026-08-26 disagreed about exactly
-# those three items and no others. If a drawn surface shows up as SUSPECT, run it again on a quiet
-# desktop, or look at it. Retrying each suspect once in a fresh window would settle it and has not
-# been written yet.
+# **Every suspect is asked twice.** The client area is captured *off the screen* — a D3D11
+# swapchain cannot be rendered into a bitmap with `PrintWindow`, which is why `shot-window.ps1` has
+# to pin the window topmost — so anything overlapping the window for the moment of a capture turns
+# a real change into "nothing happened". Two consecutive runs on 2026-08-26 disagreed about exactly
+# the items whose whole effect was drawn, and about nothing else. So an item that reports nothing
+# is run again in another fresh window, and only a *second* silent reading is carried to the
+# summary. One that moves on the retry says so, because a reading that changes between two
+# identical runs is itself worth seeing.
 #
 # And the **effect is observed on four surfaces at once**: the window title, which carries the
 # file, format, follow state, filters and sort; the set of top-level windows, which catches every
@@ -236,27 +237,16 @@ $suspects = @()
 $chosen = 0
 $heading = ''
 
-foreach ($p in $plan) {
-    if ($Menu -and $p.Head -notlike "$Menu*") { continue }
-    if ($p.Head -ne $heading) {
-        $heading = $p.Head
-        Write-Host ''
-        Write-Host "--- $heading ---"
-    }
 
-    if ($p.Popup) {
-        Write-Host ("  {0,-26} SKIP -- a submenu; its rows are data, not commands" -f $p.Label)
-        continue
-    }
-    if ($p.Id -ge 10100 -and $p.Id -lt 10200) {
-        Write-Host ("  {0,-26} SKIP -- a recent file; opening it would change the tab set" -f $p.Label)
-        continue
-    }
-    if ($SKIP.ContainsKey($p.Label)) {
-        Write-Host ("  {0,-26} SKIP -- {1}" -f $p.Label, $SKIP[$p.Label])
-        continue
-    }
-
+# Chooses one item, in a window of its own, and reports what it did.
+#
+# **It neither prints nor counts**, because a `SUSPECT` is worth asking twice before it is
+# believed. The pixel surface is captured off the screen — a D3D11 swapchain cannot be rendered
+# into a bitmap with `PrintWindow`, which is why `shot-window.ps1` has to pin the window topmost —
+# so anything that overlaps the window for the moment of a capture makes a real change read as no
+# change at all. That is not hypothetical: two consecutive runs on 2026-08-26 disagreed about
+# exactly the items whose whole effect was drawn, and about nothing else.
+function Invoke-Item($p, $watch, [int]$tolerance) {
     Wait-NoTailhawk
     $proc = Start-Tailhawk $Log
     try {
@@ -264,18 +254,13 @@ foreach ($p in $plan) {
             ForEach-Object { $_.Items } |
             Where-Object { $_.Id -eq $p.Id } | Select-Object -First 1
         if (-not $live) {
-            Write-Host ("  {0,-26} FAIL -- id {1} is not in the menu of a fresh window" -f $p.Label, $p.Id)
-            $suspects += "$($p.Head) > $($p.Label) (vanished)"
-            continue
+            return @{ Verdict = 'fail'; Detail = "id $($p.Id) is not in the menu of a fresh window"
+                      Note = 'vanished' }
         }
-        if (-not $live.Enabled) {
-            Write-Host ("  {0,-26} greyed" -f $p.Label)
-            continue
-        }
+        if (-not $live.Enabled) { return @{ Verdict = 'greyed' } }
 
         $before = Get-Surfaces $proc
         Send-MenuCommand $proc.MainWindowHandle $live
-        $chosen++
 
         # **Wait for the dialog rather than sampling once and moving on.** A file dialog can take
         # well over a second to appear, and a draft that looked once at 700 ms blamed it on
@@ -300,34 +285,84 @@ foreach ($p in $plan) {
         foreach ($w in $raised) {
             $title = $w -replace '^#32770\|', ''
             if (-not (Close-Dialog $proc.Id $title)) {
-                Write-Host ("  {0,-26} FAIL -- its '{1}' dialog would not close" -f $p.Label, $title)
-                $suspects += "$($p.Head) > $($p.Label) (dialog stuck)"
+                Remove-Surfaces $before
+                return @{ Verdict = 'fail'; Detail = "its '$title' dialog would not close"
+                          Note = 'dialog stuck' }
             }
         }
         if ($raised) { $null = Restore-Foreground $proc }
         Start-Sleep -Milliseconds 300
 
         if ($proc.HasExited) {
-            Write-Host ("  {0,-26} FAIL -- the application exited" -f $p.Label)
-            $suspects += "$($p.Head) > $($p.Label) (exited)"
-            continue
+            Remove-Surfaces $before
+            return @{ Verdict = 'fail'; Detail = 'the application exited'; Note = 'exited' }
         }
 
         $after = Get-Surfaces $proc
         $moved = Compare-Surfaces $before $after $watch $tolerance
-        if ($raised) {
-            $names = ($raised | ForEach-Object { $_ -replace '^#32770\|', '' }) -join ', '
-            Write-Host ("  {0,-26} raised {1}" -f $p.Label, $names)
-        } elseif ($moved) {
-            Write-Host ("  {0,-26} moved {1}" -f $p.Label, ($moved -join ' and '))
-        } else {
-            Write-Host ("  {0,-26} SUSPECT -- enabled, and nothing observable changed" -f $p.Label)
-            $suspects += "$($p.Head) > $($p.Label)"
-        }
         Remove-Surfaces $before
         Remove-Surfaces $after
+        if ($raised) {
+            return @{ Verdict = 'raised'
+                      Detail = ($raised | ForEach-Object { $_ -replace '^#32770\|', '' }) -join ', ' }
+        }
+        if ($moved) { return @{ Verdict = 'moved'; Detail = ($moved -join ' and ') } }
+        return @{ Verdict = 'suspect' }
     } finally {
         if (-not $proc.HasExited) { $proc.Kill() }
+    }
+}
+
+foreach ($p in $plan) {
+    if ($Menu -and $p.Head -notlike "$Menu*") { continue }
+    if ($p.Head -ne $heading) {
+        $heading = $p.Head
+        Write-Host ''
+        Write-Host "--- $heading ---"
+    }
+
+    if ($p.Popup) {
+        Write-Host ("  {0,-26} SKIP -- a submenu; its rows are data, not commands" -f $p.Label)
+        continue
+    }
+    if ($p.Id -ge 10100 -and $p.Id -lt 10200) {
+        Write-Host ("  {0,-26} SKIP -- a recent file; opening it would change the tab set" -f $p.Label)
+        continue
+    }
+    if ($SKIP.ContainsKey($p.Label)) {
+        Write-Host ("  {0,-26} SKIP -- {1}" -f $p.Label, $SKIP[$p.Label])
+        continue
+    }
+
+    $verdict = Invoke-Item $p $watch $tolerance
+    if ($verdict.Verdict -ne 'greyed') { $chosen++ }
+
+    # **A suspect is asked a second time, in another fresh window, before it is reported.** One
+    # occluded capture is enough to turn a real change into "nothing happened", and a sweep that
+    # cries wolf is a sweep nobody reads. Only an item that says nothing happened *twice* is
+    # carried to the summary; one that moves on the retry says so, because a reading that changes
+    # between two identical runs is itself worth seeing.
+    if ($verdict.Verdict -eq 'suspect') {
+        $again = Invoke-Item $p $watch $tolerance
+        $chosen++
+        if ($again.Verdict -eq 'suspect') {
+            Write-Host ("  {0,-26} SUSPECT -- nothing observable changed, in two windows" -f $p.Label)
+            $suspects += "$($p.Head) > $($p.Label)"
+        } else {
+            Write-Host ("  {0,-26} {1} {2}  (the first window read as nothing - occluded)" -f `
+                $p.Label, $again.Verdict, $again.Detail)
+        }
+        continue
+    }
+
+    switch ($verdict.Verdict) {
+        'greyed' { Write-Host ("  {0,-26} greyed" -f $p.Label) }
+        'raised' { Write-Host ("  {0,-26} raised {1}" -f $p.Label, $verdict.Detail) }
+        'moved' { Write-Host ("  {0,-26} moved {1}" -f $p.Label, $verdict.Detail) }
+        'fail' {
+            Write-Host ("  {0,-26} FAIL -- {1}" -f $p.Label, $verdict.Detail)
+            $suspects += "$($p.Head) > $($p.Label) ($($verdict.Note))"
+        }
     }
 }
 
