@@ -305,6 +305,8 @@ pub fn menu_bar(
     let filters = doc.is_some_and(|d| d.filters_open());
     let filtered = doc.is_some_and(|d| d.is_filtered());
     let saving = doc.is_some_and(|d| d.is_saving());
+    let back = doc.is_some_and(|d| d.can_step(true));
+    let forward = doc.is_some_and(|d| d.can_step(false));
 
     // The recent files are entries of the File menu itself — the owner's choice of the
     // Notepad++ model over a submenu: numbered, newest first, just above Exit, and simply absent
@@ -434,8 +436,8 @@ pub fn menu_bar(
                     open,
                 ),
                 Item::separator(),
-                on(cmd("&Back", "Alt+←", Command::Back), open),
-                on(cmd("F&orward", "Alt+→", Command::Forward), open),
+                on(cmd("&Back", "Alt+←", Command::Back), back),
+                on(cmd("F&orward", "Alt+→", Command::Forward), forward),
             ],
         ),
         Item::submenu(

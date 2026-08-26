@@ -1279,6 +1279,17 @@ impl Document {
         self.view.grid().is_following()
     }
 
+    /// Whether `Alt+←` (`back`) or `Alt+→` has anywhere to go — the same emptiness
+    /// [`Document::history_step`] reports by refusing, asked before the item is drawn rather than
+    /// after it is pressed.
+    fn can_step(&self, back: bool) -> bool {
+        if back {
+            !self.history.back.is_empty()
+        } else {
+            !self.history.forward.is_empty()
+        }
+    }
+
     /// §6.4's collapse: continuations hidden, only first lines are rows.
     fn is_collapsed(&self) -> bool {
         self.filtering.records_only
@@ -1373,6 +1384,7 @@ impl Document {
                 }
                 _ => Vec::new(),
             },
+            filters_hidden: !self.show_filters,
         })
     }
 
@@ -1389,10 +1401,12 @@ impl Document {
                 self.filtering.chips.chips.push(chip);
             }
         }
-        // Chips that arrive without a keystroke — `--filter=`, a file's remembered state — must
-        // bring their panel with them: filters in force with no UI saying so is the invisible
-        // state §1.1 forbids, and the bar that used to always show them is gone.
-        if !self.filtering.chips.chips.is_empty() {
+        // Chips that arrive without a keystroke — `--filter=`, a file's remembered state — bring
+        // their panel with them unless this file was closed with it hidden. §1.1 forbids filters
+        // in force with nothing saying so, and until the status line counted them the panel was
+        // the only thing that could: hence `filters_hidden` is the newer half of a pair, and
+        // honouring it is only safe because `▼ n filters · k of m` now says it too.
+        if !self.filtering.chips.chips.is_empty() && !state.filters_hidden {
             self.show_filters = true;
         }
         self.filtering.records_only = state.collapse && self.detection.accepted.is_some();
@@ -1875,6 +1889,17 @@ impl Document {
                 self.filtering.error = None;
                 self.filtering.chips.chips.push(chip);
                 self.filtering.clear_results();
+                // **A filter brings its panel, and that belongs here rather than at each caller.**
+                // Two callers set the flag themselves immediately before calling this — the grid's
+                // *Filter to this text* and the Filter dialog's OK — and a third added later would
+                // have been a filter in force with nothing on screen saying so, which is §1.1's
+                // invisible state. One chip added, one panel shown, decided once.
+                //
+                // The four remaining `show_filters = true` in the shell are a different act: they
+                // open the panel *before* the Filter dialog, so the surface the filter will land in
+                // is already there while it is being composed. No chip exists at that point, so
+                // this is not the place for them.
+                self.show_filters = true;
                 self.refilter();
             }
             Err(e) => self.filtering.error = Some(format!("{text}: {e}")),
@@ -3211,6 +3236,8 @@ impl Filtering {
     }
 
     /// The title's filter fragment, or `None` when no filter is in play.
+    ///
+    /// See [`NAMED_CHIPS`] for where naming the filters gives way to counting them.
     fn describe(&self, total_rows: u64) -> Option<String> {
         if let Some(error) = &self.error {
             return Some(format!("▼ {error}"));
@@ -3219,12 +3246,23 @@ impl Filtering {
         if self.records_only {
             text.push_str(" ▤ records");
         }
-        for chip in &self.chips.chips {
-            let sign = match chip.polarity {
-                Polarity::Include => '+',
-                Polarity::Exclude => '−',
-            };
-            text.push_str(&format!(" {sign}{}", chip.source));
+        // **Named while they fit, counted once they do not.** Two chips read `+error −retrying`,
+        // which says more than any count could; six spelled out crowd the format, the follow
+        // state, a sort and an export off the end of a status bar they all share. The panel lists
+        // them in full and has the room for it — this fragment only has to say that filters are in
+        // force and how much of the file survives them, which is what lets the panel be closed
+        // without §1.1's invisible state coming back.
+        let chips = &self.chips.chips;
+        if chips.len() > NAMED_CHIPS {
+            text.push_str(&format!(" {} filters", chips.len()));
+        } else {
+            for chip in chips {
+                let sign = match chip.polarity {
+                    Polarity::Include => '+',
+                    Polarity::Exclude => '−',
+                };
+                text.push_str(&format!(" {sign}{}", chip.source));
+            }
         }
         if text.is_empty() {
             return None;
@@ -3432,6 +3470,13 @@ const WM_DRAIN_DIALOGS: u32 = WM_APP + 8;
 
 /// The most states kept in either direction.
 const HISTORY_DEPTH: usize = 64;
+
+/// How many filters the status line names before it starts counting them instead.
+///
+/// Three is what fits beside everything else the line carries — the format and its confidence, the
+/// follow state, a sort, an export in flight — on a window of ordinary width. It is a legibility
+/// threshold, not a limit on filters.
+const NAMED_CHIPS: usize = 3;
 
 /// Every command the shell has, by name — what the palette lists and what the keys dispatch, so a
 /// binding and a palette entry cannot disagree about what a name does.
@@ -4470,6 +4515,8 @@ impl Shell {
                     self.reading.remove(i);
                     // §12.4: the file's remembered view, before it is first drawn.
                     if !self.initial_chips.is_empty() {
+                        // `--filter=` on the command line always brings the panel: the user has
+                        // just typed the filters and has no remembered preference about them yet.
                         document.apply_state(&settings::FileState {
                             path: String::new(),
                             chips: self.initial_chips.clone(),
@@ -4477,6 +4524,7 @@ impl Shell {
                             bookmarks: Vec::new(),
                             labels: Vec::new(),
                             columns: Vec::new(),
+                            filters_hidden: false,
                         });
                     }
                     let key = document
@@ -7758,7 +7806,6 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
                     return false;
                 };
                 let expression = dialog::compose_filter(None, 0, line, false, false);
-                doc.show_filters = true;
                 doc.add_chip(&expression, polarity);
                 let rows = doc.view_rows();
                 doc.view.grid_mut().set_total_rows(rows);
@@ -7938,7 +7985,6 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                 STATE.with(|s| {
                     if let Some(shell) = s.borrow_mut().as_mut() {
                         if let Some(doc) = shell.document.as_mut() {
-                            doc.show_filters = true;
                             doc.add_chip(&edit.expression, polarity);
                             let rows = doc.view_rows();
                             doc.view.grid_mut().set_total_rows(rows);
@@ -10917,6 +10963,86 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Closing the filter panel is remembered with the file, and honoured when it opens again.
+    ///
+    /// **The open case is the one that must not regress.** Until the status line learned to count
+    /// filters, a remembered file *had* to bring its panel back, because the panel was the only
+    /// thing on screen saying the view was narrowed — §1.1's rule against invisible state. What
+    /// makes closing it safe now is `▼ n filters · k of m`, and that is why this asserts both
+    /// directions rather than only the new one.
+    #[test]
+    fn a_closed_filter_panel_comes_back_closed_and_an_open_one_open() {
+        let path = scratch_log("tailhawk_panel_state_test.log", 300);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        filter_for(&mut doc, "line", Polarity::Include);
+        assert!(doc.show_filters, "adding a filter opens the panel");
+
+        let left_open = doc.file_state().expect("a path to key by");
+        assert!(!left_open.filters_hidden);
+        doc.show_filters = false;
+        let left_closed = doc.file_state().expect("a path to key by");
+        assert!(left_closed.filters_hidden, "the choice is recorded");
+
+        let mut closed = Document::open(&path).expect("reopen");
+        closed.lay_out((8.0, 10.0), (800, 200));
+        closed.apply_state(&left_closed);
+        assert_eq!(
+            closed.filtering.chips.chips.len(),
+            1,
+            "the filter came back"
+        );
+        assert!(!closed.show_filters, "and the panel stayed closed");
+
+        let mut open = Document::open(&path).expect("reopen");
+        open.lay_out((8.0, 10.0), (800, 200));
+        open.apply_state(&left_open);
+        assert!(open.show_filters, "a panel left open comes back open");
+    }
+
+    /// A menu item that could not do anything is greyed, not offered.
+    ///
+    /// **`tools/verify-menus.ps1` found this.** The sweep chooses every enabled item in a window
+    /// of its own and reports the ones that change nothing observable; `View ▸ Back` and
+    /// `View ▸ Forward` came back as two of only three, because a fresh window has no view to
+    /// return to and they were gated on nothing more than a document being open. `Alt+←` had
+    /// always answered honestly by doing nothing — it was the menu that was inviting a press it
+    /// could not honour.
+    #[test]
+    fn back_and_forward_are_greyed_until_there_is_a_view_to_return_to() {
+        fn enabled(doc: &Document, label: &str) -> bool {
+            let menu = menubar::menu_bar(Some(doc), false, &[]);
+            for top in 0..menu.items().len() {
+                let Some(items) = menu.at(&[top]) else {
+                    continue;
+                };
+                if let Some(item) = items.iter().find(|i| i.label == label) {
+                    return item.enabled;
+                }
+            }
+            panic!("no menu item labelled {label}");
+        }
+
+        let path = scratch_log("tailhawk_history_menu_test.log", 300);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.view.grid_mut().scroll_to_row(0);
+
+        assert!(
+            !enabled(&doc, "&Back"),
+            "a fresh view has nothing behind it"
+        );
+        assert!(!enabled(&doc, "F&orward"), "nor anything ahead");
+
+        doc.go_to_line(200);
+        assert!(enabled(&doc, "&Back"), "the jump left a view behind");
+        assert!(!enabled(&doc, "F&orward"), "still nothing ahead");
+
+        assert!(doc.history_step(true), "back to where the jump started");
+        assert!(enabled(&doc, "F&orward"), "stepping back leaves one ahead");
+        assert!(!enabled(&doc, "&Back"), "and that was the first view");
+    }
+
     /// E27: a chip, a collapse and a jump each leave the view they replaced on the back stack;
     /// `Alt+←` restores it — the chips and the top row — and `Alt+→` redoes; a fresh change after
     /// going back forgets the forward states.
@@ -11284,6 +11410,42 @@ mod tests {
             std::thread::yield_now();
         }
         doc.poll_filter();
+    }
+
+    /// Past a few filters the status line stops naming them and starts counting them.
+    ///
+    /// **Naming them is right while it fits**, and the test above holds that: two chips read
+    /// `▼ +error −retrying`, which says more than any count could. But the fragment shares a
+    /// status bar and a title with the format, the follow state, a sort and an export, and six
+    /// filters spelled out crowd all of it off the end. The filters are listed in full in the
+    /// panel, which is the surface that has room; this one only has to say that they are in force
+    /// and how much of the file survives them.
+    #[test]
+    fn many_filters_are_counted_in_the_status_line_rather_than_spelled_out() {
+        let path = scratch_log("tailhawk_filter_count_test.log", 300);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        filter_for(&mut doc, "line", Polarity::Include);
+        filter_for(&mut doc, "log", Polarity::Include);
+        filter_for(&mut doc, "record", Polarity::Include);
+        assert!(
+            doc.describe().contains("▼ +line +log +record"),
+            "three still fit: {}",
+            doc.describe()
+        );
+
+        filter_for(&mut doc, "width", Polarity::Include);
+        let text = doc.describe();
+        assert!(text.contains("▼ 4 filters"), "four are counted: {text}");
+        assert!(
+            !text.contains("+line"),
+            "and are no longer spelled out: {text}"
+        );
+        assert!(
+            text.contains(" of 300"),
+            "the survivors are still said: {text}"
+        );
     }
 
     /// §7.3's in-place hide, end to end on a real file: the grid counts survivors, view row *k*
