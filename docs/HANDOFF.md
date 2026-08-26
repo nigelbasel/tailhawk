@@ -11,7 +11,8 @@ the top three items off its list.
 | The discarded command-bar mockups deleted, and two dangling paths with them | `37b3851` |
 | **`README.md`** — the front page a public repository had been missing | `79dc8fe` |
 | **The three dead harnesses**, driving the real menu; a mnemonic clash found and fixed | `6ae6f96` |
-| **`USING.md` re-walked** against the running application | *this commit* |
+| **`USING.md` re-walked** against the running application | `4a56e5a` |
+| **The filter panel is remembered**, the status line counts what it hides, and `Back`/`Forward` are gated | `f4e2e50` |
 
 **What the harness rework actually bought.** `verify-dialogs`, `verify-menus` and `verify-recent`
 had all been failing with *"menu drew no entries"* since the bar became a native `HMENU` — three
@@ -47,10 +48,10 @@ items of that menu rather than a submenu. It builds both shapes now.
    and two consecutive runs disagreed about exactly those and nothing else. Retrying each suspect
    once in a fresh window would settle it, and has not been written.
 
-**One finding left for the owner.** The sweep's residue is three items, and two of them look like a
-real if minor defect: **`View ▸ Back` and `View ▸ Forward` are enabled on a fresh window that has no
-history to move through.** They are gated on a document being open rather than on the history
-holding anything. (The third, `Follow tail`, is honest — a fresh window already follows.)
+**The sweep paid for itself the same day.** Its residue was three items, and two were a real if
+minor defect: `View ▸ Back` and `View ▸ Forward` were enabled on a fresh window with no history to
+move through, gated on a document being open rather than on the history holding anything. Fixed in
+`f4e2e50`, test-first. The third, `Follow tail`, is honest — a fresh window already follows.
 
 Two PowerShell traps cost a run each and are worth knowing: a function parameter named `$Pid`
 silently shadows the automatic variable, so every lookup searched the host's own process; and
@@ -129,8 +130,11 @@ been reasoned out, and two of them had passing tests either side.
 3. ~~**The stale harnesses.**~~ **Done** — see the top of this file. `verify-dialogs` now covers
    eight dialogs including Define Format and Import Layout, which is the `verify-format.ps1` that
    was wanted, without a fourth script.
-4. **Still outstanding from earlier stretches:** filter-panel visibility is not persisted
-   (§12.4 says remembered), and the status bar has no `n filters · k of m` chip.
+4. ~~**Filter-panel visibility and the status chip.**~~ **Done**, and the order was forced: the
+   panel could not be allowed to stay closed until the status line said what it was hiding.
+   `▼ n filters · k of m` names filters while they fit and counts them past three; `filters_hidden`
+   is per file and stored the negative way round, so an absent key — every settings file written
+   before today — reads as *shown*.
 5. **The remaining drawn overlays**, now that the wizard has gone: §5's `RulesOverlay` and the
    command palette are the last two surfaces the app draws itself. The owner has not asked about
    either, and the palette is arguably right as it is — but the rules editor is the same kind of
