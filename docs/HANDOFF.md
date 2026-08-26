@@ -66,13 +66,42 @@ have covered the only thing worth previewing. `create_find_dialog` was the templ
    One was worse than dead — `find_char` claimed every character typed at the grid while the rules
    editor was open, which for a *modeless* dialog is any time it is up.
 2. ~~**The two dogfooding findings.**~~ **Done** (`b3d03c5`) — see below.
-3. **Three paths the harness still does not reach**, in falling order of worth: the two colour
-   buttons (they open `ChooseColorW`, which is modal, so the harness must dismiss it); **Save**
-   writing the personal tier and the reload that follows; and **Close** leaving the on-disk rules
-   in force with the status bar saying so when the set was unsaved. Everything else in the dialog
-   is covered by `verify-rules.ps1`.
+3. ~~**Three paths the harness does not reach.**~~ **Done** (`4f428aa`) — `verify-rules.ps1` is at
+   twenty checks, and covering those three found three more defects. See below.
 4. `verify-menus.ps1`'s pixel surface is occlusion-sensitive — retry each suspect once in a fresh
    window. Written up in session 26's resume point below.
+5. Nothing else is queued. The dialog conversions are finished and verified; what is left in
+   `SPEC.md` is feature work rather than debt.
+
+### What covering those three paths found (`4f428aa`)
+
+- **Six status messages could never be seen.** `Shell::file` carried two different things — what
+  the document *is*, and what just happened — and `status_text` read it only when there was **no**
+  document to describe. A document being open is the only time any of those messages can be
+  written, so every one was discarded on the next repaint without reaching a pixel: "rules closed
+  unsaved" (§10 requires that one), "rules not saved: …", "no line to define a format from",
+  "format wizard closed — nothing saved", "name the format first", and a failed split. They now go
+  to a `notice` slot shown *beside* the description; the order is `status_line`'s, which is pure
+  and tested.
+- **A byte-order mark swallowed the first rule** of a hand-edited `tailhawk.rules.toml`.
+  `str::trim` does not remove `U+FEFF`. Notepad, VS Code and PowerShell's
+  `Set-Content -Encoding utf8` all write one, and `ruleset::import` already tolerated it while
+  `rules::parse` did not — so the set loaded, applied, and was quietly missing its first colour.
+- **The colour round trip is right**, and is now asserted rather than assumed: pressing OK on the
+  seeded colour must return it unchanged, which is what would catch a `COLORREF` `0x00bbggrr`
+  against `#rrggbb` byte swap. That is invisible in a screenshot of the swatch and obvious in a
+  hex field.
+
+**`verify-rules.ps1` cannot touch the real rules file.** The personal tier is resolved through
+`APPDATA`, so the harness hands the child process a scratch one — nothing to back up, and nothing
+left broken if the script dies half way. Any future harness that presses **Save** must do the same.
+
+> **This has now happened twice: a push created no CI run at all.** `b3d03c5` and `4f428aa` both
+> landed on the remote with no run and no check-runs against the SHA — not the billing failure of
+> the 25th, and at least once accompanied by `error connecting to api.github.com`, so a flaky
+> connection is the likeliest cause. A missing run reads exactly like a green one if you look at
+> the top of `gh run list` instead of at the SHA. **Check the SHA.** `gh workflow run CI --ref
+> master` re-triggers on the same commit without manufacturing an empty one.
 
 ### Known-unfinished, deliberately
 
