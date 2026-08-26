@@ -382,6 +382,21 @@ pub fn recognised_label(layout: &str) -> String {
     }
 }
 
+/// How many earlier findings came out of the same config file as `selected`.
+///
+/// [`Wizard::from_found`] numbers a second layout **within one file**, so it needs this and not
+/// the list's own index: numbering by the index would call the only layout in the second file its
+/// own second, and that number becomes the definition's name and the compiled format's id.
+pub fn nth_in_file(found: &[tailhawk_core::template::Found], selected: usize) -> usize {
+    let Some(chosen) = found.get(selected) else {
+        return 0;
+    };
+    found[..selected]
+        .iter()
+        .filter(|f| f.source == chosen.source)
+        .count()
+}
+
 /// One row of the Import Layout dialog's findings list.
 pub struct ImportFoundRow {
     /// The config file's own name — the path is context, the file is the identity.
@@ -2163,12 +2178,22 @@ unsafe extern "system" fn import_proc(
                     match lv_selected(list).and_then(|at| state.found.get(at).map(|f| (at, f))) {
                         None => format_say(hdlg, "choose one of the layouts found first"),
                         Some((at, f)) => {
-                            let taken = Wizard::from_found(f, at);
+                            // Numbered **within its own config file**, not by the list's index —
+                            // see [`nth_in_file`]. The number becomes the definition's name.
+                            let mut taken = Wizard::from_found(f, nth_in_file(&state.found, at));
+                            // **The list picks the layout, not the name.** Whatever the user has
+                            // already typed into Save as — and the glob they chose — survives
+                            // browsing the findings; silently renaming a definition because
+                            // someone looked at a list is not what a list is for.
+                            let chosen = read_dlg_text(hdlg, ID_W_SAVEAS);
+                            if !chosen.trim().is_empty() {
+                                taken.name = chosen;
+                            }
+                            taken.glob = state.wizard.glob.clone();
+                            taken.set_samples(state.wizard.samples().to_vec());
                             let layout = wsz(&taken.template());
                             let name = wsz(&taken.name);
-                            let samples = state.wizard.samples().to_vec();
                             *state.wizard = taken;
-                            state.wizard.set_samples(samples);
                             format_quietly(|| unsafe {
                                 let _ = SetDlgItemTextW(
                                     hdlg,
@@ -2514,6 +2539,31 @@ mod tests {
             refused != IMPORT_HINT && !refused.is_empty(),
             "an unrecognised paste says why: {refused}"
         );
+    }
+
+    /// A second layout is the second **of its own config file**, not of the list — the number
+    /// becomes the definition's name, so numbering by the list index would call the only layout
+    /// in the second file its own second.
+    #[test]
+    fn a_finding_is_numbered_within_its_own_config_file() {
+        let found = |file: &str, template: &str| tailhawk_core::template::Found {
+            language: tailhawk_core::template::Language::NLog,
+            template: template.to_owned(),
+            source: std::path::PathBuf::from(r"C:\dev\ndc\Api").join(file),
+        };
+        let all = [
+            found("NLog.config", "${longdate}|${message}"),
+            found("NLog.config", "${level}|${message}"),
+            found("appsettings.json", "${logger}|${message}"),
+        ];
+        assert_eq!(nth_in_file(&all, 0), 0);
+        assert_eq!(nth_in_file(&all, 1), 1, "the second layout of NLog.config");
+        assert_eq!(
+            nth_in_file(&all, 2),
+            0,
+            "the only layout of appsettings.json, not the list's third"
+        );
+        assert_eq!(nth_in_file(&all, 9), 0, "out of range is not a panic");
     }
 
     /// The findings list is read, not guessed at: each row carries the file, the language and the
