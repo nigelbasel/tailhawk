@@ -1,17 +1,44 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-26, session 27: the last drawn surfaces are gone, unverified
+## ▶ Resume point — 2026-08-27, session 28: the rules dialog is open, and it works
 
-**Read this first: the rules dialog has never been opened.** Everything below is committed, pushed,
-and green on all three local gates — 817 tests, clippy, fmt — but `afe8686` converts §5's rules
-editor to a modeless dialog and **no one has looked at it running**. The session ended before that
-could happen. Assume it has defects the compiler cannot see; the last three conversions each had
-two or three found only by photographing them.
+**Tailhawk now draws none of its own chrome.** Every surface is a real Win32 control, and the last
+one to convert has been run, driven through all fifteen of its paths, and photographed. §5's live
+preview is confirmed working: typing `ERROR()` into a pattern recoloured the `ERROR` level words in
+the grid *behind* the dialog, which is the whole reason it is modeless.
 
 | Landed | Commit |
 |---|---|
 | The command palette **deleted**, and `Go to line…` given the dialog it had been standing in for | `92eccf8` |
 | §5's rules editor as a **modeless** dialog; the drawn overlay deleted | `afe8686` |
+| The dialog opened for the first time; two defects found and fixed; `verify-rules.ps1` | `3e29a92` |
+
+**What the first run found, and what it says about the last three sessions.** The conversion
+compiled, 817 tests passed, clippy and fmt were clean — and the caret went back to the start on
+every keystroke. Typing `ERROR` produced `(RORRE`, the word backwards, because each keystroke
+rewrote the control it had just been typed into. The comment beside the offending line said in so
+many words that the field being typed into must not be written back to. **A test suite cannot see a
+caret**, and this is the fourth conversion in a row where the only thing that found the defect was
+running it.
+
+The other was a regex complaint clipped to the half that says nothing: the parse error is four
+lines with a caret diagram, the fault line is one line high, so it read `exception: regex parse
+error:` and stopped. `one_line` folds it.
+
+**`tools/verify-rules.ps1` needs no foreground**, so it can run while the desktop is in use, and it
+is the model for any future dialog harness. `PrintWindow` with `PW_RENDERFULLCONTENT` renders
+standard controls wherever they sit in the z-order — a D3D swapchain cannot be captured that way,
+which is why `shot-window.ps1` has to pin the main window topmost, but a dialog can. Every gesture
+is a message to the control that would have received it.
+
+> **A trap that cost an hour, written into that harness's header too.** Driving a list view with
+> `LVM_SETITEMSTATE` from another process hands the target a pointer into the *sender's* address
+> space — `comctl32` does not marshal list-view messages — and the application dies with
+> `0xC000041D` inside `comctl32.dll`. It reads exactly like an application defect and it is not.
+> `WM_KEYDOWN` goes through the control's own input path. `main` gained `TAILHAWK_PANIC_LOG` while
+> chasing it: a panic inside a window procedure never reaches a console, because Windows kills the
+> process at the kernel callback boundary before the hook's output is flushed, so a file is the
+> only sink that survives — and an empty one is itself the answer.
 
 **The owner's decision, 2026-08-26.** They looked at the two surfaces Tailhawk still drew for
 itself and judged both inconsistent with the rest of the application. The palette was **deleted
@@ -25,27 +52,28 @@ removal record rather than a deleted section.
 preview: `rules_apply` recompiles the set and repaints the log on every keystroke. A modal would
 have covered the only thing worth previewing. `create_find_dialog` was the template.
 
-### ⏭ Do these first, in this order
+### ⏭ What is next, in the order it should be taken
 
-1. **Open the rules dialog and photograph it.** `Ctrl+H`, or **Rules ▸ Highlight rules…**. Check:
-   the list fills; selecting a row fills the four fields and the check boxes; typing in *Pattern*
-   recolours the grid behind and shows an error inline for a bad regex without the caret jumping;
-   Add/Remove/Move up/Move down; both colour buttons open `ChooseColorW` and write `#rrggbb`; Save
-   writes the personal tier; Close leaves the on-disk rules in force and says so if unsaved.
-   `tools/verify-dialogs.ps1` is the harness and needs no foreground — but it only proves a
-   `#32770` appeared, so the rest is eyes.
-2. **A live check that `Go to line…` works** — same harness; the case is already in its table.
-3. **`Ctrl+H` while the dialog is up should close it.** That path is written (`pending_rules` sees
-   a live `rules_dialog` and destroys it) and never run.
+1. **Delete the dead model API.** `Editor::begin_edit` / `commit_edit` / `preview_edit` /
+   `cancel_edit` / `field` in `tailhawk-core` had the drawn editor as their only caller. They were
+   held back so the dialog could be judged first; it has been, so they go — with their tests, which
+   test nothing that ships. `set_cell` is what a real control uses.
+2. **The two dogfooding findings below**, both real and neither started.
+3. **Three paths the harness still does not reach**, in falling order of worth: the two colour
+   buttons (they open `ChooseColorW`, which is modal, so the harness must dismiss it); **Save**
+   writing the personal tier and the reload that follows; and **Close** leaving the on-disk rules
+   in force with the status bar saying so when the set was unsaved. Everything else in the dialog
+   is covered by `verify-rules.ps1`.
+4. `verify-menus.ps1`'s pixel surface is occlusion-sensitive — retry each suspect once in a fresh
+   window. Written up in session 26's resume point below.
 
 ### Known-unfinished, deliberately
 
-- `Editor::begin_edit` / `commit_edit` / `preview_edit` / `cancel_edit` / `field` are now **dead
-  API** in the core: the drawn editor was their only caller. They are left in place rather than
-  removed in the same commit as the conversion, so the dialog can be judged before the model is
-  cut down. Delete them once it is verified — with their tests, which test nothing that ships.
 - The `Rules` menu still offers **Open rules file** and **Reload rules**, which now overlap the
-  dialog. Probably right to keep, but nobody has decided.
+  dialog. Probably right to keep — the file is still the thing a curated set is shared as — but
+  nobody has decided.
+- §5's `Apply to ▾`, the `identifier` role and `▉ auto-colour` are still unrepresented; the reasons
+  are in `ruleset.rs`'s module doc and unchanged by the conversion.
 
 ### Two findings from dogfooding, both real and neither started
 
