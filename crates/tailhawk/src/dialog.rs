@@ -16,7 +16,11 @@
 //! hand the finished template to Windows and copy control state in and out, deciding nothing.
 
 use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Controls::Dialogs::{
+    ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
+};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMHDR,
@@ -25,7 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetDlgItem,
     GetDlgItemInt, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SendMessageW,
     SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, DLGTEMPLATE, SW_SHOW,
-    WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NOTIFY,
+    WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY,
+    WM_NOTIFY,
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
@@ -90,6 +95,24 @@ const ID_I_USE: u16 = 163;
 
 const ID_G_LINE: u16 = 170;
 const ID_G_STATUS: u16 = 171;
+
+const ID_R_LIST: u16 = 180;
+const ID_R_ADD: u16 = 181;
+const ID_R_REMOVE: u16 = 182;
+const ID_R_UP: u16 = 183;
+const ID_R_DOWN: u16 = 184;
+const ID_R_NAME: u16 = 185;
+const ID_R_PATTERN: u16 = 186;
+const ID_R_FG: u16 = 187;
+const ID_R_BG: u16 = 188;
+const ID_R_FGPICK: u16 = 189;
+const ID_R_BGPICK: u16 = 190;
+const ID_R_ENABLED: u16 = 191;
+const ID_R_WHOLE: u16 = 192;
+const ID_R_CASE: u16 = 193;
+const ID_R_LITERAL: u16 = 194;
+const ID_R_ERROR: u16 = 195;
+const ID_R_SAVE: u16 = 196;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -540,6 +563,545 @@ pub fn go_to_status(target: GoTo, total: u64) -> String {
     }
 }
 
+/// The rules editor's grid, in dialog units.
+const R_LEFT: i16 = 7;
+const R_LIST_W: i16 = 300;
+const R_VERB_X: i16 = 313;
+const R_VERB_W: i16 = 100;
+const R_FIELD_X: i16 = 55;
+
+/// §5's rules editor as a **modeless** dialog, laid out purely so the template walk can check it
+/// without a window.
+///
+/// **Modeless, where Define Format and Import Layout are modal, and §5 is why.** That section asks
+/// for "inline, non-modal, live preview over the real file" — the surface that replaces
+/// LogExpert's "set up a dev environment and compile a DLL". A modal box covers the grid, and the
+/// grid *is* the preview: every keystroke in the pattern recompiles the set and repaints the log
+/// underneath. The Find dialog had already established the shape here, so this follows it rather
+/// than `show_format_dialog`.
+fn rules_dialog_items() -> Vec<Item> {
+    let label = |text: &str, y: i16, w: i16| {
+        Item::new(Class::Static, text, 0xFFFF, (R_LEFT, y + 2, w, 8), 0)
+    };
+    let verb = |text: &str, id: u16, row: i16| {
+        Item::new(
+            Class::Button,
+            text,
+            id,
+            (R_VERB_X, 7 + row * 17, R_VERB_W, 14),
+            WS_TABSTOP,
+        )
+    };
+    let field = |id: u16, y: i16, x: i16, w: i16| {
+        Item::new(
+            Class::Edit,
+            "",
+            id,
+            (x, y, w, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        )
+    };
+    let check = |text: &str, id: u16, x: i16, w: i16| {
+        Item::new(
+            Class::Button,
+            text,
+            id,
+            (x, 170, w, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        )
+    };
+    vec![
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_R_LIST,
+            (R_LEFT, 7, R_LIST_W, 100),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        verb("&Add", ID_R_ADD, 0),
+        verb("&Remove", ID_R_REMOVE, 1),
+        verb("Move &up", ID_R_UP, 2),
+        verb("Move &down", ID_R_DOWN, 3),
+        label("&Name:", 114, 44),
+        field(ID_R_NAME, 114, R_FIELD_X, 252),
+        label("&Pattern:", 130, 44),
+        field(ID_R_PATTERN, 130, R_FIELD_X, 252),
+        Item::new(
+            Class::Button,
+            "Te&xt…",
+            ID_R_FGPICK,
+            (R_LEFT, 147, 50, 14),
+            WS_TABSTOP,
+        ),
+        field(ID_R_FG, 149, 60, 55),
+        Item::new(
+            Class::Button,
+            "Bac&kground…",
+            ID_R_BGPICK,
+            (125, 147, 70, 14),
+            WS_TABSTOP,
+        ),
+        field(ID_R_BG, 149, 200, 55),
+        check("&Enabled", ID_R_ENABLED, R_LEFT, 60),
+        check("&Whole line", ID_R_WHOLE, 75, 70),
+        check("&Ignore case", ID_R_CASE, 150, 75),
+        check("&Literal", ID_R_LITERAL, 235, 60),
+        Item::new(Class::Static, "", ID_R_ERROR, (R_LEFT, 186, 400, 16), 0),
+        Item::new(
+            Class::Button,
+            "&Save",
+            ID_R_SAVE,
+            (R_VERB_X - 55, 208, 50, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "&Close",
+            IDCANCEL,
+            (R_VERB_X, 208, 50, 14),
+            WS_TABSTOP,
+        ),
+    ]
+}
+
+/// The rules dialog's own state: the window it previews over, and the custom colours the two
+/// pickers share for as long as it is up.
+struct RulesState {
+    owner: HWND,
+    custom: [COLORREF; 16],
+}
+
+thread_local! {
+    /// Suppresses the `EN_CHANGE` a programmatic `SetDlgItemTextW` fires, for the reason
+    /// `FORMAT_QUIET` does — an edit control cannot tell a typist from a caller, and refreshing
+    /// the fields on a selection change would otherwise write those fields straight back into the
+    /// model, marking a set dirty for having been looked at.
+    ///
+    /// A `thread_local` rather than a field of [`RulesState`] for the same reason as well: a
+    /// `&mut RulesState` and the pointer the reader takes out of `DWLP_USER` alias, and the
+    /// optimiser is entitled to drop a store it can prove nobody reads through that reference.
+    static RULES_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rules_quietly<R>(write: impl FnOnce() -> R) -> R {
+    RULES_QUIET.with(|q| q.set(true));
+    let out = write();
+    RULES_QUIET.with(|q| q.set(false));
+    out
+}
+
+fn rules_state(hdlg: HWND) -> Option<&'static mut RulesState> {
+    let at = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) };
+    (at != 0).then(|| unsafe { &mut *(at as *mut RulesState) })
+}
+
+/// §5's rules editor, created **modeless** so the grid it previews over stays on screen.
+///
+/// The editor itself lives on the shell, not in here: the dialog reads and writes it through
+/// [`crate::rules_read`] and [`crate::rules_apply`], and the second of those repaints the log
+/// under the box on every change. That is §5's "live preview over the real file", and it is the
+/// whole reason this is not a modal like its two siblings.
+pub fn create_rules_dialog(owner: HWND) -> HWND {
+    let icc = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_LISTVIEW_CLASSES,
+    };
+    unsafe {
+        let _ = InitCommonControlsEx(&icc);
+    }
+    let t = template("Highlight rules", 420, 232, &rules_dialog_items());
+    // Leaked deliberately: a modeless dialog outlives this call, and its proc reads this for as
+    // long as the window is up. `rules_proc` frees it on `WM_NCDESTROY`.
+    let state = Box::into_raw(Box::new(RulesState {
+        owner,
+        custom: [COLORREF(0x00FF_FFFF); 16],
+    }));
+    let created = unsafe {
+        CreateDialogIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            owner,
+            Some(rules_proc),
+            LPARAM(state as isize),
+        )
+    };
+    let Ok(hdlg) = created else {
+        drop(unsafe { Box::from_raw(state) });
+        return HWND::default();
+    };
+    unsafe {
+        let _ = ShowWindow(hdlg, SW_SHOW);
+    }
+    hdlg
+}
+
+/// Rebuilds the list from the live editor and points every field at `keep`.
+///
+/// **One refresh, called by every verb.** Define Format's comment makes the argument and it holds
+/// here: the alternative is a dialog where four of the six buttons update the screen and the fifth
+/// ships broken.
+/// One list row per rule: **On, Pattern, Kind, Colour, Problem**.
+///
+/// Pure, and separately, because three of the things it decides are requirements rather than
+/// presentation, and the drawn overlay it replaces had each of them under test:
+///
+/// - **A rule still being filled in shows its name rather than a blank line.** A new rule is added
+///   with an empty pattern and the caret in it; a row that rendered as nothing would look like the
+///   Add button had failed.
+/// - **A broken rule carries its error on its own row**, which is §5's "checked as you type, with
+///   the error shown inline — never on OK". The fault line under the list says it too, but only
+///   for the selected rule; a set with three bad patterns has to show three.
+/// - **Both colours, or one, or neither**, and a rule with neither is the one `Spec::compile`
+///   rejects — so the column being empty is the visible half of the error beside it.
+pub fn rules_row_cells(editor: &tailhawk_core::ruleset::Editor) -> Vec<[String; 5]> {
+    use tailhawk_core::rules::hex;
+    editor
+        .rows()
+        .iter()
+        .map(|row| {
+            let colour = match (row.fg, row.bg) {
+                (Some(fg), Some(bg)) => format!("{} on {}", hex(fg), hex(bg)),
+                (Some(fg), None) => hex(fg),
+                (None, Some(bg)) => format!("on {}", hex(bg)),
+                (None, None) => String::new(),
+            };
+            [
+                if row.enabled { "on" } else { "off" }.to_owned(),
+                if row.pattern.is_empty() {
+                    row.name.to_owned()
+                } else {
+                    row.pattern.to_owned()
+                },
+                if row.literal { "Ab" } else { ".*" }.to_owned(),
+                colour,
+                row.error.unwrap_or_default().to_owned(),
+            ]
+        })
+        .collect()
+}
+
+fn rules_refresh(hdlg: HWND, keep: Option<usize>) {
+    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_R_LIST)) }) else {
+        return;
+    };
+    let Some(rows) = crate::rules_read(rules_row_cells) else {
+        return;
+    };
+
+    lv_reset(list);
+    lv_column(list, 0, "On", 34);
+    lv_column(list, 1, "Pattern", 190);
+    lv_column(list, 2, "Kind", 40);
+    lv_column(list, 3, "Colour", 130);
+    lv_column(list, 4, "Problem", 200);
+    for (i, cells) in rows.iter().enumerate() {
+        lv_row(list, i as i32, cells);
+    }
+    if let Some(at) = keep.filter(|&a| a < rows.len()) {
+        lv_select(list, at);
+    }
+    rules_show_selected(hdlg);
+}
+
+/// Points the fields, the check boxes and the fault line at the selected rule, and greys them all
+/// when there is no rule to point at — §10's empty state, which a set with every rule removed
+/// reaches in one press of Remove.
+fn rules_show_selected(hdlg: HWND) {
+    let Some(shown) = crate::rules_read(|editor| {
+        let rows = editor.rows();
+        rows.get(editor.selected()).map(|row| {
+            (
+                row.name.to_owned(),
+                row.pattern.to_owned(),
+                row.fg.map(tailhawk_core::rules::hex).unwrap_or_default(),
+                row.bg.map(tailhawk_core::rules::hex).unwrap_or_default(),
+                row.enabled,
+                row.whole_line,
+                row.case_insensitive,
+                row.literal,
+                row.error.unwrap_or_default().to_owned(),
+            )
+        })
+    }) else {
+        return;
+    };
+
+    let has = shown.is_some();
+    for id in [
+        ID_R_NAME,
+        ID_R_PATTERN,
+        ID_R_FG,
+        ID_R_BG,
+        ID_R_FGPICK,
+        ID_R_BGPICK,
+        ID_R_ENABLED,
+        ID_R_WHOLE,
+        ID_R_CASE,
+        ID_R_LITERAL,
+        ID_R_REMOVE,
+        ID_R_UP,
+        ID_R_DOWN,
+    ] {
+        unsafe {
+            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), has);
+        }
+    }
+
+    let (name, pattern, fg, bg, enabled, whole, case, literal, error) = shown.unwrap_or_default();
+    rules_quietly(|| unsafe {
+        for (id, text) in [
+            (ID_R_NAME, name.as_str()),
+            (ID_R_PATTERN, pattern.as_str()),
+            (ID_R_FG, fg.as_str()),
+            (ID_R_BG, bg.as_str()),
+        ] {
+            let w = wsz(text);
+            let _ = SetDlgItemTextW(hdlg, i32::from(id), PCWSTR(w.as_ptr()));
+        }
+    });
+    for (id, on) in [
+        (ID_R_ENABLED, enabled),
+        (ID_R_WHOLE, whole),
+        (ID_R_CASE, case),
+        (ID_R_LITERAL, literal),
+    ] {
+        unsafe {
+            SendDlgItemMessageW(
+                hdlg,
+                i32::from(id),
+                BM_SETCHECK,
+                WPARAM(usize::from(on)),
+                LPARAM(0),
+            );
+        }
+    }
+    let w = wsz(&error);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_R_ERROR), PCWSTR(w.as_ptr()));
+    }
+}
+
+/// Opens the standard colour picker on the rule's current colour and writes what comes back.
+fn rules_pick_colour(hdlg: HWND, state: &mut RulesState, which: tailhawk_core::ruleset::Cell) {
+    let seeded = crate::rules_read(|editor| {
+        editor.rows().get(editor.selected()).and_then(|row| {
+            if which == tailhawk_core::ruleset::Cell::Fg {
+                row.fg
+            } else {
+                row.bg
+            }
+        })
+    })
+    .flatten();
+    let mut chosen = COLORREF(seeded.map_or(0x00FF_FFFF, colourref));
+    let mut cc = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: hdlg,
+        rgbResult: chosen,
+        lpCustColors: state.custom.as_mut_ptr(),
+        // The full picker rather than the swatch grid: §5's colours are arbitrary hex, and a
+        // sixteen-square palette cannot express one.
+        Flags: CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR,
+        ..Default::default()
+    };
+    if !unsafe { ChooseColorW(&mut cc) }.as_bool() {
+        return;
+    }
+    chosen = cc.rgbResult;
+    let hex = tailhawk_core::rules::hex(from_colourref(chosen.0));
+    crate::rules_apply(state.owner, |editor| editor.set_cell(which, &hex));
+    let at = crate::rules_read(|editor| editor.selected());
+    rules_refresh(hdlg, at);
+}
+
+/// A colour as `COLORREF` — `0x00bbggrr`, which is the reverse of the `#rrggbb` the rules file
+/// and every other surface here use.
+fn colourref(c: tailhawk_core::highlight::Colour) -> u32 {
+    let byte = |v: f32| u32::from((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    byte(c[0]) | (byte(c[1]) << 8) | (byte(c[2]) << 16)
+}
+
+fn from_colourref(v: u32) -> tailhawk_core::highlight::Colour {
+    let channel = |shift: u32| ((v >> shift) & 0xFF) as f32 / 255.0;
+    [channel(0), channel(8), channel(16), 1.0]
+}
+
+unsafe extern "system" fn rules_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    use tailhawk_core::ruleset::Cell;
+    match msg {
+        WM_INITDIALOG => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_R_LIST)) } {
+                unsafe {
+                    SendMessageW(
+                        list,
+                        LVM_SETEXTENDEDLISTVIEWSTYLE,
+                        WPARAM(0),
+                        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                    );
+                }
+            }
+            let at = crate::rules_read(|editor| editor.selected());
+            rules_refresh(hdlg, at.or(Some(0)));
+            1
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == usize::from(ID_R_LIST) && header.code == LVN_ITEMCHANGED {
+                if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_R_LIST)) } {
+                    if let Some(at) = lv_selected(list) {
+                        let Some(state) = rules_state(hdlg) else {
+                            return 0;
+                        };
+                        crate::rules_apply(state.owner, |editor| editor.select(at));
+                        rules_show_selected(hdlg);
+                    }
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = (wparam.0 >> 16) as u16;
+            let Some(state) = rules_state(hdlg) else {
+                return 0;
+            };
+            // A refresh writing the fields fires `EN_CHANGE` on each of them; without this the
+            // dialog would write what it had just read straight back into the model, and mark a
+            // set dirty for having been looked at.
+            if RULES_QUIET.with(|q| q.get()) {
+                return 0;
+            }
+            let owner = state.owner;
+            let selected = crate::rules_read(|editor| editor.selected());
+
+            match (id, u32::from(code)) {
+                (ID_R_NAME | ID_R_PATTERN | ID_R_FG | ID_R_BG, EN_CHANGE) => {
+                    let cell = match id {
+                        ID_R_NAME => Cell::Name,
+                        ID_R_PATTERN => Cell::Pattern,
+                        ID_R_FG => Cell::Fg,
+                        _ => Cell::Bg,
+                    };
+                    let text = read_dlg_text(hdlg, id);
+                    crate::rules_apply(owner, |editor| editor.set_cell(cell, &text));
+                    // The list and the fault line follow, but **the control being typed into is
+                    // not written back to** — a caret does not survive having its text replaced
+                    // from under it. `rules_refresh` writes every field, so only the list and the
+                    // error are refreshed here.
+                    rules_relist(hdlg, selected);
+                    rules_say_error(hdlg);
+                    1
+                }
+                (ID_R_ENABLED | ID_R_WHOLE | ID_R_CASE | ID_R_LITERAL, BN_CLICKED) => {
+                    crate::rules_apply(owner, |editor| match id {
+                        ID_R_ENABLED => editor.toggle_enabled(),
+                        ID_R_WHOLE => editor.toggle_whole_line(),
+                        ID_R_CASE => editor.toggle_case_insensitive(),
+                        _ => editor.toggle_literal(),
+                    });
+                    rules_refresh(hdlg, selected);
+                    1
+                }
+                (ID_R_ADD, BN_CLICKED) => {
+                    crate::rules_apply(owner, |editor| editor.add_rule());
+                    let at = crate::rules_read(|editor| editor.selected());
+                    rules_refresh(hdlg, at);
+                    unsafe {
+                        let _ =
+                            SetFocus(GetDlgItem(hdlg, i32::from(ID_R_PATTERN)).unwrap_or_default());
+                    }
+                    1
+                }
+                (ID_R_REMOVE, BN_CLICKED) => {
+                    crate::rules_apply(owner, |editor| editor.remove_rule());
+                    let at = crate::rules_read(|editor| editor.selected());
+                    rules_refresh(hdlg, at);
+                    1
+                }
+                (ID_R_UP | ID_R_DOWN, BN_CLICKED) => {
+                    let delta = if id == ID_R_UP { -1 } else { 1 };
+                    crate::rules_apply(owner, |editor| editor.move_row(delta));
+                    let at = crate::rules_read(|editor| editor.selected());
+                    rules_refresh(hdlg, at);
+                    1
+                }
+                (ID_R_FGPICK, BN_CLICKED) => {
+                    rules_pick_colour(hdlg, state, Cell::Fg);
+                    1
+                }
+                (ID_R_BGPICK, BN_CLICKED) => {
+                    rules_pick_colour(hdlg, state, Cell::Bg);
+                    1
+                }
+                (ID_R_SAVE, _) => {
+                    crate::rules_save(owner);
+                    rules_refresh(hdlg, selected);
+                    1
+                }
+                (IDCANCEL, _) => {
+                    unsafe {
+                        let _ = DestroyWindow(hdlg);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = DestroyWindow(hdlg);
+            }
+            1
+        }
+        WM_NCDESTROY => {
+            if let Some(state) = rules_state(hdlg) {
+                let owner = state.owner;
+                crate::rules_dialog_closed(hdlg, owner);
+                let raw = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) };
+                unsafe {
+                    SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), 0);
+                }
+                drop(unsafe { Box::from_raw(raw as *mut RulesState) });
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// Rewrites the list rows without touching the fields — what an `EN_CHANGE` wants, because the
+/// field it came from is being typed into.
+fn rules_relist(hdlg: HWND, keep: Option<usize>) {
+    let quiet = RULES_QUIET.with(|q| q.get());
+    RULES_QUIET.with(|q| q.set(true));
+    rules_refresh(hdlg, keep);
+    RULES_QUIET.with(|q| q.set(quiet));
+}
+
+/// Writes the selected rule's error, or clears the line.
+fn rules_say_error(hdlg: HWND) {
+    let error = crate::rules_read(|editor| {
+        editor
+            .rows()
+            .get(editor.selected())
+            .and_then(|row| row.error.map(str::to_owned))
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    let w = wsz(&error);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_R_ERROR), PCWSTR(w.as_ptr()));
+    }
+}
+
 /// What the Go to line dialog is asked and what it answers with.
 pub struct GoToChoice {
     /// The file's line count, for the label's range and the clamp.
@@ -873,6 +1435,14 @@ const ES_AUTOHSCROLL: u32 = 0x0080;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const EN_CHANGE: u32 = 0x0300;
+/// A button's click notification.
+///
+/// **Spelled out here because the absence of it was silent.** Written as a bare name in a `match`
+/// pattern, an identifier Rust cannot resolve to a constant becomes a fresh *binding* that matches
+/// anything — so `(ID_R_ADD, BN_CLICKED)` would have fired on every notification that control
+/// sends, not only a click. The compiler said so as "unused variable: `BN_CLICKED`", which is an
+/// easy warning to read past.
+const BN_CLICKED: u32 = 0;
 const CBN_SELCHANGE: u32 = 1;
 const EM_GETSEL: u32 = 0x00B0;
 
@@ -2902,7 +3472,10 @@ mod tests {
     fn no_two_controls_of_a_dialog_share_a_mnemonic() {
         for (name, items) in [
             ("Define Format", format_dialog_items()),
+            ("Import Layout", import_dialog_items()),
             ("Filter", filter_dialog_items()),
+            ("Highlight rules", rules_dialog_items()),
+            ("Go to line", goto_dialog_items(500)),
         ] {
             let mut seen = Vec::new();
             for item in &items {
@@ -3001,6 +3574,8 @@ mod tests {
             ("Define Format", format_dialog_items()),
             ("Import Layout", import_dialog_items()),
             ("Filter", filter_dialog_items()),
+            ("Highlight rules", rules_dialog_items()),
+            ("Go to line", goto_dialog_items(500)),
         ] {
             let t = template("x", 100, 100, &items);
             // Walk the template the way Windows does: header, then aligned items.

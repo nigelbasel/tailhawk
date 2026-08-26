@@ -249,7 +249,11 @@ pub fn colour(text: &str) -> Option<Colour> {
     }
 }
 
-pub(crate) fn hex(c: Colour) -> String {
+/// A colour in the `#rrggbb` form the rules file is written in and the rules editor shows.
+///
+/// The inverse of [`colour`], and public for the same reason that one is: the shell has to put a
+/// colour a user picked back in front of them as text they could have typed themselves.
+pub fn hex(c: Colour) -> String {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", byte(c[0]), byte(c[1]), byte(c[2]))
 }

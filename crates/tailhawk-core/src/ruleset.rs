@@ -278,6 +278,33 @@ impl Editor {
         self.revalidate(row);
     }
 
+    /// Writes `text` into `cell` of the selected row and revalidates that row.
+    ///
+    /// **This is the door a real control uses**, where [`begin_edit`](Self::begin_edit) and
+    /// [`commit_edit`](Self::commit_edit) are the drawn editor's: that surface had one
+    /// [`TextField`] standing in for whichever cell held the caret, so an edit had to be opened
+    /// on a cell and closed again. A dialog gives every cell a control of its own and the control
+    /// *is* the text, so there is nothing to open. §5's "checked as you type, with the error shown
+    /// inline — never on OK" then falls out for free: the row is revalidated by the keystroke that
+    /// wrote it.
+    ///
+    /// A colour cell that does not read as `#rrggbb` clears that colour rather than keeping a
+    /// stale one, exactly as committing one did.
+    pub fn set_cell(&mut self, cell: Cell, text: &str) {
+        let row = self.selected;
+        let Some(spec) = self.specs.get_mut(row) else {
+            return;
+        };
+        match cell {
+            Cell::Name => spec.name = text.to_owned(),
+            Cell::Pattern => spec.pattern = text.to_owned(),
+            Cell::Fg => spec.fg = rules::colour(text),
+            Cell::Bg => spec.bg = rules::colour(text),
+        }
+        self.dirty = true;
+        self.revalidate(row);
+    }
+
     /// Abandons the edit, leaving the row as it was — including its error, which
     /// [`preview_edit`](Self::preview_edit) may have set from text that is now discarded.
     pub fn cancel_edit(&mut self) {
@@ -593,6 +620,47 @@ mod tests {
         let mut e = Editor::new("test", specs);
         e.open();
         e
+    }
+
+    /// A cell written straight from a control, with no begin-and-commit around it.
+    ///
+    /// **Real edit controls made this the natural door.** [`Editor::begin_edit`] and
+    /// [`Editor::commit_edit`] exist because the drawn editor had one [`TextField`] standing in
+    /// for whichever cell held the caret; a dialog gives every cell a control of its own, and the
+    /// control *is* the text. §5's "checked as you type, never on OK" then costs nothing: the row
+    /// is revalidated on the keystroke that wrote it.
+    #[test]
+    fn a_cell_can_be_written_straight_from_a_control_and_revalidates_as_it_goes() {
+        let mut set = editor(vec![spec("first", "ERROR"), spec("second", "WARN")]);
+        set.select(1);
+
+        set.set_cell(Cell::Pattern, "(unclosed");
+        assert!(
+            set.rows()[1].error.is_some(),
+            "the row says why on the keystroke that broke it"
+        );
+        assert!(set.rows()[0].error.is_none(), "and its neighbour does not");
+        assert!(set.is_dirty());
+
+        set.set_cell(Cell::Pattern, "(closed)");
+        assert!(set.rows()[1].error.is_none(), "and again when it is fixed");
+        assert_eq!(set.specs()[1].pattern, "(closed)");
+
+        set.set_cell(Cell::Name, "renamed");
+        assert_eq!(set.specs()[1].name, "renamed");
+        assert_eq!(set.specs()[0].name, "first", "only the selected row moves");
+
+        set.set_cell(Cell::Bg, "#3a1e1e");
+        assert_eq!(
+            set.specs()[1].bg,
+            Some([0.227_450_98, 0.117_647_06, 0.117_647_06, 1.0])
+        );
+        set.set_cell(Cell::Bg, "");
+        assert_eq!(
+            set.specs()[1].bg,
+            None,
+            "a colour that does not read as #rrggbb clears it, as committing one did"
+        );
     }
 
     #[test]
