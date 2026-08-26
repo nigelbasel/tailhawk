@@ -1,6 +1,65 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-25, session 25: the drawn chrome is gone, and the owner is dogfooding
+## ▶ Resume point — 2026-08-26, session 26: the repository has a front page, and the harnesses work again
+
+**Where master stands.** Everything below is committed, pushed and green. The session picked up a
+machine shutdown that had cut session 25 off at a clean point — nothing was lost — and then took
+the top three items off its list.
+
+| Landed this session | Commit |
+|---|---|
+| The discarded command-bar mockups deleted, and two dangling paths with them | `37b3851` |
+| **`README.md`** — the front page a public repository had been missing | `79dc8fe` |
+| **The three dead harnesses**, driving the real menu; a mnemonic clash found and fixed | `6ae6f96` |
+| **`USING.md` re-walked** against the running application | *this commit* |
+
+**What the harness rework actually bought.** `verify-dialogs`, `verify-menus` and `verify-recent`
+had all been failing with *"menu drew no entries"* since the bar became a native `HMENU` — three
+red scripts in the tree pretending to be coverage. Two shared modules replace the machinery they
+lost. `tools/Menu.ps1` reads the real `HMENU`, which is a **better** source than the deleted rect
+dump: it reports what Windows holds rather than what Tailhawk believed it drew, so the pure
+`menu_bar()` tree and the menu on screen can be compared at last. `tools/Dialog.ps1` finds dialogs
+**scoped to a process id** — the trap `verify-find` hit once, when it reported another
+application's Find dialog and failed honestly while testing nothing.
+
+The first live reading found a defect the unit tests could not reach: `&Close Tab` and `&Clear
+recent files` both claimed `C`. The mnemonic test only ever built `menu_bar(None, false, &[])` — a
+File menu with **no recent files**, which is not the menu any user sees, because the recents are
+items of that menu rather than a submenu. It builds both shapes now.
+
+**Three things to know before touching these scripts.**
+
+1. **`verify-dialogs` needs no foreground; the other two do.** Choosing a menu item *is* a
+   `WM_COMMAND` carrying that item's id, and `Send-MenuCommand` reads the id off the live menu and
+   **posts** it — so the message is the one the menu itself would send, and nothing steals the
+   desktop. It must be posted, never sent: a command that raises a modal dialog does not return
+   until that dialog closes, and a blocking `SendMessage` deadlocks on it. `verify-menus` launches
+   the application about forty times and forces each window to the front, so **ask the owner before
+   running it** — this was got wrong on the 26th and cost them several minutes of their machine.
+2. **A popup's items are stale until `WM_INITMENUPOPUP`.** Tailhawk builds the bar once and refills
+   each popup when it opens, so a menu read cold from a running window describes the moment that
+   window was created — the first smoke run reported `Close Tab`, `Copy` and `Find…` greyed with a
+   large file open. `Read-MenuBar` sends that message itself, which is what makes a live reading
+   possible without touching the keyboard.
+3. **`verify-menus`' pixel surface is occlusion-sensitive.** The client area is captured off the
+   screen, so a window something overlaps for the moment of the capture reads as unchanged. That
+   only bites commands whose whole effect is *drawn* — the command palette and the rules editor —
+   and two consecutive runs disagreed about exactly those and nothing else. Retrying each suspect
+   once in a fresh window would settle it, and has not been written.
+
+**One finding left for the owner.** The sweep's residue is three items, and two of them look like a
+real if minor defect: **`View ▸ Back` and `View ▸ Forward` are enabled on a fresh window that has no
+history to move through.** They are gated on a document being open rather than on the history
+holding anything. (The third, `Follow tail`, is honest — a fresh window already follows.)
+
+Two PowerShell traps cost a run each and are worth knowing: a function parameter named `$Pid`
+silently shadows the automatic variable, so every lookup searched the host's own process; and
+Tailhawk is single-instance, so a launch while a killed instance is still dying hands the file over
+and exits without a window — wait for the process count to reach zero, never sleep.
+
+---
+
+## Resume point — 2026-08-25, session 25: the drawn chrome is gone, and the owner is dogfooding
 
 **Where master stands.** Everything below is committed and pushed. The session resumed a
 predecessor that a Nimbalyst crash had cut off mid-flight — its step-3 work was intact in the tree
@@ -62,19 +121,14 @@ been reasoned out, and two of them had passing tests either side.
    gates, the seven documents and `CLEANROOM.md`, and states plainly that there is no release.
    It corrects one thing on the way: an ARM64 claim has to say *best-effort*, because §2.1 says
    x64 is the only shipped and supported architecture.
-2. **`USING.md` is stale, and the README now advertises it.** It was written against the drawn
-   chrome and still describes what the last two sessions deleted: `Ctrl+L` adding a chip inline,
-   chips that drag to reorder and take a `Ctrl+click` to edit, a find *field*. The panel is
-   standard controls with Add/Edit/Remove buttons, `Ctrl+L` opens the Filter dialog, and Find is
-   a modeless `#32770`. On a private repo this was an internal note; on a public one, linked from
-   the front page as *the* user guide, it is a document that lies. Re-walk it against the running
-   app — the keys table and the Filters section are the two that have moved.
-3. **The stale harnesses.** `verify-dialogs.ps1`, `verify-menus.ps1` and `verify-recent.ps1` all
-   drive the deleted drawn bar through `TAILHAWK_DUMP_MENU_HITS` and fail with *"menu drew no
-   entries"*. They test nothing today. Rework them to drive the native menus, or retire them —
-   but do not leave three red harnesses in the tree pretending to be coverage. There is no
-   `verify-format.ps1` either, and both new dialogs deserve one: the capture scripts written this
-   session (in the session scratchpad) are most of it already.
+2. ~~**`USING.md` is stale.**~~ **Done** — re-walked against the source rather than from memory,
+   which found more than the drawn chrome: `tail`'s flags are accepted and *ignored* rather than
+   honoured, the tee is called *Keep saving* in the product and the word "tee" is deliberately not
+   used, `Ctrl+H` and the rules editor were never documented at all, and the format name moved from
+   a right-edge chip to the status bar and the `Format ▸ Log format` submenu.
+3. ~~**The stale harnesses.**~~ **Done** — see the top of this file. `verify-dialogs` now covers
+   eight dialogs including Define Format and Import Layout, which is the `verify-format.ps1` that
+   was wanted, without a fourth script.
 4. **Still outstanding from earlier stretches:** filter-panel visibility is not persisted
    (§12.4 says remembered), and the status bar has no `n filters · k of m` chip.
 5. **The remaining drawn overlays**, now that the wizard has gone: §5's `RulesOverlay` and the
