@@ -1,6 +1,38 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-27, session 28 (paused): the queue is empty and everything is green
+## ▶ Resume point — 2026-08-27, session 28: the sweep proved itself and found one more
+
+**The full menu sweep ran on a quiet desktop and did its job twice over.** The retry branch fired
+and is proven — `Follow tail` reported *"nothing observable changed, in two windows"*. And chasing
+that one suspect found a real defect that was **not** the one it looked like.
+
+`Follow tail` was innocent: the menu tick goes `False → True`, so it resumes properly. **The status
+bar's follow indicator was stale.** `Shell::navigate` moved the view and asked for a frame without
+ever asking for a title, so every arrow, page, `Home`, `End` and scrollbar drag changed whether the
+view was following and left the bar saying whatever it last said — and a title built as the
+document *landed* was built before the grid knew its row count, so `is_following` answered false
+and a freshly opened file claimed `‖ paused` with its last line on screen. A growing file hid both,
+because the follow poll retitles anyway; a static file showed the wrong word indefinitely.
+
+The menu's tick never had either bug, because `WM_INITMENUPOPUP` rebuilds it from the live
+document. So the tick and the status bar contradicted each other on the same frame — and that
+contradiction is exactly what the sweep is for. Fixed in `db700c3` with one comparison a frame, in
+`paint`, which is the one place that sees every path that moves the view.
+
+> **`verify-menus.ps1` now refuses a desktop that is in use** (`c7f9fa5`). A busy desktop does not
+> make it slow, it makes it *lie*: the app never gets the foreground, every capture is of whatever
+> is on top, and calibration measures the desktop's churn instead of the window's. It measured
+> 539,409 idle "churning" pixels that way and set a tolerance of 2,157,636 — more than half the
+> client area would have had to change before the pixel surface noticed anything — then died a few
+> items later. The wrong answer was the dangerous half.
+>
+> **`Follow tail` will still be reported as a suspect, and that is correct.** A fresh window is
+> already following, so choosing it changes nothing. It is now demonstrably honest rather than
+> merely assumed to be, because the title and the tick agree.
+
+---
+
+## Resume point — 2026-08-27, session 28 (paused): the queue is empty and everything is green
 
 **Stopped at a clean point at the owner's request.** Master is `082d56d`, the tree is clean,
 everything is pushed, and every local gate passes: **815 tests**, clippy with `-D warnings`, and
