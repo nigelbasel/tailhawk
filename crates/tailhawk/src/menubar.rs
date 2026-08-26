@@ -324,7 +324,7 @@ pub fn menu_bar(
                 Item::command(&recent_label(n, path), "", ID_RECENT_BASE + n as u32)
             }),
         );
-        file_items.push(Item::command("&Clear recent files", "", ID_CLEAR_RECENT));
+        file_items.push(Item::command("Clear &recent files", "", ID_CLEAR_RECENT));
         file_items.push(Item::separator());
     }
     file_items.push(Item::command("E&xit", "Alt+F4", ID_EXIT));
@@ -666,36 +666,48 @@ mod tests {
     /// second item becomes unreachable by the very key drawn underlined beneath it. Nine items were
     /// added to menus that already had mnemonics to satisfy §1.2's discoverability rule, and this
     /// is what stops that fix quietly breaking §1.2's usability one.
+    ///
+    /// **Both shapes of the File menu are checked, and the second is why this reads as it does.**
+    /// The recent files are items of that menu rather than a submenu, so a menu built with no
+    /// history is a *different menu* from the one a user of the application ever sees — and for a
+    /// month this test only ever built the empty one. `tools/Menu.ps1`, reading the real `HMENU`
+    /// out of the running window, found the collision the empty menu cannot contain: `&Clear
+    /// recent files` claimed the `C` that `&Close Tab` already had.
     #[test]
     fn no_two_items_in_one_menu_share_a_mnemonic() {
-        let menu = menu_bar(None, false, &[]);
+        let recent: Vec<String> = (1..=10).map(|n| format!("C:\\logs\\app{n}.log")).collect();
         let mut clashes: Vec<String> = Vec::new();
 
-        let heads: Vec<Option<char>> = menu.items().iter().map(|i| i.mnemonic()).collect();
-        for (a, letter) in heads.iter().enumerate() {
-            for (b, other) in heads.iter().enumerate().skip(a + 1) {
-                if letter.is_some() && letter == other {
-                    clashes.push(format!("the bar: {a} and {b} both claim {letter:?}"));
+        for (shape, menu) in [
+            ("no recent files", menu_bar(None, false, &[])),
+            ("with recent files", menu_bar(None, false, &recent)),
+        ] {
+            let heads: Vec<Option<char>> = menu.items().iter().map(|i| i.mnemonic()).collect();
+            for (a, letter) in heads.iter().enumerate() {
+                for (b, other) in heads.iter().enumerate().skip(a + 1) {
+                    if letter.is_some() && letter == other {
+                        clashes.push(format!("{shape}, the bar: {a} and {b} claim {letter:?}"));
+                    }
                 }
             }
-        }
 
-        for (top, head) in menu.items().iter().enumerate() {
-            let Some(items) = menu.at(&[top]) else {
-                continue;
-            };
-            let letters: Vec<(String, Option<char>)> = items
-                .iter()
-                .map(|i| (i.text(), i.mnemonic()))
-                .filter(|(_, m)| m.is_some())
-                .collect();
-            for (a, (name, letter)) in letters.iter().enumerate() {
-                for (other, mark) in letters.iter().skip(a + 1) {
-                    if letter == mark {
-                        clashes.push(format!(
-                            "{}: {name:?} and {other:?} both claim {letter:?}",
-                            head.text()
-                        ));
+            for (top, head) in menu.items().iter().enumerate() {
+                let Some(items) = menu.at(&[top]) else {
+                    continue;
+                };
+                let letters: Vec<(String, Option<char>)> = items
+                    .iter()
+                    .map(|i| (i.text(), i.mnemonic()))
+                    .filter(|(_, m)| m.is_some())
+                    .collect();
+                for (a, (name, letter)) in letters.iter().enumerate() {
+                    for (other, mark) in letters.iter().skip(a + 1) {
+                        if letter == mark {
+                            clashes.push(format!(
+                                "{shape}, {}: {name:?} and {other:?} both claim {letter:?}",
+                                head.text()
+                            ));
+                        }
                     }
                 }
             }
