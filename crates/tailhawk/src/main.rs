@@ -2755,6 +2755,40 @@ impl Finder {
 /// §6.5's config scan (E11) rides along: templates found in `appsettings*.json`, `nlog.config`
 /// or `log4net.config` beside `path` are compiled and scored with the catalogue. A path of `None`
 /// — a pipe — has nothing beside it.
+/// The status bar's parts, joined, in the order a reader wants them.
+///
+/// **A notice is shown *beside* the document, not instead of it, and that is the whole point of
+/// this function existing.** The description and the notice used to share one field, `Shell::file`,
+/// which `status_text` read only when there was no document to describe — so every message written
+/// there while a file was open could never be seen. Six of them: "rules closed unsaved" (§10's
+/// requirement that discarding an unsaved set *say* so), "rules not saved: …" when the profile is
+/// read-only, "no line to define a format from", "format wizard closed — nothing saved", "name the
+/// format first", and a split that failed. Each was set, each overwrote nothing, and each was
+/// discarded on the next repaint without ever reaching a pixel.
+///
+/// `file` keeps the job it is genuinely carrying: what to say when a document failed to open and
+/// there is therefore nothing to describe.
+fn status_line(
+    driver: Option<&str>,
+    described: Option<&str>,
+    file: Option<&str>,
+    notice: Option<&str>,
+    rules: Option<&str>,
+) -> String {
+    let mut text = String::new();
+    for part in [driver, described.or(file), notice, rules]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+    {
+        if !text.is_empty() {
+            text.push_str(" — ");
+        }
+        text.push_str(part);
+    }
+    text
+}
+
 fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Option<Layout>) {
     let lines = match set.snapshot().last() {
         Some(newest) => detect::head_lines(&*newest.file, newest.charset),
@@ -3809,6 +3843,9 @@ struct Shell {
     /// §5's rules editor, modeless for the same reasons and routed the same way — and for one
     /// more: the grid behind it is the live preview, so it must stay visible and repainting.
     rules_dialog: HWND,
+    /// What just happened, as against what the document *is* — see [`status_line`]. Shown beside
+    /// the description rather than instead of it, and replaced by the next notice.
+    notice: Option<String>,
     /// What the Find dialog last held, in the form the user typed — the escaped form the engine
     /// runs is not something to hand back to a person. Seeds the dialog when it reopens.
     last_find: dialog::FindSeed,
@@ -4114,34 +4151,22 @@ impl Shell {
 
     /// The status: the driver, the document's description, the frame instrument. **In the title,
     /// where a measurement rig can read it, and in the status bar, where a user does.**
+    ///
+    /// The parts and their order are [`status_line`]'s, which is where they are tested.
     fn status_text(&self) -> String {
-        let mut text = String::new();
         let rules_note = if self.rules_failed.is_empty() {
             None
         } else {
             Some(format!("⚠ rules: {}", self.rules_failed.join("; ")))
         };
-        // **Described afresh, not read from `self.file`.** That field is a string built once when a
-        // document lands — before its grid has been told how many rows it has — and nothing rebuilt
-        // it afterwards. So `Grid::is_following` was consulted while `total_rows` was still zero, the
-        // bar said `‖ paused` with the last line of the file on screen, and `Follow tail` and
-        // `Ctrl+End` both looked dead because the view was already at the bottom and had nothing to
-        // move: no move, no repaint, no new title. `self.file` remains the answer when a document
-        // failed to open, which is the case it is genuinely carrying.
         let described = self.document.as_ref().map(|doc| doc.describe());
-        for part in [
+        let mut text = status_line(
             self.driver.as_deref(),
-            described.as_deref().or(self.file.as_deref()),
+            described.as_deref(),
+            self.file.as_deref(),
+            self.notice.as_deref(),
             rules_note.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !text.is_empty() {
-                text.push_str(" — ");
-            }
-            text.push_str(part);
-        }
+        );
         // **The frame instrument, where a user and a measurement rig can both see it.** M4 asks for
         // "without dropped frames" and nothing in the product could say whether that held; the
         // throughput rig could only measure how long the window took to answer a message, which
@@ -4638,7 +4663,7 @@ impl Shell {
                     self.rebuild_highlighter(&mut doc);
                     self.document.split(doc);
                 }
-                Err(e) => self.file = Some(format!("split: {e}")),
+                Err(e) => self.notice = Some(format!("split: {e}")),
             }
         }
         self.retitle(hwnd);
@@ -5089,7 +5114,7 @@ impl Shell {
     /// costs the user their work, so the status bar says it happened.
     fn close_rules_editor(&mut self) {
         if self.rules_editor.is_dirty() {
-            self.file = Some("rules closed unsaved — Ctrl+H, Ctrl+S to save".to_owned());
+            self.notice = Some("rules closed unsaved — Ctrl+H, Ctrl+S to save".to_owned());
         }
         self.rules_editor.close();
         let specs = self.rule_specs.clone();
@@ -5112,7 +5137,7 @@ impl Shell {
         // §10: a read-only profile is a state, not an impossibility. Say so rather than let the
         // title go on claiming the set is unsaved with no reason given.
         if let Err(e) = std::fs::write(&target, self.rules_editor.to_toml()) {
-            self.file = Some(format!("rules not saved: {e}"));
+            self.notice = Some(format!("rules not saved: {e}"));
             return;
         }
         self.rules_editor.mark_saved();
@@ -5155,7 +5180,7 @@ impl Shell {
         let lines = doc.wizard_sample();
         // §10: a command that appears to do nothing is worse than one that says why it did not.
         let Some((example, rest)) = lines.split_first() else {
-            self.file = Some("no line to define a format from".to_owned());
+            self.notice = Some("no line to define a format from".to_owned());
             return;
         };
         let mut wizard = tailhawk_core::wizard::Wizard::from_example(example);
@@ -5204,7 +5229,7 @@ impl Shell {
     /// §6.2's Cancel means the document is left exactly as it was found.
     fn close_wizard(&mut self) {
         if self.wizard.take().is_some() {
-            self.file = Some("format wizard closed — nothing saved".to_owned());
+            self.notice = Some("format wizard closed — nothing saved".to_owned());
         }
         self.wizard_found.clear();
     }
@@ -5222,7 +5247,7 @@ impl Shell {
         // again — so the next save appends another rather than replacing it. §6.2 calls the
         // control "Save as…"; asking for the name is what that means.
         if wizard.name.trim().is_empty() {
-            self.file = Some("name the format first — Tab, then type".to_owned());
+            self.notice = Some("name the format first — Tab, then type".to_owned());
             return;
         }
         let format = match wizard.compile() {
@@ -7544,7 +7569,13 @@ pub fn rules_dialog_closed(hdlg: HWND, owner: HWND) {
             if shell.rules_dialog == hdlg {
                 shell.rules_dialog = HWND::default();
                 shell.close_rules_editor();
-                shell.retitle(owner);
+                // **`refresh_title`, not `retitle`.** `retitle` recomputes `self.file` from the
+                // document before it draws — deliberately, so a stale fragment cannot survive onto
+                // a window it no longer describes — and that recomputation throws away the message
+                // `close_rules_editor` has just put there. §10 asks for an unsaved set thrown away
+                // to *say* so; calling `retitle` here said it into a variable and overwrote it in
+                // the same breath.
+                shell.refresh_title(owner);
             }
         }
     });
@@ -9199,6 +9230,7 @@ fn main() -> Result<()> {
             pending_rules: false,
             find_dialog: HWND::default(),
             rules_dialog: HWND::default(),
+            notice: None,
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
             theme_name: asked.clone(),
@@ -10165,6 +10197,47 @@ mod tests {
         open.lay_out((8.0, 10.0), (800, 200));
         open.apply_state(&left_open);
         assert!(open.show_filters, "a panel left open comes back open");
+    }
+
+    /// A notice is shown beside the document's description, not instead of it.
+    ///
+    /// **This is the bug the rules harness found.** `Shell::file` carried two different things —
+    /// what the document is, and what just happened — and `status_text` read it only when there
+    /// was no document. So `close_rules_editor`'s "rules closed unsaved" was written into a field
+    /// nothing would read while a file was open, which is the only time it can be written. §10
+    /// asks for an unsaved set thrown away to say so; it said so into a variable.
+    #[test]
+    fn a_notice_is_shown_beside_the_document_rather_than_instead_of_it() {
+        let line = status_line(
+            Some("hardware"),
+            Some("app.log: UTF-8 — 1 file"),
+            None,
+            Some("rules closed unsaved — Ctrl+H, Ctrl+S to save"),
+            None,
+        );
+        assert!(
+            line.contains("app.log") && line.contains("rules closed unsaved"),
+            "both, not one: {line}"
+        );
+        assert!(
+            line.find("app.log") < line.find("rules closed unsaved"),
+            "the document first, then what just happened: {line}"
+        );
+
+        // `file` still answers for a document that failed to open, which is the job it keeps.
+        let failed = status_line(None, None, Some("read failed"), None, None);
+        assert_eq!(failed, "read failed");
+
+        // And a description always wins over `file` when there is one — the reason `status_text`
+        // describes afresh rather than trusting a string built when the document landed.
+        let both = status_line(None, Some("described now"), Some("stale"), None, None);
+        assert_eq!(both, "described now");
+
+        assert_eq!(status_line(None, None, None, None, None), "");
+        assert_eq!(
+            status_line(None, Some("a"), None, Some("b"), Some("⚠ rules: c")),
+            "a — b — ⚠ rules: c"
+        );
     }
 
     /// A menu item that could not do anything is greyed, not offered.

@@ -59,6 +59,12 @@ public static class Rules {
     public static void Press(IntPtr dlg, int id) {
         SendMessageW(dlg, 0x0111, (IntPtr)id, GetDlgItem(dlg, id));
     }
+    // For a button that raises something modal. `ChooseColorW` pumps its own message loop, so a
+    // sent WM_COMMAND would not return until that loop ended — and the caller is what ends it.
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+    public static void Post(IntPtr dlg, int id) {
+        PostMessageW(dlg, 0x0111, (IntPtr)id, GetDlgItem(dlg, id));
+    }
     public static Bitmap Shoot(IntPtr hwnd) {
         RECT r; GetWindowRect(hwnd, out r);
         Bitmap bmp = new Bitmap(r.R - r.L, r.B - r.T);
@@ -73,7 +79,7 @@ public static class Rules {
 
 # `dialog.rs`'s control ids.
 $ID = @{ LIST = 180; ADD = 181; REMOVE = 182; UP = 183; DOWN = 184; NAME = 185; PATTERN = 186
-         FG = 187; BG = 188; ENABLED = 191; ERROR = 195; SAVE = 196 }
+         FG = 187; BG = 188; FGPICK = 189; BGPICK = 190; ENABLED = 191; ERROR = 195; SAVE = 196 }
 $VK_UP = 0x26
 $VK_DOWN = 0x28
 
@@ -97,6 +103,31 @@ function Check([string]$what, [bool]$ok, [string]$saw) {
 
 Get-Process tailhawk -ErrorAction SilentlyContinue | Stop-Process -Force
 $null = Wait-For { (Get-Process tailhawk -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0 } 'the previous instance to exit' 15
+
+# **`Save` writes the personal tier, so the personal tier is moved somewhere disposable.**
+# `%APPDATA%\Tailhawk\tailhawk.rules.toml` is the owner's own rule set — the one they curate and
+# actually use — and a harness that presses Save would overwrite it. The application resolves that
+# tier through `std::env::var_os("APPDATA")`, so pointing the *child process* at a scratch
+# directory redirects it completely, with nothing to back up and nothing to restore if this script
+# dies half way.
+$sandbox = Join-Path ([System.IO.Path]::GetTempPath()) 'tailhawk-verify-rules-appdata'
+$personal = Join-Path $sandbox 'Tailhawk\tailhawk.rules.toml'
+if (Test-Path $sandbox) { Remove-Item $sandbox -Recurse -Force }
+$null = New-Item -ItemType Directory -Force -Path (Split-Path $personal)
+@'
+[[rule]]
+name = "seeded"
+pattern = "\\bERROR\\b"
+fg = "#ff7a6b"
+
+[[rule]]
+name = "second"
+pattern = "WARN"
+bg = "#3b2e0f"
+literal = true
+enabled = false
+'@ | ForEach-Object { [System.IO.File]::WriteAllText($personal, $_, [System.Text.UTF8Encoding]::new($false)) }
+$env:APPDATA = $sandbox
 
 # Not `Start-Tailhawk`: that waits for the foreground, which is exactly what this avoids.
 $proc = Start-Process (Get-TailhawkExe) -ArgumentList $Log -PassThru
@@ -161,6 +192,75 @@ try {
     Start-Sleep -Milliseconds 400
     Check 'Remove drops it and selects a neighbour' `
         ((Field $dlg $ID.NAME).Length -gt 0) (Field $dlg $ID.NAME)
+
+    # --- the colour picker, and the byte order underneath it ---
+    #
+    # **Posted, not sent.** `ChooseColorW` pumps its own modal loop, so a `SendMessage` that
+    # started it would not return until it closed — and this script is what closes it.
+    #
+    # Pressing OK without touching anything returns the colour the dialog was *seeded* with, which
+    # is the assertion worth having: `COLORREF` is `0x00bbggrr` and `#rrggbb` is the other way
+    # round, so a round trip that came back with red and blue swapped would be invisible in a
+    # screenshot of the swatch but obvious here.
+    $before = Field $dlg $ID.FG
+    [Rules]::Post($dlg, $ID.FGPICK)
+    # The picker's caption is Windows', not ours, so it is found by *being a second dialog of this
+    # process* rather than by a title this script would have to guess — and guessing wrong would
+    # report a missing dialog that is plainly on screen.
+    $picker = [IntPtr]::Zero
+    try {
+        $null = Wait-For {
+            $script:picker = @([Dlg]::Windows($proc.Id) | Where-Object { $_ -like '#32770|*' -and $_ -notlike '*Highlight rules' })
+            $script:picker.Count -gt 0
+        } 'the colour picker' 8
+    } catch { }
+    $raised = @([Dlg]::Windows($proc.Id) | Where-Object { $_ -like '#32770|*' -and $_ -notlike '*Highlight rules' })
+    $picker = if ($raised) { Get-Dialog $proc.Id ($raised[0] -replace '^#32770\|', '') } else { [IntPtr]::Zero }
+    Check 'Text... opens the standard colour picker' ($picker -ne [IntPtr]::Zero) `
+        "this process's dialogs: $([Dlg]::Windows($proc.Id) -join ' / ')"
+    if ($picker -ne [IntPtr]::Zero) {
+        [void][Rules]::SendMessageW($picker, 0x0111, [IntPtr]1, [IntPtr]0)   # IDOK
+        Start-Sleep -Milliseconds 600
+        Check 'and OK on the seeded colour returns it unchanged' `
+            ((Field $dlg $ID.FG) -eq $before) "was '$before', now '$(Field $dlg $ID.FG)'"
+    }
+
+    # --- Save writes the personal tier ---
+    $marker = "verified-$([System.Guid]::NewGuid().ToString('N').Substring(0, 8))"
+    [void][Rules]::SendMessageW([Rules]::GetDlgItem($dlg, $ID.NAME), 0x00B1, [IntPtr]0, [IntPtr](-1))
+    [Rules]::Type([Rules]::GetDlgItem($dlg, $ID.NAME), $marker)
+    Start-Sleep -Milliseconds 400
+    [Rules]::Press($dlg, $ID.SAVE)
+    Start-Sleep -Milliseconds 900
+    $written = if (Test-Path $personal) { Get-Content $personal -Raw } else { '' }
+    Check 'Save writes the personal tier' ($written -match [regex]::Escape($marker)) `
+        "the file does not carry the name that was typed"
+
+    # --- Close leaves the on-disk rules in force, and says so when the set was unsaved ---
+    [void][Rules]::SendMessageW([Rules]::GetDlgItem($dlg, $ID.PATTERN), 0x00B1, [IntPtr]0, [IntPtr](-1))
+    [Rules]::Type([Rules]::GetDlgItem($dlg, $ID.PATTERN), 'THROWN-AWAY')
+    Start-Sleep -Milliseconds 400
+    Check 'the edit to be discarded reached the dialog' `
+        ((Field $dlg $ID.PATTERN) -eq 'THROWN-AWAY') (Field $dlg $ID.PATTERN)
+    [Rules]::Press($dlg, 2)   # IDCANCEL — the Close button
+    Start-Sleep -Milliseconds 250
+    $proc.Refresh()
+    $justAfter = $proc.MainWindowTitle
+    Start-Sleep -Milliseconds 900
+    $proc.Refresh()
+    if ($justAfter -match 'unsaved' -and $proc.MainWindowTitle -notmatch 'unsaved') {
+        Write-Host "  NOTE the message appeared and was then overwritten within a second"
+    }
+    Check 'Close says so when the set was left unsaved' `
+        ($proc.MainWindowTitle -match 'unsaved') $proc.MainWindowTitle
+    $after = if (Test-Path $personal) { Get-Content $personal -Raw } else { '' }
+    Check 'and does not write the changes it threw away' `
+        (-not ($after -match 'THROWN-AWAY')) 'the discarded edit reached the file'
+
+    # Re-open for the last check, since Close took it down.
+    Send-MenuCommand $main (Find-MenuItem (Read-MenuBar $main) 'Rules' 'Highlight rules')
+    $dlg = Wait-Dialog $proc.Id 'Highlight rules' 10
+    Start-Sleep -Milliseconds 500
 
     if ($Shots) {
         $bmp = [Rules]::Shoot($dlg)

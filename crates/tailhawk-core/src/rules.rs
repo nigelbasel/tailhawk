@@ -94,6 +94,13 @@ pub fn parse(text: &str) -> Vec<Spec> {
             out.push(spec);
         }
     };
+    // **The mark, before anything else.** `str::trim` does not remove `U+FEFF` — it stopped being
+    // White_Space in Unicode 4.0 — so without this the first `[[rule]]` of a file saved by
+    // Notepad, by VS Code, or by PowerShell's `Set-Content -Encoding utf8` arrives as
+    // `\u{feff}[[rule]]`, matches nothing, and takes the rule under it with it. The set still
+    // loads and still applies; it is simply missing its first colour, which is exactly the kind of
+    // quiet wrong answer §1.1 forbids.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -324,6 +331,34 @@ pub(crate) fn unquote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte-order mark does not cost the file its first rule.
+    ///
+    /// **This is a file the user is invited to edit by hand**, and every ordinary way of doing that
+    /// on Windows writes a BOM: Notepad, VS Code's default for a new file, and PowerShell's
+    /// `Set-Content -Encoding utf8`. `str::trim` does not remove `U+FEFF` — it has not been
+    /// White_Space since Unicode 4.0 — so the first `[[rule]]` arrived as `\u{feff}[[rule]]`,
+    /// matched nothing, and the rule under it was silently dropped. Silently is the problem: the
+    /// set still loads, still applies, and is simply missing its first colour.
+    ///
+    /// [`crate::ruleset::import`] already tolerated one. This is the same courtesy on the path a
+    /// user actually takes.
+    #[test]
+    fn a_byte_order_mark_does_not_swallow_the_first_rule() {
+        let text = template();
+        let with_bom = format!("\u{feff}{text}");
+        assert_eq!(
+            parse(&with_bom),
+            parse(&text),
+            "a BOM changes nothing about what the file says"
+        );
+
+        // And one in front of the very first `[[rule]]`, with no comment header to absorb it.
+        let bare = "\u{feff}[[rule]]\nname = \"first\"\npattern = \"ERROR\"\nfg = \"#ff0000\"\n";
+        let specs = parse(bare);
+        assert_eq!(specs.len(), 1, "the rule survives the mark in front of it");
+        assert_eq!(specs[0].name, "first");
+    }
 
     #[test]
     fn rules_round_trip_through_the_file_and_compile() {
