@@ -30,7 +30,6 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use tailhawk_core::cell::CellModel;
 use tailhawk_core::columns::{Layout, Presentation};
 use tailhawk_core::detect::{self, Detection};
 use tailhawk_core::encoding::Charset;
@@ -49,7 +48,7 @@ use tailhawk_core::sort;
 use tailhawk_core::stdin::{reap_orphans, stdin as stdin_kind, Pump, StreamEnd};
 use tailhawk_core::template;
 use tailhawk_core::theme::{self, theme, Theme};
-use tailhawk_core::widget::{Focus, TextField};
+use tailhawk_core::widget::Focus;
 use tailhawk_core::{
     Position, Renderer, RowEnd, RowSource, Selection, SeverityBand, View, WindowHandle,
     RENDER_CAP_CELLS,
@@ -86,10 +85,6 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::Ime::{
-    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT,
-    COMPOSITIONFORM, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR,
-};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_C, VK_CONTROL, VK_D,
     VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G, VK_HOME, VK_I, VK_L,
@@ -112,13 +107,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
     SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
-    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL,
-    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
+    WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL,
+    WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
@@ -2810,37 +2804,6 @@ fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Optio
     (detection, layout)
 }
 
-/// Takes one `WM_CHAR` code unit into a typed field. Returns whether it was wanted.
-///
-/// **Surrogate pairs are joined here.** `WM_CHAR` delivers a non-BMP character as two messages,
-/// and pushing each on its own puts two replacement characters into the text — a search for an
-/// emoji that cannot match one, failing as "not found" rather than as anything a user could act
-/// on. Logs carry emoji: every one of this project's own commit messages could. Shared by the find
-/// query and the filter chip, which are the two things typed into the window until M7's fields.
-fn push_typed_unit(text: &mut String, pending_high: &mut Option<u16>, unit: u16) -> bool {
-    // Control characters arrive here too — `Ctrl+F` itself is 0x06 and `Enter` is 0x0D — and
-    // every one of them is either handled as a key or is not wanted in a query.
-    if unit < 0x20 || unit == 0x7F {
-        return false;
-    }
-    match (pending_high.take(), unit) {
-        (_, high) if (0xD800..0xDC00).contains(&high) => {
-            *pending_high = Some(high);
-        }
-        (Some(high), low) if (0xDC00..0xE000).contains(&low) => {
-            text.extend(char::decode_utf16([high, low]).map(|c| c.unwrap_or('\u{FFFD}')));
-        }
-        // **A high surrogate whose partner never came becomes U+FFFD rather than being
-        // dropped**, because a character that vanishes as it is typed is indistinguishable from
-        // a keyboard that missed it. `take` above has already removed it, so without this arm
-        // passing it on it would go nowhere at all.
-        (orphan, unit) => text.extend(
-            char::decode_utf16(orphan.into_iter().chain([unit])).map(|c| c.unwrap_or('\u{FFFD}')),
-        ),
-    }
-    true
-}
-
 /// The filter state — §7.3's in-place hide, driven the way [`Finder`] is until M7's chip row.
 ///
 /// **This is the derived row space.** When `chips` is non-empty the grid counts `kept.len()` rows,
@@ -3062,13 +3025,9 @@ impl Filtering {
 /// cell model — so its text lines up with the columns beneath and a click resolves to a cell.
 struct Chrome {
     focus: Focus,
-    /// A high surrogate waiting for its low half, for `WM_CHAR` into whichever field has focus.
-    pending_high: Option<u16>,
     /// What was drawn where, in viewport x pixels, so a click can be resolved. Filled by
     /// `draw_chrome` each frame; a `RefCell` because drawing takes `&self`.
     hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, Hit)>>,
-    /// The x each field's text starts at, for placing a caret from a click.
-    origins: std::cell::Cell<(f32, f32)>,
     /// The rules editor's rows by their y, for a click on one.
     rules_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
     /// §2.1's filter panel, by x **and** y — it is a column of rows in the footer band, so x
@@ -3499,17 +3458,11 @@ fn format_menu_of(detection: &Detection, selected: usize) -> Vec<FormatRow> {
     rows
 }
 
-/// caret stays visible because the text is cut from the *left* when it overflows.
-const FIND_CELLS: usize = 36;
-const CHIP_CELLS: usize = 24;
-
 impl Default for Chrome {
     fn default() -> Self {
         Self {
             focus: Focus::Grid,
-            pending_high: None,
             hits: std::cell::RefCell::new(Vec::new()),
-            origins: std::cell::Cell::new((0.0, 0.0)),
             rules_hits: std::cell::RefCell::new(Vec::new()),
             panel_hits: std::cell::RefCell::new(Vec::new()),
         }
@@ -3517,22 +3470,9 @@ impl Default for Chrome {
 }
 
 impl Chrome {
-    /// The field that has the keyboard, if one does.
-    fn focused(&mut self) -> Option<&mut TextField> {
-        match self.focus {
-            Focus::Grid => None,
-        }
-    }
-
     /// The tab strip's height, when it is drawn.
     fn strip_height(chrome_h: f32) -> f32 {
         (chrome_h + 4.0).round()
-    }
-
-    /// The text of a field as it fits its width: cut from the left so the caret end is always on
-    /// screen. Returns the text to draw and the byte offset the cut removed.
-    fn fitted<'a>(cells: &CellModel, text: &'a str, width: usize) -> (&'a str, usize) {
-        tailhawk_core::widget::fit_from_left(cells, text, width)
     }
 }
 
@@ -5626,153 +5566,6 @@ impl Shell {
             let _ = InvalidateRect(hwnd, None, false);
         }
         true
-    }
-
-    /// One typed character, into whichever field has focus. **Surrogate pairs are joined here**:
-    /// `WM_CHAR` delivers a non-BMP character as two messages, and inserting each on its own puts
-    /// two replacement characters into the field.
-    fn find_char(&mut self, hwnd: HWND, unit: u16) -> bool {
-        // V9's editor takes typed text before anything else while it is up, and it does not use
-        // the chrome's focus: it is modal, so the cell under edit is where a character goes.
-        if self.rules_editor.is_open() {
-            if self.rules_editor.editing().is_none() {
-                return true;
-            }
-            let mut text = String::new();
-            let Some(doc) = self.document.as_mut() else {
-                return true;
-            };
-            if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
-                return true;
-            }
-            self.rules_editor.field.insert(&text);
-            self.rules_editor.preview_edit();
-            unsafe {
-                let _ = InvalidateRect(hwnd, None, false);
-            }
-            return true;
-        }
-        let Some(doc) = self.document.as_mut() else {
-            return false;
-        };
-        if doc.chrome.focus == Focus::Grid {
-            return false;
-        }
-        let mut text = String::new();
-        if !push_typed_unit(&mut text, &mut doc.chrome.pending_high, unit) {
-            return false;
-        }
-        if let Some(field) = doc.chrome.focused() {
-            field.insert(&text);
-        }
-        unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        true
-    }
-
-    /// An IME message for the focused field. `WM_IME_COMPOSITION` carries the in-progress string
-    /// (`GCS_COMPSTR`, with its cursor at `GCS_CURSORPOS`) or the settled one (`GCS_RESULTSTR`);
-    /// the field shows the first in place and commits the second. Returns whether it was consumed
-    /// — when it is, `DefWindowProcW` must not see the message, or it would turn the result into
-    /// `WM_CHAR`s and the text would arrive twice. Also parks the IME's candidate window at the
-    /// caret, so it opens beside what is being typed rather than at the window's corner.
-    fn ime(&mut self, hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
-        let Some(doc) = self.document.as_mut() else {
-            return false;
-        };
-        if doc.chrome.focus == Focus::Grid {
-            return false;
-        }
-        let (_, origin) = doc.chrome.origins.get();
-        let cell_w = self.cell_w.max(1.0);
-        let cells = *doc.view.cells();
-        let Some(field) = doc.chrome.focused() else {
-            return false;
-        };
-        let himc = unsafe { ImmGetContext(hwnd) };
-        if himc.is_invalid() {
-            return false;
-        }
-        let read =
-            |what: windows::Win32::UI::Input::Ime::IME_COMPOSITION_STRING| -> Option<String> {
-                let bytes = unsafe { ImmGetCompositionStringW(himc, what, None, 0) };
-                if bytes < 0 {
-                    return None;
-                }
-                let mut buf = vec![0u16; (bytes as usize) / 2];
-                if !buf.is_empty() {
-                    unsafe {
-                        ImmGetCompositionStringW(
-                            himc,
-                            what,
-                            Some(buf.as_mut_ptr().cast()),
-                            bytes as u32,
-                        )
-                    };
-                }
-                Some(String::from_utf16_lossy(&buf))
-            };
-        let flags = lparam.0 as u32;
-        let mut consumed = false;
-        match msg {
-            WM_IME_STARTCOMPOSITION => {
-                field.set_composition("", 0);
-                consumed = true;
-            }
-            WM_IME_COMPOSITION => {
-                if flags & GCS_RESULTSTR.0 != 0 {
-                    if let Some(result) = read(GCS_RESULTSTR) {
-                        field.commit_composition(&result);
-                        consumed = true;
-                    }
-                }
-                if flags & GCS_COMPSTR.0 != 0 {
-                    if let Some(comp) = read(GCS_COMPSTR) {
-                        let cursor =
-                            unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, None, 0) };
-                        let cursor_utf16 = cursor.max(0) as usize;
-                        let caret = comp
-                            .encode_utf16()
-                            .take(cursor_utf16)
-                            .collect::<Vec<u16>>()
-                            .len();
-                        let caret_bytes = String::from_utf16_lossy(
-                            &comp.encode_utf16().take(caret).collect::<Vec<_>>(),
-                        )
-                        .len();
-                        field.set_composition(&comp, caret_bytes);
-                        consumed = true;
-                    }
-                }
-            }
-            WM_IME_ENDCOMPOSITION => {
-                field.clear_composition();
-                consumed = true;
-            }
-            _ => {}
-        }
-        // The candidate window, at the caret.
-        let display = field.display();
-        let (shown, cut) = Chrome::fitted(&cells, &display, FIND_CELLS.max(CHIP_CELLS));
-        let caret_cell = cells.cell_at_byte(
-            shown,
-            field.display_caret().saturating_sub(cut).min(shown.len()),
-        );
-        let form = COMPOSITIONFORM {
-            dwStyle: CFS_POINT,
-            ptCurrentPos: windows::Win32::Foundation::POINT {
-                x: (origin + caret_cell as f32 * cell_w) as i32,
-                y: doc.view.chrome_px() as i32,
-            },
-            ..Default::default()
-        };
-        unsafe {
-            let _ = ImmSetCompositionWindow(himc, &form);
-            let _ = ImmReleaseContext(hwnd, himc);
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        consumed
     }
 
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
@@ -8183,18 +7976,6 @@ fn def_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 
 fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION => {
-            let consumed = STATE.with(|s| {
-                s.borrow_mut()
-                    .as_mut()
-                    .is_some_and(|shell| shell.ime(hwnd, msg, lparam))
-            });
-            if consumed {
-                LRESULT(0)
-            } else {
-                def_proc(hwnd, msg, wparam, lparam)
-            }
-        }
         WM_DROPFILES => {
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
@@ -8525,21 +8306,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     LRESULT(0)
                 }
                 None => def_proc(hwnd, msg, wparam, lparam),
-            }
-        }
-        // Typed text, which only exists as a message because `TranslateMessage` produces it from
-        // the key pair. It carries the keyboard layout, the dead keys and the IME's output — which
-        // is why a query is built from `WM_CHAR` and not from virtual-key codes.
-        WM_CHAR => {
-            let consumed = STATE.with(|s| {
-                s.borrow_mut()
-                    .as_mut()
-                    .is_some_and(|shell| shell.find_char(hwnd, wparam.0 as u16))
-            });
-            if consumed {
-                LRESULT(0)
-            } else {
-                def_proc(hwnd, msg, wparam, lparam)
             }
         }
         // §2.1: middle-click closes the tab under the pointer.
@@ -9994,31 +9760,6 @@ mod tests {
         // `out` is reused across rows, so a row with no matches must clear what the last one left.
         finder.spans(9, &mut spans);
         assert!(spans.is_empty(), "a row with no matches left spans behind");
-    }
-
-    /// **A non-BMP character typed into the query survives being two `WM_CHAR` messages.**
-    ///
-    /// Pushed separately they become two replacement characters, and the search then fails to find
-    /// the thing that is in the file — as "no matches", which is indistinguishable from the truth.
-    #[test]
-    fn a_surrogate_pair_becomes_one_character_in_the_query() {
-        let mut query = String::new();
-        let mut pending = None;
-        for unit in "ok 🦅".encode_utf16() {
-            assert!(push_typed_unit(&mut query, &mut pending, unit));
-        }
-        assert_eq!(query, "ok 🦅");
-
-        // Control codes are keys, not text: `Ctrl+F` arrives here as 0x06 and `Enter` as 0x0D.
-        assert!(!push_typed_unit(&mut query, &mut pending, 0x06));
-        assert!(!push_typed_unit(&mut query, &mut pending, 0x0D));
-        assert_eq!(query, "ok 🦅");
-
-        // A lone high surrogate is not silently dropped — a character that vanishes as it is typed
-        // looks like a keyboard fault.
-        assert!(push_typed_unit(&mut query, &mut pending, 0xD83E));
-        assert!(push_typed_unit(&mut query, &mut pending, u16::from(b'x')));
-        assert_eq!(query, "ok 🦅\u{FFFD}x");
     }
 
     /// Everything §7.4 obliges a search to disclose has to be *sayable*, and the title is the only

@@ -3,9 +3,19 @@
 //! The set of highlight rules as a thing being *edited*, where [`crate::rules`] is the same set as
 //! a thing being *read from a file* and [`crate::highlight::RuleSet`] is the same set as a thing
 //! being *applied*. The file has stood in for the editor since the rules landed; this is what §5's
-//! grid sits on. As with [`crate::palette`] and [`crate::widget`], the model is here and the window
-//! is not: the shell owns the overlay's pixels, the drag and the colour swatch, and asks this what
-//! to draw.
+//! dialog sits on. The model is here and the window is not: the shell owns the controls and asks
+//! this what to put in them.
+//!
+//! ## There is one way to write a cell, and it is [`Editor::set_cell`]
+//!
+//! There used to be two. The drawn overlay had a single [`crate::widget::TextField`] standing in
+//! for whichever cell held the caret, so an edit was *opened* on a cell and *committed* back —
+//! `begin_edit` / `commit_edit` / `cancel_edit` / `preview_edit`, all gone with the surface that
+//! needed them. A dialog gives every cell a control of its own, and the control is the text.
+//!
+//! Keeping both was worse than keeping either. `add_rule` armed an edit on the new rule's empty
+//! pattern; `set_cell` wrote the typed pattern straight into the spec; and the next `commit_edit`,
+//! fired by the first check box pressed afterwards, put the stale empty field back over the top.
 //!
 //! ## A row carries its own error
 //!
@@ -50,10 +60,9 @@
 
 use crate::highlight::{Colour, RuleSet};
 use crate::rules::{self, Spec};
-use crate::widget::TextField;
 
-/// Which of a row's cells is under edit. The flags and the order are not here: they are toggles
-/// and moves, not text.
+/// Which of a row's cells [`Editor::set_cell`] is writing. The flags and the order are not here:
+/// they are toggles and moves, not text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cell {
     Name,
@@ -91,8 +100,7 @@ const NEW_RULE_FG: Colour = [1.0, 0.78, 0.36, 1.0];
 /// generous against any hand-written set and refuses the file rather than the frame.
 pub const MAX_IMPORTED_RULES: usize = 512;
 
-/// The set under edit: its name and binding, the rules, their errors, the selection, and the cell
-/// under the caret.
+/// The set under edit: its name and binding, the rules, their errors, and the selection.
 #[derive(Debug, Default)]
 pub struct Editor {
     /// §5's title — `Rules — "App production"`.
@@ -103,13 +111,6 @@ pub struct Editor {
     specs: Vec<Spec>,
     errors: Vec<Option<String>>,
     selected: usize,
-    /// The row and cell being typed into. The **row** is recorded rather than read back from
-    /// `selected` at commit time, so a selection that moves mid-edit cannot land the text in a
-    /// different rule.
-    editing: Option<(usize, Cell)>,
-    /// The cell under edit. Public because the shell drives it with the same key handler it uses
-    /// for the find field.
-    pub field: TextField,
     open: bool,
     dirty: bool,
 }
@@ -130,19 +131,17 @@ impl Editor {
         self.open
     }
 
-    /// Opens on the first row. Any error left over from a cancelled edit is recomputed, so what the
-    /// grid shows is what the rules actually are.
+    /// Opens on the first row, revalidating every one of them, so what the dialog shows is what the
+    /// rules actually are.
     pub fn open(&mut self) {
         self.open = true;
-        self.editing = None;
         self.selected = 0;
         self.revalidate_all();
     }
 
-    /// Closes, abandoning the cell under edit. The set itself is kept — closing the editor is not
-    /// discarding the rules, and `dirty` still says whether they need writing.
+    /// Closes. The set itself is kept — closing the editor is not discarding the rules, and `dirty`
+    /// still says whether they need writing.
     pub fn close(&mut self) {
-        self.cancel_edit();
         self.open = false;
     }
 
@@ -167,13 +166,38 @@ impl Editor {
         self.selected
     }
 
-    /// Which cell is being typed into, if any.
-    pub fn editing(&self) -> Option<Cell> {
-        self.editing.map(|(_, cell)| cell)
-    }
-
     pub fn specs(&self) -> &[Spec] {
         &self.specs
+    }
+
+    /// Writes `text` into `cell` of the selected row and revalidates that row.
+    ///
+    /// **The only way a cell is written**, and that is the point. The drawn editor had a single
+    /// `TextField` standing in for whichever cell held the caret, so an edit had to be opened on a
+    /// cell and committed back — `begin_edit` / `commit_edit`, now gone with the surface that
+    /// needed them. A dialog gives every cell a control of its own and the control *is* the text.
+    ///
+    /// Keeping both was worse than either: `add_rule` armed an edit on the new rule's empty
+    /// pattern, this method wrote the typed pattern straight into the spec, and the next
+    /// `commit_edit` — fired by the first check box pressed — put the stale empty field back over
+    /// the top. §5's "checked as you type" now falls out for free: the row is revalidated by the
+    /// keystroke that wrote it.
+    ///
+    /// A colour cell that does not read as `#rrggbb` clears that colour rather than keeping a
+    /// stale one.
+    pub fn set_cell(&mut self, cell: Cell, text: &str) {
+        let row = self.selected;
+        let Some(spec) = self.specs.get_mut(row) else {
+            return;
+        };
+        match cell {
+            Cell::Name => spec.name = text.to_owned(),
+            Cell::Pattern => spec.pattern = text.to_owned(),
+            Cell::Fg => spec.fg = rules::colour(text),
+            Cell::Bg => spec.bg = rules::colour(text),
+        }
+        self.dirty = true;
+        self.revalidate(row);
     }
 
     pub fn rows(&self) -> Vec<Row<'_>> {
@@ -218,7 +242,6 @@ impl Editor {
     /// Moves the selection, clamped at both ends. An edit in flight is committed first — arrowing
     /// off a cell keeps what was typed, as every grid the user knows does.
     pub fn move_selection(&mut self, delta: i32) {
-        self.commit_edit();
         if self.specs.is_empty() {
             self.selected = 0;
             return;
@@ -235,103 +258,10 @@ impl Editor {
         if row == self.selected || row >= self.specs.len() {
             return;
         }
-        self.commit_edit();
         self.selected = row;
     }
 
-    /// Starts editing `cell` of the selected row, seeding the field with what is there. Colours
-    /// are seeded as `#rrggbb` because that is what the user can type back.
-    pub fn begin_edit(&mut self, cell: Cell) {
-        self.commit_edit();
-        let Some(spec) = self.specs.get(self.selected) else {
-            return;
-        };
-        let text = match cell {
-            Cell::Name => spec.name.clone(),
-            Cell::Pattern => spec.pattern.clone(),
-            Cell::Fg => spec.fg.map(rules::hex).unwrap_or_default(),
-            Cell::Bg => spec.bg.map(rules::hex).unwrap_or_default(),
-        };
-        self.field = TextField::new(text);
-        self.field.select_all();
-        self.editing = Some((self.selected, cell));
-    }
-
-    /// Writes the field back into the row the edit started on and revalidates it. A colour cell
-    /// that does not read as `#rrggbb` clears that colour rather than keeping a stale one — the
-    /// swatch then shows nothing, and `Spec::compile` complains if neither colour is left.
-    pub fn commit_edit(&mut self) {
-        let Some((row, cell)) = self.editing.take() else {
-            return;
-        };
-        let text = self.field.text().to_owned();
-        let Some(spec) = self.specs.get_mut(row) else {
-            return;
-        };
-        match cell {
-            Cell::Name => spec.name = text,
-            Cell::Pattern => spec.pattern = text,
-            Cell::Fg => spec.fg = rules::colour(&text),
-            Cell::Bg => spec.bg = rules::colour(&text),
-        }
-        self.dirty = true;
-        self.revalidate(row);
-    }
-
-    /// Writes `text` into `cell` of the selected row and revalidates that row.
-    ///
-    /// **This is the door a real control uses**, where [`begin_edit`](Self::begin_edit) and
-    /// [`commit_edit`](Self::commit_edit) are the drawn editor's: that surface had one
-    /// [`TextField`] standing in for whichever cell held the caret, so an edit had to be opened
-    /// on a cell and closed again. A dialog gives every cell a control of its own and the control
-    /// *is* the text, so there is nothing to open. §5's "checked as you type, with the error shown
-    /// inline — never on OK" then falls out for free: the row is revalidated by the keystroke that
-    /// wrote it.
-    ///
-    /// A colour cell that does not read as `#rrggbb` clears that colour rather than keeping a
-    /// stale one, exactly as committing one did.
-    pub fn set_cell(&mut self, cell: Cell, text: &str) {
-        let row = self.selected;
-        let Some(spec) = self.specs.get_mut(row) else {
-            return;
-        };
-        match cell {
-            Cell::Name => spec.name = text.to_owned(),
-            Cell::Pattern => spec.pattern = text.to_owned(),
-            Cell::Fg => spec.fg = rules::colour(text),
-            Cell::Bg => spec.bg = rules::colour(text),
-        }
-        self.dirty = true;
-        self.revalidate(row);
-    }
-
-    /// Abandons the edit, leaving the row as it was — including its error, which
-    /// [`preview_edit`](Self::preview_edit) may have set from text that is now discarded.
-    pub fn cancel_edit(&mut self) {
-        if let Some((row, _)) = self.editing.take() {
-            self.revalidate(row);
-        }
-    }
-
-    /// Revalidates while the user is still typing, so §5's inline error tracks the keystroke
-    /// rather than waiting for the cell to be left. Only the pattern can be wrong in a way worth
-    /// showing mid-edit, so only that cell is previewed.
-    pub fn preview_edit(&mut self) {
-        let Some((row, Cell::Pattern)) = self.editing else {
-            return;
-        };
-        let Some(spec) = self.specs.get(row) else {
-            return;
-        };
-        let candidate = Spec {
-            pattern: self.field.text().to_owned(),
-            ..spec.clone()
-        };
-        self.errors[row] = candidate.compile().err();
-    }
-
     pub fn toggle_enabled(&mut self) {
-        self.commit_edit();
         if let Some(spec) = self.specs.get_mut(self.selected) {
             spec.enabled = !spec.enabled;
             self.dirty = true;
@@ -339,7 +269,6 @@ impl Editor {
     }
 
     pub fn toggle_whole_line(&mut self) {
-        self.commit_edit();
         if let Some(spec) = self.specs.get_mut(self.selected) {
             spec.whole_line = !spec.whole_line;
             self.dirty = true;
@@ -349,7 +278,6 @@ impl Editor {
     /// §5's `.*` / `Ab` toggle: whether the pattern is a regex or plain text. This is **not** the
     /// case-sensitivity axis — `SPEC.md` §7.1 has both, and all four combinations are askable for.
     pub fn toggle_literal(&mut self) {
-        self.commit_edit();
         let row = self.selected;
         if let Some(spec) = self.specs.get_mut(row) {
             spec.literal = !spec.literal;
@@ -359,7 +287,6 @@ impl Editor {
     }
 
     pub fn toggle_case_insensitive(&mut self) {
-        self.commit_edit();
         let row = self.selected;
         if let Some(spec) = self.specs.get_mut(row) {
             spec.case_insensitive = !spec.case_insensitive;
@@ -371,7 +298,6 @@ impl Editor {
     /// Moves the selected row by `delta`, carrying the selection with it. This is precedence
     /// changing, and the row stays selected so a second press keeps moving the same rule.
     pub fn move_row(&mut self, delta: i32) {
-        self.commit_edit();
         if self.specs.is_empty() {
             return;
         }
@@ -391,7 +317,6 @@ impl Editor {
     /// §5's "+ Add rule": a new row below the selection, selected, with the pattern cell open so
     /// the next keystroke goes where the user is looking.
     pub fn add_rule(&mut self) {
-        self.commit_edit();
         let at = if self.specs.is_empty() {
             0
         } else {
@@ -412,11 +337,9 @@ impl Editor {
         self.errors.insert(at, error);
         self.selected = at;
         self.dirty = true;
-        self.begin_edit(Cell::Pattern);
     }
 
     pub fn remove_rule(&mut self) {
-        self.editing = None;
         if self.selected >= self.specs.len() {
             return;
         }
@@ -432,7 +355,6 @@ impl Editor {
         if specs.is_empty() {
             return;
         }
-        self.commit_edit();
         let at = if self.specs.is_empty() {
             0
         } else {
@@ -663,6 +585,28 @@ mod tests {
         );
     }
 
+    /// A pattern typed into a freshly added rule survives the next thing the user touches.
+    ///
+    /// **Two ways of writing a cell cannot both be armed at once.** `add_rule` used to open an
+    /// edit on the new rule's pattern, seeding a `TextField` from the empty string it has; every
+    /// mutator then began by committing that field back. Once the dialog started writing cells
+    /// directly through [`Editor::set_cell`], the two disagreed: the typed pattern went into the
+    /// spec, the stale empty field stayed armed, and the first check box pressed afterwards
+    /// committed the empty one over the top.
+    #[test]
+    fn a_pattern_typed_into_a_new_rule_survives_the_next_thing_touched() {
+        let mut set = editor(vec![spec("first", "ERROR")]);
+        set.add_rule();
+        set.set_cell(Cell::Pattern, "WARN");
+        set.toggle_enabled();
+        let at = set.selected();
+        assert_eq!(
+            set.specs()[at].pattern,
+            "WARN",
+            "the pattern is not wiped by touching something else"
+        );
+    }
+
     #[test]
     fn a_bad_pattern_is_a_property_of_its_row_not_a_refusal_to_load() {
         let set = Editor::new(
@@ -684,56 +628,14 @@ mod tests {
     }
 
     #[test]
-    fn the_error_tracks_the_keystroke_rather_than_waiting_for_ok() {
-        let mut set = editor(vec![spec("r", "ERROR")]);
-        set.begin_edit(Cell::Pattern);
-        set.field.set_text("(unclosed");
-        set.preview_edit();
-        assert!(
-            set.rows()[0].error.is_some(),
-            "invalid while still being typed"
-        );
-        set.field.set_text("(closed)");
-        set.preview_edit();
-        assert!(set.rows()[0].error.is_none(), "and valid again on the fix");
-    }
-
-    #[test]
-    fn abandoning_a_bad_pattern_takes_its_error_with_it() {
-        let mut set = editor(vec![spec("r", "ERROR")]);
-        set.begin_edit(Cell::Pattern);
-        set.field.set_text("(unclosed");
-        set.preview_edit();
-        set.cancel_edit();
-        assert_eq!(set.rows()[0].pattern, "ERROR", "the rule is untouched");
-        assert!(
-            set.rows()[0].error.is_none(),
-            "and shows no error for text that was thrown away"
-        );
-    }
-
-    #[test]
-    fn closing_on_a_bad_pattern_leaves_no_phantom_error_behind() {
-        let mut set = editor(vec![spec("r", "ERROR")]);
-        set.begin_edit(Cell::Pattern);
-        set.field.set_text("(unclosed");
-        set.preview_edit();
-        set.close();
-        set.open();
-        assert!(set.rows()[0].error.is_none());
-    }
-
-    #[test]
     fn a_toggle_does_not_wipe_the_error_of_a_pattern_still_being_typed() {
         let mut set = editor(vec![spec("r", "ERROR")]);
-        set.begin_edit(Cell::Pattern);
-        set.field.set_text("(unclosed");
-        set.preview_edit();
+        set.set_cell(Cell::Pattern, "(unclosed");
         set.toggle_enabled();
         assert_eq!(
             set.rows()[0].pattern,
             "(unclosed",
-            "the in-flight edit was committed, not discarded"
+            "what was typed is what is there"
         );
         assert!(
             set.rows()[0].error.is_some(),
@@ -754,61 +656,10 @@ mod tests {
     }
 
     #[test]
-    fn arrowing_off_a_cell_keeps_what_was_typed() {
-        let mut set = editor(vec![spec("a", "A"), spec("b", "B")]);
-        set.begin_edit(Cell::Name);
-        set.field.set_text("renamed");
-        set.move_selection(1);
-        assert_eq!(set.rows()[0].name, "renamed");
-        assert_eq!(set.editing(), None, "and the edit is over");
-    }
-
-    #[test]
-    fn the_edit_lands_in_the_row_it_started_on() {
-        let mut set = editor(vec![spec("a", "A"), spec("b", "B")]);
-        set.begin_edit(Cell::Name);
-        set.field.set_text("belongs to a");
-        set.selected = 1;
-        set.commit_edit();
-        assert_eq!(set.rows()[0].name, "belongs to a");
-        assert_eq!(
-            set.rows()[1].name,
-            "b",
-            "and not in whatever is selected now"
-        );
-    }
-
-    #[test]
-    fn selecting_the_row_already_selected_does_not_end_the_edit() {
-        let mut set = editor(vec![spec("a", "A")]);
-        set.begin_edit(Cell::Name);
-        set.select(0);
-        assert_eq!(
-            set.editing(),
-            Some(Cell::Name),
-            "a mouse-down on the current row is not a reason to stop typing"
-        );
-    }
-
-    #[test]
-    fn escape_leaves_the_row_as_it_was() {
-        let mut set = editor(vec![spec("a", "A")]);
-        set.begin_edit(Cell::Name);
-        set.field.set_text("thrown away");
-        set.cancel_edit();
-        assert_eq!(set.rows()[0].name, "a");
-    }
-
-    #[test]
     fn a_new_rule_complains_only_about_the_pattern_it_does_not_have_yet() {
         let mut set = editor(vec![spec("a", "A")]);
         set.add_rule();
         assert_eq!(set.selected(), 1, "below the selection, and selected");
-        assert_eq!(
-            set.editing(),
-            Some(Cell::Pattern),
-            "with the pattern cell open"
-        );
         let error = set.rows()[1].error.expect("a patternless rule is invalid");
         assert!(
             error.contains("no pattern"),
@@ -870,9 +721,7 @@ mod tests {
     #[test]
     fn a_colour_that_is_not_a_colour_clears_the_swatch() {
         let mut set = editor(vec![spec("a", "A")]);
-        set.begin_edit(Cell::Fg);
-        set.field.set_text("chartreuse");
-        set.commit_edit();
+        set.set_cell(Cell::Fg, "chartreuse");
         assert_eq!(set.rows()[0].fg, None);
         assert!(
             set.rows()[0].error.is_some(),
