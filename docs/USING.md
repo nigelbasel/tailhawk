@@ -28,6 +28,18 @@ tailhawk --new-instance app.log        # a second window rather than a tab in th
 
 `--filter`, `--exclude` and `--column-pattern` may each be given more than once.
 
+In a column pattern, `<ts>` is any timestamp, `<level>` a level word, `<message>` the rest of the
+line, `<_>` a word to discard, and anything else names a column. **`<<` is a literal `<`**, for a
+line that has angle brackets of its own:
+
+```
+tailhawk --column-pattern="[<ts>] <<<instance>> [<level>]  <message>" app.log
+#          matches: [11:19:32.064] <bym2013> [Information]  Request starting
+```
+
+You rarely need this. A Serilog, NLog or log4net template found in your own configuration is
+compiled automatically, and there `<` is ordinary text.
+
 `tail`'s flags are **accepted and ignored**: `-f`, `-F`, `-q`, `--quiet`, `--silent`, `-v`,
 `--verbose`, and `-n`, `-c`, `-s`, `--sleep-interval`, `--pid` along with their values. They are
 there so a command you already have in your fingers does not fail — not because they do anything.

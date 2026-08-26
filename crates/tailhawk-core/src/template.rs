@@ -534,11 +534,26 @@ fn log4net(pattern: &str) -> Result<Compiled, String> {
 /// §6.5's DSL: `<name>` tokens between literals. `<ts>` is any timestamp the semantic catalogue
 /// would recognise, `<level>` a level word, `<message>` / `<msg>` the rest of the line, `<_>` a
 /// discarded word, anything else a named word.
+///
+/// **`<<` is a literal `<`.** Without it a line with angle brackets in it cannot be described at
+/// all, and lines like that are ordinary: a Serilog console template of
+/// `[{Timestamp:HH:mm:ss.fff}] <{Instance}> [{Level}] {Message}` writes the tenant in brackets, and
+/// every NDC service in the owner's estate emits one. Read out of `appsettings.json` such a
+/// template compiles without trouble — there `<` is ordinary text — so the gap was only ever in
+/// what a person could type here.
+///
+/// `>` needs no escape: it is special only *inside* a token, and a token is entered by a `<` that
+/// this rule can decline to be.
 fn dsl(pattern: &str) -> Result<Compiled, String> {
     let mut b = Build::new();
     let mut rest = pattern;
     while let Some(open) = rest.find('<') {
         b.literal(&rest[..open]);
+        if rest[open + 1..].starts_with('<') {
+            b.literal("<");
+            rest = &rest[open + 2..];
+            continue;
+        }
         let Some(close) = rest[open..].find('>') else {
             return Err("unclosed < in pattern".into());
         };
@@ -769,6 +784,46 @@ mod tests {
     fn a_template_naming_nothing_useful_is_refused() {
         assert!(compile(Language::Serilog, "{Properties}", "x").is_err());
     }
+    /// `<<` is a literal `<`, which is the only way to describe a line that has one.
+    ///
+    /// **The case that found this was a real console template.** A Serilog sink writing
+    /// `[{Timestamp:HH:mm:ss.fff}] <{Instance}> [{Level}] {Message}` puts the tenant in angle
+    /// brackets, and every NDC service in the owner's estate emits it — so a line reads
+    /// `[11:19:32.064] <bym2013> [Information]  Request starting`. Read from `appsettings.json`
+    /// that compiles without trouble, because a Serilog template's `<` is ordinary text. Typed by
+    /// hand as `--column-pattern` it could not be expressed at all: `<` always opened a token and
+    /// there was no way to spell one that stood for itself.
+    ///
+    /// `>` needs no escape. It is only ever special *inside* a token, and a token is entered by a
+    /// `<` that this rule can now decline to be.
+    #[test]
+    fn a_doubled_angle_bracket_is_a_literal_one() {
+        let f = compile(
+            Language::Dsl,
+            "[<ts>] <<<instance>> [<level>]  <message>",
+            "x",
+        )
+        .expect("compile");
+        let r = f
+            .parse("[11:19:32.064] <bym2013> [Information]  Request starting")
+            .expect("a line shaped like the one the pattern describes");
+        assert_eq!(r.body, "Request starting");
+        let instance = r
+            .attributes
+            .iter()
+            .find(|(k, _)| *k == "instance")
+            .map(|(_, v)| format!("{v:?}"))
+            .expect("the tenant is captured from between the literal brackets");
+        assert!(instance.contains("bym2013"), "{instance}");
+
+        // A pattern that is nothing but an escaped bracket still matches one.
+        let f = compile(Language::Dsl, "<<<message>", "x").expect("compile");
+        assert_eq!(f.parse("<hello").expect("parse").body, "hello");
+
+        // And the diagnostic for a genuinely unclosed token is unchanged.
+        assert!(compile(Language::Dsl, "<ts> <oops", "x").is_err());
+    }
+
     /// §6.5's DSL, and Logback through the log4net compiler.
     #[test]
     fn the_pattern_dsl_and_a_logback_pattern_compile() {

@@ -21,6 +21,12 @@
 //! rule with a guess attached, and [`RollingSet::describe`] exists because §5.5b requires the
 //! inference be "shown in the UI for confirmation rather than silently assumed".
 //!
+//! The newest-first family has **two spellings**, not one. log4net appends to the whole name —
+//! `app.log.1` — and Serilog's `preserveLogFilename` inserts before the extension —
+//! `Api_001.log`. §5.5b names only the first, and the second went unrecognised until it turned up
+//! in the owner's own logs: opening `Nurtur.Contact.Api.log` reported one file with two
+//! generations sitting beside it.
+//!
 //! ## Numbers compare as numbers
 //!
 //! **Ours, not §5.5b's.** §5.5b's own example is `log_<seq:000>` — zero-padded, where byte order and
@@ -105,11 +111,17 @@ impl RollingSet {
     /// `siblings` is every name in the directory, the anchor included or not — it is filtered either
     /// way. Nothing is opened and no metadata is read, so this is a decision about names only.
     ///
-    /// The two recognisers are tried in a fixed order, [`Shape::Backup`] first, because `app.log`
-    /// beside `app.log.1` satisfies neither rule ambiguously: the anchor has no numeric field at
-    /// all, so [`Shape::Varying`] cannot see the set that is plainly there.
+    /// The three recognisers are tried in a fixed order, and the order carries meaning. Both backup
+    /// shapes go first, because their anchor has no numeric field at all and [`Shape::Varying`]
+    /// therefore cannot see the set that is plainly there: `app.log` beside `app.log.1`, or
+    /// `Api.log` beside `Api_001.log`. `Varying` then takes everything whose *live* name itself
+    /// counts — a date or a sequence in the anchor — which is why
+    /// [`infer_preserved`](Self::infer_preserved) declines an anchor that has one.
     pub fn infer(anchor: &str, siblings: &[String]) -> Self {
         if let Some(set) = Self::infer_backup(anchor, siblings) {
+            return set;
+        }
+        if let Some(set) = Self::infer_preserved(anchor, siblings) {
             return set;
         }
         if let Some(set) = Self::infer_varying(anchor, siblings) {
@@ -145,6 +157,69 @@ impl RollingSet {
             return None;
         }
         // Oldest first is the *largest* index first. This one line is the whole of §5.5b's trap.
+        backups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let mut members: Vec<String> = backups.into_iter().map(|(_, name)| name).collect();
+        members.push(anchor.to_string());
+        Some(Self {
+            shape: Shape::Backup {
+                live: anchor.to_string(),
+            },
+            order: Order::Descending,
+            members,
+        })
+    }
+
+    /// Serilog's `preserveLogFilename`: the anchor is the live file and `<stem>_<nnn><ext>` are its
+    /// backups, newest first — [`Shape::Backup`]'s family, spelled differently.
+    ///
+    /// The number goes **before the extension** rather than after the whole name, which is the only
+    /// thing separating this from [`infer_backup`](Self::infer_backup). It is a separate recogniser
+    /// rather than a looser one there because the two spellings must not be allowed to match each
+    /// other's sets by accident: `app.log.1` is not `app_1.log`.
+    ///
+    /// **A bigger number is older here too**, which was read off a real directory rather than
+    /// assumed — see the test. The sequence counts up as files roll, so the highest is the one
+    /// that rolled longest ago, and the live file carries no number at all.
+    fn infer_preserved(anchor: &str, siblings: &[String]) -> Option<Self> {
+        // The anchor splits at its *last* dot, so `Nurtur.Contact.Api.log` has the stem
+        // `Nurtur.Contact.Api` and the extension `.log`. A name with no dot has no extension and
+        // cannot carry a number before one.
+        let (stem, ext) = anchor.rsplit_once('.')?;
+        if stem.is_empty() {
+            return None;
+        }
+        // **The live name does not vary — that is what the option is called.** Without this,
+        // `log-20260728.txt` claims `log-20260728_001.txt` as a backup and the date set it really
+        // belongs to never gets looked at. An anchor carrying a believable field of its own is
+        // [`Shape::Varying`]'s business, and this recogniser runs first.
+        if tokenise(anchor).iter().any(believable) {
+            return None;
+        }
+        let mut backups: Vec<(u128, String)> = Vec::new();
+        for name in siblings {
+            let Some(rest) = name.strip_prefix(stem) else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix('_') else {
+                continue;
+            };
+            let Some(digits) = rest.strip_suffix(&format!(".{ext}")) else {
+                continue;
+            };
+            // Padded, for [`FIELD_MIN_DIGITS`]'s reason: `service_1.log` beside `service_2.log` is
+            // two services as readily as two generations of one, and nothing in the names says
+            // which. Serilog pads to three.
+            if digits.len() < FIELD_MIN_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            if let Ok(n) = digits.parse::<u128>() {
+                backups.push((n, name.clone()));
+            }
+        }
+        if backups.is_empty() {
+            return None;
+        }
+        // Oldest first is the largest index first — §5.5b's trap, in the other spelling.
         backups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
         let mut members: Vec<String> = backups.into_iter().map(|(_, name)| name).collect();
         members.push(anchor.to_string());
@@ -449,6 +524,59 @@ mod tests {
             ["app.log.3", "app.log.2", "app.log.1", "app.log"]
         );
         assert_eq!(set.newest(), "app.log");
+    }
+
+    /// Serilog's `preserveLogFilename` shape is log4net's family wearing different punctuation.
+    ///
+    /// **Found by dogfooding, 2026-08-27.** The owner's own APIs write through
+    /// `Serilog.Sinks.PersistentFile` with `preserveLogFilename = true`, which keeps the live file
+    /// at its fixed name and numbers the rolled ones *before the extension* — `Api.log` beside
+    /// `Api_001.log`, `Api_002.log`. Opening the live one reported **1 file** with two generations
+    /// sitting next to it, because the anchor carries no numeric field for [`Shape::Varying`] to
+    /// see and no `.N` suffix for [`Shape::Backup`]'s spelling to match.
+    ///
+    /// The direction was read off the disk rather than assumed, and it is §5.5b's trap either way:
+    /// `Api.log` was last written at 21:00, `Api_001.log` at 10:06 the same day, `Api_002.log` five
+    /// weeks earlier. **A bigger number is older**, exactly as in log4net, so this is the same
+    /// shape and not a third one.
+    #[test]
+    fn serilogs_preserved_filename_backups_are_log4nets_family_in_other_punctuation() {
+        let set = RollingSet::infer(
+            "Nurtur.Contact.Api.log",
+            &names(&[
+                "Nurtur.Contact.Api.log",
+                "Nurtur.Contact.Api_001.log",
+                "Nurtur.Contact.Api_002.log",
+            ]),
+        );
+        assert_eq!(set.order(), Order::Descending);
+        assert_eq!(
+            set.members(),
+            [
+                "Nurtur.Contact.Api_002.log",
+                "Nurtur.Contact.Api_001.log",
+                "Nurtur.Contact.Api.log"
+            ],
+            "oldest first, which is highest-numbered first"
+        );
+        assert_eq!(set.newest(), "Nurtur.Contact.Api.log");
+
+        // An unpadded neighbour is not a generation. `service_1.log` beside `service_2.log` is two
+        // services as readily as two rolls, and [`FIELD_MIN_DIGITS`] is where that line is drawn.
+        let two = RollingSet::infer("service.log", &names(&["service.log", "service_1.log"]));
+        assert_eq!(two.members(), ["service.log"], "one file, not a set");
+
+        // Nor is a file that merely starts the same way.
+        let apart = RollingSet::infer(
+            "api.log",
+            &names(&[
+                "api.log",
+                "api_001.log",
+                "api_001.log.bak",
+                "apiary_001.log",
+            ]),
+        );
+        assert_eq!(apart.members(), ["api_001.log", "api.log"]);
     }
 
     /// The two families disagree about which end is new, and `members()` hides that from callers by
