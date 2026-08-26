@@ -1,6 +1,48 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-27, session 28: the rules dialog is open, and it works
+## ▶ Resume point — 2026-08-27, session 28 (paused): the queue is empty and everything is green
+
+**Stopped at a clean point at the owner's request.** Master is `082d56d`, the tree is clean,
+everything is pushed, and every local gate passes: **815 tests**, clippy with `-D warnings`, and
+`cargo fmt --check`. Nothing is half-done and nothing is uncommitted.
+
+**The list this session inherited is finished.** All four items are struck off below. What remains
+in `SPEC.md` is feature work rather than debt, so **the next session gets to choose** rather than
+continue — that is a different kind of turn and worth knowing before you open it.
+
+### If you want somewhere to start
+
+1. **Check CI by SHA first** — `gh run list` and match `082d56d`, not the top row. Runs on this
+   repository have twice arrived several minutes late, and a late run reads exactly like a green
+   one if you look at the position instead of the commit. Wait rather than re-triggering.
+2. **The one thing written but not proven.** `verify-menus.ps1` now asks every suspect twice before
+   reporting it. The View-menu run passed with *no suspects at all*, so the retry branch never
+   fired — it is proven not to regress the pass path and not proven to work. A full sweep on a
+   quiet desktop would settle it, and takes about four minutes during which the machine is
+   unusable. **Ask before running it.**
+3. **The queue behind that is genuinely empty.** `Rules ▸ Open rules file` and `Reload rules` still
+   overlap the dialog and nobody has decided whether they should; §5's `Apply to ▾`, the
+   `identifier` role and `▉ auto-colour` remain unrepresented for the reasons in `ruleset.rs`'s
+   module doc. None of those is blocking anything.
+
+### What this session actually changed, in one line each
+
+| | Commit |
+|---|---|
+| The rules dialog opened for the first time; the caret jumped to the start on every keystroke | `3e29a92` |
+| The dead drawn-editor model deleted — and it was hiding a live bug | `904ebf6` |
+| `<<` is a literal `<`; Serilog's `preserveLogFilename` rolling shape recognised | `b3d03c5` |
+| Six status messages that could never be seen, and a BOM that ate a rule | `4f428aa` |
+| Every suspect in the menu sweep is now asked twice | `082d56d` |
+
+**The theme, if there is one: five defects this session, and not one of them was reachable by a
+test.** The caret jump, the six invisible status messages, the BOM, the pattern wiped by ticking a
+check box, the keystrokes swallowed behind a modeless dialog — every one needed the program to be
+*run* and its own output read back. 815 tests passed throughout.
+
+---
+
+## Resume point — 2026-08-27, session 28: the rules dialog is open, and it works
 
 **Tailhawk now draws none of its own chrome.** Every surface is a real Win32 control, and the last
 one to convert has been run, driven through all fifteen of its paths, and photographed. §5's live
@@ -68,8 +110,10 @@ have covered the only thing worth previewing. `create_find_dialog` was the templ
 2. ~~**The two dogfooding findings.**~~ **Done** (`b3d03c5`) — see below.
 3. ~~**Three paths the harness does not reach.**~~ **Done** (`4f428aa`) — `verify-rules.ps1` is at
    twenty checks, and covering those three found three more defects. See below.
-4. `verify-menus.ps1`'s pixel surface is occlusion-sensitive — retry each suspect once in a fresh
-   window. Written up in session 26's resume point below.
+4. ~~`verify-menus.ps1`'s pixel surface is occlusion-sensitive.~~ **Done** (`082d56d`) — every
+   suspect is asked twice, in two fresh windows, and only a second silent reading is reported. The
+   View-menu run then passed with no suspects at all, so the retry branch has not actually fired
+   yet; see the top of this file.
 5. Nothing else is queued. The dialog conversions are finished and verified; what is left in
    `SPEC.md` is feature work rather than debt.
 
