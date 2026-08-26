@@ -2,15 +2,28 @@
 
 ## ▶ Resume point — 2026-08-25, session 25: the drawn chrome is gone, and the owner is dogfooding
 
-**Where master stands.** Everything below is committed, pushed, and green on CI. The session
-resumed a predecessor that a Nimbalyst crash had cut off mid-flight — its step-3 work was intact in
-the tree and is now landed — and then took three bugs the owner reported while running the app.
+**Where master stands.** Everything below is committed and pushed. The session resumed a
+predecessor that a Nimbalyst crash had cut off mid-flight — its step-3 work was intact in the tree
+and is now landed — then took three bugs the owner reported while running the app, and finished the
+conversion those bugs pointed at.
 
 | Landed this session | Commit |
 |---|---|
 | §2.4's **native context menus** — header, grid line, filter row, via `TrackPopupMenu` | `7b160b7` |
 | The **Filter dialog's alignment** and **dark mode for the native menus** | `1267edb` |
 | **Define Format as a real dialog**, replacing §6.2's drawn sheet | `4f2bbc1` |
+| **Import Layout as a real dialog** — §6.3, the same treatment unasked | `c2a40d6` |
+| **The drawn format wizard deleted** — 1,326 lines | `372e682` |
+
+> **⚠ CI cannot run: it is the GitHub account, not the code.** Every job on `c2a40d6` and
+> `372e682` was refused to start — *"recent account payments have failed or your spending limit
+> needs to be increased."* The last run that actually executed was `32897879002`, and it was green.
+> **Do not read the red runs as broken commits.** While it is down, run the gates locally: the
+> provenance loop out of `.github/workflows/ci.yml` (it is four lines of bash), `cargo clippy
+> --release -- -D warnings` for **both** targets (`--target aarch64-pc-windows-msvc` type-checks
+> without a linker), `cargo fmt --check`, and the suite. All of those pass as of `372e682`. The
+> arm64 **link**, the binary-size gate and the CRT-dependency assertions are the legs no local run
+> covers — the arm64 linker is not installed here.
 
 **What the owner reported, and what it turned out to be.** All three were only visible on screen,
 and all three were found or confirmed by *photographing the running app* — none of them could have
@@ -32,21 +45,21 @@ been reasoned out, and two of them had passing tests either side.
 
 ### ⏭ What is next, in the order it should be taken
 
-1. **Import layout (§6.3) is still the drawn overlay.** `Command::ImportLayout` → `open_import` →
-   `wizard_overlay_of`. It is the *same* sheet the owner just rejected for Define format, so it is
-   next by the owner's own standard rather than by request. The `Wizard` model already serves both
-   (`Source::Layout`, `recognise`, `template::Found`), so this is a second dialog over the same
-   half of `wizard.rs`, not new machinery.
-2. **Then delete the drawn wizard.** `WizardOverlay`, `wizard_overlay_of`, `WizardCell`,
-   `wizard_key`, `begin_wizard_edit` / `commit_wizard_edit` / `wizard_editing_next`, the ruler and
-   its marks, and the hit rects — roughly the same shape of deletion as the menu bar's 1,247 lines,
-   and it cannot start until (1) lands, because Import is its last caller.
-3. **The stale harnesses.** `verify-dialogs.ps1`, `verify-menus.ps1` and `verify-recent.ps1` all
+1. **Get CI running again** — it is a billing block on the account, so it is the owner's to clear.
+   Nothing else here can be trusted as *verified* until it is; the local gates are a stand-in, not
+   a substitute, and they do not cover the arm64 link or the size and CRT assertions at all.
+2. **The stale harnesses.** `verify-dialogs.ps1`, `verify-menus.ps1` and `verify-recent.ps1` all
    drive the deleted drawn bar through `TAILHAWK_DUMP_MENU_HITS` and fail with *"menu drew no
    entries"*. They test nothing today. Rework them to drive the native menus, or retire them —
-   but do not leave three red harnesses in the tree pretending to be coverage.
-4. **Still outstanding from earlier stretches:** filter-panel visibility is not persisted
+   but do not leave three red harnesses in the tree pretending to be coverage. There is no
+   `verify-format.ps1` either, and both new dialogs deserve one: the capture scripts written this
+   session (in the session scratchpad) are most of it already.
+3. **Still outstanding from earlier stretches:** filter-panel visibility is not persisted
    (§12.4 says remembered), and the status bar has no `n filters · k of m` chip.
+4. **The remaining drawn overlays**, now that the wizard has gone: §5's `RulesOverlay` and the
+   command palette are the last two surfaces the app draws itself. The owner has not asked about
+   either, and the palette is arguably right as it is — but the rules editor is the same kind of
+   sheet, and the same objection would apply the moment they open it.
 
 **One thing to know before driving the app from a script.** `tools/Screen.ps1`'s `Wait-For` runs its
 condition in its own scope, so `$x = ...` inside the scriptblock does **not** reach the caller —
