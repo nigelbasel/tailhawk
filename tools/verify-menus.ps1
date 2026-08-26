@@ -177,13 +177,40 @@ function Measure-Calibration($Proc) {
         $d = [Pix]::Diff($samples[$i - 1].Shot, $samples[$i].Shot)
         if ($d -gt $churn) { $churn = $d }
     }
+    $area = if ($samples[0].Shot) { $samples[0].Shot.Width * $samples[0].Shot.Height } else { 0 }
     $samples | ForEach-Object { Remove-Surfaces $_ }
     [pscustomobject]@{
         Watch     = @($stable + 'Pixels')
         Stable    = $stable
         Churn     = $churn
+        Area      = $area
         Tolerance = [Math]::Max($churn * 4, 400)
     }
+}
+
+# **A busy desktop does not make this sweep slow; it makes it lie, and then it kills it.**
+#
+# The client area is captured off the screen, so the window has to be in front of it. When someone
+# is using the machine the application never gets the foreground, every capture is of whatever is
+# on top, and *that* keeps moving — so calibration measures the desktop's churn rather than the
+# window's. On 2026-08-27 an idle window "churned" 539,409 pixels where it normally churns none,
+# which set the tolerance to 2,157,636: more than half a 3.8-megapixel client area would have had
+# to change before the pixel surface noticed anything at all. The run then died a few items later
+# with *"timed out waiting for the window to take the foreground"* — the same cause, arriving as an
+# error instead of as a wrong answer.
+#
+# The wrong answer is the dangerous half. Refusing here is what stops it.
+function Assert-QuietDesktop($cal) {
+    if ($cal.Area -le 0) { return }
+    $share = $cal.Churn / $cal.Area
+    if ($share -lt 0.02) { return }
+    Write-Host ''
+    Write-Host ("REFUSED: an idle window churned {0:N0} of its {1:N0} pixels ({2:P0})." -f `
+        $cal.Churn, $cal.Area, $share)
+    Write-Host 'That is the desktop being used, not the window changing: the capture is of whatever'
+    Write-Host 'is in front. The pixel surface would be meaningless and the sweep would die shortly'
+    Write-Host 'afterwards anyway. Run this on a desktop nobody is using.'
+    exit 2
 }
 # **Wait for the last instance to be gone, not merely asked to go.** Tailhawk is single-instance:
 # a launch while a dying process still holds the claim hands the file to that process and exits
@@ -215,6 +242,7 @@ Write-Host "watching: $($watch -join ', ')  (an idle window churns $($cal.Churn)
 if ($restless) {
     Write-Host "not watching (changes on its own while idle): $($restless -join ', ')"
 }
+Assert-QuietDesktop $cal
 
 # The sweep is planned against one reading of the menu and then carried out against fresh ones, so
 # each item is found again by **id** in the process that will run it. Matching on the label would
