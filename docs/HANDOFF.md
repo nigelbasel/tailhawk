@@ -96,12 +96,17 @@ have covered the only thing worth previewing. `create_find_dialog` was the templ
 `APPDATA`, so the harness hands the child process a scratch one — nothing to back up, and nothing
 left broken if the script dies half way. Any future harness that presses **Save** must do the same.
 
-> **This has now happened twice: a push created no CI run at all.** `b3d03c5` and `4f428aa` both
-> landed on the remote with no run and no check-runs against the SHA — not the billing failure of
-> the 25th, and at least once accompanied by `error connecting to api.github.com`, so a flaky
-> connection is the likeliest cause. A missing run reads exactly like a green one if you look at
-> the top of `gh run list` instead of at the SHA. **Check the SHA.** `gh workflow run CI --ref
-> master` re-triggers on the same commit without manufacturing an empty one.
+> **CI runs can arrive minutes late, and a late run looks exactly like a missing one.** Both
+> `b3d03c5` and `4f428aa` showed no run and no check-runs against their SHA for long enough that
+> this file first recorded them as never created — and both `push` runs then turned up on their
+> own, several minutes behind the push. `error connecting to api.github.com` appeared once in the
+> same window, so the lag is on the reporting side rather than the queue's.
+>
+> So: **check the SHA, not the top of `gh run list`** — a run for the previous commit sitting at
+> the top reads as green for the one you just pushed. But then **wait** rather than re-triggering.
+> `gh workflow run CI --ref master` does work and does not need an empty commit, but doing it early
+> just buys a duplicate run: this repository is public, so the minutes are free, though on a
+> 2× Windows multiplier they are not free of time.
 
 ### Known-unfinished, deliberately
 
