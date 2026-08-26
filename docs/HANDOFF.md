@@ -83,8 +83,8 @@ they are at the machine.
 
 ### The owner's decisions this stretch, in order — all recorded in `UI-DESIGN.md` §2.1 and `CLEANROOM.md`
 
-1. **The command bar goes entirely** ("Option C" of three mockups in
-   `nimbalyst-local/mockups/tailhawk-command-bar-options.mockup.html`): classic dialogs, because
+1. **The command bar goes entirely** ("Option C" of three mockups, since discarded): classic
+   dialogs, because
    "a classic dialog gives more real estate for configuring … and then once it is active, the
    dialog goes away and does not occupy real estate."
 2. **Filters become a docked bottom panel**, not a modal dialog — the owner pointed at Visual
@@ -224,8 +224,7 @@ this was written; every earlier push this session is green).
 ### The two defects still open, in the owner's words
 
 5. **The command bar — decided, and half built.** The owner chose from three mocked shapes
-   (`nimbalyst-local/mockups/tailhawk-command-bar-options.mockup.html`): **the classic
-   dialogs** — "a classic dialog gives more real estate for configuring… and then the dialog
+   (since discarded): **the classic dialogs** — "a classic dialog gives more real estate for configuring… and then the dialog
    goes away" — then refined filters to a **docked panel** after raising VS tool windows:
    toggling is constant, so non-modal wins there. `UI-DESIGN.md` §2.1 is rewritten and both
    decisions are committed. **Landed (`8384b5c`, CI green): the classic Find dialog** —
