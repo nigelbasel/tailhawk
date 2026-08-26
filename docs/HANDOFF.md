@@ -54,11 +54,18 @@ have covered the only thing worth previewing. `create_find_dialog` was the templ
 
 ### ⏭ What is next, in the order it should be taken
 
-1. **Delete the dead model API.** `Editor::begin_edit` / `commit_edit` / `preview_edit` /
-   `cancel_edit` / `field` in `tailhawk-core` had the drawn editor as their only caller. They were
-   held back so the dialog could be judged first; it has been, so they go — with their tests, which
-   test nothing that ships. `set_cell` is what a real control uses.
-2. **The two dogfooding findings below**, both real and neither started.
+1. ~~**Delete the dead model API.**~~ **Done** (`904ebf6`), and it was not tidying: the API was
+   hiding a live bug. `add_rule` armed an edit on the new rule's empty pattern, `set_cell` wrote
+   the typed pattern straight into the spec, and the next `commit_edit` — fired by the first check
+   box pressed afterwards — put the stale empty field back over the top. Type a pattern into a new
+   rule, tick *Enabled*, and the pattern was gone.
+
+   The shell's half went with it, all provably inert first because `widget::Focus` has one variant:
+   `field_edit`, `clipboard_text`, `push_typed_unit`, the pending-surrogate and caret-origin
+   fields, `find_char`, the whole IME composition handler, and their `WM_CHAR` / `WM_IME_*` arms.
+   One was worse than dead — `find_char` claimed every character typed at the grid while the rules
+   editor was open, which for a *modeless* dialog is any time it is up.
+2. ~~**The two dogfooding findings.**~~ **Done** (`b3d03c5`) — see below.
 3. **Three paths the harness still does not reach**, in falling order of worth: the two colour
    buttons (they open `ChooseColorW`, which is modal, so the harness must dismiss it); **Save**
    writing the personal tier and the reload that follows; and **Close** leaving the on-disk rules
@@ -75,16 +82,37 @@ have covered the only thing worth previewing. `create_find_dialog` was the templ
 - §5's `Apply to ▾`, the `identifier` role and `▉ auto-colour` are still unrepresented; the reasons
   are in `ruleset.rs`'s module doc and unchanged by the conversion.
 
-### Two findings from dogfooding, both real and neither started
+### Two findings from dogfooding, both now fixed (`b3d03c5`)
 
-- **`--column-pattern` cannot express a literal `<`.** `template.rs`'s `dsl()` treats `<` as always
-  opening a token, with no escape, so a console template like `[{Timestamp}] <{Instance}> [{Level}]`
-  — which is what the NDC containers emit — cannot be described by hand. An escape (`<<`) would fix
-  it. The Serilog-template path is unaffected: there `<` and `>` are ordinary literals.
-- **Serilog's `preserveLogFilename: true` rolling shape is not recognised as a set.** Opening
-  `Nurtur.Contact.Api.log` reports "1 file" with `_001` and `_002` sitting beside it. The active
-  file carries no numeric field, so §5.5b's inference has no anchor — the same family as log4net's
-  rename-based backups, which §5.5b *does* name. This is the owner's own logging convention.
+Both came from pointing Tailhawk at the NDC estate rather than at a fixture, which is worth more
+than the two fixes: a fixture only ever contains shapes somebody already thought of.
+
+- **`<<` is now a literal `<` in `--column-pattern`.** Every NDC service emits
+  `[11:19:32.064] <bym2013> [Information]  …` from a Serilog console template, and `<` always
+  opened a token, so that line could not be described by hand at all. It reads
+  `[<ts>] <<<instance>> [<level>]  <message>` now. `>` needs no escape — it is special only
+  *inside* a token. Read out of `appsettings.json` such a template always compiled fine, so the
+  gap was only ever in what a person could type.
+- **Serilog's `preserveLogFilename` rolling shape is recognised** — `Api.log` beside `Api_001.log`
+  is log4net's newest-first family in different punctuation, so it is `Shape::Backup`, not a third
+  shape. **The direction was read off the disk, not assumed**, because §5.5b says getting it
+  backwards presents history in reverse without saying so: `Api.log` at 21:00, `_001` at 10:06 the
+  same day, `_002` five weeks earlier — a bigger number is older.
+
+  One guard earned the hard way: `log-20260728.txt` beside `log-20260728_001.txt` is a
+  date-and-sequence set, and the new recogniser claimed it as a backup set until it was made to
+  decline any anchor carrying a numeric field of its own. *preserveLogFilename* means the live
+  name does not vary; that is what the option is called.
+
+  On the real logs the title now reads **"3 files — oldest is `Nurtur.Contact.Api_002.log`, newest
+  is `Nurtur.Contact.Api.log`"**, 262,172 lines across 44.7 MB, where it used to say one file and
+  14,830 lines.
+
+> **A CI habit worth keeping.** `b3d03c5` pushed cleanly and GitHub created **no run at all** — not
+> the billing symptom of the 25th; the push event simply did not fire one. A missing run looks
+> exactly like a green one if you read the top of `gh run list` instead of the SHA. Check the SHA.
+> The workflow carries `workflow_dispatch`, so `gh workflow run CI --ref master` re-triggers it on
+> the same commit without manufacturing an empty one.
 
 ---
 
