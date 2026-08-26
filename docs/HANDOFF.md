@@ -15,15 +15,28 @@ conversion those bugs pointed at.
 | **Import Layout as a real dialog** — §6.3, the same treatment unasked | `c2a40d6` |
 | **The drawn format wizard deleted** — 1,326 lines | `372e682` |
 
-> **⚠ CI cannot run: it is the GitHub account, not the code.** Every job on `c2a40d6` and
-> `372e682` was refused to start — *"recent account payments have failed or your spending limit
-> needs to be increased."* The last run that actually executed was `32897879002`, and it was green.
-> **Do not read the red runs as broken commits.** While it is down, run the gates locally: the
-> provenance loop out of `.github/workflows/ci.yml` (it is four lines of bash), `cargo clippy
-> --release -- -D warnings` for **both** targets (`--target aarch64-pc-windows-msvc` type-checks
-> without a linker), `cargo fmt --check`, and the suite. All of those pass as of `372e682`. The
-> arm64 **link**, the binary-size gate and the CRT-dependency assertions are the legs no local run
-> covers — the arm64 linker is not installed here.
+> **The repository is public as of 2026-08-26, and CI is why.** Three pushes were refused before
+> they began — *"recent account payments have failed or your spending limit needs to be
+> increased"* — and the billing pages said it was neither a failure nor really a limit: the plan is
+> **GitHub Free**, August's metered usage was **$12.01, all of it this repository, all billed $0**
+> against the included allowance, and an **Actions budget of $0 with "stop usage"** then declined
+> everything once that allowance ran out on the 25th. **Private repositories meter Actions;
+> public ones do not** — standard runners are unlimited and free — so the owner chose publication
+> over paying for minutes. The repository and its 361 commits were scanned first: no secrets, no
+> personal paths, nothing deleted from history. It is dual-licensed MIT/Apache-2.0 already.
+>
+> **What that changes for the next session.** Nothing about how the code is written; two things
+> about the surroundings. There is **no `README.md`**, which on a public repository is now the
+> first thing a visitor sees, and issues are open to anyone. And the *reason* CI was expensive has
+> not gone away — the two Windows jobs bill at a **2× multiplier**, roughly **24 minutes a push** —
+> so if the repository is ever made private again, it will stop working within days unless the
+> arm64 leg moves to a nightly.
+>
+> **If CI is ever down again**, the local stand-ins are: the provenance loop out of
+> `.github/workflows/ci.yml` (four lines of bash), `cargo clippy --release -- -D warnings` for
+> **both** targets (`--target aarch64-pc-windows-msvc` type-checks without a linker),
+> `cargo fmt --check`, and the suite. The arm64 **link**, the binary-size gate and the
+> CRT-dependency assertions are the legs no local run covers — the arm64 linker is not installed.
 
 **What the owner reported, and what it turned out to be.** All three were only visible on screen,
 and all three were found or confirmed by *photographing the running app* — none of them could have
@@ -45,9 +58,9 @@ been reasoned out, and two of them had passing tests either side.
 
 ### ⏭ What is next, in the order it should be taken
 
-1. **Get CI running again** — it is a billing block on the account, so it is the owner's to clear.
-   Nothing else here can be trusted as *verified* until it is; the local gates are a stand-in, not
-   a substitute, and they do not cover the arm64 link or the size and CRT assertions at all.
+1. **A `README.md`.** The repository is public now and has none, so the front page is a file
+   listing. `SPEC.md` §1 and `CLEANROOM.md` between them already say what Tailhawk is and how it
+   is built — this is a page that points at them, not new prose.
 2. **The stale harnesses.** `verify-dialogs.ps1`, `verify-menus.ps1` and `verify-recent.ps1` all
    drive the deleted drawn bar through `TAILHAWK_DUMP_MENU_HITS` and fail with *"menu drew no
    entries"*. They test nothing today. Rework them to drive the native menus, or retire them —
