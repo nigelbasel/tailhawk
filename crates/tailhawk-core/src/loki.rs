@@ -12,9 +12,10 @@
 //! - **[`Endpoint`] is an enum**, so a path is a variant and there is no function anywhere that
 //!   builds a path from a string. §7 asks that no config-supplied path fragment ever reach path
 //!   construction; a list of permitted paths would still leave a door, and this has none.
-//! - **[`Origin::parse`] refuses** userinfo, a path, a query, a fragment, and any host outside a
-//!   deliberate character set, so the only thing a configuration can contribute is a name and a
-//!   port — and neither can carry a separator that a URL parser downstream would read as one.
+//! - **[`Origin::parse`] refuses** userinfo, a query, a fragment, any host outside a deliberate
+//!   character set, and any path that is not a plain mount prefix — so a configuration can
+//!   contribute a name, a port and a mount point, and nothing that a URL parser downstream would
+//!   read as a separator.
 //! - **[`Provenance`] lives inside the [`Origin`]**, set when it is parsed and never afterwards, so
 //!   the loopback rule cannot be relaxed by a caller passing the wrong argument.
 //! - **[`Origin::may_connect_to`] takes an address the caller has already resolved**, so the SSRF
@@ -72,8 +73,8 @@ pub enum OriginFault {
     UnsupportedScheme,
     /// A `user:password@` section. §7 rejects these outright rather than dropping them.
     Userinfo,
-    /// A path. The endpoint owns the path; a bare trailing `/` is accepted and dropped.
-    HasPath,
+    /// A path that is not a usable mount prefix — see [`Origin::parse`].
+    BadPrefix,
     /// A `?query`.
     HasQuery,
     /// A `#fragment`.
@@ -97,7 +98,7 @@ impl fmt::Display for OriginFault {
             OriginFault::NotAbsolute => "needs to start with http:// or https://",
             OriginFault::UnsupportedScheme => "only http and https are understood",
             OriginFault::Userinfo => "must not carry a user name or password",
-            OriginFault::HasPath => "must be a host and port only, with no path",
+            OriginFault::BadPrefix => "carries a path that is not a mount prefix",
             OriginFault::HasQuery => "must not carry a query string",
             OriginFault::HasFragment => "must not carry a fragment",
             OriginFault::EmptyHost => "names no host",
@@ -138,6 +139,7 @@ pub struct Origin {
     scheme: String,
     host: String,
     port: u16,
+    prefix: String,
     provenance: Provenance,
 }
 
@@ -149,12 +151,16 @@ impl Origin {
     /// The longest host name that will be accepted, from the DNS name-length limit.
     pub const MAX_HOST_LEN: usize = 253;
 
+    /// The longest mount prefix that will be accepted.
+    pub const MAX_PREFIX_LEN: usize = 128;
+
     /// Reduce a base URL to an origin, or say why not.
     ///
     /// A trailing `/` is accepted and dropped, because a person pasting a base URL from a browser
-    /// will bring one. Anything after that `/` is [`OriginFault::HasPath`] — the endpoint owns the
-    /// path, and this is where §7's rule that no configured fragment reaches path construction is
-    /// enforced.
+    /// will bring one. Anything after that `/` is a **mount prefix**, held to [`check_prefix`]'s
+    /// shape. The [`Endpoint`] enum still owns the endpoint's own path, so §7's rule that no
+    /// configured fragment reaches path *construction* holds: a configuration says where Loki is
+    /// mounted, never what is asked of it.
     ///
     /// **The host is held to a character set, and that is not fussiness.** Refusing only `/`, `?`,
     /// `#` and `@` leaves a host that can still carry a `\`, a CR/LF pair or a colon — and every
@@ -185,10 +191,9 @@ impl Origin {
             return Err(OriginFault::Userinfo);
         }
 
-        let authority = match rest.split_once('/') {
-            Some((before, "")) => before,
-            Some(_) => return Err(OriginFault::HasPath),
-            None => rest,
+        let (authority, prefix) = match rest.split_once('/') {
+            Some((before, after)) => (before, check_prefix(after)?),
+            None => (rest, String::new()),
         };
         if authority.is_empty() {
             return Err(OriginFault::EmptyHost);
@@ -207,6 +212,7 @@ impl Origin {
         };
 
         Ok(Origin {
+            prefix,
             scheme,
             host,
             port,
@@ -242,14 +248,33 @@ impl Origin {
             .unwrap_or(&self.host)
     }
 
+    /// The mount prefix, with no surrounding slashes. Empty when the base URL named none.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// The origin as it appears in a URL — the default port for the scheme is left off, because a
     /// URL that names it and one that does not are the same origin and must key the same.
+    ///
+    /// **The mount prefix is not part of this.** An origin is a scheme, a host and a port; the
+    /// prefix is where Loki happens to be mounted on that origin, and a credential is bound to the
+    /// origin rather than to the mount. Two sources on the same host at different prefixes are the
+    /// same security principal and must key alike.
     pub fn base(&self) -> String {
         let default = if self.scheme == "https" { 443 } else { 80 };
         if self.port == default {
             format!("{}://{}", self.scheme, self.host)
         } else {
             format!("{}://{}:{}", self.scheme, self.host, self.port)
+        }
+    }
+
+    /// The mount prefix as it appears in a URL — `/loki`, or empty.
+    fn mount(&self) -> String {
+        if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", self.prefix)
         }
     }
 
@@ -271,14 +296,24 @@ impl Origin {
     }
 
     /// The full URL of one allowed endpoint, in the scheme that endpoint speaks.
+    ///
+    /// The mount prefix sits between the origin and the endpoint's own path, which is why a real
+    /// deployment behind a prefix-stripping proxy produces a doubled-looking segment. That is
+    /// correct: the proxy consumes the first and Loki is served the second.
     pub fn url(&self, endpoint: Endpoint) -> String {
         if endpoint.is_websocket() {
             let scheme = if self.scheme == "https" { "wss" } else { "ws" };
             let base = self.base();
             let authority = base.split_once("://").map(|(_, a)| a).unwrap_or(&base);
-            format!("{}://{}{}", scheme, authority, endpoint.path())
+            format!(
+                "{}://{}{}{}",
+                scheme,
+                authority,
+                self.mount(),
+                endpoint.path()
+            )
         } else {
-            format!("{}{}", self.base(), endpoint.path())
+            format!("{}{}{}", self.base(), self.mount(), endpoint.path())
         }
     }
 
@@ -308,6 +343,39 @@ fn split_authority(authority: &str) -> Result<(&str, Option<&str>), OriginFault>
         Some((host, port)) => Ok((host, Some(port))),
         None => Ok((authority, None)),
     }
+}
+
+/// Hold a mount prefix to a shape, and return it with no leading or trailing slash.
+///
+/// **A prefix is a mount point, not a path.** Loki is commonly reached through a reverse proxy that
+/// matches a prefix, strips it, and forwards the rest — so a real base URL is not always bare
+/// `scheme://host:port`, and refusing every path outright would leave Tailhawk unable to reach such
+/// a deployment at all. §7's rule is that no config-supplied fragment may reach *path construction*,
+/// and that survives: the [`Endpoint`] enum remains the only thing that decides the endpoint's own
+/// path, and this is prepended to it after being held to a character set with no way to escape
+/// upwards.
+///
+/// Empty is fine and is the ordinary case. `.` and `..` segments are refused rather than resolved,
+/// because resolving them is how a prefix becomes a way to reach a different path.
+fn check_prefix(text: &str) -> Result<String, OriginFault> {
+    let trimmed = text.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > Origin::MAX_PREFIX_LEN {
+        return Err(OriginFault::TooLong);
+    }
+    let ok = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/');
+    if !trimmed.bytes().all(ok) {
+        return Err(OriginFault::BadPrefix);
+    }
+    if trimmed
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(OriginFault::BadPrefix);
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// Hold the host to a shape, and return it lowercased.
@@ -739,11 +807,11 @@ mod tests {
             ("ftp://loki.example.com", OriginFault::UnsupportedScheme),
             ("file://loki.example.com", OriginFault::UnsupportedScheme),
             ("https://user:pass@loki.example.com", OriginFault::Userinfo),
-            (
-                "https://loki.example.com/loki/api/v1/push",
-                OriginFault::HasPath,
-            ),
-            ("https://loki.example.com/anything", OriginFault::HasPath),
+            ("https://loki.example.com/a//b", OriginFault::BadPrefix),
+            ("https://loki.example.com/a/../b", OriginFault::BadPrefix),
+            ("https://loki.example.com/a/./b", OriginFault::BadPrefix),
+            ("https://loki.example.com/a b", OriginFault::BadPrefix),
+            ("https://loki.example.com/a%2fb", OriginFault::BadPrefix),
             ("https://loki.example.com?a=b", OriginFault::HasQuery),
             ("https://loki.example.com#x", OriginFault::HasFragment),
             ("https://", OriginFault::EmptyHost),
@@ -801,6 +869,65 @@ mod tests {
         ] {
             assert!(Origin::parse(text, Provenance::Typed).is_ok(), "{text}");
         }
+    }
+
+    /// The shape the owner's own deployment actually has: a reverse proxy matches a prefix, strips
+    /// it, and forwards the rest to Loki. Refusing every path — which this did until the estate was
+    /// looked at on 2026-08-27 — left Tailhawk unable to reach the only Loki there is.
+    #[test]
+    fn a_loki_mounted_under_a_prefix_can_be_reached() {
+        let o = origin("https://telemetry.example.com/loki");
+        assert_eq!(o.prefix(), "loki");
+        assert_eq!(
+            o.url(Endpoint::QueryRange),
+            "https://telemetry.example.com/loki/loki/api/v1/query_range",
+            "the proxy eats the first segment and Loki is served the second"
+        );
+        assert_eq!(
+            o.url(Endpoint::Tail),
+            "wss://telemetry.example.com/loki/loki/api/v1/tail"
+        );
+        assert_eq!(origin("https://h/a/b/c").prefix(), "a/b/c");
+        assert_eq!(origin("https://h/loki/").prefix(), "loki");
+        assert_eq!(origin("https://h/").prefix(), "");
+        assert_eq!(origin("https://h").prefix(), "");
+    }
+
+    #[test]
+    fn a_prefix_cannot_be_used_to_climb_out_of_its_mount() {
+        for text in [
+            "https://h/..",
+            "https://h/a/..",
+            "https://h/../a",
+            "https://h/a/../../b",
+            "https://h/a/%2e%2e/b",
+            "https://h/a?b",
+            "https://h/a#b",
+        ] {
+            assert!(
+                Origin::parse(text, Provenance::Typed).is_err(),
+                "{text} was accepted"
+            );
+        }
+        assert_eq!(
+            fault(&format!("https://h/{}", "a".repeat(200))),
+            OriginFault::TooLong
+        );
+    }
+
+    #[test]
+    fn a_credential_is_bound_to_the_origin_and_not_to_the_mount() {
+        let bare = origin("https://loki.example.com");
+        let mounted = origin("https://loki.example.com/loki");
+        assert_eq!(
+            bare.key(None),
+            mounted.key(None),
+            "the same host at two mounts is one security principal"
+        );
+        assert_ne!(
+            bare.key(None),
+            origin("https://other.example.com").key(None)
+        );
     }
 
     #[test]

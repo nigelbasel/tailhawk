@@ -419,10 +419,38 @@ have no dependency on the merge engine and can be done at any point before the f
 
 ## 9. Open questions
 
-**Highest value, answer first:** is the Loki HTTP API reachable **directly** from a developer
-workstation, or only through Grafana's datasource proxy? Every empirical measurement in this document
-went through the proxy. If proxy-only, Tailhawk needs a Grafana datasource-proxy mode with
-service-account tokens — different URL shape, different auth, ~+1 PW.
+~~**Highest value, answer first:** is the Loki HTTP API reachable **directly** from a developer
+workstation, or only through Grafana's datasource proxy?~~ **Answered 2026-08-27: directly.**
+
+Every empirical measurement in this document had gone through Grafana's proxy, and the worry was
+that proxy-only would mean a datasource-proxy mode with service-account tokens — a different URL
+shape, different auth and about +1 PW. None of that is needed. Grafana is not in the path at all.
+
+Three things follow, and the third is a correction to code that is already written:
+
+- **The base URL carries a mount prefix.** Loki sits behind a reverse proxy that matches a prefix,
+  strips it, and forwards to the read service — so the configured base is *not* bare
+  `scheme://host:port`, and the endpoint path from §3 follows the prefix. **`loki.rs`'s
+  `Origin::parse` refuses any path on a base URL** in service of §7's "no config-supplied path
+  fragment may ever reach path construction", which as written makes Tailhawk unable to reach this
+  deployment at all. The answer is a **bounded mount prefix as its own field** — charset-checked,
+  no `..`, no query, no fragment, length-capped — with the `Endpoint` enum still the only authority
+  on the endpoint's own path. §7's intent survives: configuration supplies a mount point, never a
+  constructed path.
+- **The credential is the narrow one, which is the good outcome.** Authentication is OAuth2
+  client-credentials with a read-only telemetry scope from the estate's own identity server, not a
+  Grafana service-account token — so §7's objection to the proxy route ("swaps a narrow Loki
+  credential for a broad, non-expiring Grafana one that also reaches `GET /api/datasources`") does
+  not apply. There is **no tenant header**: the deployment runs single-tenant with Loki's own auth
+  disabled, so `X-Scope-OrgID` is not sent. Retention is 30 days, which bounds what any time range
+  can usefully ask for.
+- **The tail's upgrade is untested but unobstructed.** The path is a container platform's ingress,
+  then a Kestrel host, then the reverse proxy — all three forward WebSocket upgrades natively — and
+  there is no application gateway, CDN or nginx in front, which is where upgrades usually die. It
+  still needs the smoke test the next bullet asks for; the risk is now low rather than unknown.
+
+> Endpoint host names and scope names are deliberately **not** written here. This repository is
+> public; the concrete addresses live in the owner's own notes.
 
 Then:
 
