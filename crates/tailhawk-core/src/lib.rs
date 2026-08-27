@@ -28,6 +28,7 @@ pub mod highlight;
 pub mod index;
 pub mod indexer;
 pub mod lines;
+pub mod loki;
 pub mod menu;
 pub mod pattern;
 pub mod record;
