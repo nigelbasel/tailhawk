@@ -11897,10 +11897,23 @@ mod tests {
         assert_eq!(rows[1][0], "off", "a disabled rule says so");
         assert_eq!(rows[1][1], "WARN");
         assert_eq!(rows[1][2], "Ab", "a literal rule reads Ab, not .*");
+        // The colour column used to read `on #333300` here. The owner's objection, 2026-08-27, was
+        // that a hex pair is a description of a colour rather than a colour — so the cell now
+        // carries a sample word and the swatch says what to paint it in.
         assert!(
-            rows[1][3].contains("on #"),
-            "and its background is named: {}",
+            !rows[1][3].contains('#'),
+            "the colour column names no numbers: {}",
             rows[1][3]
+        );
+        assert!(
+            !rows[1][3].is_empty(),
+            "a rule that set a colour has something to show it on"
+        );
+        let swatches = dialog::rules_row_swatches(&editor);
+        assert!(
+            matches!(swatches[1], Some((_, Some(_)))),
+            "the background it set reaches the swatch: {:?}",
+            swatches[1]
         );
 
         assert!(

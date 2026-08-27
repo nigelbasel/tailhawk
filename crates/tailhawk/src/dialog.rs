@@ -23,7 +23,7 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMHDR,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMHDR, NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetDlgItem,
@@ -763,17 +763,20 @@ fn one_line(text: &str) -> String {
 ///   for the selected rule; a set with three bad patterns has to show three.
 /// - **Both colours, or one, or neither**, and a rule with neither is the one `Spec::compile`
 ///   rejects — so the column being empty is the visible half of the error beside it.
+/// - **The Colour cell carries a word, not a number.** It used to read `#d75f5f on #1c1c1c`, which
+///   is a description of a colour rather than a colour — the owner's objection on 2026-08-27, and a
+///   fair one: nobody reads hex and pictures a shade. The cell now holds a fixed sample word and
+///   [`rules_row_swatches`] says what to paint it in, so the column shows the rule as the grid will
+///   actually draw it. The exact numbers stay one click away in the standard colour picker, which
+///   is where a person who wants a number goes anyway.
 pub fn rules_row_cells(editor: &tailhawk_core::ruleset::Editor) -> Vec<[String; 5]> {
-    use tailhawk_core::rules::hex;
     editor
         .rows()
         .iter()
         .map(|row| {
             let colour = match (row.fg, row.bg) {
-                (Some(fg), Some(bg)) => format!("{} on {}", hex(fg), hex(bg)),
-                (Some(fg), None) => hex(fg),
-                (None, Some(bg)) => format!("on {}", hex(bg)),
                 (None, None) => String::new(),
+                _ => SWATCH_TEXT.to_owned(),
             };
             [
                 if row.enabled { "on" } else { "off" }.to_owned(),
@@ -786,6 +789,67 @@ pub fn rules_row_cells(editor: &tailhawk_core::ruleset::Editor) -> Vec<[String; 
                 colour,
                 one_line(row.error.unwrap_or_default()),
             ]
+        })
+        .collect()
+}
+
+/// Answers one stage of the list view's custom-draw conversation.
+///
+/// Only the Colour column is touched; every other cell is left to the control, which is what keeps
+/// the rest of the row looking like a list view rather than like something we drew.
+fn rules_custom_draw(lparam: LPARAM) -> isize {
+    let draw = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
+    match draw.nmcd.dwDrawStage.0 {
+        CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW,
+        CDDS_ITEMPREPAINT => CDRF_NOTIFYSUBITEMDRAW,
+        stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
+            if draw.iSubItem != RULES_COLOUR_COLUMN {
+                return CDRF_DODEFAULT;
+            }
+            let at = draw.nmcd.dwItemSpec;
+            let swatch = crate::rules_read(rules_row_swatches)
+                .and_then(|rows| rows.get(at).copied().flatten());
+            let Some((fg, bg)) = swatch else {
+                return CDRF_DODEFAULT;
+            };
+            if let Some(fg) = fg {
+                draw.clrText = COLORREF(fg);
+            }
+            if let Some(bg) = bg {
+                draw.clrTextBk = COLORREF(bg);
+            }
+            CDRF_NEWFONT
+        }
+        _ => CDRF_DODEFAULT,
+    }
+}
+
+/// The Colour column's index in the rules list — the one cell custom draw claims.
+const RULES_COLOUR_COLUMN: i32 = 3;
+
+/// The word the Colour cell holds, so the swatch has something to tint.
+///
+/// A cell with no text cannot be coloured at all — a list view tints *text*, and an empty subitem
+/// draws nothing to tint. So the sample is a word rather than a blank, and it is the same word on
+/// every row so that the eye compares colours instead of reading.
+const SWATCH_TEXT: &str = "Sample";
+
+/// What to paint the Colour cell in, per row, in `COLORREF` order — or `None` for a rule that has
+/// chosen no colours and so has nothing to show.
+///
+/// `None` **inside** a pair means "leave that half alone": a rule with only a foreground keeps the
+/// list's own background, and one with only a background keeps the list's own text colour. Painting
+/// a guessed white behind a foreground-only rule would show the user a background they never chose,
+/// and the rules file is explicit that an unset colour is unset rather than defaulted.
+pub fn rules_row_swatches(
+    editor: &tailhawk_core::ruleset::Editor,
+) -> Vec<Option<(Option<u32>, Option<u32>)>> {
+    editor
+        .rows()
+        .iter()
+        .map(|row| match (row.fg, row.bg) {
+            (None, None) => None,
+            (fg, bg) => Some((fg.map(colourref), bg.map(colourref))),
         })
         .collect()
 }
@@ -975,13 +1039,23 @@ unsafe extern "system" fn rules_proc(
             1
         }
         WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            // Painting is answered before the quiet guard, and must be: the guard exists to ignore
+            // *selections the dialog made itself*, and a repaint is not a selection. Suppressing it
+            // would leave the swatches uncoloured for exactly as long as the list was being rebuilt.
+            if header.idFrom == usize::from(ID_R_LIST) && header.code == NM_CUSTOMDRAW {
+                let answer = rules_custom_draw(lparam);
+                unsafe {
+                    SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_MSGRESULT), answer);
+                }
+                return 1;
+            }
             // A selection the *dialog* made while rebuilding the list is not a selection the user
             // made, and answering it as one would re-point every field — including the one being
             // typed into. `rules_fill_list` holds the guard for exactly this.
             if RULES_QUIET.with(|q| q.get()) {
                 return 0;
             }
-            let header = unsafe { &*(lparam.0 as *const NMHDR) };
             if header.idFrom == usize::from(ID_R_LIST) && header.code == LVN_ITEMCHANGED {
                 if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_R_LIST)) } {
                     if let Some(at) = lv_selected(list) {
@@ -1476,6 +1550,35 @@ const EN_CHANGE: u32 = 0x0300;
 const BN_CLICKED: u32 = 0;
 const CBN_SELCHANGE: u32 = 1;
 const EM_GETSEL: u32 = 0x00B0;
+
+/// Custom draw, which is how a standard list view is asked to paint one cell in chosen colours.
+///
+/// **Chosen over drawing the swatch ourselves**, which the owner's settled direction rules out
+/// anyway: this is the control's own published mechanism, so the row keeps its real selection
+/// highlight, its themed grid lines and its focus rectangle, and Tailhawk supplies two colours
+/// rather than a paint routine.
+///
+/// The stages are a conversation: answer `CDDS_PREPAINT` with "tell me about items", answer
+/// `CDDS_ITEMPREPAINT` with "tell me about subitems", and only then does the cell arrive.
+const NM_CUSTOMDRAW: u32 = (-12_i32) as u32;
+const CDDS_PREPAINT: u32 = 0x0000_0001;
+const CDDS_ITEMPREPAINT: u32 = 0x0001_0001;
+const CDDS_SUBITEM: u32 = 0x0002_0000;
+const CDRF_DODEFAULT: isize = 0x0000_0000;
+const CDRF_NEWFONT: isize = 0x0000_0002;
+const CDRF_NOTIFYITEMDRAW: isize = 0x0000_0020;
+/// The same value as [`CDRF_NOTIFYITEMDRAW`] — comctl32 reuses the bit, and which one it means
+/// depends on the stage that is being answered. Named separately because the two readings are not
+/// the same instruction and a reader should not have to know that.
+const CDRF_NOTIFYSUBITEMDRAW: isize = 0x0000_0020;
+
+/// `DWLP_MSGRESULT` — where a dialog procedure leaves the value a window procedure would return.
+///
+/// **A dialog procedure's own return value means "did I handle this", not "here is the answer".**
+/// Returning `CDRF_NOTIFYSUBITEMDRAW` from the proc would be read as a plain `TRUE` and the custom
+/// draw would never reach the subitem stage — the classic way this feature is written once and
+/// quietly does nothing.
+const DWLP_MSGRESULT: i32 = 0;
 
 /// The list-view styles and messages the Define Format dialog uses. The `windows` crate types the
 /// structures; these are the plain integers beside them.
@@ -3816,5 +3919,88 @@ mod tests {
             "the face in use is shown even when this machine does not have it"
         );
         assert_eq!(missing.faces.len(), 2);
+    }
+
+    fn spec(name: &str, fg: Option<[f32; 4]>, bg: Option<[f32; 4]>) -> tailhawk_core::rules::Spec {
+        tailhawk_core::rules::Spec {
+            name: name.to_owned(),
+            pattern: name.to_owned(),
+            fg,
+            bg,
+            whole_line: false,
+            enabled: true,
+            case_insensitive: false,
+            literal: false,
+        }
+    }
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+    /// **The Colour column shows a colour, not a description of one.**
+    ///
+    /// The owner's objection, 2026-08-27: the column read `#d75f5f on #1c1c1c`, and nobody reads
+    /// hex and pictures a shade. What the cell holds now is a fixed word on every coloured row, so
+    /// the eye compares colours rather than parsing numbers.
+    #[test]
+    fn the_colour_column_holds_a_sample_rather_than_a_hex_pair() {
+        let editor = tailhawk_core::ruleset::Editor::new(
+            "t",
+            vec![
+                spec("both", Some(RED), Some(BLUE)),
+                spec("fg only", Some(RED), None),
+                spec("bg only", None, Some(BLUE)),
+                spec("neither", None, None),
+            ],
+        );
+        let cells = rules_row_cells(&editor);
+        let colour: Vec<&str> = cells.iter().map(|c| c[3].as_str()).collect();
+        assert_eq!(colour, [SWATCH_TEXT, SWATCH_TEXT, SWATCH_TEXT, ""]);
+        for cell in &colour {
+            assert!(!cell.contains('#'), "a hex value survived in {cell:?}");
+        }
+    }
+
+    /// **An unset colour stays unset**, rather than being guessed into a default.
+    ///
+    /// A rule with only a foreground must keep the list's own background: painting a white behind
+    /// it would show the user a colour they never chose, and the rules file treats an absent colour
+    /// as absent rather than as a default. `None` inside the pair is what carries that.
+    #[test]
+    fn a_swatch_paints_only_the_halves_the_rule_actually_set() {
+        let editor = tailhawk_core::ruleset::Editor::new(
+            "t",
+            vec![
+                spec("both", Some(RED), Some(BLUE)),
+                spec("fg only", Some(RED), None),
+                spec("bg only", None, Some(BLUE)),
+                spec("neither", None, None),
+            ],
+        );
+        let swatches = rules_row_swatches(&editor);
+        // COLORREF is 0x00bbggrr, so pure red is 0x0000FF and pure blue is 0xFF0000.
+        assert_eq!(swatches[0], Some((Some(0x0000_00FF), Some(0x00FF_0000))));
+        assert_eq!(swatches[1], Some((Some(0x0000_00FF), None)));
+        assert_eq!(swatches[2], Some((None, Some(0x00FF_0000))));
+        assert_eq!(swatches[3], None, "a rule with no colours shows nothing");
+    }
+
+    /// The swatches line up with the cells one for one, because custom draw indexes them by the
+    /// list row it is painting. A pair that could ever be a different length than the other is a
+    /// swatch drawn on the wrong rule.
+    #[test]
+    fn every_row_has_exactly_one_swatch_answer() {
+        let editor = tailhawk_core::ruleset::Editor::new(
+            "t",
+            vec![
+                spec("a", Some(RED), None),
+                spec("b", None, None),
+                spec("c", None, Some(BLUE)),
+            ],
+        );
+        assert_eq!(
+            rules_row_swatches(&editor).len(),
+            rules_row_cells(&editor).len()
+        );
     }
 }
