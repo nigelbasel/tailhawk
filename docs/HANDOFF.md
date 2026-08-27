@@ -1,6 +1,129 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-27, session 29: the Loki tail is started, and the docs no longer argue against it
+## ▶ Resume point — 2026-08-27, session 29: Loki's pure half is built, and the estate answered §9
+
+**Read this before `SPEC.md`, `LOKI.md` or `PLAN.md`.** The owner has asked, in his words,
+"numerous times" to tail Loki logs from inside Tailhawk, and it kept being lost the same way: a
+session read `LOKI.md` §8, found an ordering that put a merged view of local files first and the
+Loki tail last of three stages, re-derived it faithfully and offered it back. That is now reversed
+in every document, and `CLAUDE.md` carries it as a standing instruction. **Never `logcli`.**
+
+**Master is `219ab8f`, tree clean, CI green on all nine of today's commits by SHA, 876 tests,
+clippy `-D warnings` and `cargo fmt --check` clean.**
+
+### What landed today
+
+| Commit | What |
+|---|---|
+| `9ffc08e` | The ordering reversed across `LOKI.md` §8 + staging table, `SPEC.md` §1.3, `PLAN.md` §2.4b. Old reasoning kept collapsed, not deleted. |
+| `1044e90` | CI's **Assert no network capability** — the §13.2 assertion `SPEC.md` had *claimed* for a month and never had. |
+| `0e1944b` | `CLEANROOM.md` provenance row for `loki.rs`, filed **before** the module. |
+| `e9d38be` | `loki.rs` — the request model and §7 policy. |
+| `85fdeba` | Resume point carrying that review's findings. |
+| `66d3051` | `CLEANROOM.md` row for `lokiwire.rs`, again before the module. |
+| `c240512` | `lokiwire.rs` — the `query_range` wire parser and §7's caps. |
+| `e3c859e` | An owner-reported defect, recorded rather than chased. |
+| `219ab8f` | §9's first question answered, and the mount-prefix correction it forced. |
+
+### ⚠ Two owner-reported defects, live, and neither is understood
+
+**Both are in the main grid, not the rules dialog** — the owner clarified this mid-session.
+
+1. **`Format ▸ Define from a line` opens nothing**, with a line clicked or without. **The code path
+   was read end to end and is intact**: menu id → `menu_choose` → `Command::DefineFormat` →
+   `open_wizard` → `pending_format` → `run_pending_dialogs` → `show_format_dialog` →
+   `DialogBoxIndirectParamW`. `wizard_sample` falls back to the scroll row when there is no
+   selection, so a missing selection should not stop it. **This was never reproduced** — it needs
+   running, and the known failure mode that looks exactly like this is a **malformed `DLGTEMPLATE`:
+   `DialogBoxIndirectParamW` returns and nothing appears, with no error.** The owner confirmed it
+   still fails on a fresh build, so it is not a stale binary.
+2. **Clicking a line in the grid gives no visible indication it is selected.** Not investigated at
+   all. The rules dialog's list views all carry `LVS_SHOWSELALWAYS`, so the dialog is not the
+   problem — this is the grid's own painting.
+
+**The two questions that would split it fastest, both still unanswered:** does `Format ▸ Import
+layout` open (identical `pending_import` seam, *different* template — if Import works and Define
+does not, it is the Define template), and does the status bar say anything when Define is chosen?
+
+**`tools/verify-dialogs.ps1 -Only Format` is the right tool** — it posts `WM_COMMAND` and captures
+with `PrintWindow`, needing no foreground. **Permission to run it was asked for and the session
+ended before an answer**, and there is a real hazard: single-instance forwarding may hand the
+harness's launch to the owner's open window instead of making its own. Ask again, or have him close
+his instance first.
+
+### Requested and not started: the highlight list should show colours, not hex
+
+The owner: *"the highlight view should show actual colours, not rgb values. Show a standard colour
+picker. if there is a windows one available just show that."*
+
+**Half of this is already done and was reported back to him** — `rules_pick_colour` in `dialog.rs`
+already runs the real `ChooseColorW` with `CC_FULLOPEN`. What is wrong is only the *display*:
+`rules_row_cells` renders the colour column as `#rrggbb on #rrggbb` text.
+
+The plan, unstarted: the decision — which colours a row has, and whether it has any — goes in a
+pure function in `ruleset.rs`; the dialog paints it through the list view's own `NM_CUSTOMDRAW`,
+setting `clrText`/`clrTextBk` per subitem. That is the standard control's own mechanism, so it does
+not breach the owner's settled direction against bespoke drawing.
+
+### Where the Loki work actually stands
+
+**Stage 1's pure half is complete.** `loki.rs` — endpoint allowlist as an enum, base-URL parser,
+SSRF policy, `query_range` as **POST with a form body** (§7's privacy clause: a selector names
+customers, and a GET writes it into every proxy log on the path), and `Follow`, the poll cursor with
+its settling band. `lokiwire.rs` — a streaming JSON reader with no serde and no JSON crate, reading
+**both** the two-element entries §3 measured and the three-element form the vendor documents,
+probing arity per entry, with §7's caps and an interner because §3 measured labels at 5.4x the
+payload.
+
+**Every subagent review paid for itself, and the pattern is worth keeping.** The reviews found:
+`::ffff:169.254.169.254` walking straight past the SSRF policy because every test address was
+canonical; `Follow::reach` clamping the near end of the window so a source paused overnight
+*discarded* the backlog; a credential-key collision that rebuilt §7.1's exfiltration primitive
+inside the fix for it; length caps that allocated 32 MB before refusing at 512 KB; a `max_depth`
+that could abort the process with `0xC00000FD`; and a `WireFault` carrying a server's own
+clear-screen sequence and bidi override into the status bar. **None of these were reachable by the
+tests that existed.** Everything since has been mutation-tested — break it, watch the right test
+fail — before being believed.
+
+### §9's first question is answered: **directly, not through Grafana's proxy**
+
+Established by reading the estate, with live 401-vs-404 probes confirming the route table is real.
+It forced a correction: Loki is **mounted under a prefix** a reverse proxy strips, and
+`Origin::parse` refused any path at all per §7 — so Tailhawk as written could not reach the only
+Loki there is. A base URL may now carry a bounded mount prefix; the `Endpoint` enum still owns the
+endpoint path, so configuration says *where* Loki is and never what to ask it.
+
+**Host names are deliberately absent from this repository, which is public.** They are in the
+owner's memory note `tailhawk-loki-azure-estate`, along with the auth mechanism and two traps: a
+stale `Infrastructure\telemetry\` folder that contradicts production, and `grafana/loki` pinned to
+`:latest` with `ignore_changes = [image]`, so a restart can change the API surface with no commit.
+
+### Next, in order
+
+1. **The two grid defects above.** They are what the owner is actually hitting.
+2. **The colour swatches.** Requested, unstarted, unblocked.
+3. **The shell half of the Loki source** — the WinHTTP transport. It carries a constraint from
+   `1044e90` that must not be retrofitted: **WinHTTP is delay-loaded**, on first use of a configured
+   remote source and never at startup, so CI can go on asserting the *conditional* privacy claim —
+   after a local-file run, `winhttp.dll` is absent from the process module list. Adding
+   `winhttp.dll` to that CI step's allow-list also requires rewording `SPEC.md` §13.2 in the same
+   commit; the step's own comment says so.
+4. **Blocked, needs the owner:** no `telemetry:read` credential exists on this machine, the `az`
+   service-principal secret is **expired**, and authenticating the telemetry MCP does not help — it
+   carries a *role*, while the Loki route checks the *scope*. Every example in the estate is
+   `telemetry:write` (all producers), so Tailhawk is the first read consumer and the client
+   registration probably has to be **created** — an IdentityServer Configuration DB change, which
+   goes through the deploy pipeline, not a workstation.
+
+**A measured fact worth keeping:** WinHTTP through the `windows` crate already in the tree does both
+HTTPS and WebSockets, so the whole client including the tail needs **zero new dependencies**.
+`LOKI.md` §5 measured the `reqwest + tokio + tokio-tungstenite` alternative at +1.68 MB against a
+15 MB gate, so this is no longer a size argument — it is `CLEANROOM.md` §7 and the no-runtime-deps
+promise.
+
+---
+
+## Resume point — 2026-08-27, session 29: the Loki tail is started, and the docs no longer argue against it
 
 **Read this before `SPEC.md`, `LOKI.md` or `PLAN.md`, because until today all three would have sent
 you somewhere else.** The owner has asked, in his words, "numerous times" to be able to tail Loki
