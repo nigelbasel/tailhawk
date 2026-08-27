@@ -1,6 +1,99 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-27, session 29: **tail Loki. That is the work.**
+## ▶ Resume point — 2026-08-27, session 29: the Loki tail is started, and the docs no longer argue against it
+
+**Read this before `SPEC.md`, `LOKI.md` or `PLAN.md`, because until today all three would have sent
+you somewhere else.** The owner has asked, in his words, "numerous times" to be able to tail Loki
+logs from inside Tailhawk. Each time, a session read `LOKI.md` §8, found an ordering that put a
+merged-by-timestamp view of *local* files first and the Loki tail last of three stages, re-derived
+it faithfully, and handed it back as a recommendation. It happened again on the morning of this
+session. The documents were doing what they were written to do; they were simply wrong.
+
+**Settled, and not open:**
+
+1. **Tailing Loki comes first** — ahead of §8.3's merged view, ahead of §9 trace correlation.
+2. **Built into Tailhawk.** Not `logcli`. `logcli query --tail | tailhawk -` works today through the
+   stdin pump and is **not** an answer to this request; do not offer it as one.
+
+`CLAUDE.md` now carries that as a standing instruction, which is the file a session cannot miss.
+
+### What is done, all pushed and green
+
+| Commit | What |
+|---|---|
+| `9ffc08e` | The ordering reversed in `LOKI.md` §8 and its staging table, `SPEC.md` §1.3, `PLAN.md` §2.4b. The old reasoning is kept collapsed beneath, not deleted. |
+| `1044e90` | CI's **Assert no network capability** step — the §13.2 assertion `SPEC.md` had *claimed* for a month and never had. |
+| `0e1944b` | The `CLEANROOM.md` §5 provenance row, written **before** the module for once. |
+| `e9d38be` | `crates/tailhawk-core/src/loki.rs` — the pure request model. 29 tests. |
+
+**The staging table now reads:** stage 1 is client-lite **including follow, as a poll**; the tail
+WebSocket moves to stage 2 as an accelerator. That is `LOKI.md` §6's own rule — polling is the
+correctness mechanism, `/tail` is allowed to fail — and §9's first open question is still open, so a
+stage 1 that depended on the socket would be a stage 1 that might not work.
+
+### `loki.rs` — what it is, and what the review found in it
+
+Pure, no I/O. `Endpoint` is an enum so no function anywhere takes a path string; `Origin::parse`
+reduces a base URL to scheme/host/port and refuses everything else; `Provenance` lives *inside* the
+`Origin`; `query_range` builds **POST with a form body**, never the GET every example uses;
+`Follow` is the poll cursor with the settling band.
+
+**The subagent review before committing found four defects, three of which defeated the exact rule
+the module was written to enforce. This is the most useful paragraph in this file.**
+
+- **An IPv4 address written as IPv6 walked past the whole SSRF policy.** `::ffff:169.254.169.254`
+  is the metadata service; `::127.0.0.1` is loopback. Neither `Ipv6Addr::is_loopback` nor a
+  `fe80::/10` mask sees through `::ffff:0:0/96`, so both were allowed under **both** provenances.
+  The suite could not have caught it — every address in it was written in canonical form.
+- **`Follow::reach` clamped the near end of the window instead of the far one.** A source left
+  paused overnight came back asking only for the last five minutes and moved its cursor past the
+  rest: a day of records gone, silently, in a feature whose §6 headline rule is that silent
+  truncation is the worst thing it can do. The test named for gap-freedom ran only over ticks where
+  the clamp never bound, so it was blind to the one case that produces a gap.
+- **`Origin::key` collided across its own separator** — tenant `3100` against `loki.example.com`
+  keyed identically to no tenant against `loki.example.com:3100`, and both halves come from
+  imported config. That is §7.1's exfiltration primitive rebuilt by accident inside the fix for it.
+- **The host was never held to a character set**, so a `\` (a path separator to every URL parser
+  downstream), a bare CR/LF, or a stray colon went through untouched. The `Endpoint` enum closes
+  the front door; this was the window beside it.
+
+All four are fixed and each has a test that was watched failing first. Four guards were also
+mutation-tested before the review — GET-with-the-selector-in-the-URL, loopback-allowed-when-
+imported, no-settling-band, truncated-answer-skips-its-remainder — and each broke its own test.
+
+### Next, in order
+
+1. **Answer `LOKI.md` §9's first question, which the owner has now made answerable.** The owner
+   says Grafana and Loki are **hosted in Nurtur's own Azure estate**, that applications reach Loki
+   through **OpenTelemetry**, that there is an **MCP that can get there**, and that a **service
+   principal and client secret** exist which may be used to investigate — *read-only, report
+   findings, change nothing*. That was asked for at the end of this session and is **not started**.
+   What is needed is the **query** endpoint and whether it is reachable directly or only through
+   Grafana's datasource proxy: proxy-only means a different URL shape, different auth and ~+1 PW.
+   Worth knowing before looking: a search of `c:\dev\tfsgit` found `ConnectionStrings__Loki=` empty
+   in the IdentityServer compose files and **no Loki container in the local stack**, so the answer
+   is in Azure, not in the repos.
+2. **The response parser** — `query_range`'s JSON into records. There is no JSON crate in the tree
+   and `CLEANROOM.md` §7's allow-list is the reason; `template.rs::unescape_json` and
+   `detail.rs::pretty_json` are the existing precedents. §7's response-parse caps (decompressed
+   bytes, compression *ratio*, nesting depth, keys per stream, records per response) belong in it
+   from the first line, not after.
+3. **Then the shell half**, and it carries one constraint from `1044e90` that must not be
+   retrofitted: **WinHTTP is delay-loaded**, on first use of an explicitly configured remote source
+   and never at startup, so CI can go on asserting the conditional form of the privacy claim — after
+   a run over a local file, `winhttp.dll` is absent from the process module list. Adding
+   `winhttp.dll` to that step's allow-list also requires rewording `SPEC.md` §13.2 in the same
+   commit; the step's own comment says so.
+
+**One measured finding worth keeping:** WinHTTP through the `windows` crate already in the tree does
+both HTTPS and WebSockets (`WinHttpWebSocketCompleteUpgrade`), so the whole client including the
+tail can be built with **zero new dependencies**. `LOKI.md` §5 measured the
+`reqwest + tokio + tokio-tungstenite` alternative at +1.68 MB against a 15 MB gate, so this is no
+longer a size argument — it is `CLEANROOM.md` §7 and the no-runtime-deps promise.
+
+---
+
+## Resume point — 2026-08-27, session 29: **tail Loki. That is the work.**
 
 **Read this before `SPEC.md`, `LOKI.md` or `PLAN.md`, because until today all three would have sent
 you somewhere else.** The owner has asked, in his words, "numerous times" to be able to tail Loki
