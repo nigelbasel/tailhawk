@@ -600,6 +600,37 @@ mod tests {
         }
     }
 
+    /// **The `level` vocabulary a real Loki deployment actually emits, measured rather than
+    /// assumed**, closing one of `LOKI.md` §9's open questions on 2026-08-27.
+    ///
+    /// These six are every value of the `level` stream label in the owner's estate over a day. All
+    /// six already resolve, which is the good outcome — but the reason this is a test and not a
+    /// note is that the deployment's Loki image is pinned to a moving tag, so its vocabulary can
+    /// change without a commit anywhere. If a seventh word appears and this table has not learned
+    /// it, a Loki record's severity silently becomes "unknown" and every severity-banded rule,
+    /// colour and filter quietly stops applying to it.
+    ///
+    /// Note what is *absent*: no `fatal`. The top band this deployment reaches is `critical`, so a
+    /// rule written against `fatal` will match nothing here — which is a fact about the estate, not
+    /// a defect in the table.
+    #[test]
+    fn every_level_the_owners_loki_emits_resolves_to_a_severity() {
+        for (text, expected) in [
+            ("trace", 1u8),
+            ("debug", 5),
+            ("info", 9),
+            ("warn", 13),
+            ("error", 17),
+            ("critical", 18),
+        ] {
+            assert_eq!(
+                Severity::from_level_text(text).map(Severity::get),
+                Some(expected),
+                "{text} is a level this deployment emits"
+            );
+        }
+    }
+
     /// §6.2's Loki-derived rules: matching is case-insensitive and the table carries full word
     /// forms, not just abbreviations. Loki's filed bugs are what these came from.
     #[test]

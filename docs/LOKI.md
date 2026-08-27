@@ -464,7 +464,19 @@ Then:
   bloom-friendly) versus `|~ "(?i)…"`.
 - Loki's behaviour for a **numeric** label filter on a missing label. The recommended rule avoids
   depending on it, but it should be confirmed.
-- The exact value vocabulary of `detected_level`, needed for the band-enumeration fallback.
+- ~~The exact value vocabulary of `detected_level`, needed for the band-enumeration fallback.~~
+  **Measured 2026-08-27** against the owner's own deployment, over a day: `trace`, `debug`, `info`,
+  `warn`, `error`, `critical` — lower case, six values, and **no `fatal`**. All six already resolve
+  through `record.rs`'s `Severity::from_level_text`, which is now asserted by a test named for the
+  fact rather than left as a note. The test exists because the deployment's Loki runs a moving image
+  tag: a seventh word could appear with no commit anywhere, and an unresolved level silently means
+  every severity-banded rule, colour and filter stops applying to those records.
+
+  Measured at the same time, and it settles the shape of the source: the **stream labels are only
+  `app`, `environment`, `level`** — plus `__stream_shard__`, which §2's suppression rule already
+  names, now confirmed to be really there. Everything else §2 lists arrives as structured metadata,
+  which is consistent with §3's 5.4x amplification coming from the metadata rather than from the
+  handful of indexed labels, and is why the interner is load-bearing.
 - Does WinHTTP replay application-added headers across a redirect? The safe design does not depend on
   the answer and must not be allowed to.
 - Are process-spawn sources expressible in imported config at all, given §13.1 rejects executable
