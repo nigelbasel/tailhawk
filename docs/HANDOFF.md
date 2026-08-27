@@ -61,6 +61,33 @@ All four are fixed and each has a test that was watched failing first. Four guar
 mutation-tested before the review — GET-with-the-selector-in-the-URL, loopback-allowed-when-
 imported, no-settling-band, truncated-answer-skips-its-remainder — and each broke its own test.
 
+### ⚠ Reported by the owner, 2026-08-27, not yet looked at
+
+**`Format ▸ Define from a line` opens nothing.** The owner tried it and no dialog appeared. Reported
+mid-session with "don't interrupt your work, save it for later", so it has had **no investigation at
+all** — nothing below is a diagnosis, only the places to start.
+
+The path is `Command::DefineFormat` → `pending_format` → `run_pending_dialogs` → `show_format_dialog`
+/ `format_proc` in `crates/tailhawk/src/dialog.rs`, over the pure view-model in `wizard.rs`
+(`format_field_rows`, `format_preview`, `format_status`, `format_dialog_items`). Worth knowing before
+starting:
+
+- The drawn wizard this replaced was **deleted** in `276`-era work (`CLEANROOM.md`, 2026-08-26,
+  1,326 lines), so there is no fallback surface — if the dialog does not open, nothing does, and the
+  menu item looks dead rather than broken.
+- `show_format_dialog` takes the wizard **out of `STATE`** for the length of the modal loop. A path
+  that returns early while the wizard is taken would leave `STATE` without one, and the next attempt
+  would have nothing to open.
+- The item may also be **correctly disabled** — it needs a document and a selected line. If it is
+  greyed, this is `UI-DESIGN.md` §1.1 working, and the defect is only that nothing says why. Check
+  which it is before assuming the dialog is at fault.
+- The sibling `Format ▸ Import layout` runs through the identical `pending_import` seam, so whether
+  *it* still opens splits the cause between the shared seam and this one dialog.
+
+**`tools/verify-dialogs.ps1` needs no foreground and is safe to run any time** — it posts
+`WM_COMMAND` and captures with `PrintWindow`. That is the fastest first move, and it does not block
+the owner's desktop.
+
 ### Next, in order
 
 1. **Answer `LOKI.md` §9's first question, which the owner has now made answerable.** The owner
