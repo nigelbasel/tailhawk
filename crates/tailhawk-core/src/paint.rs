@@ -363,7 +363,29 @@ impl Painter {
         let t = theme();
         let gutter = view.gutter_px();
         let cell_w = self.cell_width();
+        let caret_row = source.caret_row();
         for (row, y) in rows {
+            // The caret's row, ruled above and below rather than filled.
+            //
+            // **A fill would be wrong in two ways.** It would compete with the selection's fill for
+            // the same pixels on the same row, and under High Contrast — where the palette is three
+            // system colours — the only fill available is `highlight`, which *is* the selection.
+            // A rule is legible in every theme, is the focus idiom Windows already uses, and cannot
+            // be read as "these bytes are selected".
+            if caret_row == Some(row) {
+                let width = gutter + view.hgrid().viewport_px();
+                let height = view.grid().row_height();
+                for edge in [y, y + height - 1.0] {
+                    self.instances.push(Instance {
+                        pos: [0.0, edge],
+                        size: [width, 1.0],
+                        tint: t.caret,
+                        mode: MODE_SOLID,
+                        ..Instance::default()
+                    });
+                }
+                total.quads += 2;
+            }
             // The gutter: a mark and the physical line number, right-aligned, in a quieter ink.
             if gutter > 0.0 {
                 if let Some(colour) = source.row_mark(row) {
@@ -1288,6 +1310,90 @@ mod tests {
             narrow[2]
         );
         drop(off);
+    }
+
+    /// **The caret's row is ruled, and only the caret's row.**
+    ///
+    /// Written because the owner reported on 2026-08-27 that clicking a line gave no sign of which
+    /// line had been clicked — and he was right: a single click places an *empty* selection, which
+    /// selects nothing, so `row_selection` returned `None` and the painter had nothing to draw.
+    /// The row was live in the model the whole time, deciding what `Ctrl+D` and `Define format from
+    /// a line` acted on, with nothing on screen to say so.
+    ///
+    /// Goes through `lay_out` and inspects the instances for the same reason the selection test
+    /// does: the half that was broken is the path from the source to the quads, and a test that
+    /// calls `caret_row` directly cannot see it.
+    #[test]
+    fn the_caret_row_is_ruled_above_and_below_and_no_other_row_is() {
+        let Some((_off, mut painter)) = painter_or_skip("the_caret_row_is_ruled") else {
+            return;
+        };
+        let view = view_for(&painter, 4, 200);
+
+        struct Caret(Vec<String>);
+        impl RowSource for Caret {
+            fn row_text(&self, row: u64) -> Option<&str> {
+                self.0.get(usize::try_from(row).ok()?).map(String::as_str)
+            }
+            fn caret_row(&self) -> Option<u64> {
+                Some(1)
+            }
+        }
+        let source = Caret(vec!["aaaaaaaa".to_owned(); 3]);
+
+        painter.begin_frame();
+        painter.lay_out(&view, INK, &source).expect("lay out");
+        let row_h = view.grid().row_height();
+        let rules: Vec<f32> = painter
+            .instances()
+            .iter()
+            .filter(|i| i.mode == MODE_SOLID && i.tint == Theme::dark().caret && i.size[1] == 1.0)
+            .map(|i| i.pos[1])
+            .collect();
+
+        assert_eq!(rules.len(), 2, "one rule above the caret row and one below");
+        let top = rules[0].min(rules[1]);
+        let bottom = rules[0].max(rules[1]);
+        assert!(
+            (bottom - top - (row_h - 1.0)).abs() < 0.5,
+            "the two rules should bracket exactly one row: {top} and {bottom} against {row_h}"
+        );
+        // The rule reaches across the gutter as well, or it looks like a column divider.
+        let wide = painter
+            .instances()
+            .iter()
+            .filter(|i| i.mode == MODE_SOLID && i.tint == Theme::dark().caret && i.size[1] == 1.0)
+            .all(|i| i.pos[0] == 0.0 && i.size[0] > view.hgrid().cell_width());
+        assert!(wide, "a rule that stops at the text is not a row marker");
+    }
+
+    /// **A row that nothing points at is not ruled.**
+    ///
+    /// The companion to the test above, and the one that would catch a marker drawn on every row —
+    /// which is what a `None` mishandled as "row 0" would look like on a file nobody has clicked.
+    #[test]
+    fn no_caret_means_no_rule_anywhere() {
+        let Some((_off, mut painter)) = painter_or_skip("no_caret_means_no_rule") else {
+            return;
+        };
+        let view = view_for(&painter, 4, 200);
+
+        struct Plain(Vec<String>);
+        impl RowSource for Plain {
+            fn row_text(&self, row: u64) -> Option<&str> {
+                self.0.get(usize::try_from(row).ok()?).map(String::as_str)
+            }
+        }
+        let source = Plain(vec!["aaaaaaaa".to_owned(); 3]);
+
+        painter.begin_frame();
+        painter.lay_out(&view, INK, &source).expect("lay out");
+        let rules = painter
+            .instances()
+            .iter()
+            .filter(|i| i.mode == MODE_SOLID && i.tint == Theme::dark().caret && i.size[1] == 1.0)
+            .count();
+        assert_eq!(rules, 0, "nothing points at a row, so nothing is marked");
     }
 
     /// **A selected range reaches the quads as a filled background, and the ink is left alone.**

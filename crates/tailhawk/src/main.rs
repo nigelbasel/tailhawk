@@ -312,6 +312,18 @@ impl RowSource for Document {
         (span.start_cell < end).then_some(span.start_cell..end)
     }
 
+    /// The row the painter rules, which is [`Document::current_row`] and nothing else.
+    ///
+    /// **Deliberately the same call every row-wise command makes.** `Ctrl+D`, the bookmark steps
+    /// and §6.2's `Define format from a line` all ask `current_row`; if the marker asked anything
+    /// different — the selection's focus alone, say — then a command acting on the top row while
+    /// the rule sat elsewhere would be a screen disagreeing with the model, which is the defect
+    /// class this codebase keeps paying for. So the marker is not "where the caret is". It is
+    /// "the row the next command will act on", and that is worth more.
+    fn caret_row(&self) -> Option<u64> {
+        self.current_row()
+    }
+
     /// §6.4: the number in the gutter is the **physical** line — the file row, not the view row.
     fn row_number(&self, row: u64) -> Option<u64> {
         self.filtering.file_row(row).map(|r| r + 1)

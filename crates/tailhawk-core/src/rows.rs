@@ -127,6 +127,20 @@ pub trait RowSource {
         None
     }
 
+    /// The row a row-wise command would act on, if it is on screen.
+    ///
+    /// **This is the row `Ctrl+D`, `Define format from a line` and the bookmark steps use**, and it
+    /// existed in the model for a long time with nothing on screen to say where it was. A single
+    /// click places a caret — an empty selection — which selects nothing and therefore draws
+    /// nothing, so the owner could click a line, choose a command that acts on "a line", and have
+    /// no way to know which line that was. The point of this method is that the marker and the
+    /// command read the *same* answer, rather than the screen offering a second opinion.
+    ///
+    /// In **view** rows, like everything else the painter is given.
+    fn caret_row(&self) -> Option<u64> {
+        None
+    }
+
     /// The row's coloured runs, in **byte** offsets within it, sorted and non-overlapping.
     ///
     /// Bytes rather than the columns [`row_selection`](Self::row_selection) speaks in, because every
