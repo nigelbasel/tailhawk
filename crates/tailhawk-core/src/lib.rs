@@ -29,6 +29,7 @@ pub mod index;
 pub mod indexer;
 pub mod lines;
 pub mod loki;
+pub mod lokiwire;
 pub mod menu;
 pub mod pattern;
 pub mod record;
