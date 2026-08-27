@@ -2368,7 +2368,7 @@ fn format_dialog_items() -> Vec<Item> {
 /// It edits `wizard` in place and answers whether Save was pressed. Everything it decides, it
 /// decides by calling the model; everything it shows, it shows through [`format_field_rows`],
 /// [`format_preview`] and [`format_status`], which are pure and tested.
-pub fn show_format_dialog(hwnd: HWND, wizard: &mut Wizard) -> bool {
+pub fn show_format_dialog(hwnd: HWND, wizard: &mut Wizard) -> Result<bool, String> {
     // The list views are common controls, and a template that names a class nobody registered
     // opens as a dialog with a hole in it.
     let icc = INITCOMMONCONTROLSEX {
@@ -2383,7 +2383,7 @@ pub fn show_format_dialog(hwnd: HWND, wizard: &mut Wizard) -> bool {
         accepted: false,
     };
     let t = template("Define Format", 420, 307, &format_dialog_items());
-    unsafe {
+    let outcome = unsafe {
         DialogBoxIndirectParamW(
             None,
             t.as_ptr() as *const DLGTEMPLATE,
@@ -2392,7 +2392,22 @@ pub fn show_format_dialog(hwnd: HWND, wizard: &mut Wizard) -> bool {
             LPARAM(&mut state as *mut FormatState as isize),
         )
     };
-    state.accepted
+    if outcome == -1 {
+        return Err(last_error());
+    }
+    Ok(state.accepted)
+}
+
+/// Why a dialog did not open, in the form a person can be shown.
+///
+/// **`DialogBoxIndirectParamW` fails silently and this is the only place that can tell.** It
+/// returns `-1` and nothing appears — no window, no message, no exception — so a discarded return
+/// value turns a refused template or an exhausted handle table into a menu item that looks dead.
+/// `UI-DESIGN.md` §10: a command that appears to do nothing is worse than one that says why it did
+/// not.
+fn last_error() -> String {
+    let code = unsafe { windows::Win32::Foundation::GetLastError() };
+    format!("the dialog could not be opened (error {})", code.0)
 }
 
 /// What [`format_proc`] works on for the life of the dialog.
@@ -2798,7 +2813,7 @@ pub fn show_import_dialog(
     hwnd: HWND,
     wizard: &mut Wizard,
     found: &[tailhawk_core::template::Found],
-) -> bool {
+) -> Result<bool, String> {
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_LISTVIEW_CLASSES,
@@ -2812,7 +2827,7 @@ pub fn show_import_dialog(
         accepted: false,
     };
     let t = template("Import Layout", 420, 311, &import_dialog_items());
-    unsafe {
+    let outcome = unsafe {
         DialogBoxIndirectParamW(
             None,
             t.as_ptr() as *const DLGTEMPLATE,
@@ -2821,7 +2836,10 @@ pub fn show_import_dialog(
             LPARAM(&mut state as *mut ImportState as isize),
         )
     };
-    state.accepted
+    if outcome == -1 {
+        return Err(last_error());
+    }
+    Ok(state.accepted)
 }
 
 /// What [`import_proc`] works on for the life of the dialog.

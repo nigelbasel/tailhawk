@@ -7344,11 +7344,15 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             })
         });
         if let Some((mut wizard, found)) = taken {
-            let saved = dialog::show_import_dialog(hwnd, &mut wizard, &found);
+            let outcome = dialog::show_import_dialog(hwnd, &mut wizard, &found);
+            let saved = outcome.as_ref().copied().unwrap_or(false);
             let was = IN_WNDPROC.with(|flag| flag.replace(true));
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.wizard = Some(wizard);
+                    if let Err(why) = &outcome {
+                        shell.notice = Some(why.clone());
+                    }
                     if saved {
                         shell.save_format(hwnd);
                         let reason = shell.file.clone();
@@ -7381,11 +7385,15 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                 .and_then(|shell| shell.wizard.take())
         });
         if let Some(mut wizard) = taken {
-            let saved = dialog::show_format_dialog(hwnd, &mut wizard);
+            let outcome = dialog::show_format_dialog(hwnd, &mut wizard);
+            let saved = outcome.as_ref().copied().unwrap_or(false);
             let was = IN_WNDPROC.with(|flag| flag.replace(true));
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.wizard = Some(wizard);
+                    if let Err(why) = &outcome {
+                        shell.notice = Some(why.clone());
+                    }
                     // **Whatever happened, the drawn overlay does not come back.** `save_format`
                     // clears the wizard when it succeeds; the path where it does not — a profile
                     // that cannot be written — would otherwise answer a failed save by painting
