@@ -454,6 +454,32 @@ Three things follow, and the third is a correction to code that is already writt
 
 Then:
 
+- **New, 2026-08-28, and it blocks the source's first real connection: who resolves the name?**
+  §7 requires the resolved address to be **re-checked at connect time** against DNS rebinding, and
+  `loki.rs::address_verdict` is that check — a pure function over an `IpAddr`, already written and
+  tested. What is missing is the address itself. WinHTTP resolves internally and does not hand the
+  caller an `IpAddr`, and **nothing in the tree resolves a name today**, which is why the question
+  has not come up before. Three ways out, and they are not equivalent:
+
+  1. **Resolve ourselves** with `GetAddrInfoW`, check, then connect. Straightforward, and it is how
+    the check reads as written — but `GetAddrInfoW` lives in **`ws2_32.dll`**, which the CI network
+    assertion bans by name. It would put a second transport in the binary purely to police the
+    first, and it resolves the name *twice* (once by us, once by WinHTTP), which is its own
+    rebinding window rather than a defence against one.
+  2. **Observe WinHTTP's own resolution** through `WinHttpSetStatusCallback`, whose
+    `CALLBACK_STATUS_CONNECTING_TO_SERVER` carries the address as text, and refuse from inside the
+    callback. One resolution, no second transport, and the address checked is the one actually
+    being connected to — which is the *only* form of the check that means anything against
+    rebinding. The cost is that the refusal happens mid-call and must abort cleanly.
+  3. **Apply the address check to `Provenance::Imported` only** and trust a typed URL. Cheapest,
+    and it is *not* obviously wrong — §7's threat model is a config file that arrives by post —
+    but it silently narrows a control the section states without qualification.
+
+  **Recommended: 2.** It is the only one where the address checked and the address connected to are
+  the same address, which is the entire point of a rebinding check; 1 fails that test while also
+  costing a banned DLL, and 3 answers a different question from the one §7 asks. Worth the owner's
+  eye before it is built, because it decides how much of §7 survives contact with the platform.
+
 - Does the Grafana datasource proxy forward a **WebSocket upgrade** to `/loki/api/v1/tail`?
   Undocumented, untestable through a GET proxy. Smoke-test before committing to the tail endpoint.
 - Does the proxy restrict method/path to Loki's **mutation** endpoints? Which RBAC action gates the
