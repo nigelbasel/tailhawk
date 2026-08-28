@@ -454,7 +454,18 @@ Three things follow, and the third is a correction to code that is already writt
 
 Then:
 
-- **New, 2026-08-28, and it blocks the source's first real connection: who resolves the name?**
+- ~~**New, 2026-08-28: who resolves the name?**~~ **Answered the same day, by the owner: option 2,
+  the status callback.** `net.rs` now installs `WinHttpSetStatusCallback` and judges the address
+  reported by `CONNECTING_TO_SERVER` through the same `address_verdict` every other caller uses.
+  One resolution, no second transport, and the address checked is the address connected to.
+
+  **The residual exposure is stated rather than hidden.** The callback *records*; `send` enforces.
+  Aborting from inside a callback is documented but delicate, and a refusal that raced the send
+  would be worse than useless — so a refused address means `send` returns `NetFault::Refused`
+  without reading or returning anything, but the request headers may already have left. A future
+  hardening is to close the handle from the callback so the send fails outright; the reason it is
+  not done today is that its failure mode is a hang rather than an error, which is worse than the
+  thing it fixes. **The original question, kept for its reasoning:**
   §7 requires the resolved address to be **re-checked at connect time** against DNS rebinding, and
   `loki.rs::address_verdict` is that check — a pure function over an `IpAddr`, already written and
   tested. What is missing is the address itself. WinHTTP resolves internally and does not hand the

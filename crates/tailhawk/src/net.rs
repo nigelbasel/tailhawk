@@ -28,13 +28,15 @@
 //! - **The token is a parameter, never a field.** Nothing here holds a credential between calls, so
 //!   there is no transport state that could be logged or dumped with one in it.
 
+use std::cell::RefCell;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 
-use tailhawk_core::loki::Request;
+use tailhawk_core::loki::{address_verdict, AddressFault, Provenance, Request};
 
 /// An opaque WinHTTP handle. Session, connection and request are all `HINTERNET`.
 type Handle = *mut core::ffi::c_void;
@@ -65,6 +67,9 @@ type QueryHeadersFn = unsafe extern "system" fn(
 type QueryDataAvailableFn = unsafe extern "system" fn(Handle, *mut u32) -> i32;
 type ReadDataFn = unsafe extern "system" fn(Handle, *mut core::ffi::c_void, u32, *mut u32) -> i32;
 type CloseHandleFn = unsafe extern "system" fn(Handle) -> i32;
+type StatusCallback = unsafe extern "system" fn(Handle, usize, u32, *mut core::ffi::c_void, u32);
+type SetStatusCallbackFn =
+    unsafe extern "system" fn(Handle, Option<StatusCallback>, u32, usize) -> usize;
 
 /// The entry points, resolved once, on the first call that actually needs them.
 struct WinHttp {
@@ -78,6 +83,7 @@ struct WinHttp {
     query_data_available: QueryDataAvailableFn,
     read_data: ReadDataFn,
     close: CloseHandleFn,
+    set_status_callback: SetStatusCallbackFn,
 }
 
 // SAFETY: every field is a function pointer into a module that is never freed — the `LoadLibraryW`
@@ -165,6 +171,11 @@ fn winhttp() -> Option<&'static WinHttp> {
                         "WinHttpCloseHandle",
                     )?)
                 },
+                set_status_callback: unsafe {
+                    std::mem::transmute::<*const core::ffi::c_void, SetStatusCallbackFn>(entry(
+                        "WinHttpSetStatusCallback",
+                    )?)
+                },
             })
         })
         .as_ref()
@@ -202,6 +213,14 @@ pub enum NetFault {
     },
     /// The response is larger than [`MAX_RESPONSE`].
     TooLarge,
+    /// The name resolved to an address §7 refuses. **This is the DNS-rebinding check**, made
+    /// against the address WinHTTP actually connected to rather than one we resolved separately.
+    Refused {
+        /// The address that came back.
+        address: String,
+        /// Why it is not allowed.
+        fault: AddressFault,
+    },
 }
 
 impl std::fmt::Display for NetFault {
@@ -216,14 +235,96 @@ impl std::fmt::Display for NetFault {
                 )
             }
             NetFault::TooLarge => f.write_str("the response is larger than will be read"),
+            NetFault::Refused { address, fault } => {
+                write!(f, "the name resolved to {address}, which {fault}")
+            }
         }
     }
+}
+
+/// What the connection watcher saw, for the request being made on this thread.
+///
+/// **Thread-local because a request is synchronous here**: [`send`] installs the watcher, makes one
+/// call and reads the answer before returning, so there is exactly one request in flight per thread
+/// and no ambiguity about which one a notification belongs to. If this ever becomes concurrent, the
+/// context pointer `WinHttpSetStatusCallback` carries is the place to put this instead.
+struct Watch {
+    /// The provenance the address must be judged against — see `loki::Provenance`.
+    provenance: Provenance,
+    /// The first refusal seen, if any. Recorded rather than acted on inside the callback.
+    refused: Option<(String, AddressFault)>,
+    /// Whether any address was seen at all, which is how a connection that never resolved is told
+    /// apart from one that resolved to something allowed.
+    seen: bool,
+}
+
+thread_local! {
+    static WATCH: RefCell<Option<Watch>> = const { RefCell::new(None) };
+}
+
+/// Judge one address as WinHTTP reports it — the text form it hands the status callback.
+///
+/// Separated out because it is the whole of the decision and can be tested without a socket: the
+/// callback's only job is to hand this a string and remember what it said.
+fn verdict_of_text(text: &str, provenance: Provenance) -> Result<(), AddressFault> {
+    match text.trim().parse::<IpAddr>() {
+        Ok(address) => address_verdict(address, provenance),
+        // A notification that is not an address is not a licence to connect to it, but neither is
+        // it evidence of anything; WinHTTP documents this field as the server's address, so an
+        // unparseable one means the notification was not the one we think it was.
+        Err(_) => Ok(()),
+    }
+}
+
+/// WinHTTP's status callback, watching for the address it is about to connect to.
+///
+/// **Records; does not decide.** Aborting from inside a callback is documented but delicate, and a
+/// refusal that raced the send would be worse than useless — so the verdict is remembered here and
+/// enforced by [`send`], which refuses to read or return anything when a refusal was recorded. The
+/// residual exposure is stated plainly in [`send`]'s own note rather than papered over.
+unsafe extern "system" fn watch_connection(
+    _handle: Handle,
+    _context: usize,
+    status: u32,
+    info: *mut core::ffi::c_void,
+    _length: u32,
+) {
+    if status != WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER || info.is_null() {
+        return;
+    }
+    let text = unsafe { wide_to_string(info.cast::<u16>()) };
+    WATCH.with(|w| {
+        let mut w = w.borrow_mut();
+        let Some(watch) = w.as_mut() else {
+            return;
+        };
+        watch.seen = true;
+        if watch.refused.is_none() {
+            if let Err(fault) = verdict_of_text(&text, watch.provenance) {
+                watch.refused = Some((text, fault));
+            }
+        }
+    });
+}
+
+/// Read a NUL-terminated UTF-16 string WinHTTP owns. Bounded, because a missing terminator must not
+/// walk the heap.
+unsafe fn wide_to_string(ptr: *const u16) -> String {
+    let mut len = 0usize;
+    while len < 256 && unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
 /// The most body this will accumulate. `lokiwire::Limits` caps the parse; this caps the read, so a
 /// server that streams for ever is stopped before the parser is ever asked.
 pub const MAX_RESPONSE: usize = 64 * 1024 * 1024;
 
+const WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER: u32 = 0x0000_0020;
+const WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS: u32 = 0xffff_ffff;
+/// `WINHTTP_INVALID_STATUS_CALLBACK` — what `WinHttpSetStatusCallback` returns on failure.
+const INVALID_STATUS_CALLBACK: usize = usize::MAX;
 const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
 const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
 const WINHTTP_OPTION_DISABLE_FEATURE: u32 = 63;
@@ -240,19 +341,35 @@ const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 /// `token` is attached as a bearer credential for this call only. The caller is responsible for
 /// having checked, through `loki::Origin::may_connect_to`, that the address this resolves to is one
 /// §7 permits — this function performs the request it is given and does not re-litigate it.
-pub fn send(request: &Request, token: Option<&str>) -> Result<Answer, NetFault> {
+pub fn send(
+    request: &Request,
+    provenance: Provenance,
+    token: Option<&str>,
+) -> Result<Answer, NetFault> {
     let api = winhttp().ok_or(NetFault::NoTransport)?;
     let target = Target::parse(&request.url).ok_or(NetFault::Failed {
         during: "reading the URL",
         code: 0,
     })?;
 
+    let _watching = Watching::begin(provenance);
     let session = Session::open(api)?;
+    session.watch()?;
     let connection = session.connect(&target)?;
     let call = connection.request(&target, request.method)?;
     call.disable_redirects()?;
-    call.send(request, token)?;
+
+    // The send is where the address is resolved and connected to, so the refusal check comes
+    // straight after it and **before** anything is read.
+    let sent = call.send(request, token);
+    if let Some((address, fault)) = Watching::refusal() {
+        return Err(NetFault::Refused { address, fault });
+    }
+    sent?;
     call.receive()?;
+    if let Some((address, fault)) = Watching::refusal() {
+        return Err(NetFault::Refused { address, fault });
+    }
 
     let status = call.status()?;
     if (300..400).contains(&status) {
@@ -262,6 +379,39 @@ pub fn send(request: &Request, token: Option<&str>) -> Result<Answer, NetFault> 
         status,
         body: call.read_body()?,
     })
+}
+
+/// Installs the per-request watch and takes it down again however the request ends.
+struct Watching;
+
+impl Watching {
+    fn begin(provenance: Provenance) -> Watching {
+        WATCH.with(|w| {
+            *w.borrow_mut() = Some(Watch {
+                provenance,
+                refused: None,
+                seen: false,
+            });
+        });
+        Watching
+    }
+
+    fn refusal() -> Option<(String, AddressFault)> {
+        WATCH.with(|w| w.borrow().as_ref().and_then(|watch| watch.refused.clone()))
+    }
+
+    /// Whether any address was reported at all. Used by the tests; a request that connected without
+    /// the watch ever firing would mean the notification is not arriving and the check is dead.
+    #[cfg(test)]
+    fn saw_an_address() -> bool {
+        WATCH.with(|w| w.borrow().as_ref().is_some_and(|watch| watch.seen))
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        WATCH.with(|w| *w.borrow_mut() = None);
+    }
 }
 
 /// A URL split into the pieces WinHTTP wants separately.
@@ -354,6 +504,23 @@ impl Session {
             )
         };
         Ok(session)
+    }
+
+    /// Ask WinHTTP to report what it is connecting to, so §7's address check can be made against
+    /// the address actually used rather than one resolved separately.
+    fn watch(&self) -> Result<(), NetFault> {
+        let previous = unsafe {
+            (self.0.api.set_status_callback)(
+                self.0.handle,
+                Some(watch_connection),
+                WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS,
+                0,
+            )
+        };
+        if previous == INVALID_STATUS_CALLBACK {
+            return Err(failure("watching the connection"));
+        }
+        Ok(())
     }
 
     fn connect(&self, target: &Target) -> Result<Connection, NetFault> {
@@ -571,6 +738,65 @@ mod tests {
         assert!(!Target::parse("ws://h/x").expect("ws").secure);
         assert!(Target::parse("ftp://h/x").is_none(), "and nothing else is");
         assert!(Target::parse("not a url").is_none());
+    }
+
+    /// **§7's rebinding check, over the text WinHTTP hands its callback.**
+    ///
+    /// The callback's only job is to pass this string along; everything that decides lives here,
+    /// which is why the decision has tests and the callback does not need one.
+    #[test]
+    fn the_address_winhttp_reports_is_judged_by_the_same_policy_as_any_other() {
+        // Refused under both provenances — these are never a Loki.
+        for text in [
+            "169.254.169.254",
+            "169.254.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+        ] {
+            assert!(
+                verdict_of_text(text, Provenance::Typed).is_err(),
+                "{text} was allowed"
+            );
+            assert!(
+                verdict_of_text(text, Provenance::Imported).is_err(),
+                "{text}"
+            );
+        }
+        // The whole point of doing this at connect time: a name that resolved to loopback.
+        assert_eq!(verdict_of_text("127.0.0.1", Provenance::Typed), Ok(()));
+        assert!(verdict_of_text("127.0.0.1", Provenance::Imported).is_err());
+        // And the long way round, which is what a rebinding attack would try.
+        assert!(verdict_of_text("::ffff:169.254.169.254", Provenance::Typed).is_err());
+        assert_eq!(verdict_of_text("93.184.216.34", Provenance::Typed), Ok(()));
+    }
+
+    /// WinHTTP surrounds the address with nothing in particular, and a notification that is not an
+    /// address at all is not evidence of anything — it must not be read as a refusal *or* silently
+    /// treated as an approved address.
+    #[test]
+    fn a_notification_that_is_not_an_address_decides_nothing() {
+        assert_eq!(verdict_of_text("  10.1.2.3  ", Provenance::Typed), Ok(()));
+        assert_eq!(verdict_of_text("not-an-address", Provenance::Typed), Ok(()));
+        assert_eq!(verdict_of_text("", Provenance::Typed), Ok(()));
+    }
+
+    /// The watch is per-request and must not leak into the next one: a refusal recorded for one
+    /// call would otherwise refuse a later, innocent call on the same thread.
+    #[test]
+    fn a_watch_is_torn_down_however_the_request_ends() {
+        {
+            let _watching = Watching::begin(Provenance::Imported);
+            WATCH.with(|w| {
+                w.borrow_mut().as_mut().unwrap().refused =
+                    Some(("127.0.0.1".to_owned(), AddressFault::Loopback));
+            });
+            assert!(Watching::refusal().is_some());
+        }
+        assert!(
+            Watching::refusal().is_none(),
+            "the refusal outlived the request it belonged to"
+        );
+        assert!(!Watching::saw_an_address());
     }
 
     /// **The transport must not be in the process merely because this module is compiled in.**
