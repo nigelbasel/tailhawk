@@ -1,6 +1,85 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-28, session 30: three reports answered, and the Loki transport written
+## ▶ Resume point — 2026-08-28, session 30: native tabs, and a UI direction awaiting the owner
+
+**Master is `a5229b3`, tree clean, CI green by SHA on every commit, 897 tests, clippy `-D warnings`
+and `cargo fmt --check` clean.**
+
+> **Theseus reads a dated status file, not this one.** `SESSION-STATUS-2026-08-28-tailhawk-9e.md` at
+> the repository root carries the same state in one self-contained page and is git-ignored. **This
+> file remains the committed record and the long history.**
+
+### The one thing to do first: the owner is choosing a UI direction
+
+He asked, at the end of the session, for ideas to *"make the ui feel clean and modern"* — explicitly
+inviting departures from the spec — and called Hoo WinTail's arrangement toolbar *"a bit clunky"*.
+
+**What he specified, and it is worth keeping:** minimise / maximise / close at the far right,
+preferably on the **tab bar** rather than the menu bar, with **un-maximising a tab reverting to
+arranged windows and maximising an arranged window going back to tabs**.
+
+**What was recommended, and why it is not plain MDI.** The maximised ↔ restored model is kept, but
+"restored" means **docked split panes** rather than floating children: the same power, no
+overlapping-window management, already what §1069 reaches for with "drag-out-to-split", and it
+avoids a real cost — **floating children would each need their own swapchain**, turning one renderer
+into many. Four ideas were offered (drag-out-to-split with drop guides; one layout button in the tab
+strip's corner with Snap-Layouts-style pictograms; keyboard-first arrangement; and polish — Mica and
+rounded corners, scrolling tab overflow, a live status bar). **He has not answered.**
+
+> If he genuinely wants floating, overlappable windows, that is real MDI and is buildable — at a
+> swapchain per child, giving up the tiling model the spec is built on. **Ask; do not infer it from
+> the word "MDI".**
+
+### What the owner confirmed on screen
+
+**The tabs are native** — `SysTabControl32`, with the band height asked of the control through
+`TCM_ADJUSTRECT` rather than the drawn strip's `chrome_h + 4.0`, which was four pixels around a text
+run and was the "a bit small" he reported. He did not report flicker or overpaint, which is
+reasonable but **not explicit** evidence that `WS_CLIPCHILDREN` composites correctly over the
+`FLIP_DISCARD` swapchain. **That question gates the toolbar and any arrangement work — confirm it
+explicitly before betting a design on it.**
+
+**`Format ▸ Define from a line` now works** — and this must not be recorded as a fix. `c46baa1` only
+added a diagnostic and changed no behaviour. Either the cause was always the stale `Program Files`
+install he had been testing (a build from 2026-08-26, predating every change), or something on the
+27th–28th fixed it incidentally. **No cause was found and none should be claimed.** The eliminations
+stand: id, register, popup refill, `WM_MENUCOMMAND`, and the `WM_COMMAND` guard.
+
+### Debt this session created, and did not clear
+
+`Hit::Tab` and `BarDrag::Tab` in `main.rs` are now **unreachable** — nothing pushes `Hit::Tab` into
+the chrome hit list since the strip stopped being drawn. Drag-to-reorder was rebuilt on the control
+itself (`a5229b3`), so this is dead code the conversion orphaned. It was left for a separate careful
+pass rather than risking the chip-dragging that shares those paths. `Chrome::strip_height` is **not**
+dead: the footer band still uses it.
+
+### Two lessons from today worth not relearning
+
+**Clippy caught `WM_NOTIFY` binding as a variable** in a `match` pattern because it was not
+imported — so it matched every message the window received. This codebase already documents that
+exact trap for `BN_CLICKED` and `VK_UP`. Third occurrence, found by a lint this time.
+
+**Most of a day was spent on evidence from a stale install.** Deploying to `C:\Program Files` is
+on-request only; builds land in `target\release\`. Check what is actually running before trusting a
+report about "the latest".
+
+### The Loki source
+
+Stage 1's pure half and the transport are complete: `loki.rs`, `lokiwire.rs` (parser **and** CLEF
+spill), `net.rs` (WinHTTP by `LoadLibraryW`, redirects off, no WPAD, TLS 1.2/1.3, token as a
+parameter, and §7's rebinding check against the address WinHTTP actually connects to). §13.2's spill
+clause now covers credentialed remote data.
+
+**Next is the caller** — dialog → fetch → spill → document — which is the commit that must add
+`winhttp.dll` to CI's allow-list **and reword `SPEC.md` §13.2 in the same change**.
+
+**Still blocked on the owner:** no `telemetry:read` credential on this machine, the `az`
+service-principal secret is expired, and the telemetry MCP carries a *role* where the Loki route
+checks the *scope*.
+
+---
+
+## Resume point — 2026-08-28, session 30: three reports answered, and the Loki transport written
 
 ### Later the same day: the transport, the spill, and a question worth asking first
 
