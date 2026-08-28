@@ -281,6 +281,127 @@ impl fmt::Display for WireFault {
     }
 }
 
+/// One record as a **CLEF NDJSON** line, without its newline.
+///
+/// `LOKI.md` §4 spills a materialised window to CLEF so that the line index, the format detector
+/// and the grid read a Loki source with no new document type behind them. This is that conversion.
+///
+/// **The field order is dictated by `format.rs`'s own `ndjson` pattern, which matches `@t`, then
+/// `@l`, then `@m` sequentially.** A spill written in any other order would be a file Tailhawk
+/// could not recognise as the format it had just produced — so the order here is a contract with
+/// the detector rather than a preference, and the test that guards it runs the real detector
+/// instead of comparing against an expected string.
+///
+/// `@m` and not `@mt`: Loki hands over a rendered line, and calling it a message *template* would
+/// be a small untruth in a field other tools read. Labels follow, except the `__`-prefixed ones §2
+/// suppresses — Loki's own sharding bookkeeping, which the owner's deployment really does send.
+pub fn clef_line(entry: &Entry, interner: &Interner) -> String {
+    let mut out = String::with_capacity(entry.line.len() + 96);
+    out.push_str("{\"@t\":\"");
+    out.push_str(&rfc3339_nanos(entry.timestamp));
+    out.push('"');
+    if let Some(level) = entry.level(interner) {
+        out.push_str(",\"@l\":\"");
+        json_escape_into(&mut out, level);
+        out.push('"');
+    }
+    out.push_str(",\"@m\":\"");
+    json_escape_into(&mut out, &entry.line);
+    out.push('"');
+    for (key, value) in &entry.labels {
+        let (Some(key), Some(value)) = (interner.text(*key), interner.text(*value)) else {
+            continue;
+        };
+        if key.starts_with("__") || key == "level" {
+            continue;
+        }
+        out.push_str(",\"");
+        json_escape_into(&mut out, key);
+        out.push_str("\":\"");
+        json_escape_into(&mut out, value);
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
+/// A whole batch as CLEF NDJSON, one record per line, newline-terminated.
+pub fn clef_spill(batch: &Batch) -> String {
+    let mut out = String::new();
+    for entry in &batch.entries {
+        out.push_str(&clef_line(entry, &batch.interner));
+        out.push('\n');
+    }
+    out
+}
+
+impl Entry {
+    /// The record's level word, from whichever label carries it.
+    ///
+    /// `level` is what the owner's deployment indexes; `severity_text` is what `LOKI.md` §2 says an
+    /// OTLP-native Loki puts in structured metadata; `detected_level` is Loki's own guess. They are
+    /// tried in that order — measured first, documented second, inferred last.
+    pub fn level<'a>(&self, interner: &'a Interner) -> Option<&'a str> {
+        ["level", "severity_text", "detected_level"]
+            .into_iter()
+            .find_map(|key| self.label(interner, key))
+    }
+}
+
+fn json_escape_into(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// A nanosecond instant as RFC 3339 in UTC, to the nanosecond.
+///
+/// **The precision is kept deliberately.** §2 calls Loki's timestamp the best input the product
+/// will ever get — nanosecond, UTC, from the emitting process — and rounding it to milliseconds on
+/// the way through the spill would throw away the one thing a remote source has over a local file.
+fn rfc3339_nanos(ns: Nanos) -> String {
+    let (secs, sub) = (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000));
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{sub:09}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+/// Days since the Unix epoch back to a civil date — the inverse of `filter.rs`'s
+/// `days_from_civil`, and tested by round-tripping against it rather than against copied answers.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_shifted = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_shifted + 2) / 5 + 1) as u32;
+    let month = if month_shifted < 10 {
+        month_shifted + 3
+    } else {
+        month_shifted - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 /// Make a scrap of server text safe to put in front of a person, and short enough to fit.
 ///
 /// **This is the one place in this module where server text is sanitised, and the exception proves
@@ -1309,6 +1430,136 @@ mod tests {
         };
         assert!(status.chars().count() <= MAX_SAID + 1, "{}", status.len());
         assert!(status.ends_with('…'));
+    }
+
+    /// **The spill is read back by the detector that will actually read it.**
+    ///
+    /// `format.rs`'s `ndjson` pattern matches `@t`, then `@l`, then `@m` *sequentially*, so a spill
+    /// with the fields in any other order would be a file Tailhawk could not recognise as the
+    /// format it had just written — and an assertion against an expected string would pass while
+    /// that was true. So the oracle is the real format.
+    #[test]
+    fn a_spilled_record_is_read_back_by_the_real_detector() {
+        let batch = read(MEASURED);
+        let line = clef_line(&batch.entries[0], &batch.interner);
+        let ndjson = crate::format::by_id("ndjson").expect("the format the spill targets");
+
+        assert!(
+            ndjson.is_first_line(&line),
+            "the detector does not claim {line}"
+        );
+        let record = ndjson.parse(&line).expect("and cannot read it");
+        assert_eq!(
+            record.severity_number.map(crate::record::Severity::get),
+            Some(17),
+            "Error came back through the spill"
+        );
+
+        // The contract, stated directly as well as exercised: the pattern matches these three in
+        // this order, so their positions in the text are the thing that must not drift.
+        let at = |needle: &str| {
+            line.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {line}"))
+        };
+        assert!(
+            at("\"@t\"") < at("\"@l\"") && at("\"@l\"") < at("\"@m\""),
+            "@t, then @l, then @m — the detector reads them sequentially: {line}"
+        );
+    }
+
+    #[test]
+    fn a_spilled_record_carries_the_timestamp_to_the_nanosecond() {
+        let batch = read(MEASURED);
+        let line = clef_line(&batch.entries[0], &batch.interner);
+        // 1_724_750_000_000_000_001 ns — the trailing 1 ns is the point.
+        assert!(
+            line.contains("\"@t\":\"2024-08-27T09:13:20.000000001Z\""),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_spill_drops_lokis_own_bookkeeping_and_keeps_the_rest() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"app":"checkout","__stream_shard__":"3","level":"error"},
+                  "values":[["1","went wrong"]]}]}}"#,
+        );
+        let line = clef_line(&batch.entries[0], &batch.interner);
+        assert!(
+            !line.contains("__stream_shard__"),
+            "§2 suppresses these: {line}"
+        );
+        assert!(line.contains("\"app\":\"checkout\""), "{line}");
+        assert!(line.contains("\"@l\":\"error\""), "{line}");
+        assert_eq!(
+            line.matches("level").count(),
+            0,
+            "the level is @l and is not repeated as a label: {line}"
+        );
+    }
+
+    #[test]
+    fn a_message_that_would_break_the_json_is_escaped() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"app":"x"},"values":[["1","he said \"no\" and\nleft\ttoday"]]}]}}"#,
+        );
+        let line = clef_line(&batch.entries[0], &batch.interner);
+        let ndjson = crate::format::by_id("ndjson").expect("ndjson");
+        assert!(
+            ndjson.is_first_line(&line),
+            "an escaped message still parses as one line: {line}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "a raw newline would split the record in two"
+        );
+    }
+
+    #[test]
+    fn a_batch_spills_one_line_per_record() {
+        let batch = read(MEASURED);
+        let spill = clef_spill(&batch);
+        assert_eq!(spill.lines().count(), batch.entries.len());
+        assert!(
+            spill.ends_with('\n'),
+            "every record is terminated, including the last"
+        );
+    }
+
+    /// The inverse of `filter.rs`'s `days_from_civil`, checked against it rather than against a
+    /// table of answers copied from somewhere — a copied table can be wrong in the same way twice.
+    #[test]
+    fn a_day_number_and_a_civil_date_agree_in_both_directions() {
+        for day in [
+            -25_567_i64,
+            -1,
+            0,
+            1,
+            11_016,
+            11_017,
+            20_000,
+            30_000,
+            40_000,
+        ] {
+            let (y, m, d) = civil_from_days(day);
+            assert_eq!(
+                crate::filter::days_from_civil(y, i64::from(m), i64::from(d)),
+                Some(day),
+                "{day} became {y:04}-{m:02}-{d:02}, which is a different day"
+            );
+        }
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29), "a leap day");
+    }
+
+    /// An instant before the epoch is not a Loki timestamp, but the arithmetic must not produce
+    /// nonsense if one arrives — `div_euclid` rather than `/` is the whole reason.
+    #[test]
+    fn an_instant_before_the_epoch_still_formats_as_a_real_time() {
+        let text = rfc3339_nanos(-1);
+        assert_eq!(text, "1969-12-31T23:59:59.999999999Z");
     }
 
     #[test]

@@ -1060,7 +1060,7 @@ fn take_two(rest: &mut &str) -> Option<i64> {
 /// divisible by 4 and not by 100, or divisible by 400; shifting the year to start in March puts the
 /// leap day last, which is what makes the month-length run expressible in closed form. `days_and_the_
 /// epoch_agree_on_known_dates` pins it against dates whose day numbers are independently known.
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     if day > days_in_month(year, month) {
         return None;
     }
