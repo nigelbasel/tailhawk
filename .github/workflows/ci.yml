@@ -159,12 +159,23 @@ jobs:
       #      leaves winhttp.dll absent from the process module list. That is what keeps the
       #      *conditional* form of the claim - "unless the user explicitly opens a remote source"
       #      - checkable rather than merely asserted.
+      # $control is the positive control, and without one this step is worth very little. A scan
+      # that found nothing because its regex was wrong, or because it read the wrong encoding, would
+      # report "zero network" for ever and look exactly like a scan that found nothing because there
+      # is nothing to find. uxtheme.dll is reached through LoadLibraryW rather than the import table
+      # - so proving the scan sees *it* proves the scan can see a dynamically loaded transport too,
+      # which is the only kind a socket would arrive by now that the import table is checked.
       - name: Assert no network capability
         shell: pwsh
         run: |
           $exe = "target/${{ matrix.target }}/release/tailhawk.exe"
           $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
           $dlls = [regex]::Matches($ascii, '[A-Za-z0-9_\-\.]+\.dll') | ForEach-Object { $_.Value.ToLower() } | Sort-Object -Unique
+          $control = 'uxtheme.dll'
+          if (-not ($dlls -match [regex]::Escape($control))) {
+            throw "the scan cannot see $control, which this binary certainly loads - it is reading the wrong thing, and its 'no transport' answer means nothing"
+          }
+          "positive control: the scan sees $control, which is loaded dynamically rather than imported"
           $transports = 'winhttp|wininet|urlmon|ws2_32|wsock32|mswsock|winsock|dnsapi|httpapi|webservices|winnetwk'
           $allowed = @()
           $found = $dlls | Where-Object { $_ -match $transports } | Where-Object { $allowed -notcontains $_ }
