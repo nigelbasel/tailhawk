@@ -3601,6 +3601,29 @@ impl Tabs {
         self.active = self.tabs.len() - 1;
     }
 
+    /// Moves a tab to another slot, keeping the same document shown.
+    ///
+    /// **The active index follows the document, not the position.** Dragging the tab you are
+    /// reading must not switch you to a different file, and dragging some *other* tab past yours
+    /// must not either — both are what a naive `active = to` would do.
+    fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = if self.active == from {
+            to
+        } else if from < self.active && self.active <= to {
+            self.active - 1
+        } else if to <= self.active && self.active < from {
+            self.active + 1
+        } else {
+            self.active
+        };
+        true
+    }
+
     /// Adds a second pane under the shown tab's, and focuses it. A tab already split is left as
     /// it is.
     fn split(&mut self, doc: Document) -> bool {
@@ -8775,6 +8798,27 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 });
                 if let Some(tree) = tree {
                     menubar::refill_popup(popup, &tree, top as usize);
+                }
+            }
+            LRESULT(0)
+        }
+        // A tab was dragged onto another's place. The control does not reorder itself — the shell
+        // owns the document order, and the strip is rebuilt from it next frame, so the two cannot
+        // end up disagreeing about which tab is which.
+        tabstrip::WM_TAB_MOVED => {
+            let moved = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| shell.document.move_tab(wparam.0, lparam.0 as usize))
+            });
+            if moved {
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        shell.retitle(hwnd);
+                    }
+                });
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
             }
             LRESULT(0)

@@ -51,6 +51,91 @@ const TCS_FOCUSNEVER: u32 = 0x0000_8000;
 /// The id the control answers to in `WM_NOTIFY`, so the shell can tell it from any other child.
 pub const ID_TABS: i32 = 4_100;
 
+const TCM_HITTEST: u32 = TCM_FIRST + 13;
+
+/// Posted to the parent when a tab is dragged onto another's place: `wparam` is where it came
+/// from, `lparam` where it now belongs. The shell owns the document order, so the control asks
+/// rather than reorders — reordering the control alone would put the strip and the documents into
+/// different orders, which is the same class of lie as a stale menu tick.
+pub const WM_TAB_MOVED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x40;
+
+/// `TCHITTESTINFO`, laid out by hand beside [`TcItem`] for the same reason.
+#[repr(C)]
+struct TcHitTest {
+    pt: windows::Win32::Foundation::POINT,
+    flags: u32,
+}
+
+thread_local! {
+    /// Which tab the pointer went down on, while a drag is in progress.
+    static DRAGGING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Which tab is under a point in the control's own client coordinates.
+fn tab_at(hwnd: HWND, x: i16, y: i16) -> Option<usize> {
+    let mut hit = TcHitTest {
+        pt: windows::Win32::Foundation::POINT {
+            x: i32::from(x),
+            y: i32::from(y),
+        },
+        flags: 0,
+    };
+    let at = unsafe {
+        SendMessageW(
+            hwnd,
+            TCM_HITTEST,
+            WPARAM(0),
+            LPARAM(&mut hit as *mut TcHitTest as isize),
+        )
+    };
+    usize::try_from(at.0).ok()
+}
+
+/// Drag-to-reorder, which `SPEC.md` §1069 asks for and a tab control does not provide.
+///
+/// **Live reordering, as a browser does it**, rather than a drop at the end: the tab follows the
+/// pointer, so the order you can see is the order you will get. The control is not touched here —
+/// the shell is told, and the next frame rebuilds the strip from the new document order, so the
+/// strip cannot end up in a different order from the documents it names.
+unsafe extern "system" fn drag_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    let x = (lparam.0 & 0xFFFF) as i16;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i16;
+    match msg {
+        WM_LBUTTONDOWN => DRAGGING.with(|d| d.set(tab_at(hwnd, x, y))),
+        WM_MOUSEMOVE if wparam.0 & 0x0001 != 0 => {
+            let from = DRAGGING.with(|d| d.get());
+            if let (Some(from), Some(to)) = (from, tab_at(hwnd, x, y)) {
+                if from != to {
+                    DRAGGING.with(|d| d.set(Some(to)));
+                    let parent =
+                        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) };
+                    if let Ok(parent) = parent {
+                        unsafe {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                parent,
+                                WM_TAB_MOVED,
+                                WPARAM(from),
+                                LPARAM(to as isize),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        WM_LBUTTONUP => DRAGGING.with(|d| d.set(None)),
+        _ => {}
+    }
+    unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
 /// Windows' tab control, holding one item per open document.
 pub struct TabStrip {
     hwnd: HWND,
@@ -100,6 +185,15 @@ impl TabStrip {
         // not something this module can fix without drawing the tabs again.
         unsafe {
             let _ = SetWindowTheme(hwnd, w!("DarkMode_Explorer"), PCWSTR::null());
+        }
+        // §1069's drag-to-reorder, which the control has no notion of.
+        unsafe {
+            let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+                hwnd,
+                Some(drag_proc),
+                ID_TABS as usize,
+                0,
+            );
         }
         Some(TabStrip {
             hwnd,
