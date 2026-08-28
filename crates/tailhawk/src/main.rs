@@ -22,6 +22,13 @@ mod filterpanel;
 mod icon;
 mod keymap;
 mod menubar;
+/// The Loki transport. **Nothing calls it yet** — the source that will is the next slice — so the
+/// unused warnings are suppressed here, at the declaration, where the fact is visible rather than
+/// buried in the module. Its own tests exercise the URL splitting, and the delay-load discipline
+/// that `SPEC.md` §13.2 rests on is asserted by a test that would fail the moment anything linked
+/// it in.
+#[allow(dead_code)]
+mod net;
 mod prefs;
 mod version;
 
