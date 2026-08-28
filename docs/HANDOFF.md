@@ -1,8 +1,55 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-28, session 30: the owner's three reports, answered two and a half
+## ▶ Resume point — 2026-08-28, session 30: three reports answered, and the Loki transport written
 
-**Master is `5ea6035`, tree clean, CI green by SHA on every commit, 881 tests, clippy `-D warnings`
+### Later the same day: the transport, the spill, and a question worth asking first
+
+Four more commits after the three UI fixes, all green by SHA.
+
+**`52f7af1` — the zero-network CI assertion given a positive control, deliberately *before* any
+network code**, because that is the only moment it can be done honestly. The step scans the image
+for transport DLL names, and a scan broken by a wrong regex or the wrong encoding would report
+"zero network" for ever while looking exactly like a scan that found nothing because there is
+nothing to find. It now proves it can see `uxtheme.dll` first — reached through `LoadLibraryW`
+rather than the import table, so seeing *it* demonstrates the scan catches a dynamically loaded
+transport. Checked both directions: the control passes on the real binary and **trips** when the
+same scan is pointed at a UTF-16 decode, which finds zero DLL names.
+
+**`38e6876` — `net.rs`, the transport**, and the first network code the product has had. WinHTTP
+through `LoadLibraryW`, never a link: the `windows` crate's own bindings are refused on purpose
+because they emit a *static import*, which would put `winhttp.dll` in every process and make
+§13.2's conditional claim unwritable. Three of §7's warnings are settled in code rather than
+remembered — redirects disabled, the machine's configured proxy rather than WPAD auto-detect with
+the auto-logon flag unset, and the token passed as a parameter so no transport state can be dumped
+with a credential in it.
+
+> **Measured, and it is the better answer.** The release linker **dead-strips the whole module**,
+> because nothing reachable calls it: `winhttp.dll` and `WinHttpOpen` are **absent** from the
+> shipped binary. The zero-network claim stays *absolute*, and CI's allow-list needs no edit today —
+> it needs one the day a caller lands, which is exactly when that gate should trip.
+
+**`501426c` — the CLEF spill.** §4 materialises a window to CLEF NDJSON so the existing line index,
+format detector and grid read a Loki source with **no new document type**. The test is the point:
+`format.rs`'s `ndjson` pattern matches `@t`, then `@l`, then `@m` *sequentially*, so a spill in any
+other order would be a file Tailhawk could not recognise as the format it had just written — and an
+expected-string assertion would pass while that was true. So the oracle is the **real detector**.
+One mutation correctly did *not* fail: renaming `@l` to `lvl` still passes, because the pattern
+genuinely accepts `level|lvl|severity|@l`. A test that failed there would have been asserting a
+spelling rather than a contract. The timestamp keeps its nanoseconds, which needed the inverse of
+`filter.rs`'s `days_from_civil` — now `pub(crate)` so the new direction round-trips against the
+tested one rather than against a copied table.
+
+**`03a96e5` — a question surfaced rather than decided.** §7 requires the resolved address to be
+re-checked at connect time against rebinding; `address_verdict` is written and tested for exactly
+that, but WinHTTP resolves internally and hands back no `IpAddr`, and **nothing in this tree
+resolves a name at all today**. Three options are recorded in `LOKI.md` §9 with a recommendation —
+`WinHttpSetStatusCallback`, because it is the only one where the address checked and the address
+connected to are the same address, which is the entire content of a rebinding check. Resolving
+ourselves would need `GetAddrInfoW` from **`ws2_32.dll`**, a DLL the network assertion bans by name,
+and would resolve twice. **This blocks the caller slice and wants the owner's eye first.**
+
+
+**Master is `03a96e5`, tree clean, CI green by SHA on every commit, 894 tests, clippy `-D warnings`
 and `cargo fmt --check` clean.** A current release binary sits at `target/release/tailhawk.exe`.
 
 > **Theseus reads a dated status file, not this one.** `SESSION-STATUS-<date>-tailhawk-9e.md` at the
