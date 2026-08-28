@@ -6,3 +6,8 @@
 
 # The agent activity log — a running record for the owner to tail, not history.
 logs/
+
+# Theseus writes a dated status file per stopping point, named for the workstream key.
+# `docs/HANDOFF.md` is the committed record; these are tooling state and do not belong in a
+# public repository's root.
+SESSION-STATUS-*.md

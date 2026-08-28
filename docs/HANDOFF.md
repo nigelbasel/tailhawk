@@ -1,6 +1,108 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-08-27, session 29: Loki's pure half is built, and the estate answered §9
+## ▶ Resume point — 2026-08-28, session 30: the owner's three reports, answered two and a half
+
+**Master is `5ea6035`, tree clean, CI green by SHA on every commit, 881 tests, clippy `-D warnings`
+and `cargo fmt --check` clean.** A current release binary sits at `target/release/tailhawk.exe`.
+
+> **Theseus reads a dated status file, not this one.** `SESSION-STATUS-<date>-tailhawk-9e.md` at the
+> repository root carries the same state in one self-contained page, because `HandoffPath.For`
+> prefers a file whose *name* carries the workstream key. It is git-ignored — tooling state, not
+> project documentation. **This file remains the committed record and the long history.**
+
+### The two grid defects the owner reported, and where each stands
+
+**Fixed — the caret's row is now marked (`c227d5f`).** Not a painting bug: a single click sets an
+*empty* selection, and an empty selection selects nothing, so `row_selection` returned `None` and
+the painter was correctly asked to draw nothing. What made it worth more than cosmetics is that
+this row is what `Ctrl+D`, the bookmark steps and §6.2's `Define format from a line` all act on —
+it had been deciding those with nothing on screen to say where it was, so *"which line will this
+act on?"* was unanswerable before acting. `RowSource::caret_row` is answered by
+`Document::current_row`, **the same call those commands make**, so the marker cannot form a second
+opinion about the same row. It is a rule above and below rather than a fill, because a fill would
+compete with the selection's fill for the same pixels, and under High Contrast the only fill in the
+palette is `highlight` — which *is* the selection.
+
+**Still open — `Format ▸ Define from a line` opens nothing, and was never reproduced.** Two
+suspects were *eliminated* by reading, and the first was this file's own leading theory:
+
+- **A malformed template is now the weak suspect.** `every_item_is_dword_aligned_and_carries_its_
+  class_ordinal_or_name` already walks the **real** Define Format template — and Import, Filter,
+  Rules and Go to line — so a miscount would fail a test rather than swallow a dialog.
+- **Dispatch is sound.** `command_id` returns a position in the register, a small integer nowhere
+  near `ID_FORMAT_BASE`, so the format-candidate arm claiming a 64-wide id range cannot be eating
+  it.
+
+What was done instead (`c46baa1`) makes the next attempt diagnostic rather than silent:
+`DialogBoxIndirectParamW` returns `-1` and shows nothing when it refuses a template, and **every
+call site discarded that return value**, so a refusal and a user pressing Cancel were
+indistinguishable. Both format dialogs now return `Result<bool, String>` and the reason reaches the
+status bar. Choosing the item on the current binary gives one of three answers — the dialog, *"the
+dialog could not be opened (error N)"*, or *"no line to define a format from"* — and each points
+somewhere different.
+
+> **Permission to run `tools/verify-dialogs.ps1 -Only Format` was asked for twice and never given.**
+> It needs no foreground, but single-instance forwarding may hand its launch to the owner's own open
+> window. Ask again rather than assuming.
+
+### The colour request, done (`7f1ddde`)
+
+*"The highlight view should show actual colours, not rgb values. Show a standard colour picker. if
+there is a windows one available just show that."*
+
+**The picker half was already right** — `rules_pick_colour` has run the real `ChooseColorW`
+full-open since the rules editor became a dialog — so only the display changed. The Colour cell
+holds a sample word painted in the rule's own colours through the list view's **own**
+`NM_CUSTOMDRAW`, so the row keeps its real selection highlight, themed grid lines and focus
+rectangle, and our part is two colours rather than a paint routine.
+
+Two traps worth not re-learning. Custom draw is answered **before** the `RULES_QUIET` guard — that
+guard exists to ignore selections *the dialog made itself*, and a repaint is not a selection, so
+suppressing it would leave the swatches grey for exactly as long as the list was being rebuilt. And
+the answer goes through **`DWLP_MSGRESULT`**: a dialog procedure's return value means "did I handle
+this", so returning the notify code directly reads as a plain `TRUE` and the subitem stage never
+arrives. `None` inside a swatch means "leave that half alone", so a foreground-only rule keeps the
+list's own background rather than a guessed white.
+
+### The real Loki, measured (`5ea6035`)
+
+The telemetry MCP reaches the owner's deployment, so two things stopped being assumptions. **No log
+content was read — labels and label values only.**
+
+- **Stream labels are only `app`, `environment`, `level`**, plus `__stream_shard__` — which §2's
+  suppression rule already names and is now confirmed really present. So §3's 5.4x amplification
+  comes from **structured metadata**, not from three indexed labels, which is why `lokiwire.rs`'s
+  interner is load-bearing rather than tidy.
+- **`level` is `trace, debug, info, warn, error, critical`** — six values, lower case, and **no
+  `fatal`**, so a rule written against `fatal` matches nothing in this estate. All six already
+  resolve, and that is now a test rather than a note: the deployment's Loki runs a **moving image
+  tag**, and an unresolved level does not fail loudly — the record simply becomes severity-unknown
+  and every severity-banded rule, colour and filter silently stops applying to it.
+
+### Next, in order
+
+1. **The Format dialog**, once the owner has run the current binary or allowed the harness.
+2. **The WinHTTP transport** — the first genuinely shell-side piece of the Loki source. It carries a
+   constraint from `1044e90` that must not be retrofitted: **WinHTTP is delay-loaded**, on first use
+   of a configured remote source and never at startup, so CI can keep asserting the *conditional*
+   privacy claim — after a local-file run, `winhttp.dll` is absent from the process module list.
+   Adding `winhttp.dll` to that CI step's allow-list also requires rewording `SPEC.md` §13.2 **in
+   the same commit**; the step's own comment says so.
+3. **Blocked, needs the owner:** no `telemetry:read` credential on this machine, the `az`
+   service-principal secret is **expired**, and the telemetry MCP does not help — it carries a
+   *role* while the Loki route checks the *scope*. Every estate example is `telemetry:write` (all
+   producers), so Tailhawk would be the first read consumer and the client registration probably has
+   to be **created**, which goes through the deploy pipeline.
+4. **Offered, not taken up:** pulling one real `query_range` response to validate the parser against
+   the live wire shape. It means reading actual log lines, so it was not done without asking.
+
+**None of the three UI changes has been seen running.** Each has tests and each decision was
+mutation-tested, but this project's own record is six defects in one week invisible to a passing
+suite — so "tested" and "works" stay different claims until someone looks.
+
+---
+
+## Resume point — 2026-08-27, session 29: Loki's pure half is built, and the estate answered §9
 
 **Read this before `SPEC.md`, `LOKI.md` or `PLAN.md`.** The owner has asked, in his words,
 "numerous times" to tail Loki logs from inside Tailhawk, and it kept being lost the same way: a
