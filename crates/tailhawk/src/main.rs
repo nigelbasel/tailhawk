@@ -30,6 +30,7 @@ mod menubar;
 #[allow(dead_code)]
 mod net;
 mod prefs;
+mod tabstrip;
 mod version;
 
 use std::cell::RefCell;
@@ -117,7 +118,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
     WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
+    WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
     WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL,
     WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
@@ -213,6 +214,9 @@ struct Document {
     /// The tab strip's labels and which is this document — set by the shell before each frame,
     /// because a document knows nothing of the others. Empty or one label: no strip.
     tab_strip: (Vec<String>, usize),
+    /// The height of the tab band in pixels, measured from the real control by the shell. Zero when
+    /// there is no strip. A document cannot ask the control itself: it does not own it.
+    strip_px: f32,
     /// The status bar's text — the title's status, set by the shell before each frame so the
     /// document can draw it in the footer band. The title keeps it too: the harnesses read it there.
     status: String,
@@ -438,30 +442,11 @@ impl RowSource for Document {
         // format is the Format menu. What remains of the top chrome is the tab strip.
         let chrome_h = painter.chrome_line_height();
         let pad = painter.chrome_measure("n").max(4.0);
-        let (labels, active) = &self.tab_strip;
-        if band > 0.0 && labels.len() > 1 {
-            painter.fill(0.0, 0.0, width, band, theme().chrome_bg);
-            let strip_h = Chrome::strip_height(chrome_h);
-            let ty = ((strip_h - chrome_h) / 2.0).floor();
-            let mut tx = pad * 0.5;
-            for (i, label) in labels.iter().enumerate() {
-                let w = painter.chrome_measure(label);
-                let bg = if i == *active {
-                    theme().tab_active_bg
-                } else {
-                    theme().tab_bg
-                };
-                painter.fill(tx - 2.0, 1.0, w + pad * 2.0 + 4.0, strip_h - 2.0, bg);
-                let ink = if i == *active {
-                    theme().ink
-                } else {
-                    theme().header_ink
-                };
-                painter.chrome_run(label, tx + pad, ty, ink);
-                hits.push((tx..tx + w + pad * 2.0, Hit::Tab(i)));
-                tx += w + pad * 3.0;
-            }
-        }
+        // **The tab strip is no longer drawn.** It is `SysTabControl32`, a real child window, and
+        // the band reserved for it here is left untouched so the control shows through — see
+        // `tabstrip.rs`. Painting anything into this band would draw over the control on the frames
+        // where the swapchain wins the race, which is the flicker this is deliberately avoiding.
+        let _ = (chrome_h, pad, band, width);
 
         // V10: the detail pane, above the status bar. The first line is the record's title; the
         // rest its fields, body and tail; a pane too short for them says how many are left.
@@ -761,6 +746,7 @@ impl Document {
             chrome: Chrome::default(),
             path: opened_from,
             tab_strip: (Vec::new(), 0),
+            strip_px: 0.0,
             status: String::new(),
             unseen: false,
             detection,
@@ -820,6 +806,7 @@ impl Document {
             chrome: Chrome::default(),
             path: opened_from,
             tab_strip: (Vec::new(), 0),
+            strip_px: 0.0,
             status: String::new(),
             unseen: false,
             detection,
@@ -875,8 +862,13 @@ impl Document {
         // §2.2 as resettled: the menu bar is non-client and the command row is gone, so the top
         // chrome is the tab strip alone — and nothing at all with a single tab, exactly as a
         // standard tabbed application draws itself.
+        // **The band is the tab control's own height, measured from it by the shell**, not a number
+        // chosen here. The drawn strip used `chrome_h + 4.0` — four pixels around a text run —
+        // which is exactly the "a bit small" the owner reported, and any constant put in its place
+        // would be the same mistake with a different value. A document knows nothing of the other
+        // tabs, so the shell hands this across each frame exactly as it hands the labels.
         let strip = if self.tab_strip.0.len() > 1 {
-            Chrome::strip_height(chrome_h)
+            self.strip_px
         } else {
             0.0
         };
@@ -3788,6 +3780,12 @@ enum Selecting {
 }
 
 struct Shell {
+    /// Windows' own tab control, across the top of the client area.
+    ///
+    /// `None` only if the control could not be created, which no supported Windows should do — the
+    /// strip is then simply absent rather than the window failing to open, because a viewer with no
+    /// tab strip still views.
+    tabs: Option<tabstrip::TabStrip>,
     /// The measured cell size, for the command bar's hit-test. Zero until the first frame.
     cell_w: f32,
     cell_h: f32,
@@ -4310,9 +4308,26 @@ impl Shell {
                 let chrome_h = renderer.chrome_line_height()?;
                 // The panes stack: the first carries the tab strip, the last the status bar.
                 let tops = pane_tops(h as f32, pane_count);
+                // The real control's band, asked of it once per frame and handed to the pane that
+                // carries the strip. Placed here too, because this is where the width is known.
+                let want_strip = strip.0.len() > 1;
+                let strip_px = match (self.tabs.as_mut(), want_strip) {
+                    (Some(tabs), true) => {
+                        tabs.set(&strip.0, strip.1);
+                        let band = tabs.band_height(w as i32);
+                        tabs.place(w as i32, band, true);
+                        band as f32
+                    }
+                    (Some(tabs), false) => {
+                        tabs.place(w as i32, 0, false);
+                        0.0
+                    }
+                    (None, _) => 0.0,
+                };
                 let panes = self.document.panes_mut();
                 for (i, doc) in panes.iter_mut().enumerate() {
                     let (top, height) = tops[i];
+                    doc.strip_px = if i == 0 { strip_px } else { 0.0 };
                     doc.tab_strip = if i == 0 {
                         strip.clone()
                     } else {
@@ -8764,6 +8779,34 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
             LRESULT(0)
         }
+        // The tab control telling us the shown tab changed. It is a real control, so the click,
+        // the keyboard and the accessibility path all arrive here as one notification rather than
+        // as three hit-tests we would have had to write.
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::NMHDR) };
+            if header.idFrom == tabstrip::ID_TABS as usize && header.code == tabstrip::TCN_SELCHANGE
+            {
+                let chosen = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|shell| shell.tabs.as_ref())
+                        .and_then(|tabs| tabs.selected())
+                });
+                if let Some(at) = chosen {
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            shell.document.active = at.min(shell.document.len().saturating_sub(1));
+                            shell.retitle(hwnd);
+                            shell.sync_scrollbar(hwnd);
+                        }
+                    });
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_COMMAND if (wparam.0 >> 16) & 0xFFFF == 0 && lparam.0 == 0 => {
             // The real menu chose an id; it routes through the same register and dispatch every
             // other surface uses, and a chosen dialog opens on this message, not the next one.
@@ -9257,6 +9300,7 @@ fn main() -> Result<()> {
     let chosen_face = settings.font.clone();
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
+            tabs: None,
             cell_w: 0.0,
             cell_h: 0.0,
             settings,
@@ -9334,6 +9378,23 @@ fn main() -> Result<()> {
     // §2.1: the frame follows the theme — a dark title bar under a dark theme, and Mica behind it.
     // Called before `SetMenu` below, so the bar Windows builds is born in the right mode.
     dress_frame(hwnd, theme().dark);
+
+    // The tab strip is Windows' own control, and the first child window this window has ever had.
+    // `WS_CLIPCHILDREN` is what keeps the swapchain from presenting over it — see `tabstrip.rs` for
+    // why a flip-model swapchain makes that necessary and what the fallback is if it is not enough.
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_CLIPCHILDREN,
+        };
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style | WS_CLIPCHILDREN.0) as isize);
+    }
+    let strip = tabstrip::TabStrip::create(hwnd, instance);
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            shell.tabs = strip;
+        }
+    });
 
     // §2.2 as resettled: the menu bar is Windows' own. Content is built once here; every popup is
     // refilled from the live document at the moment it opens, in `WM_INITMENUPOPUP`.
