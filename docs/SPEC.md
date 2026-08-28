@@ -1445,9 +1445,17 @@ and session IDs.
   will be sent**, and never contains buffered log content or full file paths without redaction.
 - **Tailhawk's own diagnostic log** is off by default, enabled by a flag, written exe-adjacent if
   writable else `%TEMP%`, opened from a UI action, and **never contains log file content**.
-- **stdin spill files** (§4.2) are created with a restrictive DACL in `%TEMP%`, deleted on clean exit,
-  and reaped on next launch if orphaned. The spill location is displayed in source properties, because
-  a user piping production logs deserves to know where they landed.
+- **Spill files** are created with a restrictive DACL in `%TEMP%`, deleted on clean exit, and reaped
+  on next launch if orphaned. The spill location is displayed in source properties, because a user
+  piping production logs deserves to know where they landed.
+
+  **This covers every spill, not only stdin's.** The clause was written for §4.2's pipe, and
+  `LOKI.md` §7 records that it has to reach **credentialed remote data** as well: a Loki window
+  materialises to a CLEF spill in the same `%TEMP%`, and those bytes were fetched with a bearer
+  token from a server the user does not own. If anything they are the more sensitive of the two —
+  a pipe's contents were already on the machine, and a Loki page was not. The mechanism is
+  deliberately the *same* `Spill` rather than a second one written to a similar standard, because
+  two implementations of one guarantee is how the weaker of them ships.
 
 ### 13.3 Updates
 

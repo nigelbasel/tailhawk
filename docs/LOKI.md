@@ -256,8 +256,13 @@ And a privacy clause §13.2 does not currently cover: until now Tailhawk's netwo
 which routinely contains customer identifiers — to a third party that logs it, in a URL, into every
 proxy access log on the path. Use the documented `POST` + form-encoded form of `query_range` for
 anything containing user-typed filter text. The headline promise survives; it needs a second
-sentence, not a rewording. Separately, §13.2's spill clause was written for stdin and must be
-extended to **credentialed remote data** landing in `%TEMP%`.
+sentence, not a rewording. ~~Separately, §13.2's spill clause was written for stdin and must be
+extended to **credentialed remote data** landing in `%TEMP%`.~~ **Done 2026-08-28** — §13.2 now
+covers every spill rather than stdin's, and says why a Loki page is the more sensitive of the two:
+a pipe's contents were already on the machine, a fetched page was not. The mechanism is deliberately
+the same `Spill` — restrictive DACL at creation, deleted on clean exit, orphans reaped — rather than
+a second one written to a similar standard, because two implementations of one guarantee is how the
+weaker of them ships.
 
 Finally: **the zero-network CI assertion must be rewritten before the HTTP code lands**, moving from
 "no sockets ever" to "no sockets unless a remote source is configured, and only to the configured
