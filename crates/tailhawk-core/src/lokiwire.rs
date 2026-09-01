@@ -312,7 +312,7 @@ pub fn clef_line(entry: &Entry, interner: &Interner) -> String {
         let (Some(key), Some(value)) = (interner.text(*key), interner.text(*value)) else {
             continue;
         };
-        if key.starts_with("__") || key == "level" {
+        if key.starts_with("__") || shadows_a_clef_field(key) {
             continue;
         }
         out.push_str(",\"");
@@ -323,6 +323,33 @@ pub fn clef_line(entry: &Entry, interner: &Interner) -> String {
     }
     out.push('}');
     out
+}
+
+/// Label names that carry a level, ordered measured-first, documented-second, inferred-last.
+///
+/// **The last two are here because `format.rs`'s `ndjson` reader accepts them**, not because Loki
+/// emits them. Its pattern reads `level|lvl|severity|@l`, and it scans a line for a timestamp, then
+/// a level, then a message, *in that order*. So a stream label spelled `severity` sitting after the
+/// message is read as the level, the message group then has nothing left to match, and the reader's
+/// fallback makes the body the entire raw JSON line — every row of that stream showing its own
+/// JSON. Naming a label the reader treats as a level and then not treating it as one is what
+/// produced that.
+const LEVEL_LABELS: [&str; 5] = [
+    "level",
+    "severity_text",
+    "detected_level",
+    "severity",
+    "lvl",
+];
+
+/// Label names the spill must not repeat after the message, because the reader would find them
+/// first and lose the message behind them.
+///
+/// A label named `msg` or `message` duplicates `@m`; one named `severity` or `lvl` is already
+/// written as `@l` by [`Entry::level`]. Emitting either again is at best redundant and at worst the
+/// bug above, so the tail carries neither.
+fn shadows_a_clef_field(key: &str) -> bool {
+    LEVEL_LABELS.contains(&key) || matches!(key, "msg" | "message" | "@m" | "@mt" | "@t" | "@l")
 }
 
 /// A whole batch as CLEF NDJSON, one record per line, newline-terminated.
@@ -340,9 +367,11 @@ impl Entry {
     ///
     /// `level` is what the owner's deployment indexes; `severity_text` is what `LOKI.md` §2 says an
     /// OTLP-native Loki puts in structured metadata; `detected_level` is Loki's own guess. They are
-    /// tried in that order — measured first, documented second, inferred last.
+    /// tried in that order — measured first, documented second, inferred last. `severity` and `lvl`
+    /// follow because [`format`](crate::format)'s own reader accepts those spellings, and a name
+    /// the reader treats as a level has to be treated as one here too — see [`LEVEL_LABELS`].
     pub fn level<'a>(&self, interner: &'a Interner) -> Option<&'a str> {
-        ["level", "severity_text", "detected_level"]
+        LEVEL_LABELS
             .into_iter()
             .find_map(|key| self.label(interner, key))
     }
@@ -1464,6 +1493,32 @@ mod tests {
         assert!(
             at("\"@t\"") < at("\"@l\"") && at("\"@l\"") < at("\"@m\""),
             "@t, then @l, then @m — the detector reads them sequentially: {line}"
+        );
+    }
+
+    /// **A label whose name the detector also reads as a level breaks the whole line.**
+    ///
+    /// The round-trip test above uses a fixture that always carries `severity_text`, so `@l` is
+    /// always written and this branch was never exercised — the claim was only ever tested on the
+    /// safe half. With no level and a stream label called `severity`, `@l` is omitted, and
+    /// `format.rs`'s pattern — which matches ts, then level, then message *in that order* — finds
+    /// its level in the trailing label, leaving nothing after it for the message group. The
+    /// fallback then makes the body the **entire raw JSON line**, on every row of that stream.
+    #[test]
+    fn a_label_the_detector_would_read_as_a_level_does_not_swallow_the_message() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"app":"checkout","severity":"page-2"},
+                  "values":[["1724750000000000001","the message itself"]]}]}}"#,
+        );
+        let line = clef_line(&batch.entries[0], &batch.interner);
+        let ndjson = crate::format::by_id("ndjson").expect("the format the spill targets");
+        let record = ndjson
+            .parse(&line)
+            .expect("the detector must still read it");
+        assert_eq!(
+            record.body, "the message itself",
+            "the message came back as something else — {line}"
         );
     }
 
