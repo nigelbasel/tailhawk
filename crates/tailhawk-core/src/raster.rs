@@ -312,9 +312,19 @@ impl Rasteriser {
             return Ok(out);
         }
         let batch = batch.max(1);
-        // No inter-glyph padding: G4b measured batched cells bit-identical to per-glyph cells at a
-        // gap of zero, so DirectWrite does not let the ClearType filter bleed across the step.
-        let step = cell.width as i32;
+        // **One cell of padding between glyphs, and the reason is not the ClearType filter.**
+        //
+        // G4b measured batched cells bit-identical to per-glyph cells at a gap of zero, and that
+        // measurement holds — but it was taken over the printable ASCII the cell is *measured
+        // from*, every glyph of which fits the cell by construction. A glyph that does not fit —
+        // box drawing, a block, an accented capital, anything East Asian Wide — inks past its own
+        // cell and straight into the window `cut_cell` reads for the next glyph in the strip. The
+        // filter never bled; the glyph did.
+        //
+        // The gap costs a transient strip twice as wide during rasterisation and nothing at all
+        // per frame, which is a cheap price for making the corruption impossible rather than
+        // unlikely.
+        let step = cell.width as i32 * 2;
         let advances = vec![step as f32; batch.min(glyphs.len())];
         let mut strip: Vec<u8> = Vec::new();
 
@@ -348,7 +358,7 @@ impl Rasteriser {
             };
 
             for i in 0..chunk.len() {
-                out.push(self.cut_cell(&strip, &bounds, w, i as i32 * step, cell));
+                out.push(self.cut_cell(&strip, &bounds, w, i as i32 * step, cell, step));
             }
         }
         Ok(out)
@@ -356,6 +366,18 @@ impl Rasteriser {
 
     /// Copies one glyph's cell out of the strip, converting the three ClearType coverages to RGBA
     /// with the average in alpha.
+    ///
+    /// **Also reports whether the glyph actually fitted**, which it did not used to. The returned
+    /// `ink` was unconditionally `cell.ink()` — the uniform cell, whatever the glyph did — so
+    /// [`Atlas::insert`](crate::atlas::Atlas::insert)'s `TooLarge` refusal compared the cell
+    /// against slot dimensions taken *from that same cell* and could never fire. It read as a
+    /// safety net and was unreachable code, while the overhang it was meant to catch was silently
+    /// cropped here and left behind in the strip for the next glyph to read.
+    ///
+    /// So the scan now covers the glyph's whole territory — its cell and the padding beside it —
+    /// and any ink outside the cell is reported as an ink one pixel too big in that direction.
+    /// Nothing changes for a glyph that fits: it still reports the cell exactly, so every
+    /// measured quad and every uv stays where it was.
     fn cut_cell(
         &self,
         strip: &[u8],
@@ -363,10 +385,36 @@ impl Rasteriser {
         strip_w: i32,
         pen_x: i32,
         cell: CellBox,
+        step: i32,
     ) -> Option<Raster> {
         let mut rgba = vec![0u8; cell.bytes()];
         let mut inked = false;
+        let mut overflows = false;
         let origin_x = pen_x + cell.left;
+
+        // The territory this glyph may have inked: its own cell plus the gap before the next pen
+        // position, over every row of the strip rather than only the cell's rows.
+        for ay in bounds.top..bounds.bottom {
+            let src_row = ((ay - bounds.top) * strip_w) as usize;
+            let inside_rows = ay >= cell.top && ay < cell.top + cell.height as i32;
+            for ax in origin_x..(pen_x + step).min(bounds.right) {
+                if ax < bounds.left {
+                    continue;
+                }
+                let inside = inside_rows && ax < origin_x + cell.width as i32;
+                if inside {
+                    continue;
+                }
+                let s = (src_row + (ax - bounds.left) as usize) * 3;
+                if strip[s] | strip[s + 1] | strip[s + 2] != 0 {
+                    overflows = true;
+                    break;
+                }
+            }
+            if overflows {
+                break;
+            }
+        }
 
         for y in 0..cell.height as i32 {
             let ay = cell.top + y;
@@ -394,10 +442,18 @@ impl Rasteriser {
 
         // A cell of nothing is a blank, not a raster. Uploading it would spend a slot on a space
         // and re-request it on every frame — G4's 440-spurious-misses-per-frame bug.
-        inked.then_some(Raster {
-            ink: cell.ink(),
-            rgba,
-        })
+        //
+        // A glyph that overflowed reports an ink a pixel wider than a slot, which is the only
+        // honest thing to say about it: it did not fit, and the atlas is what decides what happens
+        // to a glyph that does not fit.
+        let ink = if overflows {
+            let mut ink = cell.ink();
+            ink.width = ink.width.saturating_add(1);
+            ink
+        } else {
+            cell.ink()
+        };
+        (inked || overflows).then_some(Raster { ink, rgba })
     }
 }
 

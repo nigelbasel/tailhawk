@@ -98,6 +98,17 @@ pub enum Residency {
     /// Not here. Rasterise it off the paint path and draw a placeholder in the meantime —
     /// `SPEC.md` §3.2: a frame must never block on rasterisation.
     Absent,
+    /// Too big for a slot, and permanently so. Draw the placeholder and **do not ask again**.
+    ///
+    /// Uniform slots are what make eviction O(1), so a glyph wider or taller than the cell — box
+    /// drawing, a block, an accented capital, anything East Asian Wide — cannot be taken in.
+    /// Until this existed such a glyph stayed [`Absent`](Residency::Absent) and was re-rasterised
+    /// on every single frame, for ever, at the cost of a whole batch each time.
+    ///
+    /// **The placeholder is a known limit, not the intended end state.** Drawing these properly
+    /// wants a second sheet with taller slots, or a variable-size atlas, and that is a larger
+    /// change than making the corruption stop.
+    Oversized,
 }
 
 /// Why a raster could not be taken in.
@@ -128,6 +139,10 @@ struct Slot {
 enum Entry {
     Slot(SlotId),
     Blank,
+    /// Refused for being too big for a slot. Terminal, like `Blank`: without it the glyph stays
+    /// `Absent`, is queued again on the next frame, and is rasterised for ever at the cost of a
+    /// full batch each time.
+    Oversized,
 }
 
 pub struct Atlas {
@@ -220,6 +235,7 @@ impl Atlas {
         match self.map.get(key) {
             None => Residency::Absent,
             Some(Entry::Blank) => Residency::Blank,
+            Some(Entry::Oversized) => Residency::Oversized,
             Some(&Entry::Slot(slot)) => {
                 self.touch(slot);
                 Residency::Resident(self.placement(slot))
@@ -262,6 +278,22 @@ impl Atlas {
     }
 
     /// Records that a glyph has no raster at all, so it is never asked for again.
+    /// Records that a glyph is too big to ever be taken in, so it is not asked for again.
+    ///
+    /// Counted against the same ceiling as blanks and swept the same way: both are entries that
+    /// hold no slot, and a hostile file full of distinct oversized codepoints must not grow the map
+    /// without bound any more than one full of distinct spaces may.
+    pub fn insert_oversized(&mut self, key: GlyphKey) {
+        if self.blanks >= self.blank_limit {
+            self.map
+                .retain(|_, e| *e != Entry::Blank && *e != Entry::Oversized);
+            self.blanks = 0;
+        }
+        if self.map.insert(key, Entry::Oversized) != Some(Entry::Oversized) {
+            self.blanks += 1;
+        }
+    }
+
     pub fn insert_blank(&mut self, key: GlyphKey) {
         if self.blanks >= self.blank_limit {
             self.map.retain(|_, e| *e != Entry::Blank);
@@ -460,6 +492,49 @@ mod tests {
         assert!(
             atlas.insert(key(3), ink()).is_ok(),
             "next frame the same slots are fair game"
+        );
+    }
+
+    /// **A glyph too big for a slot is remembered as such, and never asked for again.**
+    ///
+    /// The `TooLarge` refusal was unreachable for the life of the atlas: `cut_cell` reported every
+    /// glyph's ink as the uniform cell, so the check compared the cell against slot dimensions
+    /// derived from that same cell. It read as a safety net and could not fire. Now that the
+    /// rasteriser reports an overflowing glyph honestly, this is the state such a glyph lands in —
+    /// and the point of the state is the second assertion: left `Absent`, it would be rasterised
+    /// again on every frame for the life of the process.
+    #[test]
+    fn a_glyph_too_big_for_a_slot_is_refused_once_and_not_asked_for_again() {
+        let mut atlas = Atlas::new(32, 16, 16, 16);
+        let oversized = Ink {
+            width: 17,
+            height: 16,
+            left: 0,
+            top: 0,
+        };
+        assert_eq!(atlas.insert(key(1), oversized), Err(InsertError::TooLarge));
+        assert_eq!(
+            atlas.lookup(&key(1)),
+            Residency::Absent,
+            "refusing alone does not record anything — that is what left it re-queued for ever"
+        );
+        atlas.insert_oversized(key(1));
+        assert_eq!(atlas.lookup(&key(1)), Residency::Oversized);
+        assert_eq!(atlas.len(), 0, "and it must not spend a slot");
+    }
+
+    /// A file full of distinct oversized codepoints must not grow the map without bound, for the
+    /// same reason a file full of distinct blanks must not.
+    #[test]
+    fn oversized_entries_are_swept_like_blanks() {
+        let mut atlas = Atlas::new(32, 16, 16, 16);
+        for g in 0..10_000u16 {
+            atlas.insert_oversized(key(g));
+        }
+        assert!(
+            atlas.map.len() <= atlas.blank_limit + 1,
+            "the map grew to {} entries",
+            atlas.map.len()
         );
     }
 
@@ -673,7 +748,9 @@ mod tests {
             .values()
             .map(|e| match e {
                 Entry::Slot(s) => *s,
-                Entry::Blank => unreachable!("no blanks were inserted"),
+                Entry::Blank | Entry::Oversized => {
+                    unreachable!("this test inserts only real rasters")
+                }
             })
             .collect();
         occupied.sort_unstable();

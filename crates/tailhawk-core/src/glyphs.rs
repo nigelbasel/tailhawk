@@ -14,7 +14,7 @@
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 
-use crate::atlas::{Atlas, GlyphId, GlyphKey, Residency, Synthetic};
+use crate::atlas::{Atlas, GlyphId, GlyphKey, InsertError, Residency, Synthetic};
 use crate::raster::{CellBox, Face, Rasteriser};
 use crate::sheet::Sheet;
 use crate::text::{Instance, MODE_MONO_SUBPIXEL};
@@ -165,6 +165,18 @@ impl GlyphCache {
                 [p.x as f32, p.y as f32],
                 [(p.x + p.ink.width) as f32, (p.y + p.ink.height) as f32],
             ),
+            // The placeholder, exactly as for `Absent` — but without queueing it, because it can
+            // never land. That difference is the whole point of the state.
+            Residency::Oversized => {
+                let (px, py) = self.placeholder;
+                (
+                    [px as f32, py as f32],
+                    [
+                        (px + self.cell.width as u16) as f32,
+                        (py + self.cell.height as u16) as f32,
+                    ],
+                )
+            }
             Residency::Absent => {
                 if !self.misses.contains(&key) {
                     self.misses.push(key);
@@ -219,8 +231,18 @@ impl GlyphCache {
                 self.atlas.insert_blank(key);
                 continue;
             };
-            let Ok(placement) = self.atlas.insert(key, raster.ink) else {
-                continue;
+            let placement = match self.atlas.insert(key, raster.ink) {
+                Ok(placement) => placement,
+                // Too big for a slot, and it always will be. Recorded so it is never asked for
+                // again — left `Absent` it would be rasterised on every frame for the life of the
+                // process, a whole batch each time, for a glyph that can never land.
+                Err(InsertError::TooLarge) => {
+                    self.atlas.insert_oversized(key);
+                    continue;
+                }
+                // The sheet is full *this frame*. Next frame it will not be, so this one is asked
+                // for again deliberately.
+                Err(InsertError::SheetFullThisFrame) => continue,
             };
             if self.sheet.upload(
                 context,
