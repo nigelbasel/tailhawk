@@ -2,7 +2,7 @@
 
 ## ▶ Resume point — 2026-08-28, session 30: native tabs, and a UI direction awaiting the owner
 
-**Master is `a5229b3`, tree clean, CI green by SHA on every commit, 897 tests, clippy `-D warnings`
+**Master is `0207bcd`, tree clean, CI green by SHA, 900 tests, clippy `-D warnings`
 and `cargo fmt --check` clean.**
 
 > **Theseus reads a dated status file, not this one.** `SESSION-STATUS-2026-08-28-tailhawk-9e.md` at
@@ -45,13 +45,19 @@ install he had been testing (a build from 2026-08-26, predating every change), o
 27th–28th fixed it incidentally. **No cause was found and none should be claimed.** The eliminations
 stand: id, register, popup refill, `WM_MENUCOMMAND`, and the `WM_COMMAND` guard.
 
-### Debt this session created, and did not clear
+### ~~Debt this session created~~ — cleared in `c9f4f6e`, and it was not what this said
 
-`Hit::Tab` and `BarDrag::Tab` in `main.rs` are now **unreachable** — nothing pushes `Hit::Tab` into
-the chrome hit list since the strip stopped being drawn. Drag-to-reorder was rebuilt on the control
-itself (`a5229b3`), so this is dead code the conversion orphaned. It was left for a separate careful
-pass rather than risking the chip-dragging that shares those paths. `Chrome::strip_height` is **not**
-dead: the footer band still uses it.
+This section used to tell you to sweep up `Hit::Tab` and `BarDrag::Tab` as dead code the tab
+conversion had orphaned. **That inference was wrong**, and the note is kept rather than deleted
+because the mistake is the useful part: going to delete them found that `Shell::tab_at` was feeding
+`UI-DESIGN.md` §2.1's **middle-click-to-close**, which the conversion had broken two ways at once —
+the handler was on the main window while the click now lands on the child control, *and* it read a
+hit list nothing fills any more. Either alone would have hidden it. A feature that stops working
+silently looks exactly like code that was never reached.
+
+Both are now gone along with `tab_at`, the strip's click path and the `WM_MBUTTONDOWN` arm, and
+middle-click close is answered by the control itself. `Chrome::strip_height` is **not** dead: the
+footer band still uses it.
 
 ### Two lessons from today worth not relearning
 

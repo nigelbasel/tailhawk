@@ -3,7 +3,7 @@
 //! Derived from `experiments/g3-d3d11` and `experiments/g4-glyph-atlas`, which established the
 //! device/swapchain shape and measured the cost of getting here.
 
-use windows::Win32::Foundation::{E_UNEXPECTED, HWND};
+use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_UNEXPECTED, HWND};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
@@ -18,8 +18,9 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIFactory2, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS,
     DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
-    DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_PRESENT, DXGI_PRESENT_TEST, DXGI_SCALING_NONE,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 use crate::{Error, Result, WindowHandle};
@@ -162,6 +163,8 @@ pub struct Gpu {
     /// it because "did the renderer really replace the device" is otherwise invisible from
     /// outside.
     generation: u32,
+    /// Whether the last present said nobody can see this window. See [`Standby`].
+    standby: Standby,
     #[cfg(any(test, feature = "test-hooks"))]
     inject_loss: bool,
     /// A render target standing in for a swapchain, so the **real** frame path can be read back.
@@ -279,6 +282,42 @@ enum FrameError {
     Draw(Error),
 }
 
+/// Whether anyone can see the window, and what to do about it.
+///
+/// DXGI reports occlusion through a **success** HRESULT on `Present`, and recommends standing by
+/// rather than continuing to render frames nobody will see. It also warns that the same code must
+/// not be used to decide when to resume — a `DXGI_PRESENT_TEST` present is what answers that,
+/// because it costs nothing and returns `S_OK` once the window is visible again.
+///
+/// A struct rather than a `bool` so the decision is a pure one a test can reach: everything here
+/// takes an HRESULT in and answers a question, with no device and no window involved.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Standby {
+    occluded: bool,
+}
+
+impl Standby {
+    /// What the last present said.
+    pub fn saw(&mut self, hr: windows::core::HRESULT) {
+        self.occluded = hr == DXGI_STATUS_OCCLUDED;
+    }
+
+    /// Whether a frame is worth drawing at all.
+    pub fn should_draw(&self) -> bool {
+        !self.occluded
+    }
+
+    /// What a test-present said. `S_OK` means the window is back.
+    ///
+    /// Deliberately not `saw`: any result other than occluded ends standby, because a device error
+    /// must reach the recovery path rather than leaving the renderer parked for ever.
+    pub fn wake(&mut self, hr: windows::core::HRESULT) {
+        if hr != DXGI_STATUS_OCCLUDED {
+            self.occluded = false;
+        }
+    }
+}
+
 impl Gpu {
     pub fn new() -> Result<Self> {
         let res = create_resources(Driver::Hardware)?;
@@ -290,6 +329,7 @@ impl Gpu {
             window: None,
             size: (1, 1),
             generation: 1,
+            standby: Standby::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             inject_loss: false,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -539,6 +579,20 @@ impl Gpu {
                 DXGI_ERROR_DEVICE_REMOVED,
             )));
         }
+        // Standby: nobody can see this window, so nothing is drawn. A test present costs no frame
+        // and is the documented way to find out when that stops being true.
+        if !self.standby.should_draw() {
+            if let Some(sc) = &self.swapchain {
+                let hr = unsafe { sc.Present(0, DXGI_PRESENT_TEST) };
+                self.standby.wake(hr);
+                if hr.is_err() {
+                    return Err(FrameError::Device(windows::core::Error::from(hr)));
+                }
+            } else {
+                self.standby.wake(windows::core::HRESULT(0));
+            }
+            return Ok(());
+        }
         self.draw_background(colour);
         draw(&self.res.device, &self.res.context, self.generation).map_err(FrameError::Draw)?;
         self.present().map_err(FrameError::Device)
@@ -592,9 +646,23 @@ impl Gpu {
         }
     }
 
-    fn present(&self) -> windows::core::Result<()> {
+    /// Presents, and notices when nobody can see the result.
+    ///
+    /// **`DXGI_STATUS_OCCLUDED` is a *success* code**, so `HRESULT::ok()` — which is a sign test —
+    /// returns `Ok` for it and it was being thrown away. DXGI's own guidance is to go into standby
+    /// when it appears, because everything spent on that frame was wasted: a window behind a
+    /// maximised one, on another virtual desktop, or minimised, was still laying out a viewport,
+    /// shaping every visible row, rasterising and presenting at up to 60 Hz.
+    ///
+    /// The same guidance warns not to use this code to decide when to *come back* — that is what
+    /// [`Standby::wake`]'s test-present is for.
+    fn present(&mut self) -> windows::core::Result<()> {
         match (&self.swapchain, self.window) {
-            (Some(sc), _) => unsafe { sc.Present(1, DXGI_PRESENT(0)).ok() },
+            (Some(sc), _) => {
+                let hr = unsafe { sc.Present(1, DXGI_PRESENT(0)) };
+                self.standby.saw(hr);
+                hr.ok()
+            }
             // Attached to a window but holding no swapchain is not a state that can be presented
             // from, and it is exactly what a rebuild that forgot to re-attach would leave behind.
             // Reporting it is what stops a "recovered" renderer from returning `Ok` for ever
@@ -840,6 +908,49 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::DXGI_ERROR_INVALID_CALL;
 
     // The policy half needs no GPU at all, which is the point of separating it.
+
+    /// **Occlusion arrives as a *success* code**, which is exactly how it went unnoticed:
+    /// `HRESULT::ok()` is a sign test, so `DXGI_STATUS_OCCLUDED` read as "presented fine" and a
+    /// window nobody could see went on laying out, shaping, rasterising and presenting at 60 Hz.
+    #[test]
+    fn an_occluded_present_is_a_success_code_and_still_means_stop_drawing() {
+        assert!(
+            DXGI_STATUS_OCCLUDED.is_ok(),
+            "if this ever becomes an error code the swallowing bug was never possible"
+        );
+        let mut standby = Standby::default();
+        assert!(standby.should_draw(), "a fresh renderer draws");
+        standby.saw(windows::core::HRESULT(0));
+        assert!(standby.should_draw());
+        standby.saw(DXGI_STATUS_OCCLUDED);
+        assert!(
+            !standby.should_draw(),
+            "nobody can see it, so nothing is drawn"
+        );
+    }
+
+    /// DXGI's guidance is explicit that the occlusion code says when to *enter* standby and must
+    /// not be used to decide when to leave it — a test present answers that. So anything other
+    /// than occluded ends standby, including an error, which must reach the recovery path rather
+    /// than leaving the renderer parked for ever.
+    #[test]
+    fn standby_ends_on_anything_that_is_not_still_occluded() {
+        let mut standby = Standby::default();
+        standby.saw(DXGI_STATUS_OCCLUDED);
+
+        standby.wake(DXGI_STATUS_OCCLUDED);
+        assert!(!standby.should_draw(), "still covered, still parked");
+
+        standby.wake(windows::core::HRESULT(0));
+        assert!(standby.should_draw(), "visible again");
+
+        standby.saw(DXGI_STATUS_OCCLUDED);
+        standby.wake(DXGI_ERROR_DEVICE_REMOVED);
+        assert!(
+            standby.should_draw(),
+            "a lost device must not be left parked — it has to reach recovery"
+        );
+    }
 
     #[test]
     fn a_first_loss_is_retried_on_the_rung_it_was_already_on() {
