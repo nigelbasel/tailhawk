@@ -3805,7 +3805,11 @@ enum Selecting {
 }
 
 struct Shell {
-    /// Windows' own tab control, across the top of the client area.
+    /// The drop guide a drag-out is currently offering, if any: the zone and the rectangle to
+    /// paint. Cleared the moment the drag ends or returns to the strip, because a guide left on
+    /// screen is a promise about a drop that is no longer going to happen.
+    drag_guide: Option<(tailhawk_core::dropzone::Zone, tailhawk_core::dropzone::Rect)>,
+    /// Windows. own tab control, across the top of the client area.
     ///
     /// `None` only if the control could not be created, which no supported Windows should do — the
     /// strip is then simply absent rather than the window failing to open, because a viewer with no
@@ -4335,6 +4339,7 @@ impl Shell {
                 let tops = pane_tops(h as f32, pane_count);
                 // The real control's band, asked of it once per frame and handed to the pane that
                 // carries the strip. Placed here too, because this is where the width is known.
+                let guide = self.drag_guide.map(|(_, r)| r);
                 let want_strip = strip.0.len() > 1;
                 let strip_px = match (self.tabs.as_mut(), want_strip) {
                     (Some(tabs), true) => {
@@ -4371,6 +4376,17 @@ impl Shell {
                     // `begin_frame` inside `paint_panes` — one frame, one budget, §11.3.
                     doc.highlighter.begin_frame();
                 }
+                // §1069's drag guide, in the selection colour at a third of its opacity: the
+                // colour the app already uses for "this is what you are acting on", turned down
+                // far enough that the text underneath stays readable — a guide you cannot see
+                // through hides the very pane it is describing.
+                let overlay: Vec<(tailhawk_core::dropzone::Rect, [f32; 4])> = guide
+                    .into_iter()
+                    .map(|r| {
+                        let c = theme().selection_bg;
+                        (r, [c[0], c[1], c[2], 0.33])
+                    })
+                    .collect();
                 // `Rows` is the row source, so the painter reads its text and its column anchors
                 // by reference — the closure this replaced allocated a `String` per row per frame
                 // and had nowhere to put the anchors at all.
@@ -4379,7 +4395,7 @@ impl Shell {
                     .enumerate()
                     .map(|(i, doc)| (&doc.view, doc as &dyn RowSource, tops[i].0))
                     .collect();
-                let laid = renderer.paint_panes(&refs, (w as f32, h as f32))?;
+                let laid = renderer.paint_panes(&refs, (w as f32, h as f32), &overlay)?;
                 rasterised = laid.rasterised;
                 Ok(())
             });
@@ -4865,6 +4881,67 @@ impl Shell {
             let _ = InvalidateRect(hwnd, None, true);
         }
         self.retitle(hwnd);
+    }
+
+    /// The grid's rectangle in client coordinates — everything below the tab strip.
+    ///
+    /// The zones are measured against this rather than the whole client area, so the strip itself
+    /// is never part of a drop target and a drag along it cannot be read as hovering the top zone.
+    fn grid_rect(&self) -> Option<tailhawk_core::dropzone::Rect> {
+        let doc = self.document.as_ref()?;
+        let top = doc.strip_px;
+        let (w, h) = (
+            doc.view.gutter_px() + doc.view.hgrid().viewport_px(),
+            doc.view.height_px(),
+        );
+        (w > 0.0 && h > 0.0).then_some(tailhawk_core::dropzone::Rect {
+            x: 0.0,
+            y: top,
+            w,
+            h,
+        })
+    }
+
+    /// Splits the shown tab, putting the dragged document above or below the one already there.
+    ///
+    /// **The dragged tab is consumed into the split**, which is what "drag *out* to split" means:
+    /// the tab you pulled off the strip becomes the new pane, so the strip loses an entry and the
+    /// pane count rises. Dragging a tab onto its own pane would otherwise duplicate it.
+    fn split_from_tab(&mut self, from: usize, zone: tailhawk_core::dropzone::Zone) -> bool {
+        use tailhawk_core::dropzone::Zone;
+        if from >= self.document.len() || self.document.len() < 2 {
+            return false;
+        }
+        let target = self.document.active;
+        if from == target {
+            return false;
+        }
+        let mut tab = self.document.tabs.remove(from);
+        // Removing shifts everything after it, including the tab being split into.
+        let target = if from < target { target - 1 } else { target };
+        let Some(doc) = tab.panes.pop() else {
+            return false;
+        };
+        let Some(into) = self.document.tabs.get_mut(target) else {
+            return false;
+        };
+        if into.panes.len() >= 2 {
+            // Already split. Putting a third pane in would need the model to say how the height is
+            // shared, and it does not — so the drop is refused rather than guessed at.
+            self.document.tabs.insert(from, tab);
+            return false;
+        }
+        match zone {
+            Zone::Above => into.panes.insert(0, doc),
+            _ => into.panes.push(doc),
+        }
+        into.focused = if zone == Zone::Above {
+            0
+        } else {
+            into.panes.len() - 1
+        };
+        self.document.active = target;
+        true
     }
 
     /// Ends a bar drag at `x`: the chip is moved to the slot under the pointer. Reports whether the
@@ -8740,6 +8817,74 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
             LRESULT(0)
         }
+        // §1069's drag-out-to-split: the pointer has left the strip and is over the grid, so the
+        // pane under it offers to divide. Only a zone the pane model can actually perform is kept
+        // — `dropzone` knows which those are, and a guide for one it cannot do would be a promise
+        // the drop could not keep.
+        tabstrip::WM_TAB_DRAG_OUT => {
+            let (x, y) = (
+                (lparam.0 & 0xFFFF) as i16 as f32,
+                ((lparam.0 >> 16) & 0xFFFF) as i16 as f32,
+            );
+            let changed = STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let Some(shell) = state.as_mut() else {
+                    return false;
+                };
+                let want = shell
+                    .grid_rect()
+                    .and_then(|pane| tailhawk_core::dropzone::at(pane, x, y))
+                    .filter(|(zone, _)| zone.available() && zone.splits());
+                let changed = shell.drag_guide.map(|(z, _)| z) != want.map(|(z, _)| z);
+                shell.drag_guide = want;
+                changed
+            });
+            if changed {
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        // The drag ended, or came back onto the strip. Either way the guide stops.
+        tabstrip::WM_TAB_DRAG_OFF => {
+            let had = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| shell.drag_guide.take().is_some())
+            });
+            if had {
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        // Released over the grid: split, if the guide was offering one.
+        tabstrip::WM_TAB_DROP_OUT => {
+            let split = STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let Some(shell) = state.as_mut() else {
+                    return false;
+                };
+                let Some((zone, _)) = shell.drag_guide.take() else {
+                    return false;
+                };
+                zone.splits() && shell.split_from_tab(wparam.0, zone)
+            });
+            if split {
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        shell.retitle(hwnd);
+                        shell.sync_scrollbar(hwnd);
+                    }
+                });
+            }
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         // §2.1's middle-click close, from the control the click actually lands on.
         tabstrip::WM_TAB_CLOSE => {
             STATE.with(|s| {
@@ -9305,6 +9450,7 @@ fn main() -> Result<()> {
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
             tabs: None,
+            drag_guide: None,
             cell_w: 0.0,
             cell_h: 0.0,
             settings,

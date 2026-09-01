@@ -69,6 +69,23 @@ pub const WM_TAB_MOVED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 
 /// nothing, which is why it was mistaken for dead code rather than a broken feature.
 pub const WM_TAB_CLOSE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x41;
 
+/// Posted while a tab is being dragged **below** the strip, onto the grid: `wparam` is the tab,
+/// `lparam` the pointer in the window's client coordinates.
+///
+/// `SPEC.md` §1069's drag-out-to-split. The control keeps the mouse captured for the whole drag, so
+/// it goes on receiving moves after the pointer has left it — which is what makes leaving
+/// detectable at all, and why this lives here rather than in the window's own handler.
+///
+/// The strip sits at the window's origin, so the control's client coordinates *are* the window's.
+/// Nothing converts, and nothing has to know where the strip is.
+pub const WM_TAB_DRAG_OUT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x42;
+
+/// Posted when a drag that had left the strip is released. Same arguments as [`WM_TAB_DRAG_OUT`].
+pub const WM_TAB_DROP_OUT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x43;
+
+/// Posted when a drag ends or leaves without dropping, so the guide stops being drawn.
+pub const WM_TAB_DRAG_OFF: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x44;
+
 /// `TCHITTESTINFO`, laid out by hand beside [`TcItem`] for the same reason.
 #[repr(C)]
 struct TcHitTest {
@@ -79,6 +96,24 @@ struct TcHitTest {
 thread_local! {
     /// Which tab the pointer went down on, while a drag is in progress.
     static DRAGGING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Whether that drag has left the strip. Remembered because the button-up that ends it carries
+    /// no history, and a release below the strip means something quite different from one inside it.
+    static DRAGGED_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How far below the strip the pointer must go before a drag counts as having left it.
+///
+/// Not zero: a reorder drag along the strip wanders a pixel or two past the bottom edge, and
+/// treating that as "you want to split" would turn every reorder into a near-miss.
+const OUT_SLACK: i32 = 6;
+
+/// The strip's own height, for deciding whether the pointer is still over it.
+fn strip_height(hwnd: HWND) -> i32 {
+    let mut rect = RECT::default();
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect) }.is_err() {
+        return i32::MAX;
+    }
+    rect.bottom - rect.top
 }
 
 /// Posts one of this module's messages up to the window that owns the strip.
@@ -133,17 +168,47 @@ unsafe extern "system" fn drag_proc(
     let x = (lparam.0 & 0xFFFF) as i16;
     let y = ((lparam.0 >> 16) & 0xFFFF) as i16;
     match msg {
-        WM_LBUTTONDOWN => DRAGGING.with(|d| d.set(tab_at(hwnd, x, y))),
+        WM_LBUTTONDOWN => {
+            DRAGGING.with(|d| d.set(tab_at(hwnd, x, y)));
+            DRAGGED_OUT.with(|d| d.set(false));
+        }
         WM_MOUSEMOVE if wparam.0 & 0x0001 != 0 => {
-            let from = DRAGGING.with(|d| d.get());
-            if let (Some(from), Some(to)) = (from, tab_at(hwnd, x, y)) {
-                if from != to {
-                    DRAGGING.with(|d| d.set(Some(to)));
-                    tell_parent(hwnd, WM_TAB_MOVED, WPARAM(from), LPARAM(to as isize));
+            let Some(from) = DRAGGING.with(|d| d.get()) else {
+                return unsafe {
+                    windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam)
+                };
+            };
+            // Below the strip is §1069's drag-out. Above or beside it is a reorder that has
+            // wandered, and is left to the reorder path.
+            if i32::from(y) > strip_height(hwnd) + OUT_SLACK {
+                DRAGGED_OUT.with(|d| d.set(true));
+                tell_parent(hwnd, WM_TAB_DRAG_OUT, WPARAM(from), lparam);
+            } else {
+                if DRAGGED_OUT.with(|d| d.replace(false)) {
+                    // Came back onto the strip: the guide must go, or it hangs about promising a
+                    // split that the drop will not perform.
+                    tell_parent(hwnd, WM_TAB_DRAG_OFF, WPARAM(from), LPARAM(0));
+                }
+                if let Some(to) = tab_at(hwnd, x, y) {
+                    if from != to {
+                        DRAGGING.with(|d| d.set(Some(to)));
+                        tell_parent(hwnd, WM_TAB_MOVED, WPARAM(from), LPARAM(to as isize));
+                    }
                 }
             }
         }
-        WM_LBUTTONUP => DRAGGING.with(|d| d.set(None)),
+        WM_LBUTTONUP => {
+            let from = DRAGGING.with(|d| d.replace(None));
+            let out = DRAGGED_OUT.with(|d| d.replace(false));
+            if let Some(from) = from {
+                let what = if out {
+                    WM_TAB_DROP_OUT
+                } else {
+                    WM_TAB_DRAG_OFF
+                };
+                tell_parent(hwnd, what, WPARAM(from), lparam);
+            }
+        }
         // §2.1's middle-click close. It has to be handled here: the click lands on this control,
         // not on the window whose handler used to answer it.
         windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONDOWN => {

@@ -624,7 +624,7 @@ impl Renderer {
         self.gpu.attach_offscreen(width, height)?;
         for _ in 0..2 {
             self.gpu.clear_offscreen(theme::theme().background);
-            self.paint_panes(panes, (width as f32, height as f32))?;
+            self.paint_panes(panes, (width as f32, height as f32), &[])?;
         }
         self.gpu.read_back()
     }
@@ -640,6 +640,7 @@ impl Renderer {
                 view.gutter_px() + view.hgrid().viewport_px(),
                 view.height_px(),
             ),
+            &[],
         )
     }
 
@@ -647,10 +648,18 @@ impl Renderer {
     /// were the whole client and then moved down by `y`; `client` is the client size the shader
     /// maps pixels by. Panes are drawn in order, so a later pane's bands cover an earlier pane's
     /// last partial row.
+    /// Draws every pane, then any transient overlay over the top of all of them.
+    ///
+    /// `overlay` is the drag guide of `SPEC.md` §1069 and anything else that belongs to the window
+    /// rather than to a document — which is why it is a parameter here instead of something a
+    /// `RowSource` draws. A pane cannot draw it: the guide spans whichever pane the pointer is
+    /// over, is owned by a gesture rather than by a file, and has to sit above every pane's own
+    /// chrome rather than inside one of them.
     pub fn paint_panes(
         &mut self,
         panes: &[(&view::View, &dyn rows::RowSource, f32)],
         client: (f32, f32),
+        overlay: &[(dropzone::Rect, [f32; 4])],
     ) -> Result<paint::Laid> {
         // Disjoint field borrows: the callback needs `painter` mutably while `gpu` is borrowed for
         // the frame. Destructuring is what makes that legal, and it is also what forces the painter
@@ -687,6 +696,11 @@ impl Renderer {
                 let from = p.mark();
                 laid.merge(p.lay_out(view, t.ink, *source)?);
                 p.shift(from, 0.0, *y);
+            }
+            // Last, and therefore over everything: the guide is an answer to "where will this go",
+            // so it has to be visible on top of the pane it is answering about.
+            for (r, tint) in overlay {
+                p.fill(r.x, r.y, r.w, r.h, *tint);
             }
             // The whole client, gutter included, taken from the caller rather than the swapchain
             // so `gpu` stays out of this closure — which is what makes the disjoint borrow above
