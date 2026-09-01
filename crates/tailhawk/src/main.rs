@@ -37,7 +37,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 use tailhawk_core::columns::{Layout, Presentation};
 use tailhawk_core::detect::{self, Detection};
 use tailhawk_core::encoding::Charset;
@@ -104,23 +104,22 @@ use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMenu, GetMessageW, GetScrollInfo, GetSubMenu, GetWindow, GetWindowPlacement,
-    IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos,
-    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, ASFW_ANY, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_ARROW, MSG,
-    NONCLIENTMETRICSW, SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
-    SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
-    SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
-    SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
-    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
-    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW,
-    WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMenu,
+    GetMessageW, GetScrollInfo, GetSubMenu, GetWindow, GetWindowPlacement, IsDialogMessageW,
+    IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_ARROW, MSG, NONCLIENTMETRICSW, SB_BOTTOM, SB_HORZ,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
+    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
+    SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT,
+    WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED,
+    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
@@ -6616,163 +6615,6 @@ mod uia {
     }
 }
 
-/// §12.3's single instance: the mutex that says one is running, the pipe that carries the argv.
-mod single {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::os::windows::io::FromRawHandle;
-    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, HANDLE};
-    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
-    use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
-    };
-    use windows::Win32::System::Threading::CreateMutexW;
-
-    const MUTEX: windows::core::PCWSTR = windows::core::w!(r"Local\Tailhawk-instance");
-    const PIPE: &str = r"\\.\pipe\Tailhawk-instance";
-
-    /// The message the pipe thread posts once it has queued the paths.
-    pub const WM_HANDED_OFF: u32 = WM_APP + 7;
-
-    /// What another instance handed us, waiting for the window thread.
-    pub static INBOX: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-
-    /// Claims the per-session mutex. `false` means an instance is already running.
-    pub fn claim() -> bool {
-        match unsafe { CreateMutexW(None, false, MUTEX) } {
-            Ok(_handle) => {
-                // Held for the life of the process: the handle is deliberately leaked.
-                let already =
-                    windows::core::Error::from_win32().code() == ERROR_ALREADY_EXISTS.to_hresult();
-                !already
-            }
-            Err(_) => true,
-        }
-    }
-
-    /// Hands `paths` to the running instance. `Ok` means it took them; the caller exits 3.
-    pub fn hand_off(paths: &[PathBuf]) -> std::io::Result<()> {
-        unsafe {
-            let _ = AllowSetForegroundWindow(ASFW_ANY);
-        }
-        let mut pipe = std::fs::OpenOptions::new().write(true).open(PIPE)?;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(paths.len() as u32).to_le_bytes());
-        for path in paths {
-            let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-            bytes.extend_from_slice(&(wide.len() as u32).to_le_bytes());
-            for unit in wide {
-                bytes.extend_from_slice(&unit.to_le_bytes());
-            }
-        }
-        pipe.write_all(&bytes)?;
-        pipe.flush()
-    }
-
-    /// Serves the pipe for the life of the process: each connection's paths go to [`INBOX`] and
-    /// [`WM_HANDED_OFF`] is posted to `hwnd`.
-    pub fn serve(hwnd: isize) {
-        std::thread::Builder::new()
-            .name("tailhawk-instance".to_owned())
-            .spawn(move || loop {
-                let name: Vec<u16> = PIPE.encode_utf16().chain(std::iter::once(0)).collect();
-                let handle = unsafe {
-                    CreateNamedPipeW(
-                        windows::core::PCWSTR(name.as_ptr()),
-                        PIPE_ACCESS_INBOUND,
-                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                        PIPE_UNLIMITED_INSTANCES,
-                        0,
-                        65_536,
-                        0,
-                        None,
-                    )
-                };
-                if handle.is_invalid() {
-                    return;
-                }
-                if unsafe { ConnectNamedPipe(handle, None) }.is_err() {
-                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
-                    continue;
-                }
-                let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
-                let mut bytes = Vec::new();
-                let _ = file.read_to_end(&mut bytes);
-                let paths = decode(&bytes);
-                let _ = unsafe { DisconnectNamedPipe(HANDLE(handle.0)) };
-                drop(file);
-                if !paths.is_empty() {
-                    if let Ok(mut inbox) = INBOX.lock() {
-                        inbox.extend(paths);
-                    }
-                    unsafe {
-                        let _ =
-                            PostMessageW(HWND(hwnd as *mut _), WM_HANDED_OFF, WPARAM(0), LPARAM(0));
-                    }
-                }
-            })
-            .ok();
-    }
-
-    /// The wire format: a count, then each path as a length and UTF-16 units, all little-endian.
-    fn decode(bytes: &[u8]) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let mut at = 0usize;
-        let u32_at = |at: &mut usize| -> Option<u32> {
-            let v = u32::from_le_bytes(bytes.get(*at..*at + 4)?.try_into().ok()?);
-            *at += 4;
-            Some(v)
-        };
-        let Some(count) = u32_at(&mut at) else {
-            return out;
-        };
-        for _ in 0..count.min(1024) {
-            let Some(len) = u32_at(&mut at) else { break };
-            let end = at + (len as usize) * 2;
-            let Some(slice) = bytes.get(at..end) else {
-                break;
-            };
-            // `as_chunks`, not `chunks_exact(2)`: the pairs arrive as `[u8; 2]` rather than as
-            // slices that have to be indexed, so `from_le_bytes` takes them directly and there is
-            // no bounds check to elide. Clippy asks for this whenever the chunk size is a constant.
-            let (pairs, _odd) = slice.as_chunks::<2>();
-            let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
-            out.push(PathBuf::from(std::ffi::OsString::from_wide(&units)));
-            at = end;
-        }
-        out
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn the_wire_format_round_trips_paths() {
-            let paths = vec![
-                PathBuf::from(r"C:\logs\app.log"),
-                PathBuf::from(r"D:\ü\日本.txt"),
-            ];
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&(paths.len() as u32).to_le_bytes());
-            for path in &paths {
-                let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-                bytes.extend_from_slice(&(wide.len() as u32).to_le_bytes());
-                for unit in wide {
-                    bytes.extend_from_slice(&unit.to_le_bytes());
-                }
-            }
-            assert_eq!(decode(&bytes), paths);
-            assert!(
-                decode(&bytes[..7]).is_empty(),
-                "a truncated message yields nothing"
-            );
-            assert_eq!(decode(&[]).len(), 0);
-        }
-    }
-}
-
 /// The user's rules from every tier, and the failures by name.
 fn load_rule_specs(tiers: &[PathBuf]) -> (Vec<tailhawk_core::rules::Spec>, Vec<String>) {
     let mut specs = Vec::new();
@@ -8152,24 +7994,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
             def_proc(hwnd, msg, wparam, lparam)
         }
-        // §12.3: another instance handed its paths over — open each as a tab and come forward.
-        m if m == single::WM_HANDED_OFF => {
-            let paths: Vec<PathBuf> = single::INBOX
-                .lock()
-                .map(|mut inbox| std::mem::take(&mut *inbox))
-                .unwrap_or_default();
-            STATE.with(|s| {
-                if let Some(shell) = s.borrow_mut().as_mut() {
-                    for path in paths {
-                        shell.open_path(hwnd, path);
-                    }
-                }
-            });
-            unsafe {
-                let _ = SetForegroundWindow(hwnd);
-            }
-            LRESULT(0)
-        }
         WM_TIMER if wparam.0 == SMOOTH_TIMER => {
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
@@ -9339,37 +9163,6 @@ fn main() -> Result<()> {
         }
         reading.push(spawn_open(move || Document::open(&path)));
     }
-    // §12.3: one instance per session. With paths to open and an instance already running — and
-    // no pipe on stdin, which cannot be forwarded — the paths are handed to it and this process
-    // exits 3. `--new-instance` opts out.
-    let new_instance = std::env::args_os().any(|a| a == "--new-instance");
-    let mut handoff: Vec<std::path::PathBuf> = Vec::new();
-    let mut skip = false;
-    for arg in std::env::args_os().skip(1) {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if let Some(text) = arg.to_str() {
-            if matches!(text, "-n" | "-c" | "-s" | "--sleep-interval" | "--pid") {
-                skip = true;
-                continue;
-            }
-            if text.starts_with('-') {
-                continue;
-            }
-        }
-        let path = std::path::PathBuf::from(&arg);
-        handoff.push(std::path::absolute(&path).unwrap_or(path));
-    }
-    let is_first = single::claim();
-    if !is_first && !new_instance && !handoff.is_empty() {
-        // A hand-off that fails — the other instance is closing, say — falls through to a window
-        // of our own, which is what the user asked for either way.
-        if single::hand_off(&handoff).is_ok() {
-            std::process::exit(3);
-        }
-    }
     // **No path, so look at the standard input handle** — §4.2. `FILE_TYPE_CHAR` is an
     // interactive console and §4.2 says "do not block": reading it would wait for a human to
     // type, which for a windowed application means a window that never appears.
@@ -9576,10 +9369,6 @@ fn main() -> Result<()> {
         }
         // §12's drop target: a file dropped on the window opens in it.
         DragAcceptFiles(hwnd, true);
-        // §12.3: from here on, a second `tailhawk file.log` lands in this window.
-        if is_first {
-            single::serve(hwnd.0 as isize);
-        }
         SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
         let _ = ShowWindow(
             hwnd,

@@ -23,7 +23,6 @@ tailhawk --theme=light app.log         # dark | light | system
 tailhawk --column-pattern="<ts> [<thread>] <level> <logger> - <message>" app.log   # your own columns
 tailhawk --columns=none app.log        # no detection, plain lines
 tailhawk --stateless app.log           # remember nothing
-tailhawk --new-instance app.log        # a second window rather than a tab in the running one
 ```
 
 `--filter`, `--exclude` and `--column-pattern` may each be given more than once.
@@ -46,8 +45,8 @@ there so a command you already have in your fingers does not fail — not becaus
 Following is the default, and the window height decides how much is shown. There is no `--help`
 and no `--version`, and an unrecognised `--flag` is swallowed silently.
 
-A second `tailhawk file.log` opens the file as a tab in the running window (one instance per
-session); dropping a file on the window does the same; `Ctrl+O` asks for one.
+A second `tailhawk file.log` opens a **second window**. To add a file to a window you already have,
+drop it on that window, or press `Ctrl+O`.
 
 ## Keys
 

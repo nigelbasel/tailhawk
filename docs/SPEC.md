@@ -376,8 +376,6 @@ A process-spawn source executes a command line. This is the product's principal 
   app exit.
 - Encoding is detected on the piped bytes exactly as for a file — PowerShell's native-command pipeline
   has historically emitted UTF-16 and OEM codepages.
-- When stdin is a pipe, single-instance forwarding is **disabled** (implies `--new-window`). A pipe
-  handle cannot usefully be handed to another process.
 - **Temp-file location and lifetime are a privacy concern** — see §13.2.
 
 ### 4.3 Compressed archives (v2)
@@ -1322,7 +1320,7 @@ single most damaging possible CLI decision. **Every Tailhawk-specific option is 
 Full GNU surface including `--max-unchanged-stats` and `-z` lands with `--stdout` in v2, where the
 differential test harness against real GNU `tail` also lands.
 
-**Tailhawk options (selection):** `--new-window`, `--reuse`, `--tab|--tile|--merge`, `--profile=NAME`,
+**Tailhawk options (selection):** `--tab|--tile|--merge`, `--profile=NAME`,
 `--highlight=REGEX[:COLOUR]` (repeatable), `--filter=EXPR`, `--exclude=EXPR`, `--regex|--literal`,
 `--columns=auto|serilog|log4net|nlog|clef|none`, `--column-pattern="…"`, `--theme=dark|light|system`,
 `--encoding=…`, `--goto=N`, `--session=FILE`, `--stateless`, `--watch-dir=DIR --match=*.log`,
@@ -1336,13 +1334,17 @@ the folder-monitoring feature the owner uses.
 `\\server\share`, and only then a remaining colon as an NTFS stream separator. `--stream=NAME` opens
 an alternate data stream — no mainstream Windows tail does this.
 
-### 12.3 Single instance
+### 12.3 Every launch is its own window
 
-A per-user, per-session named mutex detects a running instance; a **named pipe** carries the argv
-(UTF-16, length-prefixed) plus the working directory so relative paths resolve. WM_COPYDATA is
-rejected — it is subject to UIPI and requires finding the target window. The receiver calls
-`AllowSetForegroundWindow`/`SetForegroundWindow`. Exit code **3** means "handed off to an existing
-instance", so scripts can distinguish forwarding from doing the work.
+`tailhawk file.log` opens a window. A second `tailhawk other.log` opens a **second window** — it
+does not reach into the first one, and there is nothing to opt out of.
+
+**This clause used to say the opposite, and that was never asked for.** An earlier draft of this
+document specified a per-session mutex, a named pipe carrying the argv, exit code 3 for "handed
+off" and a `--new-instance` escape hatch; a later session then implemented it faithfully against
+this document. The owner had not asked for any of it, and on 2026-09-01 said so: *"There is no
+reason to restrict to a single instance."* The machinery is gone. If a future session finds an
+argument for reviving it, that argument has to come from the owner, not from this file.
 
 ### 12.4 State, settings and portability
 
