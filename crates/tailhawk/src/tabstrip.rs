@@ -51,6 +51,7 @@ const TCS_FOCUSNEVER: u32 = 0x0000_8000;
 /// The id the control answers to in `WM_NOTIFY`, so the shell can tell it from any other child.
 pub const ID_TABS: i32 = 4_100;
 
+const TCM_GETITEMRECT: u32 = TCM_FIRST + 10;
 const TCM_HITTEST: u32 = TCM_FIRST + 13;
 
 /// Posted to the parent when a tab is dragged onto another's place: `wparam` is where it came
@@ -58,6 +59,15 @@ const TCM_HITTEST: u32 = TCM_FIRST + 13;
 /// rather than reorders — reordering the control alone would put the strip and the documents into
 /// different orders, which is the same class of lie as a stale menu tick.
 pub const WM_TAB_MOVED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x40;
+
+/// Posted to the parent when a tab is middle-clicked: `wparam` is the tab to close.
+///
+/// **`UI-DESIGN.md` §2.1's middle-click stopped working the moment the strip became a control**,
+/// and it did so silently. The handler lives on the *main window*, and a middle click over the
+/// strip is now delivered to the child; it also asked `Shell::tab_at`, which reads a hit list the
+/// drawn strip used to fill and nothing fills any more. Two independent reasons for the same
+/// nothing, which is why it was mistaken for dead code rather than a broken feature.
+pub const WM_TAB_CLOSE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x41;
 
 /// `TCHITTESTINFO`, laid out by hand beside [`TcItem`] for the same reason.
 #[repr(C)]
@@ -69,6 +79,20 @@ struct TcHitTest {
 thread_local! {
     /// Which tab the pointer went down on, while a drag is in progress.
     static DRAGGING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Posts one of this module's messages up to the window that owns the strip.
+///
+/// The control never acts on its own: the shell owns which documents exist and which is shown, so
+/// the strip reports the gesture and lets the shell decide. A control that closed its own tab would
+/// leave the strip and the documents disagreeing.
+fn tell_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
+    if let Ok(parent) = unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) } {
+        unsafe {
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::PostMessageW(parent, msg, wparam, lparam);
+        }
+    }
 }
 
 /// Which tab is under a point in the control's own client coordinates.
@@ -115,22 +139,18 @@ unsafe extern "system" fn drag_proc(
             if let (Some(from), Some(to)) = (from, tab_at(hwnd, x, y)) {
                 if from != to {
                     DRAGGING.with(|d| d.set(Some(to)));
-                    let parent =
-                        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) };
-                    if let Ok(parent) = parent {
-                        unsafe {
-                            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                                parent,
-                                WM_TAB_MOVED,
-                                WPARAM(from),
-                                LPARAM(to as isize),
-                            );
-                        }
-                    }
+                    tell_parent(hwnd, WM_TAB_MOVED, WPARAM(from), LPARAM(to as isize));
                 }
             }
         }
         WM_LBUTTONUP => DRAGGING.with(|d| d.set(None)),
+        // §2.1's middle-click close. It has to be handled here: the click lands on this control,
+        // not on the window whose handler used to answer it.
+        windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONDOWN => {
+            if let Some(at) = tab_at(hwnd, x, y) {
+                tell_parent(hwnd, WM_TAB_CLOSE, WPARAM(at), LPARAM(0));
+            }
+        }
         _ => {}
     }
     unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam) }
@@ -241,6 +261,33 @@ impl TabStrip {
             SendMessageW(self.hwnd, TCM_SETCURSEL, WPARAM(active), LPARAM(0));
         }
         self.shown = (labels.to_vec(), active);
+    }
+
+    /// One tab's rectangle in the strip's own client coordinates, which are also the window's here
+    /// because the strip sits at the origin.
+    ///
+    /// **The accessibility tree needs a truthful rectangle**, and the drawn strip's hit list — which
+    /// is where it used to come from — is no longer filled by anything. An element that claims to be
+    /// a tab and cannot say where it is, is worse than one that is absent.
+    pub fn item_rect(&self, at: usize) -> Option<(f32, f32, f32, f32)> {
+        let mut rect = RECT::default();
+        let ok = unsafe {
+            SendMessageW(
+                self.hwnd,
+                TCM_GETITEMRECT,
+                WPARAM(at),
+                LPARAM(&mut rect as *mut RECT as isize),
+            )
+        };
+        if ok.0 == 0 {
+            return None;
+        }
+        Some((
+            rect.left as f32,
+            rect.top as f32,
+            (rect.right - rect.left) as f32,
+            (rect.bottom - rect.top) as f32,
+        ))
     }
 
     /// Which tab the control says is current — read back after `TCN_SELCHANGE` rather than guessed.

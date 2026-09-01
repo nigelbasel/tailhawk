@@ -117,10 +117,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
     WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
     WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
-    WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL,
-    WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW,
+    WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
@@ -3340,9 +3340,12 @@ impl Command {
 }
 
 /// What is being dragged along the bar to reorder it.
+///
+/// Only chips, since the tab strip became `SysTabControl32` and reorders through its own subclass.
+/// Kept as an enum rather than flattened away because the panel's drag is the same shape it always
+/// was, and a second kind is what this is for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum BarDrag {
-    Tab,
     Chip,
 }
 
@@ -3363,7 +3366,6 @@ enum Hit {
     FilterEdit,
     FilterRemove,
     FilterClear,
-    Tab(usize),
 }
 
 /// What choosing a row of §6.1's chip menu does.
@@ -4865,25 +4867,13 @@ impl Shell {
         self.retitle(hwnd);
     }
 
-    /// The tab under `(x, y)`, if the point is in the strip — `UI-DESIGN.md` §2.1's middle-click.
-    fn tab_at(&self, x: f32, y: f32) -> Option<usize> {
-        let doc = self.document.as_ref()?;
-        if doc.tab_strip.0.len() < 2 || y >= Chrome::strip_height(self.cell_h.max(1.0)) {
-            return None;
-        }
-        doc.chrome
-            .hits
-            .borrow()
-            .iter()
-            .find_map(|(range, hit)| match hit {
-                Hit::Tab(i) if range.contains(&x) => Some(*i),
-                _ => None,
-            })
-    }
-
-    /// Ends a bar drag at `x`: the tab or chip is moved to the slot under the pointer, if it is
-    /// over another of its kind. Reports whether the order changed.
-    fn drop_bar_drag(&mut self, x: f32, y: f32) -> bool {
+    /// Ends a bar drag at `x`: the chip is moved to the slot under the pointer. Reports whether the
+    /// order changed.
+    ///
+    /// **Tabs are no longer dragged here.** The strip is `SysTabControl32` and does its own
+    /// reordering through `tabstrip`'s subclass, which posts the move rather than performing it —
+    /// so this is the panel's business alone now.
+    fn drop_bar_drag(&mut self, _x: f32, y: f32) -> bool {
         let Some((kind, from)) = self.dragging_bar.take() else {
             return false;
         };
@@ -4891,15 +4881,6 @@ impl Shell {
             return false;
         };
         let target = match kind {
-            BarDrag::Tab => doc
-                .chrome
-                .hits
-                .borrow()
-                .iter()
-                .find_map(|(range, hit)| match hit {
-                    Hit::Tab(i) if range.contains(&x) => Some(*i),
-                    _ => None,
-                }),
             // The panel is a column, so the row under the pointer is the target — y decides, and
             // anywhere along the row's width counts, which is how a vertical list reorders.
             BarDrag::Chip => {
@@ -4924,14 +4905,6 @@ impl Shell {
             return false;
         }
         match kind {
-            BarDrag::Tab => {
-                if from < self.document.tabs.len() && to < self.document.tabs.len() {
-                    let tab = self.document.tabs.remove(from);
-                    self.document.tabs.insert(to, tab);
-                    self.document.active = to;
-                    return true;
-                }
-            }
             BarDrag::Chip => {
                 if let Some(doc) = self.document.as_mut() {
                     let chips = &mut doc.filtering.chips.chips;
@@ -5721,32 +5694,20 @@ impl Shell {
             }
             return false;
         }
-        // The strip is the top band; a click there is a tab, and only a tab.
-        let in_strip = doc.tab_strip.0.len() > 1 && y < Chrome::strip_height(self.cell_h.max(1.0));
+        // The tab strip is a child window now, so a click on it never reaches here at all — it is
+        // the control's, and it answers with `TCN_SELCHANGE`, `WM_TAB_MOVED` or `WM_TAB_CLOSE`.
         let hit = panel_hit.or_else(|| {
             doc.chrome
                 .hits
                 .borrow()
                 .iter()
-                .find(|(range, hit)| range.contains(&x) && matches!(hit, Hit::Tab(_)) == in_strip)
+                .find(|(range, _)| range.contains(&x))
                 .map(|(_, hit)| *hit)
         });
-        if let Some(Hit::Tab(i)) = hit {
-            self.dragging_bar = Some((BarDrag::Tab, i));
-            unsafe { SetCapture(hwnd) };
-            self.document.active = i.min(self.document.len().saturating_sub(1));
-            self.retitle(hwnd);
-            self.sync_scrollbar(hwnd);
-            unsafe {
-                let _ = InvalidateRect(hwnd, None, false);
-            }
-            return true;
-        }
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
         match hit {
-            Some(Hit::Tab(_)) => {}
             Some(Hit::Chip(i)) if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
                 self.pending_filter_edit = Some(i);
             }
@@ -6169,23 +6130,10 @@ mod uia {
                 // §13's rects must be the ones the frame drew, so the bands are measured the
                 // way `draw` measures them — from the chrome face.
                 let band = doc.band_h(row_h);
-                let strip = if doc.tab_strip.0.len() > 1 {
-                    Chrome::strip_height(band)
-                } else {
-                    0.0
-                };
                 let (w, h) = (
                     doc.view.gutter_px() + doc.view.hgrid().viewport_px(),
                     doc.view.height_px(),
                 );
-                let x_range = |wanted: &dyn Fn(&Hit) -> bool| {
-                    doc.chrome
-                        .hits
-                        .borrow()
-                        .iter()
-                        .find(|(_, hit)| wanted(hit))
-                        .map(|(r, _)| r.clone())
-                };
                 // The filter panel's targets carry both axes, so its elements answer with real
                 // rects rather than a band guess.
                 let panel_rect = |wanted: &dyn Fn(&Hit) -> bool| {
@@ -6198,10 +6146,11 @@ mod uia {
                 };
                 Some(match self.kind {
                     Kind::Root => (0.0, 0.0, w, h),
-                    Kind::Tab(i) => {
-                        let r = x_range(&|hit| *hit == Hit::Tab(i))?;
-                        (r.start, 0.0, r.end - r.start, strip)
-                    }
+                    // Asked of the real control. The rectangle used to come from the drawn strip's
+                    // hit list, which nothing fills since the strip became `SysTabControl32` — an
+                    // element that says it is a tab and cannot say where it is would be worse than
+                    // no element at all.
+                    Kind::Tab(i) => with_shell(|s| s.tabs.as_ref()?.item_rect(i))?,
                     Kind::NewChip => {
                         // The Add… button is the panel's way in now the inline field is gone.
                         let (xr, yr) = panel_rect(&|hit| *hit == Hit::FilterAdd)?;
@@ -8434,20 +8383,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 None => def_proc(hwnd, msg, wparam, lparam),
             }
         }
-        // §2.1: middle-click closes the tab under the pointer.
-        WM_MBUTTONDOWN => {
-            let x = (lparam.0 & 0xFFFF) as i16 as f32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
-            STATE.with(|s| {
-                if let Some(shell) = s.borrow_mut().as_mut() {
-                    if let Some(i) = shell.tab_at(x, y) {
-                        shell.document.active = i;
-                        shell.run(hwnd, Command::CloseTab);
-                    }
-                }
-            });
-            LRESULT(0)
-        }
+        // §2.1's middle-click close now arrives as `WM_TAB_CLOSE` from the tab control, because
+        // that is the window the click lands on. Nothing else in the client area answers a middle
+        // click, so this message no longer needs a handler of its own.
         // §2.5: the pointer says what the column boundary does. Until this existed, resize was a
         // gesture with no sign of itself anywhere on screen — the only place it was written down
         // was a command's name in a list.
@@ -8798,6 +8736,28 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 });
                 if let Some(tree) = tree {
                     menubar::refill_popup(popup, &tree, top as usize);
+                }
+            }
+            LRESULT(0)
+        }
+        // §2.1's middle-click close, from the control the click actually lands on.
+        tabstrip::WM_TAB_CLOSE => {
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    if wparam.0 < shell.document.len() {
+                        shell.document.active = wparam.0;
+                    }
+                }
+            });
+            let closed = STATE.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|shell| shell.run(hwnd, Command::CloseTab))
+            });
+            if closed {
+                run_pending_dialogs(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
             }
             LRESULT(0)
