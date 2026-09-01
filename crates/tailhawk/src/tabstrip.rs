@@ -53,6 +53,17 @@ pub const ID_TABS: i32 = 4_100;
 
 const TCM_GETITEMRECT: u32 = TCM_FIRST + 10;
 const TCM_HITTEST: u32 = TCM_FIRST + 13;
+const TCM_SETPADDING: u32 = TCM_FIRST + 43;
+
+/// Breathing room around a tab's label, in pixels at 96 DPI, scaled with the strip's font.
+///
+/// The control's own default is 6 across and 3 down, which the owner read on 2026-08-28 as "a bit
+/// cramped … might need some white space on either side of the label … could also do with being a
+/// bit higher". These are the numbers that answer both, and they are the *only* place a size is
+/// chosen: [`TabStrip::band_height`] still asks the control how tall it has become, so the band and
+/// the tabs cannot disagree the way they would if a height were set here too.
+const PAD_X: i32 = 14;
+const PAD_Y: i32 = 7;
 
 /// Posted to the parent when a tab is dragged onto another's place: `wparam` is where it came
 /// from, `lparam` where it now belongs. The shell owns the document order, so the control asks
@@ -171,6 +182,14 @@ unsafe extern "system" fn drag_proc(
         WM_LBUTTONDOWN => {
             DRAGGING.with(|d| d.set(tab_at(hwnd, x, y)));
             DRAGGED_OUT.with(|d| d.set(false));
+            // **Capture, or a drag can never leave the strip.** This module assumed the control
+            // took the mouse itself and it does not: reorder worked because those moves are inside
+            // the control anyway, while §1069's drag-*out* saw nothing at all, because a move over
+            // the grid is delivered to whatever is under the pointer. The owner reported exactly
+            // that on 2026-08-28 — reorder fine, drag-out dead.
+            unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+            }
         }
         WM_MOUSEMOVE if wparam.0 & 0x0001 != 0 => {
             let Some(from) = DRAGGING.with(|d| d.get()) else {
@@ -198,6 +217,9 @@ unsafe extern "system" fn drag_proc(
             }
         }
         WM_LBUTTONUP => {
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+            }
             let from = DRAGGING.with(|d| d.replace(None));
             let out = DRAGGED_OUT.with(|d| d.replace(false));
             if let Some(from) = from {
@@ -270,6 +292,18 @@ impl TabStrip {
         // not something this module can fix without drawing the tabs again.
         unsafe {
             let _ = SetWindowTheme(hwnd, w!("DarkMode_Explorer"), PCWSTR::null());
+        }
+        // Padding, scaled for this monitor: the label gets room either side and the tab gets
+        // taller. Sent after the font, because the control lays a tab out from both together.
+        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+        let scale = |n: i32| n * dpi as i32 / 96;
+        unsafe {
+            SendMessageW(
+                hwnd,
+                TCM_SETPADDING,
+                WPARAM(0),
+                LPARAM(((scale(PAD_Y) << 16) | (scale(PAD_X) & 0xFFFF)) as isize),
+            );
         }
         // §1069's drag-to-reorder, which the control has no notion of.
         unsafe {
