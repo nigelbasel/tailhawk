@@ -75,10 +75,17 @@ were keyboard-only. A principle that reads as restraint was in practice a licenc
 of the interface most users reach for first.
 
 **What stays true** is the *register*, not the omission. No ribbon; no toolbar of ambiguous,
-unlabelled 16×16 icons. The menu bar and toolbar are **drawn by the app** in its own flat
-Windows 11 style — not a classic Win32 `HMENU`, whose grey 3D chrome the row above still rejects.
-Toolbar buttons carry text, or an icon with a text label beside it, never an icon alone. Every menu
-item names its accelerator, so the menu teaches the keyboard instead of competing with it.
+unlabelled 16×16 icons. Toolbar buttons carry text, or an icon with a text label beside it, never an
+icon alone. Every menu item names its accelerator, so the menu teaches the keyboard instead of
+competing with it.
+
+**Drawn by Windows, not by us — reversed 2026-08-25, and again in practice on 2026-09-01.** This
+paragraph used to end "the menu bar and toolbar are **drawn by the app** in its own flat Windows 11
+style — not a classic Win32 `HMENU`". The owner settled the opposite: standard Windows controls
+first. The menu bar became a real `HMENU`, the tab strip a real `SysTabControl32`, and the toolbar a
+real `ToolbarWindow32` — text buttons, no image list, its height asked of the control. A drawn
+toolbar would have been the third bespoke surface in a product that has twice decided against them,
+and the sentence was left standing long enough that it nearly became one.
 
 ---
 
@@ -321,6 +328,18 @@ their state is on, so the toolbar reads as a status display as well as a control
 
 The toolbar is **hideable** — `View ▸ Toolbar` — and its state is remembered per §12.4, because a
 user who works from the keyboard should be able to buy the row back.
+
+**Built 2026-09-01** as a real `ToolbarWindow32` — `crates/tailhawk/src/toolbar.rs`. Three things
+about it are decisions rather than detail. Its **height is asked of the control** through
+`TB_GETMAXSIZE` and is never a number chosen in the source, because the tab strip's band was once
+`chrome_h + 4.0` and that four was exactly the "a bit small" the owner reported. Its **button ids
+are the register's**, the same ones the menu sends, so a click goes down the one dispatch §1.2 asks
+for and the two surfaces cannot drift; a test asserts it. And it carries **no image list at all** —
+`I_IMAGENONE` on every button — which is how the "never an icon alone" rule above is kept without
+committing anyone to an icon set.
+
+The menu item reads **`Toolb&ar`**, with `a` as its mnemonic, because `T` belongs to `Go to top` and
+`b` to `Back`. The collision was caught by the menu's own mnemonic test rather than on screen.
 
 ### 2.4 Context menus `[v1]`
 

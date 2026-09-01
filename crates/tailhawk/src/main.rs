@@ -31,6 +31,7 @@ mod menubar;
 mod net;
 mod prefs;
 mod tabstrip;
+mod toolbar;
 mod version;
 
 use std::cell::RefCell;
@@ -859,18 +860,20 @@ impl Document {
         // when there are columns. Set after the viewport, which is what all three are subtracted from.
         let chrome_h = self.band_h(row_h);
         // §2.2 as resettled: the menu bar is non-client and the command row is gone, so the top
-        // chrome is the tab strip alone — and nothing at all with a single tab, exactly as a
-        // standard tabbed application draws itself.
-        // **The band is the tab control's own height, measured from it by the shell**, not a number
+        // chrome is the child controls above the grid — the tab strip, which is absent with a
+        // single tab exactly as a standard tabbed application draws itself, and §2.3's toolbar.
+        // **The band is those controls' own measured heights, summed by the shell**, not a number
         // chosen here. The drawn strip used `chrome_h + 4.0` — four pixels around a text run —
         // which is exactly the "a bit small" the owner reported, and any constant put in its place
         // would be the same mistake with a different value. A document knows nothing of the other
         // tabs, so the shell hands this across each frame exactly as it hands the labels.
-        let strip = if self.tab_strip.0.len() > 1 {
-            self.strip_px
-        } else {
-            0.0
-        };
+        //
+        // **This used to be gated on `tab_strip.0.len() > 1` and that became wrong the moment the
+        // toolbar arrived.** The shell already sets `strip_px` to zero when the strip is hidden, so
+        // the gate was redundant for tabs — but with one tab and a toolbar it also threw the
+        // toolbar's band away, and the grid drew its first rows underneath a live child window.
+        // The reserved band is simply what the shell says it is.
+        let strip = self.strip_px;
         self.view.set_chrome_px(strip);
         // V10: the detail pane sits above the status bar, a third of the height at most, when open.
         let pane_rows = if self.detail.open {
@@ -3215,6 +3218,8 @@ enum Command {
     ToggleTheme,
     EditLastChip,
     ResetColumns,
+    /// §2.3: show or hide the toolbar row.
+    ToggleToolbar,
     /// V9's rules editor — `UI-DESIGN.md` §5.
     EditRules,
     DefineFormat,
@@ -3315,6 +3320,7 @@ impl Command {
             "Reset column widths (drag a header boundary to resize; to 0 hides)",
             "",
         ),
+        (Command::ToggleToolbar, "Show or hide the toolbar", ""),
         (Command::EditRules, "Highlight rules…", "Ctrl+H"),
         (Command::DefineFormat, "Define format from a line…", ""),
         (Command::ImportLayout, "Import layout from config…", ""),
@@ -3814,6 +3820,11 @@ struct Shell {
     /// strip is then simply absent rather than the window failing to open, because a viewer with no
     /// tab strip still views.
     tabs: Option<tabstrip::TabStrip>,
+    /// §2.3's toolbar. `None` only if the control could not be created, in which case the row is
+    /// simply absent rather than the window failing to open.
+    toolbar: Option<toolbar::Toolbar>,
+    /// Whether §2.3's row is shown. Remembered per §12.4; the default is shown.
+    show_toolbar: bool,
     /// The measured cell size, for the command bar's hit-test. Zero until the first frame.
     cell_w: f32,
     cell_h: f32,
@@ -4307,9 +4318,34 @@ impl Shell {
             .and_then(|()| {
                 if pane_count == 0 {
                     // No file yet: §14's first-run surface, the recent files on it.
+                    //
+                    // **The toolbar is placed here too, and that is the whole of a defect found in
+                    // review.** This branch returns before the layout below, so a toolbar laid out
+                    // only there was never shown at a cold start and — worse — was never *hidden*
+                    // again when the last tab closed, leaving a live child window with the closed
+                    // document's enablement sitting over the Welcome surface. §2.3 wants the row
+                    // present and greyed with nothing open, so `toolbar_of(None)` is exactly the
+                    // right answer and simply has to be asked.
                     let cell = renderer.cell()?;
                     self.cell_w = cell.0;
                     self.cell_h = cell.1;
+                    let buttons = toolbar::toolbar_of(None);
+                    let band = match (self.toolbar.as_mut(), self.show_toolbar) {
+                        (Some(bar), true) => {
+                            bar.set(&buttons);
+                            let band = bar.band_height();
+                            bar.place(0, w as i32, band, true);
+                            band as f32
+                        }
+                        (Some(bar), false) => {
+                            bar.place(0, w as i32, 0, false);
+                            0.0
+                        }
+                        (None, _) => 0.0,
+                    };
+                    if let Some(tabs) = self.tabs.as_mut() {
+                        tabs.place(w as i32, 0, false);
+                    }
                     let recent: Vec<String> = self
                         .settings
                         .files
@@ -4318,8 +4354,7 @@ impl Shell {
                         .take(6)
                         .map(|f| f.path.clone())
                         .collect();
-                    let welcome =
-                        Welcome::new(cell, (w, h), &recent, renderer.chrome_line_height()?);
+                    let welcome = Welcome::new(cell, (w, h), &recent, band);
                     let laid = renderer.paint_rows(&welcome.view, &welcome)?;
                     rasterised = laid.rasterised;
                     self.welcome = Some(welcome);
@@ -4353,6 +4388,23 @@ impl Shell {
                     }
                     (None, _) => 0.0,
                 };
+                // §2.3's row, directly under the strip. Its band is asked of the control for the
+                // same reason the strip's is, and the two together are what the grid starts below.
+                let buttons = toolbar::toolbar_of(self.document.as_ref());
+                let toolbar_px = match (self.toolbar.as_mut(), self.show_toolbar) {
+                    (Some(bar), true) => {
+                        bar.set(&buttons);
+                        let band = bar.band_height();
+                        bar.place(strip_px as i32, w as i32, band, true);
+                        band as f32
+                    }
+                    (Some(bar), false) => {
+                        bar.place(0, w as i32, 0, false);
+                        0.0
+                    }
+                    (None, _) => 0.0,
+                };
+                let strip_px = strip_px + toolbar_px;
                 let panes = self.document.panes_mut();
                 for (i, doc) in panes.iter_mut().enumerate() {
                     let (top, height) = tops[i];
@@ -5522,6 +5574,14 @@ impl Shell {
                 self.toggle_theme(hwnd);
                 return true;
             }
+            // §2.3: hideable, remembered, and reachable with nothing open — a user who hid it and
+            // then closed every file must still be able to get it back.
+            Command::ToggleToolbar => {
+                self.show_toolbar = !self.show_toolbar;
+                self.settings.toolbar = Some(self.show_toolbar);
+                self.save_settings(hwnd);
+                return true;
+            }
             Command::EditRules => {
                 self.pending_rules = true;
                 return true;
@@ -5676,6 +5736,7 @@ impl Shell {
             | Command::ImportLayout
             | Command::OpenRules
             | Command::ReloadRules
+            | Command::ToggleToolbar
             | Command::CloseTab => {}
         }
         self.after_chrome_key(hwnd)
@@ -5951,7 +6012,8 @@ impl Welcome {
     /// drawn in. **A view with no chrome band never has [`RowSource::draw_chrome`] called on it** —
     /// `paint.rs` gates that call on `chrome_px() > 0` — so a `Welcome` that forgets this draws no
     /// menu bar however carefully it implements the method.
-    fn new(cell: (f32, f32), size: (u32, u32), recent: &[String], chrome_h: f32) -> Self {
+    fn new(cell: (f32, f32), size: (u32, u32), recent: &[String], band_px: f32) -> Self {
+        let chrome_h = band_px;
         let (cell_w, row_h) = cell;
         let width_cells = ((size.0 as f32) / cell_w.max(1.0)).max(20.0) as usize;
         let centre = |text: &str| {
@@ -5993,8 +6055,12 @@ impl Welcome {
         let mut view = View::new(cell_w, row_h);
         view.set_metrics(cell_w, row_h);
         view.set_viewport(size.0 as f32, size.1 as f32);
-        let _ = chrome_h;
-        view.set_chrome_px(0.0);
+        // **The band is the toolbar's, not the menu bar's.** §2.2's bar became a real non-client
+        // `HMENU`, so this surface reserves nothing for it; §2.3's toolbar is a child window that
+        // really is over the top of these rows, and its height has to come out of them or the
+        // greeting draws underneath it. `RowSource::draw_chrome` defaults to a no-op, so reserving
+        // the band costs this surface nothing else.
+        view.set_chrome_px(chrome_h);
         view.grid_mut().set_total_rows(lines.len() as u64);
         view.hgrid_mut().set_columns(width_cells as u64 + 1);
         Self { lines, opens, view }
@@ -6955,6 +7021,23 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
 /// is released — which works only if the arm that ran the command remembers to ask. The menu bar's
 /// click path did not, so **File ▸ Open…, Export view… and Keep saving… silently did nothing when
 /// clicked**, while the same three worked from the keyboard.
+/// Whether a `WM_COMMAND` with notification code zero came from the menu bar or from §2.3's
+/// toolbar — the only two surfaces whose ids are positions in [`Command::LISTED`].
+///
+/// A menu sends `lParam` zero; a control sends its own window handle. Anything else is a control
+/// this function has never heard of, and its control id must not be read as a command.
+fn from_menu_or_toolbar(lparam: LPARAM) -> bool {
+    lparam.0 == 0
+        || STATE.with(|s| {
+            s.borrow().as_ref().is_some_and(|shell| {
+                shell
+                    .toolbar
+                    .as_ref()
+                    .is_some_and(|bar| bar.hwnd().0 as isize == lparam.0)
+            })
+        })
+}
+
 fn run_pending_dialogs(hwnd: HWND) -> bool {
     let open = STATE.with(|s| {
         s.borrow_mut()
@@ -8632,6 +8715,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             shell.document.as_ref(),
                             theme().dark,
                             &shell.settings.recent,
+                            shell.show_toolbar,
                         )
                     })
                 });
@@ -8780,9 +8864,20 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
             LRESULT(0)
         }
-        WM_COMMAND if (wparam.0 >> 16) & 0xFFFF == 0 && lparam.0 == 0 => {
-            // The real menu chose an id; it routes through the same register and dispatch every
-            // other surface uses, and a chosen dialog opens on this message, not the next one.
+        // **The menu bar and the toolbar both arrive here**, which is the point of giving the
+        // toolbar the register's ids. They differ only in `lParam`: zero from a menu, the control's
+        // own handle from a toolbar button. An accelerator is what the high word excludes — it
+        // carries `1` there and is dispatched before this.
+        //
+        // **`lParam` is checked rather than merely described.** An earlier draft dropped the test
+        // and relied on the main window having no other children that send `WM_COMMAND`. That was
+        // true, and it made the id an unguarded index into `Command::LISTED` — so the next child
+        // control added here, sending `BN_CLICKED` (which is notification code **0**) with a small
+        // control id, would silently run a register command; id 0 is `Open file…`. The `WM_NOTIFY`
+        // arm above checks `idFrom`, and this is the same discipline.
+        WM_COMMAND if (wparam.0 >> 16) & 0xFFFF == 0 && from_menu_or_toolbar(lparam) => {
+            // The id routes through the same register and dispatch every other surface uses, and a
+            // chosen dialog opens on this message, not the next one.
             let id = (wparam.0 & 0xFFFF) as u32;
             let acted = STATE.with(|s| {
                 s.borrow_mut()
@@ -9243,6 +9338,8 @@ fn main() -> Result<()> {
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
             tabs: None,
+            toolbar: None,
+            show_toolbar: settings.toolbar.unwrap_or(true),
             drag_guide: None,
             cell_w: 0.0,
             cell_h: 0.0,
@@ -9333,9 +9430,11 @@ fn main() -> Result<()> {
         SetWindowLongPtrW(hwnd, GWL_STYLE, (style | WS_CLIPCHILDREN.0) as isize);
     }
     let strip = tabstrip::TabStrip::create(hwnd, instance);
+    let bar = toolbar::Toolbar::create(hwnd, instance);
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.tabs = strip;
+            shell.toolbar = bar;
         }
     });
 
@@ -9348,7 +9447,14 @@ fn main() -> Result<()> {
                 .map(|shell| shell.settings.recent.clone())
                 .unwrap_or_default()
         });
-        if let Some(bar) = menubar::build_bar(&menubar::menu_bar(None, theme().dark, &recent)) {
+        let show_toolbar =
+            STATE.with(|s| s.borrow().as_ref().is_some_and(|shell| shell.show_toolbar));
+        if let Some(bar) = menubar::build_bar(&menubar::menu_bar(
+            None,
+            theme().dark,
+            &recent,
+            show_toolbar,
+        )) {
             unsafe {
                 let _ = SetMenu(hwnd, bar);
             }
@@ -10309,7 +10415,7 @@ mod tests {
     #[test]
     fn back_and_forward_are_greyed_until_there_is_a_view_to_return_to() {
         fn enabled(doc: &Document, label: &str) -> bool {
-            let menu = menubar::menu_bar(Some(doc), false, &[]);
+            let menu = menubar::menu_bar(Some(doc), false, &[], true);
             for top in 0..menu.items().len() {
                 let Some(items) = menu.at(&[top]) else {
                     continue;

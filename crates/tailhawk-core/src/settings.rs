@@ -72,6 +72,8 @@ pub struct Settings {
     pub font: Option<String>,
     /// §2.2 Preferences: the grid em size at the 96-DPI baseline, when the user chose one.
     pub font_size: Option<u16>,
+    /// §2.3: whether the toolbar row is shown. Absent means shown — the default is the row.
+    pub toolbar: Option<bool>,
     /// File ▸ Open Recent, newest first, at most [`RECENT_MAX`].
     pub recent: Vec<String>,
     /// The Find dialog's query history, newest first, at most [`FIND_MAX`].
@@ -136,6 +138,9 @@ impl Settings {
         if over.window.is_some() {
             self.window = over.window;
         }
+        if over.toolbar.is_some() {
+            self.toolbar = over.toolbar;
+        }
         if over.theme.is_some() {
             self.theme = over.theme;
         }
@@ -160,7 +165,11 @@ impl Settings {
         // One `[appearance]` heading however many of its keys are set — a second heading for the
         // same table is legal TOML but reads as a mistake to anyone editing the file by hand, which
         // §12.4 expects them to do.
-        if self.theme.is_some() || self.font.is_some() || self.font_size.is_some() {
+        if self.theme.is_some()
+            || self.font.is_some()
+            || self.font_size.is_some()
+            || self.toolbar.is_some()
+        {
             out.push_str("\n[appearance]\n");
             if let Some(theme) = &self.theme {
                 out.push_str(&format!("theme = {}\n", quote(theme)));
@@ -170,6 +179,9 @@ impl Settings {
             }
             if let Some(size) = self.font_size {
                 out.push_str(&format!("font_size = {size}\n"));
+            }
+            if let Some(shown) = self.toolbar {
+                out.push_str(&format!("toolbar = {shown}\n"));
             }
         }
         if !self.recent.is_empty() {
@@ -268,6 +280,12 @@ impl Settings {
                     "theme" => settings.theme = Some(unquote(value)),
                     "font" => settings.font = Some(unquote(value)),
                     "font_size" => settings.font_size = value.parse().ok(),
+                    // Only the two spellings TOML has. Anything else leaves the key unset, which
+                    // means the default rather than "hidden" — a typo must not silently take the
+                    // row away, since the way back to it is the row's own menu item.
+                    "toolbar" if value == "true" || value == "false" => {
+                        settings.toolbar = Some(value == "true");
+                    }
                     _ => {}
                 },
                 Section::Recent => {
@@ -568,6 +586,7 @@ mod tests {
             theme: Some("light".to_owned()),
             font: Some("Cascadia Mono".to_owned()),
             font_size: Some(18),
+            toolbar: Some(false),
             recent: vec![r"C:\logs\app.log".to_owned()],
             find_queries: vec!["ERROR".to_owned(), r"time\d+".to_owned()],
         };
@@ -672,6 +691,21 @@ mod tests {
         });
         assert_eq!(s.files.len(), 1, "case-insensitive path replaces");
         assert_eq!(s.file(r"C:\logs\other.log").unwrap().chips, ["+x"]);
+    }
+
+    /// **An unreadable `toolbar` value leaves the row alone.** The only way back to a hidden
+    /// toolbar is the toolbar's own menu item, so a typo in a hand-edited settings file must not be
+    /// able to take it away — absent and unparseable both have to mean "the default", and the
+    /// default is shown.
+    #[test]
+    fn only_a_real_boolean_hides_the_toolbar() {
+        let read = |text: &str| Settings::from_toml(text).toolbar;
+        assert_eq!(read("[appearance]\ntoolbar = false\n"), Some(false));
+        assert_eq!(read("[appearance]\ntoolbar = true\n"), Some(true));
+        assert_eq!(read("[appearance]\ntoolbar = \"no\"\n"), None, "a string");
+        assert_eq!(read("[appearance]\ntoolbar = 0\n"), None, "a number");
+        assert_eq!(read("[appearance]\ntoolbar = False\n"), None, "wrong case");
+        assert_eq!(read("[appearance]\ntheme = \"dark\"\n"), None, "absent");
     }
 
     #[test]

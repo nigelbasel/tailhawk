@@ -466,7 +466,7 @@ struct TcItem {
 }
 
 /// The font Windows draws its own chrome in, so the strip matches every other tabbed application.
-fn shell_font() -> HFONT {
+pub fn shell_font() -> HFONT {
     let mut metrics = NONCLIENTMETRICSW {
         cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
         ..Default::default()
