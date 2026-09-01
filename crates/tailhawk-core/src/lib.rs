@@ -82,6 +82,11 @@ pub mod rotation;
 
 #[cfg(windows)]
 pub mod scanner;
+
+/// The rolling set of files behind one source. Windows-only because it is built out of [`file`],
+/// [`rotation`] and [`scanner`], all of which are — which was true from the first line of it and
+/// went unnoticed because nothing ever compiled this crate for another target.
+#[cfg(windows)]
 pub mod set;
 
 #[cfg(windows)]

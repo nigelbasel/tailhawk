@@ -37,6 +37,20 @@ jobs:
   # somewhere in CLEANROOM.md. It cannot check that the entry came first, that it is accurate, or
   # that it is honest; a human still has to read it. What it does catch is the failure that has
   # actually happened every time: a new module arriving with no entry at all.
+  # `SPEC.md` §3.1 calls `tailhawk-core` a **portable** core with the Windows backends behind
+  # `cfg(windows)`. Nothing ever checked that, and it had quietly stopped being true: `set` was the
+  # one module of its four that was not gated, so the crate did not compile for any other target.
+  # One `#[cfg(windows)]` fixed it — and a claim that costs one line to keep true is worth a job,
+  # because the way it broke was simply that nobody ever tried.
+  #
+  # This is a *compile* check, not a promise that Tailhawk runs on Linux. §2.1 scopes the product
+  # to Windows and that is unchanged; what this defends is the core staying free of the shell.
+  portable-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo check -p tailhawk-core --target x86_64-unknown-linux-gnu
+
   provenance:
     runs-on: ubuntu-latest
     steps:
