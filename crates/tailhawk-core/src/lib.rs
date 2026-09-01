@@ -16,6 +16,7 @@ pub mod cell;
 pub mod columns;
 pub mod detail;
 pub mod detect;
+pub mod dropzone;
 pub mod encoding;
 pub mod filter;
 pub mod fling;
