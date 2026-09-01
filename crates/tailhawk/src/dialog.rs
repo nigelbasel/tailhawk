@@ -23,7 +23,8 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMHDR, NMLVCUSTOMDRAW,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMCUSTOMDRAW_DRAW_STATE_FLAGS, NMHDR,
+    NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetDlgItem,
@@ -793,35 +794,101 @@ pub fn rules_row_cells(editor: &tailhawk_core::ruleset::Editor) -> Vec<[String; 
         .collect()
 }
 
-/// Answers one stage of the list view's custom-draw conversation.
+/// What one stage of the custom-draw conversation should be answered with.
 ///
-/// Only the Colour column is touched; every other cell is left to the control, which is what keeps
+/// **A value rather than a side effect**, so the whole of this decision can be exercised with no
+/// window, no list view and no `NMLVCUSTOMDRAW` to point at. The shell half below does nothing but
+/// copy the colours into the structure and hand back the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swatch {
+    /// Ask the control to say something about each **item**.
+    Items,
+    /// Ask it to say something about each **subitem** of the item it is on.
+    ///
+    /// Spelled with the same bit as [`Swatch::Items`], which is comctl32's doing and not ours; the
+    /// two are named apart because they are not the same instruction and a reader should not have
+    /// to know they collide.
+    Subitems,
+    /// Paint this cell's text and background; `None` leaves the control's own choice alone.
+    Tint(Option<u32>, Option<u32>),
+    /// Nothing to say; the control draws the cell as it would have.
+    Leave,
+}
+
+impl Swatch {
+    /// The `CDRF_*` code this answer is spelled as.
+    pub fn code(self) -> isize {
+        match self {
+            Swatch::Items => CDRF_NOTIFYITEMDRAW,
+            Swatch::Subitems => CDRF_NOTIFYSUBITEMDRAW,
+            Swatch::Tint(..) => CDRF_NEWFONT,
+            Swatch::Leave => CDRF_DODEFAULT,
+        }
+    }
+}
+
+/// The item state a tinted cell is drawn with.
+///
+/// **This is the whole of the swatch bug, and it was invisible on paper.** The list view carries
+/// `LVS_EX_FULLROWSELECT`, so the selected row's every cell — the Colour cell included — is painted
+/// in the system highlight, and comctl32 does that *after* taking the colours custom draw handed
+/// it. The first rule in the owner's own file sets only a foreground, the dialog selects row 0 when
+/// it opens, and so the one swatch he was looking at was drawn in selection blue and white. The
+/// background swatch on the unselected row below it was painting correctly the whole time.
+///
+/// A swatch whose colour depends on which row is selected is not a swatch. So the selection and
+/// focus states are dropped for this one cell, and the other four keep the highlight — the row
+/// still reads as selected, and the sample still reads as the colour it is advertising.
+pub fn tinted_state(state: u32) -> u32 {
+    state & !(CDIS_SELECTED | CDIS_FOCUS)
+}
+
+/// Which cell the swatch belongs in, and what to paint it.
+///
+/// Only the Colour column is claimed; every other cell is left to the control, which is what keeps
 /// the rest of the row looking like a list view rather than like something we drew.
+pub fn rules_swatch_for(
+    stage: u32,
+    subitem: i32,
+    at: usize,
+    swatches: &[Option<(Option<u32>, Option<u32>)>],
+) -> Swatch {
+    match stage {
+        CDDS_PREPAINT => Swatch::Items,
+        CDDS_ITEMPREPAINT => Swatch::Subitems,
+        stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
+            if subitem != RULES_COLOUR_COLUMN {
+                return Swatch::Leave;
+            }
+            match swatches.get(at).copied().flatten() {
+                Some((None, None)) | None => Swatch::Leave,
+                Some((fg, bg)) => Swatch::Tint(fg, bg),
+            }
+        }
+        _ => Swatch::Leave,
+    }
+}
+
+/// Answers one stage of the list view's custom-draw conversation.
 fn rules_custom_draw(lparam: LPARAM) -> isize {
     let draw = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
-    match draw.nmcd.dwDrawStage.0 {
-        CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW,
-        CDDS_ITEMPREPAINT => CDRF_NOTIFYSUBITEMDRAW,
-        stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
-            if draw.iSubItem != RULES_COLOUR_COLUMN {
-                return CDRF_DODEFAULT;
-            }
-            let at = draw.nmcd.dwItemSpec;
-            let swatch = crate::rules_read(rules_row_swatches)
-                .and_then(|rows| rows.get(at).copied().flatten());
-            let Some((fg, bg)) = swatch else {
-                return CDRF_DODEFAULT;
-            };
-            if let Some(fg) = fg {
-                draw.clrText = COLORREF(fg);
-            }
-            if let Some(bg) = bg {
-                draw.clrTextBk = COLORREF(bg);
-            }
-            CDRF_NEWFONT
+    let swatches = crate::rules_read(rules_row_swatches).unwrap_or_default();
+    let answer = rules_swatch_for(
+        draw.nmcd.dwDrawStage.0,
+        draw.iSubItem,
+        draw.nmcd.dwItemSpec,
+        &swatches,
+    );
+    if let Swatch::Tint(fg, bg) = answer {
+        if let Some(fg) = fg {
+            draw.clrText = COLORREF(fg);
         }
-        _ => CDRF_DODEFAULT,
+        if let Some(bg) = bg {
+            draw.clrTextBk = COLORREF(bg);
+        }
+        draw.nmcd.uItemState = NMCUSTOMDRAW_DRAW_STATE_FLAGS(tinted_state(draw.nmcd.uItemState.0));
     }
+    answer.code()
 }
 
 /// The Colour column's index in the rules list — the one cell custom draw claims.
@@ -1564,6 +1631,8 @@ const NM_CUSTOMDRAW: u32 = (-12_i32) as u32;
 const CDDS_PREPAINT: u32 = 0x0000_0001;
 const CDDS_ITEMPREPAINT: u32 = 0x0001_0001;
 const CDDS_SUBITEM: u32 = 0x0002_0000;
+const CDIS_SELECTED: u32 = 0x0000_0001;
+const CDIS_FOCUS: u32 = 0x0000_0010;
 const CDRF_DODEFAULT: isize = 0x0000_0000;
 const CDRF_NEWFONT: isize = 0x0000_0002;
 const CDRF_NOTIFYITEMDRAW: isize = 0x0000_0020;
@@ -4002,5 +4071,109 @@ mod tests {
             rules_row_swatches(&editor).len(),
             rules_row_cells(&editor).len()
         );
+    }
+
+    /// **The whole custom-draw conversation, with no window in it.**
+    ///
+    /// Every stage has to answer correctly or the cell never arrives: a control told nothing at
+    /// `CDDS_PREPAINT` never asks about items, and one told nothing at `CDDS_ITEMPREPAINT` never
+    /// asks about subitems. Each of those silences looks exactly like "the feature does nothing".
+    #[test]
+    fn each_stage_asks_the_control_for_the_next_one_down() {
+        let rows = [Some((Some(0x0000_00FF), None))];
+        assert_eq!(
+            rules_swatch_for(CDDS_PREPAINT, 0, 0, &rows),
+            Swatch::Items,
+            "the control must be asked about items"
+        );
+        assert_eq!(
+            rules_swatch_for(CDDS_ITEMPREPAINT, 0, 0, &rows),
+            Swatch::Subitems,
+            "and then about subitems"
+        );
+        assert_eq!(
+            rules_swatch_for(
+                CDDS_ITEMPREPAINT | CDDS_SUBITEM,
+                RULES_COLOUR_COLUMN,
+                0,
+                &rows
+            ),
+            Swatch::Tint(Some(0x0000_00FF), None)
+        );
+    }
+
+    /// Only the Colour column is claimed, and a row with nothing to show is left alone — including
+    /// a row index past the end, which is what a repaint arriving between a delete and a refill
+    /// looks like.
+    #[test]
+    fn every_other_cell_is_left_to_the_control() {
+        let rows = [Some((Some(0x0000_00FF), Some(0x00FF_0000))), None];
+        let subitem = |n| rules_swatch_for(CDDS_ITEMPREPAINT | CDDS_SUBITEM, n, 0, &rows);
+        for column in [0, 1, 2, 4] {
+            assert_eq!(subitem(column), Swatch::Leave, "column {column}");
+        }
+        let cell = |at| {
+            rules_swatch_for(
+                CDDS_ITEMPREPAINT | CDDS_SUBITEM,
+                RULES_COLOUR_COLUMN,
+                at,
+                &rows,
+            )
+        };
+        assert_eq!(cell(1), Swatch::Leave, "a rule with no colours");
+        assert_eq!(cell(9), Swatch::Leave, "a row that is not there");
+        assert_eq!(
+            rules_swatch_for(
+                windows::Win32::UI::Controls::CDDS_POSTPAINT.0,
+                RULES_COLOUR_COLUMN,
+                0,
+                &rows
+            ),
+            Swatch::Leave,
+            "a stage we did not ask for"
+        );
+    }
+
+    /// **The selected row's swatch has to survive the selection.** `LVS_EX_FULLROWSELECT` paints
+    /// every cell of the selected row in the system highlight, over the colours custom draw just
+    /// supplied — which is why the owner reported seeing no swatches at all while the unselected
+    /// row below was painting correctly. Measured on 2026-09-01: 8,497 pixels of selection blue in
+    /// the list, the foreground colour `#ff7a6b` nowhere in it, and the background `#3b2e0f` of the
+    /// unselected row present 3,306 times.
+    #[test]
+    fn a_tinted_cell_is_not_drawn_as_selected() {
+        use windows::Win32::UI::Controls as c;
+        let selected = c::CDIS_SELECTED.0 | c::CDIS_FOCUS.0;
+        assert_eq!(
+            tinted_state(selected),
+            0,
+            "the swatch must not be painted over by the highlight"
+        );
+        assert_eq!(
+            tinted_state(selected | c::CDIS_HOT.0),
+            c::CDIS_HOT.0,
+            "every other state is the control's business and is left alone"
+        );
+        assert_eq!(tinted_state(0), 0);
+    }
+
+    /// **The codes are the control's, not ours.** `CDRF_NOTIFYITEMDRAW` and
+    /// `CDRF_NOTIFYSUBITEMDRAW` are the same bit read two ways, and answering the wrong one — or a
+    /// stage constant off by a bit — produces a feature that compiles, runs and paints nothing.
+    /// This is the WinHTTP constant all over again, so the values are checked rather than trusted.
+    #[test]
+    fn the_hand_declared_custom_draw_constants_match_the_official_bindings() {
+        use windows::Win32::UI::Controls as c;
+        assert_eq!(CDDS_PREPAINT, c::CDDS_PREPAINT.0);
+        assert_eq!(CDDS_ITEMPREPAINT, c::CDDS_ITEMPREPAINT.0);
+        assert_eq!(CDDS_SUBITEM, c::CDDS_SUBITEM.0);
+        assert_eq!(CDRF_DODEFAULT, c::CDRF_DODEFAULT as isize);
+        assert_eq!(CDRF_NEWFONT, c::CDRF_NEWFONT as isize);
+        assert_eq!(CDRF_NOTIFYITEMDRAW, c::CDRF_NOTIFYITEMDRAW as isize);
+        assert_eq!(CDRF_NOTIFYSUBITEMDRAW, c::CDRF_NOTIFYSUBITEMDRAW as isize);
+        assert_eq!(CDIS_SELECTED, c::CDIS_SELECTED.0);
+        assert_eq!(CDIS_FOCUS, c::CDIS_FOCUS.0);
+        assert_eq!(NM_CUSTOMDRAW, c::NM_CUSTOMDRAW as u32);
+        assert_eq!(RULES_COLOUR_COLUMN, 3, "the Colour column's position");
     }
 }
