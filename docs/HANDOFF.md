@@ -2,8 +2,50 @@
 
 ## ▶ Resume point — 2026-08-28, session 30: native tabs, and a UI direction awaiting the owner
 
-**Master is `0207bcd`, tree clean, CI green by SHA, 900 tests, clippy `-D warnings`
+**Master is `f73b2cd`, tree clean, CI green by SHA on every commit, 903 tests, clippy `-D warnings`
 and `cargo fmt --check` clean.**
+
+
+### The review, and what it found — 2026-08-28
+
+Two workflows: an eight-dimension code and design review, and a four-layer one on the D3D11 / DXGI /
+DirectWrite stack. 87 findings, most refuted under adversarial checking. **Every serious claim was
+verified against the source before acting on it** — that mattered, because the refutation pass killed
+19 of 21 in the first run, and the two that survived were both real.
+
+**Three of the confirmed defects had the same shape: a guard that existed and could never fire.**
+
+| Fixed | What |
+|---|---|
+| `3b38e98` | `WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER` was `0x20`, which is `REQUEST_SENT`. §7's DNS-rebinding check was handed a byte count instead of an address and allowed every connection. |
+| `d33b27b` | The atlas's `TooLarge` refusal compared the cell against slot dimensions taken from that same cell. Meanwhile un-padded batching let any glyph wider than the ASCII-measured cell crop itself **and** bleed into its neighbour's window. |
+| `878bd69` | `DXGI_STATUS_OCCLUDED` is a *success* code, so `HRESULT::ok()` swallowed it. A minimised or covered window kept shaping, rasterising and presenting at 60 Hz. |
+| `0207bcd` | `cargo check -p tailhawk-core --target x86_64-unknown-linux-gnu` **failed**. `set` was the one module of four that was not `cfg(windows)`. One line fixed it; a CI job now keeps it true. |
+| `f73b2cd` | A stream label named `severity` made the CLEF spill's own detector return the entire raw JSON line as the message. The existing round-trip test could not catch it — its fixture always wrote `@l`. |
+
+**The durable fix for the WinHTTP one is not the `4`.** The official bindings are now a
+**dev-dependency**, and a test asserts all ten hand-declared constants against them. The shipped
+binary still imports no transport — re-checked, with the CI positive control still finding
+`uxtheme.dll`.
+
+### Still open from the reviews, none dangerous today
+
+A leaked `HBRUSH` per theme change (`main.rs:4864`); a `&mut` aliasing path where `rules_proc` holds
+a `&mut RulesState` across `ChooseColorW`'s modal loop; an unchecked `WINHTTP_OPTION_SECURE_PROTOCOLS`
+result, which on the 1809 baseline would silently fall back to a default that still offers TLS 1.0;
+`flush_misses` with no per-frame budget (the spec's own cold figure is 162 ms in one post-present
+call); and DirectWrite shaping re-run per visible row per frame, with `fit_to_width` calling a full
+shape per character boundary per column.
+
+**macOS is untested.** No Apple target is installed, and adding one changes the machine rather than
+the repository.
+
+### A second known flake
+
+`stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone` failed once under the full
+parallel suite and passes alone and on re-run. It scans `%TEMP%` for orphaned spill files, so a
+concurrent test creating or removing one trips it. **Rerun it alone before blaming a change** — the
+same advice as the `semantic` timing flake.
 
 > **Theseus reads a dated status file, not this one.** `SESSION-STATUS-2026-08-28-tailhawk-9e.md` at
 > the repository root carries the same state in one self-contained page and is git-ignored. **This
