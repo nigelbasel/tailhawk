@@ -287,12 +287,12 @@ unsafe extern "system" fn watch_connection(
     _context: usize,
     status: u32,
     info: *mut core::ffi::c_void,
-    _length: u32,
+    length: u32,
 ) {
     if status != WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER || info.is_null() {
         return;
     }
-    let text = unsafe { wide_to_string(info.cast::<u16>()) };
+    let text = unsafe { wide_to_string(info.cast::<u16>(), length) };
     WATCH.with(|w| {
         let mut w = w.borrow_mut();
         let Some(watch) = w.as_mut() else {
@@ -307,11 +307,17 @@ unsafe extern "system" fn watch_connection(
     });
 }
 
-/// Read a NUL-terminated UTF-16 string WinHTTP owns. Bounded, because a missing terminator must not
-/// walk the heap.
-unsafe fn wide_to_string(ptr: *const u16) -> String {
+/// Read a UTF-16 string WinHTTP owns, bounded **twice**.
+///
+/// `bytes` is the notification's own `dwStatusInformationLength`, which is the only thing that
+/// knows how long the buffer really is; the 256 is a second ceiling in case a notification lies or
+/// carries something that is not a string at all. Taking the smaller of the two is what stops a
+/// missing terminator walking the heap — and the reason it matters is that this callback used to
+/// be handed the wrong notification entirely, so the buffer it read was never a string.
+unsafe fn wide_to_string(ptr: *const u16, bytes: u32) -> String {
+    let ceiling = (bytes as usize / 2).min(256);
     let mut len = 0usize;
-    while len < 256 && unsafe { *ptr.add(len) } != 0 {
+    while len < ceiling && unsafe { *ptr.add(len) } != 0 {
         len += 1;
     }
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
@@ -321,7 +327,13 @@ unsafe fn wide_to_string(ptr: *const u16) -> String {
 /// server that streams for ever is stopped before the parser is ever asked.
 pub const MAX_RESPONSE: usize = 64 * 1024 * 1024;
 
-const WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER: u32 = 0x0000_0020;
+/// **`4`, and it was `0x20` for a day.** `0x20` is `WINHTTP_CALLBACK_STATUS_REQUEST_SENT`, so the
+/// watcher was handed a byte count where it expected an address, read it as a string, failed to
+/// parse it, and allowed the connection. §7's rebinding check — the reason the status callback was
+/// chosen over resolving the name ourselves — could never fire. Nothing here could have caught it:
+/// the value is only meaningful to WinHTTP, and no test in this crate talks to WinHTTP.
+/// [`tests::the_hand_declared_constants_match_the_official_bindings`] is the answer to that.
+const WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER: u32 = 0x0000_0004;
 const WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS: u32 = 0xffff_ffff;
 /// `WINHTTP_INVALID_STATUS_CALLBACK` — what `WinHttpSetStatusCallback` returns on failure.
 const INVALID_STATUS_CALLBACK: usize = usize::MAX;
@@ -738,6 +750,54 @@ mod tests {
         assert!(!Target::parse("ws://h/x").expect("ws").secure);
         assert!(Target::parse("ftp://h/x").is_none(), "and nothing else is");
         assert!(Target::parse("not a url").is_none());
+    }
+
+    /// **Every hand-declared Win32 number in this module, against the official bindings.**
+    ///
+    /// The functions are resolved by name at run time rather than bound, because binding them
+    /// would emit a static import and `SPEC.md` §13.2's conditional claim depends on there being
+    /// none. That leaves the *constants* written out by hand, and a wrong one is invisible: it
+    /// compiles, it runs, and it quietly means something else.
+    ///
+    /// One of them was wrong. `WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER` was `0x20`, which is
+    /// `REQUEST_SENT` — so §7's DNS-rebinding check was handed a byte count instead of an address
+    /// and allowed every connection. It was found by a review reading the bindings, not by any
+    /// test, because no test in this crate talks to WinHTTP. This one does, without linking
+    /// anything: the bindings are a dev-dependency, so they exist for `cargo test` and not for
+    /// `cargo build`, and CI's network assertion proves the shipped binary still imports nothing.
+    #[test]
+    fn the_hand_declared_constants_match_the_official_bindings() {
+        use windows::Win32::Networking::WinHttp as w;
+        assert_eq!(
+            WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER,
+            w::WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER,
+            "the address notification"
+        );
+        assert_eq!(
+            WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS,
+            w::WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS
+        );
+        assert_eq!(WINHTTP_FLAG_SECURE, w::WINHTTP_FLAG_SECURE.0);
+        assert_eq!(
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            w::WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY.0
+        );
+        assert_eq!(
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            w::WINHTTP_OPTION_DISABLE_FEATURE
+        );
+        assert_eq!(WINHTTP_DISABLE_REDIRECTS, w::WINHTTP_DISABLE_REDIRECTS);
+        assert_eq!(
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            w::WINHTTP_OPTION_SECURE_PROTOCOLS
+        );
+        assert_eq!(
+            TLS12_AND_13,
+            w::WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | w::WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3,
+            "the TLS posture is 1.2 and 1.3 and nothing older"
+        );
+        assert_eq!(WINHTTP_QUERY_STATUS_CODE, w::WINHTTP_QUERY_STATUS_CODE);
+        assert_eq!(WINHTTP_QUERY_FLAG_NUMBER, w::WINHTTP_QUERY_FLAG_NUMBER);
     }
 
     /// **§7's rebinding check, over the text WinHTTP hands its callback.**

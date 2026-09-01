@@ -17,6 +17,19 @@ windows-core = "0.58"
 [dev-dependencies]
 tailhawk-core = { path = "../tailhawk-core", features = ["test-hooks"] }
 
+# `net.rs` and `tabstrip.rs` declare their Win32 constants by hand, because binding the *functions*
+# would emit a static import and `SPEC.md` §13.2's conditional privacy claim depends on there being
+# none. Hand-declared numbers are unverifiable by any test that does not talk to Windows — and one
+# of them was wrong for a day, silently disabling §7's DNS-rebinding check.
+#
+# So the official bindings are pulled in **as a dev-dependency only**, and a test asserts every
+# hand-declared value against them. Under resolver 2 a dev-dependency's features do not reach
+# `cargo build`, so the shipped binary still imports nothing: the CI network assertion is the proof,
+# and it would fail the moment that stopped being true.
+[dev-dependencies.windows]
+version = "0.58"
+features = ["Win32_Networking_WinHttp", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging"]
+
 [dependencies.windows]
 version = "0.58"
 features = [
