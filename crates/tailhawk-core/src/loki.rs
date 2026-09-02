@@ -317,6 +317,16 @@ impl Origin {
         }
     }
 
+    /// The origin's own URL — base plus mount prefix, with no endpoint after it.
+    ///
+    /// For a Loki base this is not a useful address; it exists for the **token endpoint**, whose
+    /// entire path is configuration rather than one of [`Endpoint`]'s. Parsing it as an origin is
+    /// what subjects a provider's published token URL to the same §7 checks as the query URL:
+    /// scheme, host charset, length, no userinfo, no query, no fragment.
+    pub fn mounted_url(&self) -> String {
+        format!("{}{}", self.base(), self.mount())
+    }
+
     /// May Tailhawk connect to this address, given where this origin came from?
     ///
     /// Call it again on the address actually connected to — §7 asks for the re-check against DNS
@@ -586,6 +596,106 @@ pub struct Request {
 /// configurable per deployment; this is Tailhawk's, and it is a cap rather than a request.
 pub const MAX_LIMIT: u32 = 5_000;
 
+/// The token a client-credentials exchange returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    /// The bearer value. **Not `Debug`-printed by this type's own doc contract** — it is here
+    /// because it has to be somewhere, and the shell is expected to hand it straight to `send` and
+    /// drop it.
+    pub access_token: String,
+    /// Seconds the token is good for, as the server said. Zero when it did not say.
+    pub expires_in: u64,
+}
+
+/// The request that exchanges a client secret for a bearer token — **without the secret**.
+///
+/// **The secret is deliberately absent, and that is the whole design of this function.**
+/// [`Request`]'s own contract is that nothing in it is a secret, so it may be logged, shown in a
+/// dialog or compared in a test. Putting `client_secret=…` in `body` would quietly break that for
+/// every existing reader of a `Request`. The secret is appended by the transport at the moment of
+/// sending, against the origin it is bound to — exactly as the `Authorization` header already is.
+///
+/// **The token endpoint is a second origin and gets §7's controls.** Its whole URL is configuration,
+/// unlike a Loki endpoint whose path is one of ours: OAuth providers publish different paths
+/// (`/connect/token`, `/oauth/token`, `/oauth2/v2.0/token`), so the path arrives as the origin's
+/// mount prefix and is charset-checked, length-capped and refused a query, fragment or userinfo by
+/// [`Origin::parse`] like any other.
+pub fn token_request(origin: &Origin, client_id: &str, scope: &str) -> Request {
+    let mut body = format!(
+        "grant_type=client_credentials&client_id={}",
+        form_encode(client_id)
+    );
+    if !scope.is_empty() {
+        body.push_str(&format!("&scope={}", form_encode(scope)));
+    }
+    Request {
+        method: "POST",
+        url: origin.mounted_url(),
+        body,
+        content_type: Some("application/x-www-form-urlencoded"),
+    }
+}
+
+/// Reads `access_token` and `expires_in` out of a token response.
+///
+/// **A hand-written scan rather than a parser**, for the same reason `lokiwire.rs` gives: there is
+/// no JSON crate in the tree, and this needs two fields from a small, flat document. It is bounded
+/// by [`MAX_TOKEN_RESPONSE`] before anything is looked at, so a server that answers with a
+/// gigabyte cannot make this the expensive part.
+///
+/// Returns `None` when there is no `access_token` — including when the server sent an OAuth error
+/// document, which is the common case for a wrong secret and is *not* something to guess around.
+pub fn token_from_json(body: &str) -> Option<Token> {
+    if body.len() > MAX_TOKEN_RESPONSE {
+        return None;
+    }
+    let access_token = json_string(body, "access_token")?;
+    if access_token.is_empty() {
+        return None;
+    }
+    Some(Token {
+        access_token,
+        expires_in: json_number(body, "expires_in").unwrap_or(0),
+    })
+}
+
+/// The largest token response that will be looked at. A JWT is a few kilobytes; this is generous
+/// and exists so the scan is bounded before it begins.
+pub const MAX_TOKEN_RESPONSE: usize = 64 * 1024;
+
+/// The string value of `key`, honouring backslash escapes so a token containing a quote cannot cut
+/// the scan short.
+fn json_string(body: &str, key: &str) -> Option<String> {
+    let at = body.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = body.get(at..)?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// The integer value of `key`. Seconds, so a fractional or negative answer is not one.
+fn json_number(body: &str, key: &str) -> Option<u64> {
+    let at = body.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = body.get(at..)?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Ask for the records in a window.
 ///
 /// **POST, with the selector in the body.** `LOKI.md` §7: a stream selector is user-authored text
@@ -752,6 +862,121 @@ mod tests {
 
     fn fault(text: &str) -> OriginFault {
         Origin::parse(text, Provenance::Typed).expect_err("should be refused")
+    }
+
+    /// **The client secret is not in the request, and this is the test that says so.**
+    /// [`Request`]'s own doc promises it can be logged, shown in a dialog or compared in a test —
+    /// a promise every existing reader relies on. Putting the secret in `body` would break it
+    /// silently and everywhere at once, so the secret is attached by the transport at the moment
+    /// of sending, exactly as the `Authorization` header is.
+    #[test]
+    fn a_token_request_carries_everything_except_the_secret() {
+        let at = origin("https://identity.example/connect/token");
+        let request = token_request(&at, "tailhawk", "telemetry:read");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, "https://identity.example/connect/token");
+        assert_eq!(
+            request.content_type,
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(
+            request.body,
+            "grant_type=client_credentials&client_id=tailhawk&scope=telemetry%3Aread"
+        );
+
+        // The whole point, said two ways: nothing in the request mentions a secret, and nothing
+        // that renders it can leak one.
+        assert!(!request.body.contains("client_secret"));
+        let rendered = format!("{request:?}");
+        for word in ["secret", "password"] {
+            assert!(
+                !rendered.to_lowercase().contains(word),
+                "a Debug-printed Request must never carry a {word}"
+            );
+        }
+
+        // An empty scope is omitted rather than sent blank — some providers reject `scope=`.
+        let scopeless = token_request(&at, "tailhawk", "");
+        assert_eq!(
+            scopeless.body,
+            "grant_type=client_credentials&client_id=tailhawk"
+        );
+
+        // The client id is form-encoded like any other value.
+        let odd = token_request(&at, "a b&c", "s");
+        assert!(odd.body.contains("client_id=a+b%26c") || odd.body.contains("client_id=a%20b%26c"));
+    }
+
+    /// **The token endpoint is a second origin and gets §7's checks.** Its path is provider
+    /// configuration rather than one of ours, so it arrives as the mount prefix — and everything
+    /// `Origin::parse` refuses for a Loki base is refused here too.
+    #[test]
+    fn a_token_url_is_held_to_the_same_rules_as_the_query_url() {
+        assert_eq!(
+            origin("https://identity.example/connect/token").mounted_url(),
+            "https://identity.example/connect/token"
+        );
+        assert_eq!(
+            origin("https://identity.example").mounted_url(),
+            "https://identity.example",
+            "no prefix, no trailing slash"
+        );
+
+        // Each of these is refused for a token URL for the same reason it is for a query URL.
+        for bad in [
+            "https://user:pw@identity.example/connect/token",
+            "https://identity.example/connect/token?x=1",
+            "https://identity.example/connect/token#f",
+            "identity.example/connect/token",
+        ] {
+            let _ = fault(bad);
+        }
+    }
+
+    /// A token response yields its two fields, and an error document yields nothing rather than a
+    /// guess — a wrong secret is the common case and must not read as a token.
+    #[test]
+    fn a_token_response_is_read_or_refused_but_never_guessed() {
+        let good = r#"{"access_token":"abc.def.ghi","expires_in":3600,"token_type":"Bearer"}"#;
+        assert_eq!(
+            token_from_json(good),
+            Some(Token {
+                access_token: "abc.def.ghi".to_owned(),
+                expires_in: 3600
+            })
+        );
+
+        // Order does not matter, and whitespace does not either.
+        let spaced = "{ \"expires_in\" : 60 , \"access_token\" : \"t\" }";
+        assert_eq!(token_from_json(spaced).map(|t| t.expires_in), Some(60));
+
+        // No `expires_in` is not a failure; it is zero, and the caller refreshes eagerly.
+        let bare = r#"{"access_token":"t"}"#;
+        assert_eq!(token_from_json(bare).map(|t| t.expires_in), Some(0));
+
+        // An escaped quote inside the token must not cut the scan short.
+        let escaped = r#"{"access_token":"a\"b"}"#;
+        assert_eq!(
+            token_from_json(escaped).map(|t| t.access_token),
+            Some("a\"b".to_owned())
+        );
+
+        for refused in [
+            r#"{"error":"invalid_client"}"#,
+            r#"{"access_token":""}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(token_from_json(refused), None, "{refused:?}");
+        }
+
+        // Bounded before it is read.
+        let huge = format!(
+            "{{\"access_token\":\"{}\"}}",
+            "x".repeat(MAX_TOKEN_RESPONSE)
+        );
+        assert_eq!(token_from_json(&huge), None, "a response past the cap");
     }
 
     #[test]
