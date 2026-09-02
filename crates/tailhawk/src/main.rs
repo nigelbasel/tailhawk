@@ -30,10 +30,6 @@ mod menubar;
 #[allow(dead_code)]
 mod net;
 mod prefs;
-/// The credential store lands before the dialog that fills it, exactly as `net.rs` landed before
-/// the caller that sends through it. Its round-trip is tested against the real Credential Manager,
-/// so "unused" here means "no caller yet", not "unproven".
-#[allow(dead_code)]
 mod secrets;
 mod tabstrip;
 mod toolbar;
@@ -3246,6 +3242,8 @@ enum Command {
     ToggleToolbar,
     /// The owner's arrangement model: the focused pane fills the frame, or the split comes back.
     ToggleMaximise,
+    /// §12.4's remote sources — the dialog that defines them and stores their secrets.
+    EditSources,
     /// V9's rules editor — `UI-DESIGN.md` §5.
     EditRules,
     DefineFormat,
@@ -3347,6 +3345,7 @@ impl Command {
             "",
         ),
         (Command::ToggleToolbar, "Show or hide the toolbar", ""),
+        (Command::EditSources, "Remote sources…", ""),
         (
             Command::ToggleMaximise,
             "Maximise the focused pane, or restore the split",
@@ -4081,6 +4080,9 @@ struct Shell {
     /// editor through [`rules_read`] — so a `STATE` borrow alive across the call is a re-entrant
     /// borrow, not merely a risk.
     pending_rules: bool,
+    /// §12.4's remote sources dialog, deferred like every other so no `STATE` borrow is held
+    /// while it pumps its own modal loop.
+    pending_sources: bool,
     /// `Go to line…` asks for its own small dialog. `Ctrl+G` had no surface of its own until the
     /// command palette went — it opened the palette and leaned on a digits-only query meaning a
     /// line — while `UI-DESIGN.md` §2.2 had listed `Go to line…` with an ellipsis all along.
@@ -5780,6 +5782,10 @@ impl Shell {
             Command::ToggleMaximise => {
                 return self.document.toggle_maximised();
             }
+            Command::EditSources => {
+                self.pending_sources = true;
+                return true;
+            }
             Command::EditRules => {
                 self.pending_rules = true;
                 return true;
@@ -5936,6 +5942,7 @@ impl Shell {
             | Command::ReloadRules
             | Command::ToggleToolbar
             | Command::ToggleMaximise
+            | Command::EditSources
             | Command::CloseTab => {}
         }
         self.after_chrome_key(hwnd)
@@ -7283,6 +7290,59 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         let sheet = STATE.with(|s| s.borrow().as_ref().map(|shell| shell.about_sheet()));
         if let Some(sheet) = sheet {
             show_about(hwnd, &sheet);
+        }
+        return true;
+    }
+    let sources = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_sources))
+    });
+    if sources {
+        // **The store is asked only whether a secret exists, never for its value.** That is what
+        // lets the editor carry a `has_secret` flag without ever holding a credential — see
+        // `sourceset`'s module note — and it is why this reads `is_some()` and drops the rest.
+        let known = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|shell| shell.settings.sources.clone())
+                .unwrap_or_default()
+        });
+        let stored: Vec<bool> = known
+            .iter()
+            .map(|source| secrets::load(&source.name).is_some())
+            .collect();
+        let mut edit = dialog::SourcesEdit {
+            editor: tailhawk_core::sourceset::Editor::new(known, stored),
+            accepted: false,
+            store: None,
+            forget: Vec::new(),
+        };
+        // No `STATE` borrow is held across this: the dialog pumps its own modal loop.
+        if dialog::show_sources_dialog(hwnd, &mut edit) {
+            // **Credential Manager first, settings second.** If the write fails, the source is not
+            // yet recorded as configured — the other order would leave a source that looks ready
+            // and has no secret behind it.
+            for gone in &edit.forget {
+                secrets::forget(gone);
+            }
+            if let Some((name, secret)) = edit.store.take() {
+                if secret.is_empty() {
+                    secrets::forget(&name);
+                } else {
+                    secrets::store(&name, &secret);
+                }
+            }
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.settings.sources = edit.editor.sources().to_vec();
+                }
+            });
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    shell.save_settings(hwnd);
+                }
+            });
         }
         return true;
     }
@@ -9610,6 +9670,7 @@ fn main() -> Result<()> {
             pending_import: false,
             pending_goto: false,
             pending_rules: false,
+            pending_sources: false,
             find_dialog: HWND::default(),
             rules_dialog: HWND::default(),
             notice: None,

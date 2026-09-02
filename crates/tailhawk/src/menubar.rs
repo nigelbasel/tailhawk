@@ -519,6 +519,10 @@ pub fn menu_bar(
             vec![
                 check("&Dark theme", "", Command::ToggleTheme, dark),
                 Item::separator(),
+                // §12.4's remote sources. Never disabled: it is where a source is first defined,
+                // so needing one open to reach it would be a door locked from the inside.
+                cmd("&Remote sources…", "", Command::EditSources),
+                Item::separator(),
                 Item::command("&Preferences…", "", ID_PREFS),
             ],
         ),

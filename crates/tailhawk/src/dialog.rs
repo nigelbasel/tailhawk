@@ -114,6 +114,19 @@ const ID_R_CASE: u16 = 193;
 const ID_R_LITERAL: u16 = 194;
 const ID_R_ERROR: u16 = 195;
 const ID_R_SAVE: u16 = 196;
+
+/// §12.4's remote sources dialog. A range of its own so a stray id cannot land on the rules
+/// editor's controls, which sit immediately below.
+const ID_S_LIST: u16 = 210;
+const ID_S_ADD: u16 = 211;
+const ID_S_REMOVE: u16 = 212;
+const ID_S_NAME: u16 = 213;
+const ID_S_URL: u16 = 214;
+const ID_S_TOKEN: u16 = 215;
+const ID_S_CLIENT: u16 = 216;
+const ID_S_SCOPE: u16 = 217;
+const ID_S_SECRET: u16 = 218;
+const ID_S_FAULT: u16 = 219;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -570,6 +583,325 @@ const R_LIST_W: i16 = 300;
 const R_VERB_X: i16 = 313;
 const R_VERB_W: i16 = 100;
 const R_FIELD_X: i16 = 55;
+
+/// The remote-sources dialog's controls, in dialog units — pure, so the template walk checks it
+/// without a window, and held to the rules editor's rule of one left edge and one right edge.
+///
+/// **Modal, where the rules editor is modeless, and the reason is the same one read the other way.**
+/// §5 wants the rules editor non-modal because the grid underneath *is* its preview. A source has no
+/// preview: nothing in the window changes as you type a URL, and the box carries a credential, so
+/// the shorter it is on screen the better.
+fn sources_dialog_items() -> Vec<Item> {
+    let label = |text: &str, y: i16| Item::new(Class::Static, text, 0xFFFF, (7, y + 2, 48, 8), 0);
+    let field = |id: u16, y: i16, style: u32| {
+        Item::new(
+            Class::Edit,
+            "",
+            id,
+            (57, y, 290, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | style,
+        )
+    };
+    let verb = |text: &str, id: u16, row: i16| {
+        Item::new(
+            Class::Button,
+            text,
+            id,
+            (353, 7 + row * 17, 60, 14),
+            WS_TABSTOP,
+        )
+    };
+    vec![
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_S_LIST,
+            (7, 7, 340, 92),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        verb("&Add", ID_S_ADD, 0),
+        verb("&Remove", ID_S_REMOVE, 1),
+        label("&Name:", 106),
+        field(ID_S_NAME, 106, 0),
+        label("&URL:", 122),
+        field(ID_S_URL, 122, 0),
+        label("&Token URL:", 138),
+        field(ID_S_TOKEN, 138, 0),
+        label("&Client id:", 154),
+        field(ID_S_CLIENT, 154, 0),
+        label("&Scope:", 170),
+        field(ID_S_SCOPE, 170, 0),
+        label("S&ecret:", 186),
+        field(ID_S_SECRET, 186, ES_PASSWORD),
+        // The fault line, where the rules editor puts its own: what is wrong with the set, in the
+        // words `sourceset::Editor::fault` chose, while it is being typed rather than when a query
+        // fails.
+        Item::new(Class::Static, "", ID_S_FAULT, (7, 204, 340, 9), 0),
+        Item::new(
+            Class::Button,
+            "OK",
+            1,
+            (293, 216, 54, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(Class::Button, "Cancel", 2, (353, 216, 60, 14), WS_TABSTOP),
+    ]
+}
+
+/// What the sources dialog is handed and hands back.
+///
+/// **The secrets travel in this, not in the editor's rows**, and only in one direction: `store` is
+/// what the user typed and the shell must put in Credential Manager; `forget` is the names of
+/// sources they deleted, whose credentials must go with them. Nothing here ever carries a secret
+/// *read* from the store — see `sourceset`'s module note.
+pub struct SourcesEdit {
+    pub editor: tailhawk_core::sourceset::Editor,
+    pub accepted: bool,
+    /// `(name, secret)` to write, when a secret was typed.
+    pub store: Option<(String, String)>,
+    /// Names whose stored secret should be deleted.
+    pub forget: Vec<String>,
+}
+
+/// Reads a dialog field.
+fn dlg_text(hdlg: HWND, id: u16) -> String {
+    let mut buf = [0u16; 1024];
+    let len = unsafe { GetDlgItemTextW(hdlg, i32::from(id), &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..len.min(buf.len())])
+}
+
+/// Writes a dialog field.
+fn set_dlg_text(hdlg: HWND, id: u16, text: &str) {
+    let w = wsz(text);
+    unsafe {
+        let _ = SetDlgItemTextW(hdlg, i32::from(id), PCWSTR(w.as_ptr()));
+    }
+}
+
+/// Fills the list from the editor's rows, keeping the selection.
+fn sources_fill(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
+    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) }) else {
+        return;
+    };
+    lv_reset(list);
+    lv_column(list, 0, "Name", 90);
+    lv_column(list, 1, "URL", 250);
+    lv_column(list, 2, "Auth", 90);
+    // **Whether a secret is stored is a column, not a guess.** A source that is configured but has
+    // never been given its secret is the commonest half-finished state there is, and without this
+    // it looks identical to one that is ready.
+    lv_column(list, 3, "Secret", 60);
+    lv_column(list, 4, "Problem", 180);
+    for (i, row) in edit.rows().iter().enumerate() {
+        lv_row(
+            list,
+            i as i32,
+            &[
+                row.name.to_owned(),
+                row.url.to_owned(),
+                row.auth.to_owned(),
+                if row.has_secret { "stored" } else { "—" }.to_owned(),
+                row.fault.unwrap_or_default().to_owned(),
+            ],
+        );
+    }
+    if !edit.rows().is_empty() {
+        lv_select(list, edit.selected());
+    }
+}
+
+/// Points the fields at the selected source, and shows the set's fault.
+///
+/// **The secret box is always cleared**, never filled from the store: this dialog cannot show a
+/// secret, only replace one. An empty box therefore means "unchanged", which is exactly the
+/// distinction `Editor`'s pending `Option` keeps.
+fn sources_show(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
+    let current = edit.current().cloned().unwrap_or_default();
+    for (id, text) in [
+        (ID_S_NAME, current.name.as_str()),
+        (ID_S_URL, current.url.as_str()),
+        (ID_S_TOKEN, current.token_url.as_str()),
+        (ID_S_CLIENT, current.client_id.as_str()),
+        (ID_S_SCOPE, current.scope.as_str()),
+    ] {
+        set_dlg_text(hdlg, id, text);
+    }
+    if !edit.has_pending_secret() {
+        set_dlg_text(hdlg, ID_S_SECRET, "");
+    }
+    set_dlg_text(hdlg, ID_S_FAULT, edit.fault().unwrap_or_default());
+}
+
+/// Copies every field back into the selected source.
+fn sources_read(hdlg: HWND, edit: &mut tailhawk_core::sourceset::Editor) {
+    use tailhawk_core::sourceset::Field;
+    for (id, field) in [
+        (ID_S_NAME, Field::Name),
+        (ID_S_URL, Field::Url),
+        (ID_S_TOKEN, Field::TokenUrl),
+        (ID_S_CLIENT, Field::ClientId),
+        (ID_S_SCOPE, Field::Scope),
+    ] {
+        edit.edit(field, &dlg_text(hdlg, id));
+    }
+}
+
+unsafe extern "system" fn sources_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            let data = unsafe { &mut *(lparam.0 as *mut SourcesEdit) };
+            data.editor.open();
+            if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) } {
+                unsafe {
+                    SendMessageW(
+                        list,
+                        LVM_SETEXTENDEDLISTVIEWSTYLE,
+                        WPARAM(0),
+                        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                    );
+                }
+            }
+            sources_fill(hdlg, &data.editor);
+            sources_show(hdlg, &data.editor);
+            1
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == usize::from(ID_S_LIST) && header.code == LVN_ITEMCHANGED {
+                let Some(data) = sources_state(hdlg) else {
+                    return 0;
+                };
+                let data = unsafe { &mut *data };
+                if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) } {
+                    if let Some(at) = lv_selected(list) {
+                        if at != data.editor.selected() {
+                            // Read the fields back *before* moving, or the edits made to the row
+                            // being left are lost the moment the selection changes.
+                            sources_read(hdlg, &mut data.editor);
+                            data.editor.select(at);
+                            sources_show(hdlg, &data.editor);
+                        }
+                    }
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            let Some(data) = sources_state(hdlg) else {
+                return 0;
+            };
+            let data = unsafe { &mut *data };
+            match (id, code) {
+                (ID_S_SECRET, EN_CHANGE) => {
+                    data.editor.set_secret(&dlg_text(hdlg, ID_S_SECRET));
+                    return 1;
+                }
+                (ID_S_NAME | ID_S_URL | ID_S_TOKEN | ID_S_CLIENT | ID_S_SCOPE, EN_CHANGE) => {
+                    sources_read(hdlg, &mut data.editor);
+                    sources_fill(hdlg, &data.editor);
+                    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    return 1;
+                }
+                (ID_S_ADD, BN_CLICKED) => {
+                    sources_read(hdlg, &mut data.editor);
+                    data.editor.add();
+                    sources_fill(hdlg, &data.editor);
+                    sources_show(hdlg, &data.editor);
+                    unsafe {
+                        if let Ok(field) = GetDlgItem(hdlg, i32::from(ID_S_NAME)) {
+                            let _ = SetFocus(field);
+                        }
+                    }
+                    return 1;
+                }
+                (ID_S_REMOVE, BN_CLICKED) => {
+                    // **The name is remembered so its credential can be deleted too.** A source
+                    // removed from the list while its secret stayed in Credential Manager would
+                    // leave a credential nobody can see and nobody will revoke.
+                    if let Some(gone) = data.editor.remove() {
+                        if !gone.trim().is_empty() {
+                            data.forget.push(gone);
+                        }
+                    }
+                    sources_fill(hdlg, &data.editor);
+                    sources_show(hdlg, &data.editor);
+                    return 1;
+                }
+                (1, BN_CLICKED) => {
+                    sources_read(hdlg, &mut data.editor);
+                    // A set that cannot be saved says so and stays open, rather than being written
+                    // in a state the next query would fail on.
+                    if let Some(fault) = data.editor.fault() {
+                        set_dlg_text(hdlg, ID_S_FAULT, fault);
+                        return 1;
+                    }
+                    data.store = data.editor.take_secret();
+                    data.editor.saved();
+                    data.accepted = true;
+                    unsafe {
+                        let _ = EndDialog(hdlg, 1);
+                    }
+                    return 1;
+                }
+                (2, BN_CLICKED) => {
+                    data.editor.close();
+                    data.forget.clear();
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    return 1;
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            if let Some(data) = sources_state(hdlg) {
+                unsafe { &mut *data }.editor.close();
+            }
+            unsafe {
+                let _ = EndDialog(hdlg, 0);
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+fn sources_state(hdlg: HWND) -> Option<*mut SourcesEdit> {
+    let ptr =
+        unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) } as *mut SourcesEdit;
+    (!ptr.is_null()).then_some(ptr)
+}
+
+/// §12.4's remote sources — the dialog the owner asked for on 2026-09-02: *"a user interface that a
+/// user can paste the secret into which will store it securely."*
+///
+/// Reports whether the set was accepted. The caller writes `editor.sources()` into its settings and
+/// takes `store` and `forget` to Credential Manager.
+pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
+    let t = template("Remote sources", 420, 236, &sources_dialog_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            hwnd,
+            Some(sources_proc),
+            LPARAM(data as *mut SourcesEdit as isize),
+        )
+    };
+    data.accepted
+}
 
 /// §5's rules editor as a **modeless** dialog, laid out purely so the template walk can check it
 /// without a window.
@@ -1604,6 +1936,9 @@ const ES_NUMBER: u32 = 0x2000;
 const ES_MULTILINE: u32 = 0x0004;
 const ES_READONLY: u32 = 0x0800;
 const ES_AUTOHSCROLL: u32 = 0x0080;
+/// **The secret box shows dots, not the secret.** A credential on screen is a credential in every
+/// screen share and over every shoulder, and this is the one field in the product that carries one.
+const ES_PASSWORD: u32 = 0x0020;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const EN_CHANGE: u32 = 0x0300;
@@ -3725,6 +4060,7 @@ mod tests {
             ("Filter", filter_dialog_items()),
             ("Highlight rules", rules_dialog_items()),
             ("Go to line", goto_dialog_items(500)),
+            ("Remote sources", sources_dialog_items()),
         ] {
             let mut seen = Vec::new();
             for item in &items {
@@ -3825,6 +4161,7 @@ mod tests {
             ("Filter", filter_dialog_items()),
             ("Highlight rules", rules_dialog_items()),
             ("Go to line", goto_dialog_items(500)),
+            ("Remote sources", sources_dialog_items()),
         ] {
             let t = template("x", 100, 100, &items);
             // Walk the template the way Windows does: header, then aligned items.
