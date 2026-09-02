@@ -153,6 +153,17 @@ impl View {
         self.height_px
     }
 
+    /// The viewport's full width, gutter included.
+    ///
+    /// **Not `gutter_px() + hgrid().viewport_px()`**, which callers used to reconstruct it from and
+    /// which is only equal while the gutter fits: both `set_viewport` and `set_gutter_px` compute
+    /// the grid's viewport as `(width - gutter).max(0.0)`, so a gutter wider than the pane makes
+    /// that sum the *gutter's* width instead. A seven-digit line number in a narrow side-by-side
+    /// pane reaches that, and the pane would then be clipped to the right of where it ends.
+    pub fn width_px(&self) -> f32 {
+        self.width_px
+    }
+
     /// The column header's height. It is drawn in `chrome_px..chrome_px + header_px`.
     pub fn header_px(&self) -> f32 {
         self.header_px

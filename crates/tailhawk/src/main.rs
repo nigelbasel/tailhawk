@@ -3589,6 +3589,29 @@ impl Tab {
 }
 
 impl Tabs {
+    /// Whether dragging tab `from` onto tab `onto` would actually split it.
+    ///
+    /// **The guide asks this before it is drawn, and [`Tabs::split_from`] asks it before it acts.**
+    /// One predicate, two callers, because a highlight is a promise: the drop used to be declined
+    /// on conditions the guide knew nothing about, so the pane lit up and then nothing happened.
+    /// Two copies of these conditions would drift the moment either changed.
+    ///
+    /// **`onto` is passed in, never read from `self.active`.** The tab control selects on
+    /// button-*down*, so by the time the posted drop message arrives the active tab is already the
+    /// one being dragged — reading it here made `from == onto` true for every drag, which refused
+    /// every split in all four directions with no feedback at all. The strip captures what was
+    /// showing before the press and sends it along; see `tabstrip::SHOWING`.
+    fn can_split_into(&self, from: usize, onto: usize) -> bool {
+        // A pane-count limit, not a direction limit: putting a third pane in would need the model
+        // to say how the space is shared between three, and it does not. It applies to all four
+        // edges equally.
+        from < self.len()
+            && onto < self.len()
+            && from != onto
+            && self.tabs[onto].panes.len() < 2
+            && self.tabs[from].panes.len() == 1
+    }
+
     /// Splits tab `onto`, putting the dragged tab's document on whichever edge it was dropped.
     ///
     /// **The dragged tab is consumed into the split**, which is what "drag *out* to split" means:
@@ -3601,29 +3624,14 @@ impl Tabs {
         zone: tailhawk_core::dropzone::Zone,
     ) -> bool {
         use tailhawk_core::dropzone::Zone;
-        if from >= self.len() || onto >= self.len() || self.len() < 2 {
-            return false;
-        }
-        // **`onto` is passed in, not read from `self.active`.** The tab control selects on
-        // button-*down*, so by the time the posted drop message arrives the active tab is already
-        // the one being dragged — and reading it here made `from == target` true for every drag,
-        // which refused every split in all four directions with no feedback at all. The strip
-        // captures what was showing before the press and sends it along; see `tabstrip::SHOWING`.
-        let target = onto;
-        if from == target {
-            return false;
-        }
         // **Every refusal is decided before anything is moved.** An earlier shape removed the tab
         // and popped its document *first*, then discovered the target was full and put the tab back
         // — one pane short. The popped document was dropped on the floor and the file silently
         // closed. Nothing is taken apart until the answer is yes.
-        //
-        // Already split? Putting a third pane in would need the model to say how the space is
-        // shared between three, and it does not. This is a pane-count limit, not a direction
-        // limit: it applies to all four edges equally.
-        if self.tabs[target].panes.len() >= 2 || self.tabs[from].panes.len() != 1 {
+        if !self.can_split_into(from, onto) {
             return false;
         }
+        let target = onto;
         let mut tab = self.tabs.remove(from);
         // Removing shifts everything after it, including the tab being split into.
         let target = if from < target { target - 1 } else { target };
@@ -5164,10 +5172,7 @@ impl Shell {
     fn grid_rect(&self) -> Option<tailhawk_core::dropzone::Rect> {
         let doc = self.document.as_ref()?;
         let top = doc.strip_px;
-        let (w, h) = (
-            doc.view.gutter_px() + doc.view.hgrid().viewport_px(),
-            doc.view.height_px(),
-        );
+        let (w, h) = (doc.view.width_px(), doc.view.height_px());
         (w > 0.0 && h > 0.0).then_some(tailhawk_core::dropzone::Rect {
             x: 0.0,
             y: top,
@@ -8945,11 +8950,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // pane under it offers to divide. All four edges are kept now that the model divides in
         // both directions; only `Centre` is dropped, because it is not a split.
         //
-        // **The guide is still a promise this can fail to keep**, and knowingly so: the drop is
-        // refused when the target pane is already split, and nothing here knows that yet. That was
-        // true of the two vertical edges before and is now true of four. Filtering it properly
-        // means asking the target whether it has room — worth doing, and not part of making the
-        // other two directions work.
+        // **The guide is a promise this keeps.** It is filtered by `Tabs::can_split_into` — the
+        // same predicate the drop itself runs — so a pane that cannot accept the drop does not
+        // light up offering to. Before that it lit up and then declined, on two edges and later on
+        // four.
         tabstrip::WM_TAB_DRAG_OUT => {
             let (x, y) = (
                 (lparam.0 & 0xFFFF) as i16 as f32,
@@ -8960,10 +8964,20 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return false;
                 };
+                // **The guide is only drawn for a drop that will be accepted.** The same predicate
+                // the drop itself uses, so the highlight cannot promise a split that is then
+                // declined — which it did for every drag onto an already-split pane.
+                let (from, onto) = tabstrip::drag_indices(wparam);
                 let want = shell
-                    .grid_rect()
-                    .and_then(|pane| tailhawk_core::dropzone::at(pane, x, y))
-                    .filter(|(zone, _)| zone.splits());
+                    .document
+                    .can_split_into(from, onto)
+                    .then(|| {
+                        shell
+                            .grid_rect()
+                            .and_then(|pane| tailhawk_core::dropzone::at(pane, x, y))
+                            .filter(|(zone, _)| zone.splits())
+                    })
+                    .flatten();
                 let changed = shell.drag_guide.map(|(z, _)| z) != want.map(|(z, _)| z);
                 shell.drag_guide = want;
                 changed
@@ -11960,27 +11974,46 @@ mod tests {
             }
         }
         doc.status = format!("hardware — {}", doc.describe());
-        // `TAILHAWK_SHOT_SPLIT=<chip>`: a second pane under the first, filtered by the chip.
+        // `TAILHAWK_SHOT_SPLIT=<chip>`: a second pane beside or under the first, filtered by the
+        // chip. `TAILHAWK_SHOT_SIDE=1` divides the width instead of the height — **the only way
+        // anything in this tree can render a side-by-side split**, and therefore the only way the
+        // clipping at the seam can be looked at. Without it the fix for a defect that exists only
+        // in that arrangement had no harness that could show it.
+        let side = std::env::var_os("TAILHAWK_SHOT_SIDE").is_some();
         let pixels = match std::env::var("TAILHAWK_SHOT_SPLIT") {
             Ok(chip) => {
                 let mut lower = Document::open(std::path::Path::new(&file)).expect("open");
-                lower.lay_out(cell, (w, h / 2));
+                let (first, second) = if side {
+                    ((w / 2, h), (w - w / 2, h))
+                } else {
+                    ((w, h / 2), (w, h - h / 2))
+                };
+                lower.lay_out(cell, first);
                 if !chip.is_empty() {
                     filter_for(&mut lower, &chip, Polarity::Include);
                 }
-                doc.show_footer = false;
-                doc.lay_out(cell, (w, h / 2));
-                lower.pane_top = (h / 2) as f32;
-                lower.lay_out(cell, (w, h - h / 2));
+                doc.show_footer = side;
+                doc.lay_out(cell, first);
+                if side {
+                    lower.pane_left = (w / 2) as f32;
+                } else {
+                    lower.pane_top = (h / 2) as f32;
+                }
+                lower.lay_out(cell, second);
                 doc.highlighter.begin_frame();
                 lower.highlighter.begin_frame();
+                let at = if side {
+                    ((w / 2) as f32, 0.0)
+                } else {
+                    (0.0, (h / 2) as f32)
+                };
                 renderer
                     .snapshot_panes(
                         w,
                         h,
                         &[
                             (&doc.view, &doc as &dyn RowSource, 0.0, 0.0),
-                            (&lower.view, &lower as &dyn RowSource, 0.0, (h / 2) as f32),
+                            (&lower.view, &lower as &dyn RowSource, at.0, at.1),
                         ],
                     )
                     .expect("snapshot")
@@ -12218,6 +12251,59 @@ mod tests {
             full.tabs[1].panes.len(),
             2,
             "and the refused tab keeps both its documents"
+        );
+
+        // **The guide asks the same question the drop does**, so a highlight is never a promise
+        // that is then declined. These are the five ways a drop is refused, and every one of them
+        // must be visible to the guide before it draws — **each isolated**, because a fixture that
+        // trips two clauses at once tests neither. Deleting either pane-count clause once left the
+        // whole suite green, and deleting the `from` one reintroduces a silently closed file.
+        assert!(
+            !full.can_split_into(dragged, 0),
+            "the target is already split"
+        );
+        assert!(!full.can_split_into(0, 0), "a tab cannot split into itself");
+        assert!(!full.can_split_into(9, 0), "a tab that is not there");
+        assert!(!full.can_split_into(0, 9), "onto a tab that is not there");
+
+        // A split tab dragged onto a single-pane one: only the `from` clause refuses this, and
+        // without it `split_from` removes the tab, takes one of its two documents and drops the
+        // other on the floor.
+        let mut carrying = Tabs::default();
+        carrying.push(Document::open(&target).expect("target"));
+        assert!(carrying.split(Document::open(&target).expect("target again")));
+        carrying.push(Document::open(&moved).expect("moved"));
+        assert_eq!(carrying.tabs[0].panes.len(), 2, "the tab being dragged");
+        assert_eq!(carrying.tabs[1].panes.len(), 1, "the tab with room");
+        assert!(
+            !carrying.can_split_into(0, 1),
+            "a tab that is itself split has no single document to give"
+        );
+        assert!(
+            !carrying.split_from(0, 1, Zone::Below),
+            "so the drop refuses"
+        );
+        // The same pair the other way round isolates the *target* clause: a single-pane tab
+        // dragged onto one that is already split.
+        assert!(
+            !carrying.can_split_into(1, 0),
+            "the target has no room for a third pane"
+        );
+        assert!(!carrying.split_from(1, 0, Zone::Below));
+        assert_eq!(carrying.len(), 2, "both tabs survive");
+        assert_eq!(
+            carrying.tabs[0].panes.len(),
+            2,
+            "and neither of its documents is lost"
+        );
+
+        let mut room = Tabs::default();
+        room.push(Document::open(&target).expect("target"));
+        room.push(Document::open(&moved).expect("moved"));
+        assert!(room.can_split_into(1, 0), "two single-pane tabs can split");
+        assert!(
+            room.split_from(1, 0, Zone::Left),
+            "and what the predicate allows, the drop performs"
         );
 
         // **`Ctrl+\` stacks, whatever the tab was last split into.** `layout` survives an unsplit,

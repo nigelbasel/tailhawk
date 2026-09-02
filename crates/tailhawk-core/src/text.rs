@@ -78,6 +78,49 @@ pub struct Instance {
     pub pad: [u32; 3],
 }
 
+/// Cuts an instance at `right`, reporting whether any of it is left to draw.
+///
+/// **A pane's rows are bounded, but not to the pixel.** `View::slice_anchored` rounds the visible
+/// slice outward to whole clusters, so the glyph straddling a pane's right edge is laid out in
+/// full: `paint.rs` asserts the slack it allows (`right <= viewport_px + cell_width`). Stacked, that
+/// overrun ran off the window and nobody saw it. Side by side it lands on the neighbouring pane —
+/// a ragged column of half-characters down the seam that changes as the log scrolls.
+///
+/// The quad and its texture window are cut together, so what survives is the left part of the same
+/// glyph rather than a squeezed whole one. A zero-width remainder is dropped.
+pub fn clip_right(inst: &mut Instance, right: f32) -> bool {
+    let width = inst.size[0];
+    if width <= 0.0 || inst.pos[0] >= right {
+        return false;
+    }
+    let kept = right - inst.pos[0];
+    if kept >= width {
+        return true;
+    }
+    let share = kept / width;
+    inst.uv1[0] = inst.uv0[0] + (inst.uv1[0] - inst.uv0[0]) * share;
+    inst.size[0] = kept;
+    true
+}
+
+/// Cuts everything in `buffer` from index `start` onward at `right`, dropping what is wholly past.
+///
+/// **A free function rather than a `Painter` method**, so the index arithmetic can be exercised
+/// with three hand-built instances and no device. The `Painter` half needs an `HWND` and a live
+/// D3D device to reach, and this project's scar list is entirely made of decisions that were
+/// correct and untestable until they were neither.
+///
+/// The prefix before `start` belongs to panes already placed and is left exactly as it is.
+pub fn cut_from(buffer: &mut Vec<Instance>, start: usize, right: f32) {
+    let start = start.min(buffer.len());
+    let mut at = 0usize;
+    buffer.retain_mut(|inst| {
+        let keep = at < start || clip_right(inst, right);
+        at += 1;
+        keep
+    });
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct Consts {
@@ -290,6 +333,83 @@ mod tests {
 
     const SHEET: u16 = 32;
     const TARGET: u32 = 24;
+
+    fn quad(x: f32, w: f32) -> Instance {
+        Instance {
+            pos: [x, 10.0],
+            size: [w, 20.0],
+            uv0: [100.0, 200.0],
+            uv1: [110.0, 220.0],
+            tint: [1.0; 4],
+            mode: 0,
+            pad: [0; 3],
+        }
+    }
+
+    /// **The quad and its texture window are cut together.** Narrowing the quad alone would squeeze
+    /// the whole glyph into the space that is left — a visibly thinner letter at every seam —
+    /// rather than showing the left part of it and hiding the rest.
+    #[test]
+    fn a_glyph_straddling_the_edge_is_cut_not_squeezed() {
+        let mut half = quad(90.0, 10.0);
+        assert!(clip_right(&mut half, 95.0), "half of it is still on screen");
+        assert_eq!(half.size[0], 5.0, "the quad is cut to the edge");
+        assert_eq!(half.pos[0], 90.0, "and does not move");
+        assert_eq!(
+            half.uv1[0], 105.0,
+            "the texture window is cut by the same share"
+        );
+        assert_eq!(half.uv0, [100.0, 200.0], "the left edge is untouched");
+        assert_eq!(half.uv1[1], 220.0, "and so is the vertical extent");
+    }
+
+    /// **The panes already placed are never touched.** Each pane clips from its own mark, and that
+    /// mark is the buffer's length at the moment its layout began — so everything before it belongs
+    /// to a pane that has already been positioned and cut to its own edge. Re-cutting the prefix at
+    /// this pane's edge would shred the pane to its left.
+    #[test]
+    fn only_this_pane_is_cut_and_a_mark_past_the_end_is_a_no_op() {
+        let mut buffer = vec![quad(10.0, 10.0), quad(500.0, 10.0), quad(95.0, 10.0)];
+        cut_from(&mut buffer, 1, 100.0);
+        assert_eq!(buffer.len(), 2, "the one wholly past the edge goes");
+        assert_eq!(buffer[0].pos[0], 10.0, "the earlier pane is untouched…");
+        assert_eq!(buffer[0].size[0], 10.0, "…including its width");
+        assert_eq!(buffer[1].pos[0], 95.0);
+        assert_eq!(buffer[1].size[0], 5.0, "and this pane's straddler is cut");
+
+        let mut nothing = vec![quad(500.0, 10.0)];
+        cut_from(&mut nothing, 9, 100.0);
+        assert_eq!(nothing.len(), 1, "a mark past the end cuts nothing");
+        assert_eq!(nothing[0].size[0], 10.0);
+
+        let mut all = vec![quad(500.0, 10.0), quad(600.0, 10.0)];
+        cut_from(&mut all, 0, 100.0);
+        assert!(
+            all.is_empty(),
+            "a pane with nothing inside it draws nothing"
+        );
+    }
+
+    /// A glyph wholly inside is untouched, and one wholly past the edge is dropped rather than
+    /// drawn at zero width.
+    #[test]
+    fn what_fits_is_left_alone_and_what_is_past_the_edge_goes() {
+        let mut inside = quad(10.0, 10.0);
+        let before = inside;
+        assert!(clip_right(&mut inside, 400.0));
+        assert_eq!(inside.size, before.size);
+        assert_eq!(inside.uv1, before.uv1);
+
+        assert!(
+            !clip_right(&mut quad(400.0, 10.0), 400.0),
+            "starts at the edge"
+        );
+        assert!(!clip_right(&mut quad(500.0, 10.0), 400.0), "starts past it");
+        assert!(!clip_right(&mut quad(10.0, 0.0), 400.0), "nothing to draw");
+        let mut exact = quad(390.0, 10.0);
+        assert!(clip_right(&mut exact, 400.0), "ends exactly on the edge");
+        assert_eq!(exact.size[0], 10.0, "and is not cut");
+    }
 
     /// A dark backdrop, for the tests that only ask whether ink landed.
     const BACKDROP: [f32; 4] = [0.1, 0.1, 0.1, 1.0];

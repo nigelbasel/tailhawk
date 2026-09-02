@@ -696,6 +696,11 @@ impl Renderer {
                 let from = p.mark();
                 laid.merge(p.lay_out(view, t.ink, *source)?);
                 p.shift(from, *x, *y);
+                // A pane draws only inside its own width. The rows are laid out a fraction wider
+                // than the viewport — the visible slice rounds outward to whole clusters — which
+                // ran off the window edge harmlessly while panes only stacked, and lands on the
+                // neighbour now that they can sit side by side.
+                p.clip_to(from, *x + view.width_px());
             }
             // Last, and therefore over everything: the guide is an answer to "where will this go",
             // so it has to be visible on top of the pane it is answering about.

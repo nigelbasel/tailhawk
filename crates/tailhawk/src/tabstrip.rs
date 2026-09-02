@@ -80,8 +80,9 @@ pub const WM_TAB_MOVED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 
 /// nothing, which is why it was mistaken for dead code rather than a broken feature.
 pub const WM_TAB_CLOSE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x41;
 
-/// Posted while a tab is being dragged **below** the strip, onto the grid: `wparam` is the tab,
-/// `lparam` the pointer in the window's client coordinates.
+/// Posted while a tab is being dragged **below** the strip, onto the grid: `wparam` is the pair
+/// [`drag_pair`] packed — read it with [`drag_indices`], never as a bare index — and `lparam` is
+/// the pointer in the window's client coordinates.
 ///
 /// `SPEC.md` §1069's drag-out-to-split. The control keeps the mouse captured for the whole drag, so
 /// it goes on receiving moves after the pointer has left it — which is what makes leaving
@@ -95,6 +96,12 @@ pub const WM_TAB_DRAG_OUT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP
 pub const WM_TAB_DROP_OUT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x43;
 
 /// Posted when a drag ends or leaves without dropping, so the guide stops being drawn.
+///
+/// **`wparam` carries the same packed pair as its siblings**, though nothing reads it: the handler
+/// only needs to know that a guide should stop. It is packed anyway because this message is posted
+/// from two places — a drag that comes back onto the strip, and a button-up that never left — and
+/// one of them used to send a bare index. Wiring [`drag_indices`] into this arm, which is twelve
+/// lines from one that already does, would then have silently read `onto` as `0` down one path.
 pub const WM_TAB_DRAG_OFF: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x44;
 
 /// `TCHITTESTINFO`, laid out by hand beside [`TcItem`] for the same reason.
@@ -235,7 +242,8 @@ unsafe extern "system" fn drag_proc(
                 if DRAGGED_OUT.with(|d| d.replace(false)) {
                     // Came back onto the strip: the guide must go, or it hangs about promising a
                     // split that the drop will not perform.
-                    tell_parent(hwnd, WM_TAB_DRAG_OFF, WPARAM(from), LPARAM(0));
+                    let onto = SHOWING.with(|d| d.get()).unwrap_or(from);
+                    tell_parent(hwnd, WM_TAB_DRAG_OFF, drag_pair(from, onto), LPARAM(0));
                 }
                 if let Some(to) = tab_at(hwnd, x, y) {
                     if from != to {

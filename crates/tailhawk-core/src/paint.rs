@@ -103,7 +103,11 @@ impl Colours<'_> {
 /// What one row's layout produced, beyond the quads themselves.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Laid {
-    /// Quads appended for this row.
+    /// Quads appended for this row — **counted as laid out, before any clipping**.
+    ///
+    /// A pane is cut to its own width after its rows are laid out ([`Painter::clip_to`]), so on a
+    /// split this is a few quads more than the frame actually draws. It is a measure of layout
+    /// work, which is what every reader of it wants; it is not a count of what reached the screen.
     pub quads: usize,
     /// Glyphs that were not resident and are now queued for [`Painter::flush_misses`]. Non-zero on
     /// a cold viewport and zero in steady state; it is the number §3.2's placeholder rule exists
@@ -880,6 +884,16 @@ impl Painter {
     /// over the rows of the upper one while its grey bar drew correctly at the window's foot.
     pub fn mark(&self) -> (usize, usize) {
         (self.instances.len(), self.chrome_instances.len())
+    }
+
+    /// Cuts everything laid out since `from` at `right`, so a pane cannot draw over its neighbour.
+    ///
+    /// Nothing else clips: the frame has one viewport and one scissor for the whole client, and a
+    /// pane is placed by translating its instances. See [`crate::text::clip_right`] for why the
+    /// overrun exists at all and why the cut is a cut rather than a cull.
+    pub fn clip_to(&mut self, from: (usize, usize), right: f32) {
+        crate::text::cut_from(&mut self.instances, from.0, right);
+        crate::text::cut_from(&mut self.chrome_instances, from.1, right);
     }
 
     /// Moves everything laid out since `from` by `(dx, dy)`: a pane drawn at an offset.
