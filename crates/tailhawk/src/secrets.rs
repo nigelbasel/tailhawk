@@ -117,8 +117,11 @@ pub fn decode_blob(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let wide: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect();
     let text = String::from_utf16(&wide).ok()?;
     // A trailing NUL is how a C string got here; anything else interior means this is not text.
