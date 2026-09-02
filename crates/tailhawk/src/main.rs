@@ -4517,6 +4517,14 @@ impl Shell {
                         band as f32
                     }
                     (Some(tabs), false) => {
+                        // **Filled even while hidden**, so the control never holds a list the model
+                        // has moved on from. A split consumes a tab, which drops the strip to one
+                        // and hides it — and the control went on reporting the two items it had
+                        // when it was last visible. Nothing on screen was wrong, because it is
+                        // hidden; but anything asking the control what it holds got a stale answer,
+                        // which is exactly how a verification harness came to report that
+                        // drag-out-to-split had failed when it had in fact worked.
+                        tabs.set(&strip.0, strip.1);
                         tabs.place(w as i32, 0, false);
                         0.0
                     }
