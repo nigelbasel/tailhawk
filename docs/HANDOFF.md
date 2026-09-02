@@ -60,6 +60,11 @@ inviting departures from the spec — and called Hoo WinTail's arrangement toolb
 preferably on the **tab bar** rather than the menu bar, with **un-maximising a tab reverting to
 arranged windows and maximising an arranged window going back to tabs**.
 
+> **Amended 2026-09-02 — there is no minimise.** Asked what it should mean in a docked-pane model,
+> where there is nothing to minimise *to*, he answered: **"I dont think we need minimise."** The
+> maximise ↔ restore half is built and confirmed on screen (`b459f2d`). The sentence above is kept
+> because it is what he originally said, not because it is still the plan — read it with this note.
+
 **What was recommended, and why it is not plain MDI.** The maximised ↔ restored model is kept, but
 "restored" means **docked split panes** rather than floating children: the same power, no
 overlapping-window management, already what §1069 reaches for with "drag-out-to-split", and it

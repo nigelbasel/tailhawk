@@ -479,11 +479,19 @@ copy — bookmarks, highlight rules and column layout all apply.
 > owner's *"un-maximising reverts to the arrangement, maximising goes back to tabs"*, and it is
 > where this section's promises currently stop.
 >
+> **There is no minimise, and that is settled.** The owner asked for *"a close, maximise minimise
+> button on the extreme right"* on 2026-08-28, and on 2026-09-02, asked what it should mean in a
+> docked model where there is nothing to minimise *to*, answered plainly: **"I dont think we need
+> minimise."** So it is not missing and it is not deferred — it was considered and dropped. Do not
+> reintroduce it from that earlier sentence, or from HooWinTail's window controls, without asking
+> him again.
+>
 > **Not built, and not to be read as though it were**: more than two panes, Tile and Cascade over
 > several document windows, per-pane follow independence, and scroll lock by timestamp or line
 > number. The rest of this section describes an intended shape, most of it written before the owner
-> saw any of it — the placement of the window controls and the meaning of *minimise* in a docked
-> model are **open questions put to him and not yet answered**.
+> saw any of it. **Where the window controls belong** — he asked for the tab bar; Maximise is in the
+> toolbar, because a split consumes a tab and the strip is often gone exactly when the control is
+> wanted — is still open.
 
 *(Owner's requirement, 2026-08-19. §3 above is one log split two ways; this is several logs at
 once, which is a different problem and the one MDI existed to solve.)*
