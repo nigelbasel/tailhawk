@@ -353,11 +353,26 @@ const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 /// `token` is attached as a bearer credential for this call only. The caller is responsible for
 /// having checked, through `loki::Origin::may_connect_to`, that the address this resolves to is one
 /// §7 permits — this function performs the request it is given and does not re-litigate it.
-pub fn send(
-    request: &Request,
-    provenance: Provenance,
-    token: Option<&str>,
-) -> Result<Answer, NetFault> {
+/// How one request proves who is asking.
+///
+/// **A credential is an argument to the send, never a field on the request.** `loki::Request`'s
+/// contract is that it holds no secret and may therefore be logged or shown; this is the type that
+/// keeps that true, by carrying the credential separately and only for the duration of the call.
+#[derive(Debug, Clone, Copy)]
+pub enum Auth<'a> {
+    /// No credential — a Loki with `auth_enabled: false` and no proxy in front of it.
+    None,
+    /// `Authorization: Bearer …`, for a query once a token has been obtained.
+    Bearer(&'a str),
+    /// A client secret appended to the form body, for the token exchange itself.
+    ///
+    /// It goes in the **body**, not the query string: a secret in a URL is a secret in every proxy
+    /// access log on the path, which is the same argument `LOKI.md` §7 makes for `query_range`
+    /// being a POST.
+    ClientSecret(&'a str),
+}
+
+pub fn send(request: &Request, provenance: Provenance, auth: Auth<'_>) -> Result<Answer, NetFault> {
     let api = winhttp().ok_or(NetFault::NoTransport)?;
     let target = Target::parse(&request.url).ok_or(NetFault::Failed {
         during: "reading the URL",
@@ -373,7 +388,7 @@ pub fn send(
 
     // The send is where the address is resolved and connected to, so the refusal check comes
     // straight after it and **before** anything is read.
-    let sent = call.send(request, token);
+    let sent = call.send(request, auth);
     if let Some((address, fault)) = Watching::refusal() {
         return Err(NetFault::Refused { address, fault });
     }
@@ -575,20 +590,35 @@ impl Call {
         Ok(())
     }
 
-    fn send(&self, request: &Request, token: Option<&str>) -> Result<(), NetFault> {
+    fn send(&self, request: &Request, auth: Auth<'_>) -> Result<(), NetFault> {
         let mut headers = String::new();
         if let Some(kind) = request.content_type {
             headers.push_str("Content-Type: ");
             headers.push_str(kind);
             headers.push_str("\r\n");
         }
-        if let Some(token) = token {
+        if let Auth::Bearer(token) = auth {
             headers.push_str("Authorization: Bearer ");
             headers.push_str(token);
             headers.push_str("\r\n");
         }
+        // **The client secret is composed into the body here and nowhere else.** `loki::Request`
+        // promises that nothing in it is a secret — it may be logged, shown in a dialog, compared
+        // in a test — so the one place a secret may exist is this local, for as long as this call
+        // takes. It is deliberately not stored, not returned and not put back on the request.
+        let composed;
+        let body = match auth {
+            Auth::ClientSecret(secret) => {
+                composed = format!(
+                    "{}&client_secret={}",
+                    request.body,
+                    tailhawk_core::loki::form_encode(secret)
+                );
+                composed.as_bytes()
+            }
+            _ => request.body.as_bytes(),
+        };
         let wide_headers = wide(&headers);
-        let body = request.body.as_bytes();
         let ok = unsafe {
             (self.0.api.send_request)(
                 self.0.handle,

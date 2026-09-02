@@ -1448,6 +1448,27 @@ and session IDs.
   > form: after a run over a local file, `winhttp.dll` is absent from the process module list.
   > That last point is a design constraint on the Loki client, not an afterthought: load WinHTTP on
   > first use of an explicitly configured remote source, never at startup.
+  >
+  > ### That edit happened on 2026-09-03, and this is what the claim is now
+  >
+  > `winhttp.dll` is on the allow-list, so the strongest form above — *"no transport DLL is
+  > imported at all"* — **no longer holds and this section no longer claims it.** What is claimed
+  > instead, and checked:
+  >
+  > - **The only transport in the binary is the reviewed one.** CI still fails on any other, against
+  >   a positive control that proves the scan can see a dynamically loaded DLL.
+  > - **A run that opens no remote source loads no transport at all.** WinHTTP is reached by
+  >   `LoadLibraryW` on first use, never linked — the `windows` crate's own bindings are refused
+  >   precisely because they emit a static import — and
+  >   `tests::a_local_file_session_never_loads_the_transport` opens, indexes and reads a local file
+  >   and asserts `winhttp.dll` is still absent from the process module list.
+  >
+  > **That test is what replaces the proof the allow-list gives up**, and it is the reason the
+  > *conditional* wording at the top of this section is still honest. Delete it and the claim
+  > becomes an assertion again.
+  >
+  > Nothing else changed: there is still no telemetry, no update ping, no font or CDN fetch, and the
+  > only outbound connection any build can make is to a source the user configured and named.
 - **No conventional crash reporter.** A minidump would exfiltrate customer log content. If crash
   reporting exists, it is **local-file only**, user-initiated, with a **visible preview of exactly what
   will be sent**, and never contains buffered log content or full file paths without redaction.

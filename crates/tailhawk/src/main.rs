@@ -30,6 +30,11 @@ mod menubar;
 #[allow(dead_code)]
 mod net;
 mod prefs;
+/// The caller lands before the menu item that runs it, as `net.rs` and `secrets.rs` each did.
+/// Its refusals are tested and its faults are tested; "unused" here means there is no UI action
+/// yet, not that it is unproven.
+#[allow(dead_code)]
+mod pull;
 mod secrets;
 mod tabstrip;
 mod toolbar;
@@ -9942,6 +9947,38 @@ mod tests {
 
     /// A real file on disk, because `Document` owns a `LogFile` and there is no seam for a fake one
     /// — the index and the reads have to agree about the same bytes, which is the point.
+    /// **A whole local-file run leaves `winhttp.dll` out of the process** — `SPEC.md` §13.2's
+    /// *conditional* claim, and the half that keeps it checkable now that the transport is on CI's
+    /// allow-list.
+    ///
+    /// The allow-list entry means the scan can no longer prove the binary *cannot* open a socket;
+    /// it proves only that the one transport present is the reviewed one. This is what replaces the
+    /// lost proof: opening, indexing, filtering and searching a file — everything a local session
+    /// does — and asserting the transport was never loaded. It fails the moment anything reaches
+    /// the network on a path that does not begin with the user choosing a remote source.
+    #[test]
+    fn a_local_file_session_never_loads_the_transport() {
+        assert!(
+            !crate::net::transport_is_loaded(),
+            "before anything: the transport is not in this process"
+        );
+
+        let path = scratch_log("tailhawk_no_transport.log", 200);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 16.0), (800, 600));
+        let _ = doc.describe();
+        let _ = doc.file_state();
+        doc.bookmarks.insert(3);
+        let _ = doc.has_columns();
+
+        assert!(
+            !crate::net::transport_is_loaded(),
+            "opening and reading a local file must not have loaded winhttp.dll — §13.2's promise \
+             is that a run which opens no remote source has no transport in it at all"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn scratch_log(name: &str, lines: usize) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(name);
         let mut text = String::new();

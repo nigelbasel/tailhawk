@@ -191,7 +191,13 @@ jobs:
           }
           "positive control: the scan sees $control, which is loaded dynamically rather than imported"
           $transports = 'winhttp|wininet|urlmon|ws2_32|wsock32|mswsock|winsock|dnsapi|httpapi|webservices|winnetwk'
-          $allowed = @()
+          # winhttp.dll was added on 2026-09-03, with LOKI.md's remote source. Both rules above were
+          # met in the same commit: SPEC.md 13.2 was reworded from an unconditional claim to a
+          # conditional one, and the behavioural half exists as
+          # tests::a_local_file_session_never_loads_the_transport, which opens, indexes and reads a
+          # local file and asserts winhttp.dll is still absent from the process module list.
+          # That test is what replaces the proof this line gives up.
+          $allowed = @('winhttp.dll')
           $found = $dlls | Where-Object { $_ -match $transports } | Where-Object { $allowed -notcontains $_ }
           if ($found) { throw "SPEC.md 13.2: binary can open a network connection via $($found -join ', ')" }
           if ($allowed.Count -eq 0) { "zero network: no transport DLL is imported at all" }
