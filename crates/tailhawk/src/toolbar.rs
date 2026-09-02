@@ -15,7 +15,7 @@
 //! implementation of every command it offers, free to drift from the menu without anything saying
 //! so.
 //!
-//! **Nine text buttons and no image list.** §1.1 rejects "a toolbar of ambiguous, unlabelled 16×16
+//! **Text buttons and no image list.** §1.1 rejects "a toolbar of ambiguous, unlabelled 16×16
 //! icons" and requires a label beside any icon; the simplest way to keep that promise is to have no
 //! icon to keep it about. An icon set is a design commitment nobody has asked for.
 
@@ -65,7 +65,7 @@ pub struct ToolButton {
 /// the verbs; the three toggles additionally report their state. With no document the row is a line
 /// of greyed labels with `Open` live at its head — deliberately still there, because a toolbar that
 /// appears when the first file does would move the grid down the moment a file arrives.
-pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
+pub fn toolbar_of(doc: Option<&Document>, split: bool, maximised: bool) -> Vec<ToolButton> {
     let open = doc.is_some();
     let verb = |label: &'static str, c: Command, enabled: bool| ToolButton {
         label,
@@ -103,6 +103,15 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
         verb("Rules", Command::EditRules, true),
         verb("Format", Command::DefineFormat, open),
         verb("Export", Command::Export, open),
+        // §3.1's arrangement. A toggle, because it reports a state as much as it changes one — and
+        // enabled only where it has something to do, which is a tab that is actually split.
+        ToolButton {
+            label: "Maximise",
+            id: command_id(Command::ToggleMaximise),
+            enabled: split,
+            toggle: true,
+            pressed: split && maximised,
+        },
     ]
 }
 
@@ -403,16 +412,39 @@ mod tests {
         buttons.iter().map(|b| b.label).collect()
     }
 
-    /// **§2.3's row, in §2.3's order.** The order is the requirement, not a preference: the
+    /// **Maximise is enabled only where it can act, and reports the state it would change.** A
+    /// toggle that is live on an unsplit tab would do nothing when clicked, and one that never
+    /// draws pressed would leave the user guessing which of the two states they are in.
+    #[test]
+    fn maximise_is_live_only_on_a_split_and_shows_which_way_it_is() {
+        let last = |split, maximised| {
+            toolbar_of(None, split, maximised)
+                .pop()
+                .expect("the row is not empty")
+        };
+        let unsplit = last(false, false);
+        assert_eq!(unsplit.label, "Maximise");
+        assert!(!unsplit.enabled, "nothing to maximise on a single pane");
+        assert!(unsplit.toggle, "it is a state, not a verb");
+        assert!(!last(true, false).pressed, "split and restored");
+        assert!(last(true, true).pressed, "split and maximised");
+        assert!(
+            !last(false, true).pressed,
+            "a stale maximised flag on an unsplit tab must not draw pressed"
+        );
+    }
+
+    /// **§2.3's row, in §2.3's order**, plus §3.1's Maximise at the end. The order is the
+    /// requirement, not a preference: the
     /// document names these nine and this sequence, and a toolbar is a thing people reach for by
     /// position after the first week.
     #[test]
-    fn the_row_is_the_nine_buttons_the_design_names_in_its_order() {
+    fn the_row_is_the_buttons_the_design_names_in_its_order() {
         assert_eq!(
-            labels(&toolbar_of(None)),
+            labels(&toolbar_of(None, false, false)),
             [
                 "Open", "Find", "Filter", "Follow", "Collapse", "Detail", "Rules", "Format",
-                "Export"
+                "Export", "Maximise"
             ]
         );
     }
@@ -422,8 +454,8 @@ mod tests {
     /// an unavailable command is "disabled in place".
     #[test]
     fn an_empty_window_greys_the_row_rather_than_removing_it() {
-        let empty = toolbar_of(None);
-        assert_eq!(empty.len(), 9, "the row does not shrink");
+        let empty = toolbar_of(None, false, false);
+        assert_eq!(empty.len(), 10, "the row does not shrink");
         let live: Vec<&str> = empty
             .iter()
             .filter(|b| b.enabled)
@@ -440,17 +472,17 @@ mod tests {
         );
     }
 
-    /// The three toggles are marked as toggles and the six verbs are not — the distinction the
+    /// The toggles are marked as toggles and the verbs are not — the distinction the
     /// Win32 half turns into `BTNS_CHECK`. A verb given a pressed state would latch down on click
     /// and stay there.
     #[test]
-    fn exactly_the_three_state_buttons_are_toggles() {
-        let toggles: Vec<&str> = toolbar_of(None)
+    fn exactly_the_state_buttons_are_toggles() {
+        let toggles: Vec<&str> = toolbar_of(None, false, false)
             .iter()
             .filter(|b| b.toggle)
             .map(|b| b.label)
             .collect();
-        assert_eq!(toggles, ["Follow", "Collapse", "Detail"]);
+        assert_eq!(toggles, ["Follow", "Collapse", "Detail", "Maximise"]);
     }
 
     /// **Every id is the menu's.** This is the test that keeps §1.2's one-command-one-path rule
@@ -469,7 +501,7 @@ mod tests {
             Command::DefineFormat,
             Command::Export,
         ];
-        for (button, command) in toolbar_of(None).iter().zip(expected) {
+        for (button, command) in toolbar_of(None, false, false).iter().zip(expected) {
             assert_eq!(
                 button.id,
                 command_id(command),
@@ -517,7 +549,10 @@ mod tests {
     /// would make one of the pair unreachable while looking perfectly correct on screen.
     #[test]
     fn no_two_buttons_share_an_id() {
-        let mut ids: Vec<u32> = toolbar_of(None).iter().map(|b| b.id).collect();
+        let mut ids: Vec<u32> = toolbar_of(None, false, false)
+            .iter()
+            .map(|b| b.id)
+            .collect();
         let before = ids.len();
         ids.sort_unstable();
         ids.dedup();

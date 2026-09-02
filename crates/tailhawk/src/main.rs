@@ -3239,6 +3239,8 @@ enum Command {
     ResetColumns,
     /// §2.3: show or hide the toolbar row.
     ToggleToolbar,
+    /// The owner's arrangement model: the focused pane fills the frame, or the split comes back.
+    ToggleMaximise,
     /// V9's rules editor — `UI-DESIGN.md` §5.
     EditRules,
     DefineFormat,
@@ -3340,6 +3342,11 @@ impl Command {
             "",
         ),
         (Command::ToggleToolbar, "Show or hide the toolbar", ""),
+        (
+            Command::ToggleMaximise,
+            "Maximise the focused pane, or restore the split",
+            "",
+        ),
         (Command::EditRules, "Highlight rules…", "Ctrl+H"),
         (Command::DefineFormat, "Define format from a line…", ""),
         (Command::ImportLayout, "Import layout from config…", ""),
@@ -3566,6 +3573,8 @@ struct Tab {
     /// Which way this tab's panes divide the space — set by the edge the split was dropped on, and
     /// meaningless while there is one pane.
     layout: PaneLayout,
+    /// Whether the focused pane fills the frame, hiding the other rather than closing it.
+    maximised: bool,
 }
 
 impl Tab {
@@ -3574,6 +3583,7 @@ impl Tab {
             panes: vec![doc],
             focused: 0,
             layout: PaneLayout::default(),
+            maximised: false,
         }
     }
 }
@@ -3635,6 +3645,30 @@ impl Tabs {
         self.active = target;
         true
     }
+    /// Whether the shown tab's focused pane fills the frame.
+    fn maximised(&self) -> bool {
+        self.tabs.get(self.active).is_some_and(|t| t.maximised)
+    }
+
+    /// Whether maximising would change anything — a tab with one pane already fills the frame.
+    fn can_maximise(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.panes.len() > 1)
+    }
+
+    /// Maximises the focused pane, or restores the arrangement. Reports whether anything changed.
+    fn toggle_maximised(&mut self) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        if tab.panes.len() < 2 {
+            return false;
+        }
+        tab.maximised = !tab.maximised;
+        true
+    }
+
     /// How the shown tab divides its panes.
     fn layout(&self) -> PaneLayout {
         self.tabs
@@ -3804,6 +3838,22 @@ enum PaneLayout {
     Stacked,
     /// Side by side, dividing the width. What a drop on the left or right edge asks for.
     SideBySide,
+}
+
+/// Which of a tab's panes are on screen this frame.
+///
+/// **Maximise is a view state, not a change to the split.** The owner's model, 2026-08-28: a
+/// maximised document fills the frame and reads as an ordinary tabbed viewer, and restoring it
+/// brings the arrangement back. So the second pane is not closed and its document is not touched —
+/// it is simply not drawn, and one click puts it back exactly where it was.
+///
+/// A tab with one pane is already as maximised as it can be, so the state has nothing to do; asking
+/// for it anyway is not an error, it just changes nothing.
+fn visible_panes(count: usize, focused: usize, maximised: bool) -> Vec<usize> {
+    if maximised && count > 1 {
+        return vec![focused.min(count - 1)];
+    }
+    (0..count).collect()
 }
 
 /// Which pane a client point falls in, given each pane's origin and the way they divide.
@@ -4458,7 +4508,7 @@ impl Shell {
                     let cell = renderer.cell()?;
                     self.cell_w = cell.0;
                     self.cell_h = cell.1;
-                    let buttons = toolbar::toolbar_of(None);
+                    let buttons = toolbar::toolbar_of(None, false, false);
                     let band = match (self.toolbar.as_mut(), self.show_toolbar) {
                         (Some(bar), true) => {
                             bar.set(&buttons);
@@ -4503,8 +4553,15 @@ impl Shell {
                 // bands — otherwise the two grids would start at different heights and the split
                 // would read as a rendering fault rather than a layout.
                 let layout = self.document.layout();
-                let side = layout == PaneLayout::SideBySide;
-                let boxes = pane_boxes(w as f32, h as f32, pane_count, layout);
+                // A maximised tab draws its focused pane alone — one box, the whole client — and
+                // the other pane keeps its document untouched, off screen, until it is restored.
+                let visible = visible_panes(
+                    pane_count,
+                    self.document.focused_pane(),
+                    self.document.maximised(),
+                );
+                let side = layout == PaneLayout::SideBySide && visible.len() > 1;
+                let boxes = pane_boxes(w as f32, h as f32, visible.len(), layout);
                 // The real control's band, asked of it once per frame and handed to the pane that
                 // carries the strip. Placed here too, because this is where the width is known.
                 let guide = self.drag_guide.map(|(_, r)| r);
@@ -4532,7 +4589,11 @@ impl Shell {
                 };
                 // §2.3's row, directly under the strip. Its band is asked of the control for the
                 // same reason the strip's is, and the two together are what the grid starts below.
-                let buttons = toolbar::toolbar_of(self.document.as_ref());
+                let buttons = toolbar::toolbar_of(
+                    self.document.as_ref(),
+                    self.document.can_maximise(),
+                    self.document.maximised(),
+                );
                 let toolbar_px = match (self.toolbar.as_mut(), self.show_toolbar) {
                     (Some(bar), true) => {
                         bar.set(&buttons);
@@ -4549,8 +4610,14 @@ impl Shell {
                 let strip_px = strip_px + toolbar_px;
                 let panes = self.document.panes_mut();
                 for (i, doc) in panes.iter_mut().enumerate() {
-                    let (x, top, width, height) = boxes[i];
-                    let last = i + 1 == pane_count;
+                    // Panes that are not on screen keep their state and are skipped: laying one out
+                    // would cost a full re-measure every frame for something nobody can see.
+                    let Some(slot) = visible.iter().position(|&v| v == i) else {
+                        continue;
+                    };
+                    let (x, top, width, height) = boxes[slot];
+                    let last = slot + 1 == visible.len();
+                    let i = slot;
                     doc.strip_px = if side || i == 0 { strip_px } else { 0.0 };
                     doc.tab_strip = if i == 0 {
                         strip.clone()
@@ -4591,7 +4658,9 @@ impl Shell {
                 // and had nowhere to put the anchors at all.
                 let refs: Vec<(&View, &dyn RowSource, f32, f32)> = panes
                     .iter()
-                    .map(|doc| {
+                    .enumerate()
+                    .filter(|(i, _)| visible.contains(i))
+                    .map(|(_, doc)| {
                         (
                             &doc.view,
                             doc as &dyn RowSource,
@@ -5695,6 +5764,12 @@ impl Shell {
                 self.save_settings(hwnd);
                 return true;
             }
+            // Not remembered: which pane fills the frame is about the moment, not a preference,
+            // and a viewer that opened maximised over a split the user could not see would be
+            // hiding a document rather than arranging one.
+            Command::ToggleMaximise => {
+                return self.document.toggle_maximised();
+            }
             Command::EditRules => {
                 self.pending_rules = true;
                 return true;
@@ -5850,6 +5925,7 @@ impl Shell {
             | Command::OpenRules
             | Command::ReloadRules
             | Command::ToggleToolbar
+            | Command::ToggleMaximise
             | Command::CloseTab => {}
         }
         self.after_chrome_key(hwnd)
@@ -8854,6 +8930,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             theme().dark,
                             &shell.settings.recent,
                             shell.show_toolbar,
+                            shell.document.maximised(),
+                            shell.document.can_maximise(),
                         )
                     })
                 });
@@ -9598,6 +9676,8 @@ fn main() -> Result<()> {
             theme().dark,
             &recent,
             show_toolbar,
+            false,
+            false,
         )) {
             unsafe {
                 let _ = SetMenu(hwnd, bar);
@@ -10559,7 +10639,7 @@ mod tests {
     #[test]
     fn back_and_forward_are_greyed_until_there_is_a_view_to_return_to() {
         fn enabled(doc: &Document, label: &str) -> bool {
-            let menu = menubar::menu_bar(Some(doc), false, &[], true);
+            let menu = menubar::menu_bar(Some(doc), false, &[], true, false, false);
             for top in 0..menu.items().len() {
                 let Some(items) = menu.at(&[top]) else {
                     continue;
@@ -11999,6 +12079,44 @@ mod tests {
         assert_eq!(tabs.focused_pane(), 0);
         assert!(!tabs.close_active(), "and now it is gone");
 
+        let _ = std::fs::remove_file(&a);
+    }
+
+    /// **Maximising hides a pane; it does not close one.** The owner's model, 2026-08-28: a
+    /// maximised document reads as an ordinary tabbed viewer, and restoring brings the arrangement
+    /// back — so the other document must still be there, untouched, one click away.
+    #[test]
+    fn maximising_shows_the_focused_pane_alone_and_restoring_brings_the_other_back() {
+        assert_eq!(visible_panes(2, 0, true), [0], "the focused pane fills it");
+        assert_eq!(visible_panes(2, 1, true), [1], "whichever one that is");
+        assert_eq!(visible_panes(2, 1, false), [0, 1], "restored shows both");
+        assert_eq!(
+            visible_panes(1, 0, true),
+            [0],
+            "one pane already fills the frame; maximising it changes nothing"
+        );
+        assert_eq!(
+            visible_panes(2, 9, true),
+            [1],
+            "a focus index past the end must not panic or hide everything"
+        );
+
+        let a = scratch_log("tailhawk_max_a.log", 4);
+        let mut tabs = Tabs::default();
+        tabs.push(Document::open(&a).expect("a"));
+        assert!(!tabs.can_maximise(), "one pane has nothing to maximise");
+        assert!(!tabs.toggle_maximised(), "and the toggle refuses");
+        assert!(tabs.split(Document::open(&a).expect("a again")));
+        assert!(tabs.can_maximise());
+        assert!(tabs.toggle_maximised());
+        assert!(tabs.maximised());
+        assert_eq!(
+            tabs.panes().len(),
+            2,
+            "the hidden pane's document is still open"
+        );
+        assert!(tabs.toggle_maximised());
+        assert!(!tabs.maximised(), "and it comes straight back");
         let _ = std::fs::remove_file(&a);
     }
 

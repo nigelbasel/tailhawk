@@ -473,6 +473,18 @@ copy — bookmarks, highlight rules and column layout all apply.
 
 ### 3.1 Many logs at once — tiled panes, independent follow, and scroll lock
 
+> **What of this is built, as of 2026-09-02.** A tab holds **two** panes, stacked or side by side
+> per the edge a tab is dropped on, and `View ▸ Maximise pane` — with a toggle at the end of the
+> toolbar — fills the frame with the focused pane and restores the arrangement again. That is the
+> owner's *"un-maximising reverts to the arrangement, maximising goes back to tabs"*, and it is
+> where this section's promises currently stop.
+>
+> **Not built, and not to be read as though it were**: more than two panes, Tile and Cascade over
+> several document windows, per-pane follow independence, and scroll lock by timestamp or line
+> number. The rest of this section describes an intended shape, most of it written before the owner
+> saw any of it — the placement of the window controls and the meaning of *minimise* in a docked
+> model are **open questions put to him and not yet answered**.
+
 *(Owner's requirement, 2026-08-19. §3 above is one log split two ways; this is several logs at
 once, which is a different problem and the one MDI existed to solve.)*
 
