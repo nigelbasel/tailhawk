@@ -30,6 +30,11 @@ mod menubar;
 #[allow(dead_code)]
 mod net;
 mod prefs;
+/// The credential store lands before the dialog that fills it, exactly as `net.rs` landed before
+/// the caller that sends through it. Its round-trip is tested against the real Credential Manager,
+/// so "unused" here means "no caller yet", not "unproven".
+#[allow(dead_code)]
+mod secrets;
 mod tabstrip;
 mod toolbar;
 mod version;
