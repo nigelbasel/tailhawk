@@ -61,11 +61,100 @@ pub struct FileState {
     pub filters_hidden: bool,
 }
 
+/// A remote log source — `LOKI.md`, and the owner's requirement of 2026-09-02 that dev, QA and live
+/// can all be tailed at once in separate windows.
+///
+/// **The secret is not here and must never be.** This is `tailhawk.settings.toml`, which §12.4
+/// describes as a file a user opens and edits by hand; a credential in it would be a credential in
+/// every backup, screen share and "here is my config" paste. The secret is keyed out to Windows
+/// Credential Manager under [`name`](Source::name) — see the shell's `secrets` module — and this
+/// carries only what is ordinary configuration.
+///
+/// **Client credentials is the only flow built**, because it is the only one anything asks for.
+/// `token_url`, `client_id` and `scope` are named for the OAuth2 fields rather than for
+/// IdentityServer, so a different provider is a different value rather than different code; what a
+/// second provider would additionally need — HTTP Basic client authentication, or Entra's
+/// `.default` scope convention, or Auth0's `audience` — is a field added when there is one to test
+/// against, not now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Source {
+    /// What the user calls it, and the key its secret is stored under. Unique within the file.
+    pub name: String,
+    /// The base URL, including any mount prefix — `LOKI.md` §9 records that ours is served under
+    /// `/loki`, so the endpoint path follows the prefix and the doubled segment is real.
+    pub url: String,
+    /// The OAuth2 token endpoint. Empty means the source needs no token.
+    pub token_url: String,
+    /// The OAuth2 client id.
+    pub client_id: String,
+    /// The scope to request.
+    pub scope: String,
+}
+
+impl Source {
+    /// Why this source cannot be used yet, in the words the dialog shows — or `None` when it can.
+    ///
+    /// **A decision rather than a screenful of disabled buttons.** The dialog asks this and shows
+    /// the answer beside the fields, so a source that will not work says why while it is being
+    /// typed rather than when a query fails.
+    pub fn fault(&self) -> Option<&'static str> {
+        // The name is the credential's key as well as the label, so it is held to what can be one:
+        // no separator, no control characters, nothing that trims away to nothing. The shell's
+        // `secrets::target_for` enforces the same shape at the store; this is the half that can
+        // say so in words while the user is still typing.
+        if self.name.trim().is_empty() {
+            return Some("Give the source a name.");
+        }
+        if self.name.trim() != self.name {
+            return Some("The name cannot start or end with a space.");
+        }
+        let nameable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ');
+        if !self.name.chars().all(nameable) {
+            return Some("The name can hold letters, digits, spaces, - _ and . only.");
+        }
+        if self.url.trim().is_empty() {
+            return Some("Give the source a URL.");
+        }
+        if !is_https(&self.url) {
+            return Some("The URL must begin with https://.");
+        }
+        // **Half-configured authentication is the case worth catching.** It looks finished, and it
+        // fails at the first query with whatever the server says about a missing token — which
+        // sends the reader looking at the server rather than at this dialog.
+        match (
+            self.token_url.trim().is_empty(),
+            self.client_id.trim().is_empty(),
+        ) {
+            (true, true) => {}
+            (false, false) => {
+                if !is_https(&self.token_url) {
+                    return Some("The token URL must begin with https://.");
+                }
+            }
+            (true, false) => return Some("A client id needs a token URL to send it to."),
+            (false, true) => return Some("A token URL needs a client id."),
+        }
+        None
+    }
+}
+
+/// Whether `url` is an absolute https URL with a host.
+///
+/// **`http` is refused rather than warned about.** A bearer token on a cleartext connection is a
+/// bearer token given away, and `LOKI.md` §7 asks for transport that cannot be downgraded — a rule
+/// worth nothing if the URL that carries the credential can simply say `http`.
+fn is_https(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+}
+
 /// Everything persisted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     pub window: Option<Window>,
     pub files: Vec<FileState>,
+    /// `LOKI.md`'s remote sources, in the order the user put them. Secrets are NOT here.
+    pub sources: Vec<Source>,
     /// V13: `dark`, `light` or `system`, when the user chose one.
     pub theme: Option<String>,
     /// §2.2 Preferences: the grid font family, when the user chose one.
@@ -141,6 +230,12 @@ impl Settings {
         if over.toolbar.is_some() {
             self.toolbar = over.toolbar;
         }
+        // Sources merge **by name**, so a curated set beside the exe can define the shared ones and
+        // a user can still add their own — the same shape §12.4 gives every other tiered artefact.
+        for s in over.sources {
+            self.sources.retain(|e| e.name != s.name);
+            self.sources.push(s);
+        }
         if over.theme.is_some() {
             self.theme = over.theme;
         }
@@ -199,6 +294,23 @@ impl Settings {
                 w.x, w.y, w.width, w.height, w.maximized
             ));
         }
+        for s in &self.sources {
+            out.push_str("\n[[source]]\n");
+            out.push_str(&format!("name = {}\n", quote(&s.name)));
+            out.push_str(&format!("url = {}\n", quote(&s.url)));
+            // Written only when set, so an unauthenticated source reads as one rather than as three
+            // empty strings a reader has to interpret. **No secret is written, ever** — it lives in
+            // Credential Manager under `name`.
+            if !s.token_url.is_empty() {
+                out.push_str(&format!("token_url = {}\n", quote(&s.token_url)));
+            }
+            if !s.client_id.is_empty() {
+                out.push_str(&format!("client_id = {}\n", quote(&s.client_id)));
+            }
+            if !s.scope.is_empty() {
+                out.push_str(&format!("scope = {}\n", quote(&s.scope)));
+            }
+        }
         for f in &self.files {
             out.push_str("\n[[file]]\n");
             out.push_str(&format!("path = {}\n", quote(&f.path)));
@@ -235,30 +347,45 @@ impl Settings {
         let mut window = Window::default();
         let mut have_window = false;
         let mut file: Option<FileState> = None;
-        let flush_file = |file: &mut Option<FileState>, settings: &mut Settings| {
-            if let Some(f) = file.take() {
-                if !f.path.is_empty() {
-                    settings.set_file(f);
+        let mut source: Option<Source> = None;
+        let flush_file =
+            |file: &mut Option<FileState>, source: &mut Option<Source>, settings: &mut Settings| {
+                if let Some(f) = file.take() {
+                    if !f.path.is_empty() {
+                        settings.set_file(f);
+                    }
                 }
-            }
-        };
+                // A source with no name cannot key its own credential, so it is dropped rather than
+                // kept as an entry that can never work.
+                if let Some(s) = source.take() {
+                    if !s.name.trim().is_empty() {
+                        settings.sources.retain(|e| e.name != s.name);
+                        settings.sources.push(s);
+                    }
+                }
+            };
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             if let Some(header) = line.strip_prefix("[[").and_then(|l| l.strip_suffix("]]")) {
-                flush_file(&mut file, &mut settings);
-                section = if header.trim() == "file" {
-                    file = Some(FileState::default());
-                    Section::File
-                } else {
-                    Section::Other
+                flush_file(&mut file, &mut source, &mut settings);
+                section = match header.trim() {
+                    "file" => {
+                        file = Some(FileState::default());
+                        Section::File
+                    }
+                    "source" => {
+                        source = Some(Source::default());
+                        Section::Source
+                    }
+                    _ => Section::Other,
                 };
                 continue;
             }
             if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                flush_file(&mut file, &mut settings);
+                flush_file(&mut file, &mut source, &mut settings);
                 section = match header.trim() {
                     "window" => {
                         have_window = true;
@@ -308,6 +435,22 @@ impl Settings {
                     "maximized" => window.maximized = value == "true",
                     _ => {}
                 },
+                Section::Source => {
+                    if let Some(s) = source.as_mut() {
+                        match key {
+                            "name" => s.name = unquote(value),
+                            "url" => s.url = unquote(value),
+                            "token_url" => s.token_url = unquote(value),
+                            "client_id" => s.client_id = unquote(value),
+                            "scope" => s.scope = unquote(value),
+                            // **A `secret` key is read and thrown away.** Somebody will eventually
+                            // put one here by hand, and silently ignoring it is better than either
+                            // honouring it — which would defeat the whole point of the credential
+                            // store — or failing to open, which §12.4 forbids.
+                            _ => {}
+                        }
+                    }
+                }
                 Section::File => {
                     if let Some(f) = file.as_mut() {
                         match key {
@@ -331,7 +474,7 @@ impl Settings {
                 Section::None | Section::Other => {}
             }
         }
-        flush_file(&mut file, &mut settings);
+        flush_file(&mut file, &mut source, &mut settings);
         if have_window && window.width > 0 && window.height > 0 {
             settings.window = Some(window);
         }
@@ -347,6 +490,7 @@ enum Section {
     Recent,
     Find,
     File,
+    Source,
     Other,
 }
 
@@ -583,6 +727,13 @@ mod tests {
                 maximized: false,
             }),
             files: Vec::new(),
+            sources: vec![Source {
+                name: "dev".to_owned(),
+                url: "https://telemetry-dev.example/loki".to_owned(),
+                token_url: "https://identity-dev.example/connect/token".to_owned(),
+                client_id: "tailhawk".to_owned(),
+                scope: "telemetry:read".to_owned(),
+            }],
             theme: Some("light".to_owned()),
             font: Some("Cascadia Mono".to_owned()),
             font_size: Some(18),
@@ -691,6 +842,165 @@ mod tests {
         });
         assert_eq!(s.files.len(), 1, "case-insensitive path replaces");
         assert_eq!(s.file(r"C:\logs\other.log").unwrap().chips, ["+x"]);
+    }
+
+    /// **Sources round-trip, and no secret can reach the file.** The second half is the one that
+    /// matters: the whole reason the credential lives in Credential Manager is that this file is
+    /// read by hand, copied into pastes and swept into backups.
+    #[test]
+    fn sources_survive_a_round_trip_and_carry_no_secret() {
+        let mut s = Settings::default();
+        s.sources.push(Source {
+            name: "dev".to_owned(),
+            url: "https://telemetry-dev.example/loki".to_owned(),
+            token_url: "https://identity-dev.example/connect/token".to_owned(),
+            client_id: "tailhawk".to_owned(),
+            scope: "telemetry:read".to_owned(),
+        });
+        s.sources.push(Source {
+            name: "open".to_owned(),
+            url: "https://logs.example".to_owned(),
+            ..Source::default()
+        });
+
+        let text = s.to_toml();
+        assert_eq!(Settings::from_toml(&text).sources, s.sources, "round trip");
+        // An unauthenticated source writes three fewer keys rather than three empty ones.
+        assert!(!text.contains("token_url = \"\""), "no empty keys");
+
+        let secretish = ["secret", "password", "client_secret", "Bearer"];
+        for word in secretish {
+            assert!(
+                !text.to_lowercase().contains(&word.to_lowercase()),
+                "the settings file must never carry anything resembling {word:?}"
+            );
+        }
+
+        // And a `secret` somebody typed in by hand is read and dropped, not honoured.
+        let hand_edited = "[[source]]\nname = \"dev\"\nurl = \"https://a.example\"\n\
+                           secret = \"hunter2\"\n";
+        let read = Settings::from_toml(hand_edited);
+        assert_eq!(read.sources.len(), 1);
+        assert_eq!(read.sources[0].name, "dev");
+        assert!(
+            !read.to_toml().contains("hunter2"),
+            "and it does not survive to be written back"
+        );
+    }
+
+    /// A source with no name cannot key its own credential, so it is dropped rather than kept as an
+    /// entry that can never work. Sources merge by name, as every other tiered artefact does.
+    #[test]
+    fn a_nameless_source_is_dropped_and_the_tiers_merge_by_name() {
+        let read = Settings::from_toml("[[source]]\nurl = \"https://a.example\"\n");
+        assert!(read.sources.is_empty(), "no name, no source");
+
+        let exe_tier = Settings {
+            sources: vec![
+                Source {
+                    name: "live".to_owned(),
+                    url: "https://curated.example".to_owned(),
+                    ..Source::default()
+                },
+                Source {
+                    name: "mine".to_owned(),
+                    url: "https://personal.example".to_owned(),
+                    ..Source::default()
+                },
+            ],
+            ..Settings::default()
+        };
+        let user_tier = Settings {
+            sources: vec![Source {
+                name: "live".to_owned(),
+                url: "https://overridden.example".to_owned(),
+                ..Source::default()
+            }],
+            ..Settings::default()
+        };
+        let merged = user_tier.merged_under(exe_tier);
+        assert_eq!(merged.sources.len(), 2, "one replaced, one added");
+        let live = merged.sources.iter().find(|s| s.name == "live").unwrap();
+        assert_eq!(live.url, "https://curated.example", "the earlier tier wins");
+        assert!(merged.sources.iter().any(|s| s.name == "mine"));
+    }
+
+    /// **A source says why it cannot be used, while it is being typed.** The alternative is a
+    /// query that fails later with whatever the server happened to say, which is a much worse place
+    /// to learn that a URL was http or a client id was left blank.
+    #[test]
+    fn a_source_reports_the_first_thing_wrong_with_it() {
+        let good = Source {
+            name: "dev".to_owned(),
+            url: "https://telemetry-dev.example/loki".to_owned(),
+            token_url: "https://identity-dev.example/connect/token".to_owned(),
+            client_id: "tailhawk".to_owned(),
+            scope: "telemetry:read".to_owned(),
+        };
+        assert_eq!(good.fault(), None, "a complete source is usable");
+
+        let unauthenticated = Source {
+            token_url: String::new(),
+            client_id: String::new(),
+            scope: String::new(),
+            ..good.clone()
+        };
+        assert_eq!(
+            unauthenticated.fault(),
+            None,
+            "a Loki that wants no token is a real deployment, not a broken source"
+        );
+
+        let named = |name: &str| Source {
+            name: name.to_owned(),
+            ..good.clone()
+        };
+        assert!(named("").fault().is_some(), "a source needs a name");
+        assert!(named("  ").fault().is_some(), "and not a blank one");
+        assert!(
+            named("dev/live").fault().is_some(),
+            "a name that cannot key a credential is not a name"
+        );
+
+        let with_url = |url: &str| Source {
+            url: url.to_owned(),
+            ..good.clone()
+        };
+        assert!(with_url("").fault().is_some(), "a source needs a URL");
+        assert!(
+            with_url("http://telemetry.example/loki").fault().is_some(),
+            "**http is refused**: a bearer token on a cleartext connection is the token given away"
+        );
+        assert!(with_url("telemetry.example").fault().is_some(), "not a URL");
+
+        // Half-configured auth is the case worth catching: it looks finished and cannot work.
+        assert!(
+            Source {
+                client_id: String::new(),
+                ..good.clone()
+            }
+            .fault()
+            .is_some(),
+            "a token endpoint with no client id"
+        );
+        assert!(
+            Source {
+                token_url: String::new(),
+                ..good.clone()
+            }
+            .fault()
+            .is_some(),
+            "a client id with no token endpoint"
+        );
+        assert!(
+            Source {
+                token_url: "http://identity.example/connect/token".to_owned(),
+                ..good.clone()
+            }
+            .fault()
+            .is_some(),
+            "the token endpoint is a second origin and gets the same rule"
+        );
     }
 
     /// **An unreadable `toolbar` value leaves the row alone.** The only way back to a hidden
