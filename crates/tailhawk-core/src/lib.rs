@@ -41,6 +41,7 @@ pub mod search;
 pub mod selection;
 pub mod semantic;
 pub mod settings;
+pub mod sourceset;
 pub mod template;
 pub mod theme;
 pub mod view;
