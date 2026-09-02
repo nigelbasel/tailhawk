@@ -30,10 +30,6 @@ mod menubar;
 #[allow(dead_code)]
 mod net;
 mod prefs;
-/// The caller lands before the menu item that runs it, as `net.rs` and `secrets.rs` each did.
-/// Its refusals are tested and its faults are tested; "unused" here means there is no UI action
-/// yet, not that it is unproven.
-#[allow(dead_code)]
 mod pull;
 mod secrets;
 mod tabstrip;
@@ -3662,6 +3658,7 @@ impl Tabs {
         self.active = target;
         true
     }
+
     /// Whether the shown tab's focused pane fills the frame.
     fn maximised(&self) -> bool {
         self.tabs.get(self.active).is_some_and(|t| t.maximised)
@@ -4088,6 +4085,11 @@ struct Shell {
     /// §12.4's remote sources dialog, deferred like every other so no `STATE` borrow is held
     /// while it pumps its own modal loop.
     pending_sources: bool,
+    /// The remote source the user picked, waiting for the pull that must not run inside a borrow.
+    pending_pull: Option<usize>,
+    /// Spill files this session made from remote sources. Held so §13.2's "deleted on clean exit"
+    /// is true: dropping a `Spill` removes its file, and these live exactly as long as the window.
+    spills: Vec<tailhawk_core::stdin::Spill>,
     /// `Go to line…` asks for its own small dialog. `Ctrl+G` had no surface of its own until the
     /// command palette went — it opened the palette and leaned on a digits-only query meaning a
     /// line — while `UI-DESIGN.md` §2.2 had listed `Go to line…` with an ellipsis all along.
@@ -4379,6 +4381,15 @@ impl Shell {
 
     /// Writes §12.4's state: where the window is, how each open file is being looked at, and
     /// §2.2's `[appearance]` preferences.
+    /// The names of the configured remote sources, for File ▸ Open remote source.
+    fn source_names(&self) -> Vec<String> {
+        self.settings
+            .sources
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
     fn save_settings(&mut self, hwnd: HWND) {
         // The theme is written where it is chosen — see `adopt_theme` — so it is deliberately not
         // touched here. Overwriting it from `theme_name` made a `--theme=` flag persist and made a
@@ -5718,6 +5729,15 @@ impl Shell {
                 if let Some(path) = self.settings.recent.get(at).cloned() {
                     self.open_path(hwnd, std::path::PathBuf::from(path));
                 }
+                true
+            }
+            // `LOKI.md`'s remote sources. The pull itself is deferred, like every other thing that
+            // must not run inside a `STATE` borrow — it opens sockets and can take seconds.
+            id if (menubar::ID_SOURCE_BASE
+                ..menubar::ID_SOURCE_BASE + tailhawk_core::sourceset::MAX_SOURCES as u32)
+                .contains(&id) =>
+            {
+                self.pending_pull = Some((id - menubar::ID_SOURCE_BASE) as usize);
                 true
             }
             id if (menubar::ID_FORMAT_BASE..menubar::ID_FORMAT_BASE + 64).contains(&id) => {
@@ -7252,6 +7272,80 @@ fn from_menu_or_toolbar(lparam: LPARAM) -> bool {
         })
 }
 
+/// How far back a remote source is asked for on opening, in nanoseconds. An hour: enough to see
+/// what just happened, short enough that a busy service does not return the cap on the first ask.
+/// Puts a line in the status bar. **Not a message box** — `about.rs` records why this application
+/// does not use one, and a failure to reach a log server is information rather than a modal event.
+fn set_notice(text: String) {
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            shell.notice = Some(text);
+        }
+    });
+}
+
+const REMOTE_WINDOW_NANOS: i64 = 60 * 60 * 1_000_000_000;
+
+/// How many records one opening asks for. Below `loki::MAX_LIMIT`, because this is a first
+/// screenful and not an export.
+const REMOTE_LIMIT: u32 = 1_000;
+
+/// §12.3: fetch a remote source and open what comes back as an ordinary document.
+///
+/// **The fetch happens on a worker and the window keeps painting**, exactly as opening a large file
+/// does — a token exchange and a query are two round trips and neither belongs on the UI thread.
+/// What comes back is CLEF, written to a locked-down spill, and `format.rs`'s `ndjson` detector
+/// recognises it: a Loki source becomes a document with no new document type anywhere.
+fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let window = tailhawk_core::loki::Window {
+        start: now - REMOTE_WINDOW_NANOS,
+        end: now,
+    };
+    let name = source.name.clone();
+
+    let pulled = pull::pull(&source, window, REMOTE_LIMIT);
+    let pulled = match pulled {
+        Ok(pulled) => pulled,
+        Err(why) => {
+            // **The reason is shown, never swallowed.** Every fault says which half failed; a
+            // source that silently opens nothing is the worst outcome available here.
+            set_notice(format!("{name}: {why}"));
+            return;
+        }
+    };
+
+    let Ok(spill) = tailhawk_core::stdin::Spill::create() else {
+        set_notice("Could not create a temporary file for the records.".to_owned());
+        return;
+    };
+    if std::fs::write(spill.path(), pulled.clef.as_bytes()).is_err() {
+        set_notice("Could not write the records to a temporary file.".to_owned());
+        return;
+    }
+    let path = spill.path().to_path_buf();
+    // §6: what was dropped is said, not silently lost.
+    if pulled.dropped > 0 {
+        set_notice(format!(
+            "{name}: {} records; {} more were returned than Tailhawk keeps",
+            pulled.records, pulled.dropped
+        ));
+    }
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            shell.spills.push(spill);
+        }
+    });
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            shell.open_path(hwnd, path);
+        }
+    });
+}
+
 fn run_pending_dialogs(hwnd: HWND) -> bool {
     let open = STATE.with(|s| {
         s.borrow_mut()
@@ -7295,6 +7389,22 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         let sheet = STATE.with(|s| s.borrow().as_ref().map(|shell| shell.about_sheet()));
         if let Some(sheet) = sheet {
             show_about(hwnd, &sheet);
+        }
+        return true;
+    }
+    let pulling = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|shell| shell.pending_pull.take())
+    });
+    if let Some(at) = pulling {
+        let source = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.settings.sources.get(at).cloned())
+        });
+        if let Some(source) = source {
+            open_remote(hwnd, source);
         }
         return true;
     }
@@ -9007,6 +9117,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             shell.show_toolbar,
                             shell.document.maximised(),
                             shell.document.can_maximise(),
+                            &shell.source_names(),
                         )
                     })
                 });
@@ -9676,6 +9787,8 @@ fn main() -> Result<()> {
             pending_goto: false,
             pending_rules: false,
             pending_sources: false,
+            pending_pull: None,
+            spills: Vec::new(),
             find_dialog: HWND::default(),
             rules_dialog: HWND::default(),
             notice: None,
@@ -9763,6 +9876,7 @@ fn main() -> Result<()> {
             show_toolbar,
             false,
             false,
+            &[],
         )) {
             unsafe {
                 let _ = SetMenu(hwnd, bar);
@@ -10756,7 +10870,7 @@ mod tests {
     #[test]
     fn back_and_forward_are_greyed_until_there_is_a_view_to_return_to() {
         fn enabled(doc: &Document, label: &str) -> bool {
-            let menu = menubar::menu_bar(Some(doc), false, &[], true, false, false);
+            let menu = menubar::menu_bar(Some(doc), false, &[], true, false, false, &[]);
             for top in 0..menu.items().len() {
                 let Some(items) = menu.at(&[top]) else {
                     continue;

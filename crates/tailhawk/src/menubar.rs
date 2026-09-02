@@ -163,6 +163,9 @@ pub const ID_RECENT_BASE: u32 = 10_100;
 /// Format ▸ Log format's rows, the same way: `ID_FORMAT_BASE + n` is the n-th row of
 /// [`crate::format_menu_of`]'s answer, resolved back through it when chosen.
 pub const ID_FORMAT_BASE: u32 = 10_200;
+/// `LOKI.md`'s remote sources: `ID_SOURCE_BASE + n` opens the n-th configured source. A range,
+/// because the sources are data the user named rather than commands the register knows.
+pub const ID_SOURCE_BASE: u32 = 10_400;
 /// §2.4's context-menu items — the ones whose subject is *where the menu was summoned* (a column,
 /// a selection, a panel row) rather than anything the id alone could name. The caller resolves the
 /// subject before tracking and dispatches these against it.
@@ -293,6 +296,7 @@ pub fn menu_bar(
     toolbar: bool,
     maximised: bool,
     can_maximise: bool,
+    sources: &[String],
 ) -> tailhawk_core::menu::Menu {
     use tailhawk_core::menu::{Item, Menu};
     let cmd = |label: &str, key: &str, c: Command| Item::command(label, key, command_id(c));
@@ -318,6 +322,22 @@ pub fn menu_bar(
     // when there is no history rather than greyed.
     let mut file_items = vec![
         cmd("&Open…", "Ctrl+O", Command::OpenFile),
+        // `LOKI.md`'s remote sources, listed the way Open Recent lists files. **Disabled rather
+        // than hidden when none is configured**, per §2.2's rule that a menu whose shape changes is
+        // a menu that cannot be learned — and the item still names the thing, so somebody looking
+        // for it finds it and goes to Settings ▸ Remote sources, which is never disabled.
+        if sources.is_empty() {
+            on(Item::command("Open re&mote source", "", ID_UNLISTED), false)
+        } else {
+            Item::submenu(
+                "Open re&mote source",
+                sources
+                    .iter()
+                    .enumerate()
+                    .map(|(n, name)| Item::command(name, "", ID_SOURCE_BASE + n as u32))
+                    .collect(),
+            )
+        },
         on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
         Item::separator(),
         on(cmd("&Export view…", "", Command::Export), open),
@@ -664,7 +684,7 @@ mod tests {
     /// does not, is not there at all.
     #[test]
     fn every_listed_command_appears_in_at_least_one_menu() {
-        let ids = menu_bar(None, false, &[], true, false, false).ids();
+        let ids = menu_bar(None, false, &[], true, false, false, &[]).ids();
         let missing: Vec<&str> = Command::LISTED
             .iter()
             .enumerate()
@@ -698,11 +718,11 @@ mod tests {
         for (shape, menu) in [
             (
                 "no recent files",
-                menu_bar(None, false, &[], true, false, false),
+                menu_bar(None, false, &[], true, false, false, &[]),
             ),
             (
                 "with recent files",
-                menu_bar(None, false, &recent, true, false, false),
+                menu_bar(None, false, &recent, true, false, false, &[]),
             ),
         ] {
             let heads: Vec<Option<char>> = menu.items().iter().map(|i| i.mnemonic()).collect();
@@ -742,7 +762,7 @@ mod tests {
     /// keyboard once the menu is open, which §1.2 requires to be a complete path.
     #[test]
     fn every_choosable_item_marks_a_mnemonic() {
-        let menu = menu_bar(None, false, &[], true, false, false);
+        let menu = menu_bar(None, false, &[], true, false, false, &[]);
         let mut bare: Vec<String> = Vec::new();
         for top in 0..menu.items().len() {
             let Some(items) = menu.at(&[top]) else {
@@ -765,7 +785,7 @@ mod tests {
     /// a menu that hides working features.
     #[test]
     fn the_four_built_surfaces_are_no_longer_greyed() {
-        let menu = menu_bar(None, false, &[], true, false, false);
+        let menu = menu_bar(None, false, &[], true, false, false, &[]);
         for (top, label) in [
             ("Settings", "Preferences"),
             ("Help", "Keyboard map"),
@@ -827,7 +847,7 @@ mod tests {
     /// no history there is simply nothing, not a greyed stub.
     #[test]
     fn recent_files_are_entries_of_the_file_menu_itself() {
-        let menu = menu_bar(None, false, &[], true, false, false);
+        let menu = menu_bar(None, false, &[], true, false, false, &[]);
         let file = menu.at(&[0]).expect("File opens").to_vec();
         assert!(
             !file.iter().any(|i| i.text().contains("Clear recent")),
@@ -842,7 +862,7 @@ mod tests {
             r"C:\logs\newest.log".to_owned(),
             r"C:\logs\older.log".to_owned(),
         ];
-        let menu = menu_bar(None, false, &paths, true, false, false);
+        let menu = menu_bar(None, false, &paths, true, false, false, &[]);
         let file = menu.at(&[0]).expect("File opens").to_vec();
         let first = file
             .iter()
@@ -887,7 +907,7 @@ mod tests {
     /// menu would offer no way back.
     #[test]
     fn with_no_document_the_file_menu_still_offers_open() {
-        let menu = menu_bar(None, false, &[], true, false, false);
+        let menu = menu_bar(None, false, &[], true, false, false, &[]);
         let file = menu.at(&[0]).expect("File").to_vec();
         assert!(
             file[0].text().starts_with("Open"),
@@ -906,7 +926,7 @@ mod tests {
     #[test]
     fn the_theme_item_is_ticked_to_match_the_theme() {
         for dark in [true, false] {
-            let menu = menu_bar(None, dark, &[], true, false, false);
+            let menu = menu_bar(None, dark, &[], true, false, false, &[]);
             // Settings is the sixth heading.
             let settings = menu.at(&[5]).expect("Settings").to_vec();
             let theme_item = settings
