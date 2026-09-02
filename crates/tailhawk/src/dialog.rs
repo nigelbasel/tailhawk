@@ -126,7 +126,8 @@ const ID_S_TOKEN: u16 = 215;
 const ID_S_CLIENT: u16 = 216;
 const ID_S_SCOPE: u16 = 217;
 const ID_S_SECRET: u16 = 218;
-const ID_S_FAULT: u16 = 219;
+const ID_S_QUERY: u16 = 219;
+const ID_S_FAULT: u16 = 220;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -631,20 +632,22 @@ fn sources_dialog_items() -> Vec<Item> {
         field(ID_S_CLIENT, 154, 0),
         label("&Scope:", 170),
         field(ID_S_SCOPE, 170, 0),
-        label("S&ecret:", 186),
-        field(ID_S_SECRET, 186, ES_PASSWORD),
+        label("&Query:", 186),
+        field(ID_S_QUERY, 186, 0),
+        label("S&ecret:", 202),
+        field(ID_S_SECRET, 202, ES_PASSWORD),
         // The fault line, where the rules editor puts its own: what is wrong with the set, in the
         // words `sourceset::Editor::fault` chose, while it is being typed rather than when a query
         // fails.
-        Item::new(Class::Static, "", ID_S_FAULT, (7, 204, 340, 9), 0),
+        Item::new(Class::Static, "", ID_S_FAULT, (7, 220, 340, 9), 0),
         Item::new(
             Class::Button,
             "OK",
             1,
-            (293, 216, 54, 14),
+            (293, 232, 54, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
-        Item::new(Class::Button, "Cancel", 2, (353, 216, 60, 14), WS_TABSTOP),
+        Item::new(Class::Button, "Cancel", 2, (353, 232, 60, 14), WS_TABSTOP),
     ]
 }
 
@@ -686,7 +689,7 @@ fn sources_fill(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
     lv_reset(list);
     lv_column(list, 0, "Name", 90);
     lv_column(list, 1, "URL", 250);
-    lv_column(list, 2, "Auth", 90);
+    lv_column(list, 2, "Query", 140);
     // **Whether a secret is stored is a column, not a guess.** A source that is configured but has
     // never been given its secret is the commonest half-finished state there is, and without this
     // it looks identical to one that is ready.
@@ -699,7 +702,7 @@ fn sources_fill(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
             &[
                 row.name.to_owned(),
                 row.url.to_owned(),
-                row.auth.to_owned(),
+                row.query.to_owned(),
                 if row.has_secret { "stored" } else { "—" }.to_owned(),
                 row.fault.unwrap_or_default().to_owned(),
             ],
@@ -723,6 +726,7 @@ fn sources_show(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
         (ID_S_TOKEN, current.token_url.as_str()),
         (ID_S_CLIENT, current.client_id.as_str()),
         (ID_S_SCOPE, current.scope.as_str()),
+        (ID_S_QUERY, current.query.as_str()),
     ] {
         set_dlg_text(hdlg, id, text);
     }
@@ -741,6 +745,7 @@ fn sources_read(hdlg: HWND, edit: &mut tailhawk_core::sourceset::Editor) {
         (ID_S_TOKEN, Field::TokenUrl),
         (ID_S_CLIENT, Field::ClientId),
         (ID_S_SCOPE, Field::Scope),
+        (ID_S_QUERY, Field::Query),
     ] {
         edit.edit(field, &dlg_text(hdlg, id));
     }
@@ -806,7 +811,10 @@ unsafe extern "system" fn sources_proc(
                     data.editor.set_secret(&dlg_text(hdlg, ID_S_SECRET));
                     return 1;
                 }
-                (ID_S_NAME | ID_S_URL | ID_S_TOKEN | ID_S_CLIENT | ID_S_SCOPE, EN_CHANGE) => {
+                (
+                    ID_S_NAME | ID_S_URL | ID_S_TOKEN | ID_S_CLIENT | ID_S_SCOPE | ID_S_QUERY,
+                    EN_CHANGE,
+                ) => {
                     sources_read(hdlg, &mut data.editor);
                     sources_fill(hdlg, &data.editor);
                     set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
@@ -890,7 +898,7 @@ fn sources_state(hdlg: HWND) -> Option<*mut SourcesEdit> {
 /// Reports whether the set was accepted. The caller writes `editor.sources()` into its settings and
 /// takes `store` and `forget` to Credential Manager.
 pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
-    let t = template("Remote sources", 420, 236, &sources_dialog_items());
+    let t = template("Remote sources", 420, 252, &sources_dialog_items());
     unsafe {
         DialogBoxIndirectParamW(
             None,

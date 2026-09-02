@@ -89,6 +89,16 @@ pub struct Source {
     pub client_id: String,
     /// The scope to request.
     pub scope: String,
+    /// The LogQL selector this source starts from — `{environment="dev"}` and the like.
+    ///
+    /// **This is what makes one Loki into several sources**, and it is the whole of the owner's
+    /// choice of 2026-09-03. The estate runs a *single* Loki: `environment` is a **label**, not a
+    /// host, so dev, QA and live differ by what is asked and not by where. Three entries sharing a
+    /// URL, a client and a credential, differing only here, is what "three windows I can just open"
+    /// actually means.
+    ///
+    /// Empty is legitimate and means everything the credential can see — so it is never a fault.
+    pub query: String,
 }
 
 impl Source {
@@ -310,6 +320,13 @@ impl Settings {
             if !s.scope.is_empty() {
                 out.push_str(&format!("scope = {}\n", quote(&s.scope)));
             }
+            if !s.query.is_empty() {
+                out.push_str(&format!(
+                    "query = {}
+",
+                    quote(&s.query)
+                ));
+            }
         }
         for f in &self.files {
             out.push_str("\n[[file]]\n");
@@ -443,6 +460,7 @@ impl Settings {
                             "token_url" => s.token_url = unquote(value),
                             "client_id" => s.client_id = unquote(value),
                             "scope" => s.scope = unquote(value),
+                            "query" => s.query = unquote(value),
                             // **A `secret` key is read and thrown away.** Somebody will eventually
                             // put one here by hand, and silently ignoring it is better than either
                             // honouring it — which would defeat the whole point of the credential
@@ -733,6 +751,7 @@ mod tests {
                 token_url: "https://identity-dev.example/connect/token".to_owned(),
                 client_id: "tailhawk".to_owned(),
                 scope: "telemetry:read".to_owned(),
+                query: "{environment=\"dev\"}".to_owned(),
             }],
             theme: Some("light".to_owned()),
             font: Some("Cascadia Mono".to_owned()),
@@ -856,6 +875,7 @@ mod tests {
             token_url: "https://identity-dev.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
+            query: "{environment=~\"live|production\"}".to_owned(),
         });
         s.sources.push(Source {
             name: "open".to_owned(),
@@ -936,6 +956,7 @@ mod tests {
             token_url: "https://identity-dev.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
+            query: String::new(),
         };
         assert_eq!(good.fault(), None, "a complete source is usable");
 

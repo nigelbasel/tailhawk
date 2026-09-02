@@ -36,8 +36,12 @@ pub const MAX_SOURCES: usize = 64;
 pub struct Row<'a> {
     pub name: &'a str,
     pub url: &'a str,
-    /// What the Authentication column says: the client id, or that the source uses none.
-    pub auth: &'a str,
+    /// The selector this source starts from, or that it takes everything.
+    ///
+    /// **Shown in the list, and it has to be.** The estate runs one Loki, so the sources a person
+    /// actually wants — dev, QA, live — share a URL, a client and a credential and differ *only*
+    /// here. A list without this column is three rows that look identical.
+    pub query: &'a str,
     /// Whether a secret is stored for this source — the shell answers this, the editor only carries
     /// it. Shown so a source that is configured but has never been given its secret is visible as
     /// such rather than failing at the first query.
@@ -130,10 +134,10 @@ impl Editor {
             .map(|(i, s)| Row {
                 name: &s.name,
                 url: &s.url,
-                auth: if s.client_id.is_empty() {
-                    "none"
+                query: if s.query.is_empty() {
+                    "(everything)"
                 } else {
-                    &s.client_id
+                    &s.query
                 },
                 has_secret: self.stored.get(i).copied().unwrap_or(false),
                 fault: s.fault(),
@@ -182,6 +186,7 @@ impl Editor {
             Field::TokenUrl => &mut source.token_url,
             Field::ClientId => &mut source.client_id,
             Field::Scope => &mut source.scope,
+            Field::Query => &mut source.query,
         };
         if slot != value {
             slot.clear();
@@ -243,6 +248,7 @@ pub enum Field {
     TokenUrl,
     ClientId,
     Scope,
+    Query,
 }
 
 #[cfg(test)]
@@ -256,6 +262,7 @@ mod tests {
             token_url: "https://identity.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
+            query: format!("{{environment=\"{name}\"}}"),
         }
     }
 
@@ -386,6 +393,60 @@ mod tests {
         }
         assert!(!editor.add(), "the list is bounded");
         assert_eq!(editor.sources().len(), MAX_SOURCES);
+    }
+
+    /// **Three sources against one Loki differ only by their selector**, which is the shape the
+    /// owner chose on 2026-09-03 once it was established that `environment` is a label and not a
+    /// host. The list has to show it, or those three rows are indistinguishable — and an empty
+    /// selector has to say something rather than nothing, or it reads as a missing value.
+    #[test]
+    fn the_selector_is_what_tells_three_sources_of_one_loki_apart() {
+        let one = |name: &str, query: &str| Source {
+            name: name.to_owned(),
+            url: "https://telemetry.example/loki".to_owned(),
+            token_url: "https://identity.example/connect/token".to_owned(),
+            client_id: "tailhawk".to_owned(),
+            scope: "telemetry:read".to_owned(),
+            query: query.to_owned(),
+        };
+        let editor = Editor::new(
+            vec![
+                one("dev", "{environment=\"dev\"}"),
+                one("live", "{environment=~\"live|production\"}"),
+                one("all", ""),
+            ],
+            vec![true, true, true],
+        );
+        let rows = editor.rows();
+        assert!(
+            rows.iter()
+                .map(|r| r.url)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .all(|p| p[0] == p[1]),
+            "they share a host, which is the whole point"
+        );
+        let queries: Vec<&str> = rows.iter().map(|r| r.query).collect();
+        assert_eq!(
+            queries,
+            [
+                "{environment=\"dev\"}",
+                "{environment=~\"live|production\"}",
+                "(everything)"
+            ],
+            "and are told apart only by this"
+        );
+        assert_eq!(
+            queries
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "no two rows read the same"
+        );
+
+        // An empty selector is legitimate — never a fault.
+        assert!(editor.fault().is_none());
     }
 
     /// A short `stored` list is padded rather than refused: "we did not ask" reads as "no secret",
