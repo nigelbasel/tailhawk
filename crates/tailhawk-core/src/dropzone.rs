@@ -5,11 +5,17 @@
 //! zone and its guide out — so the part that can be got wrong is the part a test can reach. The
 //! shell's job is to draw the guide it is handed and act on the drop.
 //!
-//! **Two of the five zones are not available yet, and say so rather than lying.** A `Tab` holds
-//! `panes: Vec<Document>` and the layout divides a *height* between them, so a pane can be put
-//! above or below another and cannot be put beside one. Offering a `Left` guide that produced a
-//! stacked split — or nothing at all — would be the dead menu item this project has already
-//! shipped once, so [`Zone::available`] is what the shell asks before it draws anything.
+//! **All five zones are performable, as of 2026-09-02.** They were not always: a `Tab` used to hold
+//! `panes: Vec<Document>` divided by a *height* alone, so a pane could be put above or below
+//! another and could not be put beside one, and this module carried a `Zone::available` that the
+//! shell asked before drawing any guide — because a highlight is a promise, and one the product
+//! cannot keep is the dead menu item this project has already shipped once. `Tab` now carries the
+//! direction it divides in, so `available` has gone rather than becoming a function that always
+//! answers yes.
+//!
+//! **What still refuses a drop is the pane *count*, not its direction.** The model says how two
+//! panes share a space and not how three do, so a drop onto an already-split pane is declined by
+//! the shell — for all four edges equally.
 
 /// A rectangle in the coordinates the caller is working in. Pixels, in practice.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,14 +49,6 @@ pub enum Zone {
 }
 
 impl Zone {
-    /// Whether the pane model can actually perform this split today.
-    ///
-    /// The shell must not draw a guide for a zone that answers `false`: a highlight is a promise,
-    /// and one the product cannot keep is worse than no highlight at all.
-    pub fn available(self) -> bool {
-        !matches!(self, Zone::Left | Zone::Right)
-    }
-
     /// Whether taking this zone divides the pane at all.
     pub fn splits(self) -> bool {
         !matches!(self, Zone::Centre)
@@ -290,20 +288,6 @@ mod tests {
         let (left, right) = (guide(odd, Zone::Left), guide(odd, Zone::Right));
         assert_eq!(left.x + left.w, right.x);
         assert_eq!(right.x + right.w, odd.x + odd.w);
-    }
-
-    /// **The zones the pane model cannot perform report themselves.** The shell asks this before
-    /// drawing, so a guide is never a promise the product cannot keep.
-    #[test]
-    fn the_splits_the_model_cannot_do_are_marked_unavailable() {
-        assert!(Zone::Above.available());
-        assert!(Zone::Below.available());
-        assert!(Zone::Centre.available());
-        assert!(
-            !Zone::Left.available(),
-            "panes stack vertically; there is no left edge yet"
-        );
-        assert!(!Zone::Right.available());
     }
 
     #[test]

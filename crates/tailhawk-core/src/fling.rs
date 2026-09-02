@@ -218,6 +218,11 @@ pub enum TouchPhase {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Panes<'a> {
     /// The top of each pane in client coordinates, in order.
+    ///
+    /// **The caller passes the one pane the contact is in**, not all of them. This module reasons
+    /// in one dimension, which is right for the gesture — but panes may sit side by side, where
+    /// every top is zero and this list alone cannot tell them apart. Handed all of them, it read
+    /// every touch as landing in the last pane.
     pub tops: &'a [f32],
     /// Menu bar, command bar and column header — everything above the first row in a pane.
     pub top_inset: f32,

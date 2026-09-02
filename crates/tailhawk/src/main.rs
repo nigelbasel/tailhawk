@@ -275,6 +275,8 @@ struct Document {
     show_filters: bool,
     /// Where this pane's top edge is in the client, so a click can be made pane-relative.
     pane_top: f32,
+    /// The pane's left edge in client pixels — zero unless the tab is split side by side.
+    pane_left: f32,
     /// Whether the producer had closed its end as of the last tick.
     ///
     /// **A remembered edge, not a query.** The title only redraws when a tick reports a change, and
@@ -437,6 +439,16 @@ impl RowSource for Document {
         let mut hits = self.chrome.hits.borrow_mut();
         hits.clear();
 
+        // **A side-by-side split needs a seam drawn, and a stacked one does not.** Stacked, the
+        // lower pane's column-header band is itself the break. Side by side, the two header bands
+        // sit at the same height and the grids simply abut — the only cue that it is a split is a
+        // line-number gutter appearing in the middle of the window, which reads as a rendering
+        // fault rather than as a layout. One rule, in the colour the detail pane and the filter
+        // panel already use for the same job.
+        if self.pane_left > 0.0 {
+            painter.fill(0.0, 0.0, 1.0, view.height_px(), theme().pane_edge);
+        }
+
         // §2.2 as resettled: the menu bar is Windows' own, outside the client area, and the
         // command-bar row is gone — search is the Find dialog, filters are the panel below,
         // format is the Format menu. What remains of the top chrome is the tab strip.
@@ -584,8 +596,13 @@ impl RowSource for Document {
 
         // The status bar, at the bottom: what the title says, where a user looks. Cut from the
         // right if it is longer than the window; the front is the part that changes.
+        // **The bar is painted whenever it is reserved, whatever it has to say.** Gating the fill
+        // on the text left a pane that reserves the band and holds no status — the right-hand one
+        // of a side-by-side split, which shows the bar while the left one owns the words — with an
+        // unpainted strip of grid background beside a grey one, and a hard vertical seam between
+        // them at the window's foot.
         let footer = strip.min(view.footer_px());
-        if footer > 0.0 && !self.status.is_empty() {
+        if footer > 0.0 {
             let fy = view.height_px() - footer;
             painter.fill(0.0, fy, width, footer, theme().chrome_bg);
             // §1.1: chrome is drawn in the system UI font, not the grid's monospace. The status
@@ -767,6 +784,7 @@ impl Document {
             show_filters: false,
             filter_selected: None,
             pane_top: 0.0,
+            pane_left: 0.0,
             pump: None,
             stream_done: false,
         })
@@ -827,6 +845,7 @@ impl Document {
             show_filters: false,
             filter_selected: None,
             pane_top: 0.0,
+            pane_left: 0.0,
             pump: Some(pump),
             stream_done: false,
         })
@@ -3538,12 +3557,15 @@ struct Tabs {
     active: usize,
 }
 
-/// One tab: a pane, or two stacked — `SPEC.md` §7.3's split view, `UI-DESIGN.md` §3. Each pane
+/// One tab: a pane, or two — stacked or side by side, per `Tab::layout` — `SPEC.md` §7.3's split view, `UI-DESIGN.md` §3. Each pane
 /// is a whole [`Document`] on the same path (see `CLEANROOM.md`, 2026-08-17: a second handle and
 /// index rather than two views over one document); the keyboard goes to the focused one.
 struct Tab {
     panes: Vec<Document>,
     focused: usize,
+    /// Which way this tab's panes divide the space — set by the edge the split was dropped on, and
+    /// meaningless while there is one pane.
+    layout: PaneLayout,
 }
 
 impl Tab {
@@ -3551,11 +3573,75 @@ impl Tab {
         Self {
             panes: vec![doc],
             focused: 0,
+            layout: PaneLayout::default(),
         }
     }
 }
 
 impl Tabs {
+    /// Splits tab `onto`, putting the dragged tab's document on whichever edge it was dropped.
+    ///
+    /// **The dragged tab is consumed into the split**, which is what "drag *out* to split" means:
+    /// the tab you pulled off the strip becomes the new pane, so the strip loses an entry and the
+    /// pane count rises. Dragging a tab onto its own pane would otherwise duplicate it.
+    fn split_from(
+        &mut self,
+        from: usize,
+        onto: usize,
+        zone: tailhawk_core::dropzone::Zone,
+    ) -> bool {
+        use tailhawk_core::dropzone::Zone;
+        if from >= self.len() || onto >= self.len() || self.len() < 2 {
+            return false;
+        }
+        // **`onto` is passed in, not read from `self.active`.** The tab control selects on
+        // button-*down*, so by the time the posted drop message arrives the active tab is already
+        // the one being dragged — and reading it here made `from == target` true for every drag,
+        // which refused every split in all four directions with no feedback at all. The strip
+        // captures what was showing before the press and sends it along; see `tabstrip::SHOWING`.
+        let target = onto;
+        if from == target {
+            return false;
+        }
+        // **Every refusal is decided before anything is moved.** An earlier shape removed the tab
+        // and popped its document *first*, then discovered the target was full and put the tab back
+        // — one pane short. The popped document was dropped on the floor and the file silently
+        // closed. Nothing is taken apart until the answer is yes.
+        //
+        // Already split? Putting a third pane in would need the model to say how the space is
+        // shared between three, and it does not. This is a pane-count limit, not a direction
+        // limit: it applies to all four edges equally.
+        if self.tabs[target].panes.len() >= 2 || self.tabs[from].panes.len() != 1 {
+            return false;
+        }
+        let mut tab = self.tabs.remove(from);
+        // Removing shifts everything after it, including the tab being split into.
+        let target = if from < target { target - 1 } else { target };
+        let doc = tab.panes.remove(0);
+        let into = &mut self.tabs[target];
+        // **The edge chosen is the layout.** A drop on the top or bottom stacks; one on the left or
+        // right puts the panes beside each other. `Centre` never reaches here — it does not split.
+        into.layout = match zone {
+            Zone::Left | Zone::Right => PaneLayout::SideBySide,
+            _ => PaneLayout::Stacked,
+        };
+        let first = matches!(zone, Zone::Above | Zone::Left);
+        if first {
+            into.panes.insert(0, doc);
+        } else {
+            into.panes.push(doc);
+        }
+        into.focused = if first { 0 } else { into.panes.len() - 1 };
+        self.active = target;
+        true
+    }
+    /// How the shown tab divides its panes.
+    fn layout(&self) -> PaneLayout {
+        self.tabs
+            .get(self.active)
+            .map_or(PaneLayout::default(), |t| t.layout)
+    }
+
     fn as_ref(&self) -> Option<&Document> {
         let tab = self.tabs.get(self.active)?;
         tab.panes.get(tab.focused)
@@ -3566,7 +3652,7 @@ impl Tabs {
         tab.panes.get_mut(tab.focused)
     }
 
-    /// The shown tab's panes, top to bottom.
+    /// The shown tab's panes, in layout order — top to bottom, or left to right.
     fn panes(&self) -> &[Document] {
         self.tabs
             .get(self.active)
@@ -3640,6 +3726,11 @@ impl Tabs {
         if tab.panes.len() >= 2 {
             return false;
         }
+        // **`Ctrl+\` always stacks**, and says so rather than inheriting. `layout` outlives the
+        // split that set it — unsplitting leaves one pane and a stale direction — so a tab last
+        // split side by side would come back side by side from a keystroke that has no way to
+        // express a direction and never meant one. Choosing the edge is the drag's job.
+        tab.layout = PaneLayout::Stacked;
         tab.panes.push(doc);
         tab.focused = tab.panes.len() - 1;
         true
@@ -3703,16 +3794,54 @@ impl Tabs {
     }
 }
 
-/// Where each of `n` stacked panes starts and how tall it is, in a client `height` px tall. Two
-/// panes split the height evenly; the top pane rounds down.
-fn pane_tops(height: f32, n: usize) -> Vec<(f32, f32)> {
+/// How a tab's panes divide the space between them — `SPEC.md` §1069's "split panes tile
+/// horizontally or vertically".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PaneLayout {
+    /// One above the other, dividing the height. The only arrangement the model had until
+    /// 2026-09-02, and still what a drop on the top or bottom edge asks for.
+    #[default]
+    Stacked,
+    /// Side by side, dividing the width. What a drop on the left or right edge asks for.
+    SideBySide,
+}
+
+/// Which pane a client point falls in, given each pane's origin and the way they divide.
+///
+/// **Panes tile in one direction only**, so only that direction is compared: side by side, the
+/// point's `y` says nothing about which pane it is in, and stacked, its `x` says nothing. A point
+/// before the first pane's origin belongs to the first pane, which is what makes a click in the
+/// chrome band route to a pane at all.
+fn pane_hit(origins: &[(f32, f32)], layout: PaneLayout, x: f32, y: f32) -> usize {
+    let side = layout == PaneLayout::SideBySide;
+    let at = if side { x } else { y };
+    origins
+        .iter()
+        .rposition(|o| at >= if side { o.0 } else { o.1 })
+        .unwrap_or(0)
+}
+
+/// Where each of `n` panes sits in a client `width` × `height` px, as `(x, y, w, h)`.
+///
+/// **The last pane takes the remainder**, so the panes tile the client exactly: two panes in an odd
+/// number of pixels must not leave a seam or overlap by one, and dividing evenly and rounding would
+/// do both depending on the parity.
+fn pane_boxes(width: f32, height: f32, n: usize, layout: PaneLayout) -> Vec<(f32, f32, f32, f32)> {
     let n = n.max(1);
-    let each = (height / n as f32).floor();
+    let along = if layout == PaneLayout::SideBySide {
+        width
+    } else {
+        height
+    };
+    let each = (along / n as f32).floor();
     (0..n)
         .map(|i| {
-            let top = each * i as f32;
-            let h = if i + 1 == n { height - top } else { each };
-            (top, h)
+            let start = each * i as f32;
+            let span = if i + 1 == n { along - start } else { each };
+            match layout {
+                PaneLayout::Stacked => (0.0, start, width, span),
+                PaneLayout::SideBySide => (start, 0.0, span, height),
+            }
         })
         .collect()
 }
@@ -4369,8 +4498,13 @@ impl Shell {
                 self.cell_h = cell.1;
                 // §1.1: the chrome bands are sized by the chrome face, not the grid's row.
                 let chrome_h = renderer.chrome_line_height()?;
-                // The panes stack: the first carries the tab strip, the last the status bar.
-                let tops = pane_tops(h as f32, pane_count);
+                // Stacked, the first pane carries the chrome band and the last the status bar.
+                // **Side by side, every pane touches both edges**, so every one reserves both
+                // bands — otherwise the two grids would start at different heights and the split
+                // would read as a rendering fault rather than a layout.
+                let layout = self.document.layout();
+                let side = layout == PaneLayout::SideBySide;
+                let boxes = pane_boxes(w as f32, h as f32, pane_count, layout);
                 // The real control's band, asked of it once per frame and handed to the pane that
                 // carries the strip. Placed here too, because this is where the width is known.
                 let guide = self.drag_guide.map(|(_, r)| r);
@@ -4407,22 +4541,28 @@ impl Shell {
                 let strip_px = strip_px + toolbar_px;
                 let panes = self.document.panes_mut();
                 for (i, doc) in panes.iter_mut().enumerate() {
-                    let (top, height) = tops[i];
-                    doc.strip_px = if i == 0 { strip_px } else { 0.0 };
+                    let (x, top, width, height) = boxes[i];
+                    let last = i + 1 == pane_count;
+                    doc.strip_px = if side || i == 0 { strip_px } else { 0.0 };
                     doc.tab_strip = if i == 0 {
                         strip.clone()
                     } else {
                         (Vec::new(), 0)
                     };
                     doc.chrome_h = chrome_h;
-                    doc.show_footer = i + 1 == pane_count;
-                    doc.status = if doc.show_footer {
+                    doc.show_footer = side || last;
+                    // **The status text belongs to whichever pane owns the window's bottom-left
+                    // corner**, because that is where a status bar's text starts. Stacked, that is
+                    // the last pane; side by side, every pane draws the bar but only the leftmost
+                    // has anything to say, so the text is not repeated across the seam.
+                    doc.status = if if side { i == 0 } else { last } {
                         status.clone()
                     } else {
                         String::new()
                     };
                     doc.pane_top = top;
-                    doc.lay_out(cell, (w, height as u32));
+                    doc.pane_left = x;
+                    doc.lay_out(cell, (width as u32, height as u32));
                     // The highlighter's frame budget starts here, alongside the painter's own
                     // `begin_frame` inside `paint_panes` — one frame, one budget, §11.3.
                     doc.highlighter.begin_frame();
@@ -4441,10 +4581,16 @@ impl Shell {
                 // `Rows` is the row source, so the painter reads its text and its column anchors
                 // by reference — the closure this replaced allocated a `String` per row per frame
                 // and had nowhere to put the anchors at all.
-                let refs: Vec<(&View, &dyn RowSource, f32)> = panes
+                let refs: Vec<(&View, &dyn RowSource, f32, f32)> = panes
                     .iter()
-                    .enumerate()
-                    .map(|(i, doc)| (&doc.view, doc as &dyn RowSource, tops[i].0))
+                    .map(|doc| {
+                        (
+                            &doc.view,
+                            doc as &dyn RowSource,
+                            doc.pane_left,
+                            doc.pane_top,
+                        )
+                    })
                     .collect();
                 let laid = renderer.paint_panes(&refs, (w as f32, h as f32), &overlay)?;
                 rasterised = laid.rasterised;
@@ -4953,48 +5099,6 @@ impl Shell {
         })
     }
 
-    /// Splits the shown tab, putting the dragged document above or below the one already there.
-    ///
-    /// **The dragged tab is consumed into the split**, which is what "drag *out* to split" means:
-    /// the tab you pulled off the strip becomes the new pane, so the strip loses an entry and the
-    /// pane count rises. Dragging a tab onto its own pane would otherwise duplicate it.
-    fn split_from_tab(&mut self, from: usize, zone: tailhawk_core::dropzone::Zone) -> bool {
-        use tailhawk_core::dropzone::Zone;
-        if from >= self.document.len() || self.document.len() < 2 {
-            return false;
-        }
-        let target = self.document.active;
-        if from == target {
-            return false;
-        }
-        let mut tab = self.document.tabs.remove(from);
-        // Removing shifts everything after it, including the tab being split into.
-        let target = if from < target { target - 1 } else { target };
-        let Some(doc) = tab.panes.pop() else {
-            return false;
-        };
-        let Some(into) = self.document.tabs.get_mut(target) else {
-            return false;
-        };
-        if into.panes.len() >= 2 {
-            // Already split. Putting a third pane in would need the model to say how the height is
-            // shared, and it does not — so the drop is refused rather than guessed at.
-            self.document.tabs.insert(from, tab);
-            return false;
-        }
-        match zone {
-            Zone::Above => into.panes.insert(0, doc),
-            _ => into.panes.push(doc),
-        }
-        into.focused = if zone == Zone::Above {
-            0
-        } else {
-            into.panes.len() - 1
-        };
-        self.document.active = target;
-        true
-    }
-
     /// Ends a bar drag at `x`: the chip is moved to the slot under the pointer. Reports whether the
     /// order changed.
     ///
@@ -5049,15 +5153,16 @@ impl Shell {
         false
     }
 
-    /// Which pane a client `y` falls in, and that pane's top — for routing a click. `None` with no
-    /// document.
-    fn pane_at(&self, y: f32) -> Option<(usize, f32)> {
+    /// Which pane a client point falls in, and that pane's origin — for routing a click. `None`
+    /// with no document.
+    fn pane_at(&self, x: f32, y: f32) -> Option<(usize, f32, f32)> {
         let panes = self.document.panes();
         if panes.is_empty() {
             return None;
         }
-        let hit = panes.iter().rposition(|d| y >= d.pane_top).unwrap_or(0);
-        Some((hit, panes[hit].pane_top))
+        let origins: Vec<(f32, f32)> = panes.iter().map(|d| (d.pane_left, d.pane_top)).collect();
+        let hit = pane_hit(&origins, self.document.layout(), x, y);
+        Some((hit, panes[hit].pane_left, panes[hit].pane_top))
     }
 
     /// One tick of the wheel's easing: a share of what is left, never less than a pixel, and the
@@ -6850,7 +6955,10 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
                 doc.view.chrome_px() + doc.view.header_px() + 1.0,
             )
         } else {
-            (point.x as f32, point.y as f32 - doc.pane_top)
+            (
+                point.x as f32 - doc.pane_left,
+                point.y as f32 - doc.pane_top,
+            )
         };
         let row = doc
             .chrome
@@ -6899,7 +7007,7 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
                 detail: doc.detail_open(),
             }
         };
-        Some((under, (x, y + doc.pane_top)))
+        Some((under, (x + doc.pane_left, y + doc.pane_top)))
     });
     let Some((under, anchor)) = resolved else {
         return;
@@ -8407,7 +8515,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     }
                 }
                 let (x, y) = (point.x as f32, point.y as f32);
-                let Some((pane, _)) = shell.pane_at(y) else {
+                let Some((pane, _, _)) = shell.pane_at(x, y) else {
                     return false;
                 };
                 let Some(doc) = shell.document.panes().get(pane) else {
@@ -8415,7 +8523,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 };
                 // `Some(Some(_))` is a boundary; `Some(None)` is a title, which stays an arrow, as
                 // a list header does.
-                matches!(doc.header_hit(x, y - doc.pane_top), Some(Some(_)))
+                matches!(
+                    doc.header_hit(x - doc.pane_left, y - doc.pane_top),
+                    Some(Some(_))
+                )
             });
             if sizing {
                 // SAFETY: a shared system cursor; `LoadCursorW` with a null instance and an
@@ -8459,26 +8570,41 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return false;
                 };
-                let y = pt.y as f32;
+                let (x, y) = (pt.x as f32, pt.y as f32);
                 // Everything the decision needs, and nothing decided here. `fling::decide` owns
                 // which pane the contact is in, whether a second finger may take a pan in progress,
                 // whether the point is on rows rather than chrome, and whether a capture change is
                 // even about this contact.
                 let covered = shell.rules_editor.is_open() || shell.wizard.is_some();
-                let tops: Vec<f32> = shell.document.panes().iter().map(|d| d.pane_top).collect();
-                let Some(first) = shell.document.panes().first() else {
+                // **`fling` reasons in one dimension, and it is right to.** It was handed every
+                // pane's `pane_top` and asked which one `y` fell in — which side by side is every
+                // pane at zero, so every contact reported the *last* pane and a finger on the left
+                // pane scrolled the right one. It is handed the pane actually under the pointer
+                // instead, and then its vertical arithmetic is exactly correct: that pane's own
+                // top, its own bottom, and its own insets rather than the first pane's.
+                //
+                // **Mid-pan the pane is the one the pan began in**, not the one under the pointer:
+                // a drag that wanders into the neighbouring pane goes on scrolling what it started
+                // on, which is what `panning_pane_top` was always documented to mean.
+                let hit = if shell.panning.is_some() {
+                    shell.document.focused_pane()
+                } else {
+                    shell.pane_at(x, y).map_or(0, |(i, _, _)| i)
+                };
+                let Some(doc) = shell.document.panes().get(hit) else {
                     return false;
                 };
+                let tops = [doc.pane_top];
                 let panes = fling::Panes {
                     tops: &tops,
-                    top_inset: first.view.chrome_px() + first.view.header_px(),
-                    bottom_inset: first.view.footer_px(),
-                    bottom: first.view.height_px(),
+                    top_inset: doc.view.chrome_px() + doc.view.header_px(),
+                    bottom_inset: doc.view.footer_px(),
+                    bottom: doc.pane_top + doc.view.height_px(),
                 };
                 match fling::decide(phase, id, y, shell.panning, covered, panes) {
                     TouchAction::Ignore => false,
-                    TouchAction::Begin { pane, y } => {
-                        shell.document.focus_pane(pane);
+                    TouchAction::Begin { pane: _, y } => {
+                        shell.document.focus_pane(hit);
                         // A finger on a moving view stops it — whichever kind of motion it is.
                         shell.cancel_fling(hwnd);
                         shell.cancel_wheel(hwnd);
@@ -8547,11 +8673,15 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 // A split: a press focuses the pane under it, and every coordinate from here on is
                 // relative to the focused pane's top — a drag stays with the pane it started in.
                 if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
-                    if let Some((pane, _)) = shell.pane_at(y) {
+                    if let Some((pane, _, _)) = shell.pane_at(x, y) {
                         shell.document.focus_pane(pane);
                     }
                 }
-                let y = y - shell.document.as_ref().map_or(0.0, |d| d.pane_top);
+                let (px, py) = shell
+                    .document
+                    .as_ref()
+                    .map_or((0.0, 0.0), |d| (d.pane_left, d.pane_top));
+                let (x, y) = (x - px, y - py);
                 // No document: the welcome surface — a click on a recent file opens it.
                 if shell.document.panes().is_empty() {
                     if msg == WM_LBUTTONDOWN {
@@ -8725,10 +8855,15 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
             LRESULT(0)
         }
-        // §1069's drag-out-to-split: the pointer has left the strip and is over the grid, so the
-        // pane under it offers to divide. Only a zone the pane model can actually perform is kept
-        // — `dropzone` knows which those are, and a guide for one it cannot do would be a promise
-        // the drop could not keep.
+        // §8.1's drag-out-to-split: the pointer has left the strip and is over the grid, so the
+        // pane under it offers to divide. All four edges are kept now that the model divides in
+        // both directions; only `Centre` is dropped, because it is not a split.
+        //
+        // **The guide is still a promise this can fail to keep**, and knowingly so: the drop is
+        // refused when the target pane is already split, and nothing here knows that yet. That was
+        // true of the two vertical edges before and is now true of four. Filtering it properly
+        // means asking the target whether it has room — worth doing, and not part of making the
+        // other two directions work.
         tabstrip::WM_TAB_DRAG_OUT => {
             let (x, y) = (
                 (lparam.0 & 0xFFFF) as i16 as f32,
@@ -8742,7 +8877,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let want = shell
                     .grid_rect()
                     .and_then(|pane| tailhawk_core::dropzone::at(pane, x, y))
-                    .filter(|(zone, _)| zone.available() && zone.splits());
+                    .filter(|(zone, _)| zone.splits());
                 let changed = shell.drag_guide.map(|(z, _)| z) != want.map(|(z, _)| z);
                 shell.drag_guide = want;
                 changed
@@ -8778,7 +8913,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some((zone, _)) = shell.drag_guide.take() else {
                     return false;
                 };
-                zone.splits() && shell.split_from_tab(wparam.0, zone)
+                let (from, onto) = tabstrip::drag_indices(wparam);
+                zone.splits() && shell.document.split_from(from, onto, zone)
             });
             if split {
                 STATE.with(|s| {
@@ -11755,8 +11891,8 @@ mod tests {
                         w,
                         h,
                         &[
-                            (&doc.view, &doc as &dyn RowSource, 0.0),
-                            (&lower.view, &lower as &dyn RowSource, (h / 2) as f32),
+                            (&doc.view, &doc as &dyn RowSource, 0.0, 0.0),
+                            (&lower.view, &lower as &dyn RowSource, 0.0, (h / 2) as f32),
                         ],
                     )
                     .expect("snapshot")
@@ -11825,7 +11961,7 @@ mod tests {
         let _ = std::fs::remove_file(&b);
     }
     /// The split: a second pane joins the shown tab and takes focus; the keyboard's document is the
-    /// focused pane; the panes stack by `pane_tops`; closing the focused pane keeps the tab; a tab
+    /// focused pane; the panes are placed by `pane_boxes`; closing the focused pane keeps the tab; a tab
     /// is one label whichever pane grew.
     #[test]
     fn a_split_tab_holds_two_panes_and_the_focused_one_is_the_document() {
@@ -11855,9 +11991,171 @@ mod tests {
         assert_eq!(tabs.focused_pane(), 0);
         assert!(!tabs.close_active(), "and now it is gone");
 
-        assert_eq!(pane_tops(500.0, 1), [(0.0, 500.0)]);
-        assert_eq!(pane_tops(501.0, 2), [(0.0, 250.0), (250.0, 251.0)]);
         let _ = std::fs::remove_file(&a);
+    }
+
+    /// **A click is routed by the direction the panes actually divide in.** Side by side, the
+    /// pointer's `y` says nothing about which pane it is over, and stacked, its `x` says nothing —
+    /// so comparing the wrong axis sends every click in the second pane to the first, which is a
+    /// split that looks right and does not work.
+    #[test]
+    fn a_click_finds_its_pane_along_the_axis_the_panes_divide() {
+        use PaneLayout::{SideBySide, Stacked};
+        let stacked = [(0.0, 0.0), (0.0, 250.0)];
+        assert_eq!(pane_hit(&stacked, Stacked, 700.0, 10.0), 0, "top pane");
+        assert_eq!(pane_hit(&stacked, Stacked, 10.0, 400.0), 1, "bottom pane");
+        assert_eq!(
+            pane_hit(&stacked, Stacked, 799.0, 249.0),
+            0,
+            "x is irrelevant when they stack"
+        );
+
+        let side = [(0.0, 0.0), (400.0, 0.0)];
+        assert_eq!(pane_hit(&side, SideBySide, 10.0, 400.0), 0, "left pane");
+        assert_eq!(pane_hit(&side, SideBySide, 700.0, 10.0), 1, "right pane");
+        assert_eq!(
+            pane_hit(&side, SideBySide, 399.0, 499.0),
+            0,
+            "y is irrelevant when they sit beside each other"
+        );
+
+        // A point above or left of every origin — the chrome band — still belongs to a pane, or a
+        // click on the header would route nowhere.
+        assert_eq!(pane_hit(&stacked, Stacked, 5.0, -10.0), 0);
+        assert_eq!(pane_hit(&side, SideBySide, -10.0, 5.0), 0);
+        assert_eq!(pane_hit(&[(0.0, 0.0)], Stacked, 5.0, 5.0), 0, "one pane");
+    }
+
+    /// **The edge you drop on is the direction the panes divide in**, and the pane you dropped
+    /// beside keeps its side. A drop on the left puts the dragged document on the left.
+    #[test]
+    fn the_edge_dropped_on_decides_the_layout_and_the_order() {
+        use tailhawk_core::dropzone::Zone;
+        let cases = [
+            (Zone::Above, PaneLayout::Stacked, 0),
+            (Zone::Below, PaneLayout::Stacked, 1),
+            (Zone::Left, PaneLayout::SideBySide, 0),
+            (Zone::Right, PaneLayout::SideBySide, 1),
+        ];
+        let target = scratch_log("tailhawk_split_target.log", 4);
+        let moved = scratch_log("tailhawk_split_moved.log", 4);
+        for (zone, want_layout, want_focus) in cases {
+            let mut tabs = Tabs::default();
+            tabs.push(Document::open(&target).expect("target"));
+            tabs.push(Document::open(&moved).expect("moved"));
+            // **`active` is the dragged tab, exactly as the shell has it**: the control selects on
+            // button-down before the drop message is handled. A test that set `active = 0` here
+            // would be testing a state production can never be in.
+            tabs.active = 1;
+            assert!(tabs.split_from(1, 0, zone), "{zone:?} should split");
+            assert_eq!(tabs.len(), 1, "{zone:?}: the dragged tab is consumed");
+            let tab = &tabs.tabs[0];
+            assert_eq!(tab.layout, want_layout, "{zone:?} layout");
+            assert_eq!(tab.panes.len(), 2, "{zone:?} pane count");
+            assert!(
+                tab.panes[want_focus].summary.contains("moved"),
+                "{zone:?}: the dragged document takes the side it was dropped on, but pane \
+                 {want_focus} is {:?}",
+                tab.panes[want_focus].summary
+            );
+            assert_eq!(tab.focused, want_focus, "{zone:?} focus follows the drop");
+        }
+        // `Centre` is not a split and never reaches here; the shell filters it on `Zone::splits`.
+        let mut tabs = Tabs::default();
+        tabs.push(Document::open(&target).expect("target"));
+        tabs.push(Document::open(&moved).expect("moved"));
+        let self_drop = tabs.active;
+        assert!(
+            !tabs.split_from(self_drop, self_drop, Zone::Left),
+            "a tab dropped onto its own pane is refused, not duplicated"
+        );
+        assert_eq!(tabs.len(), 2, "and nothing was consumed by the refusal");
+
+        // **A refused drop must not cost you a file.** The earlier shape removed the tab and popped
+        // its document before discovering the target was already split, then put the tab back one
+        // pane short — silently closing the second document. Every refusal is now decided before
+        // anything is taken apart.
+        let mut full = Tabs::default();
+        full.push(Document::open(&target).expect("target"));
+        assert!(full.split(Document::open(&target).expect("target again")));
+        full.push(Document::open(&moved).expect("moved"));
+        assert!(full.split(Document::open(&moved).expect("moved again")));
+        assert_eq!(full.len(), 2, "two tabs, each with two panes");
+        let dragged = full.active;
+        assert!(
+            !full.split_from(dragged, 0, Zone::Below),
+            "a full target refuses the drop"
+        );
+        assert_eq!(full.len(), 2, "both tabs survive");
+        assert_eq!(full.tabs[0].panes.len(), 2, "the target is untouched");
+        assert_eq!(
+            full.tabs[1].panes.len(),
+            2,
+            "and the refused tab keeps both its documents"
+        );
+
+        // **`Ctrl+\` stacks, whatever the tab was last split into.** `layout` survives an unsplit,
+        // so without this the keystroke would silently reproduce a direction it cannot express.
+        let mut keyed = Tabs::default();
+        keyed.push(Document::open(&target).expect("target"));
+        keyed.push(Document::open(&moved).expect("moved"));
+        keyed.active = 0;
+        assert!(keyed.split_from(1, 0, Zone::Right));
+        assert_eq!(keyed.tabs[0].layout, PaneLayout::SideBySide);
+        assert!(keyed.close_active(), "unsplit back to one pane");
+        assert_eq!(keyed.panes().len(), 1);
+        assert!(keyed.split(Document::open(&moved).expect("again")));
+        assert_eq!(
+            keyed.tabs[0].layout,
+            PaneLayout::Stacked,
+            "the keyboard split does not inherit the drag's direction"
+        );
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&moved);
+    }
+
+    /// **Panes tile their client exactly, in either direction.** A seam loses a column or row of
+    /// pixels and an overlap draws one twice, and an odd client is where both show up — so the last
+    /// pane takes the remainder rather than every pane taking an equal rounded share.
+    #[test]
+    fn panes_tile_the_client_exactly_whichever_way_they_divide_it() {
+        use PaneLayout::{SideBySide, Stacked};
+        assert_eq!(
+            pane_boxes(800.0, 500.0, 1, Stacked),
+            [(0.0, 0.0, 800.0, 500.0)],
+            "one pane is the whole client"
+        );
+        assert_eq!(
+            pane_boxes(800.0, 500.0, 1, SideBySide),
+            [(0.0, 0.0, 800.0, 500.0)],
+            "and the layout cannot matter when there is nothing to divide"
+        );
+        assert_eq!(
+            pane_boxes(800.0, 501.0, 2, Stacked),
+            [(0.0, 0.0, 800.0, 250.0), (0.0, 250.0, 800.0, 251.0)],
+            "the odd pixel goes to the lower pane"
+        );
+        assert_eq!(
+            pane_boxes(801.0, 500.0, 2, SideBySide),
+            [(0.0, 0.0, 400.0, 500.0), (400.0, 0.0, 401.0, 500.0)],
+            "and to the right-hand one"
+        );
+        for layout in [Stacked, SideBySide] {
+            for n in 1..=3 {
+                let boxes = pane_boxes(801.0, 501.0, n, layout);
+                let (last_x, last_y, last_w, last_h) = boxes[n - 1];
+                assert_eq!(last_x + last_w, 801.0, "{layout:?} {n} right edge");
+                assert_eq!(last_y + last_h, 501.0, "{layout:?} {n} bottom edge");
+                for pair in boxes.windows(2) {
+                    let (ax, ay, aw, ah) = pair[0];
+                    let (bx, by, ..) = pair[1];
+                    match layout {
+                        Stacked => assert_eq!(ay + ah, by, "{layout:?} seam"),
+                        SideBySide => assert_eq!(ax + aw, bx, "{layout:?} seam"),
+                    }
+                }
+            }
+        }
     }
 
     /// §8.1's watched folder: a directory plus a glob; what matches now is opened, what appears

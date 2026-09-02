@@ -610,7 +610,7 @@ impl Renderer {
         view: &view::View,
         source: &dyn rows::RowSource,
     ) -> Result<gpu::offscreen::Pixels> {
-        self.snapshot_panes(width, height, &[(view, source, 0.0)])
+        self.snapshot_panes(width, height, &[(view, source, 0.0, 0.0)])
     }
 
     /// [`Renderer::snapshot`] for a split: several panes at their offsets.
@@ -619,7 +619,7 @@ impl Renderer {
         &mut self,
         width: u32,
         height: u32,
-        panes: &[(&view::View, &dyn rows::RowSource, f32)],
+        panes: &[(&view::View, &dyn rows::RowSource, f32, f32)],
     ) -> Result<gpu::offscreen::Pixels> {
         self.gpu.attach_offscreen(width, height)?;
         for _ in 0..2 {
@@ -635,7 +635,7 @@ impl Renderer {
         source: &dyn rows::RowSource,
     ) -> Result<paint::Laid> {
         self.paint_panes(
-            &[(view, source, 0.0)],
+            &[(view, source, 0.0, 0.0)],
             (
                 view.gutter_px() + view.hgrid().viewport_px(),
                 view.height_px(),
@@ -657,7 +657,7 @@ impl Renderer {
     /// chrome rather than inside one of them.
     pub fn paint_panes(
         &mut self,
-        panes: &[(&view::View, &dyn rows::RowSource, f32)],
+        panes: &[(&view::View, &dyn rows::RowSource, f32, f32)],
         client: (f32, f32),
         overlay: &[(dropzone::Rect, [f32; 4])],
     ) -> Result<paint::Laid> {
@@ -692,10 +692,10 @@ impl Renderer {
 
             p.begin_frame();
             laid = paint::Laid::default();
-            for (view, source, y) in panes {
+            for (view, source, x, y) in panes {
                 let from = p.mark();
                 laid.merge(p.lay_out(view, t.ink, *source)?);
-                p.shift(from, 0.0, *y);
+                p.shift(from, *x, *y);
             }
             // Last, and therefore over everything: the guide is an answer to "where will this go",
             // so it has to be visible on top of the pane it is answering about.

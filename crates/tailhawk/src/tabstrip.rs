@@ -110,6 +110,30 @@ thread_local! {
     /// Whether that drag has left the strip. Remembered because the button-up that ends it carries
     /// no history, and a release below the strip means something quite different from one inside it.
     static DRAGGED_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// **Which tab was showing when the button went down** — read from the control *before* it is
+    /// allowed to act on the press.
+    ///
+    /// This is the whole reason drag-out-to-split never split anything. `SysTabControl32` selects
+    /// on button-**down** and raises `TCN_SELCHANGE` synchronously, so by the time the *posted*
+    /// `WM_TAB_DROP_OUT` is handled the shell's active tab is already the tab being dragged. The
+    /// shell's "you cannot drop a tab onto its own pane" guard then refused every drop, in all four
+    /// directions, with no error and no feedback — the guide simply vanished. Nothing downstream
+    /// can recover this: once the selection has moved, the tab that was showing is gone. So it is
+    /// captured here, at the only moment it still exists.
+    static SHOWING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Packs the dragged tab and the tab being dropped onto into one `WPARAM`.
+///
+/// Two small indices rather than a second message: a drag has exactly one origin and one
+/// destination, and splitting them across messages would let the pair arrive half-updated.
+fn drag_pair(from: usize, onto: usize) -> WPARAM {
+    WPARAM((from & 0xFFFF) | ((onto & 0xFFFF) << 16))
+}
+
+/// Unpacks what [`drag_pair`] wrote: `(the tab being dragged, the tab it is being dropped onto)`.
+pub fn drag_indices(wparam: WPARAM) -> (usize, usize) {
+    (wparam.0 & 0xFFFF, (wparam.0 >> 16) & 0xFFFF)
 }
 
 /// How far below the strip the pointer must go before a drag counts as having left it.
@@ -182,6 +206,10 @@ unsafe extern "system" fn drag_proc(
         WM_LBUTTONDOWN => {
             DRAGGING.with(|d| d.set(tab_at(hwnd, x, y)));
             DRAGGED_OUT.with(|d| d.set(false));
+            // **Before `DefSubclassProc`, which is where the selection moves.** Read after it, this
+            // would be the tab just pressed and the drop would always be onto itself.
+            let showing = unsafe { SendMessageW(hwnd, TCM_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
+            SHOWING.with(|d| d.set(usize::try_from(showing).ok()));
             // **Capture, or a drag can never leave the strip.** This module assumed the control
             // took the mouse itself and it does not: reorder worked because those moves are inside
             // the control anyway, while §1069's drag-*out* saw nothing at all, because a move over
@@ -201,7 +229,8 @@ unsafe extern "system" fn drag_proc(
             // wandered, and is left to the reorder path.
             if i32::from(y) > strip_height(hwnd) + OUT_SLACK {
                 DRAGGED_OUT.with(|d| d.set(true));
-                tell_parent(hwnd, WM_TAB_DRAG_OUT, WPARAM(from), lparam);
+                let onto = SHOWING.with(|d| d.get()).unwrap_or(from);
+                tell_parent(hwnd, WM_TAB_DRAG_OUT, drag_pair(from, onto), lparam);
             } else {
                 if DRAGGED_OUT.with(|d| d.replace(false)) {
                     // Came back onto the strip: the guide must go, or it hangs about promising a
@@ -228,7 +257,8 @@ unsafe extern "system" fn drag_proc(
                 } else {
                     WM_TAB_DRAG_OFF
                 };
-                tell_parent(hwnd, what, WPARAM(from), lparam);
+                let onto = SHOWING.with(|d| d.replace(None)).unwrap_or(from);
+                tell_parent(hwnd, what, drag_pair(from, onto), lparam);
             }
         }
         // §2.1's middle-click close. It has to be handled here: the click lands on this control,

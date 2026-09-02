@@ -869,15 +869,28 @@ impl Painter {
     }
 
     /// Draws the frame. The render target and viewport must already be set.
-    /// How many instances the frame holds so far — the start of a pane, for [`Painter::shift`].
-    pub fn mark(&self) -> usize {
-        self.instances.len()
+    /// Where both instance buffers stand — the start of a pane, for [`Painter::shift`].
+    ///
+    /// **Both, because the glyphs a pane draws land in two places.** Grid text and every filled
+    /// quad go to `instances`; anything drawn through `chrome_run` — the status text, the filter
+    /// panel's title, its chip labels and its buttons — goes to `chrome_instances`, which is a
+    /// separate pass so that chrome draws over the grid rather than under it. A mark that counted
+    /// only the first left a pane's chrome text unmoved: side by side, the right pane's panel
+    /// labels drew on top of the left pane's, and stacked, the lower pane's status text floated
+    /// over the rows of the upper one while its grey bar drew correctly at the window's foot.
+    pub fn mark(&self) -> (usize, usize) {
+        (self.instances.len(), self.chrome_instances.len())
     }
 
-    /// Moves every instance laid out since `from` by `(dx, dy)`: a pane drawn at an offset.
-    pub fn shift(&mut self, from: usize, dx: f32, dy: f32) {
-        let from = from.min(self.instances.len());
-        for instance in &mut self.instances[from..] {
+    /// Moves everything laid out since `from` by `(dx, dy)`: a pane drawn at an offset.
+    pub fn shift(&mut self, from: (usize, usize), dx: f32, dy: f32) {
+        let grid = from.0.min(self.instances.len());
+        for instance in &mut self.instances[grid..] {
+            instance.pos[0] += dx;
+            instance.pos[1] += dy;
+        }
+        let chrome = from.1.min(self.chrome_instances.len());
+        for instance in &mut self.chrome_instances[chrome..] {
             instance.pos[0] += dx;
             instance.pos[1] += dy;
         }

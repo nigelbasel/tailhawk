@@ -1067,6 +1067,12 @@ Two view modes, both shipped — klogg ships only the first and has an open requ
 Flat tab strip with drag-to-reorder and drag-out-to-split. **No MDI child-window chrome.** Split panes
 tile horizontally or vertically with independent or synchronised scroll.
 
+**Both directions built 2026-09-02.** The edge a tab is dropped on is the direction: top or bottom
+stacks the panes and divides the height, left or right sets them beside each other and divides the
+width. **Two panes is the limit**, and a drop onto an already-split pane is refused rather than
+guessed at — the model says how two panes share a space and does not say how three would. Scrolling
+is independent; synchronised scroll is not built.
+
 **File sets** — a named batch of files opened in one click, and from the command line. This is a
 feature the owner uses daily and it is v1.
 

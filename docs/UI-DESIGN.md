@@ -200,6 +200,12 @@ filter action.
 unfocused. Middle-click closes; drag reorders; drag out of the strip creates a split pane; drag onto
 another window merges. `+` opens a file, a file set, or a watched folder.
 
+**The drop guide answers "where will this go", and since 2026-09-02 it can answer in all four
+directions.** Dragging a tab over the grid highlights the half the document would take: the top or
+bottom half stacks the panes, the left or right half sets them side by side, and the middle is no
+split at all — it just shows that tab. Two panes is the limit, so a drop onto a pane that is already
+split is declined.
+
 **Menu bar and toolbar.** Two rows under the tab strip — see §2.2 and §2.3. Together they are the
 **primary** interface per §1.1: every feature is reachable by mouse from one of them, and the palette
 is an accelerator over the top rather than the only door.
