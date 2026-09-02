@@ -91,6 +91,41 @@ pub fn store(name: &str, secret: &str) -> bool {
     unsafe { CredWriteW(&credential, 0) }.is_ok()
 }
 
+/// Turns a credential blob into the text it holds, whichever encoding put it there.
+///
+/// **This exists because the store is deliberately user-visible, and that cuts both ways.** The
+/// argument for Credential Manager over a DPAPI file is that the owner of the secret can see, audit
+/// and revoke it in Control Panel — so they can also *create* it there, and Control Panel and
+/// `cmdkey` write the blob as UTF-16LE where this application writes UTF-8.
+///
+/// **Reading UTF-16 as UTF-8 does not fail; it succeeds and returns rubbish.** ASCII encoded as
+/// UTF-16LE is a run of `byte, 0x00` pairs, and every one of those is valid UTF-8 — so
+/// `utf16-secret-123` came back as `"u\0t\0f\01\06\0-\0…"`, a `String` the caller would have sent
+/// as the client secret. The server answers 401 and the reader goes to look at the server. That is
+/// the failure this function exists to make impossible, and it is why the rule is *interior NUL*
+/// rather than *invalid UTF-8*: the bytes are perfectly valid, they are simply not the text.
+///
+/// A secret is text and text has no interior NUL, so a NUL is the signal. Nothing guesses at
+/// encodings beyond these two, because these two are what can actually reach the store.
+pub fn decode_blob(bytes: &[u8]) -> Option<String> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.contains('\0') {
+            return Some(text.to_owned());
+        }
+    }
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let wide: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let text = String::from_utf16(&wide).ok()?;
+    // A trailing NUL is how a C string got here; anything else interior means this is not text.
+    let text = text.trim_end_matches('\0');
+    (!text.contains('\0')).then(|| text.to_owned())
+}
+
 /// Reads the secret stored against `name`, or `None` if there is none.
 ///
 /// **The buffer belongs to the store and is freed before returning**, so the secret exists in this
@@ -118,7 +153,7 @@ pub fn load(name: &str) -> Option<String> {
             credential.CredentialBlob,
             credential.CredentialBlobSize as usize,
         );
-        String::from_utf8(bytes.to_vec()).ok()
+        decode_blob(bytes)
     };
     unsafe { CredFree(out as *const core::ffi::c_void) };
     secret
@@ -216,6 +251,87 @@ mod tests {
             forget(name),
             "forgetting what is not there is not a failure"
         );
+    }
+
+    /// **The decode, with no store in it.** The store round-trip below needs Credential Manager;
+    /// this needs nothing, so the case that actually bit — UTF-16 read as UTF-8 *succeeding* and
+    /// returning rubbish — is pinned where it can never depend on a machine having `cmdkey`.
+    #[test]
+    fn a_utf16_blob_is_not_read_as_utf8_that_happens_to_parse() {
+        assert_eq!(
+            decode_blob(b"plain-secret").as_deref(),
+            Some("plain-secret")
+        );
+        assert_eq!(decode_blob(b"").as_deref(), Some(""), "an empty secret");
+
+        // What Control Panel writes: ASCII as UTF-16LE. Every byte pair is valid UTF-8, which is
+        // exactly why reading it as UTF-8 succeeded and returned nonsense.
+        let utf16: Vec<u8> = "utf16-secret"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert!(
+            std::str::from_utf8(&utf16).is_ok(),
+            "the trap: these bytes ARE valid UTF-8, so validity cannot be the test"
+        );
+        assert_eq!(decode_blob(&utf16).as_deref(), Some("utf16-secret"));
+
+        // The same, NUL-terminated as a C string reaches the store.
+        let mut terminated = utf16.clone();
+        terminated.extend_from_slice(&[0, 0]);
+        assert_eq!(decode_blob(&terminated).as_deref(), Some("utf16-secret"));
+
+        // Non-ASCII survives both ways round.
+        assert_eq!(
+            decode_blob("naïve-π".as_bytes()).as_deref(),
+            Some("naïve-π")
+        );
+        let wide: Vec<u8> = "naïve-π"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(decode_blob(&wide).as_deref(), Some("naïve-π"));
+
+        // Not text at all: refused rather than handed back as a secret.
+        assert_eq!(
+            decode_blob(&[0xFF, 0xFE, 0x01]),
+            None,
+            "odd length, not UTF-8"
+        );
+        assert_eq!(decode_blob(&[0x00, 0x01, 0x02]), None, "an interior NUL");
+    }
+
+    /// **A credential the user created themselves must be readable.** The whole argument for
+    /// Credential Manager over a DPAPI blob is that the owner of the secret can see it, audit it and
+    /// revoke it in Control Panel — and anything they can edit there, they can also *create* there.
+    /// Control Panel and `cmdkey` write the blob as UTF-16LE; this application writes UTF-8. A
+    /// reader that understood only its own encoding would reject the credential the user had just
+    /// typed in, and say nothing more useful than "no secret".
+    #[test]
+    fn a_credential_written_the_way_control_panel_writes_one_is_readable() {
+        let name = "tailhawk-utf16-selftest";
+        let target = target_for(name).expect("a name");
+        let _ = forget(name);
+
+        // `cmdkey` is Control Panel's own path into the store, and writes UTF-16LE like it does.
+        let wrote = std::process::Command::new("cmdkey")
+            .arg(format!("/generic:{target}"))
+            .arg("/user:tailhawk")
+            .arg("/pass:utf16-secret-123")
+            .output();
+        let Ok(output) = wrote else {
+            return; // No `cmdkey` on this machine: nothing to assert against.
+        };
+        if !output.status.success() {
+            return;
+        }
+
+        assert_eq!(
+            load(name).as_deref(),
+            Some("utf16-secret-123"),
+            "a credential the user created in Control Panel must read back"
+        );
+        assert!(forget(name));
     }
 
     /// A name the store will not take is refused by every entry point, rather than half of them.
