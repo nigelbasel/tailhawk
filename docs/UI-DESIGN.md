@@ -55,7 +55,23 @@ contact. Everything else follows from seven principles:
 | Toolbar of ambiguous 16×16 icons | **A menu bar and a toolbar**, primary. (A command palette was tried as an extra and removed — §9.) |
 | Modal config dialogs per feature | Inline editors with live preview over real data |
 | Settings spread across 6 tabbed property sheets | One searchable settings surface |
-| Fixed-function status bar | Status bar as a row of **live, clickable chips** |
+| Fixed-function status bar | Status bar as a row of **live, clickable chips** — **as parts of `msctls_statusbar32`**, see below |
+
+**On the status bar — a decision narrowed, 2026-09-03.** "Rejecting a fixed-function status bar" was
+read as rejecting *the control*, and what it produced was a drawn band with its own text stack. That
+band was **losing glyphs** — `hardware` rendered as `har ware`, `following` as `fo owing`,
+`tailhawk-spill` as `tai hawk-spi`, every missing character an `l` or a `d` — while the same letters
+drew correctly in the grid a few pixels above it. It also sat *above* the horizontal scroll bar,
+which no Windows application does. The owner reported both before any test did.
+
+**The bar is `msctls_statusbar32`.** What the table was reaching for was *live and clickable* rather
+than a row of dead text, and a real status bar carries **parts** and hit-tests them — so the chips
+survive as parts of a control instead of as drawing. The parts are not built yet; the bar carries
+one composed sentence today. Nothing here is drawn, so nothing here can lose a letter, and the bar
+docks itself along the bottom, which is what puts the scroll bar back above it.
+
+This is the general rule restated: **prefer the real control, and where a surface genuinely cannot
+be one, draw it only through `controls.rs`.**
 
 **On menus and toolbars — a decision reversed, 2026-08-19.** An earlier draft of this table rejected
 both, and made the command palette the only route to a command with no dedicated control. That was

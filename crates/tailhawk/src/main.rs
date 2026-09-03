@@ -32,6 +32,7 @@ mod net;
 mod prefs;
 mod pull;
 mod secrets;
+mod statusbar;
 mod tabstrip;
 mod toolbar;
 mod version;
@@ -4016,6 +4017,9 @@ struct Shell {
     /// §2.3's toolbar. `None` only if the control could not be created, in which case the row is
     /// simply absent rather than the window failing to open.
     toolbar: Option<toolbar::Toolbar>,
+    /// §1.1's status bar, as the real control. `None` only if it could not be created, in which
+    /// case the window has no status bar rather than failing to open.
+    statusbar: Option<statusbar::StatusBar>,
     /// Whether §2.3's row is shown. Remembered per §12.4; the default is shown.
     show_toolbar: bool,
     /// The measured cell size, for the command bar's hit-test. Zero until the first frame.
@@ -4592,7 +4596,25 @@ impl Shell {
                     self.document.maximised(),
                 );
                 let side = layout == PaneLayout::SideBySide && visible.len() > 1;
-                let boxes = pane_boxes(w as f32, h as f32, visible.len(), layout);
+                // §1.1's status bar is `msctls_statusbar32` and docks itself along the bottom, so
+                // the client area the panes are laid out in stops above it. **The band is asked of
+                // the control**: its height follows the shell font and the DPI, and a number
+                // guessed here would put the grid's own scroll bar under the bar or leave a strip
+                // of nothing over it.
+                let status_px = match self.statusbar.as_mut() {
+                    Some(bar) => {
+                        bar.resize();
+                        bar.set(&status);
+                        bar.band_height() as f32
+                    }
+                    None => 0.0,
+                };
+                let boxes = pane_boxes(
+                    w as f32,
+                    (h as f32 - status_px).max(1.0),
+                    visible.len(),
+                    layout,
+                );
                 // The real control's band, asked of it once per frame and handed to the pane that
                 // carries the strip. Placed here too, because this is where the width is known.
                 let guide = self.drag_guide.map(|(_, r)| r);
@@ -4656,16 +4678,14 @@ impl Shell {
                         (Vec::new(), 0)
                     };
                     doc.chrome_h = chrome_h;
-                    doc.show_footer = side || last;
-                    // **The status text belongs to whichever pane owns the window's bottom-left
-                    // corner**, because that is where a status bar's text starts. Stacked, that is
-                    // the last pane; side by side, every pane draws the bar but only the leftmost
-                    // has anything to say, so the text is not repeated across the seam.
-                    doc.status = if if side { i == 0 } else { last } {
-                        status.clone()
-                    } else {
-                        String::new()
-                    };
+                    // **No pane draws a footer any more.** The status bar is a child window
+                    // spanning the whole client area, below every pane, so the band a pane used to
+                    // reserve for it — and the text it used to draw into that band — belong to the
+                    // control now. The pane-owns-the-corner rule that lived here went with them:
+                    // there is one bar and it is nobody's pane.
+                    doc.show_footer = false;
+                    doc.status = String::new();
+                    let _ = (side, last);
                     doc.pane_top = top;
                     doc.pane_left = x;
                     doc.lay_out(cell, (width as u32, height as u32));
@@ -9773,6 +9793,7 @@ fn main() -> Result<()> {
         *s.borrow_mut() = Some(Shell {
             tabs: None,
             toolbar: None,
+            statusbar: None,
             show_toolbar: settings.toolbar.unwrap_or(true),
             drag_guide: None,
             cell_w: 0.0,
@@ -9868,10 +9889,12 @@ fn main() -> Result<()> {
     }
     let strip = tabstrip::TabStrip::create(hwnd, instance);
     let bar = toolbar::Toolbar::create(hwnd, instance);
+    let status = statusbar::StatusBar::new(hwnd, instance);
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.tabs = strip;
             shell.toolbar = bar;
+            shell.statusbar = status;
         }
     });
 
