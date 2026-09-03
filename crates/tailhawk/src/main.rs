@@ -7327,11 +7327,28 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
         return;
     }
     let path = spill.path().to_path_buf();
-    // §6: what was dropped is said, not silently lost.
+    // §6: what is missing is said, not silently lost — and there are **two** ways to be missing
+    // records, which the first real run against live made obvious.
+    //
+    // `dropped` is Tailhawk's own cap: the response held more than the parser keeps. The other way
+    // is Loki's, and it leaves no trace at all — a window with more records than `limit` comes back
+    // holding exactly `limit`, indistinguishable from a window that happened to hold that many. The
+    // first live query returned exactly 1,000 of 1,000 and said nothing, which is precisely the
+    // "fewer lines, no error" failure this project keeps calling the worst kind.
     if pulled.dropped > 0 {
         set_notice(format!(
             "{name}: {} records; {} more were returned than Tailhawk keeps",
             pulled.records, pulled.dropped
+        ));
+    } else if pulled.records as u32 >= REMOTE_LIMIT {
+        set_notice(format!(
+            "{name}: the newest {} in the last hour — there are probably more",
+            pulled.records
+        ));
+    } else {
+        set_notice(format!(
+            "{name}: {} records in the last hour",
+            pulled.records
         ));
     }
     STATE.with(|s| {
