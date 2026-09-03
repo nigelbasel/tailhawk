@@ -1,5 +1,23 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-09-03, session 31: Tailhawk tails Loki
+
+`Open remote source` was a **fetch, not a tail** — one `query_range` for the last hour, into a
+spill, opened as a document. The window said "● following" and was telling the truth about the
+file; nothing ever wrote to that file again. `tail.rs` is the loop that fixes it, and it is
+confirmed against live: **1,000 → 30,484 lines in a minute**, no duplication, and the last poll
+returning nothing because it had caught up.
+
+**Knowingly left undone:**
+
+| | |
+|---|---|
+| **A record that reaches Loki late is missed** | The mark advances to the newest record *returned*. A record whose timestamp falls before that but which Loki indexes afterwards is never asked for again. Real tailers either query to `now − lag` or re-ask an overlapping window; neither is built. Measured lag on the estate is ~30 s between a record's timestamp and its being queryable, so the exposure is real. |
+| **The spill grows without bound** | Live produces faster than 2,000 records per 5 s. A window left open all day is gigabytes. There is no roll, no cap and no eviction. |
+| **`§5`'s `lagging 2s` is not shown** | `UI-DESIGN.md` §597 specifies the lag in the status bar. The tail knows it — newest record versus now — and does not say it. |
+| **Closing the tab does not stop the tail** | Tails live for the window's life, alongside the spills, which is the existing behaviour for spills rather than a new decision. |
+| **Frame budget** | p95 **291 ms**, worst 373 ms while tailing, against §11's 16 ms. This is now the worst thing about using the app and it gets worse as the spill grows. Not investigated. |
+
 ## ▶ Resume point — 2026-09-03, session 31: a JSON file's keys are its columns
 
 Loki's stream labels reach the grid. `app` and `environment` were already in every spilled line —

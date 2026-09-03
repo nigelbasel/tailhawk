@@ -105,13 +105,24 @@ pub struct Pulled {
     pub records: usize,
     /// Records the response held beyond the cap and this did not keep. **Never silently zero.**
     pub dropped: usize,
+    /// The newest timestamp in what came back, if anything did — where a tail resumes from.
+    ///
+    /// **From the records, not from the window that was asked for.** Advancing on the window would
+    /// skip whatever Loki had not yet indexed when the query ran: records that exist, are late, and
+    /// would never be asked for again.
+    pub newest: Option<tailhawk_core::loki::Nanos>,
 }
 
 /// Fetch a window of records from `source`.
 ///
 /// The secret is read immediately before the exchange and dropped immediately after — it is never
 /// held across the query, which carries the shorter-lived bearer token instead.
-pub fn pull(source: &Source, window: Window, limit: u32) -> Result<Pulled, PullFault> {
+pub fn pull(
+    source: &Source,
+    window: Window,
+    limit: u32,
+    direction: Direction,
+) -> Result<Pulled, PullFault> {
     let origin = Origin::parse(&source.url, Provenance::Imported).map_err(PullFault::Origin)?;
     refuse_insecure(&origin)?;
     refuse_literal_address(&origin).map_err(PullFault::Address)?;
@@ -122,7 +133,7 @@ pub fn pull(source: &Source, window: Window, limit: u32) -> Result<Pulled, PullF
         Some(fetch_token(source)?)
     };
 
-    let request = loki::query_range(&origin, &source.query, window, limit, Direction::Backward);
+    let request = loki::query_range(&origin, &source.query, window, limit, direction);
     let auth = match token.as_deref() {
         Some(bearer) => Auth::Bearer(bearer),
         None => Auth::None,
@@ -141,6 +152,7 @@ pub fn pull(source: &Source, window: Window, limit: u32) -> Result<Pulled, PullF
         clef: lokiwire::clef_spill(&batch),
         records: batch.entries.len(),
         dropped: batch.dropped,
+        newest: batch.entries.iter().map(|entry| entry.timestamp).max(),
     })
 }
 
@@ -217,7 +229,12 @@ mod tests {
         };
         assert!(
             matches!(
-                pull(&loopback, Window { start: 0, end: 1 }, 10),
+                pull(
+                    &loopback,
+                    Window { start: 0, end: 1 },
+                    10,
+                    Direction::Backward
+                ),
                 Err(PullFault::Address(_))
             ),
             "a settings-borne URL is Imported, so loopback is refused — see the module note"
@@ -228,7 +245,12 @@ mod tests {
             ..source()
         };
         assert!(matches!(
-            pull(&bad_token_url, Window { start: 0, end: 1 }, 10),
+            pull(
+                &bad_token_url,
+                Window { start: 0, end: 1 },
+                10,
+                Direction::Backward
+            ),
             Err(PullFault::Insecure)
         ));
 
@@ -246,7 +268,13 @@ mod tests {
     fn a_source_with_no_stored_secret_says_so_rather_than_asking() {
         let _ = crate::secrets::forget("pull-selftest");
         assert_eq!(
-            pull(&source(), Window { start: 0, end: 1 }, 10).err(),
+            pull(
+                &source(),
+                Window { start: 0, end: 1 },
+                10,
+                Direction::Backward
+            )
+            .err(),
             Some(PullFault::NoSecret)
         );
         assert!(
@@ -274,7 +302,13 @@ mod tests {
             },
         ] {
             assert_eq!(
-                pull(&insecure, Window { start: 0, end: 1 }, 10).err(),
+                pull(
+                    &insecure,
+                    Window { start: 0, end: 1 },
+                    10,
+                    Direction::Backward
+                )
+                .err(),
                 Some(PullFault::Insecure),
                 "http must be refused however it got into the settings file"
             );

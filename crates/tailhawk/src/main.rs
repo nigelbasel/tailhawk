@@ -34,6 +34,7 @@ mod pull;
 mod secrets;
 mod statusbar;
 mod tabstrip;
+mod tail;
 mod toolbar;
 mod version;
 
@@ -4094,6 +4095,15 @@ struct Shell {
     /// Spill files this session made from remote sources. Held so §13.2's "deleted on clean exit"
     /// is true: dropping a `Spill` removes its file, and these live exactly as long as the window.
     spills: Vec<tailhawk_core::stdin::Spill>,
+    /// The running Loki tails, one per open remote source. Dropping one stops its thread.
+    ///
+    /// Held for the window's life alongside the spills they append to, and for the same reason:
+    /// 13.2 wants a spill gone on a clean exit, and a tail still writing to a deleted file is a
+    /// thread that outlives the thing it was for.
+    tails: Vec<tail::Tail>,
+    /// What the tail workers have to say. Drained on the follow tick — the status bar belongs to
+    /// this thread and a worker must not reach into it.
+    tail_notices: Vec<std::sync::mpsc::Receiver<String>>,
     /// `Go to line…` asks for its own small dialog. `Ctrl+G` had no surface of its own until the
     /// command palette went — it opened the palette and leaned on a digits-only query meaning a
     /// line — while `UI-DESIGN.md` §2.2 had listed `Go to line…` with an ellipsis all along.
@@ -7327,7 +7337,12 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
     };
     let name = source.name.clone();
 
-    let pulled = pull::pull(&source, window, REMOTE_LIMIT);
+    let pulled = pull::pull(
+        &source,
+        window,
+        REMOTE_LIMIT,
+        tailhawk_core::loki::Direction::Backward,
+    );
     let pulled = match pulled {
         Ok(pulled) => pulled,
         Err(why) => {
@@ -7371,9 +7386,22 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
             pulled.records
         ));
     }
+    // **And now it tails.** Everything above is one window of history; this is what makes the
+    // source live. The worker asks Loki for what is newer than the newest record just written and
+    // appends it to this same spill, so the follow machinery that was already saying "● following"
+    // finally has something to follow. `LOKI.md` §5, and `CLAUDE.md`'s standing instruction.
+    let (notices, from_tail) = std::sync::mpsc::channel();
+    let tail = tail::Tail::start(
+        source,
+        path.clone(),
+        pulled.newest.unwrap_or(window.end),
+        notices,
+    );
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.spills.push(spill);
+            shell.tails.push(tail);
+            shell.tail_notices.push(from_tail);
         }
     });
     STATE.with(|s| {
@@ -8512,6 +8540,17 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return false;
                 };
+                // What the tail workers have to say, on the thread that owns the status bar. Only
+                // the newest is kept: they are faults, and a reader wants the current one rather
+                // than a queue of them.
+                let said: Option<String> = shell
+                    .tail_notices
+                    .iter()
+                    .flat_map(|from| from.try_iter().collect::<Vec<_>>())
+                    .last();
+                if let Some(said) = said {
+                    shell.notice = Some(said);
+                }
                 let active = shell.document.active;
                 let mut shown_grew = false;
                 for (i, doc) in shell.document.all_mut() {
@@ -9827,6 +9866,8 @@ fn main() -> Result<()> {
             pending_sources: false,
             pending_pull: None,
             spills: Vec::new(),
+            tails: Vec::new(),
+            tail_notices: Vec::new(),
             find_dialog: HWND::default(),
             rules_dialog: HWND::default(),
             notice: None,

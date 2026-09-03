@@ -365,10 +365,27 @@ fn shadows_a_clef_field(key: &str) -> bool {
     LEVEL_LABELS.contains(&key) || matches!(key, "msg" | "message" | "@m" | "@mt" | "@t" | "@l")
 }
 
-/// A whole batch as CLEF NDJSON, one record per line, newline-terminated.
+/// A whole batch as CLEF NDJSON, one record per line, newline-terminated, **oldest first**.
+///
+/// **Loki orders within a stream and not across them**, which [`Batch::entries`] says plainly and
+/// this is the place that has to do something about it. A response holding four streams arrives as
+/// four ascending runs laid end to end, and spilled in that order the document showed timestamps
+/// walking backwards every few rows — `…:57.141`, `…:57.120`, `…:57.682` down consecutive lines of
+/// a real pull. For a log viewer that is not cosmetic: §8.3's ordering, a time filter and every
+/// "what happened next" reading of the grid all assume the rows run forwards.
+///
+/// It is also what makes a **tail** possible. Appending a later window to a spill is only correct
+/// if both are ordered and the new one starts after the old one ends, and the newest timestamp a
+/// window holds — the thing the next query starts from — is the last line when the batch is sorted
+/// and nothing in particular when it is not.
+///
+/// The sort is **stable**, so records sharing a timestamp keep the order the response gave them.
+/// Loki's own resolution makes ties ordinary rather than exotic.
 pub fn clef_spill(batch: &Batch) -> String {
+    let mut order: Vec<&Entry> = batch.entries.iter().collect();
+    order.sort_by_key(|entry| entry.timestamp);
     let mut out = String::new();
-    for entry in &batch.entries {
+    for entry in order {
         out.push_str(&clef_line(entry, &batch.interner));
         out.push('\n');
     }
@@ -1662,6 +1679,46 @@ mod tests {
         assert!(
             !line.contains('\n'),
             "a raw newline would split the record in two"
+        );
+    }
+
+    /// **Two streams interleave in time, and the spill has to put them back in order.** Loki
+    /// orders within a stream and not across them, so a response holding two streams is two
+    /// ascending runs laid end to end. Written in that order the grid showed timestamps walking
+    /// backwards every few rows, which a real pull made obvious and no test had ever asked about.
+    #[test]
+    fn records_from_two_streams_spill_oldest_first() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"app":"a"},"values":[["30","third"],["10","first"]]},
+                 {"stream":{"app":"b"},"values":[["40","fourth"],["20","second"]]}]}}"#,
+        );
+        let spill = clef_spill(&batch);
+        let said: Vec<&str> = spill
+            .lines()
+            .map(|line| {
+                let at = line.find("\"@m\":\"").expect("a message") + 6;
+                let rest = &line[at..];
+                &rest[..rest.find('"').expect("its end")]
+            })
+            .collect();
+        assert_eq!(said, ["first", "second", "third", "fourth"], "{spill}");
+    }
+
+    /// Records sharing a timestamp keep the order the response gave them — the sort is stable, and
+    /// Loki's resolution makes ties ordinary rather than exotic.
+    #[test]
+    fn records_sharing_a_timestamp_keep_the_order_they_arrived_in() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"app":"a"},"values":[["10","one"],["10","two"],["10","three"]]}]}}"#,
+        );
+        let spill = clef_spill(&batch);
+        let first = spill.lines().next().expect("a line");
+        assert!(first.contains("\"@m\":\"one\""), "{spill}");
+        assert!(
+            spill.lines().nth(2).expect("a third").contains("three"),
+            "{spill}"
         );
     }
 
