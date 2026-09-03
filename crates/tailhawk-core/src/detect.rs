@@ -84,6 +84,14 @@ pub const MAX_JSON_COLUMNS: usize = 6;
 /// still in the record's attributes and in §6.1's raw line, which is what the detail pane reads.
 pub const JSON_COLUMN_SHARE: usize = 4;
 
+/// How many distinct top-level keys a JSON file may have before it is left to the catalogue.
+///
+/// [`json_template`] reconciles the key orders with a matrix of *precedes* edges, which is `n²`
+/// bytes; this bounds it. It is a long way past anything that columnises usefully — the owner's
+/// own estate reaches 45 distinct keys across a thousand records — so a file that trips it is a
+/// file with no stable shape to find.
+pub const MAX_JSON_KEYS: usize = 256;
+
 /// What kind of value a top-level JSON key carries. Both distinctions are load-bearing.
 ///
 /// **[`Text`](JsonValue::Text) is the only kind that can be a column.** A column is a **byte range
@@ -455,38 +463,87 @@ pub fn json_template(lines: &[String]) -> Option<Vec<JsonKey>> {
 
 /// The one key order every sampled line agrees with, or `None` when they cannot be reconciled.
 ///
-/// **A union, built by merging, and not "the line that has them all".** That was the first
-/// construction and it cannot survive real data: Loki merges each record's own structured metadata
-/// into its stream object, so one record carries `key_0` and its neighbour does not, and **no line
-/// is ever a superset of the rest**. Requiring one meant a live spill silently kept the catalogue's
-/// three columns — the labels were fetched, written and still not shown.
+/// **A union, and not "the line that has them all".** That was the first construction and it
+/// cannot survive real data: Loki merges each record's own structured metadata into its stream
+/// object — in this estate, the Serilog message properties, so `ElapsedMs` and `IntegrationId` and
+/// `Topic` appear on the records that have them and nowhere else. **No line is ever a superset of
+/// the rest.** Requiring one meant a live spill silently kept the catalogue's three columns: the
+/// labels were fetched, written to disk, and still not shown.
 ///
-/// Each line is walked against a cursor into the order built so far. A key found at or ahead of the
-/// cursor advances it; a key not present is *inserted* at the cursor, which is where the line says
-/// it belongs. A key found **behind** the cursor is the one thing that cannot be reconciled — this
-/// line writes two keys in the opposite order to an earlier one — and that is a genuine
-/// disagreement, so it is refused rather than guessed at.
+/// **A topological sort, and not a greedy insert**, which was the second construction and failed
+/// on the same data for a subtler reason. Walking each line against a cursor and inserting an
+/// unseen key where the cursor stands works only while consecutive lines share keys: two records
+/// with disjoint property sets give the second one no anchor, so its keys land wherever the cursor
+/// happens to be — ahead of keys that should precede them. A third record carrying both then looks
+/// like a reordering and the file is refused. Sorting the labels in `clef_line` does not save it,
+/// because the fault is in the merge and not in the input.
+///
+/// So the constraints are collected instead of applied: each line's consecutive keys give a
+/// *precedes* edge, and the order is any topological order of the whole graph. **A cycle is the
+/// genuine disagreement** — two lines writing the same pair of keys in opposite orders — and is
+/// refused. Ties are broken by name, so a file whose lines are each written in sorted order, which
+/// a spill's are, comes out in that order rather than in an arbitrary consistent one.
 fn merged_order(sampled: &[Vec<JsonKey>]) -> Option<Vec<JsonKey>> {
-    let mut order: Vec<JsonKey> = Vec::new();
+    let mut nodes: Vec<JsonKey> = Vec::new();
+    for key in sampled.iter().flatten() {
+        if !nodes.iter().any(|seen| seen.name == key.name) {
+            if nodes.len() == MAX_JSON_KEYS {
+                return None;
+            }
+            nodes.push(key.clone());
+        }
+    }
+    let n = nodes.len();
+    let at = |name: &str| nodes.iter().position(|seen| seen.name == name);
+    let mut precedes = vec![false; n * n];
     for keys in sampled {
+        for pair in keys.windows(2) {
+            let (before, after) = (at(&pair[0].name)?, at(&pair[1].name)?);
+            precedes[before * n + after] = true;
+        }
+    }
+    let mut waiting: Vec<usize> = (0..n)
+        .map(|after| (0..n).filter(|before| precedes[before * n + after]).count())
+        .collect();
+    let mut placed = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    for _ in 0..n {
+        // Ties by name, so a file whose lines are each written in sorted order — which a spill's
+        // are, because `lokiwire::clef_line` sorts its labels — comes out in that same order rather
+        // than in an arbitrary one that happens to satisfy the constraints.
+        let next = (0..n)
+            .filter(|i| !placed[*i] && waiting[*i] == 0)
+            .min_by(|a, b| nodes[*a].name.cmp(&nodes[*b].name))?;
+        placed[next] = true;
+        for after in 0..n {
+            if precedes[next * n + after] {
+                waiting[after] -= 1;
+            }
+        }
+        order.push(nodes[next].clone());
+    }
+    // A topological order already guarantees this — each line's chain forces its own keys' relative
+    // positions — so it is a check on this function rather than on the file. It is the property the
+    // pattern actually depends on, and it costs one pass.
+    let subsequence = |keys: &[JsonKey]| {
         let mut cursor = 0usize;
-        for key in keys {
+        keys.iter().all(|key| {
             match order[cursor..]
                 .iter()
                 .position(|seen| seen.name == key.name)
             {
-                Some(found) => cursor += found + 1,
-                None => {
-                    if order[..cursor].iter().any(|seen| seen.name == key.name) {
-                        return None;
-                    }
-                    order.insert(cursor, key.clone());
-                    cursor += 1;
+                Some(found) => {
+                    cursor += found + 1;
+                    true
                 }
+                None => false,
             }
-        }
-    }
-    Some(order)
+        })
+    };
+    sampled
+        .iter()
+        .all(|keys| subsequence(keys))
+        .then_some(order)
 }
 
 /// Stage 3 for one format. `None` when it matched nothing at all.
@@ -841,6 +898,59 @@ mod tests {
         assert_eq!(titles.last(), Some(&"@m"), "{titles:?}");
     }
 
+    /// **Records with disjoint property sets, which is what a real estate sends.** Loki carries
+    /// each record's Serilog message properties as structured metadata, so two consecutive records
+    /// routinely share no key beyond the fixed ones. A merge that inserts an unseen key wherever
+    /// its cursor happens to stand has no anchor for the second record, drops its keys ahead of
+    /// ones that should precede them, and then refuses the file when a third record carries both in
+    /// their real order. Collecting the constraints and sorting them topologically has no such
+    /// dependence on which line came first.
+    ///
+    /// This is the shape that defeated the second construction on live data — `Topic` on line 269
+    /// of a real pull, against an order that had already misplaced it.
+    #[test]
+    fn records_that_share_no_properties_still_reconcile_to_one_order() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"@l\":\"info\",\"ElapsedMs\":\"12\",\"@m\":\"one\"}\n\
+             {\"@t\":\"b\",\"@l\":\"info\",\"Topic\":\"contacts\",\"@m\":\"two\"}\n\
+             {\"@t\":\"c\",\"@l\":\"warn\",\"ElapsedMs\":\"31\",\"Topic\":\"leads\",\"@m\":\"three\"}\n",
+        );
+        let template = json_template(&sample).expect("a template");
+        let got = names(&template);
+        assert!(
+            got.contains(&"ElapsedMs") && got.contains(&"Topic"),
+            "{got:?}"
+        );
+        assert!(
+            got.iter().position(|k| *k == "ElapsedMs") < got.iter().position(|k| *k == "Topic"),
+            "line three writes ElapsedMs before Topic: {got:?}"
+        );
+
+        let format = detect(&sample).accepted.expect("a format");
+        let titles: Vec<&str> = format.column_titles().collect();
+        let at = |t: &str| titles.iter().position(|x| *x == t).expect(t);
+        let ranges = format.fields(&sample[2]).expect("a first line");
+        assert_eq!(
+            ranges[at("Topic")].clone().map(|r| &sample[2][r]),
+            Some("leads")
+        );
+        assert_eq!(
+            ranges[at("ElapsedMs")].clone().map(|r| &sample[2][r]),
+            Some("31")
+        );
+    }
+
+    /// Two lines writing the same pair of keys in opposite orders is a cycle in the constraints,
+    /// and there is no order that serves both. Refused, rather than one of them read wrongly.
+    #[test]
+    fn a_genuine_disagreement_about_order_is_a_cycle_and_is_refused() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"app\":\"identity\",\"region\":\"uksouth\",\"@m\":\"one\"}\n\
+             {\"@t\":\"b\",\"region\":\"uksouth\",\"app\":\"identity\",\"@m\":\"two\"}\n",
+        );
+        assert_eq!(json_template(&sample), None);
+    }
+
     /// **The order is a merge, and this is the property that says so.** Taking any single line —
     /// the first, or the longest — cannot see a key that line does not carry. Here the longest
     /// record is the one with two one-off keys, and `region` is on three rows out of four but not
@@ -1160,6 +1270,43 @@ mod corpus {
                 "  columns: {:?}",
                 format.column_titles().collect::<Vec<_>>()
             );
+        }
+        // **Why the JSON branch declined, when it did.** Stage 2 is silent by design — it either
+        // describes the file or leaves it to the catalogue — and a real file that *should* have
+        // been columnised and was not leaves a reader nothing to go on. Twice the answer has been
+        // in the data rather than in the code, and both times it took reading the file to find.
+        //
+        // **It asks the real functions and re-implements none of them.** An earlier draft of this
+        // walked its own copy of the merge, and when the merge changed the diagnostic went on
+        // reporting the old algorithm's complaint about a file the new one reads perfectly — a
+        // harness disagreeing with the product, which is a failure this project has had three
+        // times and does not need a fourth.
+        match json_template(&lines) {
+            Some(template) => println!(
+                "  json: a template of {} keys, {:?}",
+                template.len(),
+                template.iter().map(|k| k.name.as_str()).collect::<Vec<_>>()
+            ),
+            None => {
+                let culprit = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| !l.trim().is_empty())
+                    .find_map(|(n, l)| match json_keys(l) {
+                        None => Some(format!("line {n} is not an object")),
+                        Some(keys) => keys
+                            .iter()
+                            .find(|k| k.value == JsonValue::Nested)
+                            .map(|k| format!("line {n} nests at {:?}", k.name)),
+                    });
+                match culprit {
+                    Some(why) => println!("  json: no template — {why}"),
+                    None => println!(
+                        "  json: no template — the sampled lines cannot be reconciled to one key \
+                         order, or carry nothing beyond a timestamp, level and message"
+                    ),
+                }
+            }
         }
         for c in &d.candidates {
             println!(
