@@ -4844,12 +4844,20 @@ impl Shell {
                         let visible_w = width as i32 - gutter as i32;
                         let band = doc.header_band.round() as i32;
                         let shown = doc.header.is_some();
+                        // **The header spans the gutter, as Explorer's spans its list from the
+                        // left edge** — the owner's answer of 2026-09-03. Item 0 is a blank fixed
+                        // item as wide as the gutter, and the control starts at the pane's edge.
+                        // Scrolled sideways, the columns move left while the gutter does not, so
+                        // the blank item shrinks by the scroll; past the gutter's width it is
+                        // gone and the control itself shifts left, exactly as the columns do.
+                        let gutter_item = (gutter - scroll_px).round().max(0.0) as i32;
+                        let shift = (gutter - scroll_px).round().min(0.0) as i32;
                         if let Some(ctl) = doc.header_ctl.as_mut() {
-                            ctl.set(&columns, cell_w);
+                            ctl.set(&columns, cell_w, gutter_item);
                             ctl.place(
-                                (x + gutter - scroll_px).round() as i32,
+                                x.round() as i32 + shift,
                                 (top + chrome).round() as i32,
-                                total_px.max(visible_w) + scroll_px.round() as i32,
+                                gutter_item + total_px.max(visible_w) + scroll_px.round() as i32,
                                 band,
                                 shown,
                             );
@@ -9576,10 +9584,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         match request {
                             header::Request::Resize { item, px } => {
                                 // The message column takes the remainder; there is no width to set.
-                                if item >= last {
-                                    return false;
-                                }
-                                let Some(b) = boxes.get(item) else {
+                                // Item 0 is the gutter; the message box takes the remainder.
+                                let Some(b) = header::item_to_box(item)
+                                    .filter(|b| *b < last)
+                                    .and_then(|b| boxes.get(b))
+                                else {
                                     return false;
                                 };
                                 // The item is the box, gap included; the model holds the content.
@@ -9596,11 +9605,13 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 // Both ends in the model's own spaces: the column that moves, and
                                 // the display position of the box it was dropped on. The message
                                 // box is never a destination and never moves.
-                                if from >= last || to >= last {
-                                    return false;
-                                }
-                                let (Some(moved), Some(target)) = (boxes.get(from), boxes.get(to))
-                                else {
+                                // Neither end may be the gutter item or the message box.
+                                let box_of = |item: usize| {
+                                    header::item_to_box(item)
+                                        .filter(|b| *b < last)
+                                        .and_then(|b| boxes.get(b))
+                                };
+                                let (Some(moved), Some(target)) = (box_of(from), box_of(to)) else {
                                     return false;
                                 };
                                 let (moved, target) = (moved.column, target.column);
@@ -9609,10 +9620,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                     slot.is_some_and(|slot| l.move_column(moved, slot))
                                 })
                             }
-                            header::Request::Sort { item } => match boxes.get(item) {
-                                Some(b) => doc.cycle_sort(b.column),
-                                None => false,
-                            },
+                            header::Request::Sort { item } => {
+                                match header::item_to_box(item).and_then(|b| boxes.get(b)) {
+                                    Some(b) => doc.cycle_sort(b.column),
+                                    None => false,
+                                }
+                            }
                         }
                     });
                     if changed {

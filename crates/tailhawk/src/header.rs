@@ -25,10 +25,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT, HGDIOBJ};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, HDF_LEFT, HDF_SORTDOWN, HDF_SORTUP, HDF_STRING, HDITEMW, HDI_FORMAT,
-    HDI_TEXT, HDI_WIDTH, HDLAYOUT, HDM_DELETEITEM, HDM_GETITEMCOUNT, HDM_INSERTITEMW, HDM_LAYOUT,
-    HDM_SETITEMW, HDS_BUTTONS, HDS_DRAGDROP, HDS_FULLDRAG, HDS_HORZ, ICC_LISTVIEW_CLASSES,
-    INITCOMMONCONTROLSEX, NMHEADERW, WC_HEADERW,
+    InitCommonControlsEx, HDF_FIXEDWIDTH, HDF_LEFT, HDF_SORTDOWN, HDF_SORTUP, HDF_STRING, HDITEMW,
+    HDI_FORMAT, HDI_TEXT, HDI_WIDTH, HDLAYOUT, HDM_DELETEITEM, HDM_GETITEMCOUNT, HDM_INSERTITEMW,
+    HDM_LAYOUT, HDM_SETITEMW, HDS_BUTTONS, HDS_DRAGDROP, HDS_FULLDRAG, HDS_HORZ,
+    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, NMHEADERW, WC_HEADERW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, SendMessageW, SetWindowPos, ShowWindow, HMENU, HWND_TOP,
@@ -126,6 +126,15 @@ pub(crate) fn trace(line: &str) {
     }
 }
 
+/// The header box a control item names, or `None` for the gutter item at 0, which names nothing.
+///
+/// Every gesture goes through this before touching the model: a resize of item 0 is refused by the
+/// control (`HDF_FIXEDWIDTH`), but a drag *onto* it or a click on it still arrives, and the model
+/// must never be asked to act on a column that is not there.
+pub fn item_to_box(item: usize) -> Option<usize> {
+    item.checked_sub(1)
+}
+
 /// The width in pixels a column of `cells` cells takes, and the inverse, **rounded** — the grid is a
 /// cell grid and honours nothing finer.
 pub fn px_of_cells(cells: usize, cell_w: f32) -> i32 {
@@ -146,6 +155,9 @@ pub struct Header {
     /// What the control was last filled with, so a frame that changes nothing does not rebuild it —
     /// a rebuild would drop a drag that is mid-track.
     shown: Vec<HeaderColumn>,
+    /// The blank first item's width when the control was last filled — the gutter's, so the
+    /// header spans it the way Explorer's spans its list from the left edge.
+    gutter: i32,
     visible: bool,
 }
 
@@ -200,6 +212,7 @@ impl Header {
             hwnd,
             font,
             shown: Vec::new(),
+            gutter: 0,
             visible: false,
         })
     }
@@ -210,8 +223,8 @@ impl Header {
 
     /// Fills the control from the layout's boxes. `columns` are in display order, the last taking
     /// the remainder; widths are `cells × cell_w`, the same arithmetic the grid draws by.
-    pub fn set(&mut self, columns: &[HeaderColumn], cell_w: f32) {
-        if self.shown == columns {
+    pub fn set(&mut self, columns: &[HeaderColumn], cell_w: f32, gutter_px: i32) {
+        if self.shown == columns && self.gutter == gutter_px {
             return;
         }
         trace(&format!("header.set rebuild items={}", columns.len()));
@@ -221,7 +234,27 @@ impl Header {
                 SendMessageW(self.hwnd, HDM_DELETEITEM, WPARAM(i as usize), LPARAM(0));
             }
         }
-        for (i, column) in columns.iter().enumerate() {
+        // **Item 0 is the gutter: blank, fixed, and never a column.** The owner's answer on
+        // 2026-09-03 was "same as Explorer", whose header runs from the list's left edge; ours
+        // starts where the line numbers end, so the band over them was bare. A fixed-width item
+        // cannot be dragged to resize, and [`item_to_box`] keeps it out of every gesture.
+        let gutter_item = HDITEMW {
+            mask: HDI_WIDTH | HDI_FORMAT,
+            cxy: gutter_px.max(0),
+            fmt: windows::Win32::UI::Controls::HEADER_CONTROL_FORMAT_FLAGS(
+                HDF_LEFT.0 | HDF_FIXEDWIDTH.0,
+            ),
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                self.hwnd,
+                HDM_INSERTITEMW,
+                WPARAM(0),
+                LPARAM(&gutter_item as *const HDITEMW as isize),
+            );
+        }
+        for (i, column) in columns.iter().enumerate().map(|(i, c)| (i + 1, c)) {
             let mut wide: Vec<u16> = column.title.encode_utf16().collect();
             wide.push(0);
             // The caret comes with the box, from the model that decided it — one answer, not a
@@ -251,6 +284,7 @@ impl Header {
             }
         }
         self.shown = columns.to_vec();
+        self.gutter = gutter_px;
     }
 
     /// Tells the control a width it asked for was rounded to the grid's cells.
@@ -350,6 +384,14 @@ unsafe impl Send for Header {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 0 is the gutter and names no box; every other item names the box one before it.
+    #[test]
+    fn the_gutter_item_names_no_box_and_the_rest_shift_by_one() {
+        assert_eq!(item_to_box(0), None);
+        assert_eq!(item_to_box(1), Some(0));
+        assert_eq!(item_to_box(4), Some(3));
+    }
 
     /// **`NM_CUSTOMDRAW` carries no item and must never be read as one.** The header sends it on
     /// every paint, and the first wiring read `pitem` out of it — a pointer taken from the middle of

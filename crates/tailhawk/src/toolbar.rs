@@ -84,7 +84,13 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
     vec![
         verb("Open", Command::OpenFile, true),
         verb("Find", Command::Find, open),
-        verb("Filter", Command::ToggleFilters, open),
+        // A toggle, not a verb, since 2026-09-03: the owner's answer to §2.5's open question. It
+        // reports whether the filter panel is shown, the way Follow reports following.
+        toggle(
+            "Filter",
+            Command::ToggleFilters,
+            doc.is_some_and(|d| d.show_filters),
+        ),
         toggle(
             "Follow",
             Command::FollowTail,
@@ -451,7 +457,7 @@ mod tests {
             .filter(|b| b.toggle)
             .map(|b| b.label)
             .collect();
-        assert_eq!(toggles, ["Follow", "Collapse", "Detail"]);
+        assert_eq!(toggles, ["Filter", "Follow", "Collapse", "Detail"]);
     }
 
     /// **Every id is the menu's.** This is the test that keeps §1.2's one-command-one-path rule

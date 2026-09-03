@@ -507,10 +507,21 @@ copy — bookmarks, highlight rules and column layout all apply.
 > **Not built, and not to be read as though it were**: more than two panes, Tile and Cascade over
 > several document windows, per-pane follow independence, and scroll lock by timestamp or line
 > number. The rest of this section describes an intended shape, most of it written before the owner
-> saw any of it. **Where the window controls belong** is half settled: **not in the toolbar** — the
-> toggle that lived there was removed on 2026-09-03 after the owner's screenshot — and whether they
-> go on the tab bar, as he first asked, is the question still open with him. Until it is answered
-> the menu is the only door, and a split that consumes the strip does not lose the command.
+> saw any of it. **Where the window controls belong — answered 2026-09-03:** *"same as for a normal
+> window … in HooWinTail they appear at the extreme right of the menu bar when maximised, and on
+> the window when in MDI mode."* That is Windows' own MDI behaviour: a maximised child's
+> minimise/restore/close buttons are drawn by the system at the right end of the frame's menu bar,
+> and on the child's caption otherwise. **His two screenshots of HooWinTail settle what that
+> means: real MDI, with a tab strip as well.** Tiled, each document is an MDI child with its own
+> caption — title, minimise, restore, close at its right. Maximised, the child's icon sits at the
+> left of the menu bar, its three buttons at the extreme right, and its title merges into the
+> frame's (`Hoo WinTail - [path]`). Windows draws all of it for an `MDICLIENT`; a tabbed window
+> gets none of it. **So §1.1's "MDI child windows with their own title bars — rejected" is
+> overturned by the owner**, and this table's "flat tab strip" is *in addition to* MDI, exactly as
+> HooWinTail has both. That is a structural change — an `MDICLIENT` host, and a swapchain per
+> document child, which is also the fallback `tabstrip.rs` recorded for child windows over a
+> flip-model swapchain — and it is scheduled with the owner rather than started on the strength of
+> a screenshot. Not in the toolbar, settled; the menu remains the door until then.
 
 *(Owner's requirement, 2026-08-19. §3 above is one log split two ways; this is several logs at
 once, which is a different problem and the one MDI existed to solve.)*
