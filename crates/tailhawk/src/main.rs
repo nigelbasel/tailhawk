@@ -19,6 +19,7 @@ mod controls;
 mod darkmode;
 mod dialog;
 mod filterpanel;
+mod header;
 mod icon;
 mod keymap;
 mod menubar;
@@ -242,6 +243,12 @@ struct Document {
     moving: Option<usize>,
     /// `layout.header()`, built once at open. See [`Document::header_text`].
     header: Option<String>,
+    /// §2.5's header as the real control, one per pane, created by the shell the first time this
+    /// pane is laid out with a layout. `None` until then, and the painter draws the band instead.
+    header_ctl: Option<header::Header>,
+    /// The control's band in pixels — `HDM_LAYOUT`'s answer — which the view reserves in place of
+    /// the drawn band's row height once the control exists.
+    header_band: f32,
     /// The visible rows' presentations under `layout`, rebuilt by `lay_out` each frame — §7.1's
     /// visible-rows rule applied to columns. Keyed by **file** row, ascending.
     presented: Vec<(u64, Presentation)>,
@@ -378,6 +385,11 @@ impl RowSource for Document {
     /// call. A row whose text is not in memory yet gets the matches and nothing else, which is
     /// also what it gets drawn as.
     fn header(&self) -> Option<&str> {
+        // With the real control over the band, the painter draws nothing into it. The band is
+        // still reserved — `header_px` is the control's height — so the row arithmetic is untouched.
+        if self.header_ctl.is_some() {
+            return None;
+        }
         self.header_text()
     }
 
@@ -401,6 +413,7 @@ impl RowSource for Document {
             let cells = layout.widths[i] + tailhawk_core::columns::GAP;
             out.push(tailhawk_core::rows::HeaderColumn {
                 title: layout.title(i).to_owned(),
+                column: i,
                 start: at,
                 cells,
                 content: layout.widths[i],
@@ -417,6 +430,7 @@ impl RowSource for Document {
         if !layout.format.columns.is_empty() {
             out.push(tailhawk_core::rows::HeaderColumn {
                 title: layout.title(last).to_owned(),
+                column: last,
                 start: at,
                 // It runs to the edge: whatever the viewport still has, in cells. No gap follows it,
                 // so the box and its content are the same width.
@@ -772,6 +786,8 @@ impl Document {
             unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
+            header_ctl: None,
+            header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
             moving: None,
@@ -833,6 +849,8 @@ impl Document {
             unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
+            header_ctl: None,
+            header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
             moving: None,
@@ -918,8 +936,14 @@ impl Document {
         );
         self.view
             .set_footer_px(footer + DetailPane::height(pane_rows, row_h) + panel);
+        // The band is the control's height once the control exists, and the drawn band's row
+        // height until then — never a constant, for the reason every native surface here gives.
         self.view
-            .set_header_px(if self.header.is_some() { row_h } else { 0.0 });
+            .set_header_px(match (&self.header, &self.header_ctl) {
+                (None, _) => 0.0,
+                (Some(_), Some(_)) if self.header_band > 0.0 => self.header_band,
+                (Some(_), _) => row_h,
+            });
         {
             let rows = self.view_rows();
             // The gutter: room for the widest physical line number, a mark's half-cell before it
@@ -2315,6 +2339,12 @@ impl Document {
     /// Whether `(x, y)` — pane-relative — is on the header band, and if so which column boundary
     /// is within a cell of it. `Some(None)` is the header away from a boundary.
     fn header_hit(&self, x: f32, y: f32) -> Option<Option<usize>> {
+        // With the real control on the band, every gesture on it is the control's. The drawn
+        // band's own hit-test would otherwise still answer for the strip left of the control —
+        // over the gutter — and a click there sorted by the first column with no affordance.
+        if self.header_ctl.is_some() {
+            return None;
+        }
         let header = self.view.header_px();
         let top = self.view.chrome_px();
         if header <= 0.0 || y < top || y >= top + header {
@@ -4726,11 +4756,28 @@ impl Shell {
                     (None, _) => 0.0,
                 };
                 let strip_px = strip_px + toolbar_px;
+                // Only the active tab is laid out below, so every other tab's headers are hidden
+                // here — a child window does not know its document is not the one on screen, and
+                // a columnar tab's header would otherwise sit over a plain-text tab's first row.
+                let active = self.document.active;
+                for (tab, doc) in self.document.all_mut() {
+                    if tab != active {
+                        if let Some(ctl) = doc.header_ctl.as_mut() {
+                            ctl.place(0, 0, 0, 0, false);
+                        }
+                    }
+                }
                 let panes = self.document.panes_mut();
                 for (i, doc) in panes.iter_mut().enumerate() {
                     // Panes that are not on screen keep their state and are skipped: laying one out
                     // would cost a full re-measure every frame for something nobody can see.
                     let Some(slot) = visible.iter().position(|&v| v == i) else {
+                        // A pane not on screen this frame must not leave its header on screen:
+                        // a maximised neighbour would otherwise have this pane's titles over its
+                        // own rows, answering to its own gestures.
+                        if let Some(ctl) = doc.header_ctl.as_mut() {
+                            ctl.place(0, 0, 0, 0, false);
+                        }
                         continue;
                     };
                     let (x, top, width, height) = boxes[slot];
@@ -4753,7 +4800,52 @@ impl Shell {
                     let _ = (side, last);
                     doc.pane_top = top;
                     doc.pane_left = x;
+                    // §2.5's header is `SysHeader32`, one per pane, made the first time the pane
+                    // has columns to name. The band it wants is asked of it and reserved by the
+                    // view *before* the layout, so the rows start under a control of the system's
+                    // height rather than under a guess.
+                    if doc.header.is_some() && doc.header_ctl.is_none() {
+                        let instance = unsafe {
+                            windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                        }
+                        .map(|m| HINSTANCE(m.0))
+                        .unwrap_or_default();
+                        doc.header_ctl = header::Header::create(hwnd, instance, slot);
+                    }
+                    doc.header_band = doc
+                        .header_ctl
+                        .as_ref()
+                        .map(|h| h.band_height(width as i32) as f32)
+                        .unwrap_or(0.0);
                     doc.lay_out(cell, (width as u32, height as u32));
+                    // Filled and placed after the layout, from the same boxes the drawn band used,
+                    // over the band the view just reserved. Scrolled sideways, the control is
+                    // shifted left by the scroll and left wider than the viewport, exactly as a
+                    // list view keeps its header over its columns.
+                    if doc.header_ctl.is_some() {
+                        let columns = doc.header_columns();
+                        let cell_w = doc.view.hgrid().cell_width().max(1.0);
+                        let scroll_px = doc.view.hgrid().visible_columns().start as f32 * cell_w;
+                        let total_px: i32 = columns
+                            .iter()
+                            .map(|c| header::px_of_cells(c.cells, cell_w))
+                            .sum();
+                        let gutter = doc.view.gutter_px();
+                        let chrome = doc.view.chrome_px();
+                        let visible_w = width as i32 - gutter as i32;
+                        let band = doc.header_band.round() as i32;
+                        let shown = doc.header.is_some();
+                        if let Some(ctl) = doc.header_ctl.as_mut() {
+                            ctl.set(&columns, cell_w);
+                            ctl.place(
+                                (x + gutter - scroll_px).round() as i32,
+                                (top + chrome).round() as i32,
+                                total_px.max(visible_w) + scroll_px.round() as i32,
+                                band,
+                                shown,
+                            );
+                        }
+                    }
                     // The highlighter's frame budget starts here, alongside the painter's own
                     // `begin_frame` inside `paint_panes` — one frame, one budget, §11.3.
                     doc.highlighter.begin_frame();
@@ -5270,6 +5362,12 @@ impl Shell {
         .flatten()
         {
             controls::apply_theme(child, next.dark);
+        }
+        // And every pane's header, which lives on the document rather than the shell.
+        for (_, doc) in self.document.all_mut() {
+            if let Some(ctl) = doc.header_ctl.as_ref() {
+                controls::apply_theme(ctl.hwnd(), next.dark);
+            }
         }
         // The *name*, not the resolved palette: "system" is an instruction, and storing what it
         // resolved to today loses the instruction.
@@ -9424,6 +9522,99 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     });
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            // §2.5's header control, one per pane, answering as `ID_HEADER_BASE + pane`. Its three
+            // gestures go down the model paths the drawn band used — resize, reorder, sort — and
+            // the control decides nothing: a width comes back in cells, rounded, and the control is
+            // told the rounded width so it never shows a boundary the grid does not honour.
+            let pane = header.idFrom as i64 - header::ID_HEADER_BASE as i64;
+            if (0..header::MAX_HEADERS as i64).contains(&pane) {
+                let request = unsafe { header::request_from_notify(lparam) };
+                let from_control = header.hwndFrom;
+                if let Some(request) = request {
+                    let changed = STATE.with(|s| {
+                        let mut state = s.borrow_mut();
+                        let Some(shell) = state.as_mut() else {
+                            return false;
+                        };
+                        // **The document is found by the control's window, never by its id.** The
+                        // id is the pane slot the control was *created* for, and a document moves
+                        // slot on every split, close and maximise; an id lookup would resize the
+                        // neighbour. The window is the one thing that stays the document's own.
+                        let Some((_, doc)) = shell.document.all_mut().find(|(_, d)| {
+                            d.header_ctl
+                                .as_ref()
+                                .is_some_and(|c| c.hwnd() == from_control)
+                        }) else {
+                            return false;
+                        };
+                        let cell_w = doc.view.hgrid().cell_width().max(1.0);
+                        // The control's items are `header_columns`' boxes in the same order, and
+                        // each box knows which layout column it names — so item → column is a
+                        // read, not an arithmetic over `shown_order` that hidden columns break.
+                        let boxes = doc.header_columns();
+                        let last = boxes.len().saturating_sub(1);
+                        match request {
+                            header::Request::Resize { item, px } => {
+                                // The message column takes the remainder; there is no width to set.
+                                if item >= last {
+                                    return false;
+                                }
+                                let Some(b) = boxes.get(item) else {
+                                    return false;
+                                };
+                                // The item is the box, gap included; the model holds the content.
+                                let gap = tailhawk_core::columns::GAP;
+                                let cells =
+                                    header::cells_of_px(px, cell_w).saturating_sub(gap).max(1);
+                                let changed = doc.set_column_width(b.column, cells);
+                                if let Some(ctl) = doc.header_ctl.as_ref() {
+                                    ctl.set_width(item, header::px_of_cells(cells + gap, cell_w));
+                                }
+                                changed
+                            }
+                            header::Request::Reorder { from, to } => {
+                                // Both ends in the model's own spaces: the column that moves, and
+                                // the display position of the box it was dropped on. The message
+                                // box is never a destination and never moves.
+                                if from >= last || to >= last {
+                                    return false;
+                                }
+                                let (Some(moved), Some(target)) = (boxes.get(from), boxes.get(to))
+                                else {
+                                    return false;
+                                };
+                                let (moved, target) = (moved.column, target.column);
+                                doc.layout.as_mut().is_some_and(|l| {
+                                    let slot = l.shown_order().iter().position(|&c| c == target);
+                                    slot.is_some_and(|slot| l.move_column(moved, slot))
+                                })
+                            }
+                            header::Request::Sort { item } => match boxes.get(item) {
+                                Some(b) => doc.cycle_sort(b.column),
+                                None => false,
+                            },
+                        }
+                    });
+                    if changed {
+                        STATE.with(|s| {
+                            if let Some(shell) = s.borrow_mut().as_mut() {
+                                shell.retitle(hwnd);
+                            }
+                        });
+                        unsafe {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    // **A drop is answered "handled", whatever the model said.** Zero here lets the
+                    // control reorder its own items; when the model refuses — the message column,
+                    // a slot already held — that leaves the titles in one order over rows in
+                    // another, permanently. The model's answer is the only reorder there is, and
+                    // the next frame's `set` shows it.
+                    if matches!(request, header::Request::Reorder { .. }) {
+                        return LRESULT(1);
                     }
                 }
             }

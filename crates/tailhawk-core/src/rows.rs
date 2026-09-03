@@ -78,6 +78,11 @@ pub struct HeaderColumn {
     /// The column's title, as the user reads it. No padding and no sort marker — both are the
     /// painter's business now.
     pub title: String,
+    /// **The layout column this box names**, so a control whose items are these boxes can hand a
+    /// gesture back in the model's index space. The two are not the same space: a box list skips
+    /// hidden columns and ends with the message, so "item 2" is not "column 2" once anything is
+    /// hidden, and mapping through `shown_order` by position was wrong in exactly that case.
+    pub column: usize,
     /// The first cell of this column's box.
     pub start: usize,
     /// How many cells wide the box is, **including** the gap that separates it from the next. This
