@@ -192,6 +192,7 @@ impl Toolbar {
         }
         // The same theme decision the menus take — see `controls::apply_theme` for the screenshot
         // that made this one place rather than three.
+        crate::header::trace(&format!("child: toolbar hwnd={:?}", hwnd.0));
         crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
         Some(Toolbar {
             hwnd,

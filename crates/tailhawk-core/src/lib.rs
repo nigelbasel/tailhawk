@@ -697,6 +697,7 @@ impl Renderer {
 
             p.begin_frame();
             laid = paint::Laid::default();
+            crate::glyphs::atlas_log("core: begin");
             for (view, source, x, y) in panes {
                 let from = p.mark();
                 laid.merge(p.lay_out(view, t.ink, *source)?);
@@ -712,6 +713,7 @@ impl Renderer {
             for (r, tint) in overlay {
                 p.fill(r.x, r.y, r.w, r.h, *tint);
             }
+            crate::glyphs::atlas_log("core: laid all panes, drawing");
             // The whole client, gutter included, taken from the caller rather than the swapchain
             // so `gpu` stays out of this closure — which is what makes the disjoint borrow above
             // hold. The shader maps pixels to clip space by this number, so a width short of the
@@ -722,6 +724,7 @@ impl Renderer {
                 (client.0.max(1.0) as u32, client.1.max(1.0) as u32),
             )
         })?;
+        crate::glyphs::atlas_log("core: presented");
 
         // **After presenting, which is what `render_frame_with` returning means.** §3.2 requires
         // the ordering and `experiments/g4b-batched-raster` measured why: a genuinely cold
@@ -734,6 +737,7 @@ impl Renderer {
             let p = &mut built.painter;
             let (_, context) = gpu.resources();
             laid.rasterised = p.flush_misses(context)?;
+            crate::glyphs::atlas_log("core: flushed");
             laid.oversized = p.oversized_hits();
             laid.blanked = p.blanked_hits();
             laid.flush_stats = p.flush_stats();

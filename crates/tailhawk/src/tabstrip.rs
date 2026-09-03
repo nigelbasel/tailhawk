@@ -329,6 +329,7 @@ impl TabStrip {
         // not something this module can fix without drawing the tabs again. The decision itself is
         // the menus' — `controls::apply_theme`, one place for every native surface.
         crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
+        crate::header::trace(&format!("child: tabstrip hwnd={:?}", hwnd.0));
         // Padding, scaled for this monitor: the label gets room either side and the tab gets
         // taller. Sent after the font, because the control lays a tab out from both together.
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);

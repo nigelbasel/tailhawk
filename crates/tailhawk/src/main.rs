@@ -1575,6 +1575,7 @@ impl Document {
     /// the message loop 70% idle and is what carries the 50 MB/s of `SPEC.md` §11.3's criterion; a
     /// single byte-budgeted scan per tick capped throughput at roughly 40 MB/s.
     fn poll_follow(&mut self) -> bool {
+        header::trace("poll_follow enter");
         let was_following = self.view.grid().is_following();
 
         // **Read before the scan, not after.** The pump flushes each read and only then sets its
@@ -1586,7 +1587,9 @@ impl Document {
         let stream_changed = finished_now != self.stream_done;
         self.stream_done = finished_now;
 
+        header::trace("poll_follow: set.poll enter");
         let polled = self.set.poll();
+        header::trace("poll_follow: set.poll done");
         if polled.is_quiet() {
             // The rows did not move, but the title may still be wrong. §4.2's end of stream "is not
             // an app exit", and a window that stops updating without saying why looks like one that
@@ -4614,6 +4617,7 @@ impl Shell {
     }
 
     fn paint_inner(&mut self, hwnd: HWND) -> bool {
+        header::trace("paint enter");
         // The strip and the status are the shell's knowledge, handed to the document that draws them.
         let strip = (self.document.labels(), self.document.active);
         let status = self.status_text();
@@ -4804,7 +4808,11 @@ impl Shell {
                     // has columns to name. The band it wants is asked of it and reserved by the
                     // view *before* the layout, so the rows start under a control of the system's
                     // height rather than under a guess.
-                    if doc.header.is_some() && doc.header_ctl.is_none() {
+                    // `TAILHAWK_NO_HEADER=1` leaves the control out and the drawn band in — a
+                    // bisecting switch for a harness, so a fault that appears only with columns
+                    // can be laid at the control's door or taken away from it without a rebuild.
+                    let header_allowed = std::env::var_os("TAILHAWK_NO_HEADER").is_none();
+                    if header_allowed && doc.header.is_some() && doc.header_ctl.is_none() {
                         let instance = unsafe {
                             windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
                         }
@@ -4818,6 +4826,7 @@ impl Shell {
                         .map(|h| h.band_height(width as i32) as f32)
                         .unwrap_or(0.0);
                     doc.lay_out(cell, (width as u32, height as u32));
+                    header::trace("shell: pane laid out");
                     // Filled and placed after the layout, from the same boxes the drawn band used,
                     // over the band the view just reserved. Scrolled sideways, the control is
                     // shifted left by the scroll and left wider than the viewport, exactly as a
@@ -4877,6 +4886,7 @@ impl Shell {
                         )
                     })
                     .collect();
+                header::trace("shell: paint_panes enter");
                 let laid = renderer.paint_panes(&refs, (w as f32, h as f32), &overlay)?;
                 rasterised = laid.rasterised;
                 placeholders = PlaceholderStats::from(&laid);
@@ -4894,6 +4904,7 @@ impl Shell {
         // frame finds those glyphs resident, rasterises nothing and asks for nothing.
         self.needs_frame = rasterised > 0;
         self.placeholders = placeholders;
+        header::trace("paint exit");
         if let Err(e) = &drawn {
             self.notice = Some(format!("paint: {e}"));
         }
@@ -5056,6 +5067,7 @@ impl Shell {
     /// current answer, and a title assembled from remembered fragments is how "2 files … newest is
     /// log_002.txt" survived onto a window showing three.
     fn retitle(&mut self, hwnd: HWND) {
+        header::trace("retitle enter");
         if let Some(doc) = self.document.as_ref() {
             self.file = Some(doc.describe());
         }
@@ -8698,6 +8710,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == FOLLOW_TIMER => {
+            header::trace("timer: follow tick enter");
             // **The scan is bounded, so this cannot hold the message loop.** `Follow::poll` stops at
             // its byte budget and says whether more is waiting; a writer producing faster than the
             // tick just takes several ticks to catch up, which is §11.3's requirement — the UI stays
@@ -8799,6 +8812,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 // the update region still has to be cleared or the loop spins on WM_PAINT.
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::ValidateRect(hwnd, None);
+                    header::trace("wm_paint: validated");
                 }
                 // **Strictly after the validate.** Invalidating before it is invalidating into a
                 // region that is about to be cleared, which is why the first attempt at this
@@ -9535,7 +9549,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let from_control = header.hwndFrom;
                 if let Some(request) = request {
                     let changed = STATE.with(|s| {
-                        let mut state = s.borrow_mut();
+                        let Ok(mut state) = s.try_borrow_mut() else {
+                            header::trace("NOTIFY REENTRANT: state already borrowed");
+                            return false;
+                        };
                         let Some(shell) = state.as_mut() else {
                             return false;
                         };
@@ -10256,6 +10273,10 @@ fn main() -> Result<()> {
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        header::trace(&format!(
+            "loop: msg 0x{:x} hwnd={:?}",
+            msg.message, msg.hwnd.0
+        ));
         // The modeless Find dialog's keyboard — Tab between its controls, Enter as Find Next,
         // Esc as Cancel — only works if the loop offers it the message first, which is the
         // documented contract of a modeless dialog. The handle is copied out so no borrow is

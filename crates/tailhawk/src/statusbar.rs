@@ -79,6 +79,7 @@ impl StatusBar {
             }
         }
         // The same theme decision the menus take — `controls::apply_theme`, one place for all.
+        crate::header::trace(&format!("child: statusbar hwnd={:?}", hwnd.0));
         crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
         let bar = StatusBar {
             hwnd,

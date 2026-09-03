@@ -57,6 +57,12 @@ pub enum Request {
 
 use windows::Win32::UI::Controls::{HDN_ENDDRAG, HDN_ENDTRACKW, HDN_ITEMCLICKW};
 
+/// Whether `code` is one of the three notifications whose `lParam` really is an `NMHEADERW` with a
+/// `pitem` worth reading. Everything else the control sends shares the `NMHDR` and nothing more.
+pub fn carries_item(code: u32) -> bool {
+    matches!(code, HDN_ENDTRACKW | HDN_ENDDRAG | HDN_ITEMCLICKW)
+}
+
 /// Turns a header notification into a [`Request`], or nothing when it is one this does not act on.
 ///
 /// `HDN_ENDDRAG` reports the *target* slot in `pitem.iOrder`; `-1` there is the control saying the
@@ -81,6 +87,15 @@ pub fn request_of(code: u32, item: i32, order: i32, width: Option<i32>) -> Optio
 /// this module's ids; nothing else is dereferenced.
 pub unsafe fn request_from_notify(lparam: LPARAM) -> Option<Request> {
     let n = unsafe { &*(lparam.0 as *const NMHEADERW) };
+    // **The code is read before anything else is believed.** A header sends far more than the
+    // three notifications this acts on — `NM_CUSTOMDRAW` on every paint, for one — and those
+    // arrive as *other* structs behind the same `NMHDR`. Reading `pitem` out of an `NMCUSTOMDRAW`
+    // is reading a pointer out of its `rc`, and following it from inside a paint callback is an
+    // access violation the kernel swallows on x64: no crash, no panic, a thread that never comes
+    // back. That was the hang.
+    if !carries_item(n.hdr.code) {
+        return None;
+    }
     let (order, width) = if n.pitem.is_null() {
         (-1, None)
     } else {
@@ -91,6 +106,24 @@ pub unsafe fn request_from_notify(lparam: LPARAM) -> Option<Request> {
         (item.iOrder, carried.then_some(item.cxy))
     };
     request_of(n.hdr.code, n.iItem, order, width)
+}
+
+/// Diagnostic: appends a line to the file `TAILHAWK_ATLAS_LOG` names, if it names one — the same
+/// switch the glyph cache logs under, so one file carries the frame in order.
+pub(crate) fn trace(line: &str) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("TAILHAWK_ATLAS_LOG").ok()) else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// The width in pixels a column of `cells` cells takes, and the inverse, **rounded** — the grid is a
@@ -161,6 +194,7 @@ impl Header {
                 SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
             }
         }
+        trace(&format!("child: header hwnd={:?}", hwnd.0));
         crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
         Some(Header {
             hwnd,
@@ -180,6 +214,7 @@ impl Header {
         if self.shown == columns {
             return;
         }
+        trace(&format!("header.set rebuild items={}", columns.len()));
         let count = unsafe { SendMessageW(self.hwnd, HDM_GETITEMCOUNT, WPARAM(0), LPARAM(0)) }.0;
         for i in (0..count.max(0)).rev() {
             unsafe {
@@ -238,6 +273,7 @@ impl Header {
 
     /// How tall the control wants to be for its font — `HDM_LAYOUT`'s answer, never a constant.
     pub fn band_height(&self, width: i32) -> i32 {
+        trace("header.band_height enter");
         let mut rc = RECT {
             left: 0,
             top: 0,
@@ -267,6 +303,9 @@ impl Header {
     /// horizontally: the control is wider than the viewport and shifted left by the scroll, exactly
     /// as a list view keeps its header aligned with its columns.
     pub fn place(&mut self, x: i32, top: i32, width: i32, height: i32, visible: bool) {
+        trace(&format!(
+            "header.place x={x} top={top} w={width} h={height} visible={visible}"
+        ));
         if visible {
             unsafe {
                 let _ = SetWindowPos(
@@ -311,6 +350,24 @@ unsafe impl Send for Header {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`NM_CUSTOMDRAW` carries no item and must never be read as one.** The header sends it on
+    /// every paint, and the first wiring read `pitem` out of it — a pointer taken from the middle of
+    /// an `NMCUSTOMDRAW` — and followed it from inside the paint: an access violation the kernel
+    /// swallows on x64, and a window that never painted again after its first follow tick.
+    #[test]
+    fn only_the_three_item_notifications_are_read_as_items() {
+        use windows::Win32::UI::Controls::{HDN_ITEMCHANGINGW, HDN_TRACKW, NM_CUSTOMDRAW};
+        assert!(carries_item(HDN_ENDTRACKW));
+        assert!(carries_item(HDN_ENDDRAG));
+        assert!(carries_item(HDN_ITEMCLICKW));
+        assert!(
+            !carries_item(NM_CUSTOMDRAW),
+            "custom draw is not an item notification"
+        );
+        assert!(!carries_item(HDN_ITEMCHANGINGW));
+        assert!(!carries_item(HDN_TRACKW));
+    }
 
     /// The three gestures §2.5 names, each from the notification the control sends for it.
     #[test]
