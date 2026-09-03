@@ -730,6 +730,12 @@ impl Painter {
                     baseline_y - offset.ascender,
                     ink,
                 ) {
+                    if !blank && self.cache.is_placeholder(&quad) {
+                        crate::glyphs::atlas_log(&format!(
+                            "placeholder cluster {:?}",
+                            &text[cluster.span.byte..cluster.span.byte + cluster.span.byte_len]
+                        ));
+                    }
                     if !(blank && self.cache.is_placeholder(&quad)) {
                         self.instances.push(quad);
                         laid.quads += 1;

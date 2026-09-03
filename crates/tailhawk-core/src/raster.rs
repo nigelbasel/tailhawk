@@ -392,12 +392,24 @@ impl Rasteriser {
         let mut overflows = false;
         let origin_x = pen_x + cell.left;
 
-        // The territory this glyph may have inked: its own cell plus the gap before the next pen
-        // position, over every row of the strip rather than only the cell's rows.
+        // The territory this glyph may have inked: its own cell plus **its own half of the gap**
+        // before the next pen position, over every row of the strip rather than only the cell's
+        // rows.
+        //
+        // **Half, not all of it.** The gap is shared: this glyph's right-hand overhang lands at its
+        // near end, and the *next* glyph's left-hand fringe — a `W` or a `Y` whose subpixel
+        // rendering bleeds a pixel left of its own pen — lands at the far end. Scanning the whole
+        // gap charged that pixel to whatever glyph came before it, and for a space that meant a
+        // raster with no ink coming back "overflowing", refused by the atlas for the life of the
+        // process, and a placeholder box drawn at every space on screen. A real overflow is ink well
+        // past the cell; nothing a monospace face draws reaches half a cell beyond its own.
+        let territory_right = (origin_x + cell.width as i32 + (step - cell.width as i32) / 2)
+            .min(pen_x + step)
+            .min(bounds.right);
         for ay in bounds.top..bounds.bottom {
             let src_row = ((ay - bounds.top) * strip_w) as usize;
             let inside_rows = ay >= cell.top && ay < cell.top + cell.height as i32;
-            for ax in origin_x..(pen_x + step).min(bounds.right) {
+            for ax in origin_x..territory_right {
                 if ax < bounds.left {
                     continue;
                 }
@@ -676,6 +688,45 @@ mod tests {
                     _ => panic!("glyph {} (index {i}) is blank in only one arm", glyphs[i]),
                 }
             }
+        }
+    }
+
+    /// **A space beside a digit is still a space, at every size a window uses.** The batch strip
+    /// lays glyphs a cell apart and charges each glyph with any ink in its cell *and the gap after
+    /// it* — so a neighbour whose subpixel fringe bleeds one pixel left of its own pen lands in the
+    /// previous glyph's gap, and a space that has no ink at all comes back "overflowing". The atlas
+    /// then refuses it for the life of the process and every space on screen draws the placeholder
+    /// box. Real on the owner's 150 % display at 24 px, invisible at the 14 px this suite measures.
+    #[test]
+    fn a_space_beside_any_glyph_is_blank_at_every_size() {
+        let Some((rasteriser, face)) =
+            face_or_skip("a_space_beside_any_glyph_is_blank_at_every_size")
+        else {
+            return;
+        };
+        for px in [14u16, 16, 18, 20, 24, 28, 32] {
+            let cell = rasteriser
+                .measure_cell(&face, &ascii_glyphs(&face), px)
+                .expect("measure");
+            let mut codepoints: Vec<u32> = Vec::new();
+            for c in 0x21..0x7Fu32 {
+                codepoints.push(0x20);
+                codepoints.push(c);
+            }
+            let glyphs = face.glyph_indices(&codepoints);
+            let rasters = rasteriser
+                .rasterise(&face, &glyphs, px, cell)
+                .expect("raster");
+            let charged: Vec<char> = rasters
+                .iter()
+                .enumerate()
+                .filter(|(i, r)| i % 2 == 0 && r.is_some())
+                .map(|(i, _)| char::from_u32(codepoints[i + 1]).unwrap_or('?'))
+                .collect();
+            assert!(
+                charged.is_empty(),
+                "at {px}px a space was charged with ink when followed by {charged:?}"
+            );
         }
     }
 

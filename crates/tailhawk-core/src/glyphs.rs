@@ -55,16 +55,21 @@ pub struct GlyphCache {
 }
 
 /// Diagnostic: appends a line to the file `TAILHAWK_ATLAS_LOG` names, if it names one.
-fn atlas_log(line: &str) {
+pub(crate) fn atlas_log(line: &str) {
     use std::io::Write;
-    if let Ok(path) = std::env::var("TAILHAWK_ATLAS_LOG") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(f, "{line}");
-        }
+    use std::sync::OnceLock;
+    // Read once: this is called per placeholder hit, thousands of times a frame on a bad day, and
+    // an environment lookup each time would be the diagnostic costing more than the fault.
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("TAILHAWK_ATLAS_LOG").ok()) else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
     }
 }
 
@@ -235,6 +240,7 @@ impl GlyphCache {
             // never land. That difference is the whole point of the state.
             Residency::Oversized => {
                 self.oversized_hits += 1;
+                atlas_log(&format!("refused {key:?}"));
                 let (px, py) = self.placeholder;
                 (
                     [px as f32, py as f32],
@@ -309,6 +315,10 @@ impl GlyphCache {
                 // again — left `Absent` it would be rasterised on every frame for the life of the
                 // process, a whole batch each time, for a glyph that can never land.
                 Err(InsertError::TooLarge) => {
+                    atlas_log(&format!(
+                        "too large {key:?} ink {}x{} slot {}x{}",
+                        raster.ink.width, raster.ink.height, self.cell.width, self.cell.height
+                    ));
                     self.atlas.insert_oversized(key);
                     continue;
                 }
