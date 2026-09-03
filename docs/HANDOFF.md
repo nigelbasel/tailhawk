@@ -1,5 +1,28 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-09-03, session 31 (later): the column header is a control, and it hung
+
+`header.rs` is `SysHeader32`, one control per pane over the band the view already reserves;
+`HeaderColumn` carries its layout column; a gesture finds its document by the control's own
+window, never by id. The pre-commit review found four defects (gap double-counted on resize,
+reorder in the wrong index space, id = creation slot, hidden panes' headers never hidden) and
+each was fixed before `684d854`.
+
+**Then it hung, and the lesson is worth more than the fix.** A columnised document followed while
+*another process* appended to it stopped painting after the first append: no CPU, no panic, a
+thread that never came back. Bisected with `TAILHAWK_NO_HEADER=1` (kept), then traced with
+`TAILHAWK_ATLAS_LOG` (every child's handle, the paint's stages, the follow tick, each message the
+loop dispatches — all kept, env-gated): the message that never returned was `WM_PAINT` to the
+header. The cause was `request_from_notify` reading `pitem` out of **every** notification the
+control sent — and a header sends `NM_CUSTOMDRAW` on every paint, whose `lParam` is an
+`NMCUSTOMDRAW`, so the "pointer" was its `rc`. **An access violation inside a window procedure
+called from a paint is swallowed by the x64 kernel**: nothing the panic hook can see ever happens,
+and every probe reads as "blocked". `carries_item(code)` now gates the read; `4611e0a`.
+
+**Left undone on the header:** the band above the line-number gutter is bare (owner to say whether
+the header should span it, as Explorer's does); the font is not re-set on `WM_DPICHANGED`; the
+divider double-click reset and hide-by-drag-to-zero the drawn band had are not carried over.
+
 ## ▶ Resume point — 2026-09-03, session 31: Tailhawk tails Loki
 
 `Open remote source` was a **fetch, not a tail** — one `query_range` for the last hour, into a
@@ -16,7 +39,7 @@ returning nothing because it had caught up.
 | **The spill grows without bound** | Live produces faster than 2,000 records per 5 s. A window left open all day is gigabytes. There is no roll, no cap and no eviction. |
 | **`§5`'s `lagging 2s` is not shown** | `UI-DESIGN.md` §597 specifies the lag in the status bar. The tail knows it — newest record versus now — and does not say it. |
 | **Closing the tab does not stop the tail** | Tails live for the window's life, alongside the spills, which is the existing behaviour for spills rather than a new decision. |
-| **Frame budget** | p95 **291 ms**, worst 373 ms while tailing, against §11's 16 ms. This is now the worst thing about using the app and it gets worse as the spill grows. Not investigated. |
+| **Frame budget — closed** | The 291 ms p95 seen here was the header hang's frames (see the resume point above), not the grid. Re-measured with `4611e0a`: synthetic growth of 500 lines every 200 ms with columns and the header, **p95 7.8 ms**, worst 20.8; the live Loki tail **p95 9.4–11.2 ms, worst 11.3 ms, 0 over budget at 63,000 lines**. §11's budget is 16 ms. The only frame over it is the opening one (~110–150 ms: cold atlas plus first index), which is a first-paint cost and not a steady-state one. |
 
 ## ▶ Resume point — 2026-09-03, session 31: a JSON file's keys are its columns
 
