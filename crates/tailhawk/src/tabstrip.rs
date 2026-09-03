@@ -24,7 +24,6 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT};
-use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, SendMessageW, SetWindowPos, ShowWindow, SystemParametersInfoW,
     HWND_TOP, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
@@ -327,10 +326,9 @@ impl TabStrip {
         }
         // Best effort, and documented as such: the tab control honours far less of the dark theme
         // than a list view does. A light strip under a dark theme is a known limit of the control,
-        // not something this module can fix without drawing the tabs again.
-        unsafe {
-            let _ = SetWindowTheme(hwnd, w!("DarkMode_Explorer"), PCWSTR::null());
-        }
+        // not something this module can fix without drawing the tabs again. The decision itself is
+        // the menus' — `controls::apply_theme`, one place for every native surface.
+        crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
         // Padding, scaled for this monitor: the label gets room either side and the tab gets
         // taller. Sent after the font, because the control lays a tab out from both together.
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
@@ -438,6 +436,11 @@ impl TabStrip {
     /// `TCM_ADJUSTRECT` maps a control rectangle to the display area inside it; the difference at
     /// the top is exactly the band the tabs occupy at this font and DPI. Asking is the point — the
     /// drawn strip's `chrome_h + 4.0` is the smallness the owner reported.
+    /// The control's window, for the shell to re-theme when the theme changes.
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     pub fn band_height(&self, width: i32) -> i32 {
         let mut rect = RECT {
             left: 0,

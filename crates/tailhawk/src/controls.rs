@@ -88,3 +88,27 @@ mod tests {
         assert!(big.button_pad_y > small.button_pad_y);
     }
 }
+
+/// Themes a native child control to match the window's menus — **one decision for every surface**.
+///
+/// The owner's screenshot of 2026-09-03 had a light native menu bar sitting on a dark toolbar
+/// strip, and read it as a second, broken menu. Each control had been handed `DarkMode_Explorer`
+/// unconditionally while the menus took the theme setting through `darkmode.rs` — and on a machine
+/// where that best-effort ordinal call does nothing, the two disagree. So the controls follow the
+/// same `dark` the frame is dressed with, here and nowhere else: a toolbar, a tab strip and a status
+/// bar that are all the system's own colours, or all its dark ones, but never a mixture.
+///
+/// Best effort, like everything about theming a common control: a refusal leaves the control in
+/// the system's default look, which is a standard Windows control and exactly what §1.1 asks for.
+pub fn apply_theme(hwnd: windows::Win32::Foundation::HWND, dark: bool) {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::Controls::SetWindowTheme;
+    let name = if dark {
+        w!("DarkMode_Explorer")
+    } else {
+        w!("Explorer")
+    };
+    unsafe {
+        let _ = SetWindowTheme(hwnd, name, PCWSTR::null());
+    }
+}

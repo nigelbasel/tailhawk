@@ -490,10 +490,12 @@ copy — bookmarks, highlight rules and column layout all apply.
 ### 3.1 Many logs at once — tiled panes, independent follow, and scroll lock
 
 > **What of this is built, as of 2026-09-02.** A tab holds **two** panes, stacked or side by side
-> per the edge a tab is dropped on, and `View ▸ Maximise pane` — with a toggle at the end of the
-> toolbar — fills the frame with the focused pane and restores the arrangement again. That is the
-> owner's *"un-maximising reverts to the arrangement, maximising goes back to tabs"*, and it is
-> where this section's promises currently stop.
+> per the edge a tab is dropped on, and `View ▸ Maximise pane` fills the frame with the focused
+> pane and restores the arrangement again. That is the owner's *"un-maximising reverts to the
+> arrangement, maximising goes back to tabs"*, and it is where this section's promises currently
+> stop. **The toolbar toggle it briefly had is gone (2026-09-03):** a window arrangement is not a
+> document command, and the owner's screenshot of a `Maximise` button sitting after `Export` read
+> as exactly the "randomly different" chrome he had asked never to see. The menu is the door.
 >
 > **There is no minimise, and that is settled.** The owner asked for *"a close, maximise minimise
 > button on the extreme right"* on 2026-08-28, and on 2026-09-02, asked what it should mean in a
@@ -505,9 +507,10 @@ copy — bookmarks, highlight rules and column layout all apply.
 > **Not built, and not to be read as though it were**: more than two panes, Tile and Cascade over
 > several document windows, per-pane follow independence, and scroll lock by timestamp or line
 > number. The rest of this section describes an intended shape, most of it written before the owner
-> saw any of it. **Where the window controls belong** — he asked for the tab bar; Maximise is in the
-> toolbar, because a split consumes a tab and the strip is often gone exactly when the control is
-> wanted — is still open.
+> saw any of it. **Where the window controls belong** is half settled: **not in the toolbar** — the
+> toggle that lived there was removed on 2026-09-03 after the owner's screenshot — and whether they
+> go on the tab bar, as he first asked, is the question still open with him. Until it is answered
+> the menu is the only door, and a split that consumes the strip does not lose the command.
 
 *(Owner's requirement, 2026-08-19. §3 above is one log split two ways; this is several logs at
 once, which is a different problem and the one MDI existed to solve.)*

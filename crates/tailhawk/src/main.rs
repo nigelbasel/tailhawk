@@ -4611,7 +4611,7 @@ impl Shell {
                     let cell = renderer.cell()?;
                     self.cell_w = cell.0;
                     self.cell_h = cell.1;
-                    let buttons = toolbar::toolbar_of(None, false, false);
+                    let buttons = toolbar::toolbar_of(None);
                     let band = match (self.toolbar.as_mut(), self.show_toolbar) {
                         (Some(bar), true) => {
                             bar.set(&buttons);
@@ -4711,11 +4711,7 @@ impl Shell {
                 };
                 // §2.3's row, directly under the strip. Its band is asked of the control for the
                 // same reason the strip's is, and the two together are what the grid starts below.
-                let buttons = toolbar::toolbar_of(
-                    self.document.as_ref(),
-                    self.document.can_maximise(),
-                    self.document.maximised(),
-                );
+                let buttons = toolbar::toolbar_of(self.document.as_ref());
                 let toolbar_px = match (self.toolbar.as_mut(), self.show_toolbar) {
                     (Some(bar), true) => {
                         bar.set(&buttons);
@@ -5263,6 +5259,18 @@ impl Shell {
     fn adopt_theme(&mut self, hwnd: HWND, name: &str, next: Theme) {
         theme::set_theme(next);
         dress_frame(hwnd, next.dark);
+        // The native children follow the same decision as the frame and the menus, or the window
+        // is a light menu bar over a dark toolbar — which is what the owner's screenshot showed.
+        for child in [
+            self.tabs.as_ref().map(|t| t.hwnd()),
+            self.toolbar.as_ref().map(|t| t.hwnd()),
+            self.statusbar.as_ref().map(|s| s.hwnd()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            controls::apply_theme(child, next.dark);
+        }
         // The *name*, not the resolved palette: "system" is an instruction, and storing what it
         // resolved to today loses the instruction.
         self.theme_name = Some(name.to_owned());

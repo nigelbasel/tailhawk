@@ -23,8 +23,8 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT, HGDIOBJ};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetWindowTheme, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, SBARS_SIZEGRIP,
-    SB_SETPARTS, SB_SETTEXTW,
+    InitCommonControlsEx, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, SBARS_SIZEGRIP, SB_SETPARTS,
+    SB_SETTEXTW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetWindowRect, SendMessageW, HMENU, WINDOW_EX_STYLE,
@@ -78,11 +78,8 @@ impl StatusBar {
                 SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
             }
         }
-        // Best effort, exactly as the toolbar's and the tab strip's are: the bar honours some of
-        // the dark theme through this and the rest is the system's business, not ours to paint.
-        unsafe {
-            let _ = SetWindowTheme(hwnd, w!("DarkMode_Explorer"), PCWSTR::null());
-        }
+        // The same theme decision the menus take — `controls::apply_theme`, one place for all.
+        crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
         let bar = StatusBar {
             hwnd,
             font,
@@ -103,6 +100,11 @@ impl StatusBar {
                 LPARAM(edges.as_ptr() as isize),
             );
         }
+    }
+
+    /// The control's window, for the shell to re-theme when the theme changes.
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
     }
 
     /// How tall the bar is, in client pixels — the system's answer, not ours. The caller subtracts
