@@ -955,6 +955,26 @@ mod tests {
     }
     const PAPER: [f32; 4] = [0.85, 0.85, 0.85, 1.0];
 
+    fn painter_at_or_skip(what: &str, em: u16) -> Option<(Offscreen, Painter)> {
+        let off = match Offscreen::new(TARGET, TARGET) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("SKIPPED {what}: no D3D11 device ({e})");
+                return None;
+            }
+        };
+        match Painter::new(off.device(), CANDIDATES, em, CHROME, CHROME_EM) {
+            Ok(mut p) => {
+                assert!(p.prime(off.context()), "the placeholder must upload");
+                Some((off, p))
+            }
+            Err(e) => {
+                eprintln!("SKIPPED {what}: no usable font or pipeline ({e})");
+                None
+            }
+        }
+    }
+
     fn painter_or_skip(what: &str) -> Option<(Offscreen, Painter)> {
         let off = match Offscreen::new(TARGET, TARGET) {
             Ok(o) => o,
@@ -1085,6 +1105,49 @@ mod tests {
             "the space drew {} quad(s) — a placeholder box, on every space in the grid",
             with - without
         );
+    }
+
+    /// **At every size the owner's machine can be running.** §3.1 re-derives the cell per scale, so
+    /// "a space draws nothing" at the test's own em says nothing about the em a real window uses:
+    /// the settings on the machine that showed the boxes carry `font_size = 16`, and a display at
+    /// 150 % turns that into 24. A glyph whose ink escapes its cell at one size and not another is
+    /// refused by the atlas as `Oversized` and draws the placeholder for the life of the process,
+    /// so a size-dependent fault is exactly the shape this defect has.
+    #[test]
+    fn a_space_draws_nothing_at_every_size_a_window_uses() {
+        for em in [12u16, 14, 16, 18, 20, 24, 28, 32] {
+            let Some((off, mut painter)) = painter_at_or_skip("space at size", em) else {
+                return;
+            };
+            let view = view_for(&painter, 1, 200);
+            // **A differential, not an absolute count.** A long row is clipped by the view, and the
+            // view holds a different number of cells at every size — so the only figure that means
+            // the same thing across the sweep is what the space itself cost.
+            let mut quads = |text: &str| {
+                for _ in 0..3 {
+                    painter.begin_frame();
+                    painter
+                        .lay_out_row(
+                            &view,
+                            text,
+                            ColumnAnchors::none_ref(),
+                            Colours::plain(INK),
+                            0.0,
+                        )
+                        .expect("lay out");
+                    painter.flush_misses(off.context()).expect("flush");
+                }
+                painter.instances().len()
+            };
+            let without = quads("AB");
+            let with = quads("A B");
+            assert_eq!(
+                with,
+                without,
+                "at {em}px a space drew {} quad(s) — a placeholder box",
+                with.saturating_sub(without)
+            );
+        }
     }
 
     /// **The commonest character in a log file, and nothing had ever asked about it.** A grid full
