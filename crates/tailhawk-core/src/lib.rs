@@ -984,6 +984,38 @@ mod tests {
         assert!(warm.quads > 0);
     }
 
+    /// **A warm frame draws one quad per inked character and not one more.**
+    ///
+    /// The owner reported a grid of hollow rectangles, one at every space. A cell-sized hollow
+    /// rectangle is the glyph cache's placeholder, and there are two ways for one to survive a
+    /// flush: the glyph is never queued, or it is `Oversized` — which draws the placeholder for the
+    /// life of the process **and is never queued**, so
+    /// [`the_second_frame_is_warm`](tests::the_second_frame_is_warm) passes over it in silence.
+    /// That is the hole this closes: counting quads catches what counting misses cannot.
+    ///
+    /// The line is a real one, from a live pull.
+    #[cfg(windows)]
+    #[test]
+    fn a_warm_frame_draws_no_quad_for_a_space() {
+        let Some((mut r, view)) = renderer_or_skip("a_warm_frame_draws_no_quad_for_a_space") else {
+            return;
+        };
+        let text = "HTTP GET /connect/userinfo responded 200 in 65.2437 ms";
+        let line = Listed(vec![text.to_owned()]);
+
+        let _cold = r.paint_rows(&view, &line).expect("cold frame");
+        let warm = r.paint_rows(&view, &line).expect("warm frame");
+
+        let inked = text.chars().filter(|c| !c.is_whitespace()).count();
+        let spaces = text.chars().filter(|c| c.is_whitespace()).count();
+        assert_eq!(
+            warm.quads, inked,
+            "{} quads for {inked} inked characters and {spaces} spaces — the difference is a \
+             placeholder box per space",
+            warm.quads
+        );
+    }
+
     /// The two stages of the first paint must be the same colour (`SPEC.md` §3.2). They are
     /// necessarily expressed twice — GDI wants 8-bit channels, the render target wants floats —
     /// and if they ever drift apart the handover from the class brush to the renderer becomes a

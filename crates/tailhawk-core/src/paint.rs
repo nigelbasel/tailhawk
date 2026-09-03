@@ -1017,6 +1017,98 @@ mod tests {
         );
     }
 
+    /// **A space must put no quad on screen, and this is the test that was missing.**
+    ///
+    /// The owner reported a grid full of hollow rectangles — `HTTP□GET`, and a lattice of them
+    /// filling the padding after every short value. A cell-sized hollow rectangle is exactly what
+    /// [`GlyphCache::prime`](crate::glyphs::GlyphCache) uploads as its placeholder, so every space
+    /// was drawing the placeholder for the life of the process.
+    ///
+    /// Nothing caught it because everything that *could* have was aimed one layer off. The glyph
+    /// cache has `a_space_is_recorded_as_blank_and_stops_being_a_miss` and it passes; the faces
+    /// have their space, and [`both_faces_have_a_space`] says so. Neither goes through the
+    /// **shaper**, which is what a row is actually laid out with — and a row is where the boxes
+    /// were.
+    #[test]
+    fn a_space_in_a_row_draws_nothing_at_all() {
+        let Some((_off, mut painter)) = painter_or_skip("a space draws nothing") else {
+            return;
+        };
+        let view = view_for(&painter, 1, 200);
+
+        // **Warm the cache first.** On a cold one a placeholder is the correct answer — §3.2 says a
+        // frame must never block on rasterisation — so asserting before a flush would be asserting
+        // against the design. What must not happen is the placeholder *surviving* the flush.
+        for _ in 0..2 {
+            painter.begin_frame();
+            painter
+                .lay_out_row(
+                    &view,
+                    "A B",
+                    ColumnAnchors::none_ref(),
+                    Colours::plain(INK),
+                    0.0,
+                )
+                .expect("lay out");
+            painter.flush_misses(_off.context()).expect("flush");
+        }
+
+        // Two rows of the same letters, one with a space between them and one without. The
+        // difference in quads is what the space cost, and it must be nothing.
+        painter.begin_frame();
+        painter
+            .lay_out_row(
+                &view,
+                "AB",
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
+            .expect("lay out");
+        let without = painter.instances().len();
+
+        painter.begin_frame();
+        painter
+            .lay_out_row(
+                &view,
+                "A B",
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
+            .expect("lay out");
+        let with = painter.instances().len();
+
+        assert_eq!(
+            with,
+            without,
+            "the space drew {} quad(s) — a placeholder box, on every space in the grid",
+            with - without
+        );
+    }
+
+    /// **The commonest character in a log file, and nothing had ever asked about it.** A grid full
+    /// of hollow rectangles between every pair of words is what a `.notdef` space looks like, and
+    /// the owner reported exactly that — `HTTP□GET`, and a lattice of boxes filling the padding
+    /// after every short value. The markers above are tested for this and the space was not,
+    /// because it is the character you never think to check.
+    #[test]
+    fn both_faces_have_a_space() {
+        let Some((_off, p)) = painter_or_skip("space") else {
+            return;
+        };
+        assert_ne!(
+            p.grid_face().glyph_indices(&[0x20])[0],
+            0,
+            "the grid face draws every space as a .notdef box"
+        );
+        assert_ne!(
+            p.chrome_face().glyph_indices(&[0x20])[0],
+            0,
+            "the chrome face draws every space as a .notdef box"
+        );
+    }
+
     #[test]
     fn the_chrome_face_has_the_markers_the_chrome_draws() {
         let Some((_off, p)) = painter_or_skip("chrome markers") else {
