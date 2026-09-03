@@ -439,7 +439,7 @@ pub fn w3c(fields: &[String]) -> &'static Format {
 /// The spellings are the `ndjson` catalogue entry's own, deliberately: a key that reader would
 /// have taken as the timestamp must not arrive here as an ordinary column, or the same file would
 /// have a `ts` column under one reader and a `@t` column under the other.
-fn understood(key: &str) -> Option<&'static str> {
+pub(crate) fn understood_key(key: &str) -> Option<&'static str> {
     match key {
         "@t" | "time" | "timestamp" | "ts" => Some(TS),
         "@l" | "level" | "lvl" | "severity" => Some(LEVEL),
@@ -468,7 +468,7 @@ fn json_columns(keys: &[crate::detect::JsonKey]) -> Vec<(String, String)> {
     let text: Vec<&crate::detect::JsonKey> = keys.iter().filter(|k| k.is_text()).collect();
     let mut roles: Vec<(String, String)> = Vec::new();
     for key in &text {
-        if let Some(role) = understood(&key.name) {
+        if let Some(role) = understood_key(&key.name) {
             if !roles.iter().any(|(taken, _)| taken == role) {
                 roles.push((role.to_owned(), key.name.clone()));
             }
@@ -519,7 +519,7 @@ fn json_columns(keys: &[crate::detect::JsonKey]) -> Vec<(String, String)> {
 pub fn json_lines_adds_columns(keys: &[crate::detect::JsonKey]) -> bool {
     let columns = json_columns(keys);
     let has_message = columns.iter().any(|(name, _)| name == MSG);
-    let extras = columns.iter().any(|(_, raw)| understood(raw).is_none());
+    let extras = columns.iter().any(|(_, raw)| understood_key(raw).is_none());
     has_message && extras
 }
 

@@ -788,9 +788,17 @@ new directive appears and subsequent rows are re-keyed.
 
 **A JSON file describes its columns in its keys**, which is how the context beside the message —
 `app`, `environment`, a trace id, a scope — reaches the grid at all: the catalogue's JSON-lines
-entry declares `ts`, `level` and `msg` and has nowhere to put anything else. The template is the
-richest sampled line rather than the first, since a structured logger omits a key it has no value
-for.
+entry declares `ts`, `level` and `msg` and has nowhere to put anything else.
+
+**The key order is merged across the sampled lines, not taken from any one of them.** No single
+line can be trusted to hold every key: a structured logger omits a key it has no value for, and
+Loki merges each record's own structured metadata into its stream object, so one record carries a
+`key_0` its neighbour does not. Each line is walked against a cursor into the order built so far —
+a key found at or ahead of it advances the cursor, a key not yet seen is inserted there, and a key
+found *behind* it is a genuine disagreement about order and refuses the file. Keys are then ranked
+by **how many sampled rows carry them**, since a merged order is a union and collects the one-off
+alongside the universal; a key on fewer than a quarter of the rows is not a column, because a
+column blank on three rows in four is a gap with a heading.
 
 **Four refusals, each of which is a way of being silently wrong**, and all of them apply the same
 rule as stage 4's margin — silent mis-columnising is worse than no columnising:
@@ -801,9 +809,9 @@ rule as stage 4's margin — silent mis-columnising is worse than no columnising
   continuation of that single row.
 - **No line may nest.** A pattern searches the whole line and cannot count braces, so
   `{"ctx":{"app":"decoy"},"app":"real"}` binds the `app` column to `decoy` on every row.
-- Every other line's keys must be a **subsequence** of the template. A reordered line still
-  matches — every group is optional — but binds the wrong ones, so cells go blank on some rows and
-  not others with nothing on screen to say why.
+- The sampled lines must not disagree about key **order**. A reordered line still matches — every
+  group is optional — but binds the wrong ones, so cells go blank on some rows and not others with
+  nothing on screen to say why.
 - There must be a **message** column, since §2.5 gives the last column the free remainder of the
   width and that is where the message is placed, whatever order the file writes it in.
 

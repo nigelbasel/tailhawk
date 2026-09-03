@@ -75,6 +75,15 @@ pub const ACCEPT_MARGIN: f32 = 1.15;
 /// the measurements are in `HANDOFF.md`.
 pub const MAX_JSON_COLUMNS: usize = 6;
 
+/// The share of sampled rows a key must appear on to be worth a column: one in this many.
+///
+/// A merged key order is a **union**, so it collects a single record's `key_0` alongside the `app`
+/// every record carries. Without a floor those one-offs take the cap purely by being in the list,
+/// and the labels that prompted all of this never reach the grid. A column blank on three rows in
+/// four is not context; it is a gap with a heading. Nothing is lost by leaving it out — the key is
+/// still in the record's attributes and in §6.1's raw line, which is what the detail pane reads.
+pub const JSON_COLUMN_SHARE: usize = 4;
+
 /// What kind of value a top-level JSON key carries. Both distinctions are load-bearing.
 ///
 /// **[`Text`](JsonValue::Text) is the only kind that can be a column.** A column is a **byte range
@@ -371,19 +380,15 @@ pub fn json_keys(line: &str) -> Option<Vec<JsonKey>> {
 
 /// The key order a whole file can be read by, or `None` when it has no single one.
 ///
-/// **The template is the richest sampled line, not the first.** Loki writes `@l` only for a stream
-/// that carries a level, so the opening line of a spill is routinely missing a key most of the
-/// rest have, and taking line one would drop that column from the entire file.
+/// **The order is merged across the sampled lines — see [`merged_order`], which is where the
+/// reasoning lives and where the first construction of this went wrong.**
 ///
-/// **Every other line's keys must be a subsequence of it**, which is the guard that matters, and
-/// what goes wrong without it is quieter than it looks. Every group in the pattern is optional and
-/// the whole thing is wrapped in `^\s*\{ … \}\s*$`, so a reordered line still *matches* — it does
-/// not become a §6.4 continuation. What it does is bind the wrong groups: a line writing `@m`
-/// before `app` gives up its message cell, because the message group sits after the `app` group
-/// and the text it wanted has already been consumed. **Empty cells on some rows and not others**,
-/// with nothing on screen to say the file was read wrongly. Lines that disagree on order are
-/// precisely the evidence that no ordered pattern can serve this file, so it gets none and the
-/// catalogue keeps it.
+/// What the merge is guarding against is quieter than it looks. Every group in the pattern is
+/// optional and the whole thing is wrapped in `^\s*\{ … \}\s*$`, so a line whose keys run the other
+/// way still *matches* — it does not become a §6.4 continuation. What it does is bind the wrong
+/// groups: a line writing `@m` before `app` gives up its message cell, because the message group
+/// sits after the `app` group and the text it wanted has already been consumed. **Empty cells on
+/// some rows and not others**, with nothing on screen to say the file was read wrongly.
 ///
 /// **The sample is the head alone** — [`HEAD_BYTES`], through [`head_lines`] — so this is evidence
 /// about a file, not a proof about it. A file that changes its key order a gigabyte in loses cells
@@ -400,10 +405,6 @@ pub fn json_template(lines: &[String]) -> Option<Vec<JsonKey>> {
     for line in lines.iter().filter(|l| !l.trim().is_empty()) {
         sampled.push(json_keys(line)?);
     }
-    let template = sampled.iter().max_by_key(|keys| keys.len())?.clone();
-    if template.is_empty() {
-        return None;
-    }
     // Nesting anywhere in the head costs the file its columns — see [`JsonValue::Nested`], which
     // is where the reason lives.
     if sampled
@@ -413,25 +414,79 @@ pub fn json_template(lines: &[String]) -> Option<Vec<JsonKey>> {
     {
         return None;
     }
-    let subsequence = |keys: &[JsonKey]| {
-        let mut at = 0usize;
-        keys.iter().all(|key| {
-            match template[at..]
-                .iter()
-                .position(|candidate| candidate.name == key.name)
-            {
-                Some(found) => {
-                    at += found + 1;
-                    true
-                }
-                None => false,
-            }
-        })
+    let order = merged_order(&sampled)?;
+    if order.is_empty() {
+        return None;
+    }
+    // **Extras are ranked by how many rows carry them**, because a merged order is a union and a
+    // union collects the rare along with the universal: one record's `key_0` sits in the same list
+    // as the `app` every record has, and a column present on two rows in four hundred is a column
+    // of blanks. Ties keep merged order, so a file whose keys are all universal — which a spill's
+    // are — is presented in the order it writes them.
+    let rows = |name: &str| {
+        sampled
+            .iter()
+            .filter(|keys| keys.iter().any(|key| key.name == name))
+            .count()
     };
-    sampled
+    let floor = sampled.len().div_ceil(JSON_COLUMN_SHARE);
+    let mut extras: Vec<(usize, usize)> = order
         .iter()
-        .all(|keys| subsequence(keys))
-        .then_some(template)
+        .enumerate()
+        .filter(|(_, key)| key.is_text() && crate::format::understood_key(&key.name).is_none())
+        .map(|(at, key)| (at, rows(&key.name)))
+        .filter(|(_, rows)| *rows >= floor)
+        .collect();
+    extras.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    extras.truncate(MAX_JSON_COLUMNS);
+    let kept: Vec<usize> = extras.into_iter().map(|(at, _)| at).collect();
+    Some(
+        order
+            .into_iter()
+            .enumerate()
+            .filter(|(at, key)| {
+                key.is_text()
+                    && (crate::format::understood_key(&key.name).is_some() || kept.contains(at))
+            })
+            .map(|(_, key)| key)
+            .collect(),
+    )
+}
+
+/// The one key order every sampled line agrees with, or `None` when they cannot be reconciled.
+///
+/// **A union, built by merging, and not "the line that has them all".** That was the first
+/// construction and it cannot survive real data: Loki merges each record's own structured metadata
+/// into its stream object, so one record carries `key_0` and its neighbour does not, and **no line
+/// is ever a superset of the rest**. Requiring one meant a live spill silently kept the catalogue's
+/// three columns — the labels were fetched, written and still not shown.
+///
+/// Each line is walked against a cursor into the order built so far. A key found at or ahead of the
+/// cursor advances it; a key not present is *inserted* at the cursor, which is where the line says
+/// it belongs. A key found **behind** the cursor is the one thing that cannot be reconciled — this
+/// line writes two keys in the opposite order to an earlier one — and that is a genuine
+/// disagreement, so it is refused rather than guessed at.
+fn merged_order(sampled: &[Vec<JsonKey>]) -> Option<Vec<JsonKey>> {
+    let mut order: Vec<JsonKey> = Vec::new();
+    for keys in sampled {
+        let mut cursor = 0usize;
+        for key in keys {
+            match order[cursor..]
+                .iter()
+                .position(|seen| seen.name == key.name)
+            {
+                Some(found) => cursor += found + 1,
+                None => {
+                    if order[..cursor].iter().any(|seen| seen.name == key.name) {
+                        return None;
+                    }
+                    order.insert(cursor, key.clone());
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    Some(order)
 }
 
 /// Stage 3 for one format. `None` when it matched nothing at all.
@@ -742,12 +797,113 @@ mod tests {
         assert_eq!(json_keys("{}"), Some(Vec::new()));
     }
 
-    /// **The template is the richest line, not the first.** Loki writes `@l` only for a stream
-    /// that carries a level, so the first line of a spill is routinely missing a key that most of
-    /// the rest have; taking line one as the template would drop `level` from every row in the
-    /// file.
+    /// **The shape a real Loki spill actually has, and the one the first construction could not
+    /// read.** Every record merges its own structured metadata into its stream object, so one line
+    /// carries `key_0` and its neighbours do not — no line is a superset of the rest. Requiring one
+    /// meant a live spill silently kept the catalogue's three columns: the labels were fetched,
+    /// written to disk, and still not shown. These two lines are the first two of a real pull,
+    /// with the values replaced.
     #[test]
-    fn the_template_is_the_line_with_the_most_keys_not_the_first() {
+    fn a_key_only_one_record_carries_does_not_cost_the_file_its_columns() {
+        // **Three lines, and the third is what makes this a real fixture.** With only the first
+        // two, line two happens to hold every key line one has — so the superset rule this replaced
+        // would pass, and a mutation back to it went green. It takes a *second* record with a
+        // one-off key of its own before no line contains them all, which is the case a 560-line
+        // sample is full of and a two-line fixture cannot reach.
+        let sample = lines(
+            "{\"@t\":\"2026-09-03T08:29:55.7228166Z\",\"@l\":\"info\",\"app\":\"nurtur-contacts-job-manager\",\"environment\":\"live\",\"message_template_text\":\"Updating Worker Threads\",\"observed_timestamp\":\"1788424195722816600\",\"scope_name\":\"QueueManagerWorker\",\"severity_number\":\"9\",\"@m\":\"Updating Worker Threads\"}\n\
+             {\"@t\":\"2026-09-03T08:29:55.7228497Z\",\"@l\":\"info\",\"app\":\"nurtur-contacts-job-manager\",\"environment\":\"live\",\"key_0\":\"0\",\"message_template_text\":\"Removing {0} Queues\",\"observed_timestamp\":\"1788424195722849700\",\"scope_name\":\"QueueManagerWorker\",\"severity_number\":\"9\",\"@m\":\"Removing 0 Queues\"}\n\
+             {\"@t\":\"2026-09-03T08:29:55.7229120Z\",\"@l\":\"warn\",\"app\":\"nurtur-identity-server\",\"environment\":\"live\",\"key_queue\":\"contacts\",\"message_template_text\":\"Queue {queue} is deep\",\"observed_timestamp\":\"1788424195722912000\",\"scope_name\":\"TokenEndpoint\",\"severity_number\":\"13\",\"@m\":\"Queue contacts is deep\"}\n",
+        );
+        let template = json_template(&sample).expect("a real spill must yield a template");
+        assert!(names(&template).contains(&"app"), "{:?}", names(&template));
+        assert!(
+            names(&template).contains(&"environment"),
+            "{:?}",
+            names(&template)
+        );
+
+        let format = detect(&sample).accepted.expect("a format");
+        assert_eq!(format.id, "json-lines");
+        let titles: Vec<&str> = format.column_titles().collect();
+        let at = |title: &str| titles.iter().position(|t| *t == title).expect(title);
+        let read = |line: &String, title: &str| {
+            format.fields(line).expect("a first line")[at(title)]
+                .clone()
+                .map(|r| line[r].to_owned())
+        };
+        assert_eq!(
+            read(&sample[1], "app").as_deref(),
+            Some("nurtur-contacts-job-manager")
+        );
+        assert_eq!(read(&sample[1], "environment").as_deref(), Some("live"));
+        assert_eq!(read(&sample[1], "@m").as_deref(), Some("Removing 0 Queues"));
+        assert_eq!(titles.last(), Some(&"@m"), "{titles:?}");
+    }
+
+    /// **The order is a merge, and this is the property that says so.** Taking any single line —
+    /// the first, or the longest — cannot see a key that line does not carry. Here the longest
+    /// record is the one with two one-off keys, and `region` is on three rows out of four but not
+    /// on that one: read from the longest line it would never be a column at all, and the merge is
+    /// what puts it back.
+    #[test]
+    fn a_key_the_longest_line_lacks_still_becomes_a_column() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"app\":\"identity\",\"one_off_x\":\"1\",\"one_off_y\":\"2\",\"@m\":\"one\"}\n\
+             {\"@t\":\"b\",\"app\":\"identity\",\"region\":\"uksouth\",\"@m\":\"two\"}\n\
+             {\"@t\":\"c\",\"app\":\"identity\",\"region\":\"uksouth\",\"@m\":\"three\"}\n\
+             {\"@t\":\"d\",\"app\":\"identity\",\"region\":\"ukwest\",\"@m\":\"four\"}\n",
+        );
+        let template = json_template(&sample).expect("a template");
+        assert!(
+            names(&template).contains(&"region"),
+            "the longest line has no region: {:?}",
+            names(&template)
+        );
+
+        let format = detect(&sample).accepted.expect("a format");
+        let titles: Vec<&str> = format.column_titles().collect();
+        let at = titles.iter().position(|t| *t == "region").expect("region");
+        let ranges = format.fields(&sample[3]).expect("a first line");
+        assert_eq!(
+            ranges[at].clone().map(|r| &sample[3][r]),
+            Some("ukwest"),
+            "{titles:?}"
+        );
+    }
+
+    /// **Rare keys lose their column to common ones.** A merged order is a union, so it collects
+    /// the one record's `key_0` alongside the `app` every record has; without ranking, a handful of
+    /// one-off keys would take the cap and leave the labels out of the grid.
+    #[test]
+    fn a_key_almost_no_row_carries_loses_its_column_to_one_they_all_do() {
+        let mut sample: Vec<String> = (0..20)
+            .map(|i| {
+                format!(
+                    "{{\"@t\":\"a{i}\",\"app\":\"identity\",\"environment\":\"live\",\"@m\":\"m{i}\"}}"
+                )
+            })
+            .collect();
+        sample[3] = "{\"@t\":\"a3\",\"app\":\"identity\",\"environment\":\"live\",\"one_off_a\":\"x\",\"one_off_b\":\"x\",\"one_off_c\":\"x\",\"one_off_d\":\"x\",\"one_off_e\":\"x\",\"one_off_f\":\"x\",\"@m\":\"m3\"}".to_owned();
+        let template = json_template(&sample).expect("a template");
+        assert!(names(&template).contains(&"app"), "{:?}", names(&template));
+        assert!(
+            names(&template).contains(&"environment"),
+            "{:?}",
+            names(&template)
+        );
+        assert!(
+            !names(&template).contains(&"one_off_a"),
+            "{:?}",
+            names(&template)
+        );
+    }
+
+    /// A key most lines lack still merges into the order, and it lands where the line that has it
+    /// says it belongs. Loki writes `@l` only for a stream that carries a level, so the first line
+    /// of a spill is routinely short a key most of the rest have.
+    #[test]
+    fn a_key_missing_from_the_first_line_still_merges_into_the_order() {
         let sample = lines(
             "{\"@t\":\"2026-09-03T07:00:00Z\",\"@m\":\"one\",\"app\":\"identity\"}\n\
              {\"@t\":\"2026-09-03T07:00:01Z\",\"@l\":\"Error\",\"@m\":\"two\",\"app\":\"identity\",\"environment\":\"live\"}\n\
@@ -999,6 +1155,12 @@ mod corpus {
             d.accepted.map(|f| f.id),
             d.describe().unwrap_or_else(|| "plain text".into())
         );
+        if let Some(format) = d.accepted {
+            println!(
+                "  columns: {:?}",
+                format.column_titles().collect::<Vec<_>>()
+            );
+        }
         for c in &d.candidates {
             println!(
                 "  {:<16} score {:.3} quality {:.3} match {:.2} valid {:.2} cover {:.2}",
