@@ -90,6 +90,17 @@ pub struct Format {
 }
 
 impl Format {
+    /// Each of [`columns`](Self::columns) as the header names it: the declared title where there is
+    /// one, the capture name otherwise. The same choice [`Layout::title`](crate::columns::Layout::title)
+    /// makes, without needing a layout to ask it.
+    pub fn column_titles(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.columns.iter().enumerate().map(|(i, name)| {
+            self.titles
+                .and_then(|titles| titles.get(i).copied())
+                .unwrap_or(name)
+        })
+    }
+
     /// Marks the message as living on the line after the first — MEL Simple. See [`Format::body_next_line`].
     fn with_body_on_next_line(mut self) -> Self {
         self.body_next_line = true;
@@ -417,6 +428,158 @@ pub fn w3c(fields: &[String]) -> &'static Format {
         levels: &[],
         continuation: Some(re("^#")),
         columns,
+        samples: &[],
+        body_next_line: false,
+        titles: Some(titles),
+    }))
+}
+
+/// The capture name a JSON key plays, when it is one of the three the grid understands.
+///
+/// The spellings are the `ndjson` catalogue entry's own, deliberately: a key that reader would
+/// have taken as the timestamp must not arrive here as an ordinary column, or the same file would
+/// have a `ts` column under one reader and a `@t` column under the other.
+fn understood(key: &str) -> Option<&'static str> {
+    match key {
+        "@t" | "time" | "timestamp" | "ts" => Some(TS),
+        "@l" | "level" | "lvl" | "severity" => Some(LEVEL),
+        "@m" | "@mt" | "msg" | "message" => Some(MSG),
+        _ => None,
+    }
+}
+
+/// The columns a JSON template yields: the capture name, and the raw key as its title.
+///
+/// A key is dropped when its value is not a string (see [`JsonKey`](crate::detect::JsonKey)), when
+/// its sanitised name collides with one already taken — two keys spelled `a.b` and `a-b` would
+/// compile to one capture name, which is an error rather than a column — or when the extras are
+/// already at [`MAX_JSON_COLUMNS`](crate::detect::MAX_JSON_COLUMNS).
+/// **Two passes, and the order of them is the point.** The understood roles are bound first, from
+/// the *raw* key, so that a key spelled `msg ` or `@level` — which sanitises onto a role's own
+/// name — cannot take a role's place merely by appearing earlier in the record. A single pass did
+/// exactly that: `{"msg ":"…","@m":"the real message"}` gave the `msg` column to the decoy and
+/// dropped `@m` from the grid entirely, message and all.
+///
+/// Extras are then sanitised into capture names and **disambiguated with a suffix** rather than
+/// dropped. Two keys spelled `a.b` and `a-b` compile to one capture name, which `regex` refuses,
+/// and any two non-ASCII keys sanitise to nothing at all — silently losing the second is a column
+/// of real data gone with no sign of it.
+fn json_columns(keys: &[crate::detect::JsonKey]) -> Vec<(String, String)> {
+    let text: Vec<&crate::detect::JsonKey> = keys.iter().filter(|k| k.is_text()).collect();
+    let mut roles: Vec<(String, String)> = Vec::new();
+    for key in &text {
+        if let Some(role) = understood(&key.name) {
+            if !roles.iter().any(|(taken, _)| taken == role) {
+                roles.push((role.to_owned(), key.name.clone()));
+            }
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut extras = 0usize;
+    for key in &text {
+        if let Some(found) = roles.iter().find(|(_, raw)| *raw == key.name) {
+            out.push(found.clone());
+            continue;
+        }
+        if extras == crate::detect::MAX_JSON_COLUMNS {
+            continue;
+        }
+        extras += 1;
+        let sanitised: String = key
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let mut stem = sanitised.trim_matches('_').to_owned();
+        if stem.is_empty() || stem.starts_with(|c: char| c.is_ascii_digit()) {
+            stem.insert(0, 'k');
+        }
+        let mut name = stem.clone();
+        let mut suffix = 2usize;
+        while roles
+            .iter()
+            .chain(out.iter())
+            .any(|(taken, _)| *taken == name)
+        {
+            name = format!("{stem}{suffix}");
+            suffix += 1;
+        }
+        out.push((name, key.name.clone()));
+    }
+    out
+}
+
+/// Whether a JSON template is worth a format of its own.
+///
+/// Two conditions, both necessary. It must carry **something beyond** the three columns the
+/// catalogue's `ndjson` reader already shows, or there is nothing to gain by leaving it. And it
+/// must have a **message column**, because §2.5 gives the grid's last column the free remainder of
+/// the width and [`json_lines`] puts the message there — with no message key at all, a label would
+/// inherit the whole window.
+pub fn json_lines_adds_columns(keys: &[crate::detect::JsonKey]) -> bool {
+    let columns = json_columns(keys);
+    let has_message = columns.iter().any(|(name, _)| name == MSG);
+    let extras = columns.iter().any(|(_, raw)| understood(raw).is_none());
+    has_message && extras
+}
+
+/// A format for JSON lines that share one key order — `SPEC.md` §6.3 stage 2, the self-describing
+/// branch a `#Fields:` line takes for W3C. See [`detect::json_template`](crate::detect::json_template).
+///
+/// Every group is **optional**, so a line missing a key the template has still matches and simply
+/// leaves that cell empty; what a line may not do is write its keys in a different order, which is
+/// what `json_template` refuses up front.
+///
+/// **Leaked, for the reason [`w3c`] is**: the catalogue is `'static`, everything downstream holds a
+/// `&'static Format`, and this is one small allocation per file opened.
+pub fn json_lines(keys: &[crate::detect::JsonKey]) -> &'static Format {
+    let columns = json_columns(keys);
+    // **The pattern follows the file's key order; the columns do not have to.** A regex must
+    // consume its groups in the order the text writes them, but `Format::fields` looks each column
+    // up *by name*, so display order is free — which is what lets the message go last whatever the
+    // file does with it.
+    let mut pattern = String::from(r"^\s*\{");
+    for (name, raw) in &columns {
+        pattern.push_str(&format!(
+            r#"(?:.*?"{}"\s*:\s*"(?P<{name}>(?:[^"\\]|\\.)*)")?"#,
+            regex::escape(raw)
+        ));
+    }
+    pattern.push_str(r".*\}\s*$");
+    // §2.5 gives the last column the free remainder of the width, and that has to be the message.
+    // Bunyan writes `name, hostname, pid, level, msg, time, v`; left in file order the message
+    // would be capped at `columns::MAX_CELLS` and a twenty-character timestamp would be handed the
+    // rest of the window.
+    let mut shown = columns.clone();
+    if let Some(at) = shown.iter().position(|(name, _)| name == MSG) {
+        let message = shown.remove(at);
+        shown.push(message);
+    }
+    let leak = |s: &str| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) };
+    let names: &'static [&'static str] = Box::leak(
+        shown
+            .iter()
+            .map(|(name, _)| leak(name))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let titles: &'static [&'static str] = Box::leak(
+        shown
+            .iter()
+            .map(|(_, raw)| leak(raw))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(Format {
+        id: "json-lines",
+        name: "JSON lines",
+        specificity: 0.95,
+        first_line: re(&pattern),
+        stamp: Stamp::Iso,
+        level: Level::Word,
+        levels: &[],
+        continuation: None,
+        columns: names,
         samples: &[],
         body_next_line: false,
         titles: Some(titles),

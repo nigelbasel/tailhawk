@@ -14,10 +14,16 @@
 //! ## Stage 2 — self-describing short-circuits
 //!
 //! `memmem`-class tests, first match wins, no scoring: `#Fields:` in the first 20 lines is **W3C
-//! Extended** and its columns are taken verbatim; `{"@t":` is Serilog CLEF and `"{OriginalFormat}"`
-//! is MEL Json, both of which the catalogue's JSON-lines format reads. The rest of §6.3's table —
-//! XML fragment streams, wevtutil, journal export, OTLP/JSON, the Docker and CRI unwrap-and-recurse
-//! cases — is recognised nowhere yet, and says so in `HANDOFF.md`.
+//! Extended** and its columns are taken verbatim, and **a file whose lines are JSON objects sharing
+//! one key order declares its columns the same way** — in its keys, through [`json_template`]. The
+//! rest of §6.3's table — XML fragment streams, wevtutil, journal export, OTLP/JSON, the Docker and
+//! CRI unwrap-and-recurse cases — is recognised nowhere yet, and says so in `HANDOFF.md`.
+//!
+//! The JSON branch adds *columns*, it does not take the format over: a record carrying nothing
+//! beyond `@t`, `@l` and `@m` is what the catalogue's `ndjson` entry already reads, so it is left
+//! to it. What the branch is for is the context beside the message — a Loki spill arrives with
+//! `app` and `environment` on every line, and under `ndjson` alone they were fetched, written and
+//! then never shown, because that format declares three columns and has nowhere to put a label.
 //!
 //! ## Stages 3 and 4 — the score, and the tie-break
 //!
@@ -56,11 +62,64 @@ pub const HEAD_BYTES: usize = 256 * 1024;
 pub const ACCEPT_SCORE: f32 = 0.75;
 pub const ACCEPT_MARGIN: f32 = 1.15;
 
+/// How many keys beyond `ts`, `level` and `msg` a JSON file may turn into columns.
+///
+/// A presentation limit and nothing more: [`Format::parse`](crate::format::Format::parse) still
+/// carries every capture into the record's attributes, and the raw line is lossless under §6.1. A
+/// structured logger writing forty properties would otherwise produce a grid nobody can read.
+///
+/// **It is also a frame budget.** Each column is one more optional `.*?`-separated group in the
+/// pattern, and `columns.rs` rebuilds the presentation per visible row per frame. Measured in
+/// release on the owner's machine: over a 4 KiB line, three groups cost 96 µs and eleven cost
+/// 2.45 ms — fifty rows of the latter is 120 ms, against §11's 16 ms. Six extras is the compromise;
+/// the measurements are in `HANDOFF.md`.
+pub const MAX_JSON_COLUMNS: usize = 6;
+
+/// What kind of value a top-level JSON key carries. Both distinctions are load-bearing.
+///
+/// **[`Text`](JsonValue::Text) is the only kind that can be a column.** A column is a **byte range
+/// of the raw line** — that is what lets a search match be carried across into the columnised view
+/// — and the only range that reads correctly for a string is the one *inside* its quotes. There is
+/// no such range for `41982` that does not include the value's own punctuation, so a scalar stays
+/// in the record's attributes and out of the header.
+///
+/// **[`Nested`](JsonValue::Nested) anywhere in the head costs the file its columns**, which is a
+/// blunter rule and is deliberate. The scan below knows a nested key is not a top-level one, but
+/// the *pattern* built from a template cannot: it searches the whole line, so
+/// `{"ctx":{"app":"decoy"},"app":"real"}` binds the `app` column to `decoy` on every row, with
+/// nothing on screen to say so. A regex cannot count braces, so the only honest answer is to
+/// decline files that nest at all and leave them to the catalogue.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum JsonValue {
+    /// A quoted string — the only kind a column can show.
+    Text,
+    /// A number, `true`, `false` or `null`.
+    Scalar,
+    /// An object or an array.
+    Nested,
+}
+
+/// One top-level key of a JSON record, and what kind of value it carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonKey {
+    pub name: String,
+    pub value: JsonValue,
+}
+
+impl JsonKey {
+    /// Whether this key can be a column at all. See [`JsonValue`].
+    pub fn is_text(&self) -> bool {
+        self.value == JsonValue::Text
+    }
+}
+
 /// What a self-describing file said about itself.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SelfDescribed {
     /// `#Fields:` — the columns, verbatim, in order.
     W3c { fields: Vec<String> },
+    /// A JSON record's own keys, in the order the file writes them. See [`json_template`].
+    Json { keys: Vec<JsonKey> },
 }
 
 /// One format's standing after scoring.
@@ -106,6 +165,9 @@ impl Detection {
     pub fn describe(&self) -> Option<String> {
         if let Some(SelfDescribed::W3c { fields }) = &self.self_described {
             return Some(format!("W3C Extended ({} fields)", fields.len()));
+        }
+        if let Some(SelfDescribed::Json { keys }) = &self.self_described {
+            return Some(format!("JSON lines ({} keys)", keys.len()));
         }
         let best = self.best()?;
         if self.accepted.is_some() {
@@ -177,6 +239,7 @@ pub fn detect_with(lines: &[String], extra: &[&'static Format]) -> Detection {
     let accepted = match &self_described {
         // Self-describing wins over scoring: the file said what its columns are.
         Some(SelfDescribed::W3c { fields }) => Some(crate::format::w3c(fields)),
+        Some(SelfDescribed::Json { keys }) => Some(crate::format::json_lines(keys)),
         None => match (candidates.first(), candidates.get(1)) {
             (Some(best), _) if best.quality < ACCEPT_SCORE => None,
             (Some(best), Some(second)) if best.score < second.score * ACCEPT_MARGIN => None,
@@ -193,15 +256,182 @@ pub fn detect_with(lines: &[String], extra: &[&'static Format]) -> Detection {
     }
 }
 
-/// Stage 2. `#Fields:` in the first 20 lines is W3C; the JSON short-circuits are handled by the
-/// catalogue's JSON-lines format scoring at full marks on those files, so they need no branch here.
+/// Stage 2. `#Fields:` in the first 20 lines is W3C; a file whose lines are JSON objects sharing
+/// one key order describes its columns the same way, in its keys.
+///
+/// **A JSON file is only self-describing when it has something to describe.** A record carrying
+/// nothing but `@t`, `@l` and `@m` is exactly what the catalogue's `ndjson` reader already handles,
+/// so it is left to it — this branch adds columns to JSON, it does not take the format over.
 fn short_circuit(lines: &[String]) -> Option<SelfDescribed> {
-    lines.iter().take(20).find_map(|line| {
+    if let Some(w3c) = lines.iter().take(20).find_map(|line| {
         let rest = line.strip_prefix("#Fields:")?;
         Some(SelfDescribed::W3c {
             fields: rest.split_whitespace().map(str::to_owned).collect(),
         })
-    })
+    }) {
+        return Some(w3c);
+    }
+    let keys = json_template(lines)?;
+    crate::format::json_lines_adds_columns(&keys).then_some(SelfDescribed::Json { keys })
+}
+
+/// The top-level keys of one JSON object line, in the order written, with nothing from inside a
+/// value. `None` when the line is not a complete object.
+///
+/// A hand scan rather than a parser: this runs over the head of every file opened, it needs the
+/// keys and their order and nothing else, and §6.1 keeps the raw line anyway. It walks
+/// `"key" : value` pairs, stepping over strings with their escapes and over nested objects and
+/// arrays by depth, so a `{` inside a value is not structure and a decoy key inside a nested
+/// object is not a key.
+pub fn json_keys(line: &str) -> Option<Vec<JsonKey>> {
+    let bytes = line.as_bytes();
+    let mut at = 0usize;
+    let skip_ws = |bytes: &[u8], mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    // The end of the string starting at the opening quote `at`, one past its closing quote.
+    let end_of_string = |bytes: &[u8], mut at: usize| -> Option<usize> {
+        at += 1;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at += 2,
+                b'"' => return Some(at + 1),
+                _ => at += 1,
+            }
+        }
+        None
+    };
+    at = skip_ws(bytes, at);
+    if bytes.get(at) != Some(&b'{') {
+        return None;
+    }
+    at += 1;
+    let mut keys = Vec::new();
+    loop {
+        at = skip_ws(bytes, at);
+        match bytes.get(at) {
+            Some(b'}') => return Some(keys),
+            Some(b'"') => {}
+            _ => return None,
+        }
+        let key_end = end_of_string(bytes, at)?;
+        let name = line.get(at + 1..key_end - 1)?.to_owned();
+        at = skip_ws(bytes, key_end);
+        if bytes.get(at) != Some(&b':') {
+            return None;
+        }
+        at = skip_ws(bytes, at + 1);
+        let value = match bytes.get(at) {
+            Some(b'"') => JsonValue::Text,
+            Some(b'{') | Some(b'[') => JsonValue::Nested,
+            _ => JsonValue::Scalar,
+        };
+        at = match bytes.get(at) {
+            Some(b'"') => end_of_string(bytes, at)?,
+            Some(b'{') | Some(b'[') => {
+                let mut depth = 0usize;
+                loop {
+                    match bytes.get(at)? {
+                        b'"' => at = end_of_string(bytes, at)?,
+                        b'{' | b'[' => {
+                            depth += 1;
+                            at += 1;
+                        }
+                        b'}' | b']' => {
+                            depth -= 1;
+                            at += 1;
+                            if depth == 0 {
+                                break at;
+                            }
+                        }
+                        _ => at += 1,
+                    }
+                }
+            }
+            Some(_) => {
+                while at < bytes.len() && !matches!(bytes[at], b',' | b'}') {
+                    at += 1;
+                }
+                at
+            }
+            None => return None,
+        };
+        keys.push(JsonKey { name, value });
+        at = skip_ws(bytes, at);
+        match bytes.get(at) {
+            Some(b',') => at += 1,
+            Some(b'}') => return Some(keys),
+            _ => return None,
+        }
+    }
+}
+
+/// The key order a whole file can be read by, or `None` when it has no single one.
+///
+/// **The template is the richest sampled line, not the first.** Loki writes `@l` only for a stream
+/// that carries a level, so the opening line of a spill is routinely missing a key most of the
+/// rest have, and taking line one would drop that column from the entire file.
+///
+/// **Every other line's keys must be a subsequence of it**, which is the guard that matters, and
+/// what goes wrong without it is quieter than it looks. Every group in the pattern is optional and
+/// the whole thing is wrapped in `^\s*\{ … \}\s*$`, so a reordered line still *matches* — it does
+/// not become a §6.4 continuation. What it does is bind the wrong groups: a line writing `@m`
+/// before `app` gives up its message cell, because the message group sits after the `app` group
+/// and the text it wanted has already been consumed. **Empty cells on some rows and not others**,
+/// with nothing on screen to say the file was read wrongly. Lines that disagree on order are
+/// precisely the evidence that no ordered pattern can serve this file, so it gets none and the
+/// catalogue keeps it.
+///
+/// **The sample is the head alone** — [`HEAD_BYTES`], through [`head_lines`] — so this is evidence
+/// about a file, not a proof about it. A file that changes its key order a gigabyte in loses cells
+/// from that point and says nothing. Re-reading the format mid-file is §6.3's stage 5, which
+/// `HANDOFF.md` lists as not built.
+pub fn json_template(lines: &[String]) -> Option<Vec<JsonKey>> {
+    // **Every non-blank sampled line must be an object, and a line that is not costs the file its
+    // columns.** Collecting only the lines that happen to be JSON would let a *trace* of JSON take
+    // the file over: stage 2 wins unconditionally over scoring, so one CLEF line in the head of a
+    // Serilog log — or one pretty-printed payload dumped on its own line, which is a shape every
+    // estate has — would make that whole file one JSON row with every text line a §6.4
+    // continuation of it.
+    let mut sampled: Vec<Vec<JsonKey>> = Vec::new();
+    for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        sampled.push(json_keys(line)?);
+    }
+    let template = sampled.iter().max_by_key(|keys| keys.len())?.clone();
+    if template.is_empty() {
+        return None;
+    }
+    // Nesting anywhere in the head costs the file its columns — see [`JsonValue::Nested`], which
+    // is where the reason lives.
+    if sampled
+        .iter()
+        .flatten()
+        .any(|key| key.value == JsonValue::Nested)
+    {
+        return None;
+    }
+    let subsequence = |keys: &[JsonKey]| {
+        let mut at = 0usize;
+        keys.iter().all(|key| {
+            match template[at..]
+                .iter()
+                .position(|candidate| candidate.name == key.name)
+            {
+                Some(found) => {
+                    at += found + 1;
+                    true
+                }
+                None => false,
+            }
+        })
+    };
+    sampled
+        .iter()
+        .all(|keys| subsequence(keys))
+        .then_some(template)
 }
 
 /// Stage 3 for one format. `None` when it matched nothing at all.
@@ -421,6 +651,323 @@ mod tests {
             got.iter().all(|l| l.starts_with("line ")),
             "no partial line at the cut"
         );
+    }
+
+    fn names(keys: &[JsonKey]) -> Vec<&str> {
+        keys.iter().map(|k| k.name.as_str()).collect()
+    }
+
+    /// The top-level keys, in the order written, and nothing from inside a value.
+    #[test]
+    fn the_keys_of_an_object_are_read_in_order_and_nesting_is_skipped() {
+        let keys = json_keys(
+            r#"{"@t":"2026-09-03T07:00:00Z","@m":"hello","inner":{"@t":"decoy","app":"decoy"},"tags":["a","b"],"n":41982,"app":"identity"}"#,
+        )
+        .expect("an object");
+        assert_eq!(names(&keys), ["@t", "@m", "inner", "tags", "n", "app"]);
+        let string_valued: Vec<&str> = keys
+            .iter()
+            .filter(|k| k.is_text())
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(string_valued, ["@t", "@m", "app"]);
+    }
+
+    /// **One JSON line in a text file must not take the file over.** Stage 2 wins unconditionally
+    /// over scoring — it has no coverage floor the way stage 3 does — so collecting only the lines
+    /// that happen to be JSON let a *trace* of JSON decide the format for all of them: a Serilog
+    /// log with one CLEF line in its head opened as **a single row**, every text line a §6.4
+    /// continuation of it. The "payload follows" shape, where an ordinary log dumps a JSON body on
+    /// its own line, is the same bug and is far more common.
+    #[test]
+    fn one_json_line_among_text_lines_does_not_take_the_file_over() {
+        let mut text: Vec<String> = (0..30)
+            .map(|i| format!("2026-08-16 09:14:{i:02} INFO  BYM.Api  request served"))
+            .collect();
+        text.insert(
+            7,
+            "{\"@t\":\"2026-09-03T07:00:00Z\",\"app\":\"identity\",\"@m\":\"one\"}".to_owned(),
+        );
+        assert_eq!(json_template(&text), None);
+
+        let d = detect(&text);
+        assert_eq!(
+            d.accepted.map(|f| f.id),
+            Some("generic"),
+            "the text lines must keep their own format: {:?}",
+            d.candidates
+        );
+    }
+
+    /// A blank line is not evidence against a JSON file — files end with one.
+    #[test]
+    fn a_blank_line_does_not_cost_a_json_file_its_columns() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"app\":\"identity\",\"@m\":\"one\"}\n\
+             \n\
+             {\"@t\":\"b\",\"app\":\"identity\",\"@m\":\"two\"}\n",
+        );
+        assert!(json_template(&sample).is_some());
+    }
+
+    /// **A nested object steals the column from the top-level key of the same name.** The scan
+    /// knows `app` inside `ctx` is not a top-level key; the *pattern* built from the template
+    /// cannot, because it searches the whole line and binds to the first `"app":"` it finds. Every
+    /// row would show the decoy with nothing to say so, and a regex cannot count braces — so a
+    /// file that nests at all is declined and left to the catalogue.
+    #[test]
+    fn a_file_that_nests_is_declined_rather_than_reading_the_inner_key() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"ctx\":{\"app\":\"DECOY\"},\"app\":\"real\",\"@m\":\"one\"}\n\
+             {\"@t\":\"b\",\"ctx\":{\"app\":\"DECOY\"},\"app\":\"real\",\"@m\":\"two\"}\n",
+        );
+        assert_eq!(json_template(&sample), None);
+        assert_ne!(detect(&sample).accepted.map(|f| f.id), Some("json-lines"));
+    }
+
+    /// A key whose name contains an escaped quote must not end the name early, and a value
+    /// containing a brace must not be read as structure.
+    #[test]
+    fn an_escaped_quote_in_a_key_and_a_brace_in_a_value_are_both_survived() {
+        let keys = json_keys(r#"{"a\"b":"}{","c":"d"}"#).expect("an object");
+        assert_eq!(names(&keys), [r#"a\"b"#, "c"]);
+    }
+
+    /// Not an object, and a truncated one, are both "no keys" rather than a wrong answer.
+    #[test]
+    fn a_non_object_and_a_truncated_object_yield_no_keys() {
+        assert_eq!(json_keys("2026-08-16 09:14:02 INFO one"), None);
+        assert_eq!(json_keys(r#"["a","b"]"#), None);
+        assert_eq!(json_keys(r#"{"a":"b","c"#), None);
+        assert_eq!(json_keys("{}"), Some(Vec::new()));
+    }
+
+    /// **The template is the richest line, not the first.** Loki writes `@l` only for a stream
+    /// that carries a level, so the first line of a spill is routinely missing a key that most of
+    /// the rest have; taking line one as the template would drop `level` from every row in the
+    /// file.
+    #[test]
+    fn the_template_is_the_line_with_the_most_keys_not_the_first() {
+        let sample = lines(
+            "{\"@t\":\"2026-09-03T07:00:00Z\",\"@m\":\"one\",\"app\":\"identity\"}\n\
+             {\"@t\":\"2026-09-03T07:00:01Z\",\"@l\":\"Error\",\"@m\":\"two\",\"app\":\"identity\",\"environment\":\"live\"}\n\
+             {\"@t\":\"2026-09-03T07:00:02Z\",\"@m\":\"three\",\"app\":\"identity\"}\n",
+        );
+        assert_eq!(
+            names(&json_template(&sample).expect("a template")),
+            ["@t", "@l", "@m", "app", "environment"]
+        );
+    }
+
+    /// **The guard that stops rows silently merging.** The pattern built from a template is
+    /// ordered, so a line whose keys run the other way does not match the first-line anchor — and
+    /// §6.4 then makes it a *continuation* of the row above rather than a row of its own. Lines
+    /// disagreeing on order is exactly the signal that no ordered pattern can serve the file, so
+    /// there is no template and the plain reader keeps the file.
+    #[test]
+    fn keys_in_a_different_order_are_refused_rather_than_merging_rows() {
+        let sample = lines(
+            "{\"@t\":\"2026-09-03T07:00:00Z\",\"app\":\"identity\",\"environment\":\"live\"}\n\
+             {\"@t\":\"2026-09-03T07:00:01Z\",\"environment\":\"live\",\"app\":\"identity\"}\n",
+        );
+        assert_eq!(json_template(&sample), None);
+    }
+
+    /// A key some lines lack is fine — that is a subsequence, and the column is simply empty on
+    /// those rows. Only *reordering* is fatal.
+    #[test]
+    fn a_key_missing_from_some_lines_still_yields_a_template() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"@l\":\"Error\",\"@m\":\"one\",\"app\":\"identity\"}\n\
+             {\"@t\":\"b\",\"@m\":\"two\"}\n",
+        );
+        assert_eq!(
+            names(&json_template(&sample).expect("a template")),
+            ["@t", "@l", "@m", "app"]
+        );
+    }
+
+    /// A file of plain text has no template at all, so nothing here can disturb it.
+    #[test]
+    fn a_file_that_is_not_json_has_no_template() {
+        assert_eq!(
+            json_template(&lines("2026-08-16 09:14:02 INFO one\n")),
+            None
+        );
+    }
+
+    /// **What the whole change is for.** A Loki spill arrives with `app` and `environment` on
+    /// every line, and before this they were fetched, written and then never shown: the `ndjson`
+    /// format declares `ts`, `level` and `msg` and has nowhere to put a label. The file describes
+    /// its own columns, so it is read the way a W3C file with a `#Fields:` line is.
+    #[test]
+    fn a_loki_spill_is_columnised_by_its_own_labels() {
+        let sample = lines(
+            "{\"@t\":\"2026-09-03T07:00:00.1Z\",\"@l\":\"Information\",\"app\":\"nurtur-identity-server\",\"environment\":\"live\",\"@m\":\"token issued\"}\n\
+             {\"@t\":\"2026-09-03T07:00:01.2Z\",\"@l\":\"Error\",\"app\":\"campaign-editor-api\",\"environment\":\"live\",\"@m\":\"boom\"}\n",
+        );
+        let d = detect(&sample);
+        let format = d.accepted.expect("a format");
+        let titles: Vec<&str> = format.column_titles().collect();
+        assert_eq!(titles, ["@t", "@l", "app", "environment", "@m"]);
+
+        let ranges = format.fields(&sample[0]).expect("a first line");
+        let read = |i: usize| ranges[i].clone().map(|r| &sample[0][r]);
+        assert_eq!(read(2), Some("nurtur-identity-server"));
+        assert_eq!(read(3), Some("live"));
+        assert_eq!(read(4), Some("token issued"));
+    }
+
+    /// The two apps are told apart by a column, which is the request this was built for: with only
+    /// `ts`, `level` and `msg` on screen, one window holding two services is unreadable.
+    #[test]
+    fn two_apps_in_one_spill_read_differently_in_the_app_column() {
+        let sample = lines(
+            "{\"@t\":\"2026-09-03T07:00:00.1Z\",\"app\":\"nurtur-identity-server\",\"@m\":\"one\"}\n\
+             {\"@t\":\"2026-09-03T07:00:01.2Z\",\"app\":\"campaign-editor-api\",\"@m\":\"two\"}\n",
+        );
+        let format = detect(&sample).accepted.expect("a format");
+        let app_of = |line: &String| {
+            let r = format.fields(line).expect("a first line")[1].clone();
+            r.map(|r| line[r].to_owned())
+        };
+        assert_eq!(
+            app_of(&sample[0]).as_deref(),
+            Some("nurtur-identity-server")
+        );
+        assert_eq!(app_of(&sample[1]).as_deref(), Some("campaign-editor-api"));
+    }
+
+    /// A key whose value is not a string does not become a column. A column is a **byte range of
+    /// the raw line**, so the only honest range for `41982` or `{"a":1}` would include the value's
+    /// own punctuation; a number would read `41982` but an object would read its braces and a
+    /// string would need its quotes stripped, and one of those three has to be wrong. Strings are
+    /// what labels are.
+    #[test]
+    fn a_key_that_is_not_a_string_is_not_offered_as_a_column() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"job\":41982,\"app\":\"identity\",\"@m\":\"one\"}\n\
+             {\"@t\":\"b\",\"job\":41983,\"app\":\"identity\",\"@m\":\"two\"}\n",
+        );
+        let format = detect(&sample).accepted.expect("a format");
+        let titles: Vec<&str> = format.column_titles().collect();
+        assert!(!titles.contains(&"job"), "{titles:?}");
+        assert_eq!(titles, ["@t", "app", "@m"]);
+    }
+
+    /// A wide record does not become a wide grid. The cap is a presentation limit, not a parsing
+    /// one — `parse` still carries every capture into the record's attributes.
+    #[test]
+    fn a_record_with_many_keys_is_capped_to_a_readable_number_of_columns() {
+        let mut line = String::from("{\"@t\":\"a\",\"@m\":\"one\"");
+        for i in 0..40 {
+            line.push_str(&format!(",\"k{i}\":\"v{i}\""));
+        }
+        line.push('}');
+        let sample = lines(&format!("{line}\n{line}\n"));
+        let format = detect(&sample).accepted.expect("a format");
+        assert!(
+            format.columns.len() <= MAX_JSON_COLUMNS + 3,
+            "{:?}",
+            format.column_titles().collect::<Vec<_>>()
+        );
+    }
+
+    /// **The message is the last column whatever the file does with it**, because §2.5 gives the
+    /// last column the free remainder of the width. Bunyan writes `name, hostname, pid, level,
+    /// msg, time, v` — left in file order the message was capped at `columns::MAX_CELLS` and a
+    /// twenty-character timestamp was handed the rest of the window.
+    #[test]
+    fn the_message_column_is_last_even_when_the_file_writes_it_in_the_middle() {
+        let sample = lines(
+            "{\"name\":\"api\",\"hostname\":\"box\",\"pid\":41,\"level\":\"error\",\"msg\":\"one\",\"time\":\"2026-09-03T07:00:00Z\"}\n\
+             {\"name\":\"api\",\"hostname\":\"box\",\"pid\":42,\"level\":\"error\",\"msg\":\"two\",\"time\":\"2026-09-03T07:00:01Z\"}\n",
+        );
+        let format = detect(&sample).accepted.expect("a format");
+        let titles: Vec<&str> = format.column_titles().collect();
+        assert_eq!(
+            titles.last(),
+            Some(&"msg"),
+            "the message must take the remainder: {titles:?}"
+        );
+        let ranges = format.fields(&sample[0]).expect("a first line");
+        let last = ranges.last().expect("a last column").clone();
+        assert_eq!(last.map(|r| &sample[0][r]), Some("one"));
+    }
+
+    /// **A key that sanitises onto a role's name must not take the role.** `msg ` — with the
+    /// trailing space a real logger will eventually emit — sanitises to `msg`, and binding it
+    /// first gave the message column to the decoy and dropped `@m` from the grid altogether:
+    /// message gone, and `app` inheriting the free-remainder width behind it.
+    #[test]
+    fn a_key_that_sanitises_onto_a_role_does_not_steal_it() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"msg \":\"NOT THE MESSAGE\",\"app\":\"identity\",\"@m\":\"the real message\"}\n\
+             {\"@t\":\"b\",\"msg \":\"NOT THE MESSAGE\",\"app\":\"identity\",\"@m\":\"also real\"}\n",
+        );
+        let format = detect(&sample).accepted.expect("a format");
+        let titles: Vec<&str> = format.column_titles().collect();
+        assert!(titles.contains(&"@m"), "the message survives: {titles:?}");
+        assert!(
+            titles.contains(&"msg "),
+            "and so does the decoy: {titles:?}"
+        );
+
+        let ranges = format.fields(&sample[0]).expect("a first line");
+        let at = titles.iter().position(|t| *t == "@m").expect("@m");
+        assert_eq!(
+            ranges[at].clone().map(|r| &sample[0][r]),
+            Some("the real message")
+        );
+    }
+
+    /// **Two keys that sanitise to the same capture name are both kept, suffixed.** Dropping the
+    /// second loses a column of real data with nothing on screen to say so — and any two non-ASCII
+    /// keys sanitise to nothing at all, so this is not an exotic case in an estate with
+    /// non-English field names.
+    #[test]
+    fn keys_that_sanitise_alike_are_disambiguated_rather_than_dropped() {
+        let sample = lines(
+            "{\"@t\":\"a\",\"a.b\":\"first\",\"a-b\":\"second\",\"@m\":\"one\"}\n\
+             {\"@t\":\"b\",\"a.b\":\"first\",\"a-b\":\"second\",\"@m\":\"two\"}\n",
+        );
+        let format = detect(&sample).accepted.expect("a format");
+        let titles: Vec<&str> = format.column_titles().collect();
+        assert!(
+            titles.contains(&"a.b") && titles.contains(&"a-b"),
+            "{titles:?}"
+        );
+
+        let ranges = format.fields(&sample[0]).expect("a first line");
+        let read = |title: &str| {
+            let at = titles.iter().position(|t| *t == title).expect(title);
+            ranges[at].clone().map(|r| sample[0][r].to_owned())
+        };
+        assert_eq!(read("a.b").as_deref(), Some("first"));
+        assert_eq!(read("a-b").as_deref(), Some("second"));
+    }
+
+    /// A JSON file with no message key at all is left to the catalogue: with the message column
+    /// absent, §2.5's free remainder would fall to whichever label happened to be last.
+    #[test]
+    fn a_json_file_with_no_message_key_is_left_to_the_catalogue() {
+        let sample = lines(
+            "{\"@t\":\"2026-09-03T07:00:00Z\",\"app\":\"identity\",\"environment\":\"live\"}\n\
+             {\"@t\":\"2026-09-03T07:00:01Z\",\"app\":\"identity\",\"environment\":\"live\"}\n",
+        );
+        assert_ne!(detect(&sample).accepted.map(|f| f.id), Some("json-lines"));
+    }
+
+    /// A JSON file with nothing but the three understood keys gains no columns, so the catalogue's
+    /// own `ndjson` reader is what a plain CLEF file still gets — this adds columns, it does not
+    /// replace the format.
+    #[test]
+    fn a_json_file_with_no_extra_keys_is_left_to_the_catalogue() {
+        let sample = lines(
+            "{\"@t\":\"2026-09-03T07:00:00Z\",\"@l\":\"Error\",\"@m\":\"one\"}\n\
+             {\"@t\":\"2026-09-03T07:00:01Z\",\"@l\":\"Error\",\"@m\":\"two\"}\n",
+        );
+        assert_eq!(detect(&sample).accepted.map(|f| f.id), Some("ndjson"));
     }
 }
 

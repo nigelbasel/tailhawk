@@ -293,8 +293,20 @@ impl fmt::Display for WireFault {
 /// instead of comparing against an expected string.
 ///
 /// `@m` and not `@mt`: Loki hands over a rendered line, and calling it a message *template* would
-/// be a small untruth in a field other tools read. Labels follow, except the `__`-prefixed ones §2
-/// suppresses — Loki's own sharding bookkeeping, which the owner's deployment really does send.
+/// be a small untruth in a field other tools read.
+///
+/// **The labels come before `@m`, sorted, and both of those are load-bearing.**
+/// [`detect::json_template`](crate::detect::json_template) reads a JSON file's own keys as its
+/// columns, which is what puts `app` and `environment` on screen — and it needs two things this
+/// function is the only one able to promise. *Sorted*, because a template is refused outright when
+/// sampled lines disagree on key order, and the label order Loki hands over is per-stream: two
+/// streams listing the same labels differently would cost the file its columns. *Before `@m`*,
+/// because the grid gives its **last** column the free remainder of the width, and that has to be
+/// the message — labels written after it would leave `environment` stretched across the window
+/// with the log line crushed into a few cells beside it.
+///
+/// The `__`-prefixed labels §2 suppresses — Loki's own sharding bookkeeping, which the owner's
+/// deployment really does send — are dropped rather than sorted with the rest.
 pub fn clef_line(entry: &Entry, interner: &Interner) -> String {
     let mut out = String::with_capacity(entry.line.len() + 96);
     out.push_str("{\"@t\":\"");
@@ -305,22 +317,23 @@ pub fn clef_line(entry: &Entry, interner: &Interner) -> String {
         json_escape_into(&mut out, level);
         out.push('"');
     }
-    out.push_str(",\"@m\":\"");
-    json_escape_into(&mut out, &entry.line);
-    out.push('"');
-    for (key, value) in &entry.labels {
-        let (Some(key), Some(value)) = (interner.text(*key), interner.text(*value)) else {
-            continue;
-        };
-        if key.starts_with("__") || shadows_a_clef_field(key) {
-            continue;
-        }
+    let mut labels: Vec<(&str, &str)> = entry
+        .labels
+        .iter()
+        .filter_map(|(key, value)| Some((interner.text(*key)?, interner.text(*value)?)))
+        .filter(|(key, _)| !key.starts_with("__") && !shadows_a_clef_field(key))
+        .collect();
+    labels.sort_unstable_by_key(|(key, _)| *key);
+    for (key, value) in labels {
         out.push_str(",\"");
         json_escape_into(&mut out, key);
         out.push_str("\":\"");
         json_escape_into(&mut out, value);
         out.push('"');
     }
+    out.push_str(",\"@m\":\"");
+    json_escape_into(&mut out, &entry.line);
+    out.push('"');
     out.push('}');
     out
 }
@@ -1493,6 +1506,86 @@ mod tests {
         assert!(
             at("\"@t\"") < at("\"@l\"") && at("\"@l\"") < at("\"@m\""),
             "@t, then @l, then @m — the detector reads them sequentially: {line}"
+        );
+    }
+
+    /// **The labels are what put `app` and `environment` on screen, and sorting them is what keeps
+    /// them there.**
+    ///
+    /// `detect::json_template` reads a JSON file's keys as its columns and refuses the file
+    /// outright when its lines disagree on key order — an ordered pattern cannot serve them, and
+    /// guessing would merge rows rather than columnise them. Loki hands labels over per stream, so
+    /// two streams naming the same labels in different orders is not a hypothetical: it is a busy
+    /// environment. Unsorted, this spill would have no columns at all.
+    #[test]
+    fn two_streams_listing_their_labels_differently_still_columnise() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"environment":"live","app":"nurtur-identity-server"},
+                  "values":[["1724750000000000001","token issued"]]},
+                 {"stream":{"app":"campaign-editor-api","environment":"live"},
+                  "values":[["1724750000000000002","boom"]]}]}}"#,
+        );
+        let spill = clef_spill(&batch);
+        let lines: Vec<String> = spill.lines().map(str::to_owned).collect();
+        assert_eq!(lines.len(), 2, "{spill}");
+
+        let format = crate::detect::detect(&lines)
+            .accepted
+            .expect("the spill describes its own columns");
+        let titles: Vec<&str> = format.column_titles().collect();
+        assert_eq!(titles, ["@t", "app", "environment", "@m"], "{spill}");
+
+        let column = |line: &String, i: usize| {
+            format.fields(line).expect("a first line")[i]
+                .clone()
+                .map(|r| line[r].to_owned())
+        };
+        assert_eq!(
+            column(&lines[0], 1).as_deref(),
+            Some("nurtur-identity-server")
+        );
+        assert_eq!(column(&lines[1], 1).as_deref(), Some("campaign-editor-api"));
+        assert_eq!(column(&lines[0], 2).as_deref(), Some("live"));
+    }
+
+    /// **Escaping a label value became load-bearing when the labels moved in front of `@m`.**
+    /// While they sat after the message, a label value that spelled out `"@m":"…"` could not be
+    /// mistaken for the message — the real one had already been matched. In front of it, the
+    /// `ndjson` reader's lazy scan would find the counterfeit first, so the only thing standing
+    /// between a log line and the wrong message column is `json_escape_into`. It was doing the job
+    /// before this change; nothing was asserting it.
+    #[test]
+    fn a_label_value_impersonating_the_message_field_does_not_become_the_message() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"app":"{\"@m\":\"counterfeit\"}"},
+                  "values":[["1","the real message"]]}]}}"#,
+        );
+        let line = clef_line(&batch.entries[0], &batch.interner);
+        let ndjson = crate::format::by_id("ndjson").expect("the format the spill targets");
+        let record = ndjson
+            .parse(&line)
+            .expect("the detector must still read it");
+        assert_eq!(record.body, "the real message", "{line}");
+    }
+
+    /// The message is the **last** key, because the grid gives its last column the free remainder
+    /// of the window's width. With a label written after it, `environment` would take the whole
+    /// window and the log line would be crushed into the cells left over.
+    #[test]
+    fn the_message_is_the_last_key_so_it_gets_the_width() {
+        let batch = read(
+            r#"{"status":"success","data":{"resultType":"streams","result":[
+                 {"stream":{"app":"checkout","environment":"live"},
+                  "values":[["1","went wrong"]]}]}}"#,
+        );
+        let line = clef_line(&batch.entries[0], &batch.interner);
+        let keys = crate::detect::json_keys(&line).expect("an object");
+        assert_eq!(
+            keys.last().map(|k| k.name.as_str()),
+            Some("@m"),
+            "the message must be last: {line}"
         );
     }
 

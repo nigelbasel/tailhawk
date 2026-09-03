@@ -1,5 +1,21 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-09-03, session 31: a JSON file's keys are its columns
+
+Loki's stream labels reach the grid. `app` and `environment` were already in every spilled line —
+fetched, written, then never shown, because `format.rs`'s `ndjson` entry declares three columns and
+has nowhere to put a label. A JSON file now describes its columns in its keys, the way a W3C file
+does in `#Fields:`; `SPEC.md` §6.3 stage 2 carries the rule and its four refusals.
+
+**Knowingly left undone, and the measurement behind one of them:**
+
+| | |
+|---|---|
+| **`MAX_JSON_COLUMNS` is a frame budget, not just a legibility one** | Each column is another optional `.*?`-separated group, and `columns.rs` rebuilds the presentation per visible row per frame. Measured in release on the owner's machine: over a **4 KiB** line, 3 groups cost **96 µs**, 11 cost **2.45 ms** — fifty rows of the latter is **120 ms** against §11's 16 ms. Over a 16 KiB line, 6.4 ms and 8.9 ms. The cap is **6** extras, and the catalogue's own `ndjson` entry has the identical shape at 3 groups, so this is an aggravation of an existing cost rather than a new one. Rejection is cheap (37 µs at 16 KiB), so only files that adopt the format pay. **Not optimised, and a JSON log with multi-kilobyte lines will feel it.** |
+| **A file that nests gets no columns at all** | A pattern searches the whole line and cannot count braces, so the only safe answer to `{"ctx":{"app":"decoy"},"app":"real"}` is to decline. That is blunt: a Serilog CLEF file with a structured property loses its columns entirely, where a brace-counting extractor would keep them. Doing better means `Format::fields` growing a non-regex path. |
+| **All of it is judged on the head sample** | `HEAD_BYTES`, 256 KiB. A file that changes its key order or starts nesting a gigabyte in loses cells from that point and says nothing. That is §6.3 stage 5, which is not built — see the table below. |
+| **The multiple-apps picker** | The owner asked to pick several apps and either interleave them or open one window each. **Both already work** — a source's `query` is raw LogQL, so `app=~"a\|b"` interleaves and one source per app gives a window each. What is missing is only the convenience: a picker populated from Loki's `/loki/api/v1/label/app/values` (~70 values) so the names need not be typed. Not started. |
+
 ## ▶ Resume point — 2026-08-28, session 30: native tabs, and a UI direction awaiting the owner
 
 **Master is `f73b2cd`, tree clean, CI green by SHA on every commit, 903 tests, clippy `-D warnings`

@@ -772,6 +772,7 @@ what the user cares about.
 | Test | Format |
 |---|---|
 | `#Fields:` in the first 20 lines | **W3C Extended** — take columns verbatim |
+| Every sampled line a JSON object, sharing one key order | **JSON lines** — take columns from the keys |
 | `<log4net:event` / `<log4j:event` / `<Event xmlns=…win/2004/08/events` | XML fragment stream |
 | `^Event\[\d+\]:` | wevtutil text |
 | `^__CURSOR=` | systemd journal export |
@@ -784,6 +785,37 @@ what the user cares about.
 W3C is never scored and never guessed. **`#Fields` recurs mid-file** — IIS and ASP.NET Core
 `W3CLogger` re-emit it on rotation and config change — so column definitions are re-read whenever a
 new directive appears and subsequent rows are re-keyed.
+
+**A JSON file describes its columns in its keys**, which is how the context beside the message —
+`app`, `environment`, a trace id, a scope — reaches the grid at all: the catalogue's JSON-lines
+entry declares `ts`, `level` and `msg` and has nowhere to put anything else. The template is the
+richest sampled line rather than the first, since a structured logger omits a key it has no value
+for.
+
+**Four refusals, each of which is a way of being silently wrong**, and all of them apply the same
+rule as stage 4's margin — silent mis-columnising is worse than no columnising:
+
+- **Every** non-blank sampled line must be an object. Stage 2 has no coverage floor, so a *trace*
+  of JSON would otherwise decide the format for a whole file: one CLEF line in the head of a text
+  log, or one pretty-printed payload on its own line, and every text line around it becomes a §6.4
+  continuation of that single row.
+- **No line may nest.** A pattern searches the whole line and cannot count braces, so
+  `{"ctx":{"app":"decoy"},"app":"real"}` binds the `app` column to `decoy` on every row.
+- Every other line's keys must be a **subsequence** of the template. A reordered line still
+  matches — every group is optional — but binds the wrong ones, so cells go blank on some rows and
+  not others with nothing on screen to say why.
+- There must be a **message** column, since §2.5 gives the last column the free remainder of the
+  width and that is where the message is placed, whatever order the file writes it in.
+
+Only **string-valued** keys become columns, because a column is a byte range of the raw line and no
+range of `41982` reads correctly without its own punctuation; the rest stay in the record's
+attributes, where §6.1's lossless raw line still carries them. At most **6** keys beyond the
+understood three are shown — a limit on the grid's legibility and on §11's frame budget alike, since
+each column is another group in the pattern and the presentation is rebuilt per visible row.
+
+All of this is judged on the **head sample alone**. It is evidence about a file, not a proof about
+it: a file that changes shape a gigabyte in loses cells from that point and says nothing. Re-reading
+the format mid-file is stage 5, which is not built.
 
 **Stage 3 — Scored matching.**
 
