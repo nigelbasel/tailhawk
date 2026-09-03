@@ -316,6 +316,7 @@ pub struct Fonts<'a> {
 /// Diagnostic: how many painters have ever been built in this process.
 pub static PAINTER_BUILDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(windows)]
 fn ensure_painter<'a>(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
