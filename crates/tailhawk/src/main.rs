@@ -11452,6 +11452,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **A header box names its layout column, and a hidden column is not a box.** The control's
+    /// items are these boxes in this order, so "item 1" is not "column 1" once a column is hidden
+    /// — and the first wiring mapped items through `shown_order` by position, which sorted by the
+    /// hidden column and resized it back into existence when the box beside it was dragged. The
+    /// review caught it; this is the test that would have.
+    #[test]
+    fn a_header_box_carries_its_layout_column_and_skips_a_hidden_one() {
+        let path = std::env::temp_dir().join("tailhawk_header_boxes_test.log");
+        std::fs::write(
+            &path,
+            "2026-08-17 09:14:03.884 +01:00 [INF] Zenith.Dispatcher Dispatching job 41981\n\
+             2026-08-17 09:14:04.120 +01:00 [ERR] Zenith.Dispatcher Failed\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let n = doc
+            .layout
+            .as_ref()
+            .expect("Serilog is detected")
+            .widths
+            .len();
+        assert!(
+            n >= 3,
+            "the fixture needs a column to hide between the first and the message"
+        );
+
+        let all: Vec<usize> = doc.header_columns().iter().map(|b| b.column).collect();
+        assert_eq!(
+            all,
+            (0..n).collect::<Vec<_>>(),
+            "every column, in order, nothing hidden"
+        );
+
+        assert!(doc.set_column_width(0, 0), "hide column 0");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let shown: Vec<usize> = doc.header_columns().iter().map(|b| b.column).collect();
+        let mut expected: Vec<usize> = (0..n).collect();
+        expected.remove(0);
+        assert_eq!(
+            shown, expected,
+            "the hidden column is not a box, the rest keep their index"
+        );
+        assert_eq!(
+            doc.header_columns().last().map(|b| b.column),
+            Some(n - 1),
+            "the last box is always the message column"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// §2.1's resizable columns: a boundary sits after each shown column; a press on one and a
     /// drag sets that column's width from the mouse; zero hides it and the boundaries close up;
     /// reset brings the measured widths back; the header follows every change.

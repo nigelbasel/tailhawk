@@ -342,6 +342,27 @@ mod tests {
         assert_eq!(request_of(HDN_ITEMCLICKW, -1, -1, None), None);
     }
 
+    /// **The item is the box, gap included; the model holds the content.** The first wiring fed
+    /// one into the other, so a divider pressed and released without moving grew its column by
+    /// the gap — two cells — every time. The review caught it; this pins the arithmetic the
+    /// notify arm must do: box in pixels → cells → minus the gap → content, and back.
+    #[test]
+    fn a_box_width_becomes_content_by_losing_the_gap_and_gets_it_back() {
+        use tailhawk_core::columns::GAP;
+        let (content, cell_w) = (5usize, 10.0);
+        let box_px = px_of_cells(content + GAP, cell_w);
+        let read_back = cells_of_px(box_px, cell_w).saturating_sub(GAP);
+        assert_eq!(
+            read_back, content,
+            "a drag that moved nothing must change nothing"
+        );
+        assert_eq!(
+            px_of_cells(read_back + GAP, cell_w),
+            box_px,
+            "and the control is told the same box back"
+        );
+    }
+
     /// **A width round-trips through cells and back, rounded.** The grid cannot draw two-thirds of
     /// a cell, so a boundary dragged to 137 px at a 10 px cell is fourteen cells and the control is
     /// told 140 — never left showing a divider the grid does not honour.
