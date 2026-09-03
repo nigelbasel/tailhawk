@@ -4178,6 +4178,47 @@ struct Shell {
     dragging_bar: Option<(BarDrag, usize)>,
     /// How long recent frames took. See [`Frames`].
     frames: Frames,
+    /// Last frame's placeholder draws: glyphs queued, and glyphs the atlas has refused. The
+    /// second is the one no miss count can see — see `GlyphCache::oversized_hits`.
+    placeholders: PlaceholderStats,
+}
+
+/// What the last frame's glyph cache did, for the title beside the frame times.
+///
+/// **This exists because the space boxes were invisible to every test.** A glyph the atlas has
+/// refused draws the placeholder for the life of the process and is never queued, so a miss count
+/// stays at zero while the screen fills with boxes; a blank that is recorded and then lost looks
+/// identical from outside. These are the numbers that told those cases apart on the owner's
+/// machine, and they stay because the next fault of this shape will need them again.
+#[derive(Clone, Copy, Debug, Default)]
+struct PlaceholderStats {
+    queued: usize,
+    refused: usize,
+    blanked: usize,
+    landed: usize,
+    distinct: usize,
+    held: usize,
+    sheet_full: usize,
+    capacity: usize,
+    builds: u32,
+}
+
+impl From<&tailhawk_core::paint::Laid> for PlaceholderStats {
+    fn from(laid: &tailhawk_core::paint::Laid) -> Self {
+        let (distinct, held) = laid.flush_stats;
+        let (sheet_full, capacity, builds) = laid.sheet;
+        PlaceholderStats {
+            queued: laid.queued,
+            refused: laid.oversized,
+            blanked: laid.blanked,
+            landed: laid.rasterised,
+            distinct,
+            held,
+            sheet_full,
+            capacity,
+            builds,
+        }
+    }
 }
 
 /// A ring of recent frame durations, and the reason there is one.
@@ -4458,6 +4499,22 @@ impl Shell {
             text.push_str(&format!(
                 " — frame p95 {p95:.1} ms, worst {worst:.1} ms, {over} over budget"
             ));
+            let p = self.placeholders;
+            if p.queued > 0 || p.refused > 0 || p.blanked > 0 {
+                text.push_str(&format!(
+                    " — placeholders {} queued ({} distinct), {} refused, {} blanked, {} landed, \
+                     {} sheet-full, atlas holds {} blanks of {} slots, {} painter builds",
+                    p.queued,
+                    p.distinct,
+                    p.refused,
+                    p.blanked,
+                    p.landed,
+                    p.sheet_full,
+                    p.held,
+                    p.capacity,
+                    p.builds
+                ));
+            }
         }
         text
     }
@@ -4536,6 +4593,7 @@ impl Shell {
         };
         let (w, h) = Self::client_size(hwnd);
         let mut rasterised = 0;
+        let mut placeholders = PlaceholderStats::default();
         let pane_count = self.document.panes().len();
         let drawn = renderer
             .attach(WindowHandle(hwnd.0 as isize), w, h)
@@ -4581,6 +4639,7 @@ impl Shell {
                     let welcome = Welcome::new(cell, (w, h), &recent, band);
                     let laid = renderer.paint_rows(&welcome.view, &welcome)?;
                     rasterised = laid.rasterised;
+                    placeholders = PlaceholderStats::from(&laid);
                     self.welcome = Some(welcome);
                     return Ok(());
                 }
@@ -4732,6 +4791,7 @@ impl Shell {
                     .collect();
                 let laid = renderer.paint_panes(&refs, (w as f32, h as f32), &overlay)?;
                 rasterised = laid.rasterised;
+                placeholders = PlaceholderStats::from(&laid);
                 Ok(())
             });
         // **Rasterising is a reason to draw again, and the request cannot be made from in here.**
@@ -4745,6 +4805,10 @@ impl Shell {
         // handler invalidates once it has validated. It converges rather than spinning — the next
         // frame finds those glyphs resident, rasterises nothing and asks for nothing.
         self.needs_frame = rasterised > 0;
+        self.placeholders = placeholders;
+        if let Err(e) = &drawn {
+            self.notice = Some(format!("paint: {e}"));
+        }
         if drawn.is_err() {
             // The renderer rebuilds a lost device itself, so an error here means it tried and
             // gave up. Drop back to stage one rather than tearing the process down — `SPEC.md`
@@ -9893,6 +9957,7 @@ fn main() -> Result<()> {
             rules_tiers,
             rules_failed,
             frames: Frames::new(),
+            placeholders: PlaceholderStats::default(),
             last_double: None,
             file: None,
         });
@@ -12150,6 +12215,14 @@ mod tests {
             }
         };
         let (w, h) = (1200u32, 500u32);
+        // `TAILHAWK_SHOT_DPI=144`: render as a 150 % display would, which is where the owner's
+        // machine lives and where a fault invisible at 96 was found.
+        if let Some(dpi) = std::env::var("TAILHAWK_SHOT_DPI")
+            .ok()
+            .and_then(|d| d.parse::<u32>().ok())
+        {
+            renderer.set_dpi(dpi);
+        }
         let cell = renderer.cell().expect("cell metrics");
         // `TAILHAWK_SHOT_WELCOME=1`: the first-run surface instead of a document.
         if std::env::var_os("TAILHAWK_SHOT_WELCOME").is_some() {

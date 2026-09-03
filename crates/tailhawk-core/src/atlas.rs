@@ -219,6 +219,11 @@ impl Atlas {
         self.map.len() - self.blanks
     }
 
+    /// How many blank-or-oversized entries are held. Diagnostic.
+    pub fn blank_count(&self) -> usize {
+        self.blanks
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

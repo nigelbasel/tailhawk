@@ -32,8 +32,15 @@
 //! between the words, for the 8–10 frames `experiments/g4b-batched-raster` measured. It self-heals
 //! and it is not a correctness fault — `a_viewport_of_rows_reaches_real_pixels` asserts the warm
 //! frame draws strictly *fewer* quads for exactly this reason — but "reads as loading" was the
-//! placeholder's justification, and boxes between words reads as broken. Suppressing the
-//! placeholder for whitespace clusters is a `glyphs.rs` change and is not made here.
+//! placeholder's justification, and boxes between words reads as broken.
+//!
+//! **So a whitespace cluster is queued but not drawn** — [`Painter::lay_out_row`] withholds the
+//! placeholder when the cluster's *text* is whitespace, and lets the miss go through so the atlas
+//! still records the glyph as blank. That was written off above as "a `glyphs.rs` change, not made
+//! here", and it stayed unmade until the owner reported the boxes: `HTTP□GET`, and a lattice of
+//! them in the padding after every short value, on a 150 % display where a cold frame is a screen
+//! nobody could read. The text decides, not the glyph, because a glyph id says nothing about ink
+//! until it has been rasterised — which is the whole problem.
 //!
 //! ## ⚠ Right-to-left rows are not placed yet, and this module says so out loud
 //!
@@ -113,6 +120,15 @@ pub struct Laid {
     /// a cold viewport and zero in steady state; it is the number §3.2's placeholder rule exists
     /// for, and it must never be a reason to delay the frame.
     pub queued: usize,
+    /// Quads this row drew the placeholder for a glyph the atlas has **refused** as oversized.
+    /// Never queued, so invisible to `queued`; see [`crate::glyphs::GlyphCache::oversized_hits`].
+    pub oversized: usize,
+    /// Glyphs the flush recorded as blank this frame. Diagnostic; see `GlyphCache::blanked_hits`.
+    pub blanked: usize,
+    /// Diagnostic: distinct keys flushed, and blanks the grid atlas holds after the flush.
+    pub flush_stats: (usize, usize),
+    /// Diagnostic: glyphs turned away as sheet-full, the grid atlas capacity, painter rebuilds so far.
+    pub sheet: (usize, usize, u32),
     /// **Right-to-left runs this pass placed in logical columns, which is the wrong place.** See
     /// the module note. Zero for almost every line in almost every log; non-zero is a correctness
     /// claim this module is not yet entitled to make.
@@ -695,6 +711,16 @@ impl Painter {
             let last_x = cluster_x + (cells - 1) as f32 * cell_width;
 
             let mut pen = cluster_x;
+            // **A whitespace cluster is queued but never drawn as a box.** Blankness is a property
+            // the atlas can only record after rasterising, so on a cold frame a space is `Absent`
+            // like any other glyph and would get the placeholder — a hollow box between every pair
+            // of words, which reads as broken and not as loading. The miss still goes through
+            // `quad` so it is flushed and recorded blank; only the box is withheld. The text is the
+            // authority on whitespace here rather than the glyph, because a glyph id says nothing
+            // about ink until it has been rasterised, which is the whole problem.
+            let blank = text
+                .get(cluster.span.byte..cluster.span.byte + cluster.span.byte_len)
+                .is_some_and(|s| s.chars().all(char::is_whitespace));
             for i in cluster.first_glyph..cluster.first_glyph + cluster.glyph_count {
                 let offset = shaped.offsets[i];
                 let before = self.cache.pending();
@@ -704,8 +730,10 @@ impl Painter {
                     baseline_y - offset.ascender,
                     ink,
                 ) {
-                    self.instances.push(quad);
-                    laid.quads += 1;
+                    if !(blank && self.cache.is_placeholder(&quad)) {
+                        self.instances.push(quad);
+                        laid.quads += 1;
+                    }
                 }
                 laid.queued += self.cache.pending() - before;
                 // Within the cluster only, and never past its last cell. The next *cluster* starts
@@ -927,6 +955,23 @@ impl Painter {
     /// waited on.
     pub fn flush_misses(&mut self, context: &ID3D11DeviceContext) -> Result<usize> {
         Ok(self.cache.flush_misses(context)? + self.chrome.flush_misses(context)?)
+    }
+
+    /// This frame's refused-glyph placeholder draws, grid and chrome faces together.
+    pub fn oversized_hits(&self) -> usize {
+        self.cache.oversized_hits() + self.chrome.oversized_hits()
+    }
+
+    pub fn blanked_hits(&self) -> usize {
+        self.cache.blanked_hits() + self.chrome.blanked_hits()
+    }
+
+    pub fn flush_stats(&self) -> (usize, usize) {
+        self.cache.flush_stats()
+    }
+
+    pub fn sheet_stats(&self) -> (usize, usize) {
+        (self.cache.sheet_full_hits(), self.cache.capacity())
     }
 }
 
@@ -1150,6 +1195,54 @@ mod tests {
         }
     }
 
+    /// **A space draws no box even on a cold frame.** The warm-frame tests above were all green
+    /// while the owner was looking at `HTTP□GET`, because on a cold frame a space is `Absent` like
+    /// any other glyph and the placeholder is exactly a hollow cell-sized box. This is the test the
+    /// module note said was missing: no warm-up, first frame, the space costs nothing on screen —
+    /// while still being queued, so the atlas can record it blank.
+    #[test]
+    fn a_space_draws_no_box_on_a_cold_frame() {
+        let Some((_off, mut painter)) = painter_or_skip("cold space") else {
+            return;
+        };
+        let view = view_for(&painter, 1, 200);
+
+        painter.begin_frame();
+        painter
+            .lay_out_row(
+                &view,
+                "AB",
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
+            .expect("lay out");
+        let without = painter.instances().len();
+
+        painter.begin_frame();
+        let laid = painter
+            .lay_out_row(
+                &view,
+                "A B",
+                ColumnAnchors::none_ref(),
+                Colours::plain(INK),
+                0.0,
+            )
+            .expect("lay out");
+        let with = painter.instances().len();
+
+        assert_eq!(
+            with,
+            without,
+            "cold, the space drew {} placeholder box(es)",
+            with.saturating_sub(without)
+        );
+        assert!(
+            laid.queued >= 1,
+            "the space must still be queued, or it is never recorded blank"
+        );
+    }
+
     /// **The commonest character in a log file, and nothing had ever asked about it.** A grid full
     /// of hollow rectangles between every pair of words is what a `.notdef` space looks like, and
     /// the owner reported exactly that — `HTTP□GET`, and a lattice of boxes filling the padding
@@ -1234,9 +1327,17 @@ mod tests {
                 &Listed(lines.iter().map(|s| (*s).to_owned()).collect()),
             )
             .expect("lay out");
+        // **At most one quad per inked character, and never a quad for a space** — the bound was
+        // `> 100` when every space on a cold frame cost a placeholder quad, and dropped to 96 the
+        // moment whitespace stopped drawing a box. The upper bound is the one that would catch a
+        // box coming back; the lower one only says the rows were laid out at all.
+        let inked: usize = lines
+            .iter()
+            .map(|l| l.chars().filter(|c| !c.is_whitespace()).count())
+            .sum();
         assert!(
-            first.quads > 100,
-            "only {} quads for four rows",
+            first.quads > 60 && first.quads <= inked,
+            "{} quads for four rows holding {inked} inked characters",
             first.quads
         );
         assert!(first.queued > 0, "a cold cache queued nothing");
@@ -1267,16 +1368,18 @@ mod tests {
             second.queued
         );
 
-        // **The warm frame draws *fewer* quads, and that is correct.** A glyph with no ink — every
-        // space — is only known to be blank once it has been rasterised, so the cold frame drew a
-        // placeholder box for each one and the warm frame draws nothing at all. See the module note
-        // on what that looks like on screen.
-        assert!(
-            second.quads < first.quads,
-            "the blank glyphs should stop being drawn once rasterised: {} then {}",
-            first.quads,
-            second.quads
+        // **The warm frame draws the *same* quads as the cold one, and that is now the point.** This
+        // used to assert strictly fewer: a space was only known to be blank once rasterised, so the
+        // cold frame drew a placeholder box for each one and the warm frame dropped them. The
+        // module note records what that looked like on screen, and `lay_out_row` now withholds the
+        // box for a whitespace cluster on the cold frame too — so the two frames differ in nothing
+        // but residency, and the warm one queues nothing.
+        assert_eq!(
+            second.quads, first.quads,
+            "a cold frame and a warm frame draw the same quads once whitespace draws no box: {} then {}",
+            first.quads, second.quads
         );
+        assert_eq!(second.queued, 0, "the warm frame queued {}", second.queued);
 
         off.clear(PAPER);
         painter.draw(off.context(), (TARGET, TARGET)).expect("draw");
@@ -1312,10 +1415,14 @@ mod tests {
             .expect("lay out");
 
         // Rebuild the expected column x for every cluster and require a quad to start there. The
-        // cell's own `left` offsets ink within the cell, so the comparison allows it.
+        // cell's own `left` offsets ink within the cell, so the comparison allows it. A whitespace
+        // cluster is the one kind that draws nothing at all, cold or warm, and is skipped.
         let left = painter.cache.cell().left as f32;
         for cell in view.cells().cells(line) {
-            if cell.width == 0 {
+            let blank = line[cell.byte..cell.byte + cell.byte_len]
+                .chars()
+                .all(char::is_whitespace);
+            if cell.width == 0 || blank {
                 continue;
             }
             let expected = view.hgrid().x_of_column(cell.cell) + left;

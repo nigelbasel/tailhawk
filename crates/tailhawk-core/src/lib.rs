@@ -313,6 +313,9 @@ pub struct Fonts<'a> {
 }
 
 #[cfg(windows)]
+/// Diagnostic: how many painters have ever been built in this process.
+pub static PAINTER_BUILDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn ensure_painter<'a>(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
@@ -344,6 +347,7 @@ fn ensure_painter<'a>(
             fonts.chrome_px,
         )?;
         fresh.prime(context);
+        PAINTER_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *slot = Some(Built {
             generation,
             px_per_em: fonts.grid_px,
@@ -730,6 +734,15 @@ impl Renderer {
             let p = &mut built.painter;
             let (_, context) = gpu.resources();
             laid.rasterised = p.flush_misses(context)?;
+            laid.oversized = p.oversized_hits();
+            laid.blanked = p.blanked_hits();
+            laid.flush_stats = p.flush_stats();
+            let (full, cap) = p.sheet_stats();
+            laid.sheet = (
+                full,
+                cap,
+                PAINTER_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            );
         }
         Ok(laid)
     }

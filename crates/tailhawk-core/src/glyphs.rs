@@ -43,6 +43,29 @@ pub struct GlyphCache {
     /// it can never be evicted.
     placeholder: (u16, u16),
     misses: Vec<GlyphKey>,
+    /// See [`GlyphCache::oversized_hits`]. Reset by `begin_frame`.
+    oversized_hits: usize,
+    /// How many glyphs the last flush recorded as **blank**. Diagnostic: a space that is queued on
+    /// every frame and blanked on every flush is a blank that is being lost between the two.
+    blanked_last: usize,
+    /// Distinct keys the last flush was handed, and blanks the atlas held once it finished.
+    flush_stats: (usize, usize),
+    /// Diagnostic: how many glyphs the last flush turned away with `SheetFullThisFrame`.
+    sheet_full_last: usize,
+}
+
+/// Diagnostic: appends a line to the file `TAILHAWK_ATLAS_LOG` names, if it names one.
+fn atlas_log(line: &str) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var("TAILHAWK_ATLAS_LOG") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
 }
 
 impl GlyphCache {
@@ -79,6 +102,10 @@ impl GlyphCache {
             cell,
             placeholder: (0, atlas_height),
             misses: Vec::new(),
+            oversized_hits: 0,
+            blanked_last: 0,
+            flush_stats: (0, 0),
+            sheet_full_last: 0,
         })
     }
 
@@ -139,6 +166,45 @@ impl GlyphCache {
     pub fn begin_frame(&mut self) {
         self.atlas.begin_frame();
         self.misses.clear();
+        self.oversized_hits = 0;
+        atlas_log(&format!(
+            "begin px={} map_len={} blanks={}",
+            self.px_per_em,
+            self.atlas.len() + self.atlas.blank_count(),
+            self.atlas.blank_count()
+        ));
+    }
+
+    /// How many quads this frame drew the placeholder for a glyph the atlas has **refused**.
+    ///
+    /// An `Oversized` glyph draws the placeholder for the life of the process and is never queued,
+    /// so it is invisible to every count of misses — `queued` stays at zero while the screen fills
+    /// with boxes. This is the number that makes that state visible; the shell shows it beside the
+    /// frame times.
+    pub fn oversized_hits(&self) -> usize {
+        self.oversized_hits
+    }
+
+    /// Whether `quad` is the placeholder — the hollow box a glyph draws until its raster lands.
+    ///
+    /// A caller that knows the cluster is whitespace uses this to *queue without drawing*: the miss
+    /// still has to be flushed so the atlas can record the glyph as blank, but a box between two
+    /// words reads as broken rather than as loading, and there is no reader for whom it is useful.
+    pub fn is_placeholder(&self, quad: &Instance) -> bool {
+        quad.uv0 == [self.placeholder.0 as f32, self.placeholder.1 as f32]
+    }
+
+    /// Glyphs the last flush recorded as blank. See the field.
+    pub fn blanked_hits(&self) -> usize {
+        self.blanked_last
+    }
+
+    pub fn flush_stats(&self) -> (usize, usize) {
+        self.flush_stats
+    }
+
+    pub fn sheet_full_hits(&self) -> usize {
+        self.sheet_full_last
     }
 
     /// The quad to draw a glyph with, at a pen position on the baseline.
@@ -168,6 +234,7 @@ impl GlyphCache {
             // The placeholder, exactly as for `Absent` — but without queueing it, because it can
             // never land. That difference is the whole point of the state.
             Residency::Oversized => {
+                self.oversized_hits += 1;
                 let (px, py) = self.placeholder;
                 (
                     [px as f32, py as f32],
@@ -180,6 +247,7 @@ impl GlyphCache {
             Residency::Absent => {
                 if !self.misses.contains(&key) {
                     self.misses.push(key);
+                    atlas_log(&format!("miss {key:?}"));
                 }
                 let (px, py) = self.placeholder;
                 (
@@ -218,17 +286,21 @@ impl GlyphCache {
             return Ok(0);
         }
         let queued = std::mem::take(&mut self.misses);
+        let distinct = queued.len();
         let glyphs: Vec<GlyphId> = queued.iter().map(|k| k.glyph).collect();
         let rasters = self
             .rasteriser
             .rasterise(&self.face, &glyphs, self.px_per_em, self.cell)?;
 
         let mut landed = 0;
+        let mut blanked = 0;
+        let mut sheet_full = 0;
         for (key, raster) in queued.into_iter().zip(rasters) {
             let Some(raster) = raster else {
                 // No ink. Recorded so it is never asked for again — without this, every space in
                 // the viewport is a miss on every frame.
                 self.atlas.insert_blank(key);
+                blanked += 1;
                 continue;
             };
             let placement = match self.atlas.insert(key, raster.ink) {
@@ -242,7 +314,10 @@ impl GlyphCache {
                 }
                 // The sheet is full *this frame*. Next frame it will not be, so this one is asked
                 // for again deliberately.
-                Err(InsertError::SheetFullThisFrame) => continue,
+                Err(InsertError::SheetFullThisFrame) => {
+                    sheet_full += 1;
+                    continue;
+                }
             };
             if self.sheet.upload(
                 context,
@@ -255,6 +330,13 @@ impl GlyphCache {
                 landed += 1;
             }
         }
+        self.blanked_last = blanked;
+        self.flush_stats = (distinct, self.atlas.blank_count());
+        self.sheet_full_last = sheet_full;
+        atlas_log(&format!(
+            "flush distinct={distinct} landed={landed} blanked={blanked} map_len={}",
+            self.atlas.len() + self.atlas.blank_count()
+        ));
         Ok(landed)
     }
 }
