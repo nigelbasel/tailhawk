@@ -51,6 +51,52 @@ pub fn caught_up(records: usize) -> bool {
     (records as u64) < TAIL_LIMIT as u64
 }
 
+/// How many recent spill lines are remembered for de-duplication.
+///
+/// Bounded by count rather than by time because a count is what a ring can hold without a clock:
+/// two polls' worth at a few hundred records a second, which covers everything an
+/// [`OVERLAP_NANOS`] window can bring back twice. A burst larger than this in one overlap would let
+/// a repeat through, and that is preferred to a set that grows for the life of the window.
+pub const RECENT_LINES: usize = 8_192;
+
+/// The lines most recently written to the spill, so a record the overlap fetches again is written
+/// once. **Keyed by the line itself, hashed** — `clef_line` is deterministic, so the same record
+/// spills to the same bytes — and evicted oldest-first at [`RECENT_LINES`].
+#[derive(Debug, Default)]
+pub struct Recent {
+    ring: std::collections::VecDeque<u64>,
+    seen: std::collections::HashSet<u64>,
+    cap: usize,
+}
+
+impl Recent {
+    pub fn new(cap: usize) -> Recent {
+        Recent {
+            ring: std::collections::VecDeque::with_capacity(cap.min(RECENT_LINES)),
+            seen: std::collections::HashSet::with_capacity(cap.min(RECENT_LINES)),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Whether `line` is new — and, if so, remembers it. `false` means it has already been written.
+    pub fn admit(&mut self, line: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        line.hash(&mut h);
+        let key = h.finish();
+        if !self.seen.insert(key) {
+            return false;
+        }
+        self.ring.push_back(key);
+        while self.ring.len() > self.cap {
+            if let Some(old) = self.ring.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
 /// The window a poll should ask for, given the newest record already held.
 ///
 /// **It starts from the data, not from the clock.** A window of "the last five seconds" drops
@@ -61,14 +107,33 @@ pub fn caught_up(records: usize) -> bool {
 /// **Plus one nanosecond**, because `Window::start` is inclusive: resuming at the timestamp itself
 /// re-fetches the record that carries it, and the spill would show it twice.
 pub fn window_after(since: Nanos, now: Nanos) -> Window {
+    // **Start a little before the newest record held, and end a little before now.** A record
+    // reaches Loki's index some seconds after its own timestamp — the estate measured around
+    // thirty at the worst moment of a busy hour — and a window that starts at the newest record
+    // *seen* skips everything indexed late with an earlier stamp, for ever, with nothing to say
+    // so. The overlap asks for that stretch again; [`Recent`] keeps the repeats off the spill.
+    // The lag holds the window's end back so the newest few seconds are asked for once they
+    // have had a chance to land, rather than being crossed off before they exist.
+    // `Nanos` is signed, so a saturating subtraction bottoms out far below zero rather than at it;
+    // the clamp is what keeps a mark near the epoch from asking Loki for a negative start.
+    let start = since.saturating_sub(OVERLAP_NANOS).max(0).saturating_add(1);
     Window {
-        start: since.saturating_add(1),
+        start,
         // A clock that has gone backwards — a correction, a VM resuming — must not produce a
         // window that ends before it starts. An empty window is the right answer: nothing is newer
         // than what is already held, which is exactly what the clock is claiming.
-        end: now.max(since.saturating_add(1)),
+        end: now.saturating_sub(LAG_NANOS).max(start),
     }
 }
+
+/// How far behind the clock the window ends. A record indexed within this of its own timestamp is
+/// never missed; one indexed later is caught by the overlap for as long as the overlap reaches.
+pub const LAG_NANOS: Nanos = 5 * 1_000_000_000;
+
+/// How far before the newest record held each window starts again. Sized with [`TAIL_LIMIT`] in
+/// mind: at a few hundred records a second this re-fetches a few hundred, which the limit absorbs;
+/// a minute would not, and a tail whose every poll fills its limit with repeats never catches up.
+pub const OVERLAP_NANOS: Nanos = 5 * 1_000_000_000;
 
 /// How long to wait after a poll that failed.
 ///
@@ -121,10 +186,22 @@ impl Tail {
     /// Faults are sent on `notices` rather than shown from the worker: the status bar belongs to
     /// the UI thread, and a background thread reaching into it is how a repaint ends up on the
     /// wrong side of a `RefCell` borrow.
-    pub fn start(source: Source, path: PathBuf, since: Nanos, notices: Sender<String>) -> Tail {
+    pub fn start(
+        source: Source,
+        path: PathBuf,
+        since: Nanos,
+        seed: &str,
+        notices: Sender<String>,
+    ) -> Tail {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let name = source.name.clone();
+        // The opening pull's lines are what the first overlap would fetch again; seeded here so the
+        // first poll after opening writes nothing twice.
+        let mut recent = Recent::new(RECENT_LINES);
+        for line in seed.lines() {
+            recent.admit(line);
+        }
         std::thread::spawn(move || {
             let mut since = since;
             let mut backoff = Backoff::default();
@@ -151,11 +228,25 @@ impl Tail {
                 ) {
                     Ok(pulled) => {
                         backoff.succeeded();
+                        // Behind is judged on what Loki returned, repeats included: the limit
+                        // was spent on them all.
                         behind = !caught_up(pulled.records);
                         if pulled.records == 0 {
                             continue;
                         }
-                        if append(&path, &pulled.clef).is_err() {
+                        // The overlap asks for the last few seconds again on purpose; only the
+                        // lines the spill has not seen are written.
+                        let mut fresh = String::with_capacity(pulled.clef.len());
+                        for line in pulled.clef.lines() {
+                            if recent.admit(line) {
+                                fresh.push_str(line);
+                                fresh.push('\n');
+                            }
+                        }
+                        if fresh.is_empty() {
+                            continue;
+                        }
+                        if append(&path, &fresh).is_err() {
                             let _ = notices.send(format!("{name}: could not write new records"));
                             return;
                         }
@@ -227,15 +318,30 @@ fn append(path: &PathBuf, clef: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// The window resumes from the data, one nanosecond past it.
+    /// **The window starts before the newest record held and ends before now.** Records reach
+    /// Loki's index seconds after their own timestamps, so a window that started at the newest
+    /// record *seen* skipped everything indexed late with an earlier stamp — for ever, silently.
+    /// The overlap re-asks that stretch and [`Recent`] keeps the repeats off the spill; the lag
+    /// holds the end back so the newest seconds are asked for once they have had a chance to land.
     #[test]
-    fn the_next_window_starts_just_after_the_newest_record_held() {
-        let w = window_after(1_000, 9_000);
+    fn the_next_window_overlaps_the_last_and_lags_the_clock() {
+        let since = 100 * 1_000_000_000;
+        let now = 200 * 1_000_000_000;
+        let w = window_after(since, now);
         assert_eq!(
-            w.start, 1_001,
-            "start is inclusive, so the record itself would repeat"
+            w.start,
+            since - OVERLAP_NANOS + 1,
+            "one past the overlap's start"
         );
-        assert_eq!(w.end, 9_000);
+        assert_eq!(w.end, now - LAG_NANOS, "held back by the lag");
+        assert!(w.start < w.end);
+    }
+
+    /// A mark near the epoch cannot overlap into negative time.
+    #[test]
+    fn an_overlap_before_the_epoch_is_clamped() {
+        let w = window_after(1_000, 200 * 1_000_000_000);
+        assert_eq!(w.start, 1, "saturated at zero, then one past it");
     }
 
     /// **A clock that has gone backwards must not make a window that ends before it starts.** A
@@ -243,23 +349,41 @@ mod tests {
     /// something to find out from a user's log being wrong.
     #[test]
     fn a_clock_that_went_backwards_yields_an_empty_window_not_a_reversed_one() {
-        let w = window_after(9_000, 1_000);
+        let since = 900 * 1_000_000_000;
+        let w = window_after(since, 100 * 1_000_000_000);
         assert!(w.end >= w.start, "{w:?}");
-        assert_eq!(w.start, 9_001);
-        assert_eq!(w.end, 9_001);
+        assert_eq!(w.end, w.start, "empty, not reversed");
     }
 
-    /// **A full answer means there is more to come.** This is the rule the first live run needed
-    /// and did not have: it returned exactly `TAIL_LIMIT` records on every single poll and was
-    /// eighty-four seconds behind after one minute, losing ground the whole time, because
-    /// production writes faster than one poll's worth per interval. Sleeping on a full answer is
-    /// what makes that permanent.
+    /// A line seen once is written once; a new line is admitted; the ring forgets oldest-first.
     #[test]
-    fn a_poll_that_filled_its_limit_has_not_caught_up() {
-        assert!(!caught_up(TAIL_LIMIT as usize));
-        assert!(!caught_up(TAIL_LIMIT as usize + 1));
-        assert!(caught_up(TAIL_LIMIT as usize - 1));
-        assert!(caught_up(0), "nothing new is as caught up as it gets");
+    fn a_repeated_line_is_refused_and_the_ring_forgets_the_oldest() {
+        let mut r = Recent::new(3);
+        assert!(r.admit("a"));
+        assert!(
+            !r.admit("a"),
+            "the overlap brought it back; it is not written twice"
+        );
+        assert!(r.admit("b"));
+        assert!(r.admit("c"));
+        assert!(r.admit("d"), "a fourth line evicts the first");
+        assert!(
+            r.admit("a"),
+            "and the first is new again — bounded by count, not for ever"
+        );
+        assert!(!r.admit("d"));
+    }
+
+    /// The seed is the opening pull, so the very first poll's overlap writes nothing twice.
+    #[test]
+    fn a_seeded_ring_refuses_the_opening_pulls_lines() {
+        let opening = "{\"@t\":\"a\",\"@m\":\"one\"}\n{\"@t\":\"b\",\"@m\":\"two\"}\n";
+        let mut r = Recent::new(RECENT_LINES);
+        for line in opening.lines() {
+            r.admit(line);
+        }
+        assert!(!r.admit("{\"@t\":\"b\",\"@m\":\"two\"}"));
+        assert!(r.admit("{\"@t\":\"c\",\"@m\":\"three\"}"));
     }
 
     /// A healthy tail polls at the interval; a failing one waits longer each time, up to a ceiling

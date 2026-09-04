@@ -7585,6 +7585,7 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
         source,
         path.clone(),
         pulled.newest.unwrap_or(window.end),
+        &pulled.clef,
         notices,
     );
     STATE.with(|s| {
