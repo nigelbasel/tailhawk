@@ -106,7 +106,7 @@ impl Recent {
 ///
 /// **Plus one nanosecond**, because `Window::start` is inclusive: resuming at the timestamp itself
 /// re-fetches the record that carries it, and the spill would show it twice.
-pub fn window_after(since: Nanos, now: Nanos) -> Window {
+pub fn window_after(since: Nanos, floor: Nanos, now: Nanos) -> Option<Window> {
     // **Start a little before the newest record held, and end a little before now.** A record
     // reaches Loki's index some seconds after its own timestamp — the estate measured around
     // thirty at the worst moment of a busy hour — and a window that starts at the newest record
@@ -116,24 +116,36 @@ pub fn window_after(since: Nanos, now: Nanos) -> Window {
     // have had a chance to land, rather than being crossed off before they exist.
     // `Nanos` is signed, so a saturating subtraction bottoms out far below zero rather than at it;
     // the clamp is what keeps a mark near the epoch from asking Loki for a negative start.
-    let start = since.saturating_sub(OVERLAP_NANOS).max(0).saturating_add(1);
-    Window {
-        start,
-        // A clock that has gone backwards — a correction, a VM resuming — must not produce a
-        // window that ends before it starts. An empty window is the right answer: nothing is newer
-        // than what is already held, which is exactly what the clock is claiming.
-        end: now.saturating_sub(LAG_NANOS).max(start),
-    }
+    // **The floor is what keeps a busy source from pinning the tail.** At five hundred records a
+    // second the overlap alone is more than a poll's limit: every answer is full, every line in it
+    // is a repeat, nothing fresh is written, the mark never moves, and the same window is asked
+    // for ever. A poll that came back full with nothing new raises the floor past the newest
+    // record it saw, so the next window starts beyond the repeats; a poll that wrote anything
+    // drops it back to nothing and the overlap resumes its work.
+    let start = since
+        .saturating_sub(OVERLAP_NANOS)
+        .max(0)
+        .saturating_add(1)
+        .max(floor);
+    let end = now.saturating_sub(LAG_NANOS);
+    // **Nothing to ask is `None`, never an empty or reversed window.** With the overlap and the lag
+    // equal that only happens when the clock has gone backwards past the newest record held — a
+    // correction, a VM resuming — and what a zero-width or reversed range does at the server is not
+    // something to find out from a user's log being wrong.
+    (end > start).then_some(Window { start, end })
 }
 
 /// How far behind the clock the window ends. A record indexed within this of its own timestamp is
 /// never missed; one indexed later is caught by the overlap for as long as the overlap reaches.
 pub const LAG_NANOS: Nanos = 5 * 1_000_000_000;
 
-/// How far before the newest record held each window starts again. Sized with [`TAIL_LIMIT`] in
-/// mind: at a few hundred records a second this re-fetches a few hundred, which the limit absorbs;
-/// a minute would not, and a tail whose every poll fills its limit with repeats never catches up.
-pub const OVERLAP_NANOS: Nanos = 5 * 1_000_000_000;
+/// How far before the newest record held each window starts again. **Sized to what a poll can
+/// afford, and measured**: live runs at ~900 records a second, so five seconds of overlap was
+/// 4,500 repeats against a limit of 2,000 — every poll came back full of nothing new and the tail
+/// advanced tens of milliseconds per cycle. One second is ~900, leaving the limit room for what is
+/// actually new; the lag already holds the window back past typical indexing delay, so this only
+/// has to cover jitter beyond it.
+pub const OVERLAP_NANOS: Nanos = 1_000_000_000;
 
 /// How long to wait after a poll that failed.
 ///
@@ -204,8 +216,10 @@ impl Tail {
         }
         std::thread::spawn(move || {
             let mut since = since;
+            let mut floor: Nanos = 0;
             let mut backoff = Backoff::default();
             let mut behind = false;
+            let mut said_cut = false;
             loop {
                 // A tail that is behind asks again at once; only one that is level waits.
                 let wait = if behind {
@@ -220,17 +234,36 @@ impl Tail {
                     Some(now) => now,
                     None => continue,
                 };
-                match crate::pull::pull(
-                    &source,
-                    window_after(since, now),
-                    TAIL_LIMIT,
-                    Direction::Forward,
-                ) {
+                // Nothing askable yet — the lag has not opened a window past the newest record
+                // held — is not a failure and not a reason to hurry: wait the interval and look
+                // again.
+                let Some(window) = window_after(since, floor, now) else {
+                    behind = false;
+                    continue;
+                };
+                crate::header::trace(&format!(
+                    "tail: ask start={} end={} since={since} floor={floor}",
+                    window.start, window.end
+                ));
+                match crate::pull::pull(&source, window, TAIL_LIMIT, Direction::Forward) {
                     Ok(pulled) => {
                         backoff.succeeded();
+                        // Said once, per LOKI.md §6: a value the parser had to cut is not silently
+                        // shorter, and it is not the status bar's job to say so on every poll.
+                        if pulled.truncated > 0 && !said_cut {
+                            said_cut = true;
+                            let _ = notices.send(format!(
+                                "{name}: {} label value(s) longer than 4 KiB were cut to fit",
+                                pulled.truncated
+                            ));
+                        }
                         // Behind is judged on what Loki returned, repeats included: the limit
                         // was spent on them all.
                         behind = !caught_up(pulled.records);
+                        crate::header::trace(&format!(
+                            "tail: got records={} newest={:?} dropped={}",
+                            pulled.records, pulled.newest, pulled.dropped
+                        ));
                         if pulled.records == 0 {
                             continue;
                         }
@@ -244,8 +277,20 @@ impl Tail {
                             }
                         }
                         if fresh.is_empty() {
+                            crate::header::trace("tail: nothing fresh");
+                            // Full of repeats and nothing new: the overlap has outrun the limit.
+                            // Everything up to `since` is already written, so the next window
+                            // starts just past it — the whole overlap is forgone this cycle rather
+                            // than paid off a poll at a time, which at nine hundred records a
+                            // second was tens of milliseconds of progress per two round trips.
+                            floor = since.saturating_add(1);
                             continue;
                         }
+                        floor = 0;
+                        crate::header::trace(&format!(
+                            "tail: appended fresh_bytes={}",
+                            fresh.len()
+                        ));
                         if append(&path, &fresh).is_err() {
                             let _ = notices.send(format!("{name}: could not write new records"));
                             return;
@@ -259,6 +304,7 @@ impl Tail {
                         }
                     }
                     Err(why) => {
+                        crate::header::trace(&format!("tail: ERR {why}"));
                         // A failure is not a reason to hurry: whatever the last poll said about
                         // being behind, the next attempt waits.
                         behind = false;
@@ -327,7 +373,7 @@ mod tests {
     fn the_next_window_overlaps_the_last_and_lags_the_clock() {
         let since = 100 * 1_000_000_000;
         let now = 200 * 1_000_000_000;
-        let w = window_after(since, now);
+        let w = window_after(since, 0, now).expect("a window, well after opening");
         assert_eq!(
             w.start,
             since - OVERLAP_NANOS + 1,
@@ -340,7 +386,7 @@ mod tests {
     /// A mark near the epoch cannot overlap into negative time.
     #[test]
     fn an_overlap_before_the_epoch_is_clamped() {
-        let w = window_after(1_000, 200 * 1_000_000_000);
+        let w = window_after(1_000, 0, 200 * 1_000_000_000).expect("a window");
         assert_eq!(w.start, 1, "saturated at zero, then one past it");
     }
 
@@ -350,9 +396,27 @@ mod tests {
     #[test]
     fn a_clock_that_went_backwards_yields_an_empty_window_not_a_reversed_one() {
         let since = 900 * 1_000_000_000;
-        let w = window_after(since, 100 * 1_000_000_000);
-        assert!(w.end >= w.start, "{w:?}");
-        assert_eq!(w.end, w.start, "empty, not reversed");
+        assert_eq!(
+            window_after(since, 0, 100 * 1_000_000_000),
+            None,
+            "nothing to ask, not a reversed range"
+        );
+    }
+
+    /// **A floor moves the start past the repeats.** Live measured five hundred records a second,
+    /// so the overlap alone outruns the poll's limit: a full answer of repeats wrote nothing, the mark
+    /// never moved, and the tail asked the same window for ever after one append. With a floor set
+    /// past what that poll saw, the next window starts beyond it.
+    #[test]
+    fn a_floor_moves_the_start_past_what_a_full_poll_of_repeats_saw() {
+        let since = 100 * 1_000_000_000;
+        let now = 200 * 1_000_000_000;
+        let without = window_after(since, 0, now).expect("a window");
+        let floor = since + 3 * 1_000_000_000;
+        let with = window_after(since, floor, now).expect("a window");
+        assert_eq!(without.start, since - OVERLAP_NANOS + 1);
+        assert_eq!(with.start, floor, "the floor wins over the overlap");
+        assert!(with.start < with.end);
     }
 
     /// A line seen once is written once; a new line is admitted; the ring forgets oldest-first.

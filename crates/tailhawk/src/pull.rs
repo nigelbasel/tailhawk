@@ -91,7 +91,10 @@ impl std::fmt::Display for PullFault {
                 f.write_str("Loki refused the token — check the scope the client is allowed.")
             }
             PullFault::QueryRefused { status } => write!(f, "Loki answered {status}."),
-            PullFault::Wire(_) => f.write_str("Loki's answer could not be read."),
+            // The inner fault names what was wrong with the answer — a size, a shape, a status — and
+            // hiding it behind one sentence cost a morning: every tail poll was failing and the
+            // status bar could only say that it had.
+            PullFault::Wire(why) => write!(f, "Loki's answer could not be read: {why}"),
         }
     }
 }
@@ -111,6 +114,8 @@ pub struct Pulled {
     /// skip whatever Loki had not yet indexed when the query ran: records that exist, are late, and
     /// would never be asked for again.
     pub newest: Option<tailhawk_core::loki::Nanos>,
+    /// Label values the parser cut to its cap rather than refusing the answer for. Said, per §6.
+    pub truncated: usize,
 }
 
 /// Fetch a window of records from `source`.
@@ -153,6 +158,7 @@ pub fn pull(
         records: batch.entries.len(),
         dropped: batch.dropped,
         newest: batch.entries.iter().map(|entry| entry.timestamp).max(),
+        truncated: batch.truncated_labels,
     })
 }
 

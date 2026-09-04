@@ -160,6 +160,10 @@ pub struct Batch {
     /// truncation is the worst failure this feature can have, so a caller that ignores this is
     /// making a choice rather than missing a field.
     pub dropped: usize,
+    /// Label values longer than [`Limits::max_label_len`] that were **cut to it rather than
+    /// refused**. A response is never rejected for one over-long value — that stalled a live tail for
+    /// ever on a single record — but §6's rule stands: what was cut is said, never silently zero.
+    pub truncated_labels: usize,
 }
 
 /// `LOKI.md` §7's response-parse caps.
@@ -508,9 +512,11 @@ pub fn parse_query_range(text: &str, limits: &Limits) -> Result<Batch, WireFault
         at: 0,
         depth: 0,
         limits,
+        truncated: 0,
     };
     let mut batch = Batch::default();
     reader.read_response(&mut batch)?;
+    batch.truncated_labels = reader.truncated;
     Ok(batch)
 }
 
@@ -558,6 +564,8 @@ struct Reader<'a> {
     at: usize,
     depth: usize,
     limits: &'a Limits,
+    /// Label values cut at [`Limits::max_label_len`] by this reader and any inner one it ran.
+    truncated: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -614,7 +622,16 @@ impl<'a> Reader<'a> {
     /// input before refusing it is not a limit. Measured at 64x the cap before this changed.
     fn string(&mut self, cap: usize, kind: Text) -> Result<String, WireFault> {
         self.eat(b'"', "a string")?;
+        // **A label over the cap is cut and counted; a line over it is still refused.** The cap on
+        // a line is §7's out-of-memory guard against a hostile server. The cap on a *label* was
+        // enforced the same way, and one record in the estate carrying a 4,097-byte label value —
+        // one byte over — made the parser refuse the whole response, the poll fail, the backoff
+        // double, and every retry ask the same window and meet the same record: a tail stalled for
+        // ever by one log line. So a label past the cap keeps its first `cap` bytes, the rest are
+        // read past and not kept, and [`Batch::truncated_labels`] says it happened.
+        let cut_not_refuse = kind == Text::Label;
         let mut out = String::new();
+        let mut cut = false;
         loop {
             let byte = *self
                 .bytes
@@ -623,23 +640,33 @@ impl<'a> Reader<'a> {
             match byte {
                 b'"' => {
                     self.at += 1;
+                    if cut {
+                        self.truncated += 1;
+                    }
                     return Ok(out);
                 }
                 b'\\' => {
                     self.at += 1;
                     let escape = *self.bytes.get(self.at).ok_or(self.fault("an escape"))?;
                     self.at += 1;
-                    match escape {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => out.push(self.unicode_escape()?),
+                    let ch = match escape {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => self.unicode_escape()?,
                         _ => return Err(self.fault("a known escape")),
+                    };
+                    if out.len() + ch.len_utf8() <= cap {
+                        out.push(ch);
+                    } else if cut_not_refuse {
+                        cut = true;
+                    } else {
+                        return Err(kind.too_long(out.len() + ch.len_utf8(), self.at));
                     }
                 }
                 _ => {
@@ -648,19 +675,29 @@ impl<'a> Reader<'a> {
                         if *b == b'"' || *b == b'\\' {
                             break;
                         }
-                        if out.len() + (self.at - start) > cap {
+                        if !cut_not_refuse && out.len() + (self.at - start) > cap {
                             return Err(kind.too_long(cap + 1, self.at));
                         }
                         self.at += 1;
                     }
-                    match std::str::from_utf8(&self.bytes[start..self.at]) {
-                        Ok(run) => out.push_str(run),
+                    let run = match std::str::from_utf8(&self.bytes[start..self.at]) {
+                        Ok(run) => run,
                         Err(_) => return Err(self.fault("valid UTF-8")),
+                    };
+                    let room = cap.saturating_sub(out.len());
+                    if run.len() <= room {
+                        out.push_str(run);
+                    } else {
+                        // Cut on a character boundary, never inside one: the label stays valid
+                        // UTF-8 and the spill stays a file every reader can open.
+                        let mut end = room;
+                        while end > 0 && !run.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        out.push_str(&run[..end]);
+                        cut = true;
                     }
                 }
-            }
-            if out.len() > cap {
-                return Err(kind.too_long(out.len(), self.at));
             }
         }
     }
@@ -892,8 +929,10 @@ impl<'a> Reader<'a> {
                 at: start,
                 depth: self.depth,
                 limits: self.limits,
+                truncated: 0,
             };
             inner.read_values(batch, &labels)?;
+            self.truncated += inner.truncated;
         }
         Ok(())
     }
@@ -1287,21 +1326,55 @@ mod tests {
         ));
     }
 
+    /// **A label over the cap is cut to it and counted, and the record survives.** This used to be
+    /// a refusal of the whole response, and one record in the estate with a 4,097-byte label value
+    /// stalled a live tail for ever: the poll failed, the backoff doubled, every retry met the same
+    /// record. The cap on a *line* is still a refusal — that one is an out-of-memory guard.
     #[test]
-    fn a_label_longer_than_the_cap_is_refused() {
+    fn a_label_longer_than_the_cap_is_cut_and_counted_not_refused() {
         let text = format!(
             r#"{{"status":"success","data":{{"resultType":"streams","result":[
-                 {{"stream":{{"k":"{}"}},"values":[["1","a"]]}}]}}}}"#,
+                 {{"stream":{{"k":"{}","app":"x"}},"values":[["1","a"]]}}]}}}}"#,
             "x".repeat(500)
         );
         let limits = Limits {
             max_label_len: 100,
             ..Limits::default()
         };
-        assert!(matches!(
-            parse_query_range(&text, &limits),
-            Err(WireFault::LabelTooLong { .. })
-        ));
+        let batch = parse_query_range(&text, &limits).expect("read, not refused");
+        assert_eq!(batch.entries.len(), 1, "the record is kept");
+        assert_eq!(batch.truncated_labels, 1, "and the cut is said");
+        let k = batch.entries[0]
+            .label(&batch.interner, "k")
+            .expect("the label is kept");
+        assert_eq!(k.len(), 100, "cut to the cap, not dropped");
+        assert_eq!(
+            batch.entries[0].label(&batch.interner, "app"),
+            Some("x"),
+            "its neighbour is untouched"
+        );
+    }
+
+    /// The cut lands on a character boundary, so a label of multi-byte text stays valid UTF-8.
+    #[test]
+    fn a_cut_label_stays_valid_utf8() {
+        let text = format!(
+            r#"{{"status":"success","data":{{"resultType":"streams","result":[
+                 {{"stream":{{"k":"{}"}},"values":[["1","a"]]}}]}}}}"#,
+            "é".repeat(60)
+        );
+        let limits = Limits {
+            max_label_len: 101,
+            ..Limits::default()
+        };
+        let batch = parse_query_range(&text, &limits).expect("read");
+        let k = batch.entries[0].label(&batch.interner, "k").expect("kept");
+        assert_eq!(
+            k.len(),
+            100,
+            "101 falls inside a two-byte character; the cut steps back to 100"
+        );
+        assert!(k.chars().all(|c| c == 'é'));
     }
 
     #[test]
@@ -1364,8 +1437,11 @@ mod tests {
         );
     }
 
+    /// **A megabyte label is cut, and the cut is what bounds the memory** — the kept text never
+    /// exceeds the cap, and the rest is read past as a borrowed slice, never built. This used to be
+    /// a refusal; refusing the whole response for one value is what stalled a live tail for ever.
     #[test]
-    fn a_long_label_is_refused_without_being_built_first() {
+    fn a_long_label_is_cut_without_being_built_first() {
         let text = format!(
             r#"{{"status":"success","data":{{"resultType":"streams","result":[
                  {{"stream":{{"k":"{}"}},"values":[["1","a"]]}}]}}}}"#,
@@ -1375,28 +1451,42 @@ mod tests {
             max_label_len: 32,
             ..Limits::default()
         };
+        let batch = parse_query_range(&text, &limits).expect("cut, not refused");
+        assert_eq!(batch.truncated_labels, 1);
+        let k = batch.entries[0].label(&batch.interner, "k").expect("kept");
         assert_eq!(
-            parse_query_range(&text, &limits).unwrap_err(),
-            WireFault::LabelTooLong { len: 33 }
+            k.len(),
+            32,
+            "the kept text is the cap, whatever the wire carried"
         );
     }
 
+    /// **The two caps are told apart by kind, not by number.** With both set to 64, an over-long
+    /// *label* is cut and counted while an over-long *line* is still refused as a line — which is
+    /// the same fact this test always guarded, under the rule that labels no longer refuse.
     #[test]
-    fn a_label_is_reported_as_a_label_even_when_the_two_caps_are_equal() {
-        let text = format!(
-            r#"{{"status":"success","data":{{"resultType":"streams","result":[
-                 {{"stream":{{"k":"{}"}},"values":[["1","a"]]}}]}}}}"#,
-            "x".repeat(200)
-        );
+    fn a_label_is_cut_and_a_line_is_refused_even_when_the_two_caps_are_equal() {
         let limits = Limits {
             max_label_len: 64,
             max_line_len: 64,
             ..Limits::default()
         };
+        let long_label = format!(
+            r#"{{"status":"success","data":{{"resultType":"streams","result":[
+                 {{"stream":{{"k":"{}"}},"values":[["1","a"]]}}]}}}}"#,
+            "x".repeat(200)
+        );
+        let batch = parse_query_range(&long_label, &limits).expect("a label is cut");
+        assert_eq!(batch.truncated_labels, 1);
+        let long_line = format!(
+            r#"{{"status":"success","data":{{"resultType":"streams","result":[
+                 {{"stream":{{"k":"v"}},"values":[["1","{}"]]}}]}}}}"#,
+            "x".repeat(200)
+        );
         assert_eq!(
-            parse_query_range(&text, &limits).unwrap_err(),
-            WireFault::LabelTooLong { len: 65 },
-            "which cap was passed must not be guessed from the number"
+            parse_query_range(&long_line, &limits).unwrap_err(),
+            WireFault::LineTooLong { len: 65 },
+            "a line is still refused, and named as a line"
         );
     }
 
