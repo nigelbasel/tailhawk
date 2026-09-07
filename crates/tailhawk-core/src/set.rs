@@ -223,6 +223,30 @@ pub struct Polled {
     pub reset: bool,
     /// Members that left the set — §5.5b's retention deletions. Their rows are gone.
     pub retired: Vec<String>,
+    /// **Where those rows were**, as `(first row, rows)` pairs in the numbering that was in force
+    /// before the retirement, so a caller holding row numbers can move them rather than lose them.
+    ///
+    /// A selection or a search result is discarded on a retirement because it addresses bytes as
+    /// well as rows; a **bookmark** is a row and nothing else, and a user who marked a line does not
+    /// want it silently repointed at a different one. [`after_retirement`] is the arithmetic.
+    pub retired_rows: Vec<(u64, u64)>,
+}
+
+/// Where a row addressed before a retirement lands after it, or `None` if the retirement took it.
+///
+/// `retired` is [`Polled::retired_rows`] — non-overlapping `(first row, rows)` pairs in the old
+/// numbering, in any order. A row above a retired stretch moves down by its length; a row inside
+/// one is gone, because the line it named no longer exists in the set.
+pub fn after_retirement(row: u64, retired: &[(u64, u64)]) -> Option<u64> {
+    let mut moved = row;
+    for &(first, rows) in retired {
+        if row >= first.saturating_add(rows) {
+            moved = moved.saturating_sub(rows);
+        } else if row >= first {
+            return None;
+        }
+    }
+    Some(moved)
 }
 
 impl Polled {
@@ -733,14 +757,17 @@ impl LogSet {
         // The live member is exempt: a path that vanished is §5.5's `Missing`, which wants `tail -F`
         // semantics and not the loss of the tail we are watching.
         let mut retired = Vec::new();
+        let mut retired_rows = Vec::new();
         self.members.retain(|m| {
             let gone = m.name != live_name && !listing.contains(&m.name);
             if gone {
                 retired.push(m.name.clone());
+                retired_rows.push((m.first_row, m.index.line_count()));
             }
             !gone
         });
         polled.retired = retired;
+        polled.retired_rows = retired_rows;
 
         // **Newer means later in the *set's* order, not later in the alphabet.** Comparing names
         // directly gets log4net backwards — `app.log.1` sorts after `app.log` by any string rule and
@@ -752,9 +779,22 @@ impl LogSet {
                 .filter(|n| !held.contains(n))
                 .cloned()
                 .collect(),
-            // The live member is not in the re-inferred set at all — its path was renamed away, or
+            // The live member is not in the re-inferred set at all. Its path was renamed away, or
             // the directory changed shape under us. Attaching anything on that basis is a guess.
-            None => Vec::new(),
+            None if listing.contains(&live_name) => Vec::new(),
+            // **Unless the file we are reading is gone from the directory too**, which retention
+            // makes reachable: a reader far enough behind can have the part it holds deleted under
+            // it. The member is exempt from retirement precisely because it is live, so without
+            // this it stays live for ever, `position` keeps returning `None`, and the document
+            // stops updating silently while the writer keeps rolling. Everything the directory
+            // actually has is not a guess, so it is attached and the dead member retires on the
+            // next pass, when it is no longer the live one.
+            None => set
+                .members()
+                .iter()
+                .filter(|n| !held.contains(n) && listing.contains(n))
+                .cloned()
+                .collect(),
         };
         if arrivals.is_empty() {
             return;
@@ -1318,5 +1358,71 @@ mod tests {
         let mut set = LogSet::open(&anchor).expect("open");
         set.settle();
         assert!(set.settle().is_quiet());
+    }
+
+    #[test]
+    fn a_row_below_a_retirement_does_not_move() {
+        assert_eq!(after_retirement(4, &[(10, 5)]), Some(4));
+        assert_eq!(after_retirement(0, &[]), Some(0));
+    }
+
+    #[test]
+    fn a_row_inside_a_retirement_is_gone() {
+        assert_eq!(after_retirement(10, &[(10, 5)]), None);
+        assert_eq!(after_retirement(14, &[(10, 5)]), None);
+    }
+
+    #[test]
+    fn a_row_above_a_retirement_moves_down_by_it() {
+        assert_eq!(after_retirement(15, &[(10, 5)]), Some(10));
+        assert_eq!(
+            after_retirement(100, &[(0, 10), (20, 5)]),
+            Some(85),
+            "both stretches are below it, so both move it"
+        );
+        assert_eq!(
+            after_retirement(15, &[(20, 5)]),
+            Some(15),
+            "a stretch above the row must not move it"
+        );
+    }
+
+    /// **The reader's own live member can be deleted under it**, because retention exempts the
+    /// *writer's* newest part and knows nothing about which part a reader is holding. Before this
+    /// was handled the set stopped attaching anything at all: the dead member stayed live for ever,
+    /// the re-inferred set never contained it, and the document silently stopped updating while the
+    /// writer kept rolling.
+    #[test]
+    fn a_set_recovers_when_the_member_it_is_reading_is_deleted() {
+        let dir = scratch("live-member-deleted");
+        write(&dir, "part-000001.log", &["one", "two"]);
+        write(&dir, "part-000002.log", &["three"]);
+
+        let mut set = LogSet::open(&dir.join("part-000001.log")).expect("open");
+        set.rescan();
+        set.settle();
+        assert_eq!(set.newest().name(), "part-000002.log", "part two is live");
+        assert_eq!(set.total_rows(), 3);
+
+        // The writer rolls on and retention takes everything the reader was holding.
+        write(&dir, "part-000003.log", &["four", "five"]);
+        std::fs::remove_file(dir.join("part-000002.log")).expect("delete the live member");
+        std::fs::remove_file(dir.join("part-000001.log")).expect("delete the oldest");
+        set.rescan();
+        set.settle();
+        set.rescan();
+        set.settle();
+
+        assert_eq!(
+            set.newest().name(),
+            "part-000003.log",
+            "the set must attach the part that now exists"
+        );
+        assert_eq!(
+            set.total_rows(),
+            2,
+            "and present only the rows it still has"
+        );
+        assert_eq!(set.members().len(), 1);
     }
 }

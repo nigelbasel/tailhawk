@@ -1526,6 +1526,15 @@ and session IDs.
   deliberately the *same* `Spill` rather than a second one written to a similar standard, because
   two implementations of one guarantee is how the weaker of them ships.
 
+  **A tail's spill is a bounded directory of parts, and every clause above applies to all of them.**
+  A pipe ends and a Loki tail does not, so a remote source spills into a `%TEMP%` *directory* — the
+  directory and every part carrying the same restrictive DACL, the whole tree deleted on clean exit,
+  an orphaned one reaped whole on next launch. It holds the newest **512 MB** in **64 MB** parts and
+  the oldest are deleted behind the newest, which is a privacy property before it is a disk one:
+  credentialed customer log content stops accumulating in `%TEMP%` at a stated bound instead of
+  growing for as long as the window is open. `LOKI.md` §6 carries the reasoning and the rule that
+  dropping the oldest records is said in the status bar rather than done silently.
+
 ### 13.3 Updates
 
 **No in-app self-updater.** A check-for-update link only, and package-manager updates via scoop and

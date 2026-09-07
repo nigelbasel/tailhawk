@@ -13,7 +13,6 @@
 //! **The decisions are pure and tested; the thread is not.** [`window_after`] and [`Backoff`] are
 //! this module's whole judgement and neither needs a network, a window or a clock it does not own.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use std::time::Duration;
 
 use tailhawk_core::loki::{Direction, Nanos, Window};
 use tailhawk_core::settings::Source;
+use tailhawk_core::stdin::SpillWriter;
 
 /// How long between polls when everything is working.
 ///
@@ -193,14 +193,18 @@ pub struct Tail {
 }
 
 impl Tail {
-    /// Starts tailing `source` into the spill at `path`, resuming after `since`.
+    /// Starts tailing `source` into `spill`, resuming after `since`.
+    ///
+    /// The writer rather than a path, because the spill is bounded: a part fills, the next one
+    /// starts, and the oldest are deleted behind it. `stdin.rs` owns all three and the worker only
+    /// has to say what it wrote.
     ///
     /// Faults are sent on `notices` rather than shown from the worker: the status bar belongs to
     /// the UI thread, and a background thread reaching into it is how a repaint ends up on the
     /// wrong side of a `RefCell` borrow.
     pub fn start(
         source: Source,
-        path: PathBuf,
+        mut spill: SpillWriter,
         since: Nanos,
         seed: &str,
         notices: Sender<String>,
@@ -220,6 +224,7 @@ impl Tail {
             let mut backoff = Backoff::default();
             let mut behind = false;
             let mut said_cut = false;
+            let mut said_dropped = false;
             loop {
                 // A tail that is behind asks again at once; only one that is level waits.
                 let wait = if behind {
@@ -287,13 +292,38 @@ impl Tail {
                             continue;
                         }
                         floor = 0;
+                        // **Asked again here, immediately before the write.** The window closing
+                        // drops the `SpillSet`, which removes the directory; an append that starts
+                        // after that can create its next part inside a directory being deleted and
+                        // leave fetched log content in `%TEMP%` past a clean exit. The check cannot
+                        // close the window — the answer can be stale by the next instruction — but
+                        // it shrinks it from a whole poll to a few instructions, and `reap_orphans`
+                        // is what covers the remainder.
+                        if flag.load(Ordering::Relaxed) {
+                            return;
+                        }
                         crate::header::trace(&format!(
                             "tail: appended fresh_bytes={}",
                             fresh.len()
                         ));
-                        if append(&path, &fresh).is_err() {
-                            let _ = notices.send(format!("{name}: could not write new records"));
-                            return;
+                        match spill.append(&fresh) {
+                            // LOKI.md §6: what is missing is said. Records scrolled off the top
+                            // to keep the spill inside its bound are history the user could have
+                            // scrolled back to, so it is said once rather than never.
+                            Ok(dropped) => {
+                                if dropped > 0 && !said_dropped {
+                                    said_dropped = true;
+                                    let _ = notices.send(format!(
+                                        "{name}: the oldest records are being dropped to keep this source's temporary files near {} MB",
+                                        tailhawk_core::stdin::SPILL_BYTES / (1024 * 1024)
+                                    ));
+                                }
+                            }
+                            Err(why) => {
+                                let _ = notices
+                                    .send(format!("{name}: could not write new records: {why}"));
+                                return;
+                            }
                         }
                         // **Only what was actually written moves the mark.** Advancing on the
                         // window's end instead would skip whatever Loki had not yet indexed at the
@@ -352,12 +382,6 @@ fn now_nanos() -> Option<Nanos> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_nanos() as Nanos)
-}
-
-fn append(path: &PathBuf, clef: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
-    file.write_all(clef.as_bytes())
 }
 
 #[cfg(test)]

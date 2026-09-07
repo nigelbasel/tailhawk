@@ -183,6 +183,28 @@ Other rules:
   endpoint. Do not write any Loki server flag name or default into the spec — the two research rounds
   disagreed on the flag prefix, and the value is per-tenant anyway.
 
+- **The spill is bounded, and the bound is a rolling set — settled 2026-09-07, built.** A pipe ends;
+  a tail does not. §5's poll appends for as long as the window is open, and against the owner's own
+  source that is about **180 KB a second, 650 MB an hour, for ever** — an overnight tail was fifteen
+  gigabytes of `%TEMP%`. Of the three ways to bound a growing file, stopping the writer loses the
+  tail, which is the one thing the file exists for, and rewriting it shorter invalidates every byte
+  offset the line index holds. So a remote source's spill is a **directory of parts**: 64 MB each,
+  512 MB kept, the oldest deleted behind the newest. The reading side is §5.5b's rolling set and
+  needed nothing new — the parts are named so `pattern.rs` orders them oldest-first, `set.rs`
+  attaches a new part with the drain-then-switch it already does and retires a deleted one because
+  §5.5b requires retention deletions be tolerated, and `LogFile`'s share mode already includes
+  `DELETE` so a part can be deleted while the reader holds it.
+- **Dropping the oldest records is loss, so it is said**, once, in the status bar — the rule at the
+  top of this section applied to our own retention rather than to Loki's `limit`. A user who scrolls
+  to the top of a bounded tail is at the top of what was *kept*, not at the beginning of the source,
+  and nothing else on screen would tell them.
+- **The parts live in a directory of their own, which is a correctness fix and not only tidiness.**
+  Every spill in `%TEMP%` shares one literal name skeleton, so `LogSet::open` — which infers a set
+  from a file's siblings — could splice a *second* remote source's records into the first one's
+  scrollback as older history. `stdin.rs` had named that hazard and guarded the pipe path with
+  `open_single`; the remote path was opened the other way. Parts in a private directory make the
+  inference correct rather than merely guarded.
+
 ## 7. Security — the credential design as researched is unsound
 
 Two of the research's own load-bearing controls are defects, not fixes.

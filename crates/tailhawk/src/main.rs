@@ -1621,6 +1621,21 @@ impl Document {
             // The chips stay, and the pass restarts over what the file now is.
             self.filtering.clear_results();
             self.refilter();
+            // **A bookmark is moved, not dropped.** E20's bookmarks are row numbers and nothing
+            // else, so unlike a selection or a match there is an honest answer to where they went:
+            // a mark above a retired stretch moves down by its length, a mark inside one is gone
+            // with the line it named. Discarding them all would be the easy answer and the wrong
+            // one now that a bounded spill retires a part every few minutes rather than a log4net
+            // set retiring one a day.
+            if !polled.retired_rows.is_empty() {
+                self.bookmarks = self
+                    .bookmarks
+                    .iter()
+                    .filter_map(|row| {
+                        tailhawk_core::set::after_retirement(*row, &polled.retired_rows)
+                    })
+                    .collect();
+            }
         }
 
         // Growth is sieved on the worker as it arrives — see `Filtering::covered`.
@@ -4125,15 +4140,23 @@ struct Shell {
     pending_sources: bool,
     /// The remote source the user picked, waiting for the pull that must not run inside a borrow.
     pending_pull: Option<usize>,
-    /// Spill files this session made from remote sources. Held so §13.2's "deleted on clean exit"
-    /// is true: dropping a `Spill` removes its file, and these live exactly as long as the window.
-    spills: Vec<tailhawk_core::stdin::Spill>,
     /// The running Loki tails, one per open remote source. Dropping one stops its thread.
     ///
     /// Held for the window's life alongside the spills they append to, and for the same reason:
     /// 13.2 wants a spill gone on a clean exit, and a tail still writing to a deleted file is a
     /// thread that outlives the thing it was for.
+    ///
+    /// **Declared before `spill_sets`, and the order is load-bearing.** Rust drops a struct's
+    /// fields in declaration order, so the tails are asked to stop before the directories they
+    /// write to are removed. The other way round, a worker taking the roll branch during
+    /// `remove_dir_all` creates its next part — `CREATE_NEW` succeeds while the directory is still
+    /// there — and the removal fails on a directory that is no longer empty, leaving fetched log
+    /// content in `%TEMP%` after a clean exit.
     tails: Vec<tail::Tail>,
+    /// Spills this session made from remote sources. Held so §13.2's "deleted on clean exit" is
+    /// true: dropping a `SpillSet` removes its whole directory, parts and all, and these live
+    /// exactly as long as the window.
+    spill_sets: Vec<tailhawk_core::stdin::SpillSet>,
     /// What the tail workers have to say. Drained on the follow tick — the status bar belongs to
     /// this thread and a worker must not reach into it.
     tail_notices: Vec<std::sync::mpsc::Receiver<String>>,
@@ -7543,15 +7566,21 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
         }
     };
 
-    let Ok(spill) = tailhawk_core::stdin::Spill::create() else {
+    // **A `SpillSet`, not a `Spill`.** A pipe ends and a tail does not, so the file this writes
+    // cannot be one that only grows: `stdin.rs` rolls it into parts and deletes the oldest behind
+    // it. The parts live in a directory of their own, which is also what makes `Document::open`'s
+    // rolling-set inference *correct* here — inferred over one source's own parts rather than over
+    // every spill in `%TEMP%`, which is the splice `open_single` guards the pipe path against.
+    let Ok(spill) = tailhawk_core::stdin::SpillSet::create() else {
         set_notice("Could not create a temporary file for the records.".to_owned());
         return;
     };
-    if std::fs::write(spill.path(), pulled.clef.as_bytes()).is_err() {
+    let mut writer = spill.writer();
+    if writer.append(&pulled.clef).is_err() {
         set_notice("Could not write the records to a temporary file.".to_owned());
         return;
     }
-    let path = spill.path().to_path_buf();
+    let path = spill.first_part();
     // §6: what is missing is said, not silently lost — and there are **two** ways to be missing
     // records, which the first real run against live made obvious.
     //
@@ -7583,14 +7612,14 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
     let (notices, from_tail) = std::sync::mpsc::channel();
     let tail = tail::Tail::start(
         source,
-        path.clone(),
+        writer,
         pulled.newest.unwrap_or(window.end),
         &pulled.clef,
         notices,
     );
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
-            shell.spills.push(spill);
+            shell.spill_sets.push(spill);
             shell.tails.push(tail);
             shell.tail_notices.push(from_tail);
         }
@@ -10159,7 +10188,7 @@ fn main() -> Result<()> {
             pending_rules: false,
             pending_sources: false,
             pending_pull: None,
-            spills: Vec::new(),
+            spill_sets: Vec::new(),
             tails: Vec::new(),
             tail_notices: Vec::new(),
             find_dialog: HWND::default(),

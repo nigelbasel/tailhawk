@@ -60,9 +60,9 @@ use windows::Win32::Security::{
     TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileType, ReadFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
-    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK,
-    FILE_TYPE_PIPE,
+    CreateDirectoryW, CreateFileW, GetFileType, ReadFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+    FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR,
+    FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
 use windows::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -249,6 +249,328 @@ impl Drop for Spill {
 
 static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Names every part of a rolling spill, so [`reap_orphans`] and `pattern.rs` both recognise one.
+const PART_PREFIX: &str = "part-";
+
+/// How large one part grows before the next is started.
+///
+/// A roll costs a directory listing, a file creation and — on the reading side — a drain and a
+/// switch, so it wants to be rare; a part is also the granularity at which history is thrown
+/// away, so it wants to be small. Sixty-four megabytes is a few minutes of the owner's live
+/// source, which is both.
+pub const PART_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How much of a rolling spill survives before its oldest parts are deleted.
+///
+/// The same figure as [`crate::set::EAGER_BYTES`], and that is the argument for it: a set indexes
+/// about that much when it opens, so bytes kept beyond it are bytes the reader would not have
+/// indexed anyway. At the rate measured against the owner's live source it is roughly the last
+/// hour, and a tail left running overnight costs half a gigabyte of `%TEMP%` rather than fifteen.
+pub const SPILL_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The name of part `n`.
+///
+/// **Zero-padded to six digits because `pattern.rs` has to read it.** A rolling set's order is
+/// inferred from the names alone: six digits clears [`crate::pattern::FIELD_MIN_DIGITS`], so the
+/// parts are recognised as members at all, and padding is what makes them sort `1, 2, 10` rather
+/// than `1, 10, 2` — §5.5b's silent reversal, history shown backwards with nothing to say so.
+fn part_name(n: u64) -> String {
+    format!("{PART_PREFIX}{n:06}{SPILL_SUFFIX}")
+}
+
+/// Every part in `dir`, oldest first, with its length.
+fn parts_of(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut parts: Vec<(PathBuf, u64)> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(PART_PREFIX) && n.ends_with(SPILL_SUFFIX))
+        })
+        .map(|e| {
+            // **`fs::metadata` on the path, not the entry's own.** A directory entry carries the
+            // size the last directory update wrote, which for a file somebody holds an open write
+            // handle to reads zero however much has been written and flushed to it. Nothing here
+            // keeps such a handle today, so both answers agree; the day the writer keeps its part
+            // open across polls, the entry's answer would silently under-count the live part and
+            // every test would still pass.
+            let path = e.path();
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            (path, len)
+        })
+        .collect();
+    parts.sort_by(|a, b| a.0.cmp(&b.0));
+    parts
+}
+
+/// How many of the oldest parts must go for a spill holding `sizes` to fit in `cap`.
+///
+/// `sizes` is oldest-first and its last entry is the live part. **The live part is never
+/// deletable**, whatever it costs: it is the one being appended to, and a bound that could delete
+/// it would answer "the disk is full" by stopping the tail — which is the one thing the file
+/// exists to do. So a single part over the cap is reported as nothing to delete, and the spill is
+/// briefly larger than its bound rather than briefly empty.
+pub fn excess(sizes: &[u64], cap: u64) -> usize {
+    let mut total: u64 = sizes.iter().sum();
+    let mut dropped = 0;
+    while total > cap && dropped + 1 < sizes.len() {
+        total -= sizes[dropped];
+        dropped += 1;
+    }
+    dropped
+}
+
+/// A spill that rolls: a directory of numbered parts, bounded in total, read as one document.
+///
+/// §4.2's [`Spill`] is one file that only grows, which is right for a pipe — a pipe ends. A Loki
+/// tail does not: `LOKI.md` §5's poll appends for as long as the window is open, and at the rate
+/// measured against the owner's own source that is about 650 MB an hour, for ever. The three ways
+/// to bound a growing file are to stop writing it, to rewrite it shorter, or to keep it in parts.
+/// Stopping loses the tail; rewriting invalidates every byte offset [`crate::index::LineIndex`]
+/// holds. So: parts.
+///
+/// **Almost nothing new is needed on the reading side, and that is the whole design.** The parts
+/// are named so `pattern.rs` orders them oldest-first, which makes the directory an ordinary
+/// §5.5b rolling set; [`crate::set::LogSet`] attaches a new part with the drain-then-switch it
+/// already does for a rolling log, and retires a deleted one because §5.5b requires retention
+/// deletions be tolerated. `file.rs`'s share mode includes `DELETE`, so the writer can delete a
+/// part the reader is holding — the name goes at once under the POSIX-semantics delete Windows 10
+/// 1809 gives us, which is §2.1's floor, and the bytes go when the reader retires the member a
+/// listing interval later.
+///
+/// **The directory is also a fix, not only a container.** A remote source's spill was opened with
+/// [`LogSet::open`](crate::set::LogSet::open), which infers a set from the names beside it, and
+/// every spill in `%TEMP%` shares one literal skeleton — so a second remote source could splice
+/// the first one's records into its scrollback as older history. That is the hazard
+/// `a_spill_never_adopts_another_instances_spill_as_a_rolling_set` names and `open_single` guards
+/// the pipe path against; parts in a directory of their own make the inference *correct* rather
+/// than merely guarded, because the only names beside a part are that source's own.
+pub struct SpillSet {
+    dir: PathBuf,
+    sddl: String,
+    /// **The directory itself, held open for as long as this lives**, so another instance's
+    /// [`reap_orphans`] can see that someone is using it. The trick [`Spill`] plays with its file,
+    /// moved up a level — and it has to be up a level. Holding *part one* instead looks equivalent
+    /// and is not: retention deletes part one from every spill that runs long enough, and a live
+    /// tail would then be holding nothing at all. The test suite proved that within a minute of
+    /// the rule existing, by reaping a spill another test was still writing to.
+    ///
+    /// Shared read/write/delete, so this process's own reader, writer and retention are unaffected;
+    /// a reaper asks for the directory with **no** sharing, and that is the whole conversation.
+    hold: Option<std::fs::File>,
+    remove_on_drop: bool,
+}
+
+impl SpillSet {
+    /// Creates the directory and its first part, both with §13.2's restrictive DACL.
+    pub fn create() -> Result<Self> {
+        let temp = std::env::temp_dir();
+        let sid = current_user_sid()?;
+        let sddl = format!("D:P(A;;FA;;;{sid})");
+
+        let mut last = None;
+        for attempt in 0..2u32 {
+            let counter = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = temp.join(format!(
+                "{SPILL_PREFIX}{}-{}{attempt}",
+                std::process::id(),
+                counter
+            ));
+            match create_dir_locked_down(&dir, &sddl) {
+                Ok(()) => {
+                    let mut set = Self {
+                        dir,
+                        sddl,
+                        hold: None,
+                        remove_on_drop: true,
+                    };
+                    // Built before either, so a failure below drops `set` and takes the directory
+                    // with it rather than leaving an empty one in `%TEMP%`.
+                    //
+                    // **The hold comes before the first part, and the order is the whole guard.**
+                    // A reaper skips a directory holding no parts at all, so the moment between
+                    // the directory appearing and this handle existing is a moment in which there
+                    // is nothing to reap. Taking the hold second leaves a window where a live
+                    // spill has a part and no holder, and a concurrent launch deletes it.
+                    set.hold = Some(open_dir(&set.dir, SHARE_ALL)?);
+                    drop(create_locked_down(&set.first_part(), &set.sddl)?);
+                    return Ok(set);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| Error("no spill directory could be created".into())))
+    }
+
+    /// The directory holding the parts. §13.2's "the spill location is displayed in source
+    /// properties".
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The part a document opens. The oldest, because a set is read oldest-first.
+    pub fn first_part(&self) -> PathBuf {
+        self.dir.join(part_name(1))
+    }
+
+    /// The writing half, for the thread that fills the spill.
+    ///
+    /// Separate because a `SpillSet` the window owns and a tail thread that may outlive it cannot
+    /// share one writer without a lock neither needs — the same split [`Spill`] and [`Pump`] have.
+    pub fn writer(&self) -> SpillWriter {
+        SpillWriter {
+            dir: self.dir.clone(),
+            sddl: self.sddl.clone(),
+            part: 1,
+            part_bytes: PART_BYTES,
+            cap: SPILL_BYTES,
+        }
+    }
+}
+
+impl Drop for SpillSet {
+    /// §13.2: "deleted on clean exit" — the whole directory, and the handle first, for the reason
+    /// [`Spill`] drops its file first.
+    fn drop(&mut self) {
+        self.hold = None;
+        if self.remove_on_drop {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Appends to a [`SpillSet`], rolling and deleting as its caps require.
+pub struct SpillWriter {
+    dir: PathBuf,
+    sddl: String,
+    part: u64,
+    part_bytes: u64,
+    cap: u64,
+}
+
+impl SpillWriter {
+    /// Smaller caps, so a test can reach a roll and a deletion without writing half a gigabyte.
+    ///
+    /// The production caps are the constants and nothing outside a test sets them: a spill whose
+    /// bound could be configured is a bound somebody can turn off.
+    #[cfg(test)]
+    fn with_limits(mut self, part_bytes: u64, cap: u64) -> Self {
+        self.part_bytes = part_bytes;
+        self.cap = cap;
+        self
+    }
+
+    /// Shrinks the retention cap mid-flight, so a test can let a reader open a part and *then*
+    /// have retention take it — which is the case worth testing and cannot be reached by opening
+    /// a spill that was already over its cap.
+    #[cfg(test)]
+    fn cap_to(&mut self, cap: u64) {
+        self.cap = cap;
+    }
+
+    /// Appends `text` to the live part. Returns how many old parts this cost.
+    ///
+    /// **The count is returned rather than logged** because `LOKI.md` §6 wants what is missing
+    /// said: a tail whose oldest records have been thrown away to stay inside its bound has lost
+    /// history the user could otherwise scroll to, and the status bar is where that belongs.
+    pub fn append(&mut self, text: &str) -> Result<usize> {
+        let mut live = self.dir.join(part_name(self.part));
+        let full = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0) >= self.part_bytes;
+        if full {
+            let next = self.dir.join(part_name(self.part + 1));
+            create_locked_down(&next, &self.sddl)?;
+            self.part += 1;
+            live = next;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .map_err(|e| Error(format!("{}: {e}", live.display())))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| Error(format!("{}: {e}", live.display())))?;
+        file.flush()
+            .map_err(|e| Error(format!("{}: {e}", live.display())))?;
+        Ok(self.retire())
+    }
+
+    /// Deletes the oldest parts until the spill fits its cap. Returns how many went.
+    ///
+    /// A delete that fails is not an error and not retried here: the next append asks the same
+    /// question of a fresh listing, and a part something else is holding without `FILE_SHARE_DELETE`
+    /// is a reason to stay over the bound rather than to stop tailing.
+    fn retire(&self) -> usize {
+        let parts = parts_of(&self.dir);
+        let sizes: Vec<u64> = parts.iter().map(|(_, len)| *len).collect();
+        let mut gone = 0;
+        for (path, _) in parts.iter().take(excess(&sizes, self.cap)) {
+            if std::fs::remove_file(path).is_ok() {
+                gone += 1;
+            }
+        }
+        gone
+    }
+}
+
+/// Read, write and delete, the same sharing `file.rs` opens a log with: this process reads a spill
+/// directory, appends inside it and deletes from it while holding it open.
+const SHARE_ALL: FILE_SHARE_MODE =
+    FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
+
+/// Opens a handle to a *directory*.
+///
+/// `FILE_FLAG_BACKUP_SEMANTICS` is what makes `CreateFileW` accept one at all. With `share` at
+/// [`SHARE_ALL`] this is a claim — "someone is using this" — and with it at zero it is the
+/// question, which is how [`reap_orphans`] tells an abandoned spill from a live one.
+fn open_dir(path: &Path, share: FILE_SHARE_MODE) -> Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+
+    let wide_path = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            windows::Win32::Foundation::GENERIC_READ.0,
+            share,
+            None,
+            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+            windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(Error(format!("{}: invalid handle", path.display())));
+    }
+    Ok(unsafe { std::fs::File::from_raw_handle(handle.0) })
+}
+
+/// Creates a directory whose DACL is exactly `sddl`.
+fn create_dir_locked_down(path: &Path, sddl: &str) -> Result<()> {
+    let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_wide.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|e| Error(format!("spill security descriptor: {e}")))?;
+
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let wide_path = wide(path);
+    let created = unsafe { CreateDirectoryW(PCWSTR(wide_path.as_ptr()), Some(&attributes)) };
+    unsafe { LocalFree(HLOCAL(descriptor.0)) };
+    created.map_err(|e| Error(format!("{}: {e}", path.display())))
+}
+
 /// How a stream stopped.
 ///
 /// **`PLAN.md` asks a pipe source to "distinguish *writer finished* from *writer died mid-stream*",
@@ -403,10 +725,29 @@ pub fn reap_orphans() -> usize {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(SPILL_PREFIX) || !name.ends_with(SPILL_SUFFIX) {
+        if !name.starts_with(SPILL_PREFIX) {
             continue;
         }
         let path = entry.path();
+        // A [`SpillSet`] is a directory of parts rather than a file, and it is orphaned on the
+        // same evidence a spill file is: nobody has it open. The claim a live one makes is on
+        // the directory, so that is what is asked about — see [`SpillSet::hold`].
+
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // An empty one is left alone: it is zero bytes, it can only be a create that failed
+            // between the directory and its first part, and skipping it is what makes the
+            // [`SpillSet::create`] ordering above a guarantee rather than a narrow race.
+            if !parts_of(&path).is_empty()
+                && open_dir(&path, FILE_SHARE_MODE(0)).is_ok()
+                && std::fs::remove_dir_all(&path).is_ok()
+            {
+                reaped += 1;
+            }
+            continue;
+        }
+        if !name.ends_with(SPILL_SUFFIX) {
+            continue;
+        }
         if open_exclusive(&path).is_ok() && std::fs::remove_file(&path).is_ok() {
             reaped += 1;
         }
@@ -668,7 +1009,9 @@ mod tests {
         let live = Spill::create().expect("live");
         let live_path = live.path().to_path_buf();
 
-        assert!(reap_orphans() >= 1);
+        // Not asserted on the count: the suite runs these in parallel and another test reaping
+        // the same `%TEMP%` can get there first. What is asserted is what this test is about.
+        reap_orphans();
         assert!(!orphan.exists(), "the orphan should have been reaped");
         assert!(
             live_path.exists(),
@@ -748,5 +1091,306 @@ mod tests {
         let opened = LogSet::open_single(mine.path()).expect("open as one file");
         assert_eq!(opened.members().len(), 1);
         assert_eq!(opened.total_rows(), 1);
+    }
+
+    /// **The naming is load-bearing and this is what holds it.** `pattern.rs` decides the order of
+    /// a set from its names alone, and a spill that rolled into names it ordered newest-first
+    /// would present the tail's history backwards — §5.5b's silent reversal, arrived at through
+    /// our own file naming rather than through someone else's.
+    #[test]
+    fn parts_are_a_rolling_set_that_reads_oldest_first() {
+        use crate::pattern::{Order, RollingSet};
+
+        let names: Vec<String> = (1..=11).map(part_name).collect();
+        let set = RollingSet::infer(&names[0], &names);
+        assert_eq!(set.order(), Order::Ascending);
+        assert_eq!(set.members(), names.as_slice());
+        assert_eq!(set.newest(), part_name(11));
+        // Ten and two are where an unpadded sequence sorts wrong, so they are what to assert on.
+        assert!(
+            names[1] < names[9],
+            "part two must sort before part ten: {} vs {}",
+            names[1],
+            names[9]
+        );
+    }
+
+    #[test]
+    fn a_spill_inside_its_cap_loses_nothing() {
+        assert_eq!(excess(&[10, 10, 10], 100), 0);
+        assert_eq!(
+            excess(&[40, 40, 20], 100),
+            0,
+            "exactly the cap is inside it"
+        );
+    }
+
+    #[test]
+    fn the_oldest_parts_are_what_go() {
+        assert_eq!(excess(&[40, 40, 40], 100), 1);
+        assert_eq!(excess(&[40, 40, 40, 40], 100), 2);
+    }
+
+    /// The live part is never deleted, whatever it costs — see [`excess`].
+    #[test]
+    fn the_live_part_is_never_deletable() {
+        assert_eq!(excess(&[500], 100), 0);
+        assert_eq!(
+            excess(&[500, 500], 100),
+            1,
+            "everything but the live part goes, and no further"
+        );
+        assert_eq!(excess(&[], 100), 0);
+    }
+
+    #[test]
+    fn a_spill_set_is_readable_only_by_the_user_who_made_it() {
+        let set = SpillSet::create().expect("create a rolling spill");
+        let control = std::env::temp_dir().join("tailhawk-dacl-control-set.txt");
+        let _ = std::fs::remove_file(&control);
+        std::fs::write(&control, b"control").expect("control file");
+
+        let ordinary = dacl_of(&control);
+        assert!(
+            ordinary.contains("SY") || ordinary.contains("BA"),
+            "this machine's %TEMP% grants nobody else anything, so the comparison would be vacuous: {ordinary}"
+        );
+        for path in [set.dir().to_path_buf(), set.first_part()] {
+            let sddl = dacl_of(&path);
+            assert!(
+                !sddl.contains("SY") && !sddl.contains("BA"),
+                "{} is readable by more than its owner: {sddl}",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_file(&control);
+    }
+
+    #[test]
+    fn a_rolling_spill_deletes_itself_whole() {
+        let dir;
+        {
+            let set = SpillSet::create().expect("create");
+            dir = set.dir().to_path_buf();
+            set.writer().append("a line\n").expect("append");
+            assert!(set.first_part().exists());
+        }
+        assert!(!dir.exists(), "{} outlived its SpillSet", dir.display());
+    }
+
+    /// A part fills, the next one starts, and **nothing that was written is lost in the move** —
+    /// the rolling is a place to put new bytes, not a reason to drop old ones.
+    #[test]
+    fn a_full_part_rolls_into_the_next_one() {
+        let set = SpillSet::create().expect("create");
+        let mut writer = set.writer().with_limits(64, 1 << 30);
+
+        for n in 0..20 {
+            writer.append(&format!("line {n}\n")).expect("append");
+        }
+
+        let parts = parts_of(set.dir());
+        assert!(
+            parts.len() > 1,
+            "twenty lines over a 64-byte part must have rolled: {parts:?}"
+        );
+        assert_eq!(parts[0].0, set.first_part(), "part one is the oldest");
+        let written: String = parts
+            .iter()
+            .map(|(path, _)| std::fs::read_to_string(path).expect("read a part"))
+            .collect();
+        for n in 0..20 {
+            assert!(
+                written.contains(&format!("line {n}\n")),
+                "line {n} was lost"
+            );
+        }
+    }
+
+    /// The bound itself: parts keep arriving, the oldest keep going, and the total stays inside
+    /// the cap rather than growing for as long as the tail runs.
+    #[test]
+    fn the_oldest_parts_go_when_the_spill_is_over_its_cap() {
+        let set = SpillSet::create().expect("create");
+        let mut writer = set.writer().with_limits(64, 256);
+
+        let mut dropped = 0;
+        for n in 0..200 {
+            dropped += writer.append(&format!("line {n}\n")).expect("append");
+        }
+
+        assert!(
+            dropped > 0,
+            "nothing was ever deleted, so nothing was bounded"
+        );
+        let parts = parts_of(set.dir());
+        let total: u64 = parts.iter().map(|(_, len)| len).sum();
+        assert!(
+            total <= 256 + 64,
+            "the spill is {total} bytes against a 256-byte cap: {parts:?}"
+        );
+        assert!(!set.first_part().exists(), "part one should have gone");
+        let newest = std::fs::read_to_string(&parts.last().expect("a live part").0).expect("read");
+        assert!(
+            newest.contains("line 199\n"),
+            "the newest records must be the ones kept: {newest}"
+        );
+    }
+
+    /// **What the shell actually does with it**: open part one as a document and let the set
+    /// follow. A roll must appear as more rows in the same document, not as a second one.
+    #[test]
+    fn a_rolling_spill_reads_as_one_growing_document() {
+        use crate::set::LogSet;
+
+        let set = SpillSet::create().expect("create");
+        let mut writer = set.writer().with_limits(64, 1 << 30);
+        for n in 0..4 {
+            writer.append(&format!("line {n}\n")).expect("append");
+        }
+
+        let mut opened = LogSet::open(&set.first_part()).expect("open part one");
+        opened.settle();
+        let before = opened.total_rows();
+        assert!(before >= 4, "the opening lines are there: {before}");
+
+        for n in 4..40 {
+            writer.append(&format!("line {n}\n")).expect("append");
+        }
+        assert!(
+            parts_of(set.dir()).len() > 1,
+            "the fixture must have rolled for this to be testing anything"
+        );
+        opened.rescan();
+        opened.settle();
+
+        assert_eq!(opened.total_rows(), 40, "every line, across every part");
+        assert!(
+            opened.members().len() > 1,
+            "the roll should have attached a new member, not opened a new document"
+        );
+    }
+
+    /// The hazard `a_spill_never_adopts_another_instances_spill_as_a_rolling_set` names, closed
+    /// for the remote path by construction rather than by remembering to call `open_single`: the
+    /// only names beside a part are that source's own parts.
+    #[test]
+    fn a_rolling_spill_never_adopts_another_instances_parts() {
+        use crate::set::LogSet;
+
+        let theirs = SpillSet::create().expect("their spill");
+        theirs
+            .writer()
+            .append("someone else's records\n")
+            .expect("append");
+        let mine = SpillSet::create().expect("our spill");
+        mine.writer().append("our records\n").expect("append");
+
+        let opened = LogSet::open(&mine.first_part()).expect("open ours");
+        assert_eq!(opened.members().len(), 1);
+        assert_eq!(opened.total_rows(), 1);
+
+        // **The assertion that can actually fail is this one.** Two sets are in two directories by
+        // construction, so the open above could not splice them however the code were written; what
+        // a future change could do is put the parts back in `%TEMP%` beside every other spill,
+        // which is exactly the arrangement that made the splice possible. So the property under
+        // test is that a part is *not* a sibling of other spills.
+        assert_ne!(
+            mine.first_part().parent(),
+            Some(std::env::temp_dir().as_path()),
+            "parts must live in a directory of their own, not beside every other spill"
+        );
+        assert_ne!(theirs.dir(), mine.dir());
+    }
+
+    #[test]
+    fn reaping_removes_an_orphan_spill_directory_and_leaves_a_live_one_alone() {
+        use crate::set::LogSet;
+
+        let orphan = {
+            let mut set = SpillSet::create().expect("orphan");
+            set.writer().append("abandoned\n").expect("append");
+            set.hold = None;
+            set.remove_on_drop = false;
+            set.dir().to_path_buf()
+        };
+        let live = SpillSet::create().expect("live");
+        live.writer().append("in use\n").expect("append");
+        let reader = LogSet::open(&live.first_part()).expect("open the live one");
+
+        // Not asserted on the count, for the reason the file-reaping test above gives.
+        reap_orphans();
+        assert!(!orphan.exists(), "{} survived reaping", orphan.display());
+        assert!(
+            live.first_part().exists(),
+            "a spill someone is reading was reaped"
+        );
+        assert_eq!(reader.total_rows(), 1);
+    }
+
+    /// **The two halves of the design, exercised together — which is the whole claim.** A reader
+    /// holds a part; the writer deletes it; the name has to leave the directory at once, the set
+    /// has to retire the member, and the row space has to stay coherent across the renumber.
+    ///
+    /// Each half was tested alone and neither test could have caught the other's failure: the
+    /// reading test ran with retention switched off, and the retention test had no reader. The
+    /// mechanism they both rest on is `file.rs`'s `FILE_SHARE_DELETE` plus `std`'s choice of
+    /// POSIX-semantics delete — if either changed, the deleted name would linger as delete-pending,
+    /// the member would never retire, its bytes would never be freed, and the bound would quietly
+    /// stop working with the whole suite still green.
+    #[test]
+    fn a_part_is_deleted_under_a_reader_and_the_document_stays_coherent() {
+        use crate::set::LogSet;
+
+        let set = SpillSet::create().expect("create");
+        let mut writer = set.writer().with_limits(64, 1 << 30);
+        for n in 0..20 {
+            writer.append(&format!("line {n}\n")).expect("append");
+        }
+        let parts = parts_of(set.dir());
+        assert!(parts.len() > 1, "the fixture must have rolled: {parts:?}");
+
+        let mut opened = LogSet::open(&set.first_part()).expect("open part one");
+        opened.rescan();
+        opened.settle();
+        assert_eq!(opened.total_rows(), 20, "every line, before anything goes");
+        let oldest_rows = opened.members()[0].line_count();
+        assert!(oldest_rows > 0);
+
+        // The reader is holding part one. Retention takes it anyway, which is the thing that has
+        // to work: a `LogFile` shares delete, so this must succeed rather than fail as busy. The
+        // cap is set from the parts on disk so that exactly the oldest is over it — a fixture that
+        // deleted everything but the live part would prove less.
+        let held: u64 = parts.iter().map(|(_, len)| len).sum();
+        writer.cap_to(held - parts[0].1 + 32);
+        writer.append("line 20\n").expect("append past the cap");
+        assert!(
+            !set.first_part().exists(),
+            "the deleted name must leave the directory at once, not linger as delete-pending"
+        );
+
+        opened.rescan();
+        let polled = opened.settle();
+        assert_eq!(
+            polled.retired,
+            ["part-000001.log"],
+            "the set must notice the part it was holding has gone"
+        );
+        assert_eq!(
+            polled.retired_rows,
+            [(0, oldest_rows)],
+            "and say where those rows were, so a caller can move what it addresses"
+        );
+        assert_eq!(
+            opened.total_rows(),
+            21 - oldest_rows,
+            "the row space is what survives, renumbered"
+        );
+        opened.fetch(0, 2, false).expect("fetch");
+        assert_eq!(
+            opened.row_text(0),
+            Some(format!("line {oldest_rows}").as_str()),
+            "row zero is now the oldest surviving line"
+        );
     }
 }

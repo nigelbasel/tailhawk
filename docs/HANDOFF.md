@@ -36,8 +36,11 @@ returning nothing because it had caught up.
 | | |
 |---|---|
 | **A record that reaches Loki late is missed** | The mark advances to the newest record *returned*. A record whose timestamp falls before that but which Loki indexes afterwards is never asked for again. Real tailers either query to `now − lag` or re-ask an overlapping window; neither is built. Measured lag on the estate is ~30 s between a record's timestamp and its being queryable, so the exposure is real. |
-| **The spill grows without bound** | Live produces faster than 2,000 records per 5 s. A window left open all day is gigabytes. There is no roll, no cap and no eviction. |
+| **The spill was unbounded — fixed 2026-09-07** | Live produces faster than 2,000 records per 5 s and a window left open all day was gigabytes of `%TEMP%`. A remote source now spills into a locked-down **directory of parts** (`stdin.rs`'s `SpillSet`): 64 MB each, the newest 512 MB kept, the oldest deleted behind the newest, and the dropping said once in the status bar. The reading side needed nothing new — the parts are a §5.5b rolling set and `set.rs` already attaches and retires members. The directory also closed a real defect: a spill was opened with `LogSet::open`, which infers a set from its siblings, so a **second remote source could splice the first one's records into its scrollback** — the hazard `open_single` guards the pipe path against. |
+
 | **`§5`'s `lagging 2s` is not shown** | `UI-DESIGN.md` §597 specifies the lag in the status bar. The tail knows it — newest record versus now — and does not say it. |
+| **What the bounded spill costs, stated** | The bound is **per source and not global**: two Loki tabs is about 1.1 GB, and a closed tab keeps its spill and its tail until the window exits (see the row above), so it is a floor per tab rather than a session ceiling. `excess` never deletes the live part, so a set overshoots its cap by up to one part — the status bar says "near 512 MB" for that reason. A retirement also discards the search results and restarts the filter pass, which used to happen when a log4net set rolled once a day and now happens every few minutes on a busy tail. Bookmarks are *moved* across a retirement rather than dropped (`set::after_retirement`); a selection and a match still go, because they address bytes as well as rows. |
+
 | **Closing the tab does not stop the tail** | Tails live for the window's life, alongside the spills, which is the existing behaviour for spills rather than a new decision. |
 | **Frame budget — characterised under the live tail, not optimised** | Closed on 2026-09-03 at p95 9–11 ms; **reopened on 2026-09-04** when the corrected tail ran at ~900 records/s and the title read `frame p95 190 ms, worst 1.4 s, 61 over budget`. Attributed with wall-clock stamps on every stage (`TAILHAWK_ATLAS_LOG`; `header::trace` and `glyphs::atlas_log` both stamp `[ms]` now). A **warm** paint on the live tail is ~10 ms median: shell lay-out 2.8 ms (max 7), core begin 1.3, core lay-out + draw 3.9 (p90 5.8, max 10.4), present 0.7, flush 0.4; the worst warm paint in a 60 s run was 24 ms. Every frame far over budget is a **cold-glyph burst**: the opening frame (551 ms: 32 misses, 1,007 placeholder cells, one flush) and one 161 ms frame with 159 placeholder cells when live text brought glyphs the atlas had not seen. The 190 ms p95 was the opening burst inside a small sample; a later 60 s run read p95 24.6 ms, worst 525, 8 over. A handful of 25–68 ms frames with neither misses nor placeholders were seen once and not reproduced. **What would close it:** pre-warming the atlas with the opening screen's glyph set before the first present, and a per-frame cap on `flush_misses` so a burst spreads over frames instead of landing in one. Neither is started. |
 
@@ -98,12 +101,14 @@ shape per character boundary per column.
 **macOS is untested.** No Apple target is installed, and adding one changes the machine rather than
 the repository.
 
-### A second known flake
+### A second known flake — closed 2026-09-07
 
-`stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone` failed once under the full
-parallel suite and passes alone and on re-run. It scans `%TEMP%` for orphaned spill files, so a
-concurrent test creating or removing one trips it. **Rerun it alone before blaming a change** — the
-same advice as the `semantic` timing flake.
+`stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone` used to fail under the full
+parallel suite and pass alone: it asserted on the *count* `reap_orphans` returned, and a concurrent
+test reaping the same `%TEMP%` could get to the orphan first. Both reaping tests now assert what
+they are about — this orphan gone, that live spill untouched — and neither counts. The bounded
+spill's own tests made the race common enough to be worth fixing rather than rerunning.
+
 
 > **Theseus reads a dated status file, not this one.** `SESSION-STATUS-2026-08-28-tailhawk-9e.md` at
 > the repository root carries the same state in one self-contained page and is git-ignored. **This
