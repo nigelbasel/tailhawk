@@ -114,6 +114,7 @@ pub(crate) fn trace(line: &str) {
     use std::io::Write;
     use std::sync::OnceLock;
     static PATH: OnceLock<Option<String>> = OnceLock::new();
+    // Stamped with elapsed milliseconds since the first line, so a stage's cost is a subtraction.
     let Some(path) = PATH.get_or_init(|| std::env::var("TAILHAWK_ATLAS_LOG").ok()) else {
         return;
     };
@@ -122,7 +123,11 @@ pub(crate) fn trace(line: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{line}");
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let _ = writeln!(f, "[{ms:.3}] {line}");
     }
 }
 
