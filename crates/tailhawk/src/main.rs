@@ -195,6 +195,8 @@ struct Document {
     set: LogSet,
     view: View,
     summary: String,
+    /// Where a remote source's records landed, when this document is one — see [`Document::remote`].
+    remote_spill: Option<std::path::PathBuf>,
     /// The current selection, or `None` for "nothing selected".
     ///
     /// A caret — an empty selection at a click — is `Some`, not `None`: `Selection::at` exists so a
@@ -678,6 +680,23 @@ impl RowSource for Document {
 }
 
 impl Document {
+    /// Names this document after the **remote source it came from**, and remembers where its
+    /// records landed.
+    ///
+    /// A document is otherwise called after the file it opened, which for a Loki source is a part
+    /// of a temporary spill — `part-000001.log`. That is not a name: it says nothing about which
+    /// system is being watched, and **two remote sources open at once are identical in the tab
+    /// strip**, which is precisely the complaint that started this work. The source's own name is
+    /// the one the user chose it by, so it is the one the tab carries.
+    ///
+    /// The spill directory is kept for the title, because §13.2 wants the location of fetched
+    /// records visible for the same reason it wants a pipe's spill visible: a person tailing
+    /// production deserves to know where those bytes are sitting.
+    fn remote(&mut self, source: &str, spill: &std::path::Path) {
+        self.summary = source.to_owned();
+        self.remote_spill = Some(spill.to_path_buf());
+    }
+
     /// The line §6.2 defines a format from, and the lines it previews over: the top visible row
     /// and the rows after it, **raw**.
     ///
@@ -773,6 +792,7 @@ impl Document {
             view: View::new(1.0, 1.0),
             set,
             summary,
+            remote_spill: None,
             selection: None,
             dragging: false,
             finder: Finder::default(),
@@ -836,6 +856,7 @@ impl Document {
             // yet, so the title carries it — a user piping production logs is told where the bytes
             // are, in the only place there is to tell them.
             summary: format!("<stdin> → {}", pump.path().display()),
+            remote_spill: None,
             selection: None,
             dragging: false,
             finder: Finder::default(),
@@ -1492,7 +1513,14 @@ impl Document {
             Some((_, Some(StreamEnd::Failed(why)))) => format!(" — stream failed: {why}"),
             Some((true, _)) => " — stream complete".to_string(),
             Some((false, _)) => " — reading stdin".to_string(),
-            None => format!(" — {}", self.set.describe()),
+            // **A remote source's parts are not a file list the user has any use for.** §5.5b's
+            // description names the members, which for a Loki tail is `part-000002.log` and its
+            // siblings — machinery, not information. What §13.2 does want said is where the fetched
+            // records landed, exactly as the pipe path says it above.
+            None => match &self.remote_spill {
+                Some(dir) => format!(" — Loki, spilled to {}", dir.display()),
+                None => format!(" — {}", self.set.describe()),
+            },
         };
         // **The find state goes first**, because it is the part that changes while the user is
         // watching and the part a truncated title must not lose. Everything after it is the
@@ -5219,8 +5247,32 @@ impl Shell {
     /// at start-up, and the title says "opening" until it lands — a large file takes seconds to
     /// index and a window that went blank without a word would look hung.
     fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
-        self.file = Some(format!("opening {}…", path.display()));
-        self.reading.push(spawn_open(move || Document::open(&path)));
+        self.open_named(hwnd, path, None);
+    }
+
+    /// The same, for a document that has a **name of its own** — a remote source, whose file is a
+    /// part of a spill and whose name is the source the user configured.
+    ///
+    /// The naming happens on the worker with the open rather than after it lands, because the
+    /// document arrives through a channel and whatever reads it should never have to remember to
+    /// finish building it.
+    fn open_named(
+        &mut self,
+        hwnd: HWND,
+        path: std::path::PathBuf,
+        remote: Option<(String, std::path::PathBuf)>,
+    ) {
+        self.file = Some(match &remote {
+            Some((source, _)) => format!("opening {source}…"),
+            None => format!("opening {}…", path.display()),
+        });
+        self.reading.push(spawn_open(move || {
+            let mut doc = Document::open(&path)?;
+            if let Some((source, spill)) = remote {
+                doc.remote(&source, &spill);
+            }
+            Ok(doc)
+        }));
         self.refresh_title(hwnd);
         unsafe {
             SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
@@ -7617,6 +7669,7 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
         &pulled.clef,
         notices,
     );
+    let spill_dir = spill.dir().to_path_buf();
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.spill_sets.push(spill);
@@ -7626,7 +7679,8 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
     });
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
-            shell.open_path(hwnd, path);
+            // Named after the source, not after the part of the spill it happens to open on.
+            shell.open_named(hwnd, path, Some((name, spill_dir)));
         }
     });
 }
@@ -10502,6 +10556,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **A remote document is called after its source, not after a part of the spill.** Two Loki
+    /// sources open at once were identical in the tab strip — both `part-000001.log` — and the
+    /// title offered §5.5b's file list, which for a spill is `part-000002.log` and its siblings:
+    /// machinery, not information. §13.2's "the spill location is displayed" is met here too, in
+    /// the same place the pipe path meets it.
+    #[test]
+    fn a_remote_document_is_named_after_its_source() {
+        let path = scratch_log("tailhawk_remote_name.log", 8);
+        let spill = std::env::temp_dir().join("tailhawk-spill-fixture-0");
+        let mut doc = Document::open(&path).expect("open the fixture");
+
+        assert_eq!(
+            doc.summary, "tailhawk_remote_name.log",
+            "an ordinary document is still called after its file"
+        );
+        assert!(
+            doc.describe().contains("1 file"),
+            "and still describes its set: {}",
+            doc.describe()
+        );
+
+        doc.remote("live-identity-and-campaigns", &spill);
+        assert_eq!(doc.summary, "live-identity-and-campaigns");
+        let title = doc.describe();
+        assert!(
+            title.contains("live-identity-and-campaigns"),
+            "the source names the document: {title}"
+        );
+        assert!(
+            title.contains(&spill.display().to_string()),
+            "and the title says where the records landed: {title}"
+        );
+        assert!(
+            !title.contains("1 file"),
+            "the part list is not offered as the source description: {title}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
     fn scratch_log(name: &str, lines: usize) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(name);
         let mut text = String::new();

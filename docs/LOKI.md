@@ -444,6 +444,27 @@ both load-bearing abstractions before any of this starts.
 Independent of the above: the §7 request-level security scaffolding and the §13.2 CI-test rewrite
 have no dependency on the merge engine and can be done at any point before the first HTTP call.
 
+
+### Correlation trees — settled 2026-09-07 by the owner: **rung one only**
+
+Measured against live Loki that day: **`trace_id` and `span_id` are on every line of forty live
+services** and they propagate across a call — one trace was followed from a UI-facing API into the
+service behind it. `ParentId` is emitted by the eight UI-facing APIs only, and only for their own
+outbound calls, so a called service's lines never say whose child they are; `CorrelationId` exists
+and is empty everywhere sampled; the gateway emits no trace context at all, so a tree would begin at
+the UI-facing API rather than at the browser. `lokiwire.rs` already merges each record's structured
+metadata into its fields, so every one of these ids is **already in the spill today**.
+
+- **Build "follow this trace": take a line's `trace_id` and filter the view to it.** No inference,
+  no new concepts, and it reuses the filter machinery that exists. This is the whole of what was
+  agreed.
+- **Do not build the indented tree.** Edges would have to be inferred from time containment for
+  every hop below the first, which is right for synchronous fan-out and wrong for anything queued or
+  retried — and the owner's judgement is that a span tree is not what a tail app is for. Grafana and
+  Tempo already draw it from the same data, correctly.
+- Raised outside Tailhawk: **the gateway's missing trace context** makes every tree in the estate
+  miss its first branch, in Grafana as much as here.
+
 ## 9. Open questions
 
 ~~**Highest value, answer first:** is the Loki HTTP API reachable **directly** from a developer
