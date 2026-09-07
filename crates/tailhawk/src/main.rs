@@ -195,6 +195,10 @@ struct Document {
     set: LogSet,
     view: View,
     summary: String,
+    /// How far behind the newest record is, for a remote source: set on the follow tick from the
+    /// tail that writes this document's spill, and shown by `describe`. `None` until the tail has
+    /// written something.
+    lag: Option<tailhawk_core::loki::Nanos>,
     /// Where a remote source's records landed, when this document is one — see [`Document::remote`].
     remote_spill: Option<std::path::PathBuf>,
     /// The current selection, or `None` for "nothing selected".
@@ -793,6 +797,7 @@ impl Document {
             set,
             summary,
             remote_spill: None,
+            lag: None,
             selection: None,
             dragging: false,
             finder: Finder::default(),
@@ -857,6 +862,7 @@ impl Document {
             // are, in the only place there is to tell them.
             summary: format!("<stdin> → {}", pump.path().display()),
             remote_spill: None,
+            lag: None,
             selection: None,
             dragging: false,
             finder: Finder::default(),
@@ -1574,12 +1580,20 @@ impl Document {
             .and_then(|name| self.filtering.describe_sort(&name, self.set.total_rows()))
             .map(|text| format!("{text} — "))
             .unwrap_or_default();
+        // **`UI-DESIGN.md` §4: "the lag is stated".** A tail that is following says so, and for a
+        // remote source that is only half the answer — following *what*, how far behind? The lag is
+        // the age of the newest record the worker has written, so a source that has gone quiet and
+        // a source we are failing to keep up with both read honestly, and neither looks live.
+        let lagging = match (self.remote_spill.is_some(), self.lag) {
+            (true, Some(behind)) => format!(" · {}", tail::lag_text(behind)),
+            _ => String::new(),
+        };
         let following = if self.stream_done || !sort.is_empty() {
-            ""
+            String::new()
         } else if self.view.grid().is_following() {
-            "● following — "
+            format!("● following{lagging} — ")
         } else {
-            "‖ paused · Ctrl+End to follow — "
+            format!("‖ paused · Ctrl+End to follow{lagging} — ")
         };
         format!(
             "{following}{sort}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
@@ -4180,7 +4194,7 @@ struct Shell {
     /// `remove_dir_all` creates its next part — `CREATE_NEW` succeeds while the directory is still
     /// there — and the removal fails on a directory that is no longer empty, leaving fetched log
     /// content in `%TEMP%` after a clean exit.
-    tails: Vec<tail::Tail>,
+    tails: Vec<(std::path::PathBuf, tail::Tail)>,
     /// Spills this session made from remote sources. Held so §13.2's "deleted on clean exit" is
     /// true: dropping a `SpillSet` removes its whole directory, parts and all, and these live
     /// exactly as long as the window.
@@ -7673,7 +7687,7 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.spill_sets.push(spill);
-            shell.tails.push(tail);
+            shell.tails.push((spill_dir.clone(), tail));
             shell.tail_notices.push(from_tail);
         }
     });
@@ -8825,6 +8839,26 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     .last();
                 if let Some(said) = said {
                     shell.notice = Some(said);
+                }
+                // **How far behind each remote document is**, read from the worker that fills it.
+                // Matched by the spill directory rather than by position, because tabs open and
+                // close in an order the tails know nothing about.
+                if !shell.tails.is_empty() {
+                    if let Some(now) = tail::now_nanos() {
+                        let behind: Vec<(std::path::PathBuf, Option<i64>)> = shell
+                            .tails
+                            .iter()
+                            .map(|(dir, tail)| (dir.clone(), tail.behind(now)))
+                            .collect();
+                        for (_, doc) in shell.document.all_mut() {
+                            let Some(spill) = doc.remote_spill.clone() else {
+                                continue;
+                            };
+                            if let Some((_, lag)) = behind.iter().find(|(dir, _)| *dir == spill) {
+                                doc.lag = *lag;
+                            }
+                        }
+                    }
                 }
                 let active = shell.document.active;
                 let mut shown_grew = false;

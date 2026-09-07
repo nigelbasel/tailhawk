@@ -13,7 +13,7 @@
 //! **The decisions are pure and tested; the thread is not.** [`window_after`] and [`Backoff`] are
 //! this module's whole judgement and neither needs a network, a window or a clock it does not own.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,12 +187,47 @@ impl Backoff {
     }
 }
 
+/// How far behind the newest record is, said the way `UI-DESIGN.md` §4's status bar says it.
+///
+/// **The figure is the age of the newest record Loki has given us, not the time since the last
+/// poll.** Those differ exactly where it matters: a source that has gone quiet is not lagging, it
+/// is quiet, and a tail that is genuinely behind keeps receiving records whose timestamps are older
+/// and older. So this answers the question a person actually has — how stale is what I am reading —
+/// and it grows on its own while nothing arrives, which is the honest reading of a source that has
+/// stopped answering.
+///
+/// Sub-second is `lagging <1s` rather than a figure in milliseconds. The poll interval is five
+/// seconds and the window's own lag another five, so `lagging 340ms` would be precision this design
+/// does not have. A negative age is the server's clock disagreeing with ours and reads as no lag,
+/// never as a negative one.
+pub fn lag_text(behind: Nanos) -> String {
+    const SECOND: Nanos = 1_000_000_000;
+    let seconds = behind.max(0) / SECOND;
+    match seconds {
+        0 => "lagging <1s".to_owned(),
+        s if s < 60 => format!("lagging {s}s"),
+        s if s < 3_600 => format!("lagging {}m {}s", s / 60, s % 60),
+        s => format!("lagging {}h {}m", s / 3_600, (s % 3_600) / 60),
+    }
+}
+
 /// A running tail. Dropping it stops the thread.
 pub struct Tail {
     stop: Arc<AtomicBool>,
+    /// The timestamp of the newest record the worker has written, for [`lag_text`]. Shared because
+    /// the worker learns it and the UI thread reads it on the follow tick; an atomic rather than a
+    /// channel because a stale reading is worthless — only the latest one means anything.
+    newest: Arc<AtomicI64>,
 }
 
 impl Tail {
+    /// How far behind the newest record written is, at `now`. `None` before anything has been
+    /// written, because a tail that has not answered yet is not lagging — it is starting.
+    pub fn behind(&self, now: Nanos) -> Option<Nanos> {
+        let newest = self.newest.load(Ordering::Relaxed);
+        (newest > 0).then(|| now.saturating_sub(newest))
+    }
+
     /// Starts tailing `source` into `spill`, resuming after `since`.
     ///
     /// The writer rather than a path, because the spill is bounded: a part fills, the next one
@@ -211,6 +246,8 @@ impl Tail {
     ) -> Tail {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let newest = Arc::new(AtomicI64::new(since));
+        let mark = Arc::clone(&newest);
         let name = source.name.clone();
         // The opening pull's lines are what the first overlap would fetch again; seeded here so the
         // first poll after opening writes nothing twice.
@@ -331,6 +368,7 @@ impl Tail {
                         // asked for again.
                         if let Some(newest) = pulled.newest {
                             since = since.max(newest);
+                            mark.store(since, Ordering::Relaxed);
                         }
                     }
                     Err(why) => {
@@ -346,7 +384,7 @@ impl Tail {
                 }
             }
         });
-        Tail { stop }
+        Tail { stop, newest }
     }
 }
 
@@ -377,7 +415,7 @@ fn nap(stop: &AtomicBool, total: Duration) -> bool {
     !stop.load(Ordering::Relaxed)
 }
 
-fn now_nanos() -> Option<Nanos> {
+pub fn now_nanos() -> Option<Nanos> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -505,5 +543,45 @@ mod tests {
         b.succeeded();
         b.failed();
         assert!(b.should_say(), "a fresh outage is fresh news");
+    }
+
+    /// `UI-DESIGN.md` §4 asks for `lagging 2s`, and the shape of the number matters as much as the
+    /// number: a tail is five seconds of poll plus five of window lag, so milliseconds would be
+    /// precision this design does not have, and a negative age is a clock disagreement rather than
+    /// a tail that is ahead of the source.
+    #[test]
+    fn the_lag_is_said_in_units_the_tail_actually_has() {
+        const SECOND: Nanos = 1_000_000_000;
+        assert_eq!(lag_text(2 * SECOND), "lagging 2s");
+        assert_eq!(lag_text(SECOND - 1), "lagging <1s");
+        assert_eq!(lag_text(0), "lagging <1s");
+        assert_eq!(lag_text(-4 * SECOND), "lagging <1s", "a clock disagreement");
+        assert_eq!(lag_text(59 * SECOND), "lagging 59s");
+        assert_eq!(lag_text(90 * SECOND), "lagging 1m 30s");
+        assert_eq!(lag_text(3_600 * SECOND), "lagging 1h 0m");
+        assert_eq!(lag_text(7_900 * SECOND), "lagging 2h 11m");
+    }
+
+    /// **A tail that has not written anything is starting, not lagging.** Reporting a lag from the
+    /// mark it was seeded with would say "lagging 1h" the moment a source opens on the last hour of
+    /// history, which is a true statement about the seed and a false one about the tail.
+    #[test]
+    fn a_tail_that_has_written_nothing_reports_no_lag() {
+        let quiet = Tail {
+            stop: Arc::new(AtomicBool::new(false)),
+            newest: Arc::new(AtomicI64::new(0)),
+        };
+        assert_eq!(quiet.behind(1_000), None);
+
+        let running = Tail {
+            stop: Arc::new(AtomicBool::new(false)),
+            newest: Arc::new(AtomicI64::new(1_000_000_000)),
+        };
+        assert_eq!(running.behind(3_000_000_000), Some(2_000_000_000));
+        assert_eq!(
+            running.behind(500_000_000),
+            Some(-500_000_000),
+            "a clock behind the server's is reported as it is and read by lag_text"
+        );
     }
 }
