@@ -5257,6 +5257,36 @@ impl Shell {
         true
     }
 
+    /// Stops the tail and deletes the spill of every remote source no longer open in a tab.
+    ///
+    /// **Closing a tab used to stop nothing.** The worker kept asking Loki every five seconds for a
+    /// document nobody could see, and its spill kept growing to its own bound — half a gigabyte of
+    /// fetched log content per closed tab, held until the window itself closed. That was the
+    /// existing behaviour for a pipe's spill and it was carried over without being thought about;
+    /// a pipe is a stream the user cannot restart, and a remote source is one they can reopen with
+    /// two keystrokes, so keeping it is not the kindness it is for stdin.
+    ///
+    /// Tails first and spills second, the order the fields are declared in and for the same reason:
+    /// a worker that writes after its directory has gone leaves the directory behind it.
+    fn retire_closed_tails(&mut self) {
+        if self.tails.is_empty() {
+            return;
+        }
+        let open: Vec<std::path::PathBuf> = self
+            .document
+            .all()
+            .filter_map(|doc| doc.remote_spill.clone())
+            .collect();
+        let held: Vec<std::path::PathBuf> = self.tails.iter().map(|(dir, _)| dir.clone()).collect();
+        let going = spills_to_retire(&held, &open);
+        if going.is_empty() {
+            return;
+        }
+        self.tails.retain(|(dir, _)| !going.contains(dir));
+        self.spill_sets
+            .retain(|set| !going.iter().any(|dir| dir == set.dir()));
+    }
+
     /// Opens `path` in this window, replacing what is shown. The read runs on a worker as it does
     /// at start-up, and the title says "opening" until it lands — a large file takes seconds to
     /// index and a window that went blank without a word would look hung.
@@ -6148,6 +6178,7 @@ impl Shell {
             }
             Command::CloseTab => {
                 self.document.close_active();
+                self.retire_closed_tails();
                 if self.document.len() == 0 {
                     self.file = None;
                 }
@@ -10023,6 +10054,22 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 /// Off the window thread for the same reason the device is: a multi-GB file indexed on the message
 /// loop would undo the two-stage paint `experiments/g3-d3d11` measured at 13.1 ms. It matters more
 /// for a pipe, where the producer decides how long the open takes and may never finish at all.
+/// Which held spills nothing is reading any more.
+///
+/// **The decision, so that the shell only acts on the answer.** `held` is what this window owns and
+/// `open` is the spill directory of every document still in a tab; anything held and not open is a
+/// tail still asking Loki every five seconds and a spill still growing to its bound, on behalf of a
+/// tab the user closed.
+fn spills_to_retire(
+    held: &[std::path::PathBuf],
+    open: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    held.iter()
+        .filter(|dir| !open.contains(dir))
+        .cloned()
+        .collect()
+}
+
 fn spawn_open(
     open: impl FnOnce() -> std::result::Result<Document, String> + Send + 'static,
 ) -> Receiver<std::result::Result<Document, String>> {
@@ -10627,6 +10674,38 @@ mod tests {
             "the part list is not offered as the source description: {title}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A closed tab's tail is stopped and its spill deleted; an open one's is not touched.** The
+    /// decision is a set difference and the shell only acts on it, because the alternative — asking
+    /// the question inside the close path — needs a window, a document collection and a live worker
+    /// to exercise, which is how the last three defects in this file avoided having tests.
+    #[test]
+    fn only_the_spills_of_closed_tabs_are_retired() {
+        let one = std::path::PathBuf::from("C:/temp/tailhawk-spill-1-0");
+        let two = std::path::PathBuf::from("C:/temp/tailhawk-spill-1-1");
+        let held = [one.clone(), two.clone()];
+
+        assert_eq!(
+            spills_to_retire(&held, &[one.clone(), two.clone()]),
+            Vec::<std::path::PathBuf>::new(),
+            "both tabs are open, so neither tail goes"
+        );
+        assert_eq!(
+            spills_to_retire(&held, &[one.clone()]),
+            vec![two.clone()],
+            "the closed tab's tail goes and the open one's stays"
+        );
+        assert_eq!(
+            spills_to_retire(&held, &[]),
+            vec![one.clone(), two.clone()],
+            "every remote tab closed means no tail left running"
+        );
+        assert_eq!(
+            spills_to_retire(&[], &[one]),
+            Vec::<std::path::PathBuf>::new(),
+            "a document whose tail this window does not hold is not a reason to do anything"
+        );
     }
     fn scratch_log(name: &str, lines: usize) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(name);
