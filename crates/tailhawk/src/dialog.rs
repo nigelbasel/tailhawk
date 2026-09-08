@@ -911,6 +911,307 @@ pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
     data.accepted
 }
 
+/// The application picker. Its own id range, above the sources dialog's.
+const ID_A_LIST: u16 = 240;
+const ID_A_ALL: u16 = 241;
+const ID_A_NONE: u16 = 242;
+const ID_A_SEPARATE: u16 = 243;
+const ID_A_COUNT: u16 = 244;
+
+/// A list view's checkbox state lives in the state image, not in a style bit.
+const LVIS_STATEIMAGEMASK: u32 = 0xF000;
+const LVM_GETITEMSTATE: u32 = LVM_FIRST + 44;
+const LVM_GETITEMCOUNT: u32 = LVM_FIRST + 4;
+/// The state image a ticked box shows. One-based, so the second image is the tick.
+const CHECKED_IMAGE: u32 = 2 << 12;
+const UNCHECKED_IMAGE: u32 = 1 << 12;
+
+/// Which way the user asked for the applications they picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    /// One document holding all of them, ordered by time — the owner's "interleave them".
+    Interleaved,
+    /// One document each — the owner's "run each in a separate log window".
+    Separate,
+}
+
+/// What the picker is handed and hands back.
+pub struct AppsPick {
+    /// The offered applications and which are ticked. The dialog reads the ticks back into this on
+    /// its way out, so a caller never asks the list view anything.
+    pub list: tailhawk_core::apps::AppList,
+    /// How to open them, or `None` when the dialog was cancelled.
+    pub choice: Option<Pick>,
+}
+
+fn apps_dialog_items() -> Vec<Item> {
+    vec![
+        Item::new(
+            Class::Static,
+            "Which applications should this source show?",
+            0xFFFF,
+            (7, 7, 300, 9),
+            0,
+        ),
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_A_LIST,
+            (7, 20, 246, 180),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        Item::new(
+            Class::Button,
+            "&All",
+            ID_A_ALL,
+            (259, 20, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "&None",
+            ID_A_NONE,
+            (259, 38, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(Class::Static, "", ID_A_COUNT, (7, 204, 246, 9), 0),
+        Item::new(
+            Class::Button,
+            "&Interleave",
+            1,
+            (7, 218, 78, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "&Separate windows",
+            ID_A_SEPARATE,
+            (91, 218, 100, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(Class::Button, "Cancel", 2, (259, 218, 60, 14), WS_TABSTOP),
+    ]
+}
+
+thread_local! {
+    /// Whether the ticks being changed right now are the dialog's own.
+    ///
+    /// **`LVM_SETITEMSTATE` raises `LVN_ITEMCHANGED` synchronously**, so filling the list re-enters
+    /// `apps_proc` once per row — and the re-entry used to take a second `&mut` to the same
+    /// `AppsPick` while the first was still live, which is the aliasing `FORMAT_QUIET` and
+    /// `RULES_QUIET` were written for. Worse than the aliasing was what it did: the re-entry read
+    /// ticks back from a list view that had only been filled as far as the current row, so every
+    /// pre-ticked application below it was read as unticked and turned off. A source already
+    /// narrowed to two applications opened with nothing ticked at all.
+    static APPS_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `write`, with every `LVN_ITEMCHANGED` it provokes marked as the dialog's own.
+fn apps_quietly<R>(write: impl FnOnce() -> R) -> R {
+    APPS_QUIET.with(|q| q.set(true));
+    let out = write();
+    APPS_QUIET.with(|q| q.set(false));
+    out
+}
+
+/// Ticks or unticks one row of a checkbox list view.
+fn lv_check(list: HWND, at: i32, checked: bool) {
+    let item = LVITEMW {
+        state: LIST_VIEW_ITEM_STATE_FLAGS(if checked {
+            CHECKED_IMAGE
+        } else {
+            UNCHECKED_IMAGE
+        }),
+        stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_STATEIMAGEMASK),
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_SETITEMSTATE,
+            WPARAM(at as usize),
+            LPARAM(&item as *const LVITEMW as isize),
+        );
+    }
+}
+
+/// Whether row `at` is ticked.
+fn lv_checked(list: HWND, at: i32) -> bool {
+    let state = unsafe {
+        SendMessageW(
+            list,
+            LVM_GETITEMSTATE,
+            WPARAM(at as usize),
+            LPARAM(LVIS_STATEIMAGEMASK as isize),
+        )
+    };
+    state.0 as u32 & LVIS_STATEIMAGEMASK == CHECKED_IMAGE
+}
+
+/// Reads every tick back into the model. **The list view is asked once, on the way out or when the
+/// count line is redrawn** — the alternative, mirroring each click as it happens, means handling a
+/// notification that also fires for selection, focus and the initial fill.
+fn apps_read(hdlg: HWND, data: &mut AppsPick) {
+    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_A_LIST)) }) else {
+        return;
+    };
+    // **Only as many rows as the list view actually has.** It is filled a row at a time and each
+    // row raises a notification, so this can be reached with fewer items on screen than the model
+    // has; asking about a row that does not exist gets zero back, which reads as unticked, which
+    // turns off a choice the user made. `apps::sync` leaves anything the ticks do not cover.
+    let items = unsafe { SendMessageW(list, LVM_GETITEMCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
+    let ticks: Vec<bool> = (0..items.min(data.list.rows().len()))
+        .map(|at| lv_checked(list, at as i32))
+        .collect();
+    tailhawk_core::apps::sync(&mut data.list, &ticks);
+}
+
+/// The line under the list: how many are offered, how many are ticked, and — §6 — whether the
+/// server had more to offer than the list holds.
+fn apps_count(hdlg: HWND, data: &AppsPick) {
+    let chosen = data.list.chosen().len();
+    let offered = data.list.rows().len();
+    let mut text = format!("{offered} applications, {chosen} chosen");
+    if data.list.cut() {
+        text.push_str(&format!(
+            " — the server offered more than {} and the rest are not listed",
+            tailhawk_core::apps::MAX_APPS
+        ));
+    }
+    set_dlg_text(hdlg, ID_A_COUNT, &text);
+}
+
+unsafe extern "system" fn apps_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            // **The rows are copied out before anything is drawn.** Filling the list re-enters this
+            // procedure through `LVN_ITEMCHANGED`, and a `&mut` held across the fill would be
+            // aliased by the re-entry's own — the hazard `FORMAT_QUIET` documents at length.
+            let rows: Vec<(String, bool)> = {
+                let data = unsafe { &*(lparam.0 as *const AppsPick) };
+                data.list
+                    .rows()
+                    .iter()
+                    .map(|row| (row.name.clone(), row.chosen))
+                    .collect()
+            };
+            if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_A_LIST)) } {
+                unsafe {
+                    SendMessageW(
+                        list,
+                        LVM_SETEXTENDEDLISTVIEWSTYLE,
+                        WPARAM(0),
+                        LPARAM((LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT) as isize),
+                    );
+                }
+                apps_quietly(|| {
+                    lv_reset(list);
+                    lv_column(list, 0, "Application", 220);
+                    for (at, (name, chosen)) in rows.iter().enumerate() {
+                        lv_row(list, at as i32, std::slice::from_ref(name));
+                        lv_check(list, at as i32, *chosen);
+                    }
+                });
+            }
+            let data = unsafe { &mut *(lparam.0 as *mut AppsPick) };
+            apps_count(hdlg, data);
+            1
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == usize::from(ID_A_LIST)
+                && header.code == LVN_ITEMCHANGED
+                && !APPS_QUIET.with(|q| q.get())
+            {
+                if let Some(data) = apps_state(hdlg) {
+                    let data = unsafe { &mut *data };
+                    apps_read(hdlg, data);
+                    apps_count(hdlg, data);
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let Some(data) = apps_state(hdlg) else {
+                return 0;
+            };
+            let data = unsafe { &mut *data };
+            match id {
+                ID_A_ALL | ID_A_NONE => {
+                    let all = id == ID_A_ALL;
+                    if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_A_LIST)) } {
+                        let rows = data.list.rows().len();
+                        apps_quietly(|| {
+                            for at in 0..rows {
+                                lv_check(list, at as i32, all);
+                            }
+                        });
+                    }
+                    data.list.choose_all(all);
+                    apps_count(hdlg, data);
+                    1
+                }
+                1 | ID_A_SEPARATE => {
+                    apps_read(hdlg, data);
+                    data.choice = Some(if id == 1 {
+                        Pick::Interleaved
+                    } else {
+                        Pick::Separate
+                    });
+                    unsafe {
+                        let _ = EndDialog(hdlg, 1);
+                    }
+                    1
+                }
+                2 => {
+                    data.choice = None;
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = EndDialog(hdlg, 0);
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+fn apps_state(hdlg: HWND) -> Option<*mut AppsPick> {
+    let ptr = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) } as *mut AppsPick;
+    (!ptr.is_null()).then_some(ptr)
+}
+
+/// The owner's ask of 2026-08-31: pick several applications and either interleave them or open one
+/// window each.
+///
+/// The values come from the server immediately before this opens, so the list is what the source
+/// can actually see rather than what it could see yesterday. Reports whether anything was picked;
+/// `data.choice` says which way, and `data.list.chosen()` says what.
+pub fn show_apps_dialog(hwnd: HWND, data: &mut AppsPick) -> bool {
+    let t = template("Applications", 326, 238, &apps_dialog_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            hwnd,
+            Some(apps_proc),
+            LPARAM(data as *mut AppsPick as isize),
+        )
+    };
+    data.choice.is_some() && data.list.any()
+}
+
 /// §5's rules editor as a **modeless** dialog, laid out purely so the template walk can check it
 /// without a window.
 ///
@@ -1999,6 +2300,7 @@ const LVS_SINGLESEL: u32 = 0x0004;
 const LVS_SHOWSELALWAYS: u32 = 0x0008;
 const LVS_EX_GRIDLINES: u32 = 0x0001;
 const LVS_EX_FULLROWSELECT: u32 = 0x0020;
+const LVS_EX_CHECKBOXES: u32 = 0x0004;
 const LVM_FIRST: u32 = 0x1000;
 const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
 const LVM_GETNEXTITEM: u32 = LVM_FIRST + 12;
@@ -4069,6 +4371,7 @@ mod tests {
             ("Highlight rules", rules_dialog_items()),
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
+            ("Applications", apps_dialog_items()),
         ] {
             let mut seen = Vec::new();
             for item in &items {
@@ -4170,6 +4473,7 @@ mod tests {
             ("Highlight rules", rules_dialog_items()),
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
+            ("Applications", apps_dialog_items()),
         ] {
             let t = template("x", 100, 100, &items);
             // Walk the template the way Windows does: header, then aligned items.

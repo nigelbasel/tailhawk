@@ -7624,6 +7624,109 @@ fn set_notice(text: String) {
     });
 }
 
+/// The label whose values the picker offers. `LOKI.md` §2: the estate's services are one label, and
+/// it is this one.
+const APP_LABEL: &str = "app";
+
+/// Ask the source which applications it has, let the user pick, and open what they picked.
+///
+/// The owner's ask of 2026-08-31, and the shape of it is his words: *"choose multiple apps … and
+/// either interleave them or run each in a separate log window"*. Interleaved is one document whose
+/// selector names them all; separate is one document per name. Both go through the same
+/// [`apps::with_apps`] rewrite of the source's own query, so neither can drift from the other.
+///
+/// **A source that cannot answer still opens.** The label call is a convenience, not a gate: if it
+/// fails — no credential yet, a server that is down, a Loki too old for the endpoint — the reason is
+/// said and the source opens exactly as it did before there was a picker. A feature that can stop
+/// you reading your logs is worse than no feature.
+fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
+    let values = match pull::label_values(&source, APP_LABEL) {
+        Ok(values) if !values.is_empty() => values,
+        Ok(_) => {
+            set_notice(format!(
+                "{}: Loki lists no applications for this source — opening all of it.",
+                source.name
+            ));
+            open_remote(hwnd, source.clone(), source.name.clone());
+            return;
+        }
+        Err(why) => {
+            set_notice(format!("{}: {why} Opening all of it.", source.name));
+            open_remote(hwnd, source.clone(), source.name.clone());
+            return;
+        }
+    };
+
+    let mut pick = dialog::AppsPick {
+        list: tailhawk_core::apps::AppList::new(
+            &values,
+            &tailhawk_core::apps::apps_in(&source.query),
+        ),
+        choice: None,
+    };
+    if !dialog::show_apps_dialog(hwnd, &mut pick) {
+        // Cancelled, or accepted with nothing ticked. Nothing ticked means "no narrowing", which is
+        // the source as configured — and that is what the user gets rather than an empty window.
+        if pick.choice.is_some() {
+            open_remote(hwnd, source.clone(), source.name.clone());
+        }
+        return;
+    }
+
+    let chosen: Vec<String> = pick
+        .list
+        .chosen()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    match pick.choice {
+        Some(dialog::Pick::Interleaved) => {
+            let names: Vec<&str> = chosen.iter().map(String::as_str).collect();
+            match tailhawk_core::apps::with_apps(&source.query, &names) {
+                Ok(query) => {
+                    let label = format!("{} · {}", source.name, chosen.join(", "));
+                    open_remote(
+                        hwnd,
+                        tailhawk_core::settings::Source { query, ..source },
+                        label,
+                    );
+                }
+                Err(_) => set_notice(format!(
+                    "{}: this source's query is not a selector this can add to.",
+                    source.name
+                )),
+            }
+        }
+        Some(dialog::Pick::Separate) => {
+            // Each window is a tail of its own — a worker, a poll and a bounded spill — so a
+            // choice too large to honour is refused with the remedy rather than truncated.
+            if let Some(why) = tailhawk_core::apps::too_many_windows(chosen.len()) {
+                set_notice(why);
+                return;
+            }
+            for app in &chosen {
+                match tailhawk_core::apps::with_apps(&source.query, &[app.as_str()]) {
+                    // **The source's own name is kept**, because it is the key the credential is
+                    // stored under — only the label shown to the user changes.
+                    Ok(query) => open_remote(
+                        hwnd,
+                        tailhawk_core::settings::Source {
+                            query,
+                            ..source.clone()
+                        },
+                        format!("{} \u{b7} {app}", source.name),
+                    ),
+                    Err(_) => set_notice(format!(
+                        "{}: this source's query is not a selector this can add to.",
+                        source.name
+                    )),
+                }
+            }
+        }
+        None => {}
+    }
+}
+
 const REMOTE_WINDOW_NANOS: i64 = 60 * 60 * 1_000_000_000;
 
 /// How many records one opening asks for. Below `loki::MAX_LIMIT`, because this is a first
@@ -7636,7 +7739,7 @@ const REMOTE_LIMIT: u32 = 1_000;
 /// does — a token exchange and a query are two round trips and neither belongs on the UI thread.
 /// What comes back is CLEF, written to a locked-down spill, and `format.rs`'s `ndjson` detector
 /// recognises it: a Loki source becomes a document with no new document type anywhere.
-fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
+fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: String) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
@@ -7645,7 +7748,10 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source) {
         start: now - REMOTE_WINDOW_NANOS,
         end: now,
     };
-    let name = source.name.clone();
+    // **The label, not the source's name.** They differ when the picker opened one window per
+    // application: the source name is the key its credential is stored under and must not change,
+    // while what the tab says should be the application the user picked.
+    let name = label;
 
     let pulled = pull::pull(
         &source,
@@ -7788,7 +7894,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                 .and_then(|shell| shell.settings.sources.get(at).cloned())
         });
         if let Some(source) = source {
-            open_remote(hwnd, source);
+            open_picked(hwnd, source);
         }
         return true;
     }

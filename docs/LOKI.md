@@ -445,6 +445,27 @@ Independent of the above: the §7 request-level security scaffolding and the §1
 have no dependency on the merge engine and can be done at any point before the first HTTP call.
 
 
+
+### The application picker — built 2026-09-08
+
+`GET /loki/api/v1/label/app/values` over the last day, offered as a checkbox list when a source
+opens. Every §7 control the opening pull obeys is obeyed here: https only, the address rules, the
+secret fetched and dropped around one token exchange, the bearer used for the one call. It is a
+`GET` rather than a `POST` **because there is no user-authored selector in it** — the only thing in
+the request line is a label name this program chose, checked against Prometheus's label grammar
+before it is written, and a window of timestamps. §7's objection to `GET` is about proxies logging
+someone's filter text, and there is none here to log.
+
+- The values are the server's. Nothing caches them across sessions or infers them from what a spill
+  already holds: a picker that offers an application the source cannot see produces an empty window
+  and no reason for it.
+- The choice rewrites the source's **own** selector (`apps::with_apps`) rather than composing a new
+  one, so the environment the user chose and any pipeline stages after the selector survive. The
+  same function does both of the owner's asks: every name at once is *interleave*, one name at a
+  time is *one window each*.
+- A label response beyond a megabyte, or beyond ten thousand values, is refused rather than walked;
+  the picker itself holds 512 and says when the server offered more.
+
 ### Correlation trees — settled 2026-09-07 by the owner: **rung one only**
 
 Measured against live Loki that day: **`trace_id` and `span_id` are on every line of forty live

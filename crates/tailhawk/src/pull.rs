@@ -64,6 +64,11 @@ pub enum PullFault {
     QueryRefused { status: u16 },
     /// Loki's answer could not be read.
     Wire(WireFault),
+    /// The label name this asked for was refused before it could reach a URL. Ours, not the
+    /// user's, so it means a bug here rather than a configuration mistake.
+    Label(tailhawk_core::loki::LabelFault),
+    /// Loki answered the label call with something this could not read as a list of values.
+    LabelAnswer,
 }
 
 impl std::fmt::Display for PullFault {
@@ -95,6 +100,10 @@ impl std::fmt::Display for PullFault {
             // hiding it behind one sentence cost a morning: every tail poll was failing and the
             // status bar could only say that it had.
             PullFault::Wire(why) => write!(f, "Loki's answer could not be read: {why}"),
+            PullFault::Label(_) => f.write_str("That is not a label name Loki would recognise."),
+            PullFault::LabelAnswer => {
+                f.write_str("Loki's list of applications could not be read.")
+            }
         }
     }
 }
@@ -117,6 +126,53 @@ pub struct Pulled {
     /// Label values the parser cut to its cap rather than refusing the answer for. Said, per §6.
     pub truncated: usize,
 }
+
+/// Ask `source` which values one label has taken, so the picker can offer them.
+///
+/// **The same journey as [`pull`] and every §7 control on it** — https only, no literal address the
+/// rules forbid, the secret fetched and dropped around one exchange, the bearer used for the one
+/// call. A label list is a cheaper question than a window of records and it is not a safer one: it
+/// goes to the same server with the same credential.
+///
+/// The window is the last day rather than the last hour. A label list is a menu, and a service that
+/// logged nothing since lunchtime is still a service the user may want to look at; asking over too
+/// short a window offers a shorter menu with nothing to say what is missing from it.
+pub fn label_values(source: &Source, label: &str) -> Result<Vec<String>, PullFault> {
+    let origin = Origin::parse(&source.url, Provenance::Imported).map_err(PullFault::Origin)?;
+    refuse_insecure(&origin)?;
+    refuse_literal_address(&origin).map_err(PullFault::Address)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or_default();
+    let window = Window {
+        start: now.saturating_sub(LABEL_WINDOW_NANOS).max(0),
+        end: now,
+    };
+    let request = loki::label_values(&origin, label, window).map_err(PullFault::Label)?;
+
+    let token = if source.client_id.trim().is_empty() {
+        None
+    } else {
+        Some(fetch_token(source)?)
+    };
+    let auth = match token.as_deref() {
+        Some(bearer) => Auth::Bearer(bearer),
+        None => Auth::None,
+    };
+    let answer =
+        net::send(&request, Provenance::Imported, auth).map_err(PullFault::QueryTransport)?;
+    if answer.status != 200 {
+        return Err(PullFault::QueryRefused {
+            status: answer.status,
+        });
+    }
+    loki::label_values_from_json(&answer.body).ok_or(PullFault::LabelAnswer)
+}
+
+/// How far back the picker asks for label values. A day, for the reason [`label_values`] gives.
+const LABEL_WINDOW_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
 /// Fetch a window of records from `source`.
 ///

@@ -41,8 +41,9 @@ pub type Nanos = i64;
 pub enum Endpoint {
     /// Records within a time range. The tail's poll asks this repeatedly.
     QueryRange,
-    /// The live tail's WebSocket. Listed because it is in the allowlist; nothing opens it yet.
     Tail,
+    /// The values one label has taken. The picker asks this once when it opens.
+    LabelValues,
 }
 
 impl Endpoint {
@@ -51,6 +52,7 @@ impl Endpoint {
         match self {
             Endpoint::QueryRange => "/loki/api/v1/query_range",
             Endpoint::Tail => "/loki/api/v1/tail",
+            Endpoint::LabelValues => "/loki/api/v1/label",
         }
     }
 
@@ -694,6 +696,179 @@ fn json_number(body: &str, key: &str) -> Option<u64> {
     let rest = rest.strip_prefix(':')?.trim_start();
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// Why a label name was refused before it could reach a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelFault {
+    /// Empty, too long, or carrying anything outside Prometheus's label grammar. **A label name is
+    /// the one part of a Loki path that is not ours**, so it is checked with the same suspicion
+    /// [`Origin::parse`] gives a configured URL: a name that could carry `/` or `..` is a
+    /// configuration string choosing a path segment.
+    NotALabelName,
+}
+
+/// The longest label name that will be believed. Prometheus imposes no limit; a name longer than
+/// this is a mistake or an attack, and either way not a label anyone made on purpose.
+pub const MAX_LABEL_NAME: usize = 64;
+
+/// The most values one label response may yield. Far above the eighty-odd a real estate has, and
+/// far below what a shared deployment could answer with if a label were used for an identifier.
+pub const MAX_LABEL_VALUES: usize = 10_000;
+
+/// The largest label response that will be read. A label list is names, not log lines.
+pub const MAX_LABEL_RESPONSE: usize = 1024 * 1024;
+
+/// Whether `name` is a label name Prometheus and Loki would accept: `[a-zA-Z_][a-zA-Z0-9_]*`.
+pub fn is_label_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_LABEL_NAME {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap_or('\0');
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Ask which values one label has taken in a window — `LOKI.md` §2's "seventy `app` values", so a
+/// person can pick from them instead of spelling them.
+///
+/// **A `GET`, unlike [`query_range`], and the difference is the point.** §7 keeps user-authored
+/// selector text out of the request line because every proxy on the path logs it; there is no
+/// selector here. What is in the line is a label name this program asked for, checked against the
+/// label grammar before it is written, and a window of timestamps.
+pub fn label_values(origin: &Origin, label: &str, window: Window) -> Result<Request, LabelFault> {
+    if !is_label_name(label) {
+        return Err(LabelFault::NotALabelName);
+    }
+    Ok(Request {
+        method: "GET",
+        url: format!(
+            "{}{}{}/{}/values?start={}&end={}",
+            origin.base(),
+            origin.mount(),
+            Endpoint::LabelValues.path(),
+            label,
+            window.start,
+            window.end
+        ),
+        body: String::new(),
+        content_type: None,
+    })
+}
+
+/// The values in a label response — `{"status":"success","data":["one","two"]}`.
+///
+/// A hand-written scan for the reason `token_from_json` gives: there is no JSON crate in the tree
+/// and this is one array of strings in a small, flat document. Bounded before anything is looked
+/// at, and bounded again in the number of values, so a server answering with a label used as an
+/// identifier cannot make this the expensive part.
+///
+/// A body that is not a success envelope, or whose `data` is not an array of strings, yields
+/// `None` rather than an empty list: "the server said no values" and "the server said something I
+/// did not understand" are different answers and the caller says different things about them.
+pub fn label_values_from_json(body: &str) -> Option<Vec<String>> {
+    if body.len() > MAX_LABEL_RESPONSE {
+        return None;
+    }
+    let at = body.find("\"data\"")? + "\"data\"".len();
+    let rest = body.get(at..)?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let mut rest = rest.strip_prefix('[')?;
+
+    let mut values = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix(']') {
+            let _ = after;
+            return Some(values);
+        }
+        let (value, after) = json_string_at(rest)?;
+        if values.len() == MAX_LABEL_VALUES {
+            return Some(values);
+        }
+        values.push(value);
+        rest = after.trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next,
+            None => {
+                return rest.strip_prefix(']').map(|_| values);
+            }
+        }
+    }
+}
+
+/// Reads one quoted JSON string from the front of `text`, returning it and what follows.
+///
+/// **A value this cannot decode becomes `U+FFFD`; it never discards the answer.** The alternative
+/// was tried on the tail and cost a day: a single label value one byte over its cap made the parser
+/// refuse a whole response, and the tail stalled for ever on one record. The same shape applies
+/// here with a bigger blast radius — one surrogate pair from a proxy that re-encodes would mean no
+/// picker at all, for seventy applications whose names are ASCII.
+fn json_string_at(text: &str) -> Option<(String, &str)> {
+    let mut chars = text.strip_prefix('"')?.char_indices();
+    let body = text.get(1..)?;
+    let mut out = String::new();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '"' => return Some((out, body.get(at + 1..)?)),
+            '\\' => match chars.next()?.1 {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'u' => {
+                    let first = hex_escape(body, &mut chars)?;
+                    // A surrogate pair is two escapes for one character. Go's encoder does not
+                    // emit them, but a proxy or a re-encoder between here and Loki may, and half a
+                    // character rendered as a replacement is better than no list of applications.
+                    let decoded = match first {
+                        0xD800..=0xDBFF => {
+                            let low = paired_escape(body, &mut chars);
+                            match low {
+                                Some(low @ 0xDC00..=0xDFFF) => {
+                                    let joined =
+                                        0x10000 + ((first - 0xD800) << 10) + (low - 0xDC00);
+                                    char::from_u32(joined)
+                                }
+                                _ => None,
+                            }
+                        }
+                        code => char::from_u32(code),
+                    };
+                    out.push(decoded.unwrap_or(char::REPLACEMENT_CHARACTER));
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// The four hex digits after a `\u`, consuming them.
+fn hex_escape(body: &str, chars: &mut std::str::CharIndices) -> Option<u32> {
+    let start = chars.next()?.0;
+    let hex = body.get(start..start + 4)?;
+    let _ = chars.next();
+    let _ = chars.next();
+    let _ = chars.next();
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// The second half of a surrogate pair — `\uXXXX` immediately after the first — or `None` if what
+/// follows is anything else. Consumes only what it reads.
+fn paired_escape(body: &str, chars: &mut std::str::CharIndices) -> Option<u32> {
+    let mut ahead = chars.clone();
+    if ahead.next()?.1 != '\\' || ahead.next()?.1 != 'u' {
+        return None;
+    }
+    let low = hex_escape(body, &mut ahead)?;
+    *chars = ahead;
+    Some(low)
 }
 
 /// Ask for the records in a window.
@@ -1530,5 +1705,145 @@ mod tests {
         assert!(Window { start: 5, end: 5 }.is_empty());
         assert!(Window { start: 5, end: 4 }.is_empty());
         assert!(!Window { start: 4, end: 5 }.is_empty());
+    }
+
+    /// **A label name is the one part of a Loki URL that is not ours**, so it is checked before it
+    /// is written into one. The refusals below are the shapes that would otherwise choose a path
+    /// segment rather than name a label.
+    #[test]
+    fn a_label_name_is_checked_against_the_label_grammar() {
+        assert!(is_label_name("app"));
+        assert!(is_label_name("_app"));
+        assert!(is_label_name("app_2"));
+        assert!(!is_label_name(""));
+        assert!(!is_label_name("2app"), "a name cannot start with a digit");
+        assert!(!is_label_name("app/values/../../admin"));
+        assert!(!is_label_name("app values"));
+        assert!(!is_label_name("app%2f"));
+        assert!(!is_label_name(&"a".repeat(MAX_LABEL_NAME + 1)));
+    }
+
+    #[test]
+    fn the_label_request_names_the_label_and_the_window() {
+        let origin = Origin::parse("https://telemetry.example.com/loki", Provenance::Imported)
+            .expect("origin");
+        let request = label_values(&origin, "app", Window { start: 10, end: 20 }).expect("request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.url,
+            "https://telemetry.example.com/loki/loki/api/v1/label/app/values?start=10&end=20"
+        );
+        assert!(request.body.is_empty(), "a GET carries nothing to log");
+
+        assert_eq!(
+            label_values(&origin, "app/../push", Window { start: 1, end: 2 }),
+            Err(LabelFault::NotALabelName),
+            "a name that could choose a path segment never reaches a URL"
+        );
+    }
+
+    #[test]
+    fn the_values_are_read_out_of_the_success_envelope() {
+        let body = r#"{"status":"success","data":["gateway","nurtur-identity-server","dw.api"]}"#;
+        assert_eq!(
+            label_values_from_json(body).expect("values"),
+            ["gateway", "nurtur-identity-server", "dw.api"]
+        );
+        assert_eq!(
+            label_values_from_json(r#"{"status":"success","data":[]}"#).expect("values"),
+            Vec::<String>::new(),
+            "a label with no values is an answer, not a failure to understand one"
+        );
+    }
+
+    /// **"No values" and "I did not understand that" are different answers**, and the caller says
+    /// different things about them — so an envelope this cannot read is `None`, never an empty list
+    /// that would render as a picker with nothing in it and no reason why.
+    #[test]
+    fn an_envelope_this_cannot_read_is_not_an_empty_list() {
+        assert_eq!(label_values_from_json("not json at all"), None);
+        assert_eq!(
+            label_values_from_json(r#"{"status":"error","error":"too many outstanding requests"}"#),
+            None
+        );
+        assert_eq!(
+            label_values_from_json(r#"{"data":{"app":"gateway"}}"#),
+            None
+        );
+        assert_eq!(
+            label_values_from_json(&format!(
+                "{{\"data\":[\"{}\"]}}",
+                "x".repeat(MAX_LABEL_RESPONSE)
+            )),
+            None,
+            "a response beyond the cap is refused before it is walked"
+        );
+    }
+
+    #[test]
+    fn escapes_in_a_value_are_read_as_the_character_they_stand_for() {
+        let body = r#"{"status":"success","data":["a\"b","c\\d","eéf"]}"#;
+        assert_eq!(
+            label_values_from_json(body).expect("values"),
+            ["a\"b", "c\\d", "eéf"]
+        );
+    }
+
+    /// The value cap is the one that bites on a label used as an identifier: twelve thousand short
+    /// values are well under the body cap, so without this the picker would walk them all.
+    #[test]
+    fn more_values_than_the_cap_are_cut_rather_than_walked() {
+        let values: Vec<String> = (0..MAX_LABEL_VALUES + 2_000)
+            .map(|n| format!("\"v{n}\""))
+            .collect();
+        let body = format!("{{\"status\":\"success\",\"data\":[{}]}}", values.join(","));
+        assert!(
+            body.len() < MAX_LABEL_RESPONSE,
+            "the body cap must not be what stops this"
+        );
+        let read = label_values_from_json(&body).expect("values");
+        assert_eq!(read.len(), MAX_LABEL_VALUES);
+        assert_eq!(
+            read[0], "v0",
+            "and they are the first, not an arbitrary slice"
+        );
+    }
+
+    /// **One value nobody can decode must not cost the whole list.** The tail learned this the
+    /// expensive way in September: a parser that refused a response for one bad value stalled for
+    /// ever on one record. Here the same shape would mean no picker at all, for seventy
+    /// applications whose names are plain ASCII.
+    #[test]
+    fn an_escape_this_cannot_decode_costs_one_character_not_the_list() {
+        let paired = r#"{"data":["a\ud83d\ude00b","gateway"]}"#;
+        assert_eq!(
+            label_values_from_json(paired).expect("values"),
+            ["a\u{1F600}b", "gateway"],
+            "a surrogate pair is one character, not two replacements"
+        );
+
+        let lone = r#"{"data":["a\ud800b","gateway"]}"#;
+        let read = label_values_from_json(lone).expect("values");
+        assert_eq!(read.len(), 2, "the second value survives the first");
+        assert_eq!(read[0], "a\u{FFFD}b");
+        assert_eq!(read[1], "gateway");
+    }
+
+    #[test]
+    fn the_short_escapes_decode_to_what_they_stand_for() {
+        let body = r#"{"data":["a\nb","c\td","e\bf","g\fh","i\/j","kAl"]}"#;
+        assert_eq!(
+            label_values_from_json(body).expect("values"),
+            ["a\nb", "c\td", "e\u{8}f", "g\u{c}h", "i/j", "kAl"]
+        );
+    }
+
+    /// A string that never closes is not a value; the answer is "I did not understand this",
+    /// which the caller says differently from "there are none".
+    #[test]
+    fn an_unterminated_value_is_not_read_as_a_value() {
+        assert_eq!(label_values_from_json(r#"{"data":["gateway]}"#), None);
+        assert_eq!(label_values_from_json(r#"{"data":["a","#), None);
+        assert_eq!(label_values_from_json(r#"{"data":["a\"#), None);
     }
 }

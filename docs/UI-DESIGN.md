@@ -463,6 +463,44 @@ architecture where it was.
 
 ---
 
+### 2.6 Choosing applications when a remote source opens `[v1]` — built 2026-09-08
+
+Opening a Loki source asks it which applications it has and offers them, because the alternative is
+a person typing `nurtur-identity-server` correctly from memory into a LogQL selector.
+
+```
+┌ Applications ─────────────────────────────────────────────┐
+│ Which applications should this source show?               │
+│ ┌───────────────────────────────────────┐  ┌───────────┐  │
+│ │ ☐ address-api                         │  │    All    │  │
+│ │ ☑ nurtur-identity-server              │  ├───────────┤  │
+│ │ ☑ nurtur-gateway                      │  │   None    │  │
+│ │ ☐ nurtur-messaging-api                │  └───────────┘  │
+│ │ …                                     │                 │
+│ └───────────────────────────────────────┘                 │
+│ 74 applications, 2 chosen                                 │
+│ ┌────────────┐ ┌───────────────────┐         ┌─────────┐  │
+│ │ Interleave │ │ Separate windows  │         │ Cancel  │  │
+│ └────────────┘ └───────────────────┘         └─────────┘  │
+└───────────────────────────────────────────────────────────┘
+```
+
+- **Two ways out, because the owner asked for both.** *Interleave* opens one document whose selector
+  names every ticked application, so their records arrive in one timeline. *Separate windows* opens
+  one document per application, each named after it.
+- **The source's own query is rewritten, never replaced.** `apps::with_apps` keeps every other
+  matcher the user wrote — the environment above all — and keeps whatever pipeline follows the
+  selector. A source already narrowed to some applications opens with those ticked.
+- **Nothing ticked means the source as configured**, not an empty window: a picker that could
+  produce nothing is a picker that wastes a round trip to prove it.
+- **A source that cannot answer still opens.** No credential yet, a server that is down, a Loki
+  without the endpoint — the reason is said in the status bar and the source opens whole. A
+  convenience that can stop you reading your logs is worse than no convenience.
+- The count line says how many were offered and how many are ticked, and says so when the server
+  offered more than the list holds — §6's rule that what is missing is said, applied to a menu.
+
+---
+
 ## 3. Split view — the two-pane model
 
 klogg's most-validated layout, plus the in-place hide it has an open request for. Both ship; the user
