@@ -3333,6 +3333,12 @@ enum Command {
     ResetColumns,
     /// §2.3: show or hide the toolbar row.
     ToggleToolbar,
+    /// §2.3: the toolbar's icons in the larger of the two sizes a Windows toolbar offers.
+    ToolbarLargeIcons,
+    /// §2.3: and back to the smaller. Two commands rather than one toggle, because a pair of
+    /// sizes in a menu is a pair of radio items and choosing the one already chosen must do
+    /// nothing rather than flip to the other.
+    ToolbarSmallIcons,
     /// The owner's arrangement model: the focused pane fills the frame, or the split comes back.
     ToggleMaximise,
     /// §12.4's remote sources — the dialog that defines them and stores their secrets.
@@ -3438,6 +3444,8 @@ impl Command {
             "",
         ),
         (Command::ToggleToolbar, "Show or hide the toolbar", ""),
+        (Command::ToolbarLargeIcons, "Large toolbar icons", ""),
+        (Command::ToolbarSmallIcons, "Small toolbar icons", ""),
         (Command::EditSources, "Remote sources…", ""),
         (
             Command::ToggleMaximise,
@@ -4113,6 +4121,9 @@ struct Shell {
     statusbar: Option<statusbar::StatusBar>,
     /// Whether §2.3's row is shown. Remembered per §12.4; the default is shown.
     show_toolbar: bool,
+    /// Whether that row draws its icons large. Remembered too; the default is small, which is
+    /// where every shell toolbar starts.
+    large_icons: bool,
     /// The measured cell size, for the command bar's hit-test. Zero until the first frame.
     cell_w: f32,
     cell_h: f32,
@@ -4711,8 +4722,10 @@ impl Shell {
                     self.cell_w = cell.0;
                     self.cell_h = cell.1;
                     let buttons = toolbar::toolbar_of(None);
+                    let large = self.large_icons;
                     let band = match (self.toolbar.as_mut(), self.show_toolbar) {
                         (Some(bar), true) => {
+                            bar.set_large(large);
                             bar.set(&buttons);
                             let band = bar.band_height();
                             bar.place(0, w as i32, band, true);
@@ -4811,8 +4824,10 @@ impl Shell {
                 // §2.3's row, directly under the strip. Its band is asked of the control for the
                 // same reason the strip's is, and the two together are what the grid starts below.
                 let buttons = toolbar::toolbar_of(self.document.as_ref());
+                let large = self.large_icons;
                 let toolbar_px = match (self.toolbar.as_mut(), self.show_toolbar) {
                     (Some(bar), true) => {
+                        bar.set_large(large);
                         bar.set(&buttons);
                         let band = bar.band_height();
                         bar.place(strip_px as i32, w as i32, band, true);
@@ -6140,6 +6155,18 @@ impl Shell {
                 self.save_settings(hwnd);
                 return true;
             }
+            // The owner's ask of 2026-09-08. A size change is a different set of bitmaps, so the
+            // control is told and rebuilds itself on the next frame rather than being asked to
+            // scale what it has.
+            Command::ToolbarLargeIcons | Command::ToolbarSmallIcons => {
+                self.large_icons = command == Command::ToolbarLargeIcons;
+                self.settings.toolbar_large = Some(self.large_icons);
+                if let Some(bar) = self.toolbar.as_mut() {
+                    bar.set_large(self.large_icons);
+                }
+                self.save_settings(hwnd);
+                return true;
+            }
             // Not remembered: which pane fills the frame is about the moment, not a preference,
             // and a viewer that opened maximised over a split the user could not see would be
             // hiding a document rather than arranging one.
@@ -6306,6 +6333,8 @@ impl Shell {
             | Command::OpenRules
             | Command::ReloadRules
             | Command::ToggleToolbar
+            | Command::ToolbarLargeIcons
+            | Command::ToolbarSmallIcons
             | Command::ToggleMaximise
             | Command::EditSources
             | Command::CloseTab => {}
@@ -9667,11 +9696,14 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     s.borrow().as_ref().map(|shell| {
                         menubar::menu_bar(
                             shell.document.as_ref(),
-                            theme().dark,
+                            menubar::BarState {
+                                dark: theme().dark,
+                                toolbar: shell.show_toolbar,
+                                large_icons: shell.large_icons,
+                                maximised: shell.document.maximised(),
+                                can_maximise: shell.document.can_maximise(),
+                            },
                             &shell.settings.recent,
-                            shell.show_toolbar,
-                            shell.document.maximised(),
-                            shell.document.can_maximise(),
                             &shell.source_names(),
                         )
                     })
@@ -9813,6 +9845,22 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // as three hit-tests we would have had to write.
         WM_NOTIFY => {
             let header = unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::NMHDR) };
+            // §2.3: the toolbar's buttons are icons, so hovering one has to say what it does. The
+            // text is the toolbar's own view-model, which is the menu's register — a tooltip that
+            // named a different key from the menu would be worse than none.
+            if header.idFrom == toolbar::ID_TOOLBAR as usize
+                && header.code == toolbar::TBN_GETINFOTIPW
+            {
+                let filled = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|shell| shell.toolbar.as_ref())
+                        .is_some_and(|bar| bar.info_tip(lparam))
+                });
+                if filled {
+                    return LRESULT(0);
+                }
+            }
             if header.idFrom == tabstrip::ID_TABS as usize && header.code == tabstrip::TCN_SELCHANGE
             {
                 let chosen = STATE.with(|s| {
@@ -10430,6 +10478,7 @@ fn main() -> Result<()> {
             toolbar: None,
             statusbar: None,
             show_toolbar: settings.toolbar.unwrap_or(true),
+            large_icons: settings.toolbar_large.unwrap_or(false),
             drag_guide: None,
             cell_w: 0.0,
             cell_h: 0.0,
@@ -10545,15 +10594,21 @@ fn main() -> Result<()> {
                 .map(|shell| shell.settings.recent.clone())
                 .unwrap_or_default()
         });
-        let show_toolbar =
-            STATE.with(|s| s.borrow().as_ref().is_some_and(|shell| shell.show_toolbar));
+        let (show_toolbar, large_icons) = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|shell| (shell.show_toolbar, shell.large_icons))
+                .unwrap_or((true, false))
+        });
         if let Some(bar) = menubar::build_bar(&menubar::menu_bar(
             None,
-            theme().dark,
+            menubar::BarState {
+                dark: theme().dark,
+                toolbar: show_toolbar,
+                large_icons,
+                ..Default::default()
+            },
             &recent,
-            show_toolbar,
-            false,
-            false,
             &[],
         )) {
             unsafe {
@@ -11622,7 +11677,15 @@ mod tests {
     #[test]
     fn back_and_forward_are_greyed_until_there_is_a_view_to_return_to() {
         fn enabled(doc: &Document, label: &str) -> bool {
-            let menu = menubar::menu_bar(Some(doc), false, &[], true, false, false, &[]);
+            let menu = menubar::menu_bar(
+                Some(doc),
+                menubar::BarState {
+                    toolbar: true,
+                    ..Default::default()
+                },
+                &[],
+                &[],
+            );
             for top in 0..menu.items().len() {
                 let Some(items) = menu.at(&[top]) else {
                     continue;

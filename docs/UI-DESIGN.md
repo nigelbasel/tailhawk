@@ -90,10 +90,16 @@ clickable" status chips were not clickable, and §6.2's boundary handles — spe
 were keyboard-only. A principle that reads as restraint was in practice a licence to skip the half
 of the interface most users reach for first.
 
-**What stays true** is the *register*, not the omission. No ribbon; no toolbar of ambiguous,
-unlabelled 16×16 icons. Toolbar buttons carry text, or an icon with a text label beside it, never an
-icon alone. Every menu item names its accelerator, so the menu teaches the keyboard instead of
-competing with it.
+**What stays true** is the *register*, not the omission. No ribbon; every menu item names its
+accelerator, so the menu teaches the keyboard instead of competing with it.
+
+**"Never an icon alone" — overturned by the owner, 2026-09-08.** This section used to forbid "a
+toolbar of ambiguous, unlabelled 16×16 icons" and require a label beside every icon. What that
+produced was a row of bare words, which he called *"ugly, non standard and unusable"* — and he was
+right that it is not what a Windows toolbar looks like. The toolbar is icons, with a tooltip naming
+the command and its keys, in the two sizes Windows offers. §2.3 has the shape; the register above is
+what survives: the icons are Windows' own, not a private set, and every command they reach is on a
+menu with its accelerator written beside it.
 
 **Drawn by Windows, not by us — reversed 2026-08-25, and again in practice on 2026-09-01.** This
 paragraph used to end "the menu bar and toolbar are **drawn by the app** in its own flat Windows 11
@@ -338,30 +344,61 @@ competing with it; an item with no accelerator has none rather than a blank colu
 
 ### 2.3 The toolbar `[v1]`
 
-One row, **text labels** — or an icon with a label beside it, never an icon alone (§1.1).
+One row of **icon buttons in a rebar band**, grouped by separators, each with a tooltip naming the
+command and its shortcut. The icons are Windows' own — `Segoe Fluent Icons`, falling back to
+`Segoe MDL2 Assets` on Windows 10 — drawn into an image list at the current DPI and tinted with the
+theme's ink.
 
 ```
- Open   Find   Filter   Follow   Collapse   Detail   Rules   Format   Export
+┌────────────────────────────────────────────────────────────┐
+│⋮⋮ 📂 │ 🔍 ▽ │ ↓ ⌃ ⊣ │ 🎨 ⊞ │ 💾                            │
+└────────────────────────────────────────────────────────────┘
+  ▲                ▲
+  gripper          hovering says "Find…  (Ctrl+F)"
 ```
 
 Buttons are the commands reached most often in a session, not a mirror of the menu. A button whose
-command is unavailable is disabled in place. Toggles (Follow, Collapse, Detail) draw pressed when
-their state is on, so the toolbar reads as a status display as well as a control.
+command is unavailable is disabled in place. Toggles (Filter, Follow, Collapse, Detail) draw pressed
+when their state is on, so the toolbar reads as a status display as well as a control.
 
-The toolbar is **hideable** — `View ▸ Toolbar` — and its state is remembered per §12.4, because a
-user who works from the keyboard should be able to buy the row back.
+**Two icon sizes**, per the owner on 2026-09-08 — *"there should probably be an option for large and
+small toolbars, that is a common option of standard windows apps"*. `View ▸ Toolbar ▸ Small icons` /
+`Large icons`, sixteen and twenty-four logical pixels, scaled by the display's DPI and remembered per
+§12.4 alongside `Show toolbar`.
 
-**Built 2026-09-01** as a real `ToolbarWindow32` — `crates/tailhawk/src/toolbar.rs`. Three things
-about it are decisions rather than detail. Its **height is asked of the control** through
-`TB_GETMAXSIZE` and is never a number chosen in the source, because the tab strip's band was once
-`chrome_h + 4.0` and that four was exactly the "a bit small" the owner reported. Its **button ids
-are the register's**, the same ones the menu sends, so a click goes down the one dispatch §1.2 asks
-for and the two surfaces cannot drift; a test asserts it. And it carries **no image list at all** —
-`I_IMAGENONE` on every button — which is how the "never an icon alone" rule above is kept without
-committing anyone to an icon set.
+**Rebuilt 2026-09-08, and the rewrite is a lesson about the platform rather than about design.** The
+row was text-only because §1.1 forbade an icon without a label; the owner overturned that after
+saying four times across three sessions that the toolbar had to look like a Windows toolbar. What
+took the iterations was not the icons but everything this file had taken upon itself:
 
-The menu item reads **`Toolb&ar`**, with `a` as its mnemonic, because `T` belongs to `Go to top` and
-`b` to `Back`. The collision was caught by the menu's own mnemonic test rather than on screen.
+- **The control sizes itself, and this window had turned that off.** Microsoft's page says plainly:
+  *"The toolbar window procedure automatically sets the size and position of the toolbar window. The
+  height is based on the height of the buttons in the toolbar"*, and that `CCS_NORESIZE` /
+  `CCS_NOPARENTALIGN` — which disable it — are what *"toolbar controls that are hosted by rebar
+  controls must set"*. They were set here with no rebar in sight, so this file owned the sizing, and
+  it measured the band from a window it had itself just sized. Large icons could never make the band
+  grow; they were clipped.
+- **The button size is the control's.** An invented one — icon plus half again — made the band
+  enormous the moment large icons were chosen.
+- **Docking is a rebar, not a toolbar.** *"A rebar control acts as a container for child windows…
+  each band can have a gripper bar… As you dynamically reposition a rebar control band, the rebar
+  control manages the size and position of the child window assigned to that band."*
+
+So the toolbar now lives in a `ReBarWindow32` band, which draws the gripper, owns the layout, and
+gives the two `CCS_` styles the host they were always written for. The window positions the rebar
+and asks it for its height (`RB_GETBARHEIGHT`); it computes nothing.
+
+**What the rebar does not give**, said here because "dockable" covers both: bands drag and reorder
+within the rebar, and the rebar sits where the window puts it. Docking a toolbar to the left or
+right edge, or tearing it off into a floating window, was never a control — MFC built that on top —
+and it is not built here.
+
+**Not the resource route, and the documentation is why.** A `.rc` toolbar means `CreateToolbarEx`,
+which Microsoft's own page calls *"not recommended, as it does not support new features of toolbars,
+including image lists"*. The menu **is** a real `HMENU`, which is what a `.rc` `MENU` resource would
+have produced.
+
+---
 
 ### 2.4 Context menus `[v1]`
 

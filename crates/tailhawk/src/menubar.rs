@@ -289,13 +289,24 @@ pub fn panel_row_context(enabled: bool, include: bool) -> Vec<tailhawk_core::men
 ///
 /// An item that cannot act is **disabled, not hidden**, per §1.1 and §1.2's memorability rule: a
 /// menu whose shape changes under the user is a menu they cannot learn.
+/// What the bar needs to know about the window it describes, beyond the document itself.
+///
+/// **A struct rather than eight arguments**, which is what it had grown to and what clippy stopped
+/// at seven: a call site passing `true, false, false, false` in the right order by luck is a
+/// mistake waiting to happen, and the fourth `bool` was the one the toolbar's icon size added.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BarState {
+    pub dark: bool,
+    pub toolbar: bool,
+    pub large_icons: bool,
+    pub maximised: bool,
+    pub can_maximise: bool,
+}
+
 pub fn menu_bar(
     doc: Option<&Document>,
-    dark: bool,
+    state: BarState,
     recent: &[String],
-    toolbar: bool,
-    maximised: bool,
-    can_maximise: bool,
     sources: &[String],
 ) -> tailhawk_core::menu::Menu {
     use tailhawk_core::menu::{Item, Menu};
@@ -304,6 +315,13 @@ pub fn menu_bar(
     let check = |label: &str, key: &str, c: Command, ticked: bool| {
         Item::check(label, key, command_id(c), ticked)
     };
+    let BarState {
+        dark,
+        toolbar,
+        large_icons,
+        maximised,
+        can_maximise,
+    } = state;
     let open = doc.is_some();
     let selected = doc.is_some_and(|d| d.has_selection());
     let columns = doc.is_some_and(|d| d.has_columns());
@@ -449,7 +467,26 @@ pub fn menu_bar(
                 ),
                 // §2.3: the row is hideable, and this is the only way back to it — so it is never
                 // disabled, whatever is or is not open.
-                check("Toolb&ar", "", Command::ToggleToolbar, toolbar),
+                // §2.3: the row is hideable, and this submenu is the only way back to it — so it
+                // is never disabled, whatever is or is not open. **A submenu because that is where
+                // Windows keeps this**: View ▸ Toolbars, with the sizes under it, is the shape a
+                // person goes looking for, and it is also what gave the two size items a mnemonic
+                // each — the View menu itself had run out, which the mnemonic test said plainly.
+                Item::submenu(
+                    "Toolb&ar",
+                    vec![
+                        check("&Show toolbar", "", Command::ToggleToolbar, toolbar),
+                        Item::separator(),
+                        on(
+                            check("S&mall icons", "", Command::ToolbarSmallIcons, !large_icons),
+                            toolbar,
+                        ),
+                        on(
+                            check("&Large icons", "", Command::ToolbarLargeIcons, large_icons),
+                            toolbar,
+                        ),
+                    ],
+                ),
                 // §3.1's arrangement: the focused pane fills the frame, or the split comes back.
                 // Disabled with one pane, where it would have nothing to do.
                 on(
@@ -684,7 +721,16 @@ mod tests {
     /// does not, is not there at all.
     #[test]
     fn every_listed_command_appears_in_at_least_one_menu() {
-        let ids = menu_bar(None, false, &[], true, false, false, &[]).ids();
+        let ids = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        )
+        .ids();
         let missing: Vec<&str> = Command::LISTED
             .iter()
             .enumerate()
@@ -718,11 +764,27 @@ mod tests {
         for (shape, menu) in [
             (
                 "no recent files",
-                menu_bar(None, false, &[], true, false, false, &[]),
+                menu_bar(
+                    None,
+                    BarState {
+                        toolbar: true,
+                        ..BarState::default()
+                    },
+                    &[],
+                    &[],
+                ),
             ),
             (
                 "with recent files",
-                menu_bar(None, false, &recent, true, false, false, &[]),
+                menu_bar(
+                    None,
+                    BarState {
+                        toolbar: true,
+                        ..BarState::default()
+                    },
+                    &recent,
+                    &[],
+                ),
             ),
         ] {
             let heads: Vec<Option<char>> = menu.items().iter().map(|i| i.mnemonic()).collect();
@@ -762,7 +824,15 @@ mod tests {
     /// keyboard once the menu is open, which §1.2 requires to be a complete path.
     #[test]
     fn every_choosable_item_marks_a_mnemonic() {
-        let menu = menu_bar(None, false, &[], true, false, false, &[]);
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        );
         let mut bare: Vec<String> = Vec::new();
         for top in 0..menu.items().len() {
             let Some(items) = menu.at(&[top]) else {
@@ -785,7 +855,15 @@ mod tests {
     /// a menu that hides working features.
     #[test]
     fn the_four_built_surfaces_are_no_longer_greyed() {
-        let menu = menu_bar(None, false, &[], true, false, false, &[]);
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        );
         for (top, label) in [
             ("Settings", "Preferences"),
             ("Help", "Keyboard map"),
@@ -847,7 +925,15 @@ mod tests {
     /// no history there is simply nothing, not a greyed stub.
     #[test]
     fn recent_files_are_entries_of_the_file_menu_itself() {
-        let menu = menu_bar(None, false, &[], true, false, false, &[]);
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        );
         let file = menu.at(&[0]).expect("File opens").to_vec();
         assert!(
             !file.iter().any(|i| i.text().contains("Clear recent")),
@@ -862,7 +948,15 @@ mod tests {
             r"C:\logs\newest.log".to_owned(),
             r"C:\logs\older.log".to_owned(),
         ];
-        let menu = menu_bar(None, false, &paths, true, false, false, &[]);
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..Default::default()
+            },
+            &paths,
+            &[],
+        );
         let file = menu.at(&[0]).expect("File opens").to_vec();
         let first = file
             .iter()
@@ -907,7 +1001,15 @@ mod tests {
     /// menu would offer no way back.
     #[test]
     fn with_no_document_the_file_menu_still_offers_open() {
-        let menu = menu_bar(None, false, &[], true, false, false, &[]);
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        );
         let file = menu.at(&[0]).expect("File").to_vec();
         assert!(
             file[0].text().starts_with("Open"),
@@ -926,7 +1028,16 @@ mod tests {
     #[test]
     fn the_theme_item_is_ticked_to_match_the_theme() {
         for dark in [true, false] {
-            let menu = menu_bar(None, dark, &[], true, false, false, &[]);
+            let menu = menu_bar(
+                None,
+                BarState {
+                    dark,
+                    toolbar: true,
+                    ..Default::default()
+                },
+                &[],
+                &[],
+            );
             // Settings is the sixth heading.
             let settings = menu.at(&[5]).expect("Settings").to_vec();
             let theme_item = settings

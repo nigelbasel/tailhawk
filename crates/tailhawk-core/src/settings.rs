@@ -173,6 +173,10 @@ pub struct Settings {
     pub font_size: Option<u16>,
     /// §2.3: whether the toolbar row is shown. Absent means shown — the default is the row.
     pub toolbar: Option<bool>,
+    /// §2.3: whether the toolbar draws its icons large. Absent means small, which is what every
+    /// shell toolbar starts at. The owner's ask of 2026-09-08: "there should probably be an option
+    /// for large and small toolbars, that is a common option of standard windows apps".
+    pub toolbar_large: Option<bool>,
     /// File ▸ Open Recent, newest first, at most [`RECENT_MAX`].
     pub recent: Vec<String>,
     /// The Find dialog's query history, newest first, at most [`FIND_MAX`].
@@ -240,6 +244,9 @@ impl Settings {
         if over.toolbar.is_some() {
             self.toolbar = over.toolbar;
         }
+        if over.toolbar_large.is_some() {
+            self.toolbar_large = over.toolbar_large;
+        }
         // Sources merge **by name**, so a curated set beside the exe can define the shared ones and
         // a user can still add their own — the same shape §12.4 gives every other tiered artefact.
         for s in over.sources {
@@ -274,6 +281,7 @@ impl Settings {
             || self.font.is_some()
             || self.font_size.is_some()
             || self.toolbar.is_some()
+            || self.toolbar_large.is_some()
         {
             out.push_str("\n[appearance]\n");
             if let Some(theme) = &self.theme {
@@ -287,6 +295,9 @@ impl Settings {
             }
             if let Some(shown) = self.toolbar {
                 out.push_str(&format!("toolbar = {shown}\n"));
+            }
+            if let Some(large) = self.toolbar_large {
+                out.push_str(&format!("toolbar_large = {large}\n"));
             }
         }
         if !self.recent.is_empty() {
@@ -438,6 +449,9 @@ impl Settings {
                     // row away, since the way back to it is the row's own menu item.
                     "toolbar" if value == "true" || value == "false" => {
                         settings.toolbar = Some(value == "true");
+                    }
+                    "toolbar_large" if value == "true" || value == "false" => {
+                        settings.toolbar_large = Some(value == "true");
                     }
                     _ => {}
                 },
@@ -766,6 +780,7 @@ mod tests {
             font: Some("Cascadia Mono".to_owned()),
             font_size: Some(18),
             toolbar: Some(false),
+            toolbar_large: Some(true),
             recent: vec![r"C:\logs\app.log".to_owned()],
             find_queries: vec!["ERROR".to_owned(), r"time\d+".to_owned()],
         };
