@@ -7616,12 +7616,23 @@ fn from_menu_or_toolbar(lparam: LPARAM) -> bool {
 /// what just happened, short enough that a busy service does not return the cap on the first ask.
 /// Puts a line in the status bar. **Not a message box** — `about.rs` records why this application
 /// does not use one, and a failure to reach a log server is information rather than a modal event.
-fn set_notice(text: String) {
+/// Says something in the status bar, **and makes it appear**.
+///
+/// The invalidation is not a detail. The bar is written during a paint, so a notice set while
+/// nothing is painting — which is exactly the state of a window with no document open — reached a
+/// field and stopped there. Found by running it: opening the second configured source, which has no
+/// stored secret, produced no dialog, no document and no message. The window sat showing its
+/// welcome text, and a menu item that had failed looked identical to one that did nothing at all.
+fn set_notice(hwnd: HWND, text: String) {
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.notice = Some(text);
+            shell.refresh_title(hwnd);
         }
     });
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
 }
 
 /// The label whose values the picker offers. `LOKI.md` §2: the estate's services are one label, and
@@ -7643,15 +7654,18 @@ fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
     let values = match pull::label_values(&source, APP_LABEL) {
         Ok(values) if !values.is_empty() => values,
         Ok(_) => {
-            set_notice(format!(
-                "{}: Loki lists no applications for this source — opening all of it.",
-                source.name
-            ));
+            set_notice(
+                hwnd,
+                format!(
+                    "{}: Loki lists no applications for this source — opening all of it.",
+                    source.name
+                ),
+            );
             open_remote(hwnd, source.clone(), source.name.clone());
             return;
         }
         Err(why) => {
-            set_notice(format!("{}: {why} Opening all of it.", source.name));
+            set_notice(hwnd, format!("{}: {why} Opening all of it.", source.name));
             open_remote(hwnd, source.clone(), source.name.clone());
             return;
         }
@@ -7691,17 +7705,20 @@ fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
                         label,
                     );
                 }
-                Err(_) => set_notice(format!(
-                    "{}: this source's query is not a selector this can add to.",
-                    source.name
-                )),
+                Err(_) => set_notice(
+                    hwnd,
+                    format!(
+                        "{}: this source's query is not a selector this can add to.",
+                        source.name
+                    ),
+                ),
             }
         }
         Some(dialog::Pick::Separate) => {
             // Each window is a tail of its own — a worker, a poll and a bounded spill — so a
             // choice too large to honour is refused with the remedy rather than truncated.
             if let Some(why) = tailhawk_core::apps::too_many_windows(chosen.len()) {
-                set_notice(why);
+                set_notice(hwnd, why);
                 return;
             }
             for app in &chosen {
@@ -7716,10 +7733,13 @@ fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
                         },
                         format!("{} \u{b7} {app}", source.name),
                     ),
-                    Err(_) => set_notice(format!(
-                        "{}: this source's query is not a selector this can add to.",
-                        source.name
-                    )),
+                    Err(_) => set_notice(
+                        hwnd,
+                        format!(
+                            "{}: this source's query is not a selector this can add to.",
+                            source.name
+                        ),
+                    ),
                 }
             }
         }
@@ -7764,7 +7784,7 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
         Err(why) => {
             // **The reason is shown, never swallowed.** Every fault says which half failed; a
             // source that silently opens nothing is the worst outcome available here.
-            set_notice(format!("{name}: {why}"));
+            set_notice(hwnd, format!("{name}: {why}"));
             return;
         }
     };
@@ -7775,12 +7795,18 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
     // rolling-set inference *correct* here — inferred over one source's own parts rather than over
     // every spill in `%TEMP%`, which is the splice `open_single` guards the pipe path against.
     let Ok(spill) = tailhawk_core::stdin::SpillSet::create() else {
-        set_notice("Could not create a temporary file for the records.".to_owned());
+        set_notice(
+            hwnd,
+            "Could not create a temporary file for the records.".to_owned(),
+        );
         return;
     };
     let mut writer = spill.writer();
     if writer.append(&pulled.clef).is_err() {
-        set_notice("Could not write the records to a temporary file.".to_owned());
+        set_notice(
+            hwnd,
+            "Could not write the records to a temporary file.".to_owned(),
+        );
         return;
     }
     let path = spill.first_part();
@@ -7793,20 +7819,26 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
     // first live query returned exactly 1,000 of 1,000 and said nothing, which is precisely the
     // "fewer lines, no error" failure this project keeps calling the worst kind.
     if pulled.dropped > 0 {
-        set_notice(format!(
-            "{name}: {} records; {} more were returned than Tailhawk keeps",
-            pulled.records, pulled.dropped
-        ));
+        set_notice(
+            hwnd,
+            format!(
+                "{name}: {} records; {} more were returned than Tailhawk keeps",
+                pulled.records, pulled.dropped
+            ),
+        );
     } else if pulled.records as u32 >= REMOTE_LIMIT {
-        set_notice(format!(
-            "{name}: the newest {} in the last hour — there are probably more",
-            pulled.records
-        ));
+        set_notice(
+            hwnd,
+            format!(
+                "{name}: the newest {} in the last hour — there are probably more",
+                pulled.records
+            ),
+        );
     } else {
-        set_notice(format!(
-            "{name}: {} records in the last hour",
-            pulled.records
-        ));
+        set_notice(
+            hwnd,
+            format!("{name}: {} records in the last hour", pulled.records),
+        );
     }
     // **And now it tails.** Everything above is one window of history; this is what makes the
     // source live. The worker asks Loki for what is newer than the newest record just written and

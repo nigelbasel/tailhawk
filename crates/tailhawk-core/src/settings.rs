@@ -358,7 +358,16 @@ impl Settings {
     }
 
     /// Reads the subset this program writes. Lenient: see the module note.
+    ///
+    /// **A leading byte-order mark is consumed**, because an editor puts one there and the file is
+    /// meant to be editable by hand. Without this, `\u{feff}[[source]]` is not a section header,
+    /// the file parses to nothing, and every configured source, recent file and preference in it
+    /// vanishes with no message — §5.6 already consumes a BOM for a log the user opens, and our own
+    /// settings deserve at least that. Found by writing a settings file from PowerShell, whose
+    /// `Set-Content -Encoding utf8` writes one: two configured sources became none, and the menu
+    /// item for the missing source did nothing at all.
     pub fn from_toml(text: &str) -> Settings {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut settings = Settings::default();
         let mut section = Section::None;
         let mut window = Window::default();
@@ -1115,5 +1124,26 @@ mod tests {
             "stateless writes nothing"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A settings file with a byte-order mark is still a settings file.** Every editor on this
+    /// platform will write one sooner or later — PowerShell's own `Set-Content -Encoding utf8`
+    /// does — and before this the whole file parsed to nothing: no sources, no recent files, no
+    /// preferences, and not a word to say why. The menu item for a source that had gone simply did
+    /// nothing when clicked.
+    #[test]
+    fn a_settings_file_with_a_byte_order_mark_is_read() {
+        let toml = "[[source]]\nname = \"live\"\nurl = \"https://example.com/loki\"\nquery = \"{environment=\\\"live\\\"}\"\n";
+        let plain = Settings::from_toml(toml);
+        let marked = Settings::from_toml(&format!("\u{feff}{toml}"));
+
+        assert_eq!(plain.sources.len(), 1, "the fixture itself must parse");
+        assert_eq!(
+            marked.sources.len(),
+            1,
+            "a leading BOM must not cost the file its contents"
+        );
+        assert_eq!(marked.sources[0].name, "live");
+        assert_eq!(marked.sources[0].url, "https://example.com/loki");
     }
 }

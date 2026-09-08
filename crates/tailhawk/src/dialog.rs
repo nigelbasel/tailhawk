@@ -922,6 +922,9 @@ const ID_A_COUNT: u16 = 244;
 const LVIS_STATEIMAGEMASK: u32 = 0xF000;
 const LVM_GETITEMSTATE: u32 = LVM_FIRST + 44;
 const LVM_GETITEMCOUNT: u32 = LVM_FIRST + 4;
+const LVM_SETCOLUMNWIDTH: u32 = LVM_FIRST + 30;
+/// Fill the remaining width. The header is measured too, so a long title is not clipped.
+const LVSCW_AUTOSIZE_USEHEADER: isize = -2;
 /// The state image a ticked box shows. One-based, so the second image is the tick.
 const CHECKED_IMAGE: u32 = 2 << 12;
 const UNCHECKED_IMAGE: u32 = 1 << 12;
@@ -1113,6 +1116,16 @@ unsafe extern "system" fn apps_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam
                     for (at, (name, chosen)) in rows.iter().enumerate() {
                         lv_row(list, at as i32, std::slice::from_ref(name));
                         lv_check(list, at as i32, *chosen);
+                    }
+                    // The one column fills the list, so there is no dead strip beside the names
+                    // with a header divider over it. Explorer's single-column views do the same.
+                    unsafe {
+                        SendMessageW(
+                            list,
+                            LVM_SETCOLUMNWIDTH,
+                            WPARAM(0),
+                            LPARAM(LVSCW_AUTOSIZE_USEHEADER),
+                        );
                     }
                 });
             }
