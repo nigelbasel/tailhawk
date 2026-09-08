@@ -390,12 +390,16 @@ fn draw_glyph(dc: HDC, glyph: char, px: i32, colour: u32) -> Option<HBITMAP> {
     // premultiplied by it. A pixel the glyph never touched stays fully transparent.
     let (r, g, b) = ((colour >> 16) & 0xFF, (colour >> 8) & 0xFF, colour & 0xFF);
     let pixels = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, (px * px * 4) as usize) };
-    for pixel in pixels.chunks_exact_mut(4) {
-        let alpha = pixel[0].max(pixel[1]).max(pixel[2]) as u32;
-        pixel[0] = ((b * alpha) / 255) as u8;
-        pixel[1] = ((g * alpha) / 255) as u8;
-        pixel[2] = ((r * alpha) / 255) as u8;
-        pixel[3] = alpha as u8;
+    // Walked by index rather than in chunks: CI's clippy is a rustc newer than this machine's and
+    // wants `as_chunks_mut`, which the local toolchain does not have. An index loop suits both.
+    let mut at = 0;
+    while at + 3 < pixels.len() {
+        let alpha = pixels[at].max(pixels[at + 1]).max(pixels[at + 2]) as u32;
+        pixels[at] = ((b * alpha) / 255) as u8;
+        pixels[at + 1] = ((g * alpha) / 255) as u8;
+        pixels[at + 2] = ((r * alpha) / 255) as u8;
+        pixels[at + 3] = alpha as u8;
+        at += 4;
     }
     Some(bitmap)
 }
