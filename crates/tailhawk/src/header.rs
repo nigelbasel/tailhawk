@@ -212,7 +212,15 @@ impl Header {
             }
         }
         trace(&format!("child: header hwnd={:?}", hwnd.0));
-        crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
+        // **The list classes, not Explorer's.** A header themed `DarkMode_Explorer` stays white with
+        // black text over a dark grid; `DarkMode_ItemsView` is the class Explorer's own file list
+        // gives its header.
+        crate::controls::apply_theme_class(
+            hwnd,
+            tailhawk_core::theme::theme().dark,
+            windows::core::w!("DarkMode_ItemsView"),
+            windows::core::w!("ItemsView"),
+        );
         Some(Header {
             hwnd,
             font,

@@ -5520,7 +5520,12 @@ impl Shell {
         // And every pane's header, which lives on the document rather than the shell.
         for (_, doc) in self.document.all_mut() {
             if let Some(ctl) = doc.header_ctl.as_ref() {
-                controls::apply_theme(ctl.hwnd(), next.dark);
+                controls::apply_theme_class(
+                    ctl.hwnd(),
+                    next.dark,
+                    windows::core::w!("DarkMode_ItemsView"),
+                    windows::core::w!("ItemsView"),
+                );
             }
         }
         // The *name*, not the resolved palette: "system" is an instruction, and storing what it

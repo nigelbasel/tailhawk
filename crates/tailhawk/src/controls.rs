@@ -101,13 +101,25 @@ mod tests {
 /// Best effort, like everything about theming a common control: a refusal leaves the control in
 /// the system's default look, which is a standard Windows control and exactly what §1.1 asks for.
 pub fn apply_theme(hwnd: windows::Win32::Foundation::HWND, dark: bool) {
-    use windows::core::{w, PCWSTR};
+    use windows::core::w;
+    apply_theme_class(hwnd, dark, w!("DarkMode_Explorer"), w!("Explorer"));
+}
+
+/// The same, for a control whose dark class is not `Explorer`'s.
+///
+/// **A header is the case that forced this.** `SetWindowTheme(header, "DarkMode_Explorer")` leaves
+/// the band white with black text over a dark grid — the class exists, so the call succeeds and
+/// changes nothing worth having. The list classes are what a header follows: `ItemsView` light and
+/// `DarkMode_ItemsView` dark, which is the pair Explorer's own file list uses.
+pub fn apply_theme_class(
+    hwnd: windows::Win32::Foundation::HWND,
+    dark: bool,
+    when_dark: windows::core::PCWSTR,
+    when_light: windows::core::PCWSTR,
+) {
+    use windows::core::PCWSTR;
     use windows::Win32::UI::Controls::SetWindowTheme;
-    let name = if dark {
-        w!("DarkMode_Explorer")
-    } else {
-        w!("Explorer")
-    };
+    let name = if dark { when_dark } else { when_light };
     unsafe {
         let _ = SetWindowTheme(hwnd, name, PCWSTR::null());
     }
