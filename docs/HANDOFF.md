@@ -19,9 +19,10 @@ control sent — and a header sends `NM_CUSTOMDRAW` on every paint, whose `lPara
 called from a paint is swallowed by the x64 kernel**: nothing the panic hook can see ever happens,
 and every probe reads as "blocked". `carries_item(code)` now gates the read; `4611e0a`.
 
-**Left undone on the header:** the band above the line-number gutter is bare (owner to say whether
-the header should span it, as Explorer's does); the font is not re-set on `WM_DPICHANGED`; the
-divider double-click reset and hide-by-drag-to-zero the drawn band had are not carried over.
+**The header is finished (2026-09-09).** The band spans the gutter as Explorer's does; the font is
+re-measured per monitor on `WM_DPICHANGED`, for every native control rather than only this one; a
+boundary dragged past the gap hides its column; and a double-clicked boundary puts it back at the
+width it was measured at.
 
 ## ▶ Resume point — 2026-09-03, session 31: Tailhawk tails Loki
 
@@ -70,6 +71,8 @@ does in `#Fields:`; `SPEC.md` §6.3 stage 2 carries the rule and its four refusa
 
 | **Two defects the live run found, both fixed 2026-09-08** | `set_notice` wrote a field and invalidated nothing, and the status bar is written during a paint — so with no document open the message never reached the screen and a source that failed to open was indistinguishable from a menu item that did nothing. It repaints and retitles now. And `Settings::from_toml` did not consume a **byte-order mark**: a settings file saved by an editor that writes one parsed to nothing at all — no sources, no recent files, no preferences, no message — which is how the second finding was found while chasing the first. |
 | **The toolbar is a Windows toolbar — 2026-09-08** | Icons from the system icon font in a `ReBarWindow32` band, grouped by separators, tooltips naming each command and its keys, and `View ▸ Toolbar ▸ Small icons / Large icons` remembered per §12.4. The owner had asked four times; what took the iterations was this file doing the control's job — see `UI-DESIGN.md` §2.3, which now carries the documentation that says so. **Not built:** docking to the left or right edge, or floating a toolbar in its own window. A rebar gives grippers and drag within the band; edge-docking and floating were an MFC layer, never a control. |
+| **The header's three follow-ups are done — 2026-09-09** | The font is re-measured on `WM_DPICHANGED` — for every native control, not just the header: `SystemParametersInfoForDpi` answers per monitor where `SystemParametersInfoW` answers for the system, so dragging the window to a 150 % display used to leave the chrome at 100 % beside a rescaled grid. A boundary dragged past the gap **hides** its column again (`header::width_for`), and **double-clicking a boundary** puts that column back at the width it was measured at (`HDN_DIVIDERDBLCLICKW` → `Request::Reset`) — the two gestures the drawn band had and the control's drag did not carry over. |
+
 | **The menu bar and its popups stay light, and that is Windows** | Measured on this build (10.0.26200) on 2026-09-08: all five uxtheme dark-mode ordinals resolve (104, 132, 133, 135, 136), `SetPreferredAppMode(ForceDark)` is called **before any window or menu is created**, `RefreshImmersiveColorPolicyState` and `FlushMenuThemes` follow it, `AllowDarkModeForWindow` is called for the frame, and the menus are still drawn light. There is no supported API for a dark Win32 menu, and Windows' own classic-menu apps — `regedit`, the MMC snap-ins — are light in dark mode for the same reason. **The only route left is owner-drawing:** `MFT_OWNERDRAW` items with `WM_MEASUREITEM` / `WM_DRAWITEM` for the popups, plus the undocumented `WM_UAHDRAWMENU` messages for the bar strip behind them. That is us drawing chrome again, which §1.1 moved away from, so it is the owner's call rather than a defect to fix quietly. **Dialogs are the same family** — the picker, Find, the rules editor are light; a dialog goes dark through per-control theming plus `WM_CTLCOLOR*`, which is its own piece of work. |
 
 

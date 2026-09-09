@@ -2558,6 +2558,34 @@ impl Document {
         self.resizing = None;
     }
 
+    /// One column back to the width it was measured at — §2.5's double-click on a boundary, and
+    /// the way back from a column dragged to nothing.
+    fn reset_column(&mut self, column: usize) -> bool {
+        let Some(defaults) = self.column_defaults.clone() else {
+            return false;
+        };
+        let Some(layout) = self.layout.as_mut() else {
+            return false;
+        };
+        let Some(measured) = defaults.get(column).copied() else {
+            return false;
+        };
+        if layout.widths.get(column) == Some(&measured) {
+            return false;
+        }
+        if column >= layout.widths.len() {
+            return false;
+        }
+        layout.widths[column] = measured;
+        self.header = Some(layout.header());
+        true
+    }
+
+    /// What one column is set to now, in cells.
+    fn column_width(&self, column: usize) -> Option<usize> {
+        self.layout.as_ref()?.widths.get(column).copied()
+    }
+
     /// Every column back to its measured width — the way to see a hidden column again.
     fn reset_columns(&mut self) -> bool {
         let Some(defaults) = self.column_defaults.clone() else {
@@ -3305,6 +3333,33 @@ struct ViewState {
     chips: Chips,
     records_only: bool,
     row: u64,
+}
+
+/// A native control that draws in the shell font, so the DPI pass can re-font them together.
+///
+/// **A trait for three otherwise unrelated controls**, because the alternative is the same four
+/// lines written three times and forgotten in the fourth place — which is how the header came to be
+/// the only one anybody noticed was wrong.
+trait Fonted {
+    fn set_font(&mut self, dpi: u32);
+}
+
+impl Fonted for tabstrip::TabStrip {
+    fn set_font(&mut self, dpi: u32) {
+        tabstrip::TabStrip::set_font(self, dpi);
+    }
+}
+
+impl Fonted for toolbar::Toolbar {
+    fn set_font(&mut self, dpi: u32) {
+        toolbar::Toolbar::set_font(self, dpi);
+    }
+}
+
+impl Fonted for statusbar::StatusBar {
+    fn set_font(&mut self, dpi: u32) {
+        statusbar::StatusBar::set_font(self, dpi);
+    }
 }
 
 /// A self-posted kick for `run_pending_dialogs` — a UIA invoke queues a dialog with no input
@@ -5081,6 +5136,24 @@ impl Shell {
         // `WM_DPICHANGED` handler, and `wndproc` drops nested messages (see its note). So the
         // swap chain is resized here, from the client size the window now has.
         self.resize(hwnd);
+        // **The native children keep the font they were made with**, and this window can be dragged
+        // between monitors: without this the chrome stayed at the old scale beside a grid that had
+        // rescaled. §2.5 recorded it as a header gap; it was every control's.
+        for control in [
+            self.tabs.as_mut().map(|c| c as &mut dyn Fonted),
+            self.toolbar.as_mut().map(|c| c as &mut dyn Fonted),
+            self.statusbar.as_mut().map(|c| c as &mut dyn Fonted),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            control.set_font(dpi);
+        }
+        for (_, doc) in self.document.all_mut() {
+            if let Some(ctl) = doc.header_ctl.as_mut() {
+                ctl.set_font(dpi);
+            }
+        }
         let (chrome, chrome_px) = chrome_font(dpi);
         let changed = self.renderer.as_mut().is_some_and(|renderer| {
             // Both, and not short-circuiting: the chrome metrics are reported per DPI, so a
@@ -10123,11 +10196,31 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 };
                                 // The item is the box, gap included; the model holds the content.
                                 let gap = tailhawk_core::columns::GAP;
-                                let cells =
-                                    header::cells_of_px(px, cell_w).saturating_sub(gap).max(1);
+                                // §2.5: a boundary pulled all the way in hides the column, which
+                                // the drawn band did and the control's own drag did not carry over.
+                                let cells = header::width_for(px, cell_w, gap);
                                 let changed = doc.set_column_width(b.column, cells);
                                 if let Some(ctl) = doc.header_ctl.as_ref() {
                                     ctl.set_width(item, header::px_of_cells(cells + gap, cell_w));
+                                }
+                                changed
+                            }
+                            // §2.5's way back: double-clicking a boundary puts that column at the
+                            // width it was measured at, hidden or merely narrow.
+                            header::Request::Reset { item } => {
+                                let Some(b) = header::item_to_box(item)
+                                    .filter(|b| *b < last)
+                                    .and_then(|b| boxes.get(b))
+                                else {
+                                    return false;
+                                };
+                                let column = b.column;
+                                let changed = doc.reset_column(column);
+                                if let Some((width, ctl)) =
+                                    doc.column_width(column).zip(doc.header_ctl.as_ref())
+                                {
+                                    let gap = tailhawk_core::columns::GAP;
+                                    ctl.set_width(item, header::px_of_cells(width + gap, cell_w));
                                 }
                                 changed
                             }

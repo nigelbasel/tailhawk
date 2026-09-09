@@ -913,6 +913,30 @@ impl Toolbar {
     }
 
     /// The control's window, so the shell can tell this control's `WM_COMMAND` from anyone else's.
+    /// Re-measures the shell font for `dpi` and gives it to the control.
+    ///
+    /// **A control keeps the font it was created with**, and this window is created on one monitor
+    /// and dragged to another: without this, moving to a 150 % display left every native child
+    /// drawing at 100 % beside a grid that had rescaled. `WM_DPICHANGED` is the moment to ask
+    /// again, and `SystemParametersInfoForDpi` is what makes the answer per-monitor.
+    pub fn set_font(&mut self, dpi: u32) {
+        let font = crate::tabstrip::shell_font_for(dpi);
+        if font.is_invalid() {
+            return;
+        }
+        unsafe {
+            SendMessageW(self.hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+        // The old one goes only after the control has been told about the new one: a GDI object
+        // still selected into a live device context is undefined rather than merely untidy.
+        if !self.font.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
+        self.font = font;
+    }
+
     pub fn hwnd(&self) -> HWND {
         self.hwnd
     }

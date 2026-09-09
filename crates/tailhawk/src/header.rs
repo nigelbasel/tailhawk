@@ -54,9 +54,14 @@ pub enum Request {
     Reorder { from: usize, to: usize },
     /// A title was clicked: cycle the sort on the column at display slot `item`.
     Sort { item: usize },
+    /// A boundary was double-clicked: column `item` goes back to the width it was measured at.
+    /// §2.5's other lost gesture, and the way back from [`width_for`]'s hide.
+    Reset { item: usize },
 }
 
-use windows::Win32::UI::Controls::{HDN_ENDDRAG, HDN_ENDTRACKW, HDN_ITEMCLICKW};
+use windows::Win32::UI::Controls::{
+    HDN_DIVIDERDBLCLICKW, HDN_ENDDRAG, HDN_ENDTRACKW, HDN_ITEMCLICKW,
+};
 
 /// Whether `code` is one of the three notifications whose `lParam` really is an `NMHEADERW` with a
 /// `pitem` worth reading. Everything else the control sends shares the `NMHDR` and nothing more.
@@ -113,8 +118,29 @@ pub fn header_ink() -> u32 {
     byte(ink[0]) | (byte(ink[1]) << 8) | (byte(ink[2]) << 16)
 }
 
+/// The width a boundary drag asks for, in cells — or **zero, meaning hide the column**.
+///
+/// §2.5 gave the drawn band two gestures that the control's own drag did not carry over: a
+/// boundary pulled all the way in hides its column, and a double-click on a boundary puts it back.
+/// This is the first of them. A drag that arrives narrower than the gap between columns is a drag
+/// to nothing, and a one-cell column that cannot show a single character is not a narrower column,
+/// it is a column the user is trying to get rid of.
+///
+/// `gap` is `columns::GAP`, the space the layout puts between columns: the item's width includes
+/// it, the model's does not.
+pub fn width_for(px: i32, cell_w: f32, gap: usize) -> usize {
+    let cells = cells_of_px(px, cell_w);
+    if cells <= gap {
+        return 0;
+    }
+    cells - gap
+}
+
 pub fn carries_item(code: u32) -> bool {
-    matches!(code, HDN_ENDTRACKW | HDN_ENDDRAG | HDN_ITEMCLICKW)
+    matches!(
+        code,
+        HDN_ENDTRACKW | HDN_ENDDRAG | HDN_ITEMCLICKW | HDN_DIVIDERDBLCLICKW
+    )
 }
 
 /// Turns a header notification into a [`Request`], or nothing when it is one this does not act on.
@@ -130,6 +156,10 @@ pub fn request_of(code: u32, item: i32, order: i32, width: Option<i32>) -> Optio
             Some(Request::Reorder { from: item, to })
         }
         HDN_ITEMCLICKW => Some(Request::Sort { item }),
+        // **No width is read for this one**, and that is deliberate: `HDN_DIVIDERDBLCLICK` carries
+        // the divider's index and nothing else worth having. `request_from_notify` tolerates a null
+        // `pitem` for exactly this reason.
+        HDN_DIVIDERDBLCLICKW => Some(Request::Reset { item }),
         _ => None,
     }
 }
@@ -282,6 +312,30 @@ impl Header {
             gutter: 0,
             visible: false,
         })
+    }
+
+    /// Re-measures the shell font for `dpi` and gives it to the control.
+    ///
+    /// **A control keeps the font it was created with**, and this window is created on one monitor
+    /// and dragged to another: without this, moving to a 150 % display left every native child
+    /// drawing at 100 % beside a grid that had rescaled. `WM_DPICHANGED` is the moment to ask
+    /// again, and `SystemParametersInfoForDpi` is what makes the answer per-monitor.
+    pub fn set_font(&mut self, dpi: u32) {
+        let font = crate::tabstrip::shell_font_for(dpi);
+        if font.is_invalid() {
+            return;
+        }
+        unsafe {
+            SendMessageW(self.hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+        // The old one goes only after the control has been told about the new one: a GDI object
+        // still selected into a live device context is undefined rather than merely untidy.
+        if !self.font.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
+        self.font = font;
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -538,5 +592,44 @@ mod tests {
         assert_eq!(px_of_cells(14, 10.0), 140);
         assert_eq!(cells_of_px(-5, 10.0), 0, "a negative width is no width");
         assert_eq!(cells_of_px(100, 0.0), 0, "a zero cell divides nothing");
+    }
+
+    /// §2.5's hide: a boundary pulled in past the gap is not a narrower column, it is a column the
+    /// user is getting rid of. The drawn band did this and the control's own drag did not carry it
+    /// over, which is why a column could be squeezed to one useless cell and never removed.
+    #[test]
+    fn a_boundary_pulled_all_the_way_in_hides_the_column() {
+        let cell = 8.0;
+        let gap = tailhawk_core::columns::GAP;
+        assert_eq!(width_for(0, cell, gap), 0);
+        assert_eq!(width_for(4, cell, gap), 0, "half a cell is nothing");
+        assert_eq!(
+            width_for(px_of_cells(gap, cell), cell, gap),
+            0,
+            "the gap alone is nothing"
+        );
+        assert_eq!(
+            width_for(px_of_cells(gap + 1, cell), cell, gap),
+            1,
+            "one cell past the gap is one cell of content"
+        );
+        assert_eq!(width_for(px_of_cells(gap + 12, cell), cell, gap), 12);
+    }
+
+    /// §2.5's way back. **No width is read for this notification**, which is the whole reason it is
+    /// safe to add to `carries_item`: `HDN_DIVIDERDBLCLICK` carries the divider's index and a
+    /// `pitem` that may be null, and `request_from_notify` already tolerates that.
+    #[test]
+    fn a_double_clicked_boundary_asks_for_a_reset() {
+        assert_eq!(
+            request_of(HDN_DIVIDERDBLCLICKW, 3, -1, None),
+            Some(Request::Reset { item: 3 })
+        );
+        assert!(carries_item(HDN_DIVIDERDBLCLICKW));
+        assert_eq!(
+            request_of(HDN_ENDTRACKW, 3, -1, None),
+            None,
+            "a resize with no width is still not a request"
+        );
     }
 }
