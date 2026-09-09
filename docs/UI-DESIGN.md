@@ -870,7 +870,37 @@ toward an access model that mostly does not exist.
 
 ---
 
-## 7. Trace correlation `[v2]`
+## 7. Trace correlation
+
+### 7.1 Follow this trace `[v1]` — built 2026-09-09
+
+`Ctrl+T`, or **Follow this trace** on the row's context menu and in Edit. It reads the `trace_id` the
+caret's line carries and adds it as an include chip, so the view becomes every line of that call —
+across every service the window holds, because the id is the same in all of them.
+
+```
+▼ +d213cb0ae9cc2cc8cab31b9cd15d0854 · 4 of 12
+```
+
+- **A chip, not a new kind of view.** The trace id is a literal that appears in every line of the
+  call, so §5's filtering does the work: the user can add their own chips to it, see it in the panel,
+  and leave it the same way they leave any filter.
+- **The value is checked before it is believed** — hexadecimal, at least eight characters, not all
+  zeroes. `"trace_id":"n/a"` filtered on three characters would keep every line that happened to
+  contain them, which is a filter that looks like it worked.
+- A line with no trace id says so in the status bar rather than doing nothing.
+- Keys read, in order: `trace_id` (OpenTelemetry, on every line of forty live services), `TraceId`
+  and `traceId` (Serilog's spelling, beside it on the .NET ones).
+
+### 7.2 The tree `[v2]` — measured, and deliberately not built
+
+**Not built, by the owner's decision of 2026-09-07**, after the measurements in `LOKI.md` §8: a
+parent id is emitted by eight services of seventy, so an indented tree would infer most of its edges
+from time containment — right for a synchronous fan-out, wrong for anything queued or retried — and
+Grafana and Tempo already draw the real span tree from the same data. His judgement: a span tree is
+not what a tail app is for. The sketch below is kept as the shape it would take if that is ever
+revisited.
+
 
 **Not built in v1.** Clicking an identifier — a GUID, a `traceparent`, a CLEF `@tr`, or any column marked `identifier` —
 opens an inline affordance rather than a dialog:

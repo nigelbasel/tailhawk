@@ -245,6 +245,13 @@ pub fn grid_context(has_selection: bool, detail: bool) -> Vec<tailhawk_core::men
         ),
         Item::separator(),
         Item::command("&Bookmark", "Ctrl+D", command_id(Command::ToggleBookmark)),
+        // §7, rung one: the row's trace becomes a filter. On the row menu because that is where a
+        // person is when they have found the line they want to follow.
+        Item::command(
+            "Follo&w this trace",
+            "Ctrl+T",
+            command_id(Command::FollowTrace),
+        ),
         Item::check(
             "&Record detail",
             "Ctrl+Enter",
@@ -416,6 +423,10 @@ pub fn menu_bar(
                 ),
                 Item::separator(),
                 on(cmd("&Bookmark", "Ctrl+D", Command::ToggleBookmark), open),
+                on(
+                    cmd("Follo&w this trace", "Ctrl+T", Command::FollowTrace),
+                    open,
+                ),
                 on(cmd("Next book&mark", "F2", Command::NextBookmark), open),
                 on(
                     cmd("Previous bookmar&k", "Shift+F2", Command::PreviousBookmark),

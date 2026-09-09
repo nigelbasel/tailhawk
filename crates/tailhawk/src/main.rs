@@ -102,8 +102,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_C, VK_CONTROL, VK_D,
     VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G, VK_HOME, VK_I, VK_L,
-    VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB,
-    VK_UP, VK_W,
+    VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_T,
+    VK_TAB, VK_UP, VK_W,
 };
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::Shell::{
@@ -1801,6 +1801,30 @@ impl Document {
         self.view.grid_mut().scroll_to_row(state.row);
     }
 
+    /// §7's *follow this trace*: filter the view to the trace the caret's line belongs to.
+    ///
+    /// **A chip, not a new kind of view.** The trace id is a literal that appears in every line of
+    /// that call, so the filtering already built does the work — and the result is a view the user
+    /// can then add their own chips to, clear with the panel they already know, and get out of the
+    /// same way they got out of any other filter. Building a second filtering path for this would
+    /// have been a second set of bugs.
+    ///
+    /// Reports what to say when there is nothing to follow: a line with no trace id is the common
+    /// case for a plain text log, and silence would look like a command that did nothing.
+    fn follow_trace(&mut self) -> Option<String> {
+        let row = self.caret_row()?;
+        let file_row = self.filtering.file_row(row)?;
+        let line = self.set.row_text(file_row)?;
+        match tailhawk_core::trace::trace_id(line) {
+            Some(id) => {
+                let id = id.to_owned();
+                self.add_chip(&id, Polarity::Include);
+                Some(format!("Following trace {id}"))
+            }
+            None => Some("That line carries no trace id.".to_owned()),
+        }
+    }
+
     /// Adds a chip and starts the pass over. A chip that does not parse is held in the title, as a
     /// bad pattern is; the chips already there stand.
     fn add_chip(&mut self, text: &str, polarity: Polarity) {
@@ -3333,6 +3357,8 @@ enum Command {
     ResetColumns,
     /// §2.3: show or hide the toolbar row.
     ToggleToolbar,
+    /// §7: filter the view to the trace the caret's line belongs to.
+    FollowTrace,
     /// §2.3: the toolbar's icons in the larger of the two sizes a Windows toolbar offers.
     ToolbarLargeIcons,
     /// §2.3: and back to the smaller. Two commands rather than one toggle, because a pair of
@@ -3444,6 +3470,7 @@ impl Command {
             "",
         ),
         (Command::ToggleToolbar, "Show or hide the toolbar", ""),
+        (Command::FollowTrace, "Follow this trace", "Ctrl+T"),
         (Command::ToolbarLargeIcons, "Large toolbar icons", ""),
         (Command::ToolbarSmallIcons, "Small toolbar icons", ""),
         (Command::EditSources, "Remote sources…", ""),
@@ -5267,6 +5294,17 @@ impl Shell {
             }
             return true;
         }
+        if key == VK_T.0 {
+            // §7: follow the caret line's trace. The notice says which, or says there is none.
+            if let Some(said) = doc.follow_trace() {
+                self.notice = Some(said);
+            }
+            self.retitle(hwnd);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return true;
+        }
         if key == VK_E.0 && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 {
             return self.run(hwnd, Command::EditLastChip);
         }
@@ -6324,6 +6362,12 @@ impl Shell {
             }
             Command::ToggleBookmark => {
                 doc.toggle_bookmark();
+            }
+            // §7, rung one, and the only rung the owner wanted: the trace becomes a filter.
+            Command::FollowTrace => {
+                if let Some(said) = doc.follow_trace() {
+                    self.notice = Some(said);
+                }
             }
             Command::NextBookmark | Command::PreviousBookmark => {
                 doc.bookmark_step(command == Command::NextBookmark);

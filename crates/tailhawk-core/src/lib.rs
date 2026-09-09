@@ -45,6 +45,7 @@ pub mod settings;
 pub mod sourceset;
 pub mod template;
 pub mod theme;
+pub mod trace;
 pub mod view;
 pub mod widget;
 pub mod wizard;
