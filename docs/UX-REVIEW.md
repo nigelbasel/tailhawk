@@ -33,10 +33,10 @@ behaves, that is said in the finding rather than glossed.
 | 2 | Menu bar | **Fixed 2026-09-09** | `Preferences…` carries an ellipsis it should not have. |
 | 3 | Context menu | **Fixed 2026-09-09** | The row context menu prints shortcut keys. Context menus never do. |
 | 4 | Edit menu | **Part fixed** | No `Select all`; `Go to line` is under View where the standard puts it in Edit. |
-| 5 | Toolbar | **Fails** | No `Open remote source` button, though it is among the most used commands. |
-| 6 | Toolbar | **Fails** | `Collapse`'s icon is not self-explanatory — the owner could not tell what it was. |
-| 7 | Toolbar | **Partly** | Right-clicking the toolbar does nothing; a toolbar with options owes a context menu. |
-| 8 | Column header | **Fails** | No way to choose columns. The guide names the exact remedy. |
+| 5 | Toolbar | **Fixed 2026-09-09** | No `Open remote source` button, though it is among the most used commands. |
+| 6 | Toolbar | **Tooltip fixed** | `Collapse`'s icon is not self-explanatory — the owner could not tell what it was. |
+| 7 | Toolbar | **Fixed 2026-09-09** | Right-clicking the toolbar does nothing; a toolbar with options owes a context menu. |
+| 8 | Column header | **Fixed 2026-09-09** | No way to choose columns. The guide names the exact remedy. |
 | 9 | Applications picker | **Fixed 2026-09-09** | Commit buttons are spread across the bottom instead of right-aligned in one row. |
 | 10 | Highlight rules | **Fixed 2026-09-09** | Commit buttons are not right-aligned; `Close` carries an access key it should not have. |
 | 11 | Highlight rules | **Done as asked** | Modeless by §5's design; the owner wants modal with Save/Cancel. |
@@ -492,3 +492,24 @@ itself, mapping the point through `HDM_HITTEST`.
 | 86 | Native controls and D3D-drawn chrome (font selection) | The guidelines for making text accessible to users with disabilities or impairments can be boiled down to one simple rule: Respect the user's settings… | tabstrip.rs:542-581 — shell_font_for(dpi) reads SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, …) and creates from metrics.lfMessageFont; shell_font() is the same query at system DPI and is the d… | No change. Worth recording because it is the exact mechanism the colour half is missing — the same handler re-reads fonts and does not re-read the High Contrast palette — and because the dialog templa… | small |
 | 87 | Filter panel chip marks | The best solution to the color interpretation and accessibility problems is to use color to visually reinforce the meaning of one of these primary met… | A chip's two states are text before they are colour. FilterRow carries mark: if chip.enabled { "[x]" } else { "[ ]" } and sign: '+' / '−' (filterpanel.rs:31-35), both asserted in a_rows_mark_sign_and_… | No change. Recorded because the reinforcing-rather-than-carrying pattern here is the one the severity glyph, the colour labels and the search highlight should copy. | small |
 | 88 | Applications picker — main instruction | Express the main instruction in the form of an imperative direction or specific question. … Good main instructions communicate the user's objective ra… | dialog.rs:954 — the dialog opens with "Which applications should this source show?" above the list at :960. A specific question, in the user's terms, with the question mark the Punctuation section req… | No change. Use it as the pattern when adding main instructions to Remote sources, Define Format and Import Layout. | small |
+
+---
+
+## What has been done since part two was written
+
+**Still 2026-09-09.**
+
+- **5, 7 — the toolbar.** `Open remote` is a menu button dropping the configured sources, and the
+  bar answers a right-click with Show toolbar / Small icons / Large icons. `Follow this trace` got a
+  button too, which the owner asked for by name: *"secret handshakes are not good."*
+- **6 — `Collapse`.** The tooltip says `Collapse continuation lines`. The guide's own remedy for an
+  icon that does not explain itself is a label, and the owner chose an icons-only bar on 2026-09-08,
+  so the name lives in the tip and the menu instead. Recorded as his decision, not an oversight.
+- **8 — the column chooser exists**, on Format ▸ Select columns… and on the header's context menu,
+  which is where the *List Views* page asks for it. Ticks show and hide, `Move up` / `Move down`
+  reorder, and the message column's tick cannot be cleared. **Dragging a boundary to nothing no
+  longer hides a column** — the owner: *"this is a non standard way to show and hide columns, and so
+  should not be used"* — it leaves one cell, and hiding is the tick box now.
+- **Part two's first and third defects are fixed**: `Ctrl+H` became `Ctrl+K` and is bound, `F1`
+  opens the keyboard map, and the header's context menu can be opened at all. Its keyboard half is
+  not done: `Shift+F10` still resolves to the grid, because focus never reaches the header.
