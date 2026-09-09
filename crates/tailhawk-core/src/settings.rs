@@ -18,7 +18,8 @@
 //! - `[appearance]` — `theme`: `dark`, `light` or `system`, when chosen.
 //! - `[window]` — `x`, `y`, `width`, `height`, `maximized`: where the window was.
 //! - `[[file]]` — `path`, `chips` (each `+text` or `-text`), `collapse`, `bookmarks` (file rows),
-//!   `labels` (each `n:text`), `columns` (widths in cells), `filters_hidden`: what a file was being
+//!   `labels` (each `n:text`), `columns` (widths in cells, zero meaning hidden), `column_order`
+//!   (display order before the message), `filters_hidden`: what a file was being
 //!   looked at through, so opening it again shows the same view. Keyed by **path**; §12.4 says
 //!   file identity, which survives a rename where a path does not, and that upgrade is recorded
 //!   rather than done.
@@ -50,7 +51,17 @@ pub struct FileState {
     /// The colour labels, each `n:text` — the digit key and the literal it marks.
     pub labels: Vec<String>,
     /// Column widths in cells after the user resized them; empty means the measured widths.
+    /// **A width of zero is a hidden column**, which is what the chooser writes for an unticked
+    /// one.
     pub columns: Vec<u64>,
+    /// The display order of the columns before the message, after the user reordered them — a
+    /// header drag or the column chooser. Empty means the natural order.
+    ///
+    /// **Separate from the widths, and written even when the widths are the measured ones.** A
+    /// visit to the chooser that only moves a column changed nothing about width, so a state that
+    /// carried order inside `columns` would have thrown the move away — which is exactly what
+    /// happened to every header drag before this field existed.
+    pub column_order: Vec<u64>,
     /// §2.1's filter panel, when the user closed it on a file that has filters.
     ///
     /// **Stored the negative way round on purpose.** A settings file written before this field
@@ -206,6 +217,9 @@ impl Settings {
             || !state.bookmarks.is_empty()
             || !state.labels.is_empty()
             || !state.columns.is_empty()
+            // A reordered layout is worth remembering even when every width is the measured one:
+            // that is precisely the state a visit to the column chooser leaves behind.
+            || !state.column_order.is_empty()
         {
             self.files.push(state);
         }
@@ -364,6 +378,10 @@ impl Settings {
                 let cols: Vec<String> = f.columns.iter().map(u64::to_string).collect();
                 out.push_str(&format!("columns = [{}]\n", cols.join(", ")));
             }
+            if !f.column_order.is_empty() {
+                let order: Vec<String> = f.column_order.iter().map(u64::to_string).collect();
+                out.push_str(&format!("column_order = [{}]\n", order.join(", ")));
+            }
         }
         out
     }
@@ -506,6 +524,10 @@ impl Settings {
                             "labels" => f.labels = array(value),
                             "columns" => {
                                 f.columns =
+                                    array(value).iter().filter_map(|v| v.parse().ok()).collect()
+                            }
+                            "column_order" => {
+                                f.column_order =
                                     array(value).iter().filter_map(|v| v.parse().ok()).collect()
                             }
                             _ => {}
@@ -791,6 +813,7 @@ mod tests {
             bookmarks: vec![0, 42, 1_000_000],
             labels: vec!["1:Exception".to_owned(), "9:a \"quoted\" one".to_owned()],
             columns: vec![19, 5, 0],
+            column_order: Vec::new(),
             filters_hidden: false,
         });
         s.set_file(FileState {
@@ -800,6 +823,7 @@ mod tests {
             bookmarks: Vec::new(),
             labels: Vec::new(),
             columns: Vec::new(),
+            column_order: Vec::new(),
             filters_hidden: false,
         });
         s
@@ -861,6 +885,29 @@ mod tests {
         assert_eq!(Settings::from_toml(&text), s);
     }
 
+    /// **A reorder used to be thrown away**, and the shape of the bug is worth pinning: the widths
+    /// were written only when they differed from the measured ones, so a visit to the column
+    /// chooser that moved a column and resized nothing wrote no state at all. The order is its own
+    /// key for that reason, and it survives on its own.
+    #[test]
+    fn a_column_order_survives_on_its_own_with_the_measured_widths() {
+        let mut s = Settings::default();
+        s.set_file(FileState {
+            path: r"C:\logs\app.log".to_owned(),
+            column_order: vec![2, 0, 1],
+            ..FileState::default()
+        });
+        let text = s.to_toml();
+        assert!(text.contains("column_order = [2, 0, 1]"), "{text}");
+        assert!(!text.contains("columns = ["), "no widths to write: {text}");
+        let back = Settings::from_toml(&text);
+        assert_eq!(
+            back.file(r"C:\logs\app.log")
+                .map(|f| f.column_order.clone()),
+            Some(vec![2, 0, 1])
+        );
+    }
+
     #[test]
     fn a_file_with_nothing_to_say_is_forgotten_and_a_replaced_one_replaced() {
         let mut s = sample();
@@ -871,6 +918,7 @@ mod tests {
             bookmarks: Vec::new(),
             labels: Vec::new(),
             columns: Vec::new(),
+            column_order: Vec::new(),
             filters_hidden: false,
         });
         assert!(s.file(r"C:\logs\app.log").is_none());
@@ -881,6 +929,7 @@ mod tests {
             bookmarks: Vec::new(),
             labels: Vec::new(),
             columns: Vec::new(),
+            column_order: Vec::new(),
             filters_hidden: false,
         });
         assert_eq!(s.files.len(), 1, "case-insensitive path replaces");
@@ -1100,6 +1149,7 @@ mod tests {
             bookmarks: Vec::new(),
             labels: Vec::new(),
             columns: Vec::new(),
+            column_order: Vec::new(),
             filters_hidden: false,
         });
         std::fs::create_dir_all(tiers[1].parent().unwrap()).unwrap();
@@ -1115,6 +1165,7 @@ mod tests {
             bookmarks: Vec::new(),
             labels: Vec::new(),
             columns: Vec::new(),
+            column_order: Vec::new(),
             filters_hidden: false,
         });
         curated.set_file(FileState {
@@ -1124,6 +1175,7 @@ mod tests {
             bookmarks: Vec::new(),
             labels: Vec::new(),
             columns: Vec::new(),
+            column_order: Vec::new(),
             filters_hidden: false,
         });
         std::fs::write(&tiers[0], curated.to_toml()).unwrap();

@@ -221,6 +221,10 @@ pub fn header_context(
         Item::separator(),
         Item::command(&format!("&Filter on {title}…"), "", ID_CTX_FILTER_COLUMN),
         Item::separator(),
+        // The column chooser, on the menu the *List Views* page says to put it on: "provide a
+        // column chooser on the column header context menu". It is where a person is when they
+        // are thinking about columns.
+        Item::command("&Select columns…", "", command_id(Command::SelectColumns)),
         Item::command("&Reset columns", "", command_id(Command::ResetColumns)),
     ]
 }
@@ -609,6 +613,7 @@ pub fn menu_bar(
                 on(cmd("&Define from a line…", "", Command::DefineFormat), open),
                 on(cmd("&Import layout…", "", Command::ImportLayout), open),
                 Item::separator(),
+                on(cmd("Select &columns…", "", Command::SelectColumns), columns),
                 on(cmd("&Reset columns", "", Command::ResetColumns), columns),
                 on(cmd("Clear &sort", "", Command::ClearSort), columns),
             ],

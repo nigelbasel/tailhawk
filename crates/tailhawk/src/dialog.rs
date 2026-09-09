@@ -1087,6 +1087,239 @@ fn apps_count(hdlg: HWND, data: &AppsPick) {
     set_dlg_text(hdlg, ID_A_COUNT, &text);
 }
 
+const ID_C_LIST: u16 = 250;
+const ID_C_UP: u16 = 251;
+const ID_C_DOWN: u16 = 252;
+
+/// What the column chooser is handed and hands back: the rows as the dialog last had them, and
+/// whether the user committed. [`crate::chooser::apply`] is what turns them into a layout.
+pub struct ColumnsPick {
+    pub rows: Vec<crate::chooser::ColumnRow>,
+    pub accepted: bool,
+}
+
+/// The chooser's layout — Explorer's *Choose details* is the shape being followed: a checkbox list
+/// of every column, `Move up` / `Move down` beside it, and the commit row right-aligned beneath.
+fn columns_dialog_items() -> Vec<Item> {
+    vec![
+        Item::new(
+            Class::Static,
+            "Select the columns to show, in the order to show them:",
+            0xFFFF,
+            (7, 7, 300, 9),
+            0,
+        ),
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_C_LIST,
+            (7, 20, 220, 150),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        Item::new(
+            Class::Button,
+            "Move &up",
+            ID_C_UP,
+            (233, 20, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "Move &down",
+            ID_C_DOWN,
+            (233, 38, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "OK",
+            1,
+            (177, 178, 56, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(Class::Button, "Cancel", 2, (237, 178, 56, 14), WS_TABSTOP),
+    ]
+}
+
+thread_local! {
+    /// The chooser's own version of `APPS_QUIET` — see it for why this exists. Filling the list
+    /// raises `LVN_ITEMCHANGED` once a row, synchronously, and each of those would otherwise read
+    /// the ticks back out of a list that is only half filled.
+    static COLUMNS_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn columns_quietly<R>(write: impl FnOnce() -> R) -> R {
+    COLUMNS_QUIET.with(|q| q.set(true));
+    let out = write();
+    COLUMNS_QUIET.with(|q| q.set(false));
+    out
+}
+
+/// Fills the list from the rows, keeping `select` selected — the row that just moved, so a person
+/// clicking `Move up` twice moves one column twice rather than two columns once each.
+fn columns_fill(hdlg: HWND, rows: &[crate::chooser::ColumnRow], select: Option<usize>) {
+    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_C_LIST)) }) else {
+        return;
+    };
+    columns_quietly(|| {
+        lv_reset(list);
+        lv_column(list, 0, "Column", 190);
+        for (at, row) in rows.iter().enumerate() {
+            lv_row(list, at as i32, std::slice::from_ref(&row.title));
+            lv_check(list, at as i32, row.shown);
+        }
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_SETCOLUMNWIDTH,
+                WPARAM(0),
+                LPARAM(LVSCW_AUTOSIZE_USEHEADER),
+            );
+        }
+        if let Some(at) = select {
+            lv_select(list, at);
+        }
+    });
+}
+
+/// Reads the ticks back, and **puts the message column's tick straight back** if it was cleared.
+///
+/// The tick cannot simply be refused: a list view's check boxes have no disabled state, so the way
+/// to say "not this one" is to let the click happen and undo it. The row is still in the list,
+/// still ticked, and the user learns the column is not optional.
+fn columns_read(hdlg: HWND, data: &mut ColumnsPick) {
+    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_C_LIST)) }) else {
+        return;
+    };
+    let items = unsafe { SendMessageW(list, LVM_GETITEMCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
+    for at in 0..items.min(data.rows.len()) {
+        let ticked = lv_checked(list, at as i32);
+        if data.rows[at].locked {
+            if !ticked {
+                columns_quietly(|| lv_check(list, at as i32, true));
+            }
+            continue;
+        }
+        data.rows[at].shown = ticked;
+    }
+}
+
+unsafe extern "system" fn columns_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            // Copied out before the fill, for the aliasing reason `APPS_QUIET` documents: the fill
+            // re-enters this procedure once per row.
+            let rows: Vec<crate::chooser::ColumnRow> = {
+                let data = unsafe { &*(lparam.0 as *const ColumnsPick) };
+                data.rows.clone()
+            };
+            if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_C_LIST)) } {
+                unsafe {
+                    SendMessageW(
+                        list,
+                        LVM_SETEXTENDEDLISTVIEWSTYLE,
+                        WPARAM(0),
+                        LPARAM((LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT) as isize),
+                    );
+                }
+            }
+            columns_fill(hdlg, &rows, Some(0));
+            1
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == usize::from(ID_C_LIST)
+                && header.code == LVN_ITEMCHANGED
+                && !COLUMNS_QUIET.with(|q| q.get())
+            {
+                if let Some(data) = columns_state(hdlg) {
+                    let data = unsafe { &mut *data };
+                    columns_read(hdlg, data);
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let Some(data) = columns_state(hdlg) else {
+                return 0;
+            };
+            let data = unsafe { &mut *data };
+            match id {
+                ID_C_UP | ID_C_DOWN => {
+                    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_C_LIST)) }) else {
+                        return 1;
+                    };
+                    // The ticks are read first: a click on `Move up` after a tick change that this
+                    // procedure has not seen would otherwise move the row and lose the tick.
+                    columns_read(hdlg, data);
+                    let Some(at) = lv_selected(list) else {
+                        return 1;
+                    };
+                    if let Some(to) = crate::chooser::move_row(&mut data.rows, at, id == ID_C_UP) {
+                        let rows = data.rows.clone();
+                        columns_fill(hdlg, &rows, Some(to));
+                    }
+                    1
+                }
+                1 => {
+                    columns_read(hdlg, data);
+                    data.accepted = true;
+                    unsafe {
+                        let _ = EndDialog(hdlg, 1);
+                    }
+                    1
+                }
+                2 => {
+                    data.accepted = false;
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = EndDialog(hdlg, 0);
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+fn columns_state(hdlg: HWND) -> Option<*mut ColumnsPick> {
+    let ptr =
+        unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) } as *mut ColumnsPick;
+    (!ptr.is_null()).then_some(ptr)
+}
+
+/// The owner's ask of 2026-09-09: *"this is a non standard way to show and hide columns … a select
+/// columns dialog would be better"*. Reports whether the user committed.
+pub fn show_columns_dialog(hwnd: HWND, data: &mut ColumnsPick) -> bool {
+    let t = template("Select Columns", 300, 199, &columns_dialog_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            hwnd,
+            Some(columns_proc),
+            LPARAM(data as *mut ColumnsPick as isize),
+        )
+    };
+    data.accepted
+}
+
 unsafe extern "system" fn apps_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
     match msg {
         WM_INITDIALOG => {
@@ -4391,6 +4624,7 @@ mod tests {
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
             ("Applications", apps_dialog_items()),
+            ("Select Columns", columns_dialog_items()),
         ] {
             let mut seen = Vec::new();
             for item in &items {
@@ -4493,6 +4727,7 @@ mod tests {
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
             ("Applications", apps_dialog_items()),
+            ("Select Columns", columns_dialog_items()),
         ] {
             let t = template("x", 100, 100, &items);
             // Walk the template the way Windows does: header, then aligned items.

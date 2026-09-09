@@ -118,22 +118,18 @@ pub fn header_ink() -> u32 {
     byte(ink[0]) | (byte(ink[1]) << 8) | (byte(ink[2]) << 16)
 }
 
-/// The width a boundary drag asks for, in cells — or **zero, meaning hide the column**.
+/// The width a boundary drag asks for, in cells — **never zero**.
 ///
-/// §2.5 gave the drawn band two gestures that the control's own drag did not carry over: a
-/// boundary pulled all the way in hides its column, and a double-click on a boundary puts it back.
-/// This is the first of them. A drag that arrives narrower than the gap between columns is a drag
-/// to nothing, and a one-cell column that cannot show a single character is not a narrower column,
-/// it is a column the user is trying to get rid of.
+/// **Dragging a column to nothing used to hide it, and does not any more.** The owner, 2026-09-09:
+/// *"this is a non standard way to show and hide columns, and so should not be used"* — and he is
+/// right that no Windows list does it. A column is hidden by clearing its tick in
+/// [`crate::chooser`]'s dialog now, which is where Explorer keeps the same decision; a drag that
+/// arrives narrower than the gap leaves one cell, so the column is still there to drag back.
 ///
 /// `gap` is `columns::GAP`, the space the layout puts between columns: the item's width includes
 /// it, the model's does not.
 pub fn width_for(px: i32, cell_w: f32, gap: usize) -> usize {
-    let cells = cells_of_px(px, cell_w);
-    if cells <= gap {
-        return 0;
-    }
-    cells - gap
+    cells_of_px(px, cell_w).saturating_sub(gap).max(1)
 }
 
 pub fn carries_item(code: u32) -> bool {
@@ -666,20 +662,17 @@ mod tests {
         assert_eq!(cells_of_px(100, 0.0), 0, "a zero cell divides nothing");
     }
 
-    /// §2.5's hide: a boundary pulled in past the gap is not a narrower column, it is a column the
-    /// user is getting rid of. The drawn band did this and the control's own drag did not carry it
-    /// over, which is why a column could be squeezed to one useless cell and never removed.
+    /// **A drag never hides a column any more.** It used to: a boundary pulled in past the gap
+    /// took the column out of the layout, which is the "non standard way to show and hide columns"
+    /// the owner asked to be rid of on 2026-09-09. Hiding is the chooser's tick box now, and the
+    /// narrowest a drag can leave a column is one cell — still there, still draggable back.
     #[test]
-    fn a_boundary_pulled_all_the_way_in_hides_the_column() {
+    fn a_boundary_pulled_all_the_way_in_leaves_a_column_rather_than_hiding_it() {
         let cell = 8.0;
         let gap = tailhawk_core::columns::GAP;
-        assert_eq!(width_for(0, cell, gap), 0);
-        assert_eq!(width_for(4, cell, gap), 0, "half a cell is nothing");
-        assert_eq!(
-            width_for(px_of_cells(gap, cell), cell, gap),
-            0,
-            "the gap alone is nothing"
-        );
+        assert_eq!(width_for(0, cell, gap), 1, "never nothing");
+        assert_eq!(width_for(4, cell, gap), 1);
+        assert_eq!(width_for(px_of_cells(gap, cell), cell, gap), 1);
         assert_eq!(
             width_for(px_of_cells(gap + 1, cell), cell, gap),
             1,

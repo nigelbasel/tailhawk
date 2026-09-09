@@ -15,8 +15,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod about;
+mod chooser;
 mod controls;
 mod darkmode;
+/// The detail window. **Nothing calls it yet** — the pure half is written and tested and the
+/// window's own wiring is the next slice, so the unused warnings are suppressed here, at the
+/// declaration, the way `net` did while its transport waited for a caller.
+#[allow(dead_code)]
+mod detailwin;
 mod dialog;
 mod filterpanel;
 mod header;
@@ -1275,6 +1281,15 @@ impl Document {
                 }
                 _ => Vec::new(),
             },
+            // Written whenever the order is not the natural one, and independently of the widths:
+            // a visit to the chooser that only moves a column touches no width at all, and the
+            // move used to be thrown away for exactly that reason.
+            column_order: match &self.layout {
+                Some(layout) if layout.shown_order() != natural_order(layout.widths.len()) => {
+                    layout.shown_order().iter().map(|&c| c as u64).collect()
+                }
+                _ => Vec::new(),
+            },
             filters_hidden: !self.show_filters,
         })
     }
@@ -1307,6 +1322,21 @@ impl Document {
             if let Some(layout) = self.layout.as_mut() {
                 if state.columns.len() == layout.widths.len() {
                     layout.widths = state.columns.iter().map(|&w| w as usize).collect();
+                    self.header = Some(layout.header());
+                }
+            }
+        }
+        // **The order, restored the same way and guarded the same way.** A file remembered against
+        // one format and reopened under another has a different number of columns, and an order
+        // from the old one would name columns that are not there — `shown_order` would refuse it
+        // and fall back silently, which reads as the reorder having been forgotten. Checking the
+        // length here means it is either honoured or plainly not applied.
+        if !state.column_order.is_empty() {
+            if let Some(layout) = self.layout.as_mut() {
+                let order: Vec<usize> = state.column_order.iter().map(|&c| c as usize).collect();
+                let n = layout.widths.len().saturating_sub(1);
+                if order.len() == n && (0..n).all(|c| order.contains(&c)) {
+                    layout.order = order;
                     self.header = Some(layout.header());
                 }
             }
@@ -2517,7 +2547,7 @@ impl Document {
     }
 
     /// Starts resizing column `i` from a press at `x`. The width follows the mouse until the
-    /// button goes up; `0` hides the column.
+    /// button goes up, and stops at one cell: hiding is [`crate::chooser`]'s job now.
     fn begin_resize(&mut self, i: usize) {
         self.resizing = Some(i);
     }
@@ -2542,10 +2572,20 @@ impl Document {
         self.set_column_width(i, width)
     }
 
+    /// Sets a column's width in cells, **never to nothing**.
+    ///
+    /// **The clamp is here because there are two ways in.** The native header's drag arrives
+    /// through `header::width_for` and the drawn band's through [`Document::resize_to`], and when
+    /// the hide was taken out of the first the second could still land on zero — with
+    /// `TAILHAWK_NO_HEADER=1`, or on a machine where the control failed to create. A column hidden
+    /// by a drag is the gesture the owner called "a non standard way to show and hide columns" on
+    /// 2026-09-09; [`crate::chooser`]'s tick box is what hides one now, and this is the one place
+    /// that has to know it.
     fn set_column_width(&mut self, i: usize, width: usize) -> bool {
         let Some(layout) = self.layout.as_mut() else {
             return false;
         };
+        let width = width.max(1);
         if i + 1 >= layout.widths.len() || layout.widths[i] == width {
             return false;
         }
@@ -2559,7 +2599,7 @@ impl Document {
     }
 
     /// One column back to the width it was measured at — §2.5's double-click on a boundary, and
-    /// the way back from a column dragged to nothing.
+    /// the way back from a column dragged down to one cell.
     fn reset_column(&mut self, column: usize) -> bool {
         let Some(defaults) = self.column_defaults.clone() else {
             return false;
@@ -2946,6 +2986,15 @@ impl Finder {
 ///
 /// `file` keeps the job it is genuinely carrying: what to say when a document failed to open and
 /// there is therefore nothing to describe.
+/// `0, 1, … n-2` — the display order of a layout whose columns have never been moved.
+///
+/// The comparison is what keeps `column_order` out of the settings file for the overwhelming
+/// majority of files: `Layout::shown_order` answers the natural order for a layout with no order of
+/// its own, and writing that back would put a line in the file for every log ever opened.
+fn natural_order(columns: usize) -> Vec<usize> {
+    (0..columns.saturating_sub(1)).collect()
+}
+
 fn status_line(
     driver: Option<&str>,
     described: Option<&str>,
@@ -3410,6 +3459,10 @@ enum Command {
     ToggleTheme,
     EditLastChip,
     ResetColumns,
+    /// The column chooser — which columns are shown and in what order, as a dialog rather than as
+    /// a drag that made a column vanish. The owner, 2026-09-09: "a select columns dialog would be
+    /// better".
+    SelectColumns,
     /// §2.3: show or hide the toolbar row.
     ToggleToolbar,
     /// §7: filter the view to the trace the caret's line belongs to.
@@ -3521,9 +3574,10 @@ impl Command {
         ),
         (
             Command::ResetColumns,
-            "Reset column widths (drag a header boundary to resize; to 0 hides)",
+            "Reset column widths (drag a header boundary to resize)",
             "",
         ),
+        (Command::SelectColumns, "Select columns…", ""),
         (Command::ToggleToolbar, "Show or hide the toolbar", ""),
         (Command::FollowTrace, "Follow this trace", "Ctrl+T"),
         (Command::ToolbarLargeIcons, "Large toolbar icons", ""),
@@ -4268,6 +4322,8 @@ struct Shell {
     pending_format: bool,
     /// Format ▸ Import layout asks for §6.3's dialog, the same way.
     pending_import: bool,
+    /// Format ▸ Select columns asks for the chooser, the same way.
+    pending_columns: bool,
     /// §5's rules editor asks for its dialog. Deferred like the others and for a sharper reason:
     /// `CreateDialogIndirectParamW` runs `WM_INITDIALOG` before it returns, and that reads the
     /// editor through [`rules_read`] — so a `STATE` borrow alive across the call is a re-entrant
@@ -4580,6 +4636,7 @@ impl Shell {
                             bookmarks: Vec::new(),
                             labels: Vec::new(),
                             columns: Vec::new(),
+                            column_order: Vec::new(),
                             filters_hidden: false,
                         });
                     }
@@ -6324,6 +6381,13 @@ impl Shell {
                 self.pending_sources = true;
                 return true;
             }
+            Command::SelectColumns => {
+                self.pending_columns = self
+                    .document
+                    .as_ref()
+                    .is_some_and(|doc| doc.layout.is_some());
+                return self.pending_columns;
+            }
             Command::EditRules => {
                 self.pending_rules = true;
                 return true;
@@ -6396,6 +6460,9 @@ impl Shell {
             Command::ResetColumns => {
                 doc.reset_columns();
             }
+            // Handled above, where the shell rather than the document is in hand: the chooser is a
+            // modal dialog and so is deferred, like every other one here.
+            Command::SelectColumns => {}
             Command::SortBy(column, descending) => {
                 doc.sort_by(sort::Order {
                     column,
@@ -8661,6 +8728,57 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         }
         return true;
     }
+    // The column chooser. Everything it needs is read out first and the answer applied afterwards,
+    // because the dialog pumps its own loop — the rule every modal surface in this file follows.
+    let columns = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_columns))
+    });
+    if columns {
+        let start = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.document.as_ref())
+                .and_then(|doc| doc.layout.as_ref())
+                .map(chooser::rows_of)
+        });
+        if let Some(rows) = start {
+            let mut pick = dialog::ColumnsPick {
+                rows,
+                accepted: false,
+            };
+            if dialog::show_columns_dialog(hwnd, &mut pick) {
+                let was = IN_WNDPROC.with(|flag| flag.replace(true));
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        let defaults = shell
+                            .document
+                            .as_ref()
+                            .and_then(|doc| doc.column_defaults.clone())
+                            .unwrap_or_default();
+                        if let Some(doc) = shell.document.as_mut() {
+                            let changed = doc
+                                .layout
+                                .as_mut()
+                                .is_some_and(|l| chooser::apply(l, &defaults, &pick.rows));
+                            if changed {
+                                // The header line the grid draws its columns from is derived from
+                                // the layout, exactly as `reset_columns` rebuilds it.
+                                doc.header = doc.layout.as_ref().map(|l| l.header());
+                            }
+                        }
+                        shell.retitle(hwnd);
+                    }
+                });
+                IN_WNDPROC.with(|flag| flag.set(was));
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+        }
+        return true;
+    }
     let format = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
@@ -10356,8 +10474,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 };
                                 // The item is the box, gap included; the model holds the content.
                                 let gap = tailhawk_core::columns::GAP;
-                                // §2.5: a boundary pulled all the way in hides the column, which
-                                // the drawn band did and the control's own drag did not carry over.
+                                // §2.5 had a boundary pulled all the way in hide the column. It
+                                // does not any more — see `set_column_width`, which is where the
+                                // one-cell floor lives now that two paths reach it.
                                 let cells = header::width_for(px, cell_w, gap);
                                 let changed = doc.set_column_width(b.column, cells);
                                 if let Some(ctl) = doc.header_ctl.as_ref() {
@@ -10366,7 +10485,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 changed
                             }
                             // §2.5's way back: double-clicking a boundary puts that column at the
-                            // width it was measured at, hidden or merely narrow.
+                            // width it was measured at, however narrow it was dragged.
                             header::Request::Reset { item } => {
                                 let Some(b) = header::item_to_box(item)
                                     .filter(|b| *b < last)
@@ -10978,6 +11097,7 @@ fn main() -> Result<()> {
             pending_filter: None,
             pending_filter_edit: None,
             pending_format: false,
+            pending_columns: false,
             pending_import: false,
             pending_goto: false,
             pending_rules: false,
@@ -12429,7 +12549,17 @@ mod tests {
             "every column, in order, nothing hidden"
         );
 
-        assert!(doc.set_column_width(0, 0), "hide column 0");
+        // Hidden by the chooser, which is the only thing that hides a column now.
+        {
+            let layout = doc.layout.as_mut().expect("a layout");
+            let defaults = layout.widths.clone();
+            let mut rows = crate::chooser::rows_of(layout);
+            rows[0].shown = false;
+            assert!(
+                crate::chooser::apply(layout, &defaults, &rows),
+                "hide column 0"
+            );
+        }
         doc.lay_out((8.0, 10.0), (800, 300));
         let shown: Vec<usize> = doc.header_columns().iter().map(|b| b.column).collect();
         let mut expected: Vec<usize> = (0..n).collect();
@@ -12447,10 +12577,10 @@ mod tests {
     }
 
     /// §2.1's resizable columns: a boundary sits after each shown column; a press on one and a
-    /// drag sets that column's width from the mouse; zero hides it and the boundaries close up;
-    /// reset brings the measured widths back; the header follows every change.
+    /// drag sets that column's width from the mouse, stopping at one cell; the chooser is what
+    /// hides one; reset brings the measured widths back; the header follows every change.
     #[test]
-    fn column_boundaries_resize_hide_and_reset() {
+    fn column_boundaries_resize_and_reset_but_never_hide() {
         let path = std::env::temp_dir().join("tailhawk_columns_test.log");
         std::fs::write(
             &path,
@@ -12500,8 +12630,37 @@ mod tests {
             "the header shrank with it"
         );
 
-        // To zero: hidden, and the boundary list closes up.
-        assert!(doc.set_column_width(0, 0));
+        // **A drag cannot hide a column any more**, whichever path it comes down: the clamp is in
+        // `set_column_width`, so the drawn band's `resize_to` and the control's `width_for` both
+        // stop at one cell. Hiding is the chooser's tick box — `chooser::apply` — and this asserts
+        // the gesture the owner asked to be rid of really is gone.
+        doc.begin_resize(0);
+        assert!(doc.resize_to(gutter - 100.0), "dragged past the left edge");
+        doc.end_resize();
+        assert_eq!(
+            doc.layout.as_ref().unwrap().widths[0],
+            1,
+            "one cell, not none"
+        );
+        assert!(
+            !doc.set_column_width(0, 0),
+            "and asking for none outright changes nothing: it is already at the floor"
+        );
+        assert_eq!(
+            doc.column_boundaries()[0].0,
+            0,
+            "still the first shown column"
+        );
+        assert!(doc.header.as_ref().unwrap().starts_with('t'), "still named");
+
+        // And the chooser is the way to hide it, from the same layout.
+        {
+            let layout_now = doc.layout.as_mut().expect("a layout");
+            let mut rows = crate::chooser::rows_of(layout_now);
+            rows[0].shown = false;
+            assert!(crate::chooser::apply(layout_now, &defaults, &rows));
+        }
+        doc.header = doc.layout.as_ref().map(|l| l.header());
         assert_eq!(
             doc.column_boundaries()[0].0,
             1,

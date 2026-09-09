@@ -1,5 +1,60 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-09-09, session 32: the UI against Microsoft's guidance
+
+The owner asked for two things this session, and the second is the larger:
+
+> *"I would like you to read the windows ux guidance, and rigorously review the current ui against
+> that, I want this to satisfy those guidelines wherever possible."*
+
+> *"So regarding the detail pane. Why are you drawing it. you should only be drawing the tail window
+> since that is what needs the high perfomance… It feels like details should be a popup with a
+> property page control, or at least normal windows dialog sematices."*
+
+**`docs/UX-REVIEW.md` is the review and it is the work list.** Part one reads Menus, Toolbars, List
+Views and Microsoft's top-violations checklist — 15 findings. Part two reads the other 28 pages —
+88 more, of which 58 are *Fails*. Each finding quotes its rule, names our line, and says what the
+fix is; the ones already done are marked in place, with a note at the end of each part.
+
+**Three of part two's findings were defects, not infelicities**, each confirmed by hand:
+
+| | |
+|---|---|
+| `Ctrl+H` was advertised in three places and bound in none | Fixed: it is `Ctrl+K` (the guide forbids taking Replace's key) and `menubar::shortcut_id` binds it. A test now walks every accelerator any menu prints and fails unless something claims it. |
+| `F1` did nothing | Fixed: it opens the keyboard map, which is the only help this program has. |
+| The column header's context menu could not be opened at all | Fixed: `header::item_at` answers `HDM_HITTEST` and `WM_CONTEXTMENU` routes to the document that owns the control. **Its keyboard half is still undone** — `Shift+F10` resolves to the grid, because the header is not a tab stop and focus never reaches it. |
+
+**What else landed:** Tools ▸ Options (both words the guide forbids are gone), `Go to line…` in Edit,
+context menus without shortcut columns, right-aligned commit rows, a **modal** rules editor with
+Save/Cancel, an `Open remote` menu button and a `Trace` button on the toolbar, the toolbar's own
+context menu, and the **column chooser** — Format ▸ Select columns… and the header's context menu,
+with `Move up` / `Move down`. Dragging a boundary to nothing no longer hides a column: the owner
+called that "a non standard way to show and hide columns", and it leaves one cell now.
+
+### What is next, in the order it should be done
+
+1. **The detail pane as a real window.** `crates/tailhawk/src/detailwin.rs` exists and its pure half
+   is written and tested: `DetailView`, `view_of`, `pages_of` (Fields / Message / Raw, and a page
+   with nothing on it is not built), `title_of`, and the `lay_out` / `show_page` / `set_pages`
+   halves that need a window. **Still to do:** a resizable modeless dialog template (`dialog.rs`'s
+   `template` hardcodes its style — it needs a `WS_THICKFRAME` variant), creation and the fill,
+   `IsDialogMessageW` for it in the pump beside `find_dialog`, and then **taking the drawn pane
+   out**: `DetailPane::height` and the `detail_rows` fetch in `Document::fetch_for_frame` and the
+   painter's pane block all go. That also removes the row of squares the owner saw — it was `─`
+   repeated across the pane, a glyph the atlas refuses as one pixel too tall.
+2. **A command to separate an interleaved document, and to interleave separate ones.** He asked for
+   it by name on 2026-09-09; nothing is started.
+3. **The rest of `UX-REVIEW.md`**, worst first: the filter panel has no tab stops and `widget::Focus`
+   has one variant; the grid's text is absent from the accessibility tree; the title bar still
+   ships frame timings and atlas statistics to a user; column headings are lower-case field names.
+
+**A note on the two subagent reviews this session**, because both earned their keep: the toolbar
+review found that the chosen dropdown id was being *run* inside comctl32's `TBN_DROPDOWN` — a modal
+dialog inside a control's own click processing — and that a reference into the control's memory was
+alive across the menu's modal loop. Both are fixed. Review before committing; it is in `CLAUDE.md`
+for a reason.
+
+
 ## ▶ Resume point — 2026-09-03, session 31 (later): the column header is a control, and it hung
 
 `header.rs` is `SysHeader32`, one control per pane over the band the view already reserves;
@@ -20,9 +75,10 @@ called from a paint is swallowed by the x64 kernel**: nothing the panic hook can
 and every probe reads as "blocked". `carries_item(code)` now gates the read; `4611e0a`.
 
 **The header is finished (2026-09-09).** The band spans the gutter as Explorer's does; the font is
-re-measured per monitor on `WM_DPICHANGED`, for every native control rather than only this one; a
-boundary dragged past the gap hides its column; and a double-clicked boundary puts it back at the
-width it was measured at.
+re-measured per monitor on `WM_DPICHANGED`, for every native control rather than only this one; and
+a double-clicked boundary puts a column back at the width it was measured at. **Dragging a boundary
+to nothing no longer hides a column** — see the 2026-09-09 resume point; that is the chooser's job
+now.
 
 ## ▶ Resume point — 2026-09-03, session 31: Tailhawk tails Loki
 
