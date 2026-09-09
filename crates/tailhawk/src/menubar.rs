@@ -157,6 +157,11 @@ pub const ID_CLEAR_RECENT: u32 = 10_009;
 /// `Go to line…`. Not a register position, because [`Command::GoToLine`] carries the line it goes
 /// to and the register lists commands by value — the same reason `ID_UNLISTED` exists.
 pub const ID_GOTO: u32 = 10_010;
+/// The toolbar's `Open remote` button. **It names no command**: the button drops
+/// [`crate::toolbar::remote_menu_of`]'s menu and never sends this id anywhere, so it exists only to
+/// tell one button apart from the rest in `TBN_DROPDOWN`. What the user chooses is a source id or
+/// `EditSources`, which are commands the register already knows.
+pub const ID_SOURCE_MENU: u32 = 10_011;
 /// File's recent entries: `ID_RECENT_BASE + n` opens the n-th newest, for the shell to resolve
 /// against the list it passed in. A range, because the entries are data, not commands.
 pub const ID_RECENT_BASE: u32 = 10_100;
@@ -311,6 +316,61 @@ pub struct BarState {
     pub can_maximise: bool,
 }
 
+/// The configured remote sources as a menu, ending in the way to configure one.
+///
+/// **One function for two surfaces**: File ▸ Open remote source and the toolbar's `Open remote`
+/// button drop the same list, with the same ids, because they are the same command reached two
+/// ways. They did not, briefly: the File item greyed itself when no source was configured while the
+/// button stayed live, which is two opposite answers to one question.
+///
+/// **`Remote sources…` is always last**, and that is what makes the surface safe to leave enabled
+/// with nothing configured: a menu that drops empty is a dead end, and the first thing somebody
+/// with no sources needs is the dialog that adds one.
+///
+/// **The names are the user's**, so an ampersand in one is doubled: `AppendMenuW` reads a single
+/// `&` as a mnemonic marker, and a source called `R&D` would otherwise be drawn `RD`.
+pub fn remote_menu_of(sources: &[String]) -> Vec<tailhawk_core::menu::Item> {
+    use tailhawk_core::menu::Item;
+    let mut items: Vec<Item> = sources
+        .iter()
+        .enumerate()
+        .map(|(n, name)| Item::command(&name.replace('&', "&&"), "", ID_SOURCE_BASE + n as u32))
+        .collect();
+    if !items.is_empty() {
+        items.push(Item::separator());
+    }
+    items.push(Item::command(
+        "Remote sources…",
+        "",
+        command_id(Command::EditSources),
+    ));
+    items
+}
+
+/// The menu id a chrome shortcut runs, or `None` if this key is not one of them.
+///
+/// **This exists because a key was printed in three places and bound in none.** `Ctrl+H` was in the
+/// register, in the Rules menu, in the toolbar's tooltip and in a status notice telling the user to
+/// press it — and `VK_H` appeared nowhere in the shell. Nothing caught it because nothing could: the
+/// keys were bound inside `&mut self` methods that need a document, and the menu's text was written
+/// separately. A pure function that the menu's own text is tested against cannot drift that way.
+///
+/// **These are the shortcuts that need no document.** The navigation map, the find keys, the colour
+/// labels and the clipboard are handled where the state they act on lives; see the test below,
+/// which requires every key the menus print to be either answered here or named there.
+pub fn shortcut_id(key: u16, ctrl: bool, shift: bool) -> Option<u32> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F1, VK_K};
+    match (key, ctrl, shift) {
+        // **`Ctrl+K`, not the `Ctrl+H` this command advertised for a month.** "Never reassign
+        // standard shortcut keys": the standard Edit menu gives `Ctrl+H` to Replace, and a viewer
+        // that cannot replace anything should not be the program that takes the key.
+        (k, true, false) if k == VK_K.0 => Some(command_id(Command::EditRules)),
+        // The key every Windows user tries first, on the only help this program has.
+        (k, false, false) if k == VK_F1.0 => Some(ID_KEYMAP),
+        _ => None,
+    }
+}
+
 pub fn menu_bar(
     doc: Option<&Document>,
     state: BarState,
@@ -348,22 +408,11 @@ pub fn menu_bar(
     // when there is no history rather than greyed.
     let mut file_items = vec![
         cmd("&Open…", "Ctrl+O", Command::OpenFile),
-        // `LOKI.md`'s remote sources, listed the way Open Recent lists files. **Disabled rather
-        // than hidden when none is configured**, per §2.2's rule that a menu whose shape changes is
-        // a menu that cannot be learned — and the item still names the thing, so somebody looking
-        // for it finds it and goes to Settings ▸ Remote sources, which is never disabled.
-        if sources.is_empty() {
-            on(Item::command("Open re&mote source", "", ID_UNLISTED), false)
-        } else {
-            Item::submenu(
-                "Open re&mote source",
-                sources
-                    .iter()
-                    .enumerate()
-                    .map(|(n, name)| Item::command(name, "", ID_SOURCE_BASE + n as u32))
-                    .collect(),
-            )
-        },
+        // `LOKI.md`'s remote sources, listed the way Open Recent lists files — and **never
+        // greyed**, because [`remote_menu_of`]'s last item is the dialog that configures the first
+        // source. It used to disable itself when none was configured, which left the one command
+        // this program exists for reachable only by knowing that Tools held the way in.
+        Item::submenu("Open re&mote source", remote_menu_of(sources)),
         on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
         Item::separator(),
         on(cmd("&Export view…", "", Command::Export), open),
@@ -567,7 +616,7 @@ pub fn menu_bar(
         Item::submenu(
             "&Rules",
             vec![
-                cmd("&Highlight rules…", "Ctrl+H", Command::EditRules),
+                cmd("&Highlight rules…", "Ctrl+K", Command::EditRules),
                 cmd("&Open rules file", "", Command::OpenRules),
                 cmd("&Reload rules", "", Command::ReloadRules),
                 Item::separator(),
@@ -604,7 +653,7 @@ pub fn menu_bar(
             vec![
                 // Both are available with no document open: a user who cannot remember how to open
                 // a file is exactly the user who needs the keyboard map.
-                Item::command("&Keyboard map", "", ID_KEYMAP),
+                Item::command("&Keyboard map", "F1", ID_KEYMAP),
                 Item::separator(),
                 Item::command("&About Tailhawk", "", ID_ABOUT),
             ],
@@ -727,6 +776,183 @@ mod tests {
                 seen.push(m);
             }
         }
+    }
+
+    /// **The one thing that makes both remote surfaces safe to leave enabled.** With no source
+    /// configured the menu is not empty — it is the dialog that adds one — so neither the File
+    /// item nor the toolbar button is ever a dead end, and neither is ever greyed.
+    #[test]
+    fn the_remote_menu_always_ends_with_the_way_to_configure_one() {
+        let none = remote_menu_of(&[]);
+        assert_eq!(none.len(), 1, "no sources, no separator, no blank menu");
+        assert_eq!(none[0].text(), "Remote sources…");
+        assert_eq!(none[0].id, Some(command_id(Command::EditSources)));
+
+        let two = remote_menu_of(&["live".to_owned(), "qa".to_owned()]);
+        let text: Vec<String> = two.iter().map(|i| i.text()).collect();
+        assert_eq!(text, ["live", "qa", "", "Remote sources…"]);
+        assert_eq!(two[0].id, Some(ID_SOURCE_BASE));
+        assert_eq!(two[1].id, Some(ID_SOURCE_BASE + 1));
+    }
+
+    /// **A source the user called `R&D` is drawn `R&D`.** `AppendMenuW` reads a lone `&` as a
+    /// mnemonic marker, so an unescaped name loses the character and underlines the next one —
+    /// and a name that is all one word could take a mnemonic another item already owns.
+    #[test]
+    fn an_ampersand_in_a_source_name_survives_the_menu() {
+        let items = remote_menu_of(&["R&D".to_owned()]);
+        assert_eq!(items[0].label, "R&&D", "doubled for Windows");
+        assert_eq!(items[0].text(), "R&D", "drawn as the user typed it");
+    }
+
+    /// The File menu and the toolbar drop the same list — one function, so they cannot answer the
+    /// same question two ways, which is what they did for a few hours on 2026-09-09.
+    #[test]
+    fn the_file_menu_offers_remote_sources_even_when_none_are_configured() {
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        );
+        let file = menu.at(&[0]).expect("File opens").to_vec();
+        let remote = file
+            .iter()
+            .find(|i| i.text() == "Open remote source")
+            .expect("File offers it");
+        assert!(remote.enabled, "never greyed: it is the way in");
+        assert_eq!(
+            remote.items.iter().map(|i| i.text()).collect::<Vec<_>>(),
+            remote_menu_of(&[])
+                .iter()
+                .map(|i| i.text())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Walks a menu tree, returning every `(printed text, accelerator)` pair below it.
+    fn advertised(items: &[tailhawk_core::menu::Item], into: &mut Vec<(String, String)>) {
+        for item in items {
+            if !item.accelerator.is_empty() {
+                into.push((item.text(), item.accelerator.clone()));
+            }
+            advertised(&item.items, into);
+        }
+    }
+
+    /// **The test `Ctrl+H` needed for a month and never had.** The key was printed in the Rules
+    /// menu, in the register, in the toolbar's tooltip and in a status notice telling the user to
+    /// press it, and `VK_H` appeared nowhere in the shell: pressing it did nothing at all.
+    ///
+    /// Every key any menu prints must be either answered by [`shortcut_id`] or named below as
+    /// handled somewhere else — which is a deliberate act, so the next key advertised without a
+    /// binding fails here instead of shipping.
+    #[test]
+    fn every_key_the_menus_print_is_bound_somewhere() {
+        // Handled where the state they act on lives, and each was confirmed present in the shell
+        // rather than assumed: the navigation map and the colour labels in `view_key`, the find
+        // family in `find_key`, the dialogs in `chrome_key`, the clipboard in `WM_KEYDOWN` itself,
+        // and `Alt+F4` by Windows. **`Ctrl+X` and `Ctrl+V` are here for a different reason**: the
+        // Edit menu shows Cut and Paste permanently greyed, because a viewer that hid them would
+        // read as broken, and a greyed item's key is not a promise.
+        const ELSEWHERE: [&str; 32] = [
+            "Alt+F4",
+            "Alt+←",
+            "Alt+→",
+            "Ctrl+C",
+            "Ctrl+D",
+            "Ctrl+E",
+            "Ctrl+End",
+            "Ctrl+Enter",
+            "Ctrl+F",
+            "Ctrl+G",
+            "Ctrl+Home",
+            "Ctrl+I",
+            "Ctrl+L",
+            "Ctrl+O",
+            "Ctrl+Shift+0",
+            "Ctrl+Shift+1…9",
+            "Ctrl+Shift+C",
+            "Ctrl+Shift+E",
+            "Ctrl+Shift+L",
+            "Ctrl+Shift+Tab",
+            "Ctrl+T",
+            "Ctrl+Tab",
+            "Ctrl+V",
+            "Ctrl+W",
+            "Ctrl+X",
+            "Ctrl+\\",
+            "Esc",
+            "F2",
+            "F3",
+            "F6",
+            "Shift+F2",
+            "Shift+F3",
+        ];
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        );
+        let mut keys = Vec::new();
+        advertised(menu.items(), &mut keys);
+        assert!(keys.len() > 20, "the walk found the menus: {}", keys.len());
+
+        // What `shortcut_id` answers, written the way a menu prints it.
+        let bound: Vec<&str> = ["Ctrl+K", "F1"].to_vec();
+        let unclaimed: Vec<String> = keys
+            .iter()
+            .filter(|(_, key)| !bound.contains(&key.as_str()) && !ELSEWHERE.contains(&key.as_str()))
+            .map(|(text, key)| format!("{text} = {key}"))
+            .collect();
+        assert!(
+            unclaimed.is_empty(),
+            "nothing claims to handle: {}",
+            unclaimed.join(", ")
+        );
+    }
+
+    /// The two keys [`shortcut_id`] owns, checked against the menu that prints them — the halves
+    /// that drifted apart last time, tied together.
+    #[test]
+    fn the_keys_shortcut_id_owns_are_the_keys_the_menus_print() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F1, VK_K};
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+        );
+        let mut keys = Vec::new();
+        advertised(menu.items(), &mut keys);
+        let printed = |what: &str| -> String {
+            keys.iter()
+                .find(|(text, _)| text.starts_with(what))
+                .map(|(_, key)| key.clone())
+                .unwrap_or_else(|| panic!("{what} is in no menu"))
+        };
+        assert_eq!(printed("Highlight rules"), "Ctrl+K");
+        assert_eq!(
+            shortcut_id(VK_K.0, true, false),
+            Some(command_id(Command::EditRules))
+        );
+        assert_eq!(printed("Keyboard map"), "F1");
+        assert_eq!(shortcut_id(VK_F1.0, false, false), Some(ID_KEYMAP));
+        assert_eq!(
+            shortcut_id(VK_K.0, false, false),
+            None,
+            "the key alone is a letter, not a command"
+        );
     }
 
     /// `UI-DESIGN.md` §1.2's discoverability rule, as a test rather than an intention: **every

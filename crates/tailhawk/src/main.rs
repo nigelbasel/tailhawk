@@ -3534,7 +3534,7 @@ impl Command {
             "Maximise the focused pane, or restore the split",
             "",
         ),
-        (Command::EditRules, "Highlight rules…", "Ctrl+H"),
+        (Command::EditRules, "Highlight rules…", "Ctrl+K"),
         (Command::DefineFormat, "Define format from a line…", ""),
         (Command::ImportLayout, "Import layout from config…", ""),
         (
@@ -6013,7 +6013,7 @@ impl Shell {
     /// costs the user their work, so the status bar says it happened.
     fn close_rules_editor(&mut self) {
         if self.rules_editor.is_dirty() {
-            self.notice = Some("rules closed unsaved — Ctrl+H, Ctrl+S to save".to_owned());
+            self.notice = Some("rules closed unsaved — Ctrl+K, Ctrl+S to save".to_owned());
         }
         self.rules_editor.close();
         let specs = self.rule_specs.clone();
@@ -7583,6 +7583,103 @@ enum Under {
 /// at the grid's top-left corner, with the caret left where it is. And a right-click *outside* the
 /// selection moves the caret to the line clicked, where one inside it leaves the selection alone,
 /// because there the selection is the subject.
+/// Drops the `Open remote` button's menu under the button, and runs what was chosen.
+///
+/// The items and their ids are [`toolbar::remote_menu_of`]'s — the File menu's ids — so this
+/// function decides nothing beyond *where* the menu hangs.
+/// Reports whether it showed one, so a button that could not drop a menu is not answered "handled".
+fn open_remote_menu(hwnd: HWND) -> bool {
+    // **Everything the menu needs is read out of the borrow first.** `drop_corner` sends messages
+    // and `track_context` pumps a modal loop; either inside a `STATE` borrow is the panic this
+    // file's other deferred dialogs exist to avoid.
+    let (sources, bar) = STATE.with(|s| {
+        let state = s.borrow();
+        let Some(shell) = state.as_ref() else {
+            return (Vec::new(), None);
+        };
+        (
+            shell.source_names(),
+            shell.toolbar.as_ref().map(|bar| bar.hwnd()),
+        )
+    });
+    let Some((x, y)) = bar.and_then(|bar| toolbar::drop_corner(bar, menubar::ID_SOURCE_MENU))
+    else {
+        return false;
+    };
+    let items = menubar::remote_menu_of(&sources);
+    if let Some(id) = menubar::track_context(hwnd, &items, x, y) {
+        // **Posted, not run.** This is called from inside comctl32's `TBN_DROPDOWN` handling, and
+        // `Remote sources…` opens a modal dialog: running it here would put a second modal loop
+        // inside the control's own click processing, with the button still latched. The id reaches
+        // the same dispatch one message later, through the `WM_COMMAND` arm the toolbar already
+        // uses — `lParam` is the control's handle, which is what that arm tests for.
+        if let Some(bar) = bar {
+            unsafe {
+                let _ = PostMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    WPARAM(id as usize),
+                    LPARAM(bar.0 as isize),
+                );
+            }
+        }
+    }
+    true
+}
+
+/// The toolbar's own context menu — right-clicking the bar or its gripper.
+///
+/// A keyboard summons carries `(-1, -1)`, in which case the menu hangs off the first button rather
+/// than off the corner of the screen.
+fn toolbar_menu(hwnd: HWND, sx: i32, sy: i32) {
+    let (items, bar) = STATE.with(|s| {
+        let state = s.borrow();
+        let Some(shell) = state.as_ref() else {
+            return (Vec::new(), None);
+        };
+        (
+            toolbar::toolbar_context_of(shell.show_toolbar, shell.large_icons),
+            shell.toolbar.as_ref().map(|bar| bar.hwnd()),
+        )
+    });
+    if items.is_empty() {
+        return;
+    }
+    let (x, y) = if sx == -1 && sy == -1 {
+        let corner =
+            bar.and_then(|bar| toolbar::drop_corner(bar, menubar::command_id(Command::OpenFile)));
+        match corner {
+            Some(corner) => corner,
+            None => return,
+        }
+    } else {
+        (sx, sy)
+    };
+    let Some(id) = menubar::track_context(hwnd, &items, x, y) else {
+        return;
+    };
+    chosen_from_bar(hwnd, id);
+}
+
+/// Runs an id chosen from one of the toolbar's menus, down the path `WM_COMMAND` uses.
+///
+/// **Not a second dispatch.** `menu_choose` is the one place a command id becomes an action, and a
+/// menu dropped by the toolbar must reach it exactly as the menu bar does — including the pending
+/// dialogs, which is what opens `Remote sources…` on this message rather than the next one.
+fn chosen_from_bar(hwnd: HWND, id: u32) {
+    let acted = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| shell.menu_choose(hwnd, id))
+    });
+    run_pending_dialogs(hwnd);
+    if acted {
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+}
+
 fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
     use windows::Win32::Graphics::Gdi::ClientToScreen;
 
@@ -9519,6 +9616,16 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 return LRESULT(0);
             }
 
+            // **The chrome shortcuts, before anything borrows `STATE`**, for `Ctrl+O`'s reason: the
+            // rules editor is modal and pumps this window's messages. `menubar::shortcut_id` is the
+            // map, and it is pure so the menu's printed keys can be tested against it — which is
+            // what `Ctrl+H` needed and never had.
+            let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            if let Some(id) = menubar::shortcut_id(wparam.0 as u16, ctrl, shift_down) {
+                chosen_from_bar(hwnd, id);
+                return LRESULT(0);
+            }
+
             // **The find state is offered the key first**, because `Esc`, `Enter` and `Backspace`
             // mean something to it and nothing to the navigation map — and because `F3` must not
             // fall through to `DefWindowProcW` once there is something for it to do.
@@ -10116,6 +10223,24 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     return LRESULT(0);
                 }
             }
+            // §2.3's menu button: `Open remote` drops the configured sources rather than sending a
+            // command of its own. The list is `toolbar::remote_menu_of`'s and the ids in it are the
+            // File menu's, so a source opened from here and one opened from there are one command.
+            if header.idFrom == toolbar::ID_TOOLBAR as usize && header.code == toolbar::TBN_DROPDOWN
+            {
+                // **Copied out, not borrowed across the menu.** The only field documented as valid
+                // for this notification is `iItem`, which here is the button's command id; reading
+                // it into a local means no reference into comctl32's memory is alive while the
+                // menu pumps its own loop.
+                let item = unsafe {
+                    (*(lparam.0 as *const windows::Win32::UI::Controls::NMTOOLBARW)).iItem
+                };
+                // **Only "handled" when a menu actually appeared.** Answering `TBDDRET_DEFAULT`
+                // after showing nothing leaves a button that does nothing at all.
+                if item == menubar::ID_SOURCE_MENU as i32 && open_remote_menu(hwnd) {
+                    return LRESULT(toolbar::TBDDRET_DEFAULT);
+                }
+            }
             if header.idFrom == tabstrip::ID_TABS as usize && header.code == tabstrip::TCN_SELCHANGE
             {
                 let chosen = STATE.with(|s| {
@@ -10301,7 +10426,22 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         WM_CONTEXTMENU => {
             let sx = (lparam.0 & 0xFFFF) as i16 as i32;
             let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            context_menu(hwnd, sx, sy);
+            // **Which child was right-clicked, not where.** `wParam` carries it, and the toolbar's
+            // own menu is the *Toolbars* page's requirement that a bar with options offers at least
+            // the way to show and hide it. Without this test a right-click on the bar dropped the
+            // grid's menu, which offered to sort a column the pointer was nowhere near.
+            let from = HWND(wparam.0 as *mut core::ffi::c_void);
+            let on_toolbar = STATE.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .and_then(|shell| shell.toolbar.as_ref())
+                    .is_some_and(|bar| bar.owns(from))
+            });
+            if on_toolbar {
+                toolbar_menu(hwnd, sx, sy);
+            } else {
+                context_menu(hwnd, sx, sy);
+            }
             LRESULT(0)
         }
         WM_VSCROLL => {
@@ -11924,7 +12064,7 @@ mod tests {
             Some("hardware"),
             Some("app.log: UTF-8 — 1 file"),
             None,
-            Some("rules closed unsaved — Ctrl+H, Ctrl+S to save"),
+            Some("rules closed unsaved — Ctrl+K, Ctrl+S to save"),
             None,
         );
         assert!(

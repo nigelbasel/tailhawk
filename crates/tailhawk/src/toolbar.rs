@@ -23,7 +23,8 @@ use crate::menubar::command_id;
 use crate::tabstrip::shell_font;
 use crate::{Command, Document};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
     GetDC, GetGlyphIndicesW, ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
@@ -33,14 +34,14 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::{
     ImageList_Add, ImageList_Create, ImageList_Destroy, InitCommonControlsEx, BTNS_AUTOSIZE,
-    BTNS_CHECK, BTNS_SEP, BTNS_SHOWTEXT, CCS_NODIVIDER, CCS_NOPARENTALIGN, CCS_NORESIZE,
-    HIMAGELIST, ICC_BAR_CLASSES, ILC_COLOR32, INITCOMMONCONTROLSEX, NMTBGETINFOTIPW, RBBIM_CHILD,
-    RBBIM_CHILDSIZE, RBBIM_SIZE, RBBIM_STYLE, RBBS_CHILDEDGE, RBBS_GRIPPERALWAYS, RBS_BANDBORDERS,
-    RBS_VARHEIGHT, RB_GETBANDCOUNT, RB_GETBARHEIGHT, RB_INSERTBANDW, RB_SETBANDINFOW,
-    RB_SETBARINFO, REBARBANDINFOW, REBARINFO, TBBUTTON, TBSTATE_CHECKED, TBSTATE_ENABLED,
-    TBSTYLE_FLAT, TBSTYLE_TOOLTIPS, TB_ADDBUTTONSW, TB_ADDSTRINGW, TB_AUTOSIZE, TB_BUTTONCOUNT,
-    TB_BUTTONSTRUCTSIZE, TB_DELETEBUTTON, TB_GETITEMRECT, TB_GETMAXSIZE, TB_SETBITMAPSIZE,
-    TB_SETIMAGELIST, TB_SETSTATE,
+    BTNS_CHECK, BTNS_SEP, BTNS_SHOWTEXT, BTNS_WHOLEDROPDOWN, CCS_NODIVIDER, CCS_NOPARENTALIGN,
+    CCS_NORESIZE, HIMAGELIST, ICC_BAR_CLASSES, ILC_COLOR32, INITCOMMONCONTROLSEX, NMTBGETINFOTIPW,
+    RBBIM_CHILD, RBBIM_CHILDSIZE, RBBIM_SIZE, RBBIM_STYLE, RBBS_CHILDEDGE, RBBS_GRIPPERALWAYS,
+    RBS_BANDBORDERS, RBS_VARHEIGHT, RB_GETBANDCOUNT, RB_GETBARHEIGHT, RB_INSERTBANDW,
+    RB_SETBANDINFOW, RB_SETBARINFO, REBARBANDINFOW, REBARINFO, TBBUTTON, TBSTATE_CHECKED,
+    TBSTATE_ENABLED, TBSTYLE_FLAT, TBSTYLE_TOOLTIPS, TB_ADDBUTTONSW, TB_ADDSTRINGW, TB_AUTOSIZE,
+    TB_BUTTONCOUNT, TB_BUTTONSTRUCTSIZE, TB_DELETEBUTTON, TB_GETBUTTON, TB_GETITEMRECT,
+    TB_GETMAXSIZE, TB_SETBITMAPSIZE, TB_SETIMAGELIST, TB_SETSTATE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -85,6 +86,11 @@ pub struct ToolButton {
     /// readable**: without them nine identical squares are a wall, and a user has to hover every
     /// one to find the third thing they wanted.
     pub starts_group: bool,
+    /// Whether the button drops a menu instead of sending its id. The *Toolbars* page's menu
+    /// button: "use a menu button to present a small set of related commands" — which is what a
+    /// list of configured remote sources is. A dropdown sends no `WM_COMMAND` at all; the chosen
+    /// item's id is what reaches the dispatch, so the two surfaces still share one path.
+    pub dropdown: bool,
 }
 
 /// The toolbar for this document, or for no document at all.
@@ -111,6 +117,7 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
             toggle: false,
             pressed: false,
             starts_group: starts,
+            dropdown: false,
         };
     let toggle =
         |label: &'static str, icon: char, c: Command, pressed: bool, starts: bool| ToolButton {
@@ -122,9 +129,26 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
             toggle: true,
             pressed: open && pressed,
             starts_group: starts,
+            dropdown: false,
         };
     vec![
         verb("Open", icon::OPEN, Command::OpenFile, true, false),
+        // **The command this program exists for, which had no button.** The owner, 2026-09-09: "I
+        // see there is a toolbar for open, but not for open remote." It is a *menu* button rather
+        // than a verb because opening a remote source means choosing which one — see
+        // [`crate::menubar::remote_menu_of`] — and it is never disabled, because with none configured the menu it
+        // drops is the way to configure one.
+        ToolButton {
+            label: "Open remote",
+            icon: icon::REMOTE,
+            tip: "Open remote source".to_owned(),
+            id: crate::menubar::ID_SOURCE_MENU,
+            enabled: true,
+            toggle: false,
+            pressed: false,
+            starts_group: false,
+            dropdown: true,
+        },
         verb("Find", icon::FIND, Command::Find, open, true),
         // A toggle, not a verb, since 2026-09-03: the owner's answer to §2.5's open question. It
         // reports whether the filter panel is shown, the way Follow reports following.
@@ -135,6 +159,10 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
             doc.is_some_and(|d| d.show_filters),
             false,
         ),
+        // §7's rung one, on the bar because the owner asked for it there: "It would be good to have
+        // a menu option and toolbar button for this to aid discoverability. secret handshakes are
+        // not good." The menu already had it; a keystroke nobody can see was the whole complaint.
+        verb("Trace", icon::TRACE, Command::FollowTrace, open, false),
         toggle(
             "Follow",
             icon::FOLLOW,
@@ -142,13 +170,20 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
             doc.is_some_and(|d| d.is_following()),
             true,
         ),
-        toggle(
-            "Collapse",
-            icon::COLLAPSE,
-            Command::ToggleCollapse,
-            doc.is_some_and(|d| d.is_collapsed()),
-            false,
-        ),
+        // **The tooltip says what the chevron cannot.** The owner, 2026-09-09: "Im not sure what
+        // exctly the colapse item is in the toolbar" — the *Toolbars* page's own remedy for an icon
+        // that does not explain itself is a label, which the icons-only bar he asked for rules out,
+        // so the full name goes in the tip and in the menu instead of the one word.
+        ToolButton {
+            tip: tip_for("Collapse continuation lines", Command::ToggleCollapse),
+            ..toggle(
+                "Collapse",
+                icon::COLLAPSE,
+                Command::ToggleCollapse,
+                doc.is_some_and(|d| d.is_collapsed()),
+                false,
+            )
+        },
         toggle(
             "Detail",
             icon::DETAIL,
@@ -159,6 +194,38 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
         verb("Rules", icon::RULES, Command::EditRules, true, true),
         verb("Format", icon::FORMAT, Command::DefineFormat, open, false),
         verb("Export", icon::EXPORT, Command::Export, open, true),
+    ]
+}
+
+/// The toolbar's own context menu — *Toolbars*: "provide a context menu with at least the commands
+/// to show and hide toolbars".
+///
+/// It is the View ▸ Toolbar submenu, item for item, because it is the same three decisions and
+/// §1.2 allows one name each. **No accelerators and no access keys**: this is a context menu, and
+/// the *Menus* page excludes those from context menus rather than merely not requiring them.
+pub fn toolbar_context_of(visible: bool, large: bool) -> Vec<tailhawk_core::menu::Item> {
+    use tailhawk_core::menu::Item;
+    let sizes_live = |item: Item| if visible { item } else { item.disabled() };
+    vec![
+        Item::check(
+            "Show toolbar",
+            "",
+            command_id(Command::ToggleToolbar),
+            visible,
+        ),
+        Item::separator(),
+        sizes_live(Item::check(
+            "Small icons",
+            "",
+            command_id(Command::ToolbarSmallIcons),
+            !large,
+        )),
+        sizes_live(Item::check(
+            "Large icons",
+            "",
+            command_id(Command::ToolbarLargeIcons),
+            large,
+        )),
     ]
 }
 
@@ -188,6 +255,12 @@ pub mod icon {
     /// `OpenFolder` — the folder Explorer itself puts on an Open button. `OpenFile` (`E8E5`) was
     /// tried first and draws a page with an arrow through it, which reads as *export*.
     pub const OPEN: char = '\u{E838}';
+    /// `Cloud` — the remote sources are Loki over HTTP, and a cloud is what a Windows user reads as
+    /// "not a file on this machine". Drawn from both fonts and checked before it was chosen.
+    pub const REMOTE: char = '\u{E753}';
+    /// `Relationship` — three nodes joined by edges, which is a distributed trace drawn small. A
+    /// chevron or an arrow would have said *navigate*; this says *these lines belong together*.
+    pub const TRACE: char = '\u{F22C}';
     /// `Search` — a magnifier.
     pub const FIND: char = '\u{E721}';
     /// `Filter` — a funnel.
@@ -214,6 +287,15 @@ pub mod icon {
 /// does not bind the notification codes, and the value is the documented one.
 pub const TBN_GETINFOTIPW: u32 = (-719_i32) as u32;
 
+/// `TBN_DROPDOWN` — a menu button was pressed, and the parent is being asked to drop the menu.
+///
+/// `TBN_FIRST` is -700 and this is ten below it. The parent answers `TBDDRET_DEFAULT` when it has
+/// shown a menu of its own, which is what stops comctl32 looking for one it does not have.
+pub const TBN_DROPDOWN: u32 = (-710_i32) as u32;
+
+/// The answer to [`TBN_DROPDOWN`] that says the parent showed the menu itself.
+pub const TBDDRET_DEFAULT: isize = 0;
+
 /// The rebar's own id, so its notifications are its own.
 pub const ID_REBAR: i32 = 4_201;
 
@@ -230,6 +312,11 @@ const GGI_MARK_NONEXISTING_GLYPHS: u32 = 1;
 
 /// An image list of the toolbar's glyphs, drawn from the system icon font at this DPI.
 ///
+/// **The glyphs come from the row that is about to be built**, not from a list kept beside it. The
+/// button's image index is its position in the row, so a second list here would have to be edited
+/// in step with [`toolbar_of`] — and a button added to one and not the other draws its neighbour's
+/// icon, silently and for as long as nobody looks.
+///
 /// **`None` rather than a box.** If neither font is installed, or the font is installed but lacks
 /// one of the code points, this reports nothing and the toolbar falls back to its old labelled
 /// buttons. A tofu box on a toolbar is precisely the "ugly and non standard" the owner asked to be
@@ -240,18 +327,7 @@ const GGI_MARK_NONEXISTING_GLYPHS: u32 = 1;
 /// alpha at all: what it leaves behind is coverage in the colour channels, which is exactly the
 /// mask a 32-bit image list wants once it is turned into premultiplied alpha. Tinting from the
 /// theme is what lets one set of glyphs serve a dark toolbar and a light one.
-fn icon_list(px: i32, colour: u32) -> Option<HIMAGELIST> {
-    let glyphs = [
-        icon::OPEN,
-        icon::FIND,
-        icon::FILTER,
-        icon::FOLLOW,
-        icon::COLLAPSE,
-        icon::DETAIL,
-        icon::RULES,
-        icon::FORMAT,
-        icon::EXPORT,
-    ];
+fn icon_list(px: i32, colour: u32, glyphs: &[char]) -> Option<HIMAGELIST> {
     let screen = unsafe { GetDC(None) };
     let dc = unsafe { CreateCompatibleDC(screen) };
     unsafe {
@@ -327,7 +403,7 @@ fn icon_list(px: i32, colour: u32) -> Option<HIMAGELIST> {
     }
     let old_font = unsafe { SelectObject(dc, HGDIOBJ(font.0)) };
     for glyph in glyphs {
-        if let Some(bitmap) = draw_glyph(dc, glyph, px, colour) {
+        if let Some(bitmap) = draw_glyph(dc, *glyph, px, colour) {
             unsafe {
                 ImageList_Add(list, bitmap, HBITMAP::default());
                 let _ = DeleteObject(HGDIOBJ(bitmap.0));
@@ -688,7 +764,8 @@ impl Toolbar {
         let ink = tailhawk_core::theme::theme().ink;
         let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
         let colour = (byte(ink[0]) << 16) | (byte(ink[1]) << 8) | byte(ink[2]);
-        let fresh = icon_list(px, colour);
+        let glyphs: Vec<char> = buttons.iter().map(|b| b.icon).collect();
+        let fresh = icon_list(px, colour, &glyphs);
         if let Some(list) = fresh {
             unsafe {
                 SendMessageW(self.hwnd, TB_SETIMAGELIST, WPARAM(0), LPARAM(list.0));
@@ -756,6 +833,11 @@ impl Toolbar {
                 fsState: state_bits(button),
                 fsStyle: (BTNS_AUTOSIZE
                     | if iconic { 0 } else { BTNS_SHOWTEXT }
+                    | if button.dropdown {
+                        BTNS_WHOLEDROPDOWN
+                    } else {
+                        0
+                    }
                     | if button.toggle { BTNS_CHECK } else { 0 }) as u8,
                 bReserved: [0; 6],
                 dwData: 0,
@@ -841,6 +923,18 @@ impl Toolbar {
         }
     }
 
+    /// Whether `hwnd` is the toolbar or the rebar that hosts it.
+    ///
+    /// `WM_CONTEXTMENU` arrives at the main window whichever child was clicked, carrying that child
+    /// in `wParam`; this is how a right-click on the bar is told from a right-click on the grid.
+    /// The rebar counts as well as the toolbar — the gripper and the strip beside the last button
+    /// are its, and a user aiming at "the toolbar" hits them as often as not.
+    pub fn owns(&self, hwnd: HWND) -> bool {
+        hwnd == self.hwnd || self.rebar.is_some_and(|rebar| rebar == hwnd)
+    }
+
+    /// The control itself, for [`drop_corner`] — which is a free function precisely so it can be
+    /// called *after* the `STATE` borrow has been released rather than inside it.
     /// Answers `TBN_GETINFOTIPW` with the button's own tooltip text.
     ///
     /// **The text comes from the view-model, not from a second table.** The tooltip says the same
@@ -1002,6 +1096,55 @@ impl Drop for Toolbar {
     }
 }
 
+/// Where a button sits on screen, for a menu that must hang under it.
+///
+/// **A dropdown menu belongs at the button's bottom-left**, which is where every Windows menu
+/// button puts it: `TB_GETITEMRECT` answers in the toolbar's client space, and the corner is mapped
+/// from there rather than from the click, so the menu lands in the same place whether the button
+/// was reached by mouse or by keyboard.
+///
+/// **A free function, taking the control's handle**, so that the caller can let go of its `STATE`
+/// borrow before asking: this sends up to two messages per button, and a borrow held across a
+/// `SendMessageW` is the shape that panics the moment one of them re-enters the window procedure.
+pub fn drop_corner(hwnd: HWND, id: u32) -> Option<(i32, i32)> {
+    let count = unsafe { SendMessageW(hwnd, TB_BUTTONCOUNT, WPARAM(0), LPARAM(0)) }.0;
+    for at in 0..count {
+        let mut rect = RECT::default();
+        let got = unsafe {
+            SendMessageW(
+                hwnd,
+                TB_GETITEMRECT,
+                WPARAM(at as usize),
+                LPARAM(&mut rect as *mut RECT as isize),
+            )
+        };
+        if got.0 == 0 {
+            continue;
+        }
+        let mut button = TBBUTTON::default();
+        let read = unsafe {
+            SendMessageW(
+                hwnd,
+                TB_GETBUTTON,
+                WPARAM(at as usize),
+                LPARAM(&mut button as *mut TBBUTTON as isize),
+            )
+        };
+        if read.0 == 0 || button.idCommand != id as i32 {
+            continue;
+        }
+        let mut corner = POINT {
+            x: rect.left,
+            y: rect.bottom,
+        };
+        unsafe {
+            let _ = ClientToScreen(hwnd, &mut corner);
+        }
+        return Some((corner.x, corner.y));
+    }
+    None
+}
+
 /// The `TBSTATE_*` bits for one button.
 ///
 /// Pure, and separately, because a button that is pressed but disabled and one that is enabled but
@@ -1026,17 +1169,46 @@ mod tests {
         buttons.iter().map(|b| b.label).collect()
     }
 
+    /// *Toolbars*: a toolbar with options owes a context menu that at least shows and hides it. The
+    /// sizes grey with the bar gone, since there is nothing to size, but `Show toolbar` never does
+    /// — it is the only way back.
+    #[test]
+    fn the_toolbars_own_menu_can_always_bring_it_back() {
+        let hidden = toolbar_context_of(false, false);
+        let text: Vec<String> = hidden.iter().map(|i| i.text()).collect();
+        assert_eq!(text, ["Show toolbar", "", "Small icons", "Large icons"]);
+        assert!(hidden[0].enabled, "the way back is never greyed");
+        assert!(!hidden[2].enabled && !hidden[3].enabled);
+
+        let large = toolbar_context_of(true, true);
+        assert!(large[3].checked, "the size in use is the ticked one");
+        assert!(!large[2].checked);
+        assert!(large.iter().all(|i| i.accelerator.is_empty()));
+    }
+
     /// **§2.3's row, in §2.3's order.** Maximise is not in it: it is a window arrangement, not a
     /// document command, and the owner asked for the window controls to stay out of the toolbar. The order is the
     /// requirement, not a preference: the
-    /// document names these nine and this sequence, and a toolbar is a thing people reach for by
+    /// document names these and this sequence, and a toolbar is a thing people reach for by
     /// position after the first week.
+    ///
+    /// **Two arrived on 2026-09-09** from the owner's own reading of the bar: `Open remote`, beside
+    /// the file it belongs with, and `Trace`, so §7's rung one is not a keystroke only.
     #[test]
     fn the_row_is_the_buttons_the_design_names_in_its_order() {
         assert_eq!(
             labels(&toolbar_of(None)),
             [
-                "Open", "Find", "Filter", "Follow", "Collapse", "Detail", "Rules", "Format",
+                "Open",
+                "Open remote",
+                "Find",
+                "Filter",
+                "Trace",
+                "Follow",
+                "Collapse",
+                "Detail",
+                "Rules",
+                "Format",
                 "Export"
             ]
         );
@@ -1048,7 +1220,7 @@ mod tests {
     #[test]
     fn an_empty_window_greys_the_row_rather_than_removing_it() {
         let empty = toolbar_of(None);
-        assert_eq!(empty.len(), 9, "the row does not shrink");
+        assert_eq!(empty.len(), 11, "the row does not shrink");
         let live: Vec<&str> = empty
             .iter()
             .filter(|b| b.enabled)
@@ -1056,8 +1228,9 @@ mod tests {
             .collect();
         assert_eq!(
             live,
-            ["Open", "Rules"],
-            "only the two commands that do not need a document"
+            ["Open", "Open remote", "Rules"],
+            "only the commands that do not need a document — and the remote menu, which is how a \
+             first source gets configured"
         );
         assert!(
             empty.iter().all(|b| !b.pressed),
@@ -1081,12 +1254,17 @@ mod tests {
     /// **Every id is the menu's.** This is the test that keeps §1.2's one-command-one-path rule
     /// true: if a button ever grew an id of its own, a click would stop reaching the dispatch the
     /// menu and the keystroke use, and the two surfaces could drift apart in silence.
+    ///
+    /// **The menu button is the one exception, and it proves the rule rather than breaking it.** It
+    /// posts no command at all — its id exists only to tell `TBN_DROPDOWN` which button was pressed
+    /// — and what the user chooses from it is a File-menu id.
     #[test]
     fn every_button_carries_the_command_id_the_menu_sends() {
         let expected = [
             Command::OpenFile,
             Command::Find,
             Command::ToggleFilters,
+            Command::FollowTrace,
             Command::FollowTail,
             Command::ToggleCollapse,
             Command::ToggleDetail,
@@ -1094,7 +1272,18 @@ mod tests {
             Command::DefineFormat,
             Command::Export,
         ];
-        for (button, command) in toolbar_of(None).iter().zip(expected) {
+        let row = toolbar_of(None);
+        let (menu_buttons, verbs): (Vec<&ToolButton>, Vec<&ToolButton>) =
+            row.iter().partition(|b| b.dropdown);
+        assert_eq!(menu_buttons.len(), 1);
+        assert_eq!(menu_buttons[0].id, crate::menubar::ID_SOURCE_MENU);
+        assert!(
+            !Command::LISTED
+                .iter()
+                .any(|(c, _, _)| command_id(*c) == crate::menubar::ID_SOURCE_MENU),
+            "the menu button's id must name no command, or a stray WM_COMMAND would run one"
+        );
+        for (button, command) in verbs.iter().zip(expected) {
             assert_eq!(
                 button.id,
                 command_id(command),
@@ -1119,6 +1308,7 @@ mod tests {
             toggle: true,
             pressed,
             starts_group: false,
+            dropdown: false,
         };
         assert_eq!(state_bits(&button(false, false)), 0);
         assert_eq!(state_bits(&button(true, false)), TBSTATE_ENABLED as u8);
@@ -1129,16 +1319,21 @@ mod tests {
         );
     }
 
-    /// `I_IMAGENONE` is hand-declared because the crate does not bind it, so it is checked rather
-    /// than trusted — the WinHTTP lesson, applied to the one number this module invents. A button
-    /// given image zero instead of none reserves space for a bitmap that is not there.
+    /// Four numbers here are hand-declared because the crate does not bind them, so they are
+    /// checked rather than trusted — the WinHTTP lesson, applied to everything this module invents.
+    /// A button given image zero instead of none reserves space for a bitmap that is not there; a
+    /// notification code one off matches nothing and the feature is simply dead.
     #[test]
-    fn the_one_hand_declared_constant_is_the_documented_value() {
+    fn the_hand_declared_constants_are_the_documented_values() {
         assert_eq!(I_IMAGENONE, -2);
         assert_ne!(
             I_IMAGENONE, 0,
             "image zero is a real image, not the absence"
         );
+        // TBN_FIRST is -700; these are its documented offsets.
+        assert_eq!(TBN_GETINFOTIPW as i32, -719);
+        assert_eq!(TBN_DROPDOWN as i32, -710);
+        assert_eq!(TBDDRET_DEFAULT, 0, "the drop-down was handled");
     }
 
     /// No two buttons share an id, because the shell dispatches on the id alone and a duplicate
