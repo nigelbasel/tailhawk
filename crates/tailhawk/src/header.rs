@@ -22,13 +22,14 @@
 use crate::tabstrip::shell_font;
 use tailhawk_core::rows::HeaderColumn;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT, HGDIOBJ};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{DeleteObject, SetTextColor, HFONT, HGDIOBJ};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, HDF_FIXEDWIDTH, HDF_LEFT, HDF_SORTDOWN, HDF_SORTUP, HDF_STRING, HDITEMW,
     HDI_FORMAT, HDI_TEXT, HDI_WIDTH, HDLAYOUT, HDM_DELETEITEM, HDM_GETITEMCOUNT, HDM_INSERTITEMW,
     HDM_LAYOUT, HDM_SETITEMW, HDS_BUTTONS, HDS_DRAGDROP, HDS_FULLDRAG, HDS_HORZ,
-    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, NMHEADERW, WC_HEADERW,
+    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, NMCUSTOMDRAW, NMCUSTOMDRAW_DRAW_STAGE, NMHEADERW,
+    WC_HEADERW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, SendMessageW, SetWindowPos, ShowWindow, HMENU, HWND_TOP,
@@ -59,6 +60,59 @@ use windows::Win32::UI::Controls::{HDN_ENDDRAG, HDN_ENDTRACKW, HDN_ITEMCLICKW};
 
 /// Whether `code` is one of the three notifications whose `lParam` really is an `NMHEADERW` with a
 /// `pitem` worth reading. Everything else the control sends shares the `NMHDR` and nothing more.
+/// `NM_CUSTOMDRAW`, which the `windows` crate does not bind as a `u32`.
+pub const NM_CUSTOMDRAW: u32 = (-12_i32) as u32;
+
+/// The custom-draw stages and answers this uses. Named here because the crate binds them as typed
+/// constants of three different types and the message wants a plain `LRESULT`.
+const CDDS_PREPAINT: NMCUSTOMDRAW_DRAW_STAGE = NMCUSTOMDRAW_DRAW_STAGE(0x0000_0001);
+const CDDS_ITEMPREPAINT: NMCUSTOMDRAW_DRAW_STAGE = NMCUSTOMDRAW_DRAW_STAGE(0x0001_0001);
+const CDRF_DODEFAULT: isize = 0;
+const CDRF_NEWFONT: isize = 2;
+const CDRF_NOTIFYITEMDRAW: isize = 0x20;
+
+/// Answers the header's `NM_CUSTOMDRAW` so its titles are drawn in the theme's ink.
+///
+/// **The dark class gives a dark band and leaves the text where it was.** `DarkMode_ItemsView` is
+/// the right class — it is what Explorer's list gives its header, and it is what turned this band
+/// from white to dark — but the title text kept the light theme's near-black, which over the dark
+/// band is the owner's *"the column header is now black, but so is the text"*. The colour of item
+/// text in a custom-drawn control is the device context's, so this sets it at
+/// `CDDS_ITEMPREPAINT` and answers `CDRF_NEWFONT`, which is how a control is told the attributes
+/// it should now draw with.
+///
+/// Returns the value the window procedure must return, or `None` when this is not a stage worth
+/// answering — a caller that returns zero for those is correct, `CDRF_DODEFAULT` being zero.
+///
+/// # Safety
+///
+/// `lparam` must be the `NMCUSTOMDRAW` a header sent with `NM_CUSTOMDRAW`. The stage is read
+/// before anything else in the structure, and only the device context is touched.
+pub unsafe fn custom_draw(lparam: LPARAM, ink: u32) -> Option<isize> {
+    if lparam.0 == 0 {
+        return None;
+    }
+    let draw = unsafe { &*(lparam.0 as *const NMCUSTOMDRAW) };
+    match draw.dwDrawStage {
+        CDDS_PREPAINT => Some(CDRF_NOTIFYITEMDRAW),
+        CDDS_ITEMPREPAINT => {
+            unsafe {
+                SetTextColor(draw.hdc, COLORREF(ink));
+            }
+            Some(CDRF_NEWFONT)
+        }
+        _ => Some(CDRF_DODEFAULT),
+    }
+}
+
+/// The theme's header ink as a `COLORREF` — `0x00BBGGRR`, which is the byte order GDI wants and
+/// the reverse of the one everything else in this program writes.
+pub fn header_ink() -> u32 {
+    let ink = tailhawk_core::theme::theme().header_ink;
+    let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
+    byte(ink[0]) | (byte(ink[1]) << 8) | (byte(ink[2]) << 16)
+}
+
 pub fn carries_item(code: u32) -> bool {
     matches!(code, HDN_ENDTRACKW | HDN_ENDDRAG | HDN_ITEMCLICKW)
 }

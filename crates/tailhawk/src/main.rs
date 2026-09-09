@@ -9893,6 +9893,16 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // told the rounded width so it never shows a boundary the grid does not honour.
             let pane = header.idFrom as i64 - header::ID_HEADER_BASE as i64;
             if (0..header::MAX_HEADERS as i64).contains(&pane) {
+                // §2.5: the header draws its own titles, and the ink it uses is the device
+                // context's. The dark class darkens the band and leaves the text alone, so the
+                // colour is set here, at the stage the control asks about.
+                if header.code == header::NM_CUSTOMDRAW {
+                    if let Some(answer) =
+                        unsafe { header::custom_draw(lparam, header::header_ink()) }
+                    {
+                        return LRESULT(answer);
+                    }
+                }
                 let request = unsafe { header::request_from_notify(lparam) };
                 let from_control = header.hwndFrom;
                 if let Some(request) = request {
