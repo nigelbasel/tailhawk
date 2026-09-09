@@ -4142,6 +4142,9 @@ struct Shell {
     /// Files being opened on workers — one receiver each. Several at once is a file set from the
     /// command line or a watched folder adopting new files (§8.1).
     reading: Vec<Receiver<std::result::Result<Document, String>>>,
+    /// Loki requests in flight. **Every one of them used to run on this thread**, which is why
+    /// opening a source froze the window for as many round trips as the source needed.
+    fetching: Vec<Receiver<Fetched>>,
     /// Watched folders — a directory and a glob; new matching files are adopted as tabs as they
     /// appear (§8.1). Scanned on the follow tick, every [`WATCH_EVERY_TICKS`].
     watching: Vec<Watch>,
@@ -4447,6 +4450,34 @@ impl Shell {
             }
             Err(TryRecvError::Empty) => {}
         }
+    }
+
+    /// Takes whatever the Loki workers have finished, on the thread that owns the window.
+    ///
+    /// **Drained where the file reads are drained**, on the device-poll tick, because a remote
+    /// source is a document like any other and the window already knows how to wait for one.
+    /// Nothing here does I/O: the picker is a dialog, the spill is a file this thread creates, and
+    /// the tail is a worker that starts and goes away.
+    fn poll_fetch(&mut self, hwnd: HWND) -> Vec<Fetched> {
+        let mut landed = Vec::new();
+        let mut at = 0;
+        while at < self.fetching.len() {
+            match self.fetching[at].try_recv() {
+                Ok(answer) => {
+                    self.fetching.remove(at);
+                    landed.push(answer);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.fetching.remove(at);
+                    // A worker that died without answering is a bug, not a fault of the source, and
+                    // the window must not sit there saying "asking…" for ever.
+                    self.notice = Some("The request to Loki did not finish.".to_owned());
+                    self.refresh_title(hwnd);
+                }
+                Err(TryRecvError::Empty) => at += 1,
+            }
+        }
+        landed
     }
 
     fn poll_file(&mut self, hwnd: HWND) {
@@ -7673,6 +7704,98 @@ fn set_notice(hwnd: HWND, text: String) {
 /// it is this one.
 const APP_LABEL: &str = "app";
 
+/// What a worker asked Loki for, and what came back.
+///
+/// **Every Loki request runs on a worker now, and this is what it hands back.** They used to run on
+/// the message loop: opening a source froze the window for a token exchange, a label call, a second
+/// token exchange and a query — four round trips against a shared server, with nothing painting and
+/// no way to say what was happening. `open_remote`'s own doc-comment claimed the fetch was on a
+/// worker "and the window keeps painting", which had never been true.
+enum Fetched {
+    /// The applications this source offers, for the picker.
+    Apps {
+        source: tailhawk_core::settings::Source,
+        values: Vec<String>,
+    },
+    /// The label call could not answer. The source still opens — a picker is a convenience, and one
+    /// that can stop you reading your logs is worse than none.
+    NoApps {
+        source: tailhawk_core::settings::Source,
+        why: String,
+    },
+    /// A window of records, ready to become a document called `label`.
+    Records {
+        source: tailhawk_core::settings::Source,
+        label: String,
+        pulled: Box<pull::Pulled>,
+        window_end: tailhawk_core::loki::Nanos,
+    },
+    /// A fetch that failed, in the words the fault chose.
+    Failed { name: String, why: String },
+}
+
+/// Runs `work` on a worker and hands the answer back through a channel the shell drains.
+///
+/// The same shape as [`spawn_open`], deliberately: this window already knows how to wait for a
+/// worker without blocking, and a second mechanism would be a second set of bugs.
+fn spawn_fetch(work: impl FnOnce() -> Fetched + Send + 'static) -> Receiver<Fetched> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx
+}
+
+/// Ask a source which applications it has — **on a worker**.
+fn ask_for_apps(source: tailhawk_core::settings::Source) -> Receiver<Fetched> {
+    spawn_fetch(move || match pull::label_values(&source, APP_LABEL) {
+        Ok(values) if !values.is_empty() => Fetched::Apps { source, values },
+        Ok(_) => {
+            let why = "Loki lists no applications for this source".to_owned();
+            Fetched::NoApps { source, why }
+        }
+        Err(why) => {
+            let why = why.to_string();
+            Fetched::NoApps { source, why }
+        }
+    })
+}
+
+/// Fetch the opening window of records for `source` — **on a worker**.
+///
+/// `label` is what the document will be called: the source's name, or the application chosen for it.
+fn ask_for_records(source: tailhawk_core::settings::Source, label: String) -> Receiver<Fetched> {
+    spawn_fetch(move || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let window = tailhawk_core::loki::Window {
+            start: now - REMOTE_WINDOW_NANOS,
+            end: now,
+        };
+        match pull::pull(
+            &source,
+            window,
+            REMOTE_LIMIT,
+            tailhawk_core::loki::Direction::Backward,
+        ) {
+            Ok(pulled) => Fetched::Records {
+                source,
+                label,
+                pulled: Box::new(pulled),
+                window_end: window.end,
+            },
+            // **The reason is shown, never swallowed.** Every fault says which half failed; a
+            // source that silently opens nothing is the worst outcome available here.
+            Err(why) => Fetched::Failed {
+                name: label,
+                why: why.to_string(),
+            },
+        }
+    })
+}
+
 /// Ask the source which applications it has, let the user pick, and open what they picked.
 ///
 /// The owner's ask of 2026-08-31, and the shape of it is his words: *"choose multiple apps … and
@@ -7680,31 +7803,26 @@ const APP_LABEL: &str = "app";
 /// selector names them all; separate is one document per name. Both go through the same
 /// [`apps::with_apps`] rewrite of the source's own query, so neither can drift from the other.
 ///
-/// **A source that cannot answer still opens.** The label call is a convenience, not a gate: if it
-/// fails — no credential yet, a server that is down, a Loki too old for the endpoint — the reason is
-/// said and the source opens exactly as it did before there was a picker. A feature that can stop
-/// you reading your logs is worse than no feature.
+/// **This starts the asking and returns.** The label call is a credential read, a token exchange
+/// and an HTTP round trip; run here it froze the window, and the picker appeared out of a window
+/// that had stopped answering. [`Shell::poll_fetch`] is what opens the dialog when the answer
+/// arrives.
 fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
-    let values = match pull::label_values(&source, APP_LABEL) {
-        Ok(values) if !values.is_empty() => values,
-        Ok(_) => {
-            set_notice(
-                hwnd,
-                format!(
-                    "{}: Loki lists no applications for this source — opening all of it.",
-                    source.name
-                ),
-            );
-            open_remote(hwnd, source.clone(), source.name.clone());
-            return;
+    let name = source.name.clone();
+    let waiting = ask_for_apps(source);
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            shell.fetching.push(waiting);
         }
-        Err(why) => {
-            set_notice(hwnd, format!("{}: {why} Opening all of it.", source.name));
-            open_remote(hwnd, source.clone(), source.name.clone());
-            return;
-        }
-    };
+    });
+    set_notice(hwnd, format!("{name}: asking which applications it has…"));
+    unsafe {
+        SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
+    }
+}
 
+/// The picker, once the applications are known. Runs on the UI thread, where a modal dialog belongs.
+fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<String>) {
     let mut pick = dialog::AppsPick {
         list: tailhawk_core::apps::AppList::new(
             &values,
@@ -7716,7 +7834,8 @@ fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
         // Cancelled, or accepted with nothing ticked. Nothing ticked means "no narrowing", which is
         // the source as configured — and that is what the user gets rather than an empty window.
         if pick.choice.is_some() {
-            open_remote(hwnd, source.clone(), source.name.clone());
+            let label = source.name.clone();
+            open_remote(hwnd, source, label);
         }
         return;
     }
@@ -7789,40 +7908,34 @@ const REMOTE_LIMIT: u32 = 1_000;
 
 /// §12.3: fetch a remote source and open what comes back as an ordinary document.
 ///
-/// **The fetch happens on a worker and the window keeps painting**, exactly as opening a large file
-/// does — a token exchange and a query are two round trips and neither belongs on the UI thread.
-/// What comes back is CLEF, written to a locked-down spill, and `format.rs`'s `ndjson` detector
-/// recognises it: a Loki source becomes a document with no new document type anywhere.
+/// **This asks and returns; the window keeps painting.** A token exchange and a query are two round
+/// trips and neither belongs on the message loop — the doc-comment here has claimed that since the
+/// first version and it only became true on 2026-09-09. [`Shell::poll_fetch`] takes the records when
+/// they land and calls [`landed_records`], which is the half that needs the UI thread.
 fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: String) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
-    let window = tailhawk_core::loki::Window {
-        start: now - REMOTE_WINDOW_NANOS,
-        end: now,
-    };
-    // **The label, not the source's name.** They differ when the picker opened one window per
-    // application: the source name is the key its credential is stored under and must not change,
-    // while what the tab says should be the application the user picked.
-    let name = label;
-
-    let pulled = pull::pull(
-        &source,
-        window,
-        REMOTE_LIMIT,
-        tailhawk_core::loki::Direction::Backward,
-    );
-    let pulled = match pulled {
-        Ok(pulled) => pulled,
-        Err(why) => {
-            // **The reason is shown, never swallowed.** Every fault says which half failed; a
-            // source that silently opens nothing is the worst outcome available here.
-            set_notice(hwnd, format!("{name}: {why}"));
-            return;
+    let waiting = ask_for_records(source, label.clone());
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            shell.fetching.push(waiting);
         }
-    };
+    });
+    set_notice(hwnd, format!("{label}: fetching the last hour…"));
+    unsafe {
+        SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
+    }
+}
 
+/// The records have arrived: spill them, start the tail, open the document.
+///
+/// **What is left on the UI thread is what has to be.** Creating the spill and opening the document
+/// touch the shell; the tail is a worker of its own from here on.
+fn landed_records(
+    hwnd: HWND,
+    source: tailhawk_core::settings::Source,
+    name: String,
+    pulled: pull::Pulled,
+    window_end: tailhawk_core::loki::Nanos,
+) {
     // **A `SpillSet`, not a `Spill`.** A pipe ends and a tail does not, so the file this writes
     // cannot be one that only grows: `stdin.rs` rolls it into parts and deletes the oldest behind
     // it. The parts live in a directory of their own, which is also what makes `Document::open`'s
@@ -7882,7 +7995,7 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
     let tail = tail::Tail::start(
         source,
         writer,
-        pulled.newest.unwrap_or(window.end),
+        pulled.newest.unwrap_or(window_end),
         &pulled.clef,
         notices,
     );
@@ -8995,12 +9108,35 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == DEVICE_POLL_TIMER => {
-            STATE.with(|s| {
+            let fetched = STATE.with(|s| {
+                let mut fetched = Vec::new();
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.poll_device(hwnd);
                     shell.poll_file(hwnd);
+                    fetched = shell.poll_fetch(hwnd);
                 }
+                fetched
             });
+            // **Outside the borrow**: opening the picker pumps a modal loop, and creating a
+            // document reaches back into the shell. Both would be a second borrow from inside the
+            // first, which is the shape every re-entrancy fault in this file has had.
+            for answer in fetched {
+                match answer {
+                    Fetched::Apps { source, values } => pick_apps(hwnd, source, values),
+                    Fetched::NoApps { source, why } => {
+                        let label = source.name.clone();
+                        set_notice(hwnd, format!("{label}: {why} — opening all of it."));
+                        open_remote(hwnd, source, label);
+                    }
+                    Fetched::Records {
+                        source,
+                        label,
+                        pulled,
+                        window_end,
+                    } => landed_records(hwnd, source, label, *pulled, window_end),
+                    Fetched::Failed { name, why } => set_notice(hwnd, format!("{name}: {why}")),
+                }
+            }
             LRESULT(0)
         }
         // V15: UI Automation asks for the root provider; the answer is ours.
@@ -10504,6 +10640,7 @@ fn main() -> Result<()> {
             pending: Some(rx),
             driver: None,
             reading,
+            fetching: Vec::new(),
             watching,
             ticks: 0,
             initial_chips,
