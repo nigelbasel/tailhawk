@@ -8259,8 +8259,8 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                 .map_or(HWND::default(), |shell| shell.rules_dialog)
         });
         if !up.is_invalid() {
-            // §12 gives the editor one key that both reaches it and dismisses it, and a modeless
-            // dialog can honour that literally: `Ctrl+H` again takes it down.
+            // §12 gives the editor one key that both reaches it and dismisses it. The box is modal
+            // now, so this can only be reached if one is somehow still up.
             unsafe {
                 let _ = DestroyWindow(up);
             }
@@ -8273,12 +8273,9 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                 shell.open_rules_editor();
             }
         });
-        let hdlg = dialog::create_rules_dialog(hwnd);
-        STATE.with(|s| {
-            if let Some(shell) = s.borrow_mut().as_mut() {
-                shell.rules_dialog = hdlg;
-            }
-        });
+        // Modal since 2026-09-09: this returns when the box has gone, and `rules_proc` has already
+        // told the shell through `rules_dialog_closed` on its way out.
+        dialog::show_rules_dialog(hwnd);
         return true;
     }
     let goto = STATE.with(|s| {

@@ -222,16 +222,21 @@ pub fn header_context(
 
 /// A grid line's right-click menu: the selection's acts first, then the row's. Everything with a
 /// selection subject is disabled without one — disabled, not hidden, per §1.1.
+///
+/// **No accelerators here, and that is the guide's rule rather than a preference.** *Menus*:
+/// "Don't display shortcut key assignments within context menus. Context menus don't display the
+/// shortcut key assignments because they are optimized for efficiency." The menu bar is where the
+/// keys are taught; a context menu is where the hand already is.
 pub fn grid_context(has_selection: bool, detail: bool) -> Vec<tailhawk_core::menu::Item> {
     use tailhawk_core::menu::Item;
     let on = |item: Item, yes: bool| if yes { item } else { item.disabled() };
     vec![
         on(
-            Item::command("&Copy", "Ctrl+C", command_id(Command::Copy)),
+            Item::command("&Copy", "", command_id(Command::Copy)),
             has_selection,
         ),
         on(
-            Item::command("Copy as TS&V", "Ctrl+Shift+C", command_id(Command::CopyTsv)),
+            Item::command("Copy as TS&V", "", command_id(Command::CopyTsv)),
             has_selection,
         ),
         Item::separator(),
@@ -244,17 +249,13 @@ pub fn grid_context(has_selection: bool, detail: bool) -> Vec<tailhawk_core::men
             has_selection,
         ),
         Item::separator(),
-        Item::command("&Bookmark", "Ctrl+D", command_id(Command::ToggleBookmark)),
+        Item::command("&Bookmark", "", command_id(Command::ToggleBookmark)),
         // §7, rung one: the row's trace becomes a filter. On the row menu because that is where a
         // person is when they have found the line they want to follow.
-        Item::command(
-            "Follo&w this trace",
-            "Ctrl+T",
-            command_id(Command::FollowTrace),
-        ),
+        Item::command("Follo&w this trace", "", command_id(Command::FollowTrace)),
         Item::check(
             "&Record detail",
-            "Ctrl+Enter",
+            "",
             command_id(Command::ToggleDetail),
             detail,
         ),
@@ -407,6 +408,10 @@ pub fn menu_bar(
                     open,
                 ),
                 on(cmd("C&lear search", "Esc", Command::ClearSearch), open),
+                // **Edit, not View.** The guide's standard Edit menu is Find… / Find next / Replace… /
+                // Go to…, and a person looking for "go to line" looks where every other program
+                // keeps it.
+                on(Item::command("&Go to line…", "Ctrl+G", ID_GOTO), open),
                 Item::separator(),
                 on(
                     cmd("Filter: &include", "Ctrl+L", Command::FilterInclude),
@@ -506,7 +511,6 @@ pub fn menu_bar(
                 ),
                 Item::separator(),
                 on(cmd("Go to &top", "Ctrl+Home", Command::GoToTop), open),
-                on(Item::command("&Go to line…", "Ctrl+G", ID_GOTO), open),
                 on(cmd("&Split pane", "Ctrl+\\", Command::Split), open),
                 on(
                     cmd("Focus other pa&ne", "F6", Command::FocusOtherPane),
@@ -558,11 +562,6 @@ pub fn menu_bar(
                 Item::separator(),
                 on(cmd("&Reset columns", "", Command::ResetColumns), columns),
                 on(cmd("Clear &sort", "", Command::ClearSort), columns),
-                Item::separator(),
-                // §2.2 keeps a Font entry beside Preferences because a user looking for a font does
-                // not think to look under Preferences. Both open the same sheet; this one opens it
-                // on the font row.
-                Item::command("&Font…", "", ID_FONT),
             ],
         ),
         Item::submenu(
@@ -583,15 +582,21 @@ pub fn menu_bar(
             ],
         ),
         Item::submenu(
-            "&Settings",
+            // **`Tools`, not `Settings`.** The UX guide forbids both words this menu used to use:
+            // "Settings: Don't use as a menu label. Use Options instead" and "Preferences: Don't
+            // use. Use Options instead." `Tools` is the standard category and `Options` the
+            // standard item, which is also where a person goes looking for them.
+            "&Tools",
             vec![
                 check("&Dark theme", "", Command::ToggleTheme, dark),
-                Item::separator(),
                 // §12.4's remote sources. Never disabled: it is where a source is first defined,
                 // so needing one open to reach it would be a door locked from the inside.
                 cmd("&Remote sources…", "", Command::EditSources),
+                Item::command("&Font…", "", ID_FONT),
                 Item::separator(),
-                Item::command("&Preferences…", "", ID_PREFS),
+                // **No ellipsis**: the guide lists Options among the commands whose implicit verb
+                // is to show a window, which therefore do not take one.
+                Item::command("&Options", "", ID_PREFS),
             ],
         ),
         Item::submenu(
@@ -875,11 +880,13 @@ mod tests {
             &[],
             &[],
         );
+        // Renamed 2026-09-09 to what the UX guide calls them: `Tools` rather than `Settings`, and
+        // `Options` rather than `Preferences`, with `Font…` moved to the same menu.
         for (top, label) in [
-            ("Settings", "Preferences"),
+            ("Tools", "Options"),
+            ("Tools", "Font"),
             ("Help", "Keyboard map"),
             ("Help", "About Tailhawk"),
-            ("Format", "Font"),
         ] {
             let at = menu
                 .items()
@@ -1056,6 +1063,30 @@ mod tests {
                 .find(|i| i.text().contains("Dark theme"))
                 .expect("the Settings menu carries the theme toggle");
             assert_eq!(theme_item.checked, dark);
+        }
+    }
+
+    /// **A context menu never prints a shortcut key.** *Menus*: "Don't display shortcut key
+    /// assignments within context menus. Context menus don't display the shortcut key assignments
+    /// because they are optimized for efficiency." The menu bar teaches the keys; the context menu
+    /// is where the hand already is. Ours printed them until 2026-09-09.
+    #[test]
+    fn no_context_menu_prints_a_shortcut_key() {
+        let menus: Vec<(&str, Vec<tailhawk_core::menu::Item>)> = vec![
+            ("grid", grid_context(true, false)),
+            ("grid, no selection", grid_context(false, true)),
+            ("header", header_context("timestamp", Some(true), true)),
+            ("filter row", panel_row_context(true, true)),
+        ];
+        for (name, items) in menus {
+            for item in &items {
+                assert!(
+                    item.accelerator.is_empty(),
+                    "{name}: \"{}\" prints \"{}\"",
+                    item.text(),
+                    item.accelerator
+                );
+            }
         }
     }
 }

@@ -978,21 +978,24 @@ fn apps_dialog_items() -> Vec<Item> {
             WS_TABSTOP,
         ),
         Item::new(Class::Static, "", ID_A_COUNT, (7, 204, 246, 9), 0),
+        // **Right-aligned in one row, in the guide's order.** *Dialog Boxes*: "Right-align commit
+        // buttons in a single row across the bottom of the dialog box", and the order is the
+        // affirmative responses, then Cancel. They were strewn along the bottom until 2026-09-09.
         Item::new(
             Class::Button,
             "&Interleave",
             1,
-            (7, 218, 78, 14),
+            (85, 218, 78, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
         Item::new(
             Class::Button,
             "&Separate windows",
             ID_A_SEPARATE,
-            (91, 218, 100, 14),
+            (167, 218, 92, 14),
             WS_TABSTOP,
         ),
-        Item::new(Class::Button, "Cancel", 2, (259, 218, 60, 14), WS_TABSTOP),
+        Item::new(Class::Button, "Cancel", 2, (263, 218, 56, 14), WS_TABSTOP),
     ]
 }
 
@@ -1306,14 +1309,14 @@ fn rules_dialog_items() -> Vec<Item> {
             Class::Button,
             "&Save",
             ID_R_SAVE,
-            (R_VERB_X - 55, 208, 50, 14),
+            (303, 211, 50, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
         Item::new(
             Class::Button,
-            "&Close",
+            "Cancel",
             IDCANCEL,
-            (R_VERB_X, 208, 50, 14),
+            (357, 211, 56, 14),
             WS_TABSTOP,
         ),
     ]
@@ -1354,9 +1357,16 @@ fn rules_state(hdlg: HWND) -> Option<&'static mut RulesState> {
 ///
 /// The editor itself lives on the shell, not in here: the dialog reads and writes it through
 /// [`crate::rules_read`] and [`crate::rules_apply`], and the second of those repaints the log
-/// under the box on every change. That is §5's "live preview over the real file", and it is the
-/// whole reason this is not a modal like its two siblings.
-pub fn create_rules_dialog(owner: HWND) -> HWND {
+/// under the box on every change. That is §5's "live preview over the real file".
+///
+/// **Modal since 2026-09-09, and the preview survives it.** The owner: *"regarding the rules editor
+/// not being modal, the background window should still get redrawn when a change is made, it
+/// doesnt need it to be modeless to have a live preview"* — which is right: a modal dialog runs a
+/// message loop that dispatches the owner's `WM_PAINT` like any other, so the log still recolours
+/// under it as a pattern is typed. What modeless bought was scrolling the log while the box was
+/// open, and what it cost was a dialog that could be sent behind its owner and closed from the
+/// menu bar. Returns when the box has gone.
+pub fn show_rules_dialog(owner: HWND) {
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_LISTVIEW_CLASSES,
@@ -1371,23 +1381,15 @@ pub fn create_rules_dialog(owner: HWND) -> HWND {
         owner,
         custom: [COLORREF(0x00FF_FFFF); 16],
     }));
-    let created = unsafe {
-        CreateDialogIndirectParamW(
+    unsafe {
+        DialogBoxIndirectParamW(
             None,
             t.as_ptr() as *const DLGTEMPLATE,
             owner,
             Some(rules_proc),
             LPARAM(state as isize),
-        )
-    };
-    let Ok(hdlg) = created else {
-        drop(unsafe { Box::from_raw(state) });
-        return HWND::default();
-    };
-    unsafe {
-        let _ = ShowWindow(hdlg, SW_SHOW);
+        );
     }
-    hdlg
 }
 
 /// Rebuilds the list from the live editor and points every field at `keep`.
@@ -1870,8 +1872,12 @@ unsafe extern "system" fn rules_proc(
                     1
                 }
                 (IDCANCEL, _) => {
+                    // **`EndDialog`, not `DestroyWindow`.** The box is modal since 2026-09-09, and
+                    // a modal dialog destroyed out from under its own loop leaves that loop running
+                    // and the owner disabled  14 an application that looks hung. Caught by driving
+                    // it: Cancel destroyed the window and the main window never came back.
                     unsafe {
-                        let _ = DestroyWindow(hdlg);
+                        let _ = EndDialog(hdlg, 0);
                     }
                     1
                 }
@@ -1880,7 +1886,7 @@ unsafe extern "system" fn rules_proc(
         }
         WM_CLOSE => {
             unsafe {
-                let _ = DestroyWindow(hdlg);
+                let _ = EndDialog(hdlg, 0);
             }
             1
         }

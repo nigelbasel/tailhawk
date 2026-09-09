@@ -29,17 +29,17 @@ behaves, that is said in the finding rather than glossed.
 
 | # | Surface | Verdict | Finding |
 |---|---|---|---|
-| 1 | Menu bar | **Fails** | `Settings` is a menu category and `Preferences…` a menu item. The guide forbids both words by name. |
-| 2 | Menu bar | **Fails** | `Preferences…` carries an ellipsis it should not have. |
-| 3 | Context menu | **Fails** | The row context menu prints shortcut keys. Context menus never do. |
-| 4 | Edit menu | **Partly** | No `Select all`; `Go to line` is under View where the standard puts it in Edit. |
+| 1 | Menu bar | **Fixed 2026-09-09** | `Settings` is a menu category and `Preferences…` a menu item. The guide forbids both words by name. |
+| 2 | Menu bar | **Fixed 2026-09-09** | `Preferences…` carries an ellipsis it should not have. |
+| 3 | Context menu | **Fixed 2026-09-09** | The row context menu prints shortcut keys. Context menus never do. |
+| 4 | Edit menu | **Part fixed** | No `Select all`; `Go to line` is under View where the standard puts it in Edit. |
 | 5 | Toolbar | **Fails** | No `Open remote source` button, though it is among the most used commands. |
 | 6 | Toolbar | **Fails** | `Collapse`'s icon is not self-explanatory — the owner could not tell what it was. |
 | 7 | Toolbar | **Partly** | Right-clicking the toolbar does nothing; a toolbar with options owes a context menu. |
 | 8 | Column header | **Fails** | No way to choose columns. The guide names the exact remedy. |
-| 9 | Applications picker | **Fails** | Commit buttons are spread across the bottom instead of right-aligned in one row. |
-| 10 | Highlight rules | **Fails** | Commit buttons are not right-aligned; `Close` carries an access key it should not have. |
-| 11 | Highlight rules | **Decision** | Modeless by §5's design; the owner wants modal with Save/Cancel. |
+| 9 | Applications picker | **Fixed 2026-09-09** | Commit buttons are spread across the bottom instead of right-aligned in one row. |
+| 10 | Highlight rules | **Fixed 2026-09-09** | Commit buttons are not right-aligned; `Close` carries an access key it should not have. |
+| 11 | Highlight rules | **Done as asked** | Modeless by §5's design; the owner wants modal with Save/Cancel. |
 | 12 | Title bar | **Fails** | The title carries frame timings and atlas statistics — diagnostics shipped to a user. |
 | 13 | Detail pane | **Fails** | Drawn over the grid with no frame of its own; the rule line renders as a row of boxes. |
 | 14 | Column headings | **Partly** | Headings are lower-case field names; the guide asks for sentence-style capitalisation. |
@@ -304,3 +304,31 @@ and therefore not audited: the Wizards page against the format wizard's flow, th
 Confirmations pages against our notices, the Accessibility page against the UIA provider, and the
 Layout page against control spacing inside each dialog. Those are the next reading if this review is
 to be complete rather than representative.
+
+---
+
+## What has been done since this review was written
+
+**2026-09-09, the same day.**
+
+- **1, 2 — `Settings`/`Preferences`.** The category is **Tools** and the item is **Options**, with no
+  ellipsis. `Font…` moved there from Format, where §2.2 had put a second copy beside Preferences;
+  one home, the standard one.
+- **3 — context-menu accelerators.** Stripped from the grid, header and filter-row menus, and pinned
+  by `no_context_menu_prints_a_shortcut_key`, which walks every context menu the program builds.
+- **4 — `Go to line…` moved to Edit**, where the guide's standard menu puts it. `Select all` is
+  deliberately **not** added: this program opens multi-gigabyte files, and a command whose obvious
+  next step is Copy would offer to put ten gigabytes on the clipboard. Recorded as a considered
+  exception rather than an oversight.
+- **9 — the applications picker's commit row** is right-aligned: `Interleave`, `Separate windows`,
+  `Cancel`.
+- **10, 11 — the highlight rules editor is modal**, its commit row is right-aligned at the bottom,
+  and the buttons are **Save** and **Cancel** — the closing button losing the access key it should
+  never have had. The live preview survives, exactly as the owner said it would: a modal loop
+  dispatches the owner's `WM_PAINT` like any other, so the log recolours under the box as a pattern
+  is typed.
+
+  **A defect found by driving it rather than reading it:** the proc still called `DestroyWindow` on
+  its way out, which for a modal dialog destroys the window and leaves the modal loop running — the
+  owner window stayed disabled and the application looked hung. `EndDialog` is what ends a modal
+  dialog. Verified by asking Windows whether the owner is enabled before, during and after.
