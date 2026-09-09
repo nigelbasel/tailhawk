@@ -7680,10 +7680,26 @@ fn chosen_from_bar(hwnd: HWND, id: u32) {
     }
 }
 
-fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
+/// §2.4's context menus. `on_header` is the header control the click landed on, if it was one.
+///
+/// **The header's menu had no way in at all.** `Document::header_hit` answers `None` whenever the
+/// real control exists, and that branch was the only place the header menu was built — so `Sort
+/// ascending`, `Top N…` and `Filter on <column>…` could be reached by neither mouse nor keyboard
+/// for as long as the control has been there. The control answers for its own band now, and
+/// `header::item_at` is asked *before* the borrow, since it sends the control a message.
+fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
     use windows::Win32::Graphics::Gdi::ClientToScreen;
 
     let keyboard = sx == -1 && sy == -1;
+    let header_item = match (on_header, keyboard) {
+        (Some(control), false) => match header::item_at(control, sx, sy) {
+            // The strip past the last column is the control's, but it names no column: the grid's
+            // menu would be wrong there and no menu is the honest answer.
+            None => return,
+            item => item,
+        },
+        _ => None,
+    };
     let mut point = POINT { x: sx, y: sy };
     if !keyboard {
         unsafe {
@@ -7693,7 +7709,17 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
     let resolved = STATE.with(|s| {
         let mut state = s.borrow_mut();
         let shell = state.as_mut()?;
-        let doc = shell.document.as_mut()?;
+        // **The document is found by the control's window, never by its id** — the same rule the
+        // notification path follows, and for the same reason: a document changes pane slot on every
+        // split and close, and the window is the one thing that stays its own.
+        let doc = match on_header {
+            Some(control) => shell
+                .document
+                .all_mut()
+                .find(|(_, d)| d.header_ctl.as_ref().is_some_and(|c| c.hwnd() == control))
+                .map(|(_, d)| d)?,
+            None => shell.document.as_mut()?,
+        };
         let (x, y) = if keyboard {
             (
                 doc.view.gutter_px() + 1.0,
@@ -7722,7 +7748,19 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32) {
                     _ => None,
                 }
             });
-        let under = if let Some(at) = row.filter(|&i| i < doc.filtering.chips.chips.len()) {
+        let under = if let Some(item) = header_item {
+            // The control's items are `header_columns`' boxes in the same order, and each box knows
+            // which layout column it names — the mapping the notification path already uses, so a
+            // hidden column cannot make the menu act on its neighbour.
+            let column = header::column_of_item(&doc.header_columns(), item)?;
+            let layout = doc.layout.as_ref()?;
+            Under::Header {
+                column,
+                title: layout.title(column).to_owned(),
+                sort_here: layout.sort.and_then(|(c, d)| (c == column).then_some(d)),
+                any_sort: layout.sort.is_some(),
+            }
+        } else if let Some(at) = row.filter(|&i| i < doc.filtering.chips.chips.len()) {
             doc.filter_selected = Some(at);
             let chip = &doc.filtering.chips.chips[at];
             Under::ChipRow {
@@ -10431,16 +10469,25 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // the way to show and hide it. Without this test a right-click on the bar dropped the
             // grid's menu, which offered to sort a column the pointer was nowhere near.
             let from = HWND(wparam.0 as *mut core::ffi::c_void);
-            let on_toolbar = STATE.with(|s| {
-                s.borrow()
-                    .as_ref()
-                    .and_then(|shell| shell.toolbar.as_ref())
-                    .is_some_and(|bar| bar.owns(from))
+            let (on_toolbar, on_header) = STATE.with(|s| {
+                let state = s.borrow();
+                let Some(shell) = state.as_ref() else {
+                    return (false, None);
+                };
+                let header = shell
+                    .document
+                    .all()
+                    .any(|d| d.header_ctl.as_ref().is_some_and(|c| c.hwnd() == from))
+                    .then_some(from);
+                (
+                    shell.toolbar.as_ref().is_some_and(|bar| bar.owns(from)),
+                    header,
+                )
             });
             if on_toolbar {
                 toolbar_menu(hwnd, sx, sy);
             } else {
-                context_menu(hwnd, sx, sy);
+                context_menu(hwnd, sx, sy, on_header);
             }
             LRESULT(0)
         }

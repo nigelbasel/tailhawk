@@ -22,14 +22,14 @@
 use crate::tabstrip::shell_font;
 use tailhawk_core::rows::HeaderColumn;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{DeleteObject, SetTextColor, HFONT, HGDIOBJ};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{DeleteObject, ScreenToClient, SetTextColor, HFONT, HGDIOBJ};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, HDF_FIXEDWIDTH, HDF_LEFT, HDF_SORTDOWN, HDF_SORTUP, HDF_STRING, HDITEMW,
-    HDI_FORMAT, HDI_TEXT, HDI_WIDTH, HDLAYOUT, HDM_DELETEITEM, HDM_GETITEMCOUNT, HDM_INSERTITEMW,
-    HDM_LAYOUT, HDM_SETITEMW, HDS_BUTTONS, HDS_DRAGDROP, HDS_FULLDRAG, HDS_HORZ,
-    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, NMCUSTOMDRAW, NMCUSTOMDRAW_DRAW_STAGE, NMHEADERW,
-    WC_HEADERW,
+    InitCommonControlsEx, HDF_FIXEDWIDTH, HDF_LEFT, HDF_SORTDOWN, HDF_SORTUP, HDF_STRING,
+    HDHITTESTINFO, HDITEMW, HDI_FORMAT, HDI_TEXT, HDI_WIDTH, HDLAYOUT, HDM_DELETEITEM,
+    HDM_GETITEMCOUNT, HDM_HITTEST, HDM_INSERTITEMW, HDM_LAYOUT, HDM_SETITEMW, HDS_BUTTONS,
+    HDS_DRAGDROP, HDS_FULLDRAG, HDS_HORZ, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, NMCUSTOMDRAW,
+    NMCUSTOMDRAW_DRAW_STAGE, NMHEADERW, WC_HEADERW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, SendMessageW, SetWindowPos, ShowWindow, HMENU, HWND_TOP,
@@ -222,6 +222,52 @@ pub(crate) fn trace(line: &str) {
 /// must never be asked to act on a column that is not there.
 pub fn item_to_box(item: usize) -> Option<usize> {
     item.checked_sub(1)
+}
+
+/// The header item under a screen point, for the context menu that had no way in.
+///
+/// **§2.4's header menu was unreachable.** `Document::header_hit` returns `None` whenever the real
+/// control exists — right in itself, since the control owns its band — but that was the only branch
+/// the header's context menu was built under, and the control exists for every pane with columns.
+/// `Sort ascending`, `Sort descending`, `Top N…`, `Filter on <column>…` and `Clear sort` could
+/// therefore be reached by neither mouse nor keyboard. The control has to answer for its own band,
+/// and `HDM_HITTEST` is how it says which item a point is on.
+///
+/// A free function taking the handle, so the caller can send this message with no `STATE` borrow
+/// held. `None` means the point is on no item — the strip past the last column, most often.
+pub fn item_at(hwnd: HWND, screen_x: i32, screen_y: i32) -> Option<usize> {
+    let mut hit = HDHITTESTINFO {
+        pt: POINT {
+            x: screen_x,
+            y: screen_y,
+        },
+        ..Default::default()
+    };
+    unsafe {
+        if !ScreenToClient(hwnd, &mut hit.pt).as_bool() {
+            return None;
+        }
+        SendMessageW(
+            hwnd,
+            HDM_HITTEST,
+            WPARAM(0),
+            LPARAM(&mut hit as *mut HDHITTESTINFO as isize),
+        );
+    }
+    (hit.iItem >= 0).then_some(hit.iItem as usize)
+}
+
+/// The layout column a control item names, given the boxes the control was filled from.
+///
+/// **The box knows its column; the item's number does not.** Items are `header_columns`' boxes in
+/// order after the gutter, but a hidden column leaves the layout's numbering with a gap — so
+/// arithmetic on the item index would act on the neighbour of the column the user clicked. This is
+/// the same read the notification path does, given a name so the context menu cannot do it a
+/// second, different way.
+pub fn column_of_item(boxes: &[HeaderColumn], item: usize) -> Option<usize> {
+    item_to_box(item)
+        .and_then(|b| boxes.get(b))
+        .map(|b| b.column)
 }
 
 /// The width in pixels a column of `cells` cells takes, and the inverse, **rounded** — the grid is a
@@ -505,6 +551,32 @@ unsafe impl Send for Header {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A hidden column is why this is a read and not a subtraction.** The boxes skip what is
+    /// hidden, so with column 1 hidden the second visible box still names column 2 — and a context
+    /// menu that had worked out "item 2 means column 1" would sort the column beside the one the
+    /// user right-clicked, which is the sort of wrong that looks like a bug in sorting.
+    #[test]
+    fn an_item_names_its_boxs_column_even_when_one_is_hidden() {
+        let box_at = |title: &str, column: usize| HeaderColumn {
+            title: title.to_owned(),
+            column,
+            start: 0,
+            cells: 8,
+            content: 7,
+            sort: None,
+        };
+        let boxes = [
+            box_at("timestamp", 0),
+            box_at("message", 2),
+            box_at("trace", 5),
+        ];
+        assert_eq!(column_of_item(&boxes, 0), None, "the gutter names nothing");
+        assert_eq!(column_of_item(&boxes, 1), Some(0));
+        assert_eq!(column_of_item(&boxes, 2), Some(2), "not column 1");
+        assert_eq!(column_of_item(&boxes, 3), Some(5));
+        assert_eq!(column_of_item(&boxes, 4), None, "past the last box");
+    }
 
     /// Item 0 is the gutter and names no box; every other item names the box one before it.
     #[test]
