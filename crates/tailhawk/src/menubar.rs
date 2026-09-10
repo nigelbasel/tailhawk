@@ -318,6 +318,14 @@ pub struct BarState {
     pub large_icons: bool,
     pub maximised: bool,
     pub can_maximise: bool,
+    /// What `Interleave` / `Separate` would do to the windows as they stand: `Some(true)` to
+    /// separate the one in front into several, `Some(false)` to join several into one, `None` when
+    /// neither applies and the item is greyed.
+    ///
+    /// **One item whose words change, not two items.** *Menus*: an item says what choosing it will
+    /// do. At any moment exactly one of these is the opposite of what is on screen, so offering
+    /// both would mean offering one that does nothing.
+    pub regroup_separates: Option<bool>,
 }
 
 /// The configured remote sources as a menu, ending in the way to configure one.
@@ -393,6 +401,7 @@ pub fn menu_bar(
         large_icons,
         maximised,
         can_maximise,
+        regroup_separates: _,
     } = state;
     let open = doc.is_some();
     let selected = doc.is_some_and(|d| d.has_selection());
@@ -417,6 +426,18 @@ pub fn menu_bar(
         // source. It used to disable itself when none was configured, which left the one command
         // this program exists for reachable only by knowing that Tools held the way in.
         Item::submenu("Open re&mote source", remote_menu_of(sources)),
+        // §12.4's regroup, under the command that opened the windows it acts on.
+        on(
+            cmd(
+                match state.regroup_separates {
+                    Some(false) => "&Interleave applications",
+                    _ => "&Separate applications",
+                },
+                "",
+                Command::Regroup,
+            ),
+            state.regroup_separates.is_some(),
+        ),
         on(cmd("&Close Tab", "Ctrl+W", Command::CloseTab), open),
         Item::separator(),
         on(cmd("&Export view…", "", Command::Export), open),
@@ -835,6 +856,49 @@ mod tests {
                 .iter()
                 .map(|i| i.text())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// **One item that says what it will do, not two that describe what is true.** The owner asked
+    /// for "a command to separate if interleaved, and interleave if separate"; the *Menus* page
+    /// asks that an item name the action rather than the state. Greyed when neither applies —
+    /// shown, never hidden, so it can be found and learned before there is a source to use it on.
+    #[test]
+    fn the_regroup_item_names_the_thing_it_would_do() {
+        let file = |separates: Option<bool>| {
+            menu_bar(
+                None,
+                BarState {
+                    toolbar: true,
+                    regroup_separates: separates,
+                    ..BarState::default()
+                },
+                &[],
+                &[],
+            )
+            .at(&[0])
+            .expect("File opens")
+            .iter()
+            .find(|i| i.text().ends_with("applications"))
+            .cloned()
+            .expect("File offers it")
+        };
+        let separating = file(Some(true));
+        assert_eq!(separating.text(), "Separate applications");
+        assert!(separating.enabled);
+
+        let joining = file(Some(false));
+        assert_eq!(joining.text(), "Interleave applications");
+        assert!(joining.enabled);
+
+        let neither = file(None);
+        assert!(
+            !neither.enabled,
+            "nothing to regroup: greyed, and still there to be read"
+        );
+        assert_eq!(
+            separating.id, joining.id,
+            "one command, so one id and one dispatch"
         );
     }
 

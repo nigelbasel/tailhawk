@@ -203,6 +203,10 @@ struct Document {
     lag: Option<tailhawk_core::loki::Nanos>,
     /// Where a remote source's records landed, when this document is one — see [`Document::remote`].
     remote_spill: Option<std::path::PathBuf>,
+    /// The source this document is a view of: its **name** — the settings key, which is what says
+    /// two windows watch the same place — and the query it was opened with, narrowed to the
+    /// applications the user picked. What `Interleave` and `Separate` read.
+    remote_source: Option<(String, String)>,
     /// The current selection, or `None` for "nothing selected".
     ///
     /// A caret — an empty selection at a click — is `Some`, not `None`: `Selection::at` exists so a
@@ -681,9 +685,13 @@ impl Document {
     /// The spill directory is kept for the title, because §13.2 wants the location of fetched
     /// records visible for the same reason it wants a pipe's spill visible: a person tailing
     /// production deserves to know where those bytes are sitting.
-    fn remote(&mut self, source: &str, spill: &std::path::Path) {
+    /// `query` is the source as this document was opened with — the settings source rewritten by
+    /// `apps::with_apps` for the applications the user picked. It is kept so `Interleave` and
+    /// `Separate` can regroup the windows without asking the server again what it holds.
+    fn remote(&mut self, source: &str, spill: &std::path::Path, query: &str) {
         self.summary = source.to_owned();
         self.remote_spill = Some(spill.to_path_buf());
+        self.remote_source = Some((source.to_owned(), query.to_owned()));
     }
 
     /// The line §6.2 defines a format from, and the lines it previews over: the top visible row
@@ -782,6 +790,7 @@ impl Document {
             set,
             summary,
             remote_spill: None,
+            remote_source: None,
             lag: None,
             selection: None,
             dragging: false,
@@ -847,6 +856,7 @@ impl Document {
             // are, in the only place there is to tell them.
             summary: format!("<stdin> → {}", pump.path().display()),
             remote_spill: None,
+            remote_source: None,
             lag: None,
             selection: None,
             dragging: false,
@@ -3448,6 +3458,10 @@ enum Command {
     /// a drag that made a column vanish. The owner, 2026-09-09: "a select columns dialog would be
     /// better".
     SelectColumns,
+    /// The owner's ask of 2026-09-09: one window per application, or one window for all of them —
+    /// whichever is the opposite of what the active window already is. See
+    /// [`tailhawk_core::apps::regroup_of`].
+    Regroup,
     /// §2.3: show or hide the toolbar row.
     ToggleToolbar,
     /// §7: filter the view to the trace the caret's line belongs to.
@@ -3563,6 +3577,11 @@ impl Command {
             "",
         ),
         (Command::SelectColumns, "Select columns…", ""),
+        (
+            Command::Regroup,
+            "Separate a source's applications into windows, or interleave them into one",
+            "",
+        ),
         (Command::ToggleToolbar, "Show or hide the toolbar", ""),
         (Command::FollowTrace, "Follow this trace", "Ctrl+T"),
         (Command::ToolbarLargeIcons, "Large toolbar icons", ""),
@@ -3945,6 +3964,35 @@ impl Tabs {
         }
     }
 
+    /// Each tab as [`tailhawk_core::apps::regroup_of`] needs to see it.
+    ///
+    /// **The first pane decides.** A split tab is two views of one document, so it is one window
+    /// as far as interleaving is concerned; asking the panes separately would offer to close a
+    /// tab twice.
+    fn regroup_tabs(&self) -> Vec<tailhawk_core::apps::Tab> {
+        self.tabs
+            .iter()
+            .map(
+                |tab| match tab.panes.first().and_then(|d| d.remote_source.as_ref()) {
+                    Some((source, query)) => tailhawk_core::apps::Tab::remote(source, query),
+                    None => tailhawk_core::apps::Tab::local(),
+                },
+            )
+            .collect()
+    }
+
+    /// Closes one tab by position, whatever is shown. Reports whether it was there.
+    fn close_tab(&mut self, at: usize) -> bool {
+        if at >= self.tabs.len() {
+            return false;
+        }
+        self.tabs.remove(at);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
+        true
+    }
+
     /// Every document, in every tab.
     fn all(&self) -> impl Iterator<Item = &Document> {
         self.tabs.iter().flat_map(|t| t.panes.iter())
@@ -4309,6 +4357,9 @@ struct Shell {
     pending_import: bool,
     /// Format ▸ Select columns asks for the chooser, the same way.
     pending_columns: bool,
+    /// `Interleave` / `Separate` asks for the tabs to be regrouped — deferred because it closes
+    /// tabs and opens sources, neither of which can happen inside a `STATE` borrow.
+    pending_regroup: bool,
     /// §5's rules editor asks for its dialog. Deferred like the others and for a sharper reason:
     /// `CreateDialogIndirectParamW` runs `WM_INITDIALOG` before it returns, and that reads the
     /// editor through [`rules_read`] — so a `STATE` borrow alive across the call is a re-entrant
@@ -4705,6 +4756,16 @@ impl Shell {
     /// Writes §12.4's state: where the window is, how each open file is being looked at, and
     /// §2.2's `[appearance]` preferences.
     /// The names of the configured remote sources, for File ▸ Open remote source.
+    /// What `Interleave` / `Separate` would do to the windows as they stand — see
+    /// [`menubar::BarState::regroup_separates`]. `None` means the item is greyed.
+    fn regroup_separates(&self) -> Option<bool> {
+        let tabs = self.document.regroup_tabs();
+        match tailhawk_core::apps::regroup_of(&tabs, self.document.active)? {
+            tailhawk_core::apps::Regroup::Separate { .. } => Some(true),
+            tailhawk_core::apps::Regroup::Interleave { .. } => Some(false),
+        }
+    }
+
     fn source_names(&self) -> Vec<String> {
         self.settings
             .sources
@@ -5549,16 +5610,16 @@ impl Shell {
         &mut self,
         hwnd: HWND,
         path: std::path::PathBuf,
-        remote: Option<(String, std::path::PathBuf)>,
+        remote: Option<(String, std::path::PathBuf, String)>,
     ) {
         self.file = Some(match &remote {
-            Some((source, _)) => format!("opening {source}…"),
+            Some((source, _, _)) => format!("opening {source}…"),
             None => format!("opening {}…", path.display()),
         });
         self.reading.push(spawn_open(move || {
             let mut doc = Document::open(&path)?;
-            if let Some((source, spill)) = remote {
-                doc.remote(&source, &spill);
+            if let Some((source, spill, query)) = remote {
+                doc.remote(&source, &spill, &query);
             }
             Ok(doc)
         }));
@@ -6419,6 +6480,12 @@ impl Shell {
                     .is_some_and(|doc| doc.layout.is_some());
                 return self.pending_columns;
             }
+            // Deferred like the dialogs and for the same reason: it closes tabs and opens sources,
+            // and both of those take the `STATE` borrow this match is already holding.
+            Command::Regroup => {
+                self.pending_regroup = true;
+                return true;
+            }
             Command::EditRules => {
                 self.pending_rules = true;
                 return true;
@@ -6492,8 +6559,9 @@ impl Shell {
                 doc.reset_columns();
             }
             // Handled above, where the shell rather than the document is in hand: the chooser is a
-            // modal dialog and so is deferred, like every other one here.
-            Command::SelectColumns => {}
+            // modal dialog and so is deferred, like every other one here — and so is the regroup,
+            // which closes tabs.
+            Command::SelectColumns | Command::Regroup => {}
             Command::SortBy(column, descending) => {
                 doc.sort_by(sort::Order {
                     column,
@@ -7681,6 +7749,110 @@ enum Under {
 /// at the grid's top-left corner, with the caret left where it is. And a right-click *outside* the
 /// selection moves the caret to the line clicked, where one inside it leaves the selection alone,
 /// because there the selection is the subject.
+/// Regroups the source's windows: one window per application, or one window for all of them.
+///
+/// **The owner's ask of 2026-09-09**, and the shape of it is his: *"a command to separate if
+/// interleaved, and interleave if separate"*. [`tailhawk_core::apps::regroup_of`] decides which of
+/// the two the windows in front of the user call for; everything here is the doing.
+///
+/// **It reopens through the picker's own path.** `with_apps` rewrites the *configured* source's
+/// query exactly as `pick_apps` does, so a window that arrived by regrouping and one that arrived
+/// by ticking boxes are the same window. What is lost is the scrollback: each new window fetches
+/// the last hour again, and the notice says so rather than letting it be a surprise.
+fn regroup_now(hwnd: HWND) {
+    let plan = STATE.with(|s| {
+        let state = s.borrow();
+        let shell = state.as_ref()?;
+        let tabs = shell.document.regroup_tabs();
+        let plan = tailhawk_core::apps::regroup_of(&tabs, shell.document.active)?;
+        // The *configured* source, not the narrowed one this window holds: `with_apps` replaces the
+        // application matcher, and starting from the configuration keeps the credential's name and
+        // every other matcher the user wrote.
+        let name = tabs.get(shell.document.active)?.source.clone()?;
+        let source = shell
+            .settings
+            .sources
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()?;
+        Some((plan, source))
+    });
+    let Some((plan, source)) = plan else {
+        return;
+    };
+    let (closing, apps, separate) = match plan {
+        tailhawk_core::apps::Regroup::Separate { tab, apps } => (vec![tab], apps, true),
+        tailhawk_core::apps::Regroup::Interleave { tabs, apps } => (tabs, apps, false),
+    };
+    if separate {
+        if let Some(why) = tailhawk_core::apps::too_many_windows(apps.len()) {
+            set_notice(hwnd, why);
+            return;
+        }
+    }
+    // **Every new window is written before the old ones are closed.** `with_apps` fails for a whole
+    // source at once — a query with no selector it can parse fails for every group alike — so
+    // discovering that *after* closing meant the user lost every window and got nothing back. This
+    // is the same order as `too_many_windows` above: refuse first, destroy second.
+    let names: Vec<&str> = apps.iter().map(String::as_str).collect();
+    let groups: Vec<Vec<&str>> = if separate {
+        names.iter().map(|app| vec![*app]).collect()
+    } else {
+        vec![names.clone()]
+    };
+    let mut opening: Vec<(tailhawk_core::settings::Source, String)> = Vec::new();
+    for group in &groups {
+        let Ok(query) = tailhawk_core::apps::with_apps(&source.query, group) else {
+            set_notice(
+                hwnd,
+                format!(
+                    "{}: this source's query is not a selector this can add to.",
+                    source.name
+                ),
+            );
+            return;
+        };
+        opening.push((
+            tailhawk_core::settings::Source {
+                query,
+                ..source.clone()
+            },
+            format!("{} \u{b7} {}", source.name, group.join(", ")),
+        ));
+    }
+
+    // **Closed from the back.** Removing a tab shifts every tab after it, so the positions the plan
+    // names are only all valid if the later ones go first.
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            for at in closing.iter().rev() {
+                shell.document.close_tab(*at);
+            }
+            // A closed tab's tail and spill go with it, exactly as when the tab is closed by hand.
+            shell.retire_closed_tails();
+        }
+    });
+    let opened = opening.len();
+    for (source, label) in opening {
+        open_remote(hwnd, source, label);
+    }
+    set_notice(
+        hwnd,
+        if separate {
+            format!(
+                "{}: {opened} applications, one window each — each fetches the last hour again",
+                source.name
+            )
+        } else {
+            format!(
+                "{}: {} applications in one window — it fetches the last hour again",
+                source.name,
+                apps.len()
+            )
+        },
+    );
+}
+
 /// Drops the `Open remote` button's menu under the button, and runs what was chosen.
 ///
 /// The items and their ids are [`toolbar::remote_menu_of`]'s — the File menu's ids — so this
@@ -8337,6 +8509,9 @@ fn landed_records(
             format!("{name}: {} records in the last hour", pulled.records),
         );
     }
+    // The query this window is a view of, kept before the source moves into the tail: `Interleave`
+    // and `Separate` regroup the windows from it without asking the server anything.
+    let query = source.query.clone();
     // **And now it tails.** Everything above is one window of history; this is what makes the
     // source live. The worker asks Loki for what is newer than the newest record just written and
     // appends it to this same spill, so the follow machinery that was already saying "● following"
@@ -8360,7 +8535,7 @@ fn landed_records(
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             // Named after the source, not after the part of the spill it happens to open on.
-            shell.open_named(hwnd, path, Some((name, spill_dir)));
+            shell.open_named(hwnd, path, Some((name, spill_dir, query)));
         }
     });
 }
@@ -8757,6 +8932,17 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             });
             IN_WNDPROC.with(|flag| flag.set(was));
         }
+        return true;
+    }
+    // `Interleave` / `Separate`, before the dialogs: it opens no window of its own, and leaving it
+    // until after them would let a dialog opened in the same breath run first.
+    let regroup = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_regroup))
+    });
+    if regroup {
+        regroup_now(hwnd);
         return true;
     }
     // The column chooser. Everything it needs is read out first and the answer applied afterwards,
@@ -10307,6 +10493,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 large_icons: shell.large_icons,
                                 maximised: shell.document.maximised(),
                                 can_maximise: shell.document.can_maximise(),
+                                regroup_separates: shell.regroup_separates(),
                             },
                             &shell.settings.recent,
                             &shell.source_names(),
@@ -11185,6 +11372,7 @@ fn main() -> Result<()> {
             pending_filter_edit: None,
             pending_format: false,
             pending_columns: false,
+            pending_regroup: false,
             pending_import: false,
             pending_goto: false,
             pending_rules: false,
@@ -11542,7 +11730,11 @@ mod tests {
             doc.describe()
         );
 
-        doc.remote("live-identity-and-campaigns", &spill);
+        doc.remote(
+            "live-identity-and-campaigns",
+            &spill,
+            r#"{environment="live"}"#,
+        );
         assert_eq!(doc.summary, "live-identity-and-campaigns");
         let title = doc.describe();
         assert!(

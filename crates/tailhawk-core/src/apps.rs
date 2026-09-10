@@ -403,6 +403,96 @@ pub fn apps_in(query: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// One open tab, as the regroup decision needs to see it.
+///
+/// **The source's *name*, not its label.** The label on a tab is `live · api, worker`, which is
+/// display text; the name is the settings key the credential is stored under, and it is the only
+/// thing that says two windows are looking at the same place. A tab with no source is a local file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tab {
+    pub source: Option<String>,
+    /// The applications this tab's query names, in the order the query names them.
+    pub apps: Vec<String>,
+}
+
+impl Tab {
+    /// A tab showing `query` from the source called `source`.
+    pub fn remote(source: &str, query: &str) -> Tab {
+        Tab {
+            source: Some(source.to_owned()),
+            apps: apps_in(query),
+        }
+    }
+
+    /// A tab that is an ordinary file, and so takes no part in this.
+    pub fn local() -> Tab {
+        Tab {
+            source: None,
+            apps: Vec::new(),
+        }
+    }
+}
+
+/// What `Interleave` / `Separate` would do to the tabs as they stand, or `None` when it would do
+/// nothing and the menu should say so by greying the item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Regroup {
+    /// The active tab names several applications: close it and open one window per application.
+    Separate { tab: usize, apps: Vec<String> },
+    /// **Every** window of the active tab's source, folded into one: close them all and open one
+    /// naming every application between them, each named once.
+    ///
+    /// Usually those windows name an application each, because that is what separating leaves
+    /// behind — but one of them naming several is not a reason to leave it out. "Interleave" means
+    /// one window for this source, whatever shape the windows are in now.
+    Interleave { tabs: Vec<usize>, apps: Vec<String> },
+}
+
+/// The owner's ask of 2026-09-09: *"a command to separate if interleaved, and interleave if
+/// separate"*.
+///
+/// **Which of the two it is is read from the window in front of the user, never set.** A tab naming
+/// two or more applications is an interleaved one and separates; a tab naming one is a separated
+/// one and joins **every** window of its source — including one that names several, since the
+/// result is one window either way. That is why this is one command and not two: at any moment
+/// exactly one of them is the opposite of what is on screen.
+///
+/// It answers `None` — and the menu greys the item — for a local file, for a source opened with no
+/// narrowing (whose applications nobody has asked the server for), and for the only window of its
+/// source, which has nothing to be joined to.
+pub fn regroup_of(tabs: &[Tab], active: usize) -> Option<Regroup> {
+    let here = tabs.get(active)?;
+    let source = here.source.as_deref()?;
+    if here.apps.is_empty() {
+        return None;
+    }
+    if here.apps.len() > 1 {
+        return Some(Regroup::Separate {
+            tab: active,
+            apps: here.apps.clone(),
+        });
+    }
+    let mut gathered: Vec<usize> = Vec::new();
+    let mut apps: Vec<String> = Vec::new();
+    for (at, tab) in tabs.iter().enumerate() {
+        if tab.source.as_deref() != Some(source) || tab.apps.is_empty() {
+            continue;
+        }
+        gathered.push(at);
+        for app in &tab.apps {
+            if !apps.contains(app) {
+                apps.push(app.clone());
+            }
+        }
+    }
+    // One window naming one application is what it already is; joining it to itself is not a
+    // command, it is a repaint.
+    (apps.len() > 1).then_some(Regroup::Interleave {
+        tabs: gathered,
+        apps,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +773,107 @@ mod tests {
         assert!(
             !sync(&mut list, &[true, false, true]),
             "an unchanged read is reported as unchanged, so the dialog can skip its redraw"
+        );
+    }
+    /// **The command the owner asked for, from the state it has to read.** A window showing several
+    /// applications separates into one each; several windows of the same source interleave into
+    /// one. Which of the two is offered is not a mode the user sets — it is what the window in
+    /// front of them already is.
+    #[test]
+    fn a_window_of_several_apps_separates_and_several_windows_interleave() {
+        let many = vec![Tab::remote(
+            "live",
+            r#"{environment="live", app=~"api|worker"}"#,
+        )];
+        assert_eq!(
+            regroup_of(&many, 0),
+            Some(Regroup::Separate {
+                tab: 0,
+                apps: vec!["api".to_owned(), "worker".to_owned()],
+            })
+        );
+
+        let split = vec![
+            Tab::remote("live", r#"{environment="live", app="api"}"#),
+            Tab::remote("live", r#"{environment="live", app="worker"}"#),
+        ];
+        assert_eq!(
+            regroup_of(&split, 1),
+            Some(Regroup::Interleave {
+                tabs: vec![0, 1],
+                apps: vec!["api".to_owned(), "worker".to_owned()],
+            }),
+            "the tabs in the order they are open, and the apps with them"
+        );
+    }
+
+    /// **A source is not another source**, however alike the two look. Interleaving across sources
+    /// would put dev records in a live window, which is the one mistake this whole feature must not
+    /// make: the tabs gathered are those whose *source name* matches, and the name is the settings
+    /// key rather than the label on the tab.
+    #[test]
+    fn tabs_of_a_different_source_are_never_gathered() {
+        let tabs = vec![
+            Tab::remote("live", r#"{environment="live", app="api"}"#),
+            Tab::remote("dev", r#"{environment="dev", app="worker"}"#),
+            Tab::remote("live", r#"{environment="live", app="worker"}"#),
+        ];
+        assert_eq!(
+            regroup_of(&tabs, 0),
+            Some(Regroup::Interleave {
+                tabs: vec![0, 2],
+                apps: vec!["api".to_owned(), "worker".to_owned()],
+            })
+        );
+    }
+
+    /// Nothing to do is `None`, and the menu shows the item greyed rather than offering a command
+    /// that would do nothing: a local file, the only window of a source, and a source that was
+    /// opened with no narrowing at all — the last because "every application" cannot be separated
+    /// into windows without asking the server which applications there are.
+    #[test]
+    fn there_is_nothing_to_regroup_alone_or_unnarrowed() {
+        assert_eq!(regroup_of(&[Tab::local()], 0), None, "a local file");
+        assert_eq!(
+            regroup_of(
+                &[Tab::remote("live", r#"{environment="live", app="api"}"#)],
+                0
+            ),
+            None,
+            "one window, one application, nothing to join it to"
+        );
+        assert_eq!(
+            regroup_of(&[Tab::remote("live", r#"{environment="live"}"#)], 0),
+            None,
+            "the source as configured names no application"
+        );
+        assert_eq!(
+            regroup_of(&[Tab::local(), Tab::remote("live", r#"{app="api"}"#)], 0),
+            None,
+            "the active tab is the one that decides, and it is local"
+        );
+        assert_eq!(regroup_of(&[], 0), None);
+        assert_eq!(
+            regroup_of(&[Tab::remote("live", r#"{app="api"}"#)], 7),
+            None,
+            "an active tab that is not there"
+        );
+    }
+
+    /// The same application in two windows is one application when they are joined, and the order
+    /// is the order the windows are open in — which is the order the picker offered them in.
+    #[test]
+    fn interleaving_does_not_repeat_an_application() {
+        let tabs = vec![
+            Tab::remote("live", r#"{app=~"api|worker"}"#),
+            Tab::remote("live", r#"{app="api"}"#),
+        ];
+        assert_eq!(
+            regroup_of(&tabs, 1),
+            Some(Regroup::Interleave {
+                tabs: vec![0, 1],
+                apps: vec!["api".to_owned(), "worker".to_owned()],
+            })
         );
     }
 }

@@ -525,6 +525,15 @@ a person typing `nurtur-identity-server` correctly from memory into a LogQL sele
 - **Two ways out, because the owner asked for both.** *Interleave* opens one document whose selector
   names every ticked application, so their records arrive in one timeline. *Separate windows* opens
   one document per application, each named after it.
+- **The choice is not final, and that is a command in the File menu.** The owner, 2026-09-09: *"It
+  would also be good to have a command to separate if interleaved, and interleave if separate."*
+  Under `Open remote source` sits one item whose words say what choosing it will do — **Separate
+  applications** when the window in front names several, **Interleave applications** when several
+  windows of one source name one each — and which is greyed when neither applies. `apps::regroup_of`
+  is the decision and it reads the state rather than remembering a mode; the reopening goes through
+  the same `with_apps` rewrite as the picker, so a window that arrived by regrouping and one that
+  arrived by ticking boxes are the same window. **The scrollback does not survive it**: each new
+  window fetches the last hour again, and the status bar says so.
 - **The source's own query is rewritten, never replaced.** `apps::with_apps` keeps every other
   matcher the user wrote — the environment above all — and keeps whatever pipeline follows the
   selector. A source already narrowed to some applications opens with those ticked.
