@@ -55,9 +55,6 @@ public static class Ctl {
 
 # The toolbar's own messages, and the two bits this script asks about.
 $TB_BUTTONCOUNT = 0x0418
-$TB_GETBUTTON = 0x0417       # TB_GETBUTTONW is not needed: only the style and id are read
-$BTNS_WHOLEDROPDOWN = 0x0080
-$BTNS_SEP = 0x0001
 
 function Get-Child([IntPtr]$Hwnd, [string]$Class, [int]$Id = -1) {
     foreach ($row in [Ctl]::Children($Hwnd)) {
@@ -69,25 +66,6 @@ function Get-Child([IntPtr]$Hwnd, [string]$Class, [int]$Id = -1) {
     return [IntPtr]::Zero
 }
 
-# One TBBUTTON, read a field at a time so the script does not have to lay the structure out.
-function Read-ToolbarButtons([IntPtr]$Toolbar) {
-    $count = [Ctl]::SendMessageW($Toolbar, $TB_BUTTONCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
-    $size = 32   # sizeof(TBBUTTON) on x64: iBitmap, idCommand, fsState, fsStyle, bReserved, dwData, iString
-    $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($size)
-    $rows = @()
-    try {
-        for ($i = 0; $i -lt $count; $i++) {
-            [void][Ctl]::SendMessageW($Toolbar, $TB_GETBUTTON, [IntPtr]$i, $buf)
-            $id = [System.Runtime.InteropServices.Marshal]::ReadInt32($buf, 4)
-            $state = [System.Runtime.InteropServices.Marshal]::ReadByte($buf, 8)
-            $style = [System.Runtime.InteropServices.Marshal]::ReadByte($buf, 9)
-            $rows += [pscustomobject]@{ Index = $i; Id = $id; State = $state; Style = $style }
-        }
-    }
-    finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buf) }
-    return $rows
-}
-
 $results = @()
 function Note([string]$What, [bool]$Ok, [string]$Saying) {
     $script:results += [pscustomobject]@{ What = $What; Ok = $Ok; Saying = $Saying }
@@ -95,20 +73,21 @@ function Note([string]$What, [bool]$Ok, [string]$Saying) {
     Write-Host ("{0} {1,-34} {2}" -f $mark, $What, $Saying)
 }
 
-$app = Start-App -Log $Log -Seconds $Seconds
-$hwnd = $app.Hwnd
-$appPid = $app.Pid
+$proc = Start-Tailhawk $Log
+$hwnd = $proc.MainWindowHandle
+$appPid = $proc.Id
 try {
     # --- The toolbar, without touching the mouse -----------------------------------------------
     $toolbar = Get-Child $hwnd 'ToolbarWindow32'
     $rebar = Get-Child $hwnd 'ReBarWindow32'
     Note 'toolbar is a real control' ($toolbar -ne [IntPtr]::Zero) "hwnd=$toolbar rebar=$rebar"
     if ($toolbar -ne [IntPtr]::Zero) {
-        $buttons = Read-ToolbarButtons $toolbar
-        $real = @($buttons | Where-Object { ($_.Style -band $BTNS_SEP) -eq 0 })
-        Note 'eleven buttons and their groups' ($real.Count -eq 11) "$($real.Count) buttons, $($buttons.Count) items with separators"
-        $drop = @($buttons | Where-Object { ($_.Style -band $BTNS_WHOLEDROPDOWN) -ne 0 })
-        Note 'Open remote is a menu button' ($drop.Count -eq 1) "ids: $(($drop | ForEach-Object { $_.Id }) -join ',')"
+        # **A count, not the buttons themselves.** `TB_GETBUTTON` writes through a pointer, and a
+        # pointer only means something inside the process that owns it — a harness that passes its
+        # own buffer reads back its own uninitialised memory and reports whatever is in it. The
+        # eleven buttons and the four separators between the five groups make fifteen items.
+        $items = [Ctl]::SendMessageW($toolbar, $TB_BUTTONCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+        Note 'eleven buttons in five groups' ($items -eq 15) "$items items, separators included"
     }
 
     # --- The chooser, opened from the menu it lives on ------------------------------------------
@@ -133,7 +112,7 @@ try {
 
     # --- The two keys that were advertised and did nothing ---------------------------------------
     $wsh = New-Object -ComObject WScript.Shell
-    [void](Set-Foreground $hwnd)
+    [void]$wsh.AppActivate($proc.Id)
     $wsh.SendKeys('^k')
     $rules = Wait-Dialog $appPid 'Highlight rules' 6
     Note 'Ctrl+K opens the rules editor' ($rules -ne [IntPtr]::Zero) "hwnd=$rules"
@@ -141,17 +120,45 @@ try {
         [void][Dlg]::PostMessageW($rules, [Dlg]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
         Start-Sleep -Milliseconds 400
     }
-    [void](Set-Foreground $hwnd)
+    [void]$wsh.AppActivate($proc.Id)
     $wsh.SendKeys('{F1}')
-    $keys = Wait-Dialog $appPid 'Keyboard' 6
+    $keys = Wait-Dialog $appPid 'Keyboard map' 6
     Note 'F1 opens the keyboard map' ($keys -ne [IntPtr]::Zero) "hwnd=$keys"
     if ($keys -ne [IntPtr]::Zero) {
         [void][Dlg]::PostMessageW($keys, [Dlg]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
         Start-Sleep -Milliseconds 400
     }
+    # --- The detail window ------------------------------------------------------------------------
+    # **Every one of these was a defect when this section was first run**, which is the argument for
+    # the section: the tabs were inserted and drawn under the list, and the window took the
+    # foreground so the toggle that opened it could not close it.
+    [void]$wsh.AppActivate($proc.Id)
+    Start-Sleep -Milliseconds 300
+    $before = [Shot]::GetForegroundWindow()
+    $wsh.SendKeys('^{ENTER}')
+    Start-Sleep -Milliseconds 1200
+    $detail = Get-Dialog $appPid ''
+    Note 'Ctrl+Enter opens the detail window' ($detail -ne [IntPtr]::Zero) "hwnd=$detail"
+    if ($detail -ne [IntPtr]::Zero) {
+        Note 'it does not take the foreground' ([Shot]::GetForegroundWindow() -eq $before) 'the log keeps the keyboard'
+        $tabs = Get-Child $detail 'SysTabControl32'
+        $pages = [Ctl]::SendMessageW($tabs, 0x1304, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+        Note 'it carries its pages' ($pages -ge 2) "$pages tabs"
+        # The page area must sit *below* the tab row: same rect means the list is over the tabs.
+        $tr = New-Object Dlg+RECT
+        [void][Dlg]::GetWindowRect($tabs, [ref]$tr)
+        $list = Get-Child $detail 'SysListView32'
+        $lr = New-Object Dlg+RECT
+        [void][Dlg]::GetWindowRect($list, [ref]$lr)
+        Note 'the page sits under the tab row' (($lr.T - $tr.T) -gt 8) "$($lr.T - $tr.T) px of tab row"
+        $wsh.SendKeys('^{ENTER}')
+        Start-Sleep -Milliseconds 900
+        $gone = Get-Dialog $appPid ''
+        Note 'and the same key closes it' ($gone -eq [IntPtr]::Zero) "hwnd=$gone"
+    }
 }
 finally {
-    Stop-App $app
+    if (-not $proc.HasExited) { $proc.Kill() }
 }
 
 Write-Host ''

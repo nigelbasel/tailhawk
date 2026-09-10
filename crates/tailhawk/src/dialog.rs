@@ -188,7 +188,7 @@ pub struct Item {
 }
 
 impl Item {
-    fn new(class: Class, text: &str, id: u16, at: (i16, i16, i16, i16), style: u32) -> Self {
+    pub fn new(class: Class, text: &str, id: u16, at: (i16, i16, i16, i16), style: u32) -> Self {
         Self {
             class,
             text: text.to_owned(),
@@ -216,6 +216,12 @@ fn push_wsz(words: &mut Vec<u16>, s: &str) {
 /// 8-point shell dialog font. Every item is aligned to a DWORD boundary, which is the one layout
 /// rule a miscount breaks silently.
 pub fn template(title: &str, w: i16, h: i16, items: &[Item]) -> Vec<u16> {
+    template_with(title, w, h, items, 0)
+}
+
+/// [`template`], plus any window styles the dialog needs of its own — `WS_THICKFRAME` for one
+/// that can be resized. The base style is the same, so a caller adds rather than restates.
+pub fn template_with(title: &str, w: i16, h: i16, items: &[Item], extra: u32) -> Vec<u16> {
     const WS_POPUP: u32 = 0x8000_0000;
     const WS_CAPTION: u32 = 0x00C0_0000;
     const WS_SYSMENU: u32 = 0x0008_0000;
@@ -227,7 +233,7 @@ pub fn template(title: &str, w: i16, h: i16, items: &[Item]) -> Vec<u16> {
     let mut t = Vec::new();
     push_u32(
         &mut t,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT | DS_CENTER,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT | DS_CENTER | extra,
     );
     push_u32(&mut t, 0);
     t.push(items.len() as u16);
@@ -2490,12 +2496,13 @@ unsafe extern "system" fn keymap_proc(
 }
 
 const CBS_DROPDOWNLIST: u32 = 0x0003;
-const WS_VSCROLL: u32 = 0x0020_0000;
-const WS_TABSTOP: u32 = 0x0001_0000;
-const WS_BORDER: u32 = 0x0080_0000;
+pub const WS_VSCROLL: u32 = 0x0020_0000;
+pub const WS_HSCROLL: u32 = 0x0010_0000;
+pub const WS_TABSTOP: u32 = 0x0001_0000;
+pub const WS_BORDER: u32 = 0x0080_0000;
 const ES_NUMBER: u32 = 0x2000;
-const ES_MULTILINE: u32 = 0x0004;
-const ES_READONLY: u32 = 0x0800;
+pub const ES_MULTILINE: u32 = 0x0004;
+pub const ES_READONLY: u32 = 0x0800;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 /// **The secret box shows dots, not the secret.** A credential on screen is a credential in every
 /// screen share and over every shoulder, and this is the one field in the product that carries one.
@@ -2547,12 +2554,12 @@ const DWLP_MSGRESULT: i32 = 0;
 
 /// The list-view styles and messages the Define Format dialog uses. The `windows` crate types the
 /// structures; these are the plain integers beside them.
-const LVS_REPORT: u32 = 0x0001;
-const LVS_SINGLESEL: u32 = 0x0004;
-const LVS_SHOWSELALWAYS: u32 = 0x0008;
+pub const LVS_REPORT: u32 = 0x0001;
+pub const LVS_SINGLESEL: u32 = 0x0004;
+pub const LVS_SHOWSELALWAYS: u32 = 0x0008;
 const LVS_EX_GRIDLINES: u32 = 0x0001;
-const LVS_EX_FULLROWSELECT: u32 = 0x0020;
-const LVS_EX_CHECKBOXES: u32 = 0x0004;
+pub const LVS_EX_FULLROWSELECT: u32 = 0x0020;
+pub const LVS_EX_CHECKBOXES: u32 = 0x0004;
 const LVM_FIRST: u32 = 0x1000;
 const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
 const LVM_GETNEXTITEM: u32 = LVM_FIRST + 12;
@@ -3531,8 +3538,31 @@ fn lv_column(list: HWND, at: i32, title: &str, width: i32) {
     }
 }
 
-/// Clears a report-view list's rows **and** its columns, so a second Test does not inherit the
-/// first's headings.
+/// Fills a two-column list view with `(name, value)` pairs — the detail window's *Fields* page.
+///
+/// **The columns are rebuilt with the rows**, because the pairs come from whatever format the
+/// record was parsed by and a different record may have different fields entirely.
+pub fn lv_fill_pairs(list: HWND, pairs: &[(String, String)]) {
+    lv_reset(list);
+    lv_column(list, 0, "Field", 110);
+    lv_column(list, 1, "Value", 320);
+    for (at, (name, value)) in pairs.iter().enumerate() {
+        lv_row(list, at as i32, &[name.clone(), value.clone()]);
+    }
+    // **The value column takes the rest of the width**, so there is no dead strip beside it with a
+    // header divider over it — the same thing the applications picker does with its one column.
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_SETCOLUMNWIDTH,
+            WPARAM(1),
+            LPARAM(LVSCW_AUTOSIZE_USEHEADER),
+        );
+    }
+}
+
+/// Clears a report-view list's rows and its columns, so a second fill does not inherit the first's
+/// headings.
 fn lv_reset(list: HWND) {
     unsafe {
         SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));

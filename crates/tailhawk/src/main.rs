@@ -18,10 +18,6 @@ mod about;
 mod chooser;
 mod controls;
 mod darkmode;
-/// The detail window. **Nothing calls it yet** — the pure half is written and tested and the
-/// window's own wiring is the next slice, so the unused warnings are suppressed here, at the
-/// declaration, the way `net` did while its transport waited for a caller.
-#[allow(dead_code)]
 mod detailwin;
 mod dialog;
 mod filterpanel;
@@ -58,7 +54,7 @@ use tailhawk_core::filter::{Chip, Chips, Polarity};
 use tailhawk_core::find::{self, Outcome, Running, Update};
 use tailhawk_core::fling::{self, TouchAction, TouchPhase};
 use tailhawk_core::highlight::{Highlighter, Rule, Span};
-use tailhawk_core::paint::{Colours, Painter};
+use tailhawk_core::paint::Painter;
 use tailhawk_core::search::{Match, Pattern, SearchOptions};
 use tailhawk_core::semantic;
 use tailhawk_core::set::LogSet;
@@ -507,28 +503,11 @@ impl RowSource for Document {
             self.show_filters,
             panel_row,
         );
-        if self.detail.open && self.detail.rows > 0 && !self.detail.lines.is_empty() {
-            let pane_h = DetailPane::height(self.detail.rows, row_h);
-            let top = view.height_px() - strip - panel_h - pane_h;
-            painter.fill(0.0, top, width, pane_h, theme().pane_bg);
-            painter.fill(0.0, top, width, 1.0, theme().pane_edge);
-            let shown = self.detail.rows.min(self.detail.lines.len());
-            let hidden = self.detail.lines.len() - shown;
-            let mut y = top + 3.0;
-            for (i, line) in self.detail.lines.iter().take(shown).enumerate() {
-                let last_and_more = hidden > 0 && i + 1 == shown;
-                let more = format!("… {} more lines", hidden + 1);
-                let (text, ink) = if last_and_more {
-                    (more.as_str(), theme().field_hint)
-                } else if i == 0 {
-                    (line.as_str(), theme().header_ink)
-                } else {
-                    (line.as_str(), theme().ink)
-                };
-                let _ = painter.lay_out_at(view, cell_w, y, text, Colours::plain(ink));
-                y += row_h;
-            }
-        }
+        // **§8's detail is no longer drawn here.** It was text composed into cells and painted over
+        // the grid by the renderer that exists for scrolling fifty thousand rows a second; it is a
+        // modeless window with a tab control now — `detailwin.rs` — for the reasons the owner gave
+        // on 2026-09-09 and one he did not have to: a list of six fields could not be selected,
+        // copied or scrolled, because nothing drawn by this painter can be.
 
         // §2.1's docked filter panel, above the status bar — the VS tool-window posture, fixed.
         // A title row carries the panel's name and its buttons, drawn through the shared
@@ -949,14 +928,8 @@ impl Document {
         // The reserved band is simply what the shell says it is.
         let strip = self.strip_px;
         self.view.set_chrome_px(strip);
-        // V10: the detail pane sits above the status bar, a third of the height at most, when open.
-        let pane_rows = if self.detail.open {
-            let grid_rows = ((size.1 as f32 - strip) / row_h.max(1.0)) as u64;
-            (grid_rows / 3).clamp(4, DETAIL_MAX_ROWS) as usize
-        } else {
-            0
-        };
-        self.detail.rows = pane_rows;
+        // **The detail reserves no band any more.** It used to take a third of the window from the
+        // grid; it is its own window since 2026-09-09, so the log keeps every row it had.
         let footer = if self.show_footer {
             Chrome::strip_height(chrome_h)
         } else {
@@ -967,8 +940,7 @@ impl Document {
             self.show_filters,
             self.band_h(row_h),
         );
-        self.view
-            .set_footer_px(footer + DetailPane::height(pane_rows, row_h) + panel);
+        self.view.set_footer_px(footer + panel);
         // The band is the control's height once the control exists, and the drawn band's row
         // height until then — never a constant, for the reason every native surface here gives.
         self.view
@@ -1086,9 +1058,26 @@ impl Document {
     /// body and the continuation lines under it; without one, the line itself. Only rows the frame
     /// fetched are in reach, which is what `lay_out` arranged.
     fn compose_detail(&self, width: usize) -> Vec<String> {
-        let Some(row) = self.current_row().and_then(|r| self.filtering.file_row(r)) else {
-            return Vec::new();
-        };
+        match self.detail_of() {
+            Some((detail, _)) => tailhawk_core::detail::compose(
+                &detail,
+                width,
+                self.detail.pretty,
+                self.view.cells(),
+            ),
+            None => Vec::new(),
+        }
+    }
+
+    /// The record itself, and its first line exactly as the file holds it.
+    ///
+    /// **Two callers and one walk.** `compose_detail` turns it into §8's lines and
+    /// [`Document::detail_view`] into the window's pages; a second walk would be a second answer
+    /// to "which record is the caret on".
+    fn detail_of(&self) -> Option<(tailhawk_core::detail::Detail<'_>, &str)> {
+        let row = self
+            .current_row()
+            .and_then(|r| self.filtering.file_row(r))?;
         let total = self.set.total_rows();
         let format = self.detection.accepted;
         let mut start = row;
@@ -1103,9 +1092,7 @@ impl Document {
                 start -= 1;
             }
         }
-        let Some(first) = self.set.row_text(start) else {
-            return vec![format!("Record {} — not read yet", start + 1)];
-        };
+        let first = self.set.row_text(start)?;
         let mut fields: Vec<(&str, &str)> = Vec::new();
         let mut body: &str = first;
         if let Some(format) = format {
@@ -1138,13 +1125,21 @@ impl Document {
         if format.is_some_and(|f| f.body_next_line) && !tail.is_empty() {
             body = tail.remove(0).trim_start();
         }
-        let detail = tailhawk_core::detail::Detail {
-            line: start + 1,
-            fields,
-            body,
-            tail,
-        };
-        tailhawk_core::detail::compose(&detail, width, self.detail.pretty, self.view.cells())
+        Some((
+            tailhawk_core::detail::Detail {
+                line: start + 1,
+                fields,
+                body,
+                tail,
+            },
+            first,
+        ))
+    }
+
+    /// §8's record as the detail window shows it, or nothing when the caret is on no record.
+    fn detail_view(&self) -> Option<detailwin::DetailView> {
+        let (detail, first) = self.detail_of()?;
+        Some(detailwin::view_of(&detail, first, self.detail.pretty))
     }
 
     /// V5's column header, when there is a layout — `RowSource::header`, drawn in the band the
@@ -3339,28 +3334,18 @@ impl Tee {
 /// V10 — `UI-DESIGN.md` §8's record detail pane, at the bottom above the status bar.
 #[derive(Clone, Debug, Default)]
 struct DetailPane {
+    /// Whether the detail window is up. **The window follows this and this follows the window**:
+    /// closing the window from its own title bar clears it, so the menu tick and the toolbar's
+    /// pressed button cannot say "open" over a window that has gone.
     open: bool,
     /// §8's *Pretty*: a JSON body re-indented.
     pretty: bool,
-    /// The lines composed for this frame, top to bottom.
+    /// The lines composed for this frame, top to bottom. **Still composed**, because §8's text is
+    /// what `Copy` puts on the clipboard and what the tests read; the window builds its pages from
+    /// the structured `Detail` instead.
     lines: Vec<String>,
-    /// How many rows the pane has this frame.
-    rows: usize,
 }
 
-impl DetailPane {
-    /// The pane's height for `rows` rows: the rows and a little air, or nothing when closed.
-    fn height(rows: usize, row_h: f32) -> f32 {
-        if rows == 0 {
-            0.0
-        } else {
-            (rows as f32 * row_h + 6.0).round()
-        }
-    }
-}
-
-/// The most rows the detail pane takes.
-const DETAIL_MAX_ROWS: u64 = 16;
 /// How far back from the current row the pane looks for its record's first line, and how far
 /// forward for its continuation lines — bounded because both are reads per frame.
 const DETAIL_LOOK_BACK: u64 = 8;
@@ -4361,6 +4346,10 @@ struct Shell {
     /// The **modeless** Find dialog while it is up, so the message loop can route its keyboard
     /// through `IsDialogMessageW` and a second `Ctrl+F` focuses it instead of stacking another.
     find_dialog: HWND,
+    /// §8's record detail, since 2026-09-09 a real window rather than text painted over the grid.
+    /// Modeless, one for the window rather than one per document, and routed through
+    /// `IsDialogMessageW` like the Find dialog beside it.
+    detail_window: Option<detailwin::DetailWindow>,
     /// §5's rules editor, modeless for the same reasons and routed the same way — and for one
     /// more: the grid behind it is the live preview, so it must stay visible and repainting.
     rules_dialog: HWND,
@@ -4862,6 +4851,40 @@ impl Shell {
         }
     }
 
+    /// Opens, feeds or closes the detail window to match the active document.
+    ///
+    /// **Three states, and the window can leave on its own.** The flag says whether it should be
+    /// up; the window may have been closed from its own title bar since the last frame, which
+    /// `alive` catches; and a record the caret has moved off is a new view to push. Everything it
+    /// pushes is owned — `detail_view` composes to `String`s — so no borrow of the document's row
+    /// text is alive while a control is being filled.
+    fn sync_detail_window(&mut self, hwnd: HWND) {
+        let wanted = self.document.as_ref().is_some_and(|doc| doc.detail.open);
+        if !wanted {
+            self.detail_window = None;
+            return;
+        }
+        if self.detail_window.as_ref().is_some_and(|w| !w.alive()) {
+            self.detail_window = None;
+        }
+        if self.detail_window.is_none() {
+            self.detail_window = detailwin::DetailWindow::open(hwnd);
+            if self.detail_window.is_none() {
+                // Windows refused the template. Say so once and put the flag back, rather than
+                // trying again every frame for the life of the window.
+                self.notice = Some("the detail window could not be opened".to_owned());
+                if let Some(doc) = self.document.as_mut() {
+                    doc.detail.open = false;
+                }
+                return;
+            }
+        }
+        let view = self.document.as_ref().and_then(|doc| doc.detail_view());
+        if let (Some(window), Some(view)) = (self.detail_window.as_mut(), view) {
+            window.set(&view);
+        }
+    }
+
     fn paint_inner(&mut self, hwnd: HWND) -> bool {
         header::trace("paint enter");
         // The strip and the status are the shell's knowledge, handed to the document that draws them.
@@ -5010,6 +5033,10 @@ impl Shell {
                     (None, _) => 0.0,
                 };
                 let strip_px = strip_px + toolbar_px;
+                // §8's detail window, opened, fed and closed from the one place a frame knows what
+                // the caret is on. **The window is the shell's and the flag is the document's**: a
+                // record is what the *active* document's caret is on, so switching tabs moves the
+                // window rather than opening a second one.
                 // Only the active tab is laid out below, so every other tab's headers are hidden
                 // here — a child window does not know its document is not the one on screen, and
                 // a columnar tab's header would otherwise sit over a plain-text tab's first row.
@@ -5180,6 +5207,10 @@ impl Shell {
             self.driver = Some(driver.to_owned());
             self.refresh_title(hwnd);
         }
+        // §8's detail window, after the frame: the rows it reads are the ones the layout above just
+        // fetched, and the renderer's borrow has been given up, which is what puts this here rather
+        // than beside the toolbar.
+        self.sync_detail_window(hwnd);
         true
     }
 
@@ -9022,6 +9053,62 @@ pub fn rules_save(owner: HWND) {
 /// The dialog has gone. Closing is not saving: whatever the preview was showing, the rules in
 /// force once the box is gone are the ones on disk, and §10 wants an unsaved set thrown away to
 /// say so rather than vanish quietly.
+/// The detail window's client area changed size, so its controls are laid out again.
+///
+/// **The dialog decides nothing**; its procedure calls these three, and the window is here because
+/// the shell owns it and the shell knows which document it is showing.
+pub fn detail_window_resized(hdlg: HWND) {
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow().as_ref() {
+            if let Some(window) = shell.detail_window.as_ref() {
+                if window.hwnd() == hdlg {
+                    window.lay_out(unsafe { GetDpiForWindow(hdlg) });
+                }
+            }
+        }
+    });
+}
+
+/// A different page was chosen, so the edit control gets that page's text.
+pub fn detail_window_page_changed(hdlg: HWND) {
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow().as_ref() {
+            if let Some(window) = shell.detail_window.as_ref() {
+                if window.hwnd() == hdlg {
+                    window.page_changed();
+                }
+            }
+        }
+    });
+}
+
+/// The user closed the window from its own title bar.
+///
+/// **The toggle follows the window, not the other way round.** `Record detail` is a checked menu
+/// item and a pressed toolbar button; a window closed by its own X with the model left saying
+/// "open" would leave both of them lying, and the next `Ctrl+Enter` would appear to do nothing.
+pub fn detail_window_closed(hdlg: HWND, owner: HWND) {
+    let closed = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let Some(shell) = state.as_mut() else {
+            return false;
+        };
+        if shell.detail_window.as_ref().map(|w| w.hwnd()) != Some(hdlg) {
+            return false;
+        }
+        shell.detail_window = None;
+        for (_, doc) in shell.document.all_mut() {
+            doc.detail.open = false;
+        }
+        true
+    });
+    if closed && !owner.is_invalid() {
+        unsafe {
+            let _ = InvalidateRect(owner, None, false);
+        }
+    }
+}
+
 pub fn rules_dialog_closed(hdlg: HWND, owner: HWND) {
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
@@ -11107,6 +11194,7 @@ fn main() -> Result<()> {
             tails: Vec::new(),
             tail_notices: Vec::new(),
             find_dialog: HWND::default(),
+            detail_window: None,
             rules_dialog: HWND::default(),
             notice: None,
             titled_following: None,
@@ -11245,17 +11333,27 @@ fn main() -> Result<()> {
         // Esc as Cancel — only works if the loop offers it the message first, which is the
         // documented contract of a modeless dialog. The handle is copied out so no borrow is
         // held while the dialog's proc runs.
-        let (find, rules) = STATE.with(|s| {
+        // **The detail window is offered the message too**, and for the same reason: it is
+        // modeless, so Tab between its pages and its list is the loop's to route, not the
+        // dialog manager's.
+        let (find, detail) = STATE.with(|s| {
             s.borrow()
                 .as_ref()
                 .map_or((HWND::default(), HWND::default()), |shell| {
-                    (shell.find_dialog, shell.rules_dialog)
+                    (
+                        shell.find_dialog,
+                        shell
+                            .detail_window
+                            .as_ref()
+                            .map(|w| w.hwnd())
+                            .unwrap_or_default(),
+                    )
                 })
         });
         if !find.is_invalid() && unsafe { IsDialogMessageW(find, &msg) }.as_bool() {
             continue;
         }
-        if !rules.is_invalid() && unsafe { IsDialogMessageW(rules, &msg) }.as_bool() {
+        if !detail.is_invalid() && unsafe { IsDialogMessageW(detail, &msg) }.as_bool() {
             continue;
         }
         unsafe {
@@ -12405,9 +12503,27 @@ mod tests {
             7,
             "the next record is not part of this one: {lines:?}"
         );
+        assert_eq!(
+            doc.view.footer_px(),
+            Chrome::strip_height(10.0),
+            "**the detail takes no band from the grid any more** — it is its own window since \
+             2026-09-09, and the log keeps every row it had"
+        );
+
+        // And the window's view-model is built from the same record.
+        let view = doc.detail_view().expect("a record under the caret");
+        assert_eq!(view.line, 2);
+        assert_eq!(view.fields[0].0, "timestamp");
+        assert_eq!(view.fields[1], ("level".to_owned(), "ERR".to_owned()));
         assert!(
-            doc.view.footer_px() > Chrome::strip_height(10.0),
-            "the pane took its band"
+            view.raw.starts_with("2026-08-17 09:14:04.120 +01:00 [ERR]"),
+            "the Raw page is the file's own line: {}",
+            view.raw
+        );
+        assert!(
+            view.body.contains("System.InvalidOperationException"),
+            "the Message page carries the continuations: {}",
+            view.body
         );
 
         // The last record, on its own row: no tail.

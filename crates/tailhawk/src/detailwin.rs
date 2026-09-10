@@ -20,12 +20,20 @@
 //! **Modeless, and that is the whole point of the window.** The log goes on scrolling behind it and
 //! the pane follows the caret; a modal box would freeze the thing the user is reading.
 
+use crate::dialog::{
+    ES_MULTILINE, ES_READONLY, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    WS_BORDER, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
+};
 use tailhawk_core::detail::Detail;
-use windows::core::{w, PCWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::UI::Controls::{LVM_SETEXTENDEDLISTVIEWSTYLE, NMHDR};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GetClientRect, IsWindow, SendMessageW, SetWindowPos, ShowWindow, HWND_TOP,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
+    CreateDialogIndirectParamW, DestroyWindow, GetClientRect, GetWindow, IsWindow, PostMessageW,
+    SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, DLGTEMPLATE, GW_OWNER, HWND_TOP,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WM_CLOSE, WM_COMMAND, WM_INITDIALOG,
+    WM_NOTIFY, WM_SIZE,
 };
 
 /// The detail of one record, owned, as one frame should show it.
@@ -161,6 +169,12 @@ pub const ID_TABS: u16 = 300;
 pub const ID_LIST: u16 = 301;
 pub const ID_TEXT: u16 = 302;
 
+/// `WS_THICKFRAME` and `WS_MINIMIZEBOX`, which the crate binds as `WINDOW_STYLE` values and the
+/// template wants as plain bits. A detail window that could not be resized would be no better than
+/// the pane it replaces the first time a stack trace arrived.
+const WS_THICKFRAME: u32 = 0x0004_0000;
+const WS_MINIMIZEBOX: u32 = 0x0002_0000;
+
 /// The pixels of air between the tab control and the window's edge, in dialog units.
 const MARGIN: i32 = 7;
 
@@ -284,9 +298,14 @@ impl DetailWindow {
         }
         for (at, page) in pages.iter().enumerate() {
             let mut text: Vec<u16> = page.encode_utf16().chain(std::iter::once(0)).collect();
+            // **`image: -1`, not the zero a `Default` would give.** A tab whose image index is 0 with
+            // no image list attached reserves room for a bitmap that does not exist and draws its
+            // text nowhere — which is precisely what the first run of this window showed: three
+            // tabs the control counted and none a person could read. `tabstrip.rs` had it right.
             let mut item = TcItemW {
                 mask: TCIF_TEXT,
                 text: text.as_mut_ptr(),
+                image: -1,
                 ..Default::default()
             };
             unsafe {
@@ -302,6 +321,203 @@ impl DetailWindow {
     }
 }
 
+impl DetailWindow {
+    /// Opens the window over `owner`, or reports nothing if Windows refused the template.
+    ///
+    /// **Modeless**, so the log keeps scrolling and the pane keeps following the caret; the
+    /// message loop hands it `IsDialogMessageW` so Tab and Esc behave, exactly as the Find dialog's
+    /// has since it was built.
+    pub fn open(owner: HWND) -> Option<DetailWindow> {
+        let template = crate::dialog::template_with(
+            "Detail",
+            340,
+            220,
+            &detail_dialog_items(),
+            WS_THICKFRAME | WS_MINIMIZEBOX,
+        );
+        let hwnd = unsafe {
+            CreateDialogIndirectParamW(
+                None,
+                template.as_ptr() as *const DLGTEMPLATE,
+                owner,
+                Some(detail_proc),
+                LPARAM(0),
+            )
+        }
+        .ok()?;
+        let window = DetailWindow {
+            hwnd,
+            shown: None,
+            pages: Vec::new(),
+        };
+        crate::controls::apply_theme(hwnd, tailhawk_core::theme::theme().dark);
+        for id in [ID_TABS, ID_LIST, ID_TEXT] {
+            if let Some(child) = window.item(id) {
+                crate::controls::apply_theme(child, tailhawk_core::theme::theme().dark);
+            }
+        }
+        if let Some(list) = window.item(ID_LIST) {
+            unsafe {
+                SendMessageW(
+                    list,
+                    LVM_SETEXTENDEDLISTVIEWSTYLE,
+                    WPARAM(0),
+                    LPARAM(LVS_EX_FULLROWSELECT as isize),
+                );
+            }
+        }
+        window.lay_out(unsafe { GetDpiForWindow(hwnd) });
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+        }
+        Some(window)
+    }
+
+    /// Puts a record in the window, rebuilding only what changed.
+    ///
+    /// **A frame that changes nothing must touch nothing.** This is asked once per frame while a
+    /// log is scrolling; refilling a list view sixty times a second would flicker, lose a selection
+    /// and make text impossible to copy out of the very window that exists so text can be copied.
+    pub fn set(&mut self, view: &DetailView) {
+        if self.shown.as_ref() == Some(view) {
+            return;
+        }
+        let pages = pages_of(view);
+        if self.pages != pages {
+            self.set_pages(&pages);
+            // **Laid out again, because the tab row was not there when the window opened.**
+            // `TCM_ADJUSTRECT` answers with the display area *inside* the tabs, and a control with
+            // no items yet has almost none to subtract — so the first layout put the list over the
+            // tab row and the tabs, correctly inserted, were drawn underneath it. Three tabs the
+            // control could count and none a person could see.
+            self.lay_out(unsafe { GetDpiForWindow(self.hwnd) });
+        }
+        if let Some(list) = self.item(ID_LIST) {
+            crate::dialog::lv_fill_pairs(list, &view.fields);
+        }
+        self.set_text(page_text(view, self.current_page()));
+        let title: Vec<u16> = title_of(view)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let _ = SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr()));
+        }
+        self.shown = Some(view.clone());
+        self.show_page();
+    }
+
+    /// The page the tab control is showing, by name.
+    pub fn current_page(&self) -> &'static str {
+        let Some(tabs) = self.item(ID_TABS) else {
+            return PAGES[1];
+        };
+        let at = unsafe { SendMessageW(tabs, TCM_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
+        self.pages
+            .get(at.max(0) as usize)
+            .copied()
+            .unwrap_or(PAGES[1])
+    }
+
+    /// Re-reads the record for the page now selected — the answer to `TCN_SELCHANGE`.
+    pub fn page_changed(&self) {
+        if let Some(view) = self.shown.as_ref() {
+            self.set_text(page_text(view, self.current_page()));
+        }
+        self.show_page();
+    }
+
+    fn set_text(&self, text: &str) {
+        let Some(edit) = self.item(ID_TEXT) else {
+            return;
+        };
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let _ = SetWindowTextW(edit, PCWSTR(wide.as_ptr()));
+        }
+    }
+}
+
+/// What the edit control shows for a page. *Fields* has no text of its own — the list is the page —
+/// so it falls back to the message, which is what the edit is hidden behind anyway.
+fn page_text<'a>(view: &'a DetailView, page: &str) -> &'a str {
+    if page == PAGES[2] {
+        &view.raw
+    } else {
+        &view.body
+    }
+}
+
+/// The window's controls. The sizes here are a starting point only: [`DetailWindow::lay_out`]
+/// replaces them from the client area on every `WM_SIZE`, which is what makes the window resizable.
+fn detail_dialog_items() -> Vec<crate::dialog::Item> {
+    use crate::dialog::{Class, Item};
+    vec![
+        Item::new(
+            Class::Named("SysTabControl32"),
+            "",
+            ID_TABS,
+            (7, 7, 326, 206),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_LIST,
+            (11, 25, 318, 184),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_TEXT,
+            (11, 25, 318, 184),
+            WS_BORDER | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY,
+        ),
+    ]
+}
+
+/// The window's procedure. **It decides nothing**: it lays the controls out, tells the shell the
+/// page changed, and tells the shell it has gone.
+unsafe extern "system" fn detail_proc(hdlg: HWND, msg: u32, _w: WPARAM, _l: LPARAM) -> isize {
+    match msg {
+        // **Zero, not one.** Answering one tells the dialog manager to put the focus on the first
+        // tab stop, and focus moving into a window of its own brings that window to the front —
+        // so `Ctrl+Enter` opened the detail and then went to the detail, where it does nothing,
+        // and the toggle appeared broken. This window is a companion to the log, not a place the
+        // user was asking to be put.
+        WM_INITDIALOG => 0,
+        WM_SIZE => {
+            crate::detail_window_resized(hdlg);
+            0
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(_l.0 as *const NMHDR) };
+            if header.code == TCN_SELCHANGE {
+                crate::detail_window_page_changed(hdlg);
+            }
+            0
+        }
+        // Esc closes it, which is what every tool window on Windows does and what the dialog
+        // manager turns the key into. `IDCANCEL` is 2.
+        WM_COMMAND if (_w.0 & 0xFFFF) == 2 => {
+            unsafe {
+                let _ = PostMessageW(hdlg, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            1
+        }
+        WM_CLOSE => {
+            let owner = unsafe { GetWindow(hdlg, GW_OWNER) }.unwrap_or_default();
+            crate::detail_window_closed(hdlg, owner);
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// `TCN_SELCHANGE` — the tab control saying the page changed. `TCN_FIRST` is -550.
+const TCN_SELCHANGE: u32 = (-551_i32) as u32;
+
 impl Drop for DetailWindow {
     fn drop(&mut self) {
         if self.alive() {
@@ -311,9 +527,6 @@ impl Drop for DetailWindow {
         }
     }
 }
-
-/// The window class of the edit control the Message and Raw pages share.
-pub const EDIT_CLASS: PCWSTR = w!("EDIT");
 
 #[cfg(test)]
 mod tests {
