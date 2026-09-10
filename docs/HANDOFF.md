@@ -33,17 +33,18 @@ called that "a non standard way to show and hide columns", and it leaves one cel
 
 ### What is next, in the order it should be done
 
-1. **The detail pane as a real window.** `crates/tailhawk/src/detailwin.rs` exists and its pure half
-   is written and tested: `DetailView`, `view_of`, `pages_of` (Fields / Message / Raw, and a page
-   with nothing on it is not built), `title_of`, and the `lay_out` / `show_page` / `set_pages`
-   halves that need a window. **Still to do:** a resizable modeless dialog template (`dialog.rs`'s
-   `template` hardcodes its style — it needs a `WS_THICKFRAME` variant), creation and the fill,
-   `IsDialogMessageW` for it in the pump beside `find_dialog`, and then **taking the drawn pane
-   out**: `DetailPane::height` and the `detail_rows` fetch in `Document::fetch_for_frame` and the
-   painter's pane block all go. That also removes the row of squares the owner saw — it was `─`
-   repeated across the pane, a glyph the atlas refuses as one pixel too tall.
-2. **A command to separate an interleaved document, and to interleave separate ones.** He asked for
-   it by name on 2026-09-09; nothing is started.
+1. ~~The detail pane as a real window.~~ **Done 2026-09-10** — `detailwin.rs` is a modeless dialog
+   with a tab control (Fields / Message / Raw), the drawn pane and its band are gone, and with them
+   the row of squares: it was `─` repeated across the pane, a glyph the atlas refuses as one pixel
+   too tall. Verified on screen by `tools/verify-ux.ps1`, which found two defects doing it — the
+   tab row drawn under the list, and the window taking the foreground so the toggle could not close
+   it. **Left undone:** it is light while the app is dark, like every other dialog here.
+2. ~~A command to separate an interleaved document, and to interleave separate ones.~~ **Done
+   2026-09-10** — File ▸ Separate applications / Interleave applications, `apps::regroup_of` for the
+   decision. **Knowingly left undone:** it closes the old windows before the new ones have fetched
+   anything, so a source that cannot answer leaves the user with a status-bar message where their
+   windows were, and the scrollback is gone either way. Not exercised against live Loki — the
+   configured source still has no secret.
 3. **The rest of `UX-REVIEW.md`**, worst first: the filter panel has no tab stops and `widget::Focus`
    has one variant; the grid's text is absent from the accessibility tree; the title bar still
    ships frame timings and atlas statistics to a user; column headings are lower-case field names.
