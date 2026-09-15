@@ -67,6 +67,40 @@ const FETCH_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 /// step; the loop grows the read for the ones that do not.
 const SCATTER_READ_BYTES: usize = 4 * 1024;
 
+/// One line from `row`'s offset: read in small steps until the decoder gives one up or the file
+/// ends, never more than [`READ_BYTES`]. Answers the line, if one decoded, and the bytes it read —
+/// which the scattered fetch counts against its budget.
+fn read_one<R: ChunkReader + ?Sized>(
+    reader: &R,
+    charset: Charset,
+    index: &LineIndex,
+    row: u64,
+    buf: &mut [u8],
+) -> Result<(Option<String>, usize)> {
+    let Some(start) = offset_of_line(reader, charset, index, row)? else {
+        return Ok((None, 0));
+    };
+    let mut decoder = LineDecoder::new(charset);
+    let mut at = start;
+    let mut line: Option<String> = None;
+    let mut this_row = 0usize;
+    while line.is_none() && this_row < READ_BYTES {
+        let read = reader.read_at(at, buf)?;
+        if read == 0 {
+            decoder.finish(|text| {
+                line.get_or_insert_with(|| text.to_owned());
+            });
+            break;
+        }
+        at += read as u64;
+        this_row += read;
+        decoder.push(&buf[..read], |text| {
+            line.get_or_insert_with(|| text.to_owned());
+        });
+    }
+    Ok((line, this_row))
+}
+
 /// One box of the column header — `UI-DESIGN.md` §2.5.
 ///
 /// Positions are in **cells**, not pixels, because that is what the grid and the hit-testing both
@@ -407,50 +441,35 @@ impl Rows {
             if read_total >= FETCH_BUDGET_BYTES {
                 break;
             }
-            let start = match offset_of_line(reader, self.charset, index, row) {
-                Ok(Some(offset)) => offset,
-                Ok(None) => continue,
+            match read_one(reader, self.charset, index, row, &mut buf) {
+                Ok((line, read)) => {
+                    read_total += read as u64;
+                    if let Some(text) = line {
+                        self.rows.push(row);
+                        self.lines.push(text);
+                    }
+                }
                 Err(e) => {
                     self.last_error = Some(e.0);
                     break;
                 }
-            };
-            // One line: read in small steps until the decoder gives one up, or the file ends.
-            let mut decoder = LineDecoder::new(self.charset);
-            let mut at = start;
-            let mut line: Option<String> = None;
-            let mut this_row = 0usize;
-            while line.is_none() && this_row < READ_BYTES {
-                let read = match reader.read_at(at, &mut buf) {
-                    Ok(0) => {
-                        decoder.finish(|text| {
-                            line.get_or_insert_with(|| text.to_owned());
-                        });
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(e) => {
-                        self.last_error = Some(e.0);
-                        break;
-                    }
-                };
-                at += read as u64;
-                this_row += read;
-                read_total += read as u64;
-                decoder.push(&buf[..read], |text| {
-                    line.get_or_insert_with(|| text.to_owned());
-                });
-            }
-            if self.last_error.is_some() {
-                break;
-            }
-            if let Some(text) = line {
-                self.rows.push(row);
-                self.lines.push(text);
             }
         }
         self.finish_fetch(wanted, index, anchored);
         Ok(())
+    }
+
+    /// One row's text, read from the file with no window involved — what a caller that must not
+    /// disturb the painter's window asks for, such as the grid's text provider reading a row a
+    /// screen reader wants from off the screen. `None` past the index or where no line decodes.
+    pub fn read_line<R: ChunkReader + ?Sized>(
+        reader: &R,
+        charset: Charset,
+        index: &LineIndex,
+        row: u64,
+    ) -> Result<Option<String>> {
+        let mut buf = vec![0u8; SCATTER_READ_BYTES];
+        read_one(reader, charset, index, row, &mut buf).map(|(line, _)| line)
     }
 
     fn is_served(&self, wanted: &[u64], index: &LineIndex, anchored: bool) -> bool {

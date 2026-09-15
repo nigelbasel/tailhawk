@@ -523,6 +523,16 @@ impl LogSet {
         Ok(())
     }
 
+    /// Row `row`'s text, read from its member's file — **without touching the window** the
+    /// painter draws from.
+    pub fn read_row(&self, row: u64) -> Option<String> {
+        let at = self.locate(row)?;
+        let member = &self.members[at.member];
+        Rows::read_line(&*member.file, member.charset, &member.index, at.line)
+            .ok()
+            .flatten()
+    }
+
     /// Advances the set: growth on the live member, and every way it can stop being live.
     ///
     /// **This does no scanning.** [`crate::scanner`] runs it on a worker; what happens here is
@@ -974,6 +984,32 @@ mod tests {
         assert_eq!(set.row_text(7), Some("wed c"));
         assert_eq!(set.row_text(1), None, "not asked for");
         assert_eq!(set.row_text(3), None, "the middle member was not touched");
+    }
+
+    /// **A row off the screen is read without moving the screen.** The grid's text provider reads
+    /// any row a screen reader asks for, and the painter draws from the window `fetch` filled; a
+    /// read that replaced the window would draw the wrong rows until the next frame fetched again.
+    #[test]
+    fn a_row_off_the_window_is_read_without_moving_the_window() {
+        let dir = scratch("read-row");
+        write(&dir, "log-20260727.txt", &["mon a", "mon b", "mon c"]);
+        let anchor = write(&dir, "log-20260729.txt", &["wed a", "wed b"]);
+
+        let mut set = LogSet::open(&anchor).expect("open");
+        set.fetch(0, 2, false).expect("fetch");
+        assert_eq!(
+            set.read_row(4).as_deref(),
+            Some("wed b"),
+            "from the other member"
+        );
+        assert_eq!(set.read_row(2).as_deref(), Some("mon c"));
+        assert_eq!(
+            set.row_text(0),
+            Some("mon a"),
+            "the window still holds what it held"
+        );
+        assert_eq!(set.row_text(4), None, "and nothing it was not asked for");
+        assert_eq!(set.read_row(99), None, "past the end");
     }
 
     /// §5.5b's trap, end to end. `app.log.2` is the *oldest* text, and a set that read it as newest

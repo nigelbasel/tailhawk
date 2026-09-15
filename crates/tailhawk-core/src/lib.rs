@@ -44,6 +44,7 @@ pub mod semantic;
 pub mod settings;
 pub mod sourceset;
 pub mod template;
+pub mod textunit;
 pub mod theme;
 pub mod trace;
 pub mod view;
