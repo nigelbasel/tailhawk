@@ -45,8 +45,20 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    anything, so a source that cannot answer leaves the user with a status-bar message where their
    windows were, and the scrollback is gone either way. Not exercised against live Loki — the
    configured source still has no secret.
-3. **The rest of `UX-REVIEW.md`**, worst first: the filter panel has no tab stops and `widget::Focus`
-   has one variant; the grid's text is absent from the accessibility tree. **Column headings are done (2026-09-15):** sentence case for a
+3. **The rest of `UX-REVIEW.md`**, worst first: the grid's text is absent from the accessibility
+   tree. **The filter panel is done (2026-09-15):** `filterpanel::FilterPanel` is a check-box
+   `SysListView32` in a child dialog, reached by `F6` and left by `F6` or `Esc`; `Space` toggles,
+   `Enter` or a double-click edits, `Delete` removes, the row menu has the rest including
+   `Move up` / `Move down`. **It has no buttons, by the owner's rule** — "the only time a command
+   should not be on the menu bar is if we have context menus" — so Edit ▸ Edit filter… and Remove
+   filter act on the list's selection, and the list's keys post those same commands.
+   `tools/verify-panel.ps1` drives that keyboard path in both themes and photographs the panel;
+   `verify-uia.ps1` checks the list by message and the Edit menu's greying without the foreground.
+   **Knowingly left:** with the keyboard in the list, the main window's accelerators (`Ctrl+L` and
+   the rest) do not fire — the dialog manager hands every key to the list; `verify-uia.ps1`'s
+   "every child has a name" check fails on the tab strip, toolbar and header, which are unnamed
+   native panes, and its status check reads `doc.status`, which is the notice alone and not the
+   status bar's composed line — both older than the panel. **Column headings are done (2026-09-15):** sentence case for a
    format Tailhawk recognises, a JSON or W3C file's own keys verbatim, display only (`HeaderColumn`
    carries `title` for filters and `label` for drawing). **The title bar is done too:** it reads the document and then
    `Tailhawk`, the frame and atlas instrument appears only under `TAILHAWK_FRAME_STATS`, and the

@@ -258,6 +258,9 @@ struct Document {
     /// §2.5's header as the real control, one per pane, created by the shell the first time this
     /// pane is laid out with a layout. `None` until then, and the painter draws the band instead.
     header_ctl: Option<header::Header>,
+    /// Section 2.1's filter panel as Windows controls, one per document like the header control, placed
+    /// over the band this document reserves. Created the first frame the panel is shown.
+    filter_ctl: Option<filterpanel::FilterPanel>,
     /// The control's band in pixels — `HDM_LAYOUT`'s answer — which the view reserves in place of
     /// the drawn band's row height once the control exists.
     header_band: f32,
@@ -468,8 +471,6 @@ impl RowSource for Document {
         let row_h = painter.row_height();
         let band = view.chrome_px();
         let width = view.gutter_px() + view.hgrid().viewport_px();
-        let mut hits = self.chrome.hits.borrow_mut();
-        hits.clear();
 
         // **A side-by-side split needs a seam drawn, and a stacked one does not.** Stacked, the
         // lower pane's column-header band is itself the break. Side by side, the two header bands
@@ -503,111 +504,14 @@ impl RowSource for Document {
         } else {
             0.0
         };
-        let panel_row = self.band_h(row_h);
-        let panel_h = filterpanel::height(
-            self.filtering.chips.chips.len(),
-            self.show_filters,
-            panel_row,
-        );
         // **§8's detail is no longer drawn here.** It was text composed into cells and painted over
         // the grid by the renderer that exists for scrolling fifty thousand rows a second; it is a
         // modeless window with a tab control now — `detailwin.rs` — for the reasons the owner gave
         // on 2026-09-09 and one he did not have to: a list of six fields could not be selected,
         // copied or scrolled, because nothing drawn by this painter can be.
 
-        // §2.1's docked filter panel, above the status bar — the VS tool-window posture, fixed.
-        // A title row carries the panel's name and its buttons, drawn through the shared
-        // standard-controls module so their metrics are decided once; each chip is a row whose
-        // text selects it, for Edit… and Remove to act on. Add… opens the Filter dialog — the
-        // inline field the owner found unreadable is gone.
-        {
-            let mut panel_hits = self.chrome.panel_hits.borrow_mut();
-            panel_hits.clear();
-            if panel_h > 0.0 {
-                let top = view.height_px() - strip - panel_h;
-                painter.fill(0.0, top, width, panel_h, theme().pane_bg);
-                painter.fill(0.0, top, width, filterpanel::RULE_PX, theme().pane_edge);
-                let mut y = top + filterpanel::RULE_PX + 2.0;
-                let title_h = filterpanel::title_height(panel_row);
-                let ty = y + ((title_h - chrome_h) * 0.5).floor();
-                painter.chrome_run("Filters", pad, ty, theme().header_ink);
-                let m = controls::metrics(chrome_h);
-                let has_selection = self
-                    .filter_selected
-                    .is_some_and(|i| i < self.filtering.chips.chips.len());
-                let any = !self.filtering.chips.chips.is_empty();
-                let button_h = chrome_h + m.button_pad_y * 2.0;
-                let by = y + ((title_h - button_h) * 0.5).floor().max(0.0);
-                let mut bx = width - pad;
-                for (label, hit, enabled) in [
-                    ("Clear all", Hit::FilterClear, any),
-                    ("Remove", Hit::FilterRemove, has_selection),
-                    ("Edit…", Hit::FilterEdit, has_selection),
-                    ("Add…", Hit::FilterAdd, true),
-                ] {
-                    let (w, _) = controls::button_size(painter, chrome_h, label);
-                    bx -= w;
-                    let (xr, yr) = controls::button(painter, chrome_h, bx, by, label, enabled);
-                    if enabled {
-                        panel_hits.push((xr, yr, hit));
-                    }
-                    bx -= m.gap;
-                }
-                y += title_h;
-                for (i, row) in filterpanel::rows_of(&self.filtering.chips.chips)
-                    .iter()
-                    .enumerate()
-                {
-                    let ty = y + ((panel_row - chrome_h) * 0.5).floor();
-                    let enabled = row.mark == "[x]";
-                    let ink = if enabled {
-                        theme().ink
-                    } else {
-                        theme().field_hint
-                    };
-                    if self.filter_selected == Some(i) {
-                        painter.fill(0.0, y, width, panel_row, theme().palette_selected_bg);
-                    }
-                    let mut x = pad;
-                    let mark_w = painter.chrome_run(row.mark, x, ty, ink);
-                    panel_hits.push((x..x + mark_w + pad, y..y + panel_row, Hit::Chip(i)));
-                    x += mark_w + pad;
-                    // The sign wears the chip's colour, so include and exclude read at a glance
-                    // as the bar's chips did; clicking it flips the polarity — §5's edit.
-                    let sign = row.sign.to_string();
-                    let sign_w = painter.chrome_measure(&sign);
-                    let bg = match (row.sign, enabled) {
-                        ('+', true) => theme().chip_include_bg,
-                        (_, true) => theme().chip_exclude_bg,
-                        (_, false) => theme().field_bg,
-                    };
-                    painter.fill(x - 2.0, ty - 2.0, sign_w + 4.0, chrome_h + 4.0, bg);
-                    painter.chrome_run(&sign, x, ty, ink);
-                    panel_hits.push((
-                        x - 2.0..x + sign_w + 2.0,
-                        y..y + panel_row,
-                        Hit::FilterPolarity(i),
-                    ));
-                    x += sign_w + pad;
-                    let text_w = painter.chrome_run(&row.text, x, ty, ink);
-                    let close_x = x + text_w + pad * 1.5;
-                    let close_w = painter.chrome_run("×", close_x, ty, theme().field_hint);
-                    // The `×` first: hits resolve first-match, and the select rect below runs
-                    // wide under it so most of the row is a click target.
-                    panel_hits.push((
-                        close_x..close_x + close_w + pad,
-                        y..y + panel_row,
-                        Hit::ChipClose(i),
-                    ));
-                    panel_hits.push((
-                        x..(close_x + close_w + pad).max(width * 0.6),
-                        y..y + panel_row,
-                        Hit::FilterSelect(i),
-                    ));
-                    y += panel_row;
-                }
-            }
-        }
+        // Section 2.1's filter panel is Windows controls since 2026-09-15, placed over its band by the
+        // shell; nothing of it is painted here.
 
         // The status bar, at the bottom: what the title says, where a user looks. Cut from the
         // right if it is longer than the window; the front is the part that changes.
@@ -808,6 +712,7 @@ impl Document {
             detection,
             header: layout.as_ref().map(Layout::header),
             header_ctl: None,
+            filter_ctl: None,
             header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
@@ -874,6 +779,7 @@ impl Document {
             detection,
             header: layout.as_ref().map(Layout::header),
             header_ctl: None,
+            filter_ctl: None,
             header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             resizing: None,
@@ -947,11 +853,7 @@ impl Document {
         } else {
             0.0
         };
-        let panel = filterpanel::height(
-            self.filtering.chips.chips.len(),
-            self.show_filters,
-            self.band_h(row_h),
-        );
+        let panel = self.filter_band_px(row_h);
         self.view.set_footer_px(footer + panel);
         // The band is the control's height once the control exists, and the drawn band's row
         // height until then — never a constant, for the reason every native surface here gives.
@@ -1242,6 +1144,14 @@ impl Document {
     /// Whether the chips or the collapse are narrowing the rows — what `Clear filters` acts on.
     fn is_filtered(&self) -> bool {
         self.filtering.filtered()
+    }
+
+    /// The filter the panel's list has selected, if it still exists — what Edit filter… and Remove
+    /// filter act on. A selection past the end is no selection: a chip removed by another path must
+    /// not leave the menu pointing at nothing.
+    fn selected_filter(&self) -> Option<usize> {
+        self.filter_selected
+            .filter(|at| *at < self.filtering.chips.chips.len())
     }
 
     /// Whether there is a save to stop — a live one from "Keep saving…", or a one-shot export
@@ -1902,7 +1812,7 @@ impl Document {
     /// Drops every chip and the survivors with them: the unfiltered view.
     /// Removes chip `i` and keeps the panel's selection honest: the removed row deselects, and a
     /// selection past it slides up — every removal path comes through here, because the one that
-    /// did not is the one whose Remove button then acted on the wrong chip.
+    /// did not once left the panel's Remove acting on the wrong chip.
     fn remove_chip(&mut self, i: usize) {
         if i >= self.filtering.chips.chips.len() {
             return;
@@ -1935,6 +1845,41 @@ impl Document {
         self.refilter();
         let rows = self.view_rows();
         self.view.grid_mut().set_total_rows(rows);
+    }
+
+    /// The filter panel's band in pixels: one answer, asked by the reserver in `lay_out` and by the
+    /// shell placing the panel over it, from the list's own row and frame once the panel exists and
+    /// from the chrome row's until then.
+    fn filter_band_px(&self, row_h: f32) -> f32 {
+        let band = self.band_h(row_h);
+        let (row, frame) = self
+            .filter_ctl
+            .as_ref()
+            .map(|p| p.metrics())
+            .unwrap_or((band + 2.0, 4.0));
+        filterpanel::band_height(
+            self.filtering.chips.chips.len(),
+            self.show_filters,
+            row,
+            frame,
+        )
+    }
+
+    /// Moves chip `from` to position `to`, reporting a change. Order is display-only (section 7.2), so
+    /// nothing is filtered again; the selection follows the chip that moved. The panel's `Move up`
+    /// and `Move down` use this, because a reorder that could only be dragged is one the keyboard
+    /// cannot do.
+    fn move_chip(&mut self, from: usize, to: usize) -> bool {
+        let chips = &mut self.filtering.chips.chips;
+        if from >= chips.len() || to >= chips.len() || from == to {
+            return false;
+        }
+        let chip = chips.remove(from);
+        chips.insert(to, chip);
+        if self.filter_selected == Some(from) {
+            self.filter_selected = Some(to);
+        }
+        true
     }
 
     /// Flips chip `i`'s polarity the same way — the panel's sign and the row menu's item.
@@ -3325,15 +3270,8 @@ impl Filtering {
 /// cell model — so its text lines up with the columns beneath and a click resolves to a cell.
 struct Chrome {
     focus: Focus,
-    /// What was drawn where, in viewport x pixels, so a click can be resolved. Filled by
-    /// `draw_chrome` each frame; a `RefCell` because drawing takes `&self`.
-    hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, Hit)>>,
     /// The rules editor's rows by their y, for a click on one.
     rules_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, usize)>>,
-    /// §2.1's filter panel, by x **and** y — it is a column of rows in the footer band, so x
-    /// alone would resolve every row to the first, the lesson the menu's hits already learned.
-    #[allow(clippy::type_complexity)]
-    panel_hits: std::cell::RefCell<Vec<(std::ops::Range<f32>, std::ops::Range<f32>, Hit)>>,
 }
 
 /// E21 — an export in progress, or a live tee. See [`tailhawk_core::export`]: a tee is the export
@@ -3467,6 +3405,11 @@ enum Command {
     FilterExclude,
     ToggleFilters,
     ClearFilter,
+    /// The filter the panel's list has selected, in the Filter dialog. The owner, 2026-09-15:
+    /// commands are on the menu bar, not on buttons inside a pane.
+    EditFilter,
+    /// And removed — the panel's `Delete`, on the menu bar where it can be found.
+    RemoveFilter,
     ToggleCollapse,
     RevealInvisibles,
     ToggleBookmark,
@@ -3542,6 +3485,8 @@ impl Command {
         (Command::FilterExclude, "Add exclude filter", "Ctrl+Shift+L"),
         (Command::ToggleFilters, "Filter panel", ""),
         (Command::ClearFilter, "Clear filters", "Esc"),
+        (Command::EditFilter, "Edit the selected filter…", ""),
+        (Command::RemoveFilter, "Remove the selected filter", ""),
         (
             Command::ToggleCollapse,
             "Toggle records only (collapse continuations)",
@@ -3647,35 +3592,6 @@ impl Command {
             "Esc",
         ),
     ];
-}
-
-/// What is being dragged along the bar to reorder it.
-///
-/// Only chips, since the tab strip became `SysTabControl32` and reorders through its own subclass.
-/// Kept as an enum rather than flattened away because the panel's drag is the same shape it always
-/// was, and a second kind is what this is for.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum BarDrag {
-    Chip,
-}
-
-/// What a click on the bar landed on.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Hit {
-    /// A chip's checkbox: toggles it.
-    Chip(usize),
-    /// A chip's `×`: removes it.
-    ChipClose(usize),
-    /// A chip's `+`/`−` sign in the filter panel: flips its polarity — §5's most common edit,
-    /// which the bar's chips never offered.
-    FilterPolarity(usize),
-    /// A chip row's text: selects the row, for Edit… and Remove to act on.
-    FilterSelect(usize),
-    /// The panel's title-row buttons.
-    FilterAdd,
-    FilterEdit,
-    FilterRemove,
-    FilterClear,
 }
 
 /// What choosing a row of §6.1's chip menu does.
@@ -3819,9 +3735,7 @@ impl Default for Chrome {
     fn default() -> Self {
         Self {
             focus: Focus::Grid,
-            hits: std::cell::RefCell::new(Vec::new()),
             rules_hits: std::cell::RefCell::new(Vec::new()),
-            panel_hits: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -4498,8 +4412,6 @@ struct Shell {
     rules_fixed: Vec<tailhawk_core::rules::Spec>,
     /// §14's first-run surface, kept while it is shown so a click on a recent file can be resolved.
     welcome: Option<Welcome>,
-    /// A tab or a chip being dragged to a new place — `UI-DESIGN.md` §2.1 / §5 — from its index.
-    dragging_bar: Option<(BarDrag, usize)>,
     /// How long recent frames took. See [`Frames`].
     frames: Frames,
     /// Last frame's placeholder draws: glyphs queued, and glyphs the atlas has refused. The
@@ -5132,6 +5044,9 @@ impl Shell {
                         if let Some(ctl) = doc.header_ctl.as_mut() {
                             ctl.place(0, 0, 0, 0, false);
                         }
+                        if let Some(panel) = doc.filter_ctl.as_mut() {
+                            panel.place(0, 0, 0, 0, false);
+                        }
                     }
                 }
                 let panes = self.document.panes_mut();
@@ -5144,6 +5059,9 @@ impl Shell {
                         // own rows, answering to its own gestures.
                         if let Some(ctl) = doc.header_ctl.as_mut() {
                             ctl.place(0, 0, 0, 0, false);
+                        }
+                        if let Some(panel) = doc.filter_ctl.as_mut() {
+                            panel.place(0, 0, 0, 0, false);
                         }
                         continue;
                     };
@@ -5188,6 +5106,19 @@ impl Shell {
                         .as_ref()
                         .map(|h| h.band_height(width as i32) as f32)
                         .unwrap_or(0.0);
+                    // The filter panel is made before the layout, not after it: `lay_out` reserves
+                    // its band from the panel's own measured heights, and a panel made afterwards
+                    // would be placed from those while its first band was reserved from a guess.
+                    if doc.show_filters && doc.filter_ctl.is_none() {
+                        doc.filter_ctl = filterpanel::FilterPanel::create(hwnd);
+                    }
+                    // Filled before the layout too: a row can only be measured once the list holds
+                    // one, and a band reserved from a guessed row height clips the rows it shows.
+                    let rows = filterpanel::list_rows_of(&doc.filtering.chips.chips);
+                    let selected = doc.filter_selected;
+                    if let Some(panel) = doc.filter_ctl.as_mut() {
+                        panel.set(&rows, selected);
+                    }
                     doc.lay_out(cell, (width as u32, height as u32));
                     header::trace("shell: pane laid out");
                     // Filled and placed after the layout, from the same boxes the drawn band used,
@@ -5225,6 +5156,18 @@ impl Shell {
                                 shown,
                             );
                         }
+                    }
+                    // Section 2.1's filter panel as Windows controls: filled from the chips, and
+                    // placed over the band `lay_out` just reserved from the same `filter_band_px`.
+                    let panel_px = doc.filter_band_px(cell.1).round() as i32;
+                    if let Some(panel) = doc.filter_ctl.as_mut() {
+                        panel.place(
+                            x.round() as i32,
+                            (top + height).round() as i32 - panel_px,
+                            width.round() as i32,
+                            panel_px,
+                            panel_px > 0,
+                        );
                     }
                     // The highlighter's frame budget starts here, alongside the painter's own
                     // `begin_frame` inside `paint_panes` — one frame, one budget, §11.3.
@@ -5844,6 +5787,12 @@ impl Shell {
                 );
             }
         }
+        // And every document's filter panel, whose brush and control classes follow the theme too.
+        for (_, doc) in self.document.all_mut() {
+            if let Some(panel) = doc.filter_ctl.as_mut() {
+                panel.adopt_theme();
+            }
+        }
         // The *name*, not the resolved palette: "system" is an instruction, and storing what it
         // resolved to today loses the instruction.
         self.theme_name = Some(name.to_owned());
@@ -5877,60 +5826,6 @@ impl Shell {
             w,
             h,
         })
-    }
-
-    /// Ends a bar drag at `x`: the chip is moved to the slot under the pointer. Reports whether the
-    /// order changed.
-    ///
-    /// **Tabs are no longer dragged here.** The strip is `SysTabControl32` and does its own
-    /// reordering through `tabstrip`'s subclass, which posts the move rather than performing it —
-    /// so this is the panel's business alone now.
-    fn drop_bar_drag(&mut self, _x: f32, y: f32) -> bool {
-        let Some((kind, from)) = self.dragging_bar.take() else {
-            return false;
-        };
-        let Some(doc) = self.document.as_ref() else {
-            return false;
-        };
-        let target = match kind {
-            // The panel is a column, so the row under the pointer is the target — y decides, and
-            // anywhere along the row's width counts, which is how a vertical list reorders.
-            BarDrag::Chip => {
-                doc.chrome
-                    .panel_hits
-                    .borrow()
-                    .iter()
-                    .find_map(|(_, yr, hit)| match hit {
-                        Hit::Chip(i) | Hit::ChipClose(i) | Hit::FilterPolarity(i)
-                            if yr.contains(&y) =>
-                        {
-                            Some(*i)
-                        }
-                        _ => None,
-                    })
-            }
-        };
-        let Some(to) = target else {
-            return false;
-        };
-        if to == from {
-            return false;
-        }
-        match kind {
-            BarDrag::Chip => {
-                if let Some(doc) = self.document.as_mut() {
-                    let chips = &mut doc.filtering.chips.chips;
-                    if from < chips.len() && to < chips.len() {
-                        let mut chip = chips.remove(from);
-                        // The press that began the drag toggled it; a drag is a move, not a toggle.
-                        chip.enabled = !chip.enabled;
-                        chips.insert(to, chip);
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     /// Which pane a client point falls in, and that pane's origin — for routing a click. `None`
@@ -6533,9 +6428,21 @@ impl Shell {
                 self.reload_rules(hwnd);
                 return true;
             }
+            // F6 moves between panes, and the filter panel is one: from the log into the panel when
+            // it is shown, and otherwise to the other pane of a split. Inside the panel, F6 and Esc
+            // bring the keyboard back — see `filter_panel_escape`.
             Command::FocusOtherPane => {
-                let other = 1 - self.document.focused_pane().min(1);
-                self.document.focus_pane(other);
+                let panel = self
+                    .document
+                    .as_ref()
+                    .and_then(|d| d.filter_ctl.as_ref())
+                    .filter(|p| p.is_visible() && !p.has_focus());
+                if let Some(panel) = panel {
+                    panel.focus();
+                } else {
+                    let other = 1 - self.document.focused_pane().min(1);
+                    self.document.focus_pane(other);
+                }
             }
             Command::CloseTab => {
                 self.document.close_active();
@@ -6580,6 +6487,16 @@ impl Shell {
                 doc.show_filters = !doc.show_filters;
             }
             Command::ClearFilter => doc.clear_filter(),
+            Command::EditFilter => {
+                if let Some(at) = doc.selected_filter() {
+                    self.pending_filter_edit = Some(at);
+                }
+            }
+            Command::RemoveFilter => {
+                if let Some(at) = doc.selected_filter() {
+                    doc.remove_chip(at);
+                }
+            }
             Command::ResetColumns => {
                 doc.reset_columns();
             }
@@ -6736,7 +6653,7 @@ impl Shell {
 
     /// A click in the command bar: a field takes focus and the caret lands where the click was; a
     /// chip is removed. Returns whether the click was the bar's.
-    fn chrome_click(&mut self, hwnd: HWND, x: f32, y: f32, _extend: bool) -> bool {
+    fn chrome_click(&mut self, hwnd: HWND, _x: f32, y: f32, _extend: bool) -> bool {
         // V9's editor is modal, so a click inside it selects a rule and a click anywhere else is
         // swallowed. Without this the grid behind the box takes the click and the user finds
         // themselves dragging a selection through log text they cannot see.
@@ -6757,77 +6674,18 @@ impl Shell {
         let Some(doc) = self.document.as_mut() else {
             return false;
         };
-        // §2.1's filter panel lives in the footer band, below the grid — its targets carry both
-        // axes, so they are checked before the bar gate turns a footer click into a grid click.
-        let panel_hit = doc
-            .chrome
-            .panel_hits
-            .borrow()
-            .iter()
-            .find(|(xr, yr, _)| xr.contains(&x) && yr.contains(&y))
-            .map(|(_, _, hit)| *hit);
-        if panel_hit.is_none() && y >= doc.view.chrome_px() {
-            if doc.chrome.focus != Focus::Grid {
-                doc.chrome.focus = Focus::Grid;
-                unsafe {
-                    let _ = InvalidateRect(hwnd, None, false);
-                }
+        // Section 2.1's filter panel is Windows controls since 2026-09-15 and takes its own clicks, so
+        // what reaches here is the grid's: below the tab strip it is the grid's to handle, and above
+        // it the keyboard simply returns to the grid.
+        let below_strip = y >= doc.view.chrome_px();
+        if doc.chrome.focus != Focus::Grid {
+            doc.chrome.focus = Focus::Grid;
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
             }
-            return false;
         }
-        // The tab strip is a child window now, so a click on it never reaches here at all — it is
-        // the control's, and it answers with `TCN_SELCHANGE`, `WM_TAB_MOVED` or `WM_TAB_CLOSE`.
-        let hit = panel_hit.or_else(|| {
-            doc.chrome
-                .hits
-                .borrow()
-                .iter()
-                .find(|(range, _)| range.contains(&x))
-                .map(|(_, hit)| *hit)
-        });
-        let Some(doc) = self.document.as_mut() else {
+        if below_strip {
             return false;
-        };
-        match hit {
-            Some(Hit::Chip(i)) if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
-                self.pending_filter_edit = Some(i);
-            }
-            Some(Hit::Chip(i)) => {
-                if i < doc.filtering.chips.chips.len() {
-                    self.dragging_bar = Some((BarDrag::Chip, i));
-                    unsafe { SetCapture(hwnd) };
-                    doc.flip_chip_enabled(i);
-                }
-            }
-            Some(Hit::ChipClose(i)) => {
-                doc.remove_chip(i);
-            }
-            Some(Hit::FilterPolarity(i)) => {
-                doc.flip_chip_polarity(i);
-            }
-            Some(Hit::FilterSelect(i)) => {
-                doc.filter_selected = (i < doc.filtering.chips.chips.len()).then_some(i);
-            }
-            Some(Hit::FilterAdd) => {
-                self.pending_filter = Some((Polarity::Include, None));
-            }
-            Some(Hit::FilterEdit) => {
-                if let Some(i) = doc.filter_selected {
-                    if i < doc.filtering.chips.chips.len() {
-                        self.pending_filter_edit = Some(i);
-                    }
-                }
-            }
-            Some(Hit::FilterRemove) => {
-                if let Some(i) = doc.filter_selected {
-                    doc.remove_chip(i);
-                }
-            }
-            Some(Hit::FilterClear) => {
-                doc.filter_selected = None;
-                doc.clear_filter();
-            }
-            None => doc.chrome.focus = Focus::Grid,
         }
         self.sync_scrollbar(hwnd);
         self.retitle(hwnd);
@@ -7051,14 +6909,13 @@ mod uia {
         NavigateDirection, NavigateDirection_FirstChild, NavigateDirection_LastChild,
         NavigateDirection_NextSibling, NavigateDirection_Parent, NavigateDirection_PreviousSibling,
         ProviderOptions, ProviderOptions_ServerSideProvider, ProviderOptions_UseComThreading,
-        ToggleState, ToggleState_Off, ToggleState_On, UIA_AutomationIdPropertyId,
-        UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
-        UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsContentElementPropertyId,
-        UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
-        UIA_NamePropertyId, UIA_PaneControlTypeId, UIA_SelectionItemPatternId,
-        UIA_StatusBarControlTypeId, UIA_TabItemControlTypeId, UIA_TogglePatternId,
-        UIA_ValuePatternId, UIA_ValueValuePropertyId, UiaHostProviderFromHwnd, UiaRect,
-        UiaReturnRawElementProvider, UiaRootObjectId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+        ToggleState, ToggleState_Off, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
+        UIA_ControlTypePropertyId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId,
+        UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId,
+        UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PaneControlTypeId,
+        UIA_SelectionItemPatternId, UIA_StatusBarControlTypeId, UIA_TabItemControlTypeId,
+        UIA_TogglePatternId, UIA_ValuePatternId, UIA_ValueValuePropertyId, UiaHostProviderFromHwnd,
+        UiaRect, UiaReturnRawElementProvider, UiaRootObjectId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
     };
 
     /// `UiaAppendRuntimeId`: the first element of a fragment's runtime id, per the UIA docs.
@@ -7069,8 +6926,6 @@ mod uia {
     pub enum Kind {
         Root,
         Tab(usize),
-        NewChip,
-        Chip(usize),
         Status,
     }
 
@@ -7097,12 +6952,8 @@ mod uia {
         if doc.tab_strip.0.len() > 1 {
             out.extend((0..doc.tab_strip.0.len()).map(Kind::Tab));
         }
-        // The filter panel's controls exist for the provider exactly when they exist on screen —
-        // a tree element with no rect that types into an invisible field is the provider lying.
-        if doc.filters_open() {
-            out.push(Kind::NewChip);
-            out.extend((0..doc.filtering.chips.chips.len()).map(Kind::Chip));
-        }
+        // The filter panel is Windows controls since 2026-09-15: its list and buttons are windows
+        // with Windows' own accessibility, and are not this provider's to describe.
         out.push(Kind::Status);
         out
     }
@@ -7152,7 +7003,6 @@ mod uia {
         fn name(&self) -> String {
             match self.kind {
                 Kind::Root => "Tailhawk".to_owned(),
-                Kind::NewChip => "Add filter".to_owned(),
                 Kind::Status => "Status".to_owned(),
                 Kind::Tab(i) => with_shell(|s| {
                     s.document
@@ -7160,36 +7010,21 @@ mod uia {
                         .and_then(|d| d.tab_strip.0.get(i).cloned())
                 })
                 .unwrap_or_default(),
-                Kind::Chip(i) => with_shell(|s| {
-                    s.document.as_ref().and_then(|d| {
-                        d.filtering.chips.chips.get(i).map(|c| {
-                            let sign = match c.polarity {
-                                Polarity::Include => "include ",
-                                Polarity::Exclude => "exclude ",
-                            };
-                            format!("{sign}{}", c.source)
-                        })
-                    })
-                })
-                .unwrap_or_default(),
             }
         }
 
-        /// A stable id for tests: `find`, `chip-0`, `tab-1`, `status`.
+        /// A stable id for tests: `tab-1`, `status`.
         fn automation_id(&self) -> String {
             match self.kind {
                 Kind::Root => "tailhawk".to_owned(),
-                Kind::NewChip => "new-chip".to_owned(),
                 Kind::Status => "status".to_owned(),
                 Kind::Tab(i) => format!("tab-{i}"),
-                Kind::Chip(i) => format!("chip-{i}"),
             }
         }
 
         fn control_type(&self) -> i32 {
             match self.kind {
                 Kind::Root => UIA_PaneControlTypeId.0,
-                Kind::NewChip | Kind::Chip(_) => UIA_ButtonControlTypeId.0,
                 Kind::Tab(_) => UIA_TabItemControlTypeId.0,
                 Kind::Status => UIA_StatusBarControlTypeId.0,
             }
@@ -7220,16 +7055,6 @@ mod uia {
                     doc.view.gutter_px() + doc.view.hgrid().viewport_px(),
                     doc.view.height_px(),
                 );
-                // The filter panel's targets carry both axes, so its elements answer with real
-                // rects rather than a band guess.
-                let panel_rect = |wanted: &dyn Fn(&Hit) -> bool| {
-                    doc.chrome
-                        .panel_hits
-                        .borrow()
-                        .iter()
-                        .find(|(_, _, hit)| wanted(hit))
-                        .map(|(xr, yr, _)| (xr.clone(), yr.clone()))
-                };
                 Some(match self.kind {
                     Kind::Root => (0.0, 0.0, w, h),
                     // Asked of the real control. The rectangle used to come from the drawn strip's
@@ -7237,31 +7062,6 @@ mod uia {
                     // element that says it is a tab and cannot say where it is would be worse than
                     // no element at all.
                     Kind::Tab(i) => with_shell(|s| s.tabs.as_ref()?.item_rect(i))?,
-                    Kind::NewChip => {
-                        // The Add… button is the panel's way in now the inline field is gone.
-                        let (xr, yr) = panel_rect(&|hit| *hit == Hit::FilterAdd)?;
-                        (xr.start, yr.start, xr.end - xr.start, yr.end - yr.start)
-                    }
-                    Kind::Chip(i) => {
-                        // The row has several targets carrying this chip's index — checkbox,
-                        // text — and the element is the whole row, so the rect is their union.
-                        let hits = doc.chrome.panel_hits.borrow();
-                        let mut spanning: Option<(std::ops::Range<f32>, std::ops::Range<f32>)> =
-                            None;
-                        for (xr, yr, hit) in hits.iter() {
-                            if *hit == Hit::Chip(i) {
-                                spanning = Some(match spanning {
-                                    None => (xr.clone(), yr.clone()),
-                                    Some((sx, sy)) => (
-                                        sx.start.min(xr.start)..sx.end.max(xr.end),
-                                        sy.start.min(yr.start)..sy.end.max(yr.end),
-                                    ),
-                                });
-                            }
-                        }
-                        let (xr, yr) = spanning?;
-                        (xr.start, yr.start, xr.end - xr.start, yr.end - yr.start)
-                    }
                     Kind::Status => {
                         let footer = Chrome::strip_height(band);
                         (0.0, h - footer, w, footer)
@@ -7287,10 +7087,8 @@ mod uia {
         fn runtime_key(&self) -> i32 {
             match self.kind {
                 Kind::Root => 1,
-                Kind::NewChip => 4,
                 Kind::Status => 5,
                 Kind::Tab(i) => 100 + i as i32,
-                Kind::Chip(i) => 1000 + i as i32,
             }
         }
 
@@ -7319,8 +7117,6 @@ mod uia {
         fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
             let supported = match self.kind {
                 Kind::Status => pattern == UIA_ValuePatternId,
-                Kind::NewChip => pattern == UIA_InvokePatternId,
-                Kind::Chip(_) => pattern == UIA_InvokePatternId || pattern == UIA_TogglePatternId,
                 Kind::Tab(_) => pattern == UIA_SelectionItemPatternId,
                 Kind::Root => false,
             };
@@ -7505,78 +7301,22 @@ mod uia {
     }
 
     impl IInvokeProvider_Impl for Element_Impl {
-        /// A chip's Invoke is its `×`: the chip goes.
+        /// No element offers Invoke since the filter panel became Windows controls; its buttons are
+        /// Windows' own and answer for themselves.
         fn Invoke(&self) -> Result<()> {
-            let hwnd = self.hwnd;
-            match self.kind {
-                Kind::Chip(i) => {
-                    with_shell_mut(|s| {
-                        let doc = s.document.as_mut()?;
-                        doc.remove_chip(i);
-                        s.sync_scrollbar(hwnd);
-                        s.retitle(hwnd);
-                        Some(())
-                    });
-                    self.repaint();
-                    Ok(())
-                }
-                Kind::NewChip => {
-                    // The Add… button: queue the Filter dialog and kick the drain, because no
-                    // input message follows a UIA invoke on its own.
-                    with_shell_mut(|s| {
-                        if let Some(doc) = s.document.as_mut() {
-                            doc.show_filters = true;
-                        }
-                        s.pending_filter = Some((Polarity::Include, None));
-                        Some(())
-                    });
-                    unsafe {
-                        let _ = PostMessageW(hwnd, WM_DRAIN_DIALOGS, WPARAM(0), LPARAM(0));
-                    }
-                    Ok(())
-                }
-                _ => Err(Error::from_hresult(E_FAIL)),
-            }
+            Err(Error::from_hresult(E_FAIL))
         }
     }
 
     impl IToggleProvider_Impl for Element_Impl {
-        /// A chip's Toggle is a click on its body: enabled or not.
+        /// No element offers Toggle since the filter panel became Windows controls; each filter's
+        /// check box is its list view item's, and Windows answers for it.
         fn Toggle(&self) -> Result<()> {
-            let Kind::Chip(i) = self.kind else {
-                return Err(Error::from_hresult(E_FAIL));
-            };
-            let hwnd = self.hwnd;
-            with_shell_mut(|s| {
-                let doc = s.document.as_mut()?;
-                if i < doc.filtering.chips.chips.len() {
-                    doc.remember();
-                    let chip = &mut doc.filtering.chips.chips[i];
-                    chip.enabled = !chip.enabled;
-                    doc.filtering.clear_results();
-                    doc.refilter();
-                    let rows = doc.view_rows();
-                    doc.view.grid_mut().set_total_rows(rows);
-                }
-                s.sync_scrollbar(hwnd);
-                s.retitle(hwnd);
-                Some(())
-            });
-            self.repaint();
-            Ok(())
+            Err(Error::from_hresult(E_FAIL))
         }
 
         fn ToggleState(&self) -> Result<ToggleState> {
-            let Kind::Chip(i) = self.kind else {
-                return Ok(ToggleState_Off);
-            };
-            let on = with_shell(|s| {
-                s.document
-                    .as_ref()
-                    .and_then(|d| d.filtering.chips.chips.get(i).map(|c| c.enabled))
-            })
-            .unwrap_or(false);
-            Ok(if on { ToggleState_On } else { ToggleState_Off })
+            Ok(ToggleState_Off)
         }
     }
 
@@ -7759,11 +7499,6 @@ enum Under {
     Grid {
         has_selection: bool,
         detail: bool,
-    },
-    ChipRow {
-        at: usize,
-        enabled: bool,
-        include: bool,
     },
 }
 
@@ -8029,23 +7764,6 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
                 point.y as f32 - doc.pane_top,
             )
         };
-        let row = doc
-            .chrome
-            .panel_hits
-            .borrow()
-            .iter()
-            .find_map(|(xr, yr, hit)| {
-                if !yr.contains(&y) || !xr.contains(&x) {
-                    return None;
-                }
-                match hit {
-                    Hit::Chip(i)
-                    | Hit::ChipClose(i)
-                    | Hit::FilterPolarity(i)
-                    | Hit::FilterSelect(i) => Some(*i),
-                    _ => None,
-                }
-            });
         let under = if let Some(item) = header_item {
             // The control's items are `header_columns`' boxes in the same order, and each box knows
             // which layout column it names — the mapping the notification path already uses, so a
@@ -8058,14 +7776,6 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
                 label: layout.display_title(column),
                 sort_here: layout.sort.and_then(|(c, d)| (c == column).then_some(d)),
                 any_sort: layout.sort.is_some(),
-            }
-        } else if let Some(at) = row.filter(|&i| i < doc.filtering.chips.chips.len()) {
-            doc.filter_selected = Some(at);
-            let chip = &doc.filtering.chips.chips[at];
-            Under::ChipRow {
-                at,
-                enabled: chip.enabled,
-                include: chip.polarity == Polarity::Include,
             }
         } else if doc.header_hit(x, y).is_some() {
             let column = doc.context_column(doc.header_cell(x))?;
@@ -8106,9 +7816,6 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
             has_selection,
             detail,
         } => menubar::grid_context(*has_selection, *detail),
-        Under::ChipRow {
-            enabled, include, ..
-        } => menubar::panel_row_context(*enabled, *include),
     };
     unsafe {
         let _ = InvalidateRect(hwnd, None, false);
@@ -8168,28 +7875,6 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
                 doc.view.grid_mut().set_total_rows(rows);
                 shell.sync_scrollbar(hwnd);
                 shell.retitle(hwnd);
-                true
-            }
-            (menubar::ID_CTX_CHIP_EDIT, Under::ChipRow { at, .. }) => {
-                shell.pending_filter_edit = Some(*at);
-                true
-            }
-            (menubar::ID_CTX_CHIP_POLARITY, Under::ChipRow { at, .. }) => {
-                if let Some(doc) = shell.document.as_mut() {
-                    doc.flip_chip_polarity(*at);
-                }
-                true
-            }
-            (menubar::ID_CTX_CHIP_TOGGLE, Under::ChipRow { at, .. }) => {
-                if let Some(doc) = shell.document.as_mut() {
-                    doc.flip_chip_enabled(*at);
-                }
-                true
-            }
-            (menubar::ID_CTX_CHIP_REMOVE, Under::ChipRow { at, .. }) => {
-                if let Some(doc) = shell.document.as_mut() {
-                    doc.remove_chip(*at);
-                }
                 true
             }
             _ => shell.menu_choose(hwnd, id),
@@ -9325,6 +9010,207 @@ pub fn detail_window_closed(hdlg: HWND, owner: HWND) {
     }
 }
 
+/// The document whose native filter panel is `panel`, **made the focused pane**.
+///
+/// Found by the panel's window and never by a position — the rule the header control's
+/// notifications follow, for the same reason: a document changes tab and pane on every split and
+/// close, and its window is the one thing that stays its own. Only the shown tab's panes have a
+/// panel on screen, so only they are searched. Focused, because every gesture in a panel is about
+/// that pane's filters while the menu's commands and the pending Filter dialog act on the focused
+/// document: a double-click in the other pane's panel must not edit this one's.
+fn doc_with_panel(shell: &mut Shell, panel: HWND) -> Option<&mut Document> {
+    let pane = shell
+        .document
+        .panes()
+        .iter()
+        .position(|doc| doc.filter_ctl.as_ref().is_some_and(|p| p.hwnd() == panel))?;
+    shell.document.focus_pane(pane);
+    shell.document.panes_mut().get_mut(pane)
+}
+
+/// A gesture in the filter panel's list that is a menu command: `Enter` or a double-click is
+/// Edit ▸ Edit filter…, and `Delete` is Edit ▸ Remove filter.
+///
+/// **One command, one path.** The panel's document becomes the focused pane, and the command's own
+/// id is posted to the owner exactly as the menu bar sends it — so the Filter dialog opens from the
+/// owner's `WM_COMMAND`, outside this procedure and outside the `STATE` borrow, and a panel gesture
+/// cannot do anything its menu item does not.
+pub(crate) fn filter_panel_command(panel: HWND, command: Command) {
+    let owner =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
+    let found = STATE.with(|s| {
+        let Ok(mut state) = s.try_borrow_mut() else {
+            return false;
+        };
+        state
+            .as_mut()
+            .is_some_and(|shell| doc_with_panel(shell, panel).is_some())
+    });
+    if found && !owner.is_invalid() {
+        unsafe {
+            let _ = PostMessageW(
+                owner,
+                WM_COMMAND,
+                WPARAM(menubar::command_id(command) as usize),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// The panel's list changed: a check box was clicked, or `Space` pressed on a row, or the selection
+/// moved.
+///
+/// **A check box that disagrees with its chip is a flip** — `filterpanel::flipped` — which is the one
+/// reading that cannot come out the wrong way round, because the list view reports that a state
+/// changed and not which way.
+pub fn filter_panel_changed(panel: HWND) {
+    let owner =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
+    let changed = STATE.with(|s| {
+        let Ok(mut state) = s.try_borrow_mut() else {
+            return false;
+        };
+        let Some(shell) = state.as_mut() else {
+            return false;
+        };
+        {
+            let Some(doc) = doc_with_panel(shell, panel) else {
+                return false;
+            };
+            let Some(ctl) = doc.filter_ctl.as_ref() else {
+                return false;
+            };
+            let checks = ctl.checks();
+            let selected = ctl.selected();
+            let rows = filterpanel::list_rows_of(&doc.filtering.chips.chips);
+            let flips = filterpanel::flipped(&rows, &checks);
+            doc.filter_selected = selected.filter(|at| *at < rows.len());
+            for at in &flips {
+                doc.flip_chip_enabled(*at);
+            }
+            let now = filterpanel::list_rows_of(&doc.filtering.chips.chips);
+            if let Some(ctl) = doc.filter_ctl.as_mut() {
+                ctl.accept_checks(&now);
+            }
+        }
+        // Retitled whether or not a box flipped: a selection in the other pane's list has just
+        // made that pane the focused one, and the title names the focused document.
+        shell.sync_scrollbar(owner);
+        shell.retitle(owner);
+        true
+    });
+    if changed && !owner.is_invalid() {
+        unsafe {
+            let _ = InvalidateRect(owner, None, false);
+        }
+    }
+}
+
+/// `Esc` in the panel: the keyboard goes back to the log, which is where it came from.
+pub fn filter_panel_escape(panel: HWND) {
+    let owner =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
+    if !owner.is_invalid() {
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(owner);
+        }
+    }
+}
+
+/// A right-click on the panel's list, or `Shift+F10` / the menu key inside it: the selected row's
+/// menu — Edit, polarity, enabled, move, remove.
+///
+/// **The row is the list's selection**, which a right-click has already set, so the pointer's
+/// position decides nothing here but where the menu hangs. A keyboard summons carries `(-1, -1)`
+/// and the menu hangs off the panel instead of the screen's corner.
+pub fn filter_panel_context(panel: HWND, x: i32, y: i32) {
+    let owner =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
+    let subject = STATE.with(|s| {
+        let Ok(mut state) = s.try_borrow_mut() else {
+            return None;
+        };
+        let shell = state.as_mut()?;
+        let doc = doc_with_panel(shell, panel)?;
+        let at = doc.filter_ctl.as_ref()?.selected()?;
+        let chip = doc.filtering.chips.chips.get(at)?;
+        doc.filter_selected = Some(at);
+        Some((
+            at,
+            chip.enabled,
+            chip.polarity == Polarity::Include,
+            doc.filtering.chips.chips.len(),
+        ))
+    });
+    let Some((at, enabled, include, count)) = subject else {
+        return;
+    };
+    let (sx, sy) = if x == -1 && y == -1 {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(panel, &mut r);
+        }
+        (r.left + 8, r.top + 8)
+    } else {
+        (x, y)
+    };
+    let items = menubar::panel_row_context(enabled, include, at > 0, at + 1 < count);
+    let Some(id) = menubar::track_context(owner, &items, sx, sy) else {
+        return;
+    };
+    let acted = STATE.with(|s| {
+        let Ok(mut state) = s.try_borrow_mut() else {
+            return false;
+        };
+        let Some(shell) = state.as_mut() else {
+            return false;
+        };
+        let edit = {
+            let Some(doc) = doc_with_panel(shell, panel) else {
+                return false;
+            };
+            match id {
+                menubar::ID_CTX_CHIP_EDIT => true,
+                menubar::ID_CTX_CHIP_POLARITY => {
+                    doc.flip_chip_polarity(at);
+                    false
+                }
+                menubar::ID_CTX_CHIP_TOGGLE => {
+                    doc.flip_chip_enabled(at);
+                    false
+                }
+                menubar::ID_CTX_CHIP_UP | menubar::ID_CTX_CHIP_DOWN => {
+                    let to = if id == menubar::ID_CTX_CHIP_UP {
+                        at.saturating_sub(1)
+                    } else {
+                        at + 1
+                    };
+                    doc.move_chip(at, to);
+                    false
+                }
+                menubar::ID_CTX_CHIP_REMOVE => {
+                    doc.remove_chip(at);
+                    false
+                }
+                _ => return false,
+            }
+        };
+        if edit {
+            shell.pending_filter_edit = Some(at);
+        }
+        shell.sync_scrollbar(owner);
+        shell.retitle(owner);
+        true
+    });
+    if acted && !owner.is_invalid() {
+        unsafe {
+            let _ = PostMessageW(owner, WM_DRAIN_DIALOGS, WPARAM(0), LPARAM(0));
+            let _ = InvalidateRect(owner, None, false);
+        }
+    }
+}
+
 pub fn rules_dialog_closed(hdlg: HWND, owner: HWND) {
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
@@ -10361,21 +10247,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     if msg == WM_LBUTTONDOWN {
                         if let Some(path) = shell.welcome.as_ref().and_then(|w| w.path_at(y)) {
                             shell.open_path(hwnd, path);
-                        }
-                    }
-                    return;
-                }
-                // A tab or a chip being dragged along the bar lands where the button goes up.
-                if shell.dragging_bar.is_some() {
-                    if msg == WM_LBUTTONUP {
-                        unsafe {
-                            let _ = ReleaseCapture();
-                        }
-                        if shell.drop_bar_drag(x, y) {
-                            shell.retitle(hwnd);
-                        }
-                        unsafe {
-                            let _ = InvalidateRect(hwnd, None, false);
                         }
                     }
                     return;
@@ -11425,7 +11296,6 @@ fn main() -> Result<()> {
             fling_epoch: std::time::Instant::now(),
             fling_tick: 0.0,
             fling_on: None,
-            dragging_bar: None,
             welcome: None,
             remembered,
             rules_editor: tailhawk_core::ruleset::Editor::default(),
@@ -11573,6 +11443,39 @@ fn main() -> Result<()> {
         }
         if !detail.is_invalid() && unsafe { IsDialogMessageW(detail, &msg) }.as_bool() {
             continue;
+        }
+        // The filter panels' keyboard — Tab between the list and the buttons, access keys, Esc back
+        // to the log — is the dialog manager's, and it only runs when the loop offers it the message.
+        let panels: Vec<HWND> = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|shell| {
+                    shell
+                        .document
+                        .all()
+                        .filter_map(|d| d.filter_ctl.as_ref())
+                        .filter(|p| p.is_visible())
+                        .map(|p| p.hwnd())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        // F6 out of the panel is the loop's to answer, before the dialog manager sees it: from a
+        // push button the dialog manager hands the key to the button, which ignores it, and the
+        // keyboard would be trapped in the panel it was moved into.
+        let in_panel = panels.iter().copied().find(|panel| {
+            *panel == msg.hwnd
+                || unsafe { windows::Win32::UI::WindowsAndMessaging::IsChild(*panel, msg.hwnd) }
+                    .as_bool()
+        });
+        if let Some(panel) = in_panel {
+            if msg.message == WM_KEYDOWN && msg.wParam.0 == usize::from(VK_F6.0) {
+                filter_panel_escape(panel);
+                continue;
+            }
+            if unsafe { IsDialogMessageW(panel, &msg) }.as_bool() {
+                continue;
+            }
         }
         unsafe {
             let _ = TranslateMessage(&msg);
@@ -12576,6 +12479,62 @@ mod tests {
         assert_eq!(
             status_line(None, Some("a"), None, Some("b"), Some("⚠ rules: c")),
             "a — b — ⚠ rules: c"
+        );
+    }
+
+    /// **Editing and removing a filter are menu commands, greyed until a filter is selected.** The
+    /// owner, 2026-09-15, of the push buttons the native panel was first given: "surely commands
+    /// should all be on menu and toolbar?" — and "the only time a command should not be on the menu
+    /// bar is if we have context menus". So the panel is a list and nothing else, and what its
+    /// buttons did is on the Edit menu, acting on the row the list has selected.
+    #[test]
+    fn the_edit_menu_edits_and_removes_the_selected_filter() {
+        fn enabled(doc: &Document, label: &str) -> bool {
+            let menu = menubar::menu_bar(
+                Some(doc),
+                menubar::BarState {
+                    toolbar: true,
+                    ..Default::default()
+                },
+                &[],
+                &[],
+            );
+            for top in 0..menu.items().len() {
+                let Some(items) = menu.at(&[top]) else {
+                    continue;
+                };
+                if let Some(item) = items.iter().find(|i| i.label == label) {
+                    return item.enabled;
+                }
+            }
+            panic!("no menu item labelled {label}");
+        }
+
+        let path = scratch_log("tailhawk_filter_menu_test.log", 50);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(
+            !enabled(&doc, "E&dit filter…"),
+            "no filters, nothing to edit"
+        );
+        assert!(!enabled(&doc, "Rem&ove filter"), "nor to remove");
+
+        doc.add_chip("line", Polarity::Include);
+        doc.add_chip("9", Polarity::Exclude);
+        assert!(
+            !enabled(&doc, "E&dit filter…"),
+            "filters but none selected: which would it edit?"
+        );
+        assert!(!enabled(&doc, "Rem&ove filter"));
+
+        doc.filter_selected = Some(1);
+        assert!(enabled(&doc, "E&dit filter…"));
+        assert!(enabled(&doc, "Rem&ove filter"));
+
+        doc.filter_selected = Some(7);
+        assert!(
+            !enabled(&doc, "Rem&ove filter"),
+            "a selection past the end is no selection"
         );
     }
 

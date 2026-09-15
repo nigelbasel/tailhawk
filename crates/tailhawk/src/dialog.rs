@@ -226,16 +226,45 @@ pub fn template_with(title: &str, w: i16, h: i16, items: &[Item], extra: u32) ->
     const WS_CAPTION: u32 = 0x00C0_0000;
     const WS_SYSMENU: u32 = 0x0008_0000;
     const DS_MODALFRAME: u32 = 0x80;
-    const DS_SETFONT: u32 = 0x40;
     const DS_CENTER: u32 = 0x0800;
+    template_styled(
+        title,
+        w,
+        h,
+        items,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | extra,
+        0,
+    )
+}
+
+/// A template for a dialog that lives **inside** another window rather than over it — the filter
+/// panel's host. `DS_CONTROL` makes it behave as a control of its parent, and `WS_EX_CONTROLPARENT`
+/// lets the dialog manager walk into it, so Tab reaches its buttons and its list like any dialog's.
+/// No caption, no frame, no centring: its parent places it.
+pub fn template_child(w: i16, h: i16, items: &[Item]) -> Vec<u16> {
+    const WS_CHILD: u32 = 0x4000_0000;
+    const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
+    const DS_CONTROL: u32 = 0x0400;
+    const WS_EX_CONTROLPARENT: u32 = 0x0001_0000;
+    template_styled(
+        "",
+        w,
+        h,
+        items,
+        WS_CHILD | WS_CLIPSIBLINGS | DS_CONTROL,
+        WS_EX_CONTROLPARENT,
+    )
+}
+
+/// The one encoder both templates share: `style` beyond `DS_SETFONT`, which every template here
+/// sets, and the extended style.
+fn template_styled(title: &str, w: i16, h: i16, items: &[Item], style: u32, ex: u32) -> Vec<u16> {
+    const DS_SETFONT: u32 = 0x40;
     const WS_CHILD_VISIBLE: u32 = 0x5000_0000;
 
     let mut t = Vec::new();
-    push_u32(
-        &mut t,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT | DS_CENTER | extra,
-    );
-    push_u32(&mut t, 0);
+    push_u32(&mut t, style | DS_SETFONT);
+    push_u32(&mut t, ex);
     t.push(items.len() as u16);
     t.push(0);
     t.push(0);
@@ -1027,7 +1056,7 @@ fn apps_quietly<R>(write: impl FnOnce() -> R) -> R {
 }
 
 /// Ticks or unticks one row of a checkbox list view.
-fn lv_check(list: HWND, at: i32, checked: bool) {
+pub(crate) fn lv_check(list: HWND, at: i32, checked: bool) {
     let item = LVITEMW {
         state: LIST_VIEW_ITEM_STATE_FLAGS(if checked {
             CHECKED_IMAGE
@@ -1048,7 +1077,7 @@ fn lv_check(list: HWND, at: i32, checked: bool) {
 }
 
 /// Whether row `at` is ticked.
-fn lv_checked(list: HWND, at: i32) -> bool {
+pub(crate) fn lv_checked(list: HWND, at: i32) -> bool {
     let state = unsafe {
         SendMessageW(
             list,
@@ -3520,7 +3549,7 @@ fn format_quietly<R>(write: impl FnOnce() -> R) -> R {
 }
 
 /// Adds one column to a report-view list.
-fn lv_column(list: HWND, at: i32, title: &str, width: i32) {
+pub(crate) fn lv_column(list: HWND, at: i32, title: &str, width: i32) {
     let mut text = wsz(title);
     let mut col = LVCOLUMNW {
         mask: LVCF_TEXT | LVCF_WIDTH,
@@ -3563,7 +3592,7 @@ pub fn lv_fill_pairs(list: HWND, pairs: &[(String, String)]) {
 
 /// Clears a report-view list's rows and its columns, so a second fill does not inherit the first's
 /// headings.
-fn lv_reset(list: HWND) {
+pub(crate) fn lv_reset(list: HWND) {
     unsafe {
         SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
         while SendMessageW(list, LVM_DELETECOLUMN, WPARAM(0), LPARAM(0)).0 != 0 {}
@@ -3571,7 +3600,7 @@ fn lv_reset(list: HWND) {
 }
 
 /// Appends one row of text to a report-view list.
-fn lv_row(list: HWND, at: i32, cells: &[String]) {
+pub(crate) fn lv_row(list: HWND, at: i32, cells: &[String]) {
     let Some((first, rest)) = cells.split_first() else {
         return;
     };
@@ -3759,7 +3788,7 @@ fn format_test(hdlg: HWND, state: &mut FormatState) {
 }
 
 /// The selected row of a report-view list, or `None`.
-fn lv_selected(list: HWND) -> Option<usize> {
+pub(crate) fn lv_selected(list: HWND) -> Option<usize> {
     let found = unsafe {
         SendMessageW(
             list,
@@ -3772,7 +3801,7 @@ fn lv_selected(list: HWND) -> Option<usize> {
 }
 
 /// Selects row `at`, so an edit that reorders the fields leaves the pointer somewhere sensible.
-fn lv_select(list: HWND, at: usize) {
+pub(crate) fn lv_select(list: HWND, at: usize) {
     let item = LVITEMW {
         state: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED | LVIS_FOCUSED),
         stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED | LVIS_FOCUSED),

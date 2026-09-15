@@ -9,9 +9,33 @@ param(
     [string]$Exe = ''
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Screen.ps1')
+. (Join-Path $PSScriptRoot 'Menu.ps1')
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $A = [System.Windows.Automation.AutomationElement]
+if (-not ('PanelList' -as [type])) {
+    Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class PanelList {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    public static IntPtr Find(IntPtr main) {
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(main, (h, l) => {
+            StringBuilder c = new StringBuilder(64); GetClassNameW(h, c, 64);
+            if (c.ToString() == "SysListView32") { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}
+'@
+}
 $Scope = [System.Windows.Automation.TreeScope]::Children
 function ById($root, $id) {
     $cond = New-Object System.Windows.Automation.PropertyCondition($A::AutomationIdProperty, $id)
@@ -41,18 +65,25 @@ try {
     $sv = $status.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     Check 'the status bar carries the status text' ($sv.Current.Value -match 'lines')
 
-    $chip = ById $root 'chip-0'
-    Check 'the chip is a Button named for its text' ($chip.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $chip.Current.Name -eq 'include e')
-    $tp = $chip.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
-    $before = $tp.Current.ToggleState
-    $tp.Toggle()
-    Start-Sleep -Milliseconds 500
-    Check 'Toggle flips the chip' ($tp.Current.ToggleState -ne $before)
-    $ip = $chip.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-    $ip.Invoke()
-    Start-Sleep -Milliseconds 500
-    $gone = $null -eq $root.FindFirst($Scope, (New-Object System.Windows.Automation.PropertyCondition($A::AutomationIdProperty, 'chip-0')))
-    Check 'Invoke removes the chip' $gone
+    # **The filter panel is Windows controls since 2026-09-15**, so it is not our provider's to
+    # describe, and this script's managed UIA client reports Windows' own children as unnamed panes.
+    # So the list is asked directly, with messages that carry no pointer and so answer across
+    # processes: one row for `--filter=e`, its check box ticked. The commands that act on a row are
+    # on the Edit menu and must be greyed until one is selected. The keyboard's path through the
+    # panel — F6, Enter, Delete, Esc — needs the foreground and is `verify-panel.ps1`'s.
+    $LVM_GETITEMCOUNT = 0x1004
+    $LVM_GETITEMSTATE = 0x102C
+    $list = [PanelList]::Find($p.MainWindowHandle)
+    Check 'the filter panel is a real list view' ($list -ne [IntPtr]::Zero)
+    if ($list -ne [IntPtr]::Zero) {
+        $rows = [PanelList]::SendMessageW($list, $LVM_GETITEMCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+        Check 'it lists the one filter' ($rows -eq 1)
+        $state = [PanelList]::SendMessageW($list, $LVM_GETITEMSTATE, [IntPtr]::Zero, [IntPtr]0xF000).ToInt32()
+        Check 'its check box is ticked' (($state -band 0xF000) -eq 0x2000)
+    }
+    $bar = Read-MenuBar $p.MainWindowHandle
+    Check 'Edit > Edit filter is greyed with nothing selected' (-not (Find-MenuItem $bar 'Edit' 'Edit filter').Enabled)
+    Check 'Edit > Remove filter is greyed with nothing selected' (-not (Find-MenuItem $bar 'Edit' 'Remove filter').Enabled)
 
     if ($SecondLog -ne $Log) {
         $tab0 = ById $root 'tab-0'

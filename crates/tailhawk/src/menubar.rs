@@ -184,6 +184,8 @@ pub const ID_CTX_CHIP_EDIT: u32 = 10_306;
 pub const ID_CTX_CHIP_POLARITY: u32 = 10_307;
 pub const ID_CTX_CHIP_TOGGLE: u32 = 10_308;
 pub const ID_CTX_CHIP_REMOVE: u32 = 10_309;
+pub const ID_CTX_CHIP_UP: u32 = 10_310;
+pub const ID_CTX_CHIP_DOWN: u32 = 10_311;
 
 /// The header's right-click menu for one column: sorting, the top-N cut, and the §7.2 route —
 /// "Filter on this column…" opens the Filter dialog already scoped. `sort_here` is this column's
@@ -277,10 +279,18 @@ pub fn grid_context(has_selection: bool, detail: bool) -> Vec<tailhawk_core::men
     ]
 }
 
-/// A filter row's right-click menu in the panel — §2.4's per-chip acts, the same four the title
-/// row's buttons and the chip's own glyphs offer, gathered where the pointer already is.
-pub fn panel_row_context(enabled: bool, include: bool) -> Vec<tailhawk_core::menu::Item> {
+/// A filter row's right-click menu in the panel — §2.4's per-chip acts, gathered where the pointer
+/// already is: edit, polarity, enabled, move and remove.
+/// `can_up` and `can_down` grey the moves at the ends of the list rather than hiding them, so the
+/// menu keeps its shape from row to row: a menu whose shape changes is one that cannot be learned.
+pub fn panel_row_context(
+    enabled: bool,
+    include: bool,
+    can_up: bool,
+    can_down: bool,
+) -> Vec<tailhawk_core::menu::Item> {
     use tailhawk_core::menu::Item;
+    let on = |item: Item, yes: bool| if yes { item } else { item.disabled() };
     vec![
         Item::command("&Edit…", "", ID_CTX_CHIP_EDIT),
         Item::command(
@@ -293,6 +303,9 @@ pub fn panel_row_context(enabled: bool, include: bool) -> Vec<tailhawk_core::men
             ID_CTX_CHIP_POLARITY,
         ),
         Item::check("Ena&bled", "", ID_CTX_CHIP_TOGGLE, enabled),
+        Item::separator(),
+        on(Item::command("Move &up", "", ID_CTX_CHIP_UP), can_up),
+        on(Item::command("Move &down", "", ID_CTX_CHIP_DOWN), can_down),
         Item::separator(),
         Item::command("&Remove", "", ID_CTX_CHIP_REMOVE),
     ]
@@ -412,6 +425,7 @@ pub fn menu_bar(
     let detail = doc.is_some_and(|d| d.detail_open());
     let filters = doc.is_some_and(|d| d.filters_open());
     let filtered = doc.is_some_and(|d| d.is_filtered());
+    let chosen_filter = doc.is_some_and(|d| d.selected_filter().is_some());
     let saving = doc.is_some_and(|d| d.is_saving());
     let back = doc.is_some_and(|d| d.can_step(true));
     let forward = doc.is_some_and(|d| d.can_step(false));
@@ -496,6 +510,11 @@ pub fn menu_bar(
                     open,
                 ),
                 on(cmd("Clear filte&rs", "", Command::ClearFilter), filtered),
+                on(cmd("E&dit filter…", "", Command::EditFilter), chosen_filter),
+                on(
+                    cmd("Rem&ove filter", "", Command::RemoveFilter),
+                    chosen_filter,
+                ),
                 on(
                     cmd("&Edit last chip", "Ctrl+Shift+E", Command::EditLastChip),
                     filtered,
@@ -779,10 +798,10 @@ mod tests {
     /// offers the *other* polarity, which is the only one worth offering.
     #[test]
     fn the_panel_row_context_mirrors_its_chip() {
-        let include = panel_row_context(true, true);
+        let include = panel_row_context(true, true, true, true);
         assert!(include.iter().any(|i| i.label == "Ena&bled" && i.checked));
         assert!(include.iter().any(|i| i.label == "Make e&xcluding"));
-        let exclude = panel_row_context(false, false);
+        let exclude = panel_row_context(false, false, true, true);
         assert!(exclude.iter().any(|i| i.label == "Ena&bled" && !i.checked));
         assert!(exclude.iter().any(|i| i.label == "Make &including"));
     }
@@ -794,7 +813,7 @@ mod tests {
         for (name, items) in [
             ("header", header_context("level", None, true)),
             ("grid", grid_context(true, true)),
-            ("panel row", panel_row_context(true, true)),
+            ("panel row", panel_row_context(true, true, true, true)),
         ] {
             let mut seen = Vec::new();
             for m in items.iter().filter_map(|i| i.mnemonic()) {
@@ -899,6 +918,43 @@ mod tests {
         assert_eq!(
             separating.id, joining.id,
             "one command, so one id and one dispatch"
+        );
+    }
+
+    /// **Reordering filters without dragging.** *Accessibility*: "Don't make dragging the only way
+    /// to perform an action" — and the panel's rows could only be reordered by a drag until the panel
+    /// became a list view. The moves are greyed at the ends of the list, never hidden, so the menu
+    /// keeps one shape from row to row.
+    #[test]
+    fn a_filter_row_moves_up_and_down_and_greys_at_the_ends() {
+        let find = |items: &[tailhawk_core::menu::Item], id: u32| {
+            items
+                .iter()
+                .find(|i| i.id == Some(id))
+                .cloned()
+                .expect("the item is there")
+        };
+        let middle = panel_row_context(true, true, true, true);
+        assert!(find(&middle, ID_CTX_CHIP_UP).enabled);
+        assert!(find(&middle, ID_CTX_CHIP_DOWN).enabled);
+        assert_eq!(find(&middle, ID_CTX_CHIP_UP).text(), "Move up");
+
+        let first = panel_row_context(true, true, false, true);
+        assert!(
+            !find(&first, ID_CTX_CHIP_UP).enabled,
+            "nothing above the first"
+        );
+        assert!(find(&first, ID_CTX_CHIP_DOWN).enabled);
+
+        let last = panel_row_context(true, true, true, false);
+        assert!(
+            !find(&last, ID_CTX_CHIP_DOWN).enabled,
+            "nothing below the last"
+        );
+        assert_eq!(
+            first.len(),
+            last.len(),
+            "greyed, not removed: the menu keeps its shape"
         );
     }
 
@@ -1371,7 +1427,7 @@ mod tests {
             ("grid", grid_context(true, false)),
             ("grid, no selection", grid_context(false, true)),
             ("header", header_context("timestamp", Some(true), true)),
-            ("filter row", panel_row_context(true, true)),
+            ("filter row", panel_row_context(true, true, true, true)),
         ];
         for (name, items) in menus {
             for item in &items {
