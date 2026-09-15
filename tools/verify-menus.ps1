@@ -73,6 +73,10 @@ function Get-Surfaces($Proc, [switch]$NoShot) {
     }) -join '|'
     [pscustomobject]@{
         Title   = $Proc.MainWindowTitle
+        # **The status bar is its own surface since 2026-09-15**, when the document's facts left the
+        # title. Without it a command whose whole effect is `● following` or a filter count would read
+        # as having done nothing.
+        Status  = Get-StatusText $Proc
         # Dialogs only. Listing every window would include the main one, whose *title* is already
         # the surface above - so the two would move together and one of them would be telling the
         # reader nothing.
@@ -152,7 +156,7 @@ public static class Pix {
 '@ -ReferencedAssemblies System.Drawing
 }
 
-$TEXT_SURFACES = @('Title', 'Windows', 'Menu')
+$TEXT_SURFACES = @('Title', 'Status', 'Windows', 'Menu')
 
 function Compare-Surfaces($Before, $After, $Watch, [int]$Tolerance) {
     $moved = @($Watch | Where-Object { $_ -ne 'Pixels' -and $Before.$_ -ne $After.$_ })

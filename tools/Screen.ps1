@@ -52,6 +52,49 @@ public static class Shot {
 }
 '@ -ReferencedAssemblies System.Drawing
 
+# **The document's facts are in the status bar, not the title** — UX-REVIEW finding 12 moved them
+# there on 2026-09-15, and every harness that waited on the title for "lines" or "of N" reads this
+# instead. `WM_GETTEXT` is one of the messages Windows marshals between processes, so a string buffer
+# in this process is safe to hand to a control in another; a status bar answers it with part zero.
+if (-not ('StatusText' -as [type])) {
+    Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public static class StatusText {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, StringBuilder l);
+    const uint WM_GETTEXT = 0x000D;
+
+    public static string Of(IntPtr window) {
+        IntPtr bar = IntPtr.Zero;
+        EnumChildWindows(window, (h, l) => {
+            StringBuilder c = new StringBuilder(64);
+            GetClassNameW(h, c, 64);
+            if (c.ToString() != "msctls_statusbar32") { return true; }
+            bar = h;
+            return false;
+        }, IntPtr.Zero);
+        if (bar == IntPtr.Zero) { return ""; }
+        StringBuilder text = new StringBuilder(4096);
+        SendMessageW(bar, WM_GETTEXT, (IntPtr)text.Capacity, text);
+        return text.ToString();
+    }
+}
+'@
+}
+
+function Get-StatusText([System.Diagnostics.Process]$Proc) {
+    $Proc.Refresh()
+    if ($Proc.MainWindowHandle -eq 0) { return '' }
+    [StatusText]::Of($Proc.MainWindowHandle)
+}
+
 # Without this the host is DPI-virtualised on a scaled display: GetClientRect and CopyFromScreen
 # disagree about which pixels are the window's, and the capture lands on the desktop beside it.
 [void][Shot]::SetProcessDPIAware()
@@ -78,9 +121,9 @@ function Get-TailhawkExe {
 # SendKeys reaches it. Returns the process; its MainWindowHandle is the window.
 function Start-Tailhawk([string]$Log) {
     $proc = Start-Process (Get-TailhawkExe) -ArgumentList $Log -PassThru
-    $null = Wait-For { $proc.Refresh(); $proc.MainWindowHandle -ne 0 -and $proc.MainWindowTitle -match 'lines' } 'the window to open'
+    $null = Wait-For { (Get-StatusText $proc) -match 'lines' } 'the window to open'
     $hwnd = $proc.MainWindowHandle
-    Write-Host "opened: $($proc.MainWindowTitle)"
+    Write-Host "opened: $($proc.MainWindowTitle) | $(Get-StatusText $proc)"
 
     # AppActivate's return value says the request was made, not that it was honoured; the keys go
     # to whichever window is foreground when they are sent, so wait for that to be ours. A bare

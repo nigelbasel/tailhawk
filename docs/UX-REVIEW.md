@@ -40,7 +40,7 @@ behaves, that is said in the finding rather than glossed.
 | 9 | Applications picker | **Fixed 2026-09-09** | Commit buttons are spread across the bottom instead of right-aligned in one row. |
 | 10 | Highlight rules | **Fixed 2026-09-09** | Commit buttons are not right-aligned; `Close` carries an access key it should not have. |
 | 11 | Highlight rules | **Done as asked** | Modeless by §5's design; the owner wants modal with Save/Cancel. |
-| 12 | Title bar | **Fails** | The title carries frame timings and atlas statistics — diagnostics shipped to a user. |
+| 12 | Title bar | **Fixed 2026-09-15** | The title carries frame timings and atlas statistics — diagnostics shipped to a user. |
 | 13 | Detail pane | **Fails** | Drawn over the grid with no frame of its own; the rule line renders as a row of boxes. |
 | 14 | Column headings | **Partly** | Headings are lower-case field names; the guide asks for sentence-style capitalisation. |
 | 15 | Menus | **Platform** | Win32 menus cannot be dark-themed. Already measured and recorded. |
@@ -513,3 +513,14 @@ itself, mapping the point through `HDM_HITTEST`.
 - **Part two's first and third defects are fixed**: `Ctrl+H` became `Ctrl+K` and is bound, `F1`
   opens the keyboard map, and the header's context menu can be opened at all. Its keyboard half is
   not done: `Shift+F10` still resolves to the grid, because focus never reaches the header.
+
+---
+
+## What has been done since — 2026-09-15
+
+- **12 — the title bar.** It reads `<document> — Tailhawk` now, and `Tailhawk` with nothing open.
+  Everything else it carried was already in the status bar word for word, so nothing moved: the
+  duplicate went. The build number is in Help ▸ About. The frame and atlas instrument is shown only
+  when `TAILHAWK_FRAME_STATS` is set, at the end of the status bar. The `tools/verify-*.ps1`
+  harnesses that waited on the title for a line count, a match count or a notice read the status bar
+  instead, through `WM_GETTEXT`, which Windows marshals between processes.

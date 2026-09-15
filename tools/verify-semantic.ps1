@@ -33,6 +33,8 @@ for ($i = 0; $i -lt $Lines; $i++) {
 }
 $sw.Close()
 
+# The frame instrument is off unless asked for since UX-REVIEW finding 12, and this harness reads it.
+$env:TAILHAWK_FRAME_STATS = '1'
 $proc = Start-Tailhawk $Log
 try {
     $hwnd = $proc.MainWindowHandle
@@ -49,10 +51,10 @@ try {
     $fs = [System.IO.File]::Open($Log, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes("2026-08-16 09:15:00.000 INFO  Api.Controller appended after the scroll`n")
     $fs.Write($bytes, 0, $bytes.Length); $fs.Close()
-    $null = Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match "$($Lines + 1) lines" } 'the follow tick to notice the appended line'
+    $null = Wait-For { $proc.Refresh(); (Get-StatusText $proc) -match "$($Lines + 1) lines" } 'the follow tick to notice the appended line'
     Start-Sleep -Milliseconds 200
     $proc.Refresh()
-    $title = $proc.MainWindowTitle
+    $title = (Get-StatusText $proc)
     Write-Host "title:   $title"
 
     $bmp = [Shot]::Client($hwnd)
@@ -91,7 +93,7 @@ try {
         Write-Host ("frame p95:  {0} ms" -f $p95)
         if ($p95 -gt 16.7) { $failures += "frame p95 $p95 ms is over the 16.67 ms budget with the catalogue on" }
     } else {
-        $failures += 'the title carries no frame instrument to read'
+        $failures += 'the status bar carries no frame instrument to read'
     }
     if ($proc.HasExited) { $failures += 'the process exited' }
     if ($failures) {

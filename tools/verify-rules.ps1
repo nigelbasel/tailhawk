@@ -245,14 +245,14 @@ try {
     [Rules]::Press($dlg, 2)   # IDCANCEL — the Close button
     Start-Sleep -Milliseconds 250
     $proc.Refresh()
-    $justAfter = $proc.MainWindowTitle
+    $justAfter = (Get-StatusText $proc)
     Start-Sleep -Milliseconds 900
     $proc.Refresh()
-    if ($justAfter -match 'unsaved' -and $proc.MainWindowTitle -notmatch 'unsaved') {
+    if ($justAfter -match 'unsaved' -and (Get-StatusText $proc) -notmatch 'unsaved') {
         Write-Host "  NOTE the message appeared and was then overwritten within a second"
     }
     Check 'Close says so when the set was left unsaved' `
-        ($proc.MainWindowTitle -match 'unsaved') $proc.MainWindowTitle
+        ((Get-StatusText $proc) -match 'unsaved') (Get-StatusText $proc)
     $after = if (Test-Path $personal) { Get-Content $personal -Raw } else { '' }
     Check 'and does not write the changes it threw away' `
         (-not ($after -match 'THROWN-AWAY')) 'the discarded edit reached the file'

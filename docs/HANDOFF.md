@@ -46,8 +46,12 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    windows were, and the scrollback is gone either way. Not exercised against live Loki — the
    configured source still has no secret.
 3. **The rest of `UX-REVIEW.md`**, worst first: the filter panel has no tab stops and `widget::Focus`
-   has one variant; the grid's text is absent from the accessibility tree; the title bar still
-   ships frame timings and atlas statistics to a user; column headings are lower-case field names.
+   has one variant; the grid's text is absent from the accessibility tree; column headings are
+   lower-case field names. **The title bar is done (2026-09-15):** it reads the document and then
+   `Tailhawk`, the frame and atlas instrument appears only under `TAILHAWK_FRAME_STATS`, and the
+   harnesses that read counts, notices or the follow state from the title read the status bar
+   through `Get-StatusText` in `tools/Screen.ps1`. `verify-uia.ps1` and `verify-recent.ps1` still
+   read the title, for the file name, which it still carries.
 
 **A note on the two subagent reviews this session**, because both earned their keep: the toolbar
 review found that the chosen dropdown id was being *run* inside comctl32's `TBN_DROPDOWN` — a modal

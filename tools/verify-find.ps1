@@ -78,7 +78,7 @@ public static class FindDlg {
     Start-Sleep -Milliseconds 200
 
     $wsh.SendKeys('{ENTER}')
-    Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match 'of \d' -or $proc.MainWindowTitle -match 'no matches' } 'the search to report'
+    Wait-For { $proc.Refresh(); (Get-StatusText $proc) -match 'of \d' -or (Get-StatusText $proc) -match 'no matches' } 'the search to report'
     Start-Sleep -Milliseconds 600
     # Esc closes the dialog before the screenshot, so the grid is what is photographed — and
     # proves the dialog dismisses the way the standard one does.
@@ -88,7 +88,7 @@ public static class FindDlg {
         throw 'Esc did not close the Find dialog'
     }
     $proc.Refresh()
-    $title = $proc.MainWindowTitle
+    $title = (Get-StatusText $proc)
     Write-Host "found:   $title"
 
     $bmp = [Shot]::Client($hwnd)
@@ -112,7 +112,7 @@ public static class FindDlg {
     $wsh.SendKeys('%w')
     Start-Sleep -Milliseconds 150
     $wsh.SendKeys('{ENTER}')
-    $null = Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match 'no matches' } 'whole word to exclude the partial token' 10
+    $null = Wait-For { $proc.Refresh(); (Get-StatusText $proc) -match 'no matches' } 'whole word to exclude the partial token' 10
     Write-Host 'whole word: the partial token finds nothing, as it should'
     $wsh.SendKeys('{ESC}')
     Start-Sleep -Milliseconds 300

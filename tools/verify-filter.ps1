@@ -66,10 +66,10 @@ public static class FilterDlg {
     $wsh.SendKeys('error')
     Start-Sleep -Milliseconds 300
     $wsh.SendKeys('{ENTER}')
-    $null = Wait-For { $proc.Refresh(); $proc.MainWindowTitle -match "$expected of $Lines" -and $proc.MainWindowTitle -notmatch 'scanning' } 'the pass to finish with the expected count'
+    $null = Wait-For { $proc.Refresh(); (Get-StatusText $proc) -match "$expected of $Lines" -and (Get-StatusText $proc) -notmatch 'scanning' } 'the pass to finish with the expected count'
     Start-Sleep -Milliseconds 600
     $proc.Refresh()
-    $title = $proc.MainWindowTitle
+    $title = (Get-StatusText $proc)
     Write-Host "filtered: $title"
 
     $bmp = [Shot]::Client($hwnd)

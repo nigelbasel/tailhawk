@@ -1526,15 +1526,15 @@ impl Document {
         true
     }
 
-    /// The title text, rebuilt from the live state — every part of it except the name.
+    /// The status bar's description of the document, rebuilt from the live state — every part of it except the name.
     ///
     /// §5.5b requires the inferred set be "shown in the UI for confirmation rather than silently
-    /// assumed", and the title bar is the only UI this has. It names the oldest and newest member so
+    /// assumed", and the status bar is where that is shown. It names the oldest and newest member so
     /// the direction can be checked against the folder, rather than asking the user to take the word
     /// "ascending" on trust.
     ///
     /// **Rebuilt rather than cached because a set that rolls is a different set.** Freezing this at
-    /// open put "2 files … newest is `log_002.txt`" in the title of a window showing three, and a
+    /// open put "2 files … newest is `log_002.txt`" in the status bar of a window showing three, and a
     /// stale confirmation is worse than none — it invites a check against a list that has moved on.
     fn describe(&self) -> String {
         let flag = if self.set.newest().disagreed() {
@@ -1542,7 +1542,7 @@ impl Document {
         } else {
             ""
         };
-        // §4.2: end of stream "is **not** an app exit". Saying so in the title is what stops a
+        // §4.2: end of stream "is **not** an app exit". Saying so in the status bar is what stops a
         // window that has stopped growing looking like a window that has hung.
         // A pipe is one file by construction, so §5.5b's set description says nothing a user of it
         // wants — the spill's path is already in `summary`, which is the part §13.2 asks for.
@@ -1692,7 +1692,7 @@ impl Document {
             //
             // A *roll* does not clear them: §5.5b appends the new member at the end of the row
             // space, so every existing row keeps its number. The results are still a snapshot and
-            // still do not cover the new bytes, which is what "searched N lines" in the title says.
+            // still do not cover the new bytes, which is what "searched N lines" in the status bar says.
             self.finder.clear();
             // And the survivors: a filtered view over renumbered rows would show the wrong lines.
             // The chips stay, and the pass restarts over what the file now is.
@@ -1860,7 +1860,7 @@ impl Document {
         }
     }
 
-    /// Adds a chip and starts the pass over. A chip that does not parse is held in the title, as a
+    /// Adds a chip and starts the pass over. A chip that does not parse is held in the status bar, as a
     /// bad pattern is; the chips already there stand.
     fn add_chip(&mut self, text: &str, polarity: Polarity) {
         if text.trim().is_empty() {
@@ -2998,6 +2998,30 @@ impl Finder {
 /// its own, and writing that back would put a line in the file for every log ever opened.
 fn natural_order(columns: usize) -> Vec<usize> {
     (0..columns.saturating_sub(1)).collect()
+}
+
+/// The window's title: the document, then the program — or the program alone.
+///
+/// **UX-REVIEW finding 12.** The title carried the build, the renderer, the follow state, the
+/// encoding, the set description and the frame instrument, and the status bar said all of it again
+/// word for word. The document's facts are the status bar's; the title's job is to tell one window
+/// from another in the taskbar and in `Alt+Tab`, which is why the name comes first. The build is in
+/// Help ▸ About, which is where a person looks for it.
+fn window_title(document: Option<&str>) -> String {
+    match document.filter(|name| !name.is_empty()) {
+        Some(name) => format!("{name} — Tailhawk"),
+        None => "Tailhawk".to_owned(),
+    }
+}
+
+/// Whether the frame and atlas instrument is shown, which it is only when asked for.
+///
+/// It is genuinely useful — several defects this month were found in it — and it is not something
+/// a person reading logs needs to see. `TAILHAWK_FRAME_STATS` puts it back, at the end of the
+/// status bar, for a harness or for whoever is chasing a frame.
+fn frame_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TAILHAWK_FRAME_STATS").is_some())
 }
 
 fn status_line(
@@ -4802,8 +4826,8 @@ impl Shell {
         settings::save(&self.settings_tiers, &self.settings, self.stateless);
     }
 
-    /// The status: the driver, the document's description, the frame instrument. **In the title,
-    /// where a measurement rig can read it, and in the status bar, where a user does.**
+    /// **The status line, shown in the status bar, where a person reads it and a harness reads it
+    /// back through `WM_GETTEXT` — it is not in the title any more.**
     ///
     /// The parts and their order are [`status_line`]'s, which is where they are tested.
     fn status_text(&self) -> String {
@@ -4820,11 +4844,11 @@ impl Shell {
             self.notice.as_deref(),
             rules_note.as_deref(),
         );
-        // **The frame instrument, where a user and a measurement rig can both see it.** M4 asks for
+        // **The frame instrument, shown when `TAILHAWK_FRAME_STATS` asks for it.** M4 asks for
         // "without dropped frames" and nothing in the product could say whether that held; the
         // throughput rig could only measure how long the window took to answer a message, which
         // counts a vsync-blocked Present the same as a seized thread.
-        if let Some((p95, worst, over)) = self.frames.summary() {
+        if let Some((p95, worst, over)) = self.frames.summary().filter(|_| frame_stats_enabled()) {
             text.push_str(&format!(
                 " — frame p95 {p95:.1} ms, worst {worst:.1} ms, {over} over budget"
             ));
@@ -4849,17 +4873,8 @@ impl Shell {
     }
 
     fn refresh_title(&self, hwnd: HWND) {
-        let status = self.status_text();
-        // The build, in the one place a person looks to identify a window. It earns its space:
-        // the day a shipped rename appeared to do nothing, there was no way to tell whether this
-        // window was the new binary or yesterday's — see [`version`].
-        let name = format!("Tailhawk {}", version::VERSION);
-        let title = if status.is_empty() {
-            name
-        } else {
-            format!("{name} — {status}")
-        };
-        set_title(hwnd, &title);
+        let name = self.document.as_ref().map(|doc| doc.summary.as_str());
+        set_title(hwnd, &window_title(name));
         if self.pending.is_none() && self.reading.is_empty() {
             stop_polling(hwnd);
         }
@@ -4886,7 +4901,7 @@ impl Shell {
         painted
     }
 
-    /// Rebuilds the title when the **follow state** has turned over since the title last said it.
+    /// Rebuilds the status line when the **follow state** has turned over since it last said it.
     ///
     /// §12 calls pause-on-scroll and its affordance to resume "the single most-wanted behaviour in
     /// every tail tool", and getting it wrong "is very visible" — so it is worth one comparison a
@@ -5427,7 +5442,7 @@ impl Shell {
         }
     }
 
-    /// Rebuilds the title from the document's live state.
+    /// Rebuilds the status line, and the title with it, from the document's live state.
     ///
     /// **The cached string is refreshed from the document rather than edited**, because every part
     /// of it except the file name can change while the window is open — the counts, the membership,
@@ -5594,7 +5609,7 @@ impl Shell {
     }
 
     /// Opens `path` in this window, replacing what is shown. The read runs on a worker as it does
-    /// at start-up, and the title says "opening" until it lands — a large file takes seconds to
+    /// at start-up, and the status bar says "opening" until it lands — a large file takes seconds to
     /// index and a window that went blank without a word would look hung.
     fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
         self.open_named(hwnd, path, None);
@@ -12884,6 +12899,28 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **UX-REVIEW finding 12: the title names the document and the program, and nothing else.** It
+    /// used to carry the build, the renderer, the follow state, the encoding, the set description,
+    /// the frame percentiles and the atlas's placeholder counts — the file name twice — all of which
+    /// the status bar already said word for word. *UX checklist*: "Remove redundant text … in window
+    /// titles". The Windows convention is the document first, so a taskbar that truncates keeps the
+    /// part that tells one window from another.
+    #[test]
+    fn the_title_is_the_document_then_the_program() {
+        assert_eq!(window_title(Some("app.log")), "app.log — Tailhawk");
+        assert_eq!(
+            window_title(Some("live · api, worker")),
+            "live · api, worker — Tailhawk",
+            "a remote source is named as its tab names it"
+        );
+        assert_eq!(window_title(None), "Tailhawk", "nothing open");
+        assert_eq!(
+            window_title(Some("")),
+            "Tailhawk",
+            "a document still opening has no name yet, and a dash before nothing is not a title"
+        );
+    }
+
     /// §2.1's resizable columns: a boundary sits after each shown column; a press on one and a
     /// drag sets that column's width from the mouse, stopping at one cell; the chooser is what
     /// hides one; reset brings the measured widths back; the header follows every change.
@@ -13189,7 +13226,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A chip that does not parse is held in the title and changes nothing else.
+    /// A chip that does not parse is held in the status bar and changes nothing else.
     #[test]
     fn a_chip_that_does_not_parse_is_reported_and_the_view_stands() {
         let path = scratch_log("tailhawk_filter_bad_chip.log", 20);
