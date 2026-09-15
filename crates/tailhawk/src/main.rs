@@ -425,6 +425,7 @@ impl RowSource for Document {
             let cells = layout.widths[i] + tailhawk_core::columns::GAP;
             out.push(tailhawk_core::rows::HeaderColumn {
                 title: layout.title(i).to_owned(),
+                label: layout.display_title(i),
                 column: i,
                 start: at,
                 cells,
@@ -442,6 +443,7 @@ impl RowSource for Document {
         if !layout.format.columns.is_empty() {
             out.push(tailhawk_core::rows::HeaderColumn {
                 title: layout.title(last).to_owned(),
+                label: layout.display_title(last),
                 column: last,
                 start: at,
                 // It runs to the edge: whatever the viewport still has, in cells. No gap follows it,
@@ -1149,7 +1151,15 @@ impl Document {
     /// §8's record as the detail window shows it, or nothing when the caret is on no record.
     fn detail_view(&self) -> Option<detailwin::DetailView> {
         let (detail, first) = self.detail_of()?;
-        Some(detailwin::view_of(&detail, first, self.detail.pretty))
+        // A format carries `titles` exactly when its names are the file's own spelling, and those
+        // are shown as the file spells them (UX-REVIEW finding 14).
+        let verbatim = self.detection.accepted.is_some_and(|f| f.titles.is_some());
+        Some(detailwin::view_of(
+            &detail,
+            first,
+            self.detail.pretty,
+            verbatim,
+        ))
     }
 
     /// V5's column header, when there is a layout — `RowSource::header`, drawn in the band the
@@ -1439,7 +1449,7 @@ impl Document {
         let Some(layout) = self.layout.as_ref() else {
             return String::new();
         };
-        layout.title(i).to_owned()
+        layout.display_title(i)
     }
 
     /// Starts the sort pass once the filter has judged every row, collects what it reports, and
@@ -7740,6 +7750,9 @@ enum Under {
     Header {
         column: usize,
         title: String,
+        /// What the menu calls the column — UX-REVIEW finding 14's display name. `title` stays the
+        /// name `Filter on` seeds the dialog with, because a filter is written against the field.
+        label: String,
         sort_here: Option<bool>,
         any_sort: bool,
     },
@@ -8042,6 +8055,7 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
             Under::Header {
                 column,
                 title: layout.title(column).to_owned(),
+                label: layout.display_title(column),
                 sort_here: layout.sort.and_then(|(c, d)| (c == column).then_some(d)),
                 any_sort: layout.sort.is_some(),
             }
@@ -8059,6 +8073,7 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
             Under::Header {
                 column,
                 title: layout.title(column).to_owned(),
+                label: layout.display_title(column),
                 sort_here: layout.sort.and_then(|(c, d)| (c == column).then_some(d)),
                 any_sort: layout.sort.is_some(),
             }
@@ -8082,11 +8097,11 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
     };
     let items = match &under {
         Under::Header {
-            title,
+            label,
             sort_here,
             any_sort,
             ..
-        } => menubar::header_context(title, *sort_here, *any_sort),
+        } => menubar::header_context(label, *sort_here, *any_sort),
         Under::Grid {
             has_selection,
             detail,
@@ -12720,8 +12735,9 @@ mod tests {
         // And the window's view-model is built from the same record.
         let view = doc.detail_view().expect("a record under the caret");
         assert_eq!(view.line, 2);
-        assert_eq!(view.fields[0].0, "timestamp");
-        assert_eq!(view.fields[1], ("level".to_owned(), "ERR".to_owned()));
+        // A catalogue format, so the names are shown in sentence case (UX-REVIEW finding 14).
+        assert_eq!(view.fields[0].0, "Timestamp");
+        assert_eq!(view.fields[1], ("Level".to_owned(), "ERR".to_owned()));
         assert!(
             view.raw.starts_with("2026-08-17 09:14:04.120 +01:00 [ERR]"),
             "the Raw page is the file's own line: {}",
@@ -12843,6 +12859,50 @@ mod tests {
     /// — and the first wiring mapped items through `shown_order` by position, which sorted by the
     /// hidden column and resized it back into existence when the box beside it was dragged. The
     /// review caught it; this is the test that would have.
+    /// **UX-REVIEW finding 14: the heading a person reads and the name a filter is written against
+    /// are two different strings.** The header shows a catalogue format's names in sentence case;
+    /// the filter dialog's field list is built from the same boxes, and a filter written as
+    /// `Timestamp:` against a file whose field is `timestamp` would be a filter that matches
+    /// nothing. So a box carries both, and only the drawing reads the label.
+    #[test]
+    fn a_header_box_shows_its_label_and_filters_by_its_name() {
+        let path = std::env::temp_dir().join("tailhawk_header_labels_test.log");
+        std::fs::write(
+            &path,
+            "2026-08-17 09:14:03.884 +01:00 [INF] Zenith.Dispatcher Dispatching job 41981\n\
+             2026-08-17 09:14:04.120 +01:00 [ERR] Zenith.Dispatcher Failed\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let boxes = doc.header_columns();
+        let first = boxes.first().expect("a column");
+        assert_eq!(first.label, "Timestamp", "what the header draws");
+        assert_eq!(first.title, "timestamp", "what a filter is written against");
+        // **Asserted on a column the filter dialog does not already know by name.** `filter_columns`
+        // starts from `level`, `timestamp`, `body`, `source`, `trace` and `span`, and skips a header
+        // title that matches one of those ignoring case — so a `Timestamp` label was dropped whether
+        // or not the code read the label, and the first version of this test, asserted on
+        // `timestamp`, passed with the bug put back in. The message column is outside that list.
+        let message = boxes.last().expect("the message column");
+        assert_eq!(message.title, "message");
+        assert_eq!(message.label, "Message");
+        let fields = filter_columns(&doc);
+        assert!(
+            fields.iter().any(|f| f == "message"),
+            "the filter dialog offers the raw name: {fields:?}"
+        );
+        assert!(
+            !fields.iter().any(|f| f == "Message"),
+            "and never the label: {fields:?}"
+        );
+        assert_eq!(
+            doc.column_name(0),
+            "Timestamp",
+            "the status bar's 'sorted by' reads as the header does"
+        );
+    }
+
     #[test]
     fn a_header_box_carries_its_layout_column_and_skips_a_hidden_one() {
         let path = std::env::temp_dir().join("tailhawk_header_boxes_test.log");
@@ -13657,7 +13717,7 @@ mod tests {
         );
         assert!(
             doc.describe()
-                .contains("↕ sorted by level ▲ · not following"),
+                .contains("↕ sorted by Level ▲ · not following"),
             "{}",
             doc.describe()
         );
@@ -13741,7 +13801,7 @@ mod tests {
         );
         assert_eq!(doc.filtering.sorted().map(|r| r.to_vec()), Some(vec![0, 4]));
         assert!(
-            doc.describe().contains("↕ top 2 by level ▼"),
+            doc.describe().contains("↕ top 2 by Level ▼"),
             "{}",
             doc.describe()
         );

@@ -42,7 +42,7 @@ behaves, that is said in the finding rather than glossed.
 | 11 | Highlight rules | **Done as asked** | Modeless by §5's design; the owner wants modal with Save/Cancel. |
 | 12 | Title bar | **Fixed 2026-09-15** | The title carries frame timings and atlas statistics — diagnostics shipped to a user. |
 | 13 | Detail pane | **Fails** | Drawn over the grid with no frame of its own; the rule line renders as a row of boxes. |
-| 14 | Column headings | **Partly** | Headings are lower-case field names; the guide asks for sentence-style capitalisation. |
+| 14 | Column headings | **Fixed 2026-09-15** | Headings are lower-case field names; the guide asks for sentence-style capitalisation. |
 | 15 | Menus | **Platform** | Win32 menus cannot be dark-themed. Already measured and recorded. |
 
 ---
@@ -524,3 +524,11 @@ itself, mapping the point through `HDM_HITTEST`.
   when `TAILHAWK_FRAME_STATS` is set, at the end of the status bar. The `tools/verify-*.ps1`
   harnesses that waited on the title for a line count, a match count or a notice read the status bar
   instead, through `WM_GETTEXT`, which Windows marshals between processes.
+- **14 — column headings.** The owner chose the hybrid the finding recommended. A heading from a
+  format Tailhawk recognises — the catalogue, a template, a format defined from a line — is shown in
+  sentence case: `Timestamp`, `Level`, `Message`. A heading that is the file's own spelling — a JSON
+  key, a W3C `#Fields:` entry — is shown exactly as the file writes it. The marker already existed:
+  a format carries `titles` exactly when its names are the file's own. **Display only**, and that
+  matters: the filter dialog's field list, a filter chip's scope and copy-as-TSV all keep the raw
+  name, because a filter written as `Timestamp:` against a field named `timestamp` would match
+  nothing. `HeaderColumn` carries both, as `title` and `label`, and only the drawing reads the label.

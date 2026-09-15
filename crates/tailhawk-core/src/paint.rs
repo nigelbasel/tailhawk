@@ -808,7 +808,7 @@ impl Painter {
 
             // The title, cut to what its own box will hold. A header that overruns into the next
             // column is worse than one that is short.
-            let title = self.fit_to_width(&column.title, room);
+            let title = self.fit_to_width(&column.label, room);
             if !title.is_empty() {
                 self.chrome_run(&title, x + pad, text_y, t.header_ink);
                 quads += 1;

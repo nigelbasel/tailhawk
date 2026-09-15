@@ -42,7 +42,7 @@ pub fn rows_of(layout: &Layout) -> Vec<ColumnRow> {
         if shown(column) {
             rows.push(ColumnRow {
                 column,
-                title: layout.title(column).to_owned(),
+                title: layout.display_title(column),
                 shown: true,
                 locked: false,
             });
@@ -52,7 +52,7 @@ pub fn rows_of(layout: &Layout) -> Vec<ColumnRow> {
         if !shown(column) {
             rows.push(ColumnRow {
                 column,
-                title: layout.title(column).to_owned(),
+                title: layout.display_title(column),
                 shown: false,
                 locked: false,
             });
@@ -61,7 +61,7 @@ pub fn rows_of(layout: &Layout) -> Vec<ColumnRow> {
     if last < layout.widths.len() {
         rows.push(ColumnRow {
             column: last,
-            title: layout.title(last).to_owned(),
+            title: layout.display_title(last),
             shown: true,
             locked: true,
         });
@@ -121,7 +121,7 @@ pub fn apply(layout: &mut Layout, defaults: &[usize], rows: &[ColumnRow]) -> boo
             // model — a wide character takes two cells — and counting `chars` would give a CJK
             // title half the room it needs, which `Layout::header` would then cut.
             measured
-                .max(cells.cell_count(layout.title(row.column)))
+                .max(cells.cell_count(&layout.display_title(row.column)))
                 .max(1)
         } else {
             0
@@ -174,7 +174,11 @@ mod tests {
         let layout = layout_of(vec![10, 0, 8, 0], vec![2, 0, 1]);
         let rows = rows_of(&layout);
         let names: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
-        assert_eq!(names, ["logger", "timestamp", "level", "message"]);
+        assert_eq!(
+            names,
+            ["Logger", "Timestamp", "Level", "Message"],
+            "a catalogue format's headings in sentence case, as the header shows them"
+        );
         assert_eq!(
             rows.iter().map(|r| r.shown).collect::<Vec<_>>(),
             [true, true, false, true]

@@ -142,6 +142,12 @@ impl Layout {
         }
     }
 
+    /// Column `i`'s heading as a person reads it — see [`display_title`]. Verbatim when the format
+    /// carries `titles`, which it does exactly when its names are the file's own spelling.
+    pub fn display_title(&self, i: usize) -> String {
+        display_title(self.title(i), self.format.titles.is_some()).into_owned()
+    }
+
     /// The columns before the last, in display order — `order` when it names them all, the
     /// natural order otherwise (a layout built by hand, or an order from an older settings file).
     pub fn shown_order(&self) -> &[usize] {
@@ -268,6 +274,26 @@ impl Layout {
             continuation,
             segments,
         }
+    }
+}
+
+/// A heading as a person reads it: the first letter capitalised, unless the heading is `verbatim`.
+///
+/// **UX-REVIEW finding 14, settled by the owner on 2026-09-15.** *List Views* asks for
+/// sentence-style capitalisation, and a heading from a format Tailhawk recognises gets it. A heading
+/// that is the file's own spelling — a JSON key, a W3C `#Fields:` entry — is `verbatim` and is shown
+/// exactly as written, because that spelling is what the file says and a filter is written against
+/// it.
+///
+/// **Display only.** Nothing that matches a field — a filter's scope, a sort, copy-as-TSV — reads
+/// this; they read [`Layout::title`], which is unchanged.
+pub fn display_title(title: &str, verbatim: bool) -> std::borrow::Cow<'_, str> {
+    let mut chars = title.chars();
+    match chars.next() {
+        Some(first) if !verbatim && !first.is_uppercase() => {
+            std::borrow::Cow::Owned(first.to_uppercase().chain(chars).collect())
+        }
+        _ => std::borrow::Cow::Borrowed(title),
     }
 }
 
@@ -432,5 +458,66 @@ mod tests {
         let level_at = p.text.find("INFO").unwrap();
         let expected = layout.widths[0] + GAP + layout.widths[1] + GAP;
         assert_eq!(level_at, expected, "{:?}", p.text);
+    }
+
+    /// **UX-REVIEW finding 14, as the owner settled it on 2026-09-15.** A heading from a format
+    /// Tailhawk recognises is shown in sentence case — *List Views*: "Use sentence-style
+    /// capitalization" — and a heading that is the file's own spelling is shown exactly as the file
+    /// spells it, because a JSON key or a W3C field *is* what the file says and renaming it hides
+    /// that.
+    #[test]
+    fn a_recognised_heading_is_capitalised_and_the_files_own_is_not() {
+        assert_eq!(display_title("timestamp", false), "Timestamp");
+        assert_eq!(display_title("level", false), "Level");
+        assert_eq!(display_title("Level", false), "Level", "already right");
+        assert_eq!(
+            display_title("état", false),
+            "État",
+            "the first letter, not the first byte"
+        );
+        assert_eq!(
+            display_title("ßcode", false),
+            "SScode",
+            "a letter whose capital is two letters — which is why the chooser sizes a column from \
+             the heading it draws, not from the name"
+        );
+        assert_eq!(display_title("", false), "");
+        assert_eq!(display_title("trace_id", true), "trace_id");
+        assert_eq!(display_title("cs(User-Agent)", true), "cs(User-Agent)");
+    }
+
+    /// The layout knows which kind a heading is, from the format: a format carries `titles` exactly
+    /// when its names are the file's own spelling — W3C's `#Fields:` and a JSON file's keys — and
+    /// the catalogue's formats carry none.
+    #[test]
+    fn the_layout_shows_the_catalogues_names_capitalised_and_a_files_verbatim() {
+        let nlog = by_id("nlog").expect("catalogue");
+        let catalogue = Layout {
+            format: nlog,
+            widths: vec![10, 5, 8, 0],
+            order: vec![0, 1, 2],
+            sort: None,
+        };
+        assert_eq!(catalogue.display_title(0), "Timestamp");
+        assert_eq!(catalogue.display_title(3), "Message");
+        assert_eq!(
+            catalogue.title(0),
+            "timestamp",
+            "the name a filter uses is not changed by how it is shown"
+        );
+
+        let fields: Vec<String> = ["date", "cs-uri-stem", "sc-status", "cs(User-Agent)"]
+            .iter()
+            .map(|f| (*f).to_owned())
+            .collect();
+        let w3c = crate::format::w3c(&fields);
+        let file = Layout {
+            format: w3c,
+            widths: vec![10, 12, 3, 0],
+            order: vec![0, 1, 2],
+            sort: None,
+        };
+        assert_eq!(file.display_title(0), "date");
+        assert_eq!(file.display_title(3), "cs(User-Agent)");
     }
 }

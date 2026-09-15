@@ -418,7 +418,7 @@ impl Header {
             );
         }
         for (i, column) in columns.iter().enumerate().map(|(i, c)| (i + 1, c)) {
-            let mut wide: Vec<u16> = column.title.encode_utf16().collect();
+            let mut wide: Vec<u16> = column.label.encode_utf16().collect();
             wide.push(0);
             // The caret comes with the box, from the model that decided it — one answer, not a
             // second mapping that could disagree with it.
@@ -556,6 +556,7 @@ mod tests {
     fn an_item_names_its_boxs_column_even_when_one_is_hidden() {
         let box_at = |title: &str, column: usize| HeaderColumn {
             title: title.to_owned(),
+            label: title.to_owned(),
             column,
             start: 0,
             cells: 8,

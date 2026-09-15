@@ -75,9 +75,15 @@ const SCATTER_READ_BYTES: usize = 4 * 1024;
 /// cells is what lets the divider drawn here and the resize target be the same edge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderColumn {
-    /// The column's title, as the user reads it. No padding and no sort marker — both are the
-    /// painter's business now.
+    /// The column's **name**: the one a filter is written against and the filter dialog offers, which is the
+    /// file's own spelling for a JSON or W3C file, the catalogue's for everything else. No padding and
+    /// no sort marker; both are the painter's business now.
     pub title: String,
+    /// The heading **as drawn**, UX-REVIEW finding 14: sentence case for a format Tailhawk recognises,
+    /// the file's own spelling otherwise (see `columns::display_title`). Only the drawing reads it. A
+    /// filter written as `Timestamp:` against a field named `timestamp` would match nothing, which is
+    /// why the two are kept apart.
+    pub label: String,
     /// **The layout column this box names**, so a control whose items are these boxes can hand a
     /// gesture back in the model's index space. The two are not the same space: a box list skips
     /// hidden columns and ends with the message, so "item 2" is not "column 2" once anything is

@@ -46,8 +46,9 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    windows were, and the scrollback is gone either way. Not exercised against live Loki — the
    configured source still has no secret.
 3. **The rest of `UX-REVIEW.md`**, worst first: the filter panel has no tab stops and `widget::Focus`
-   has one variant; the grid's text is absent from the accessibility tree; column headings are
-   lower-case field names. **The title bar is done (2026-09-15):** it reads the document and then
+   has one variant; the grid's text is absent from the accessibility tree. **Column headings are done (2026-09-15):** sentence case for a
+   format Tailhawk recognises, a JSON or W3C file's own keys verbatim, display only (`HeaderColumn`
+   carries `title` for filters and `label` for drawing). **The title bar is done too:** it reads the document and then
    `Tailhawk`, the frame and atlas instrument appears only under `TAILHAWK_FRAME_STATS`, and the
    harnesses that read counts, notices or the follow state from the title read the status bar
    through `Get-StatusText` in `tools/Screen.ps1`. `verify-uia.ps1` and `verify-recent.ps1` still

@@ -62,9 +62,13 @@ pub const PAGES: [&str; 3] = ["Fields", "Message", "Raw"];
 /// `raw_first` is the record's first line as it stands in the file — `Detail::body` is only the
 /// *message* once a format has taken the line apart, so the Raw page needs the line itself.
 ///
+/// `verbatim` says the field names are the file's own spelling — a JSON key, a W3C field — and are
+/// shown as written; otherwise they are shown in sentence case, as the header shows them
+/// (UX-REVIEW finding 14).
+///
 /// `pretty` re-indents a JSON body, which is §8's *Pretty*: a courtesy on the Message page only.
 /// **Raw is never re-indented** — the page exists to answer "what does the file actually say".
-pub fn view_of(detail: &Detail<'_>, raw_first: &str, pretty: bool) -> DetailView {
+pub fn view_of(detail: &Detail<'_>, raw_first: &str, pretty: bool, verbatim: bool) -> DetailView {
     let body = match pretty
         .then(|| tailhawk_core::detail::pretty_json(detail.body))
         .flatten()
@@ -87,7 +91,12 @@ pub fn view_of(detail: &Detail<'_>, raw_first: &str, pretty: bool) -> DetailView
         fields: detail
             .fields
             .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .map(|(name, value)| {
+                (
+                    tailhawk_core::columns::display_title(name, verbatim).into_owned(),
+                    (*value).to_owned(),
+                )
+            })
             .collect(),
         body: message,
         raw,
@@ -555,7 +564,12 @@ mod tests {
             "Failed to dispatch",
             vec!["   at Api.Dispatch()", "   at Api.Run()"],
         );
-        let view = view_of(&d, "2026-08-16 09:14|ERROR|Api|Failed to dispatch", false);
+        let view = view_of(
+            &d,
+            "2026-08-16 09:14|ERROR|Api|Failed to dispatch",
+            false,
+            true,
+        );
         assert_eq!(view.line, 1_204_915);
         assert_eq!(view.fields, [("level".to_owned(), "ERROR".to_owned())]);
         assert_eq!(
@@ -571,12 +585,32 @@ mod tests {
         assert!(view.raw.ends_with("   at Api.Run()"));
     }
 
+    /// **UX-REVIEW finding 14 reaches the Fields page too.** A catalogue format's field names are
+    /// shown in sentence case, as the header shows them; a JSON or W3C file's own keys are shown
+    /// exactly as the file spells them, since that spelling is what a filter is written against.
+    #[test]
+    fn field_names_are_capitalised_unless_they_are_the_files_own() {
+        let d = detail(
+            vec![("level", "ERROR"), ("trace_id", "d213")],
+            "body",
+            vec![],
+        );
+        let recognised = view_of(&d, "raw", false, false);
+        assert_eq!(recognised.fields[0].0, "Level");
+        assert_eq!(recognised.fields[1].0, "Trace_id");
+        assert_eq!(recognised.fields[0].1, "ERROR", "values are never touched");
+
+        let files_own = view_of(&d, "raw", false, true);
+        assert_eq!(files_own.fields[0].0, "level");
+        assert_eq!(files_own.fields[1].0, "trace_id");
+    }
+
     /// A file line that already carries `\r\n` must not become `\r\r\n`, which an edit control
     /// shows as a blank line between every pair.
     #[test]
     fn a_line_that_is_already_crlf_is_not_doubled() {
         let d = detail(vec![], "one\r\ntwo", vec![]);
-        let view = view_of(&d, "one\r\ntwo", false);
+        let view = view_of(&d, "one\r\ntwo", false, true);
         assert_eq!(view.body, "one\r\ntwo");
         assert!(!view.body.contains("\r\r"));
     }
@@ -587,7 +621,7 @@ mod tests {
     fn pretty_reaches_the_message_and_never_the_raw() {
         let json = r#"{"a":1,"b":[2,3]}"#;
         let d = detail(vec![("level", "INFO")], json, vec![]);
-        let view = view_of(&d, json, true);
+        let view = view_of(&d, json, true, true);
         assert!(view.body.contains("\r\n"), "re-indented: {:?}", view.body);
         assert_eq!(view.raw, json, "the file's bytes, untouched");
     }
@@ -596,13 +630,19 @@ mod tests {
     /// and a line that is all message means Raw would repeat Message word for word.
     #[test]
     fn a_page_with_nothing_on_it_is_not_built() {
-        let plain = view_of(&detail(vec![], "just a line", vec![]), "just a line", false);
+        let plain = view_of(
+            &detail(vec![], "just a line", vec![]),
+            "just a line",
+            false,
+            true,
+        );
         assert_eq!(pages_of(&plain), ["Message"]);
 
         let full = view_of(
             &detail(vec![("level", "WARN")], "body", vec![]),
             "12:00 WARN body",
             false,
+            true,
         );
         assert_eq!(pages_of(&full), ["Fields", "Message", "Raw"]);
     }
@@ -610,7 +650,7 @@ mod tests {
     /// The title names the record, with the separators a person reads a line number by.
     #[test]
     fn the_title_names_the_record() {
-        let view = view_of(&detail(vec![], "x", vec![]), "x", false);
+        let view = view_of(&detail(vec![], "x", vec![]), "x", false, true);
         assert_eq!(title_of(&view), "Record 1,204,915 — Detail");
         assert_eq!(with_separators(0), "0");
         assert_eq!(with_separators(999), "999");
