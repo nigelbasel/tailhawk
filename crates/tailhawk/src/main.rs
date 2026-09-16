@@ -21,6 +21,7 @@ mod darkmode;
 mod detailwin;
 mod dialog;
 mod filterpanel;
+mod gridtext;
 mod header;
 mod icon;
 mod keymap;
@@ -194,6 +195,10 @@ thread_local! {
 struct Document {
     /// The source, which is **a set of files and not one file** — §5.5b. A log with nothing beside
     /// it is a set of one, so there is a single path here rather than two.
+    /// This document, told from every other one. **A text range holds this rather than a pane
+    /// number**, because a pane number means whichever tab is shown: a range a screen reader keeps
+    /// across a tab switch would otherwise start reading a different file.
+    id: u64,
     set: LogSet,
     view: View,
     summary: String,
@@ -309,6 +314,12 @@ struct Document {
     /// end-of-stream changes nothing about the file — so without this the window that has stopped
     /// growing goes on saying "reading stdin", which is what a hung window looks like.
     stream_done: bool,
+}
+
+/// The next document's id, never reused within a run. See [`Document::id`].
+fn next_document_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// **Every row the painter, the selection and the clipboard name is a *view* row**, and the
@@ -711,6 +722,7 @@ impl Document {
             unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
+            id: next_document_id(),
             header_ctl: None,
             filter_ctl: None,
             header_band: 0.0,
@@ -778,6 +790,7 @@ impl Document {
             unseen: false,
             detection,
             header: layout.as_ref().map(Layout::header),
+            id: next_document_id(),
             header_ctl: None,
             filter_ctl: None,
             header_band: 0.0,
@@ -4297,6 +4310,9 @@ struct Shell {
     pending_filter: Option<(Polarity, Option<String>)>,
     /// The panel's Edit… asks for the Filter dialog seeded with this chip, deferred the same way.
     pending_filter_edit: Option<usize>,
+    /// Each shown pane's text selection as UI Automation last heard it, so `TextSelectionChanged`
+    /// is raised when it moves and not on every frame. See `uia::raise_selection_changes`.
+    uia_selections: Vec<uia::Signature>,
     /// Format ▸ Define format from a line asks for §6.2's dialog, deferred the same way — and for
     /// the same reason the others are: a modal dialog pumps its own loop, and no `STATE` borrow
     /// may be alive while it does.
@@ -6898,8 +6914,15 @@ mod uia {
     use windows::Win32::Foundation::{BOOL, E_FAIL, POINT};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Com::SAFEARRAY;
-    use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayPutElement};
-    use windows::Win32::System::Variant::VT_I4;
+    use windows::Win32::System::Ole::{
+        SafeArrayCreateVector, SafeArrayDestroy, SafeArrayPutElement,
+    };
+    use windows::Win32::System::Variant::{VT_I4, VT_R8, VT_UNKNOWN};
+
+    use crate::gridtext::{self, DocText};
+    use tailhawk_core::textunit::{self, Pos, Unit};
+    use windows::core::{AsImpl, Interface};
+    use windows::Win32::Foundation::E_INVALIDARG;
     use windows::Win32::UI::Accessibility::{
         IInvokeProvider, IInvokeProvider_Impl, IRawElementProviderFragment,
         IRawElementProviderFragmentRoot, IRawElementProviderFragmentRoot_Impl,
@@ -6917,6 +6940,15 @@ mod uia {
         UIA_TogglePatternId, UIA_ValuePatternId, UIA_ValueValuePropertyId, UiaHostProviderFromHwnd,
         UiaRect, UiaReturnRawElementProvider, UiaRootObjectId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
     };
+    use windows::Win32::UI::Accessibility::{
+        ITextProvider, ITextProvider_Impl, ITextRangeProvider, ITextRangeProvider_Impl,
+        SupportedTextSelection, SupportedTextSelection_Single, TextPatternRangeEndpoint,
+        TextPatternRangeEndpoint_Start, TextUnit, TextUnit_Character, TextUnit_Format,
+        TextUnit_Line, TextUnit_Page, TextUnit_Paragraph, TextUnit_Word, UIA_DocumentControlTypeId,
+        UIA_IsReadOnlyAttributeId, UIA_TextPatternId, UIA_Text_TextSelectionChangedEventId,
+        UiaClientsAreListening, UiaGetReservedNotSupportedValue, UiaPoint, UiaRaiseAutomationEvent,
+        UIA_TEXTATTRIBUTE_ID,
+    };
 
     /// `UiaAppendRuntimeId`: the first element of a fragment's runtime id, per the UIA docs.
     const APPEND_RUNTIME_ID: i32 = 3;
@@ -6926,6 +6958,9 @@ mod uia {
     pub enum Kind {
         Root,
         Tab(usize),
+        /// A shown pane's log text, by its place in the shown tab — `SPEC.md` §14.1's grid text
+        /// provider: a *Document* with the Text pattern.
+        Grid(usize),
         Status,
     }
 
@@ -6954,6 +6989,7 @@ mod uia {
         }
         // The filter panel is Windows controls since 2026-09-15: its list and buttons are windows
         // with Windows' own accessibility, and are not this provider's to describe.
+        out.extend((0..shell.document.panes().len()).map(Kind::Grid));
         out.push(Kind::Status);
         out
     }
@@ -6983,7 +7019,8 @@ mod uia {
         IValueProvider,
         IInvokeProvider,
         IToggleProvider,
-        ISelectionItemProvider
+        ISelectionItemProvider,
+        ITextProvider
     )]
     struct Element {
         hwnd: HWND,
@@ -7004,6 +7041,10 @@ mod uia {
             match self.kind {
                 Kind::Root => "Tailhawk".to_owned(),
                 Kind::Status => "Status".to_owned(),
+                Kind::Grid(i) => {
+                    with_shell(|s| s.document.panes().get(i).map(|d| d.summary.clone()))
+                        .unwrap_or_default()
+                }
                 Kind::Tab(i) => with_shell(|s| {
                     s.document
                         .as_ref()
@@ -7019,6 +7060,7 @@ mod uia {
                 Kind::Root => "tailhawk".to_owned(),
                 Kind::Status => "status".to_owned(),
                 Kind::Tab(i) => format!("tab-{i}"),
+                Kind::Grid(i) => format!("grid-{i}"),
             }
         }
 
@@ -7027,20 +7069,25 @@ mod uia {
                 Kind::Root => UIA_PaneControlTypeId.0,
                 Kind::Tab(_) => UIA_TabItemControlTypeId.0,
                 Kind::Status => UIA_StatusBarControlTypeId.0,
+                Kind::Grid(_) => UIA_DocumentControlTypeId.0,
             }
         }
 
-        /// **Nothing in this tree takes the keyboard, and that is now true rather than a gap.**
-        /// The command palette was the one focusable element here, and it is gone; everything the
-        /// window still draws for itself — the tabs, the chips, the status bar — is read or
-        /// clicked, never typed into. What *is* typed into is a real dialog, and Windows provides
-        /// those elements without this provider's help.
+        /// **A pane's text is the one element here that takes the keyboard** — the grid, which is
+        /// where the keyboard is whenever it is in the main window. Everything else the window
+        /// still draws for itself is read or clicked, never typed into; what *is* typed into is a
+        /// real dialog or a native control, and Windows provides those elements itself.
         fn is_focusable(&self) -> bool {
-            false
+            matches!(self.kind, Kind::Grid(_))
         }
 
         fn has_focus(&self) -> bool {
-            false
+            let Kind::Grid(pane) = self.kind else {
+                return false;
+            };
+            let focused = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+            focused == self.hwnd
+                && with_shell(|s| Some(s.document.focused_pane() == pane)).unwrap_or(false)
         }
 
         /// The element's client-relative rectangle, from what the frame drew.
@@ -7062,6 +7109,15 @@ mod uia {
                     // element that says it is a tab and cannot say where it is would be worse than
                     // no element at all.
                     Kind::Tab(i) => with_shell(|s| s.tabs.as_ref()?.item_rect(i))?,
+                    Kind::Grid(i) => {
+                        let pane = s.document.panes().get(i)?;
+                        (
+                            pane.pane_left,
+                            pane.pane_top,
+                            pane.view.width_px(),
+                            pane.view.height_px(),
+                        )
+                    }
                     Kind::Status => {
                         let footer = Chrome::strip_height(band);
                         (0.0, h - footer, w, footer)
@@ -7089,6 +7145,7 @@ mod uia {
                 Kind::Root => 1,
                 Kind::Status => 5,
                 Kind::Tab(i) => 100 + i as i32,
+                Kind::Grid(i) => 200 + i as i32,
             }
         }
 
@@ -7118,6 +7175,7 @@ mod uia {
             let supported = match self.kind {
                 Kind::Status => pattern == UIA_ValuePatternId,
                 Kind::Tab(_) => pattern == UIA_SelectionItemPatternId,
+                Kind::Grid(_) => pattern == UIA_TextPatternId,
                 Kind::Root => false,
             };
             if !supported {
@@ -7130,6 +7188,7 @@ mod uia {
                     p if p == UIA_ValuePatternId => self.cast::<IValueProvider>()?.into(),
                     p if p == UIA_InvokePatternId => self.cast::<IInvokeProvider>()?.into(),
                     p if p == UIA_TogglePatternId => self.cast::<IToggleProvider>()?.into(),
+                    p if p == UIA_TextPatternId => self.cast::<ITextProvider>()?.into(),
                     _ => self.cast::<ISelectionItemProvider>()?.into(),
                 }
             };
@@ -7223,10 +7282,21 @@ mod uia {
             none()
         }
 
-        /// Nothing here takes the keyboard — see [`Element::is_focusable`] — so this succeeds
-        /// without doing anything. `Ok(())` rather than a failure because the interface requires
-        /// it and a caller has asked for nothing unreasonable.
+        /// A pane's text takes the keyboard: the window gets the focus and the pane becomes the
+        /// focused one. Nothing else here takes it — see [`Element::is_focusable`] — so for every
+        /// other element this succeeds without doing anything, because the interface requires an
+        /// answer and a caller has asked for nothing unreasonable.
         fn SetFocus(&self) -> Result<()> {
+            if let Kind::Grid(pane) = self.kind {
+                with_shell_mut(|s| {
+                    s.document.focus_pane(pane);
+                    Some(())
+                });
+                unsafe {
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.hwnd);
+                }
+                self.repaint();
+            }
             Ok(())
         }
 
@@ -7263,11 +7333,16 @@ mod uia {
             none()
         }
 
-        /// No element of this tree can hold the keyboard, so none is ever the focused one. When
-        /// the keyboard is somewhere in this application it is in a dialog, and that dialog's
-        /// elements are Windows', reported by Windows.
+        /// The focused pane's text, when the keyboard is in the main window — the one element of
+        /// this tree that takes it. Anywhere else the keyboard is in a dialog or a native control,
+        /// whose elements are Windows', reported by Windows.
         fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
-            none()
+            if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() } != self.hwnd {
+                return none();
+            }
+            with_shell(|s| (!s.document.panes().is_empty()).then(|| s.document.focused_pane()))
+                .map(|pane| self.make(Kind::Grid(pane)))
+                .ok_or_else(|| Error::from_hresult(HRESULT(0)))
         }
     }
 
@@ -7361,6 +7436,629 @@ mod uia {
                 kind: Kind::Root,
             }
             .into())
+        }
+    }
+
+    /// The most UTF-16 code units one `GetText` returns. A request with no limit over a document
+    /// of millions of rows would read the whole file on the window's thread; a mebibyte is far more
+    /// than any screen reader asks for at once.
+    const TEXT_CAP: usize = 1 << 20;
+
+    /// A shown pane's document, read without waiting for the shell.
+    fn with_doc<T>(pane: usize, f: impl FnOnce(&Document) -> T) -> Option<T> {
+        with_shell(|s| s.document.panes().get(pane).map(f))
+    }
+
+    /// The document with this id, wherever it is now — and `None` once it is gone, which is what a
+    /// range held across the closing of its tab must answer rather than reading its successor.
+    fn with_doc_id<T>(doc: u64, f: impl FnOnce(&Document) -> T) -> Option<T> {
+        with_shell(|s| s.document.panes().iter().find(|d| d.id == doc).map(f))
+    }
+
+    /// The same, to act on: the shell and the pane that document is in.
+    fn with_doc_id_mut<T>(doc: u64, f: impl FnOnce(&mut Shell, usize) -> Option<T>) -> Option<T> {
+        with_shell_mut(|s| {
+            let at = s.document.panes().iter().position(|d| d.id == doc)?;
+            f(s, at)
+        })
+    }
+
+    /// Which document a shown pane is.
+    fn pane_doc_id(pane: usize) -> Option<u64> {
+        with_doc(pane, |doc| doc.id)
+    }
+
+    /// `ranges` as the `SAFEARRAY` of text-range pointers `GetSelection` and `GetVisibleRanges`
+    /// answer with.
+    fn range_array(hwnd: HWND, doc: u64, ranges: &[(Pos, Pos)]) -> Result<*mut SAFEARRAY> {
+        let array = unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, ranges.len() as u32) };
+        if array.is_null() {
+            return Err(Error::from_hresult(E_FAIL));
+        }
+        for (i, (start, end)) in ranges.iter().enumerate() {
+            let range = TextRange::make(hwnd, doc, *start, *end);
+            let index = i as i32;
+            // The array holds a reference to every range already in it, so a failure part of the
+            // way through destroys it rather than leaking the array and those references with it.
+            let put = unsafe { SafeArrayPutElement(array, &index, range.as_raw() as *const _) };
+            if let Err(why) = put {
+                unsafe {
+                    let _ = SafeArrayDestroy(array);
+                }
+                return Err(why);
+            }
+        }
+        Ok(array)
+    }
+
+    impl ITextProvider_Impl for Element_Impl {
+        fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+            let Kind::Grid(pane) = self.kind else {
+                return Err(Error::from_hresult(E_FAIL));
+            };
+            let doc = pane_doc_id(pane).ok_or_else(|| Error::from_hresult(E_FAIL))?;
+            let selected: Vec<(Pos, Pos)> = with_doc(pane, gridtext::selection_range)
+                .flatten()
+                .into_iter()
+                .collect();
+            range_array(self.hwnd, doc, &selected)
+        }
+
+        fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> {
+            let Kind::Grid(pane) = self.kind else {
+                return Err(Error::from_hresult(E_FAIL));
+            };
+            let doc = pane_doc_id(pane).ok_or_else(|| Error::from_hresult(E_FAIL))?;
+            let visible: Vec<(Pos, Pos)> = with_doc(pane, gridtext::visible_range)
+                .flatten()
+                .into_iter()
+                .collect();
+            range_array(self.hwnd, doc, &visible)
+        }
+
+        /// The text has no embedded objects, so no child element has a range in it.
+        fn RangeFromChild(
+            &self,
+            _child: Option<&IRawElementProviderSimple>,
+        ) -> Result<ITextRangeProvider> {
+            Err(Error::from_hresult(E_INVALIDARG))
+        }
+
+        /// Where a click at the point would put the caret, or the nearest position to it — the
+        /// line above the top of the rows, the line below the bottom, the start of the row a click
+        /// in the gutter is beside.
+        fn RangeFromPoint(&self, point: &UiaPoint) -> Result<ITextRangeProvider> {
+            let Kind::Grid(pane) = self.kind else {
+                return Err(Error::from_hresult(E_FAIL));
+            };
+            let doc = pane_doc_id(pane).ok_or_else(|| Error::from_hresult(E_FAIL))?;
+            let mut origin = POINT { x: 0, y: 0 };
+            unsafe {
+                let _ = ClientToScreen(self.hwnd, &mut origin);
+            }
+            let at = with_doc(pane, |document| {
+                let x = (point.x - f64::from(origin.x)) as f32 - document.pane_left;
+                let y = (point.y - f64::from(origin.y)) as f32 - document.pane_top;
+                gridtext::pos_at_or_nearest(document, x, y)
+            })
+            .flatten()
+            .unwrap_or(textunit::START);
+            Ok(TextRange::make(self.hwnd, doc, at, at))
+        }
+
+        fn DocumentRange(&self) -> Result<ITextRangeProvider> {
+            let Kind::Grid(pane) = self.kind else {
+                return Err(Error::from_hresult(E_FAIL));
+            };
+            let doc = pane_doc_id(pane).ok_or_else(|| Error::from_hresult(E_FAIL))?;
+            let end = with_doc(pane, |document| textunit::end(&DocText(document)))
+                .unwrap_or(textunit::START);
+            Ok(TextRange::make(self.hwnd, doc, textunit::START, end))
+        }
+
+        /// One selection at a time: a stream or a block, never several disjoint spans.
+        fn SupportedTextSelection(&self) -> Result<SupportedTextSelection> {
+            Ok(SupportedTextSelection_Single)
+        }
+    }
+
+    /// A private interface, answered by this provider's ranges and by nothing else — the identity
+    /// [`peer`] asks for. It is never called.
+    #[windows::core::interface("a3c1f6de-5f4b-4a5e-9d12-7c0e8b4f2a91")]
+    unsafe trait IGridRange: windows::core::IUnknown {
+        unsafe fn id(&self) -> u64;
+    }
+
+    /// A text range over one document — the object a screen reader moves and reads.
+    ///
+    /// **It holds two positions and the document's id**, and resolves them against that document on
+    /// every call, so a range kept across a scroll or the file's growth reads what is there now —
+    /// [`textunit`] clamps whatever no longer fits — and one kept across a tab switch answers with
+    /// nothing rather than with a different file.
+    #[implement(ITextRangeProvider, IGridRange)]
+    struct TextRange {
+        hwnd: HWND,
+        doc: u64,
+        start: std::cell::Cell<Pos>,
+        end: std::cell::Cell<Pos>,
+    }
+
+    impl IGridRange_Impl for TextRange_Impl {
+        unsafe fn id(&self) -> u64 {
+            self.doc
+        }
+    }
+
+    impl TextRange {
+        fn make(hwnd: HWND, doc: u64, start: Pos, end: Pos) -> ITextRangeProvider {
+            TextRange {
+                hwnd,
+                doc,
+                start: std::cell::Cell::new(start),
+                end: std::cell::Cell::new(end),
+            }
+            .into()
+        }
+
+        fn endpoint(&self, which: TextPatternRangeEndpoint) -> Pos {
+            if which == TextPatternRangeEndpoint_Start {
+                self.start.get()
+            } else {
+                self.end.get()
+            }
+        }
+
+        /// Puts one endpoint at `at`, and the other with it where they would cross — Microsoft's
+        /// rule for `MoveEndpointByUnit` and `MoveEndpointByRange`.
+        fn set_endpoint(&self, which: TextPatternRangeEndpoint, at: Pos) {
+            if which == TextPatternRangeEndpoint_Start {
+                self.start.set(at);
+                if self.end.get() < at {
+                    self.end.set(at);
+                }
+            } else {
+                self.end.set(at);
+                if self.start.get() > at {
+                    self.start.set(at);
+                }
+            }
+        }
+
+        /// A UI Automation unit as [`textunit`]'s, a page being the pane's screenful.
+        fn unit(&self, unit: TextUnit) -> Unit {
+            match unit {
+                u if u == TextUnit_Character => Unit::Character,
+                u if u == TextUnit_Format => Unit::Format,
+                u if u == TextUnit_Word => Unit::Word,
+                u if u == TextUnit_Line => Unit::Line,
+                u if u == TextUnit_Paragraph => Unit::Paragraph,
+                u if u == TextUnit_Page => Unit::Page(
+                    with_doc_id(self.doc, |doc| doc.view.grid().page_rows())
+                        .unwrap_or(1)
+                        .max(1),
+                ),
+                _ => Unit::Document,
+            }
+        }
+    }
+
+    /// The range a client handed back, as ours.
+    ///
+    /// **Asked for, not assumed.** Microsoft's Text pattern requires that every range passed to
+    /// `Compare`, `CompareEndpoints` and `MoveEndpointByRange` is "a peer of the same Text control
+    /// pattern implementation", but nothing enforces it, and `as_impl` is pointer arithmetic with no
+    /// identity check of its own: a range from another provider — a client holding ranges from two
+    /// applications, or simply a mistaken one — would be read as one of ours, off the end of
+    /// whatever object it really is. [`IGridRange`] is answered by nothing else, so asking for it is
+    /// the check.
+    ///
+    /// SAFETY: the `QueryInterface` succeeded, so this object is one of this provider's.
+    fn peer(range: Option<&ITextRangeProvider>) -> Result<&TextRange> {
+        let range = range.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        range
+            .cast::<IGridRange>()
+            .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+        Ok(unsafe { range.as_impl() })
+    }
+
+    impl ITextRangeProvider_Impl for TextRange_Impl {
+        fn Clone(&self) -> Result<ITextRangeProvider> {
+            Ok(TextRange::make(
+                self.hwnd,
+                self.doc,
+                self.start.get(),
+                self.end.get(),
+            ))
+        }
+
+        fn Compare(&self, range: Option<&ITextRangeProvider>) -> Result<BOOL> {
+            let other = peer(range)?;
+            Ok(BOOL::from(
+                other.doc == self.doc
+                    && other.start.get() == self.start.get()
+                    && other.end.get() == self.end.get(),
+            ))
+        }
+
+        fn CompareEndpoints(
+            &self,
+            endpoint: TextPatternRangeEndpoint,
+            targetrange: Option<&ITextRangeProvider>,
+            targetendpoint: TextPatternRangeEndpoint,
+        ) -> Result<i32> {
+            let other = peer(targetrange)?;
+            // Two documents' positions are not on one scale, so they do not compare.
+            if other.doc != self.doc {
+                return Err(Error::from_hresult(E_INVALIDARG));
+            }
+            Ok(
+                match self.endpoint(endpoint).cmp(&other.endpoint(targetendpoint)) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                },
+            )
+        }
+
+        fn ExpandToEnclosingUnit(&self, unit: TextUnit) -> Result<()> {
+            let unit = self.unit(unit);
+            let start = self.start.get();
+            if let Some((first, last)) = with_doc_id(self.doc, |doc| {
+                textunit::enclosing(&DocText(doc), start, unit)
+            }) {
+                self.start.set(first);
+                self.end.set(last);
+            }
+            Ok(())
+        }
+
+        /// The text carries no attributes of its own to search by.
+        fn FindAttribute(
+            &self,
+            _attributeid: UIA_TEXTATTRIBUTE_ID,
+            _val: &VARIANT,
+            _backward: BOOL,
+        ) -> Result<ITextRangeProvider> {
+            none()
+        }
+
+        fn FindText(
+            &self,
+            text: &BSTR,
+            backward: BOOL,
+            ignorecase: BOOL,
+        ) -> Result<ITextRangeProvider> {
+            let needle = text.to_string();
+            let (start, end) = (self.start.get(), self.end.get());
+            let found = with_doc_id(self.doc, |doc| {
+                gridtext::find(
+                    doc,
+                    start,
+                    end,
+                    &needle,
+                    backward.as_bool(),
+                    ignorecase.as_bool(),
+                )
+            })
+            .flatten();
+            match found {
+                Some((first, last)) => Ok(TextRange::make(self.hwnd, self.doc, first, last)),
+                None => none(),
+            }
+        }
+
+        /// Read-only, and nothing else: the text has no attribute this provider could report
+        /// honestly, and "not supported" is Microsoft's answer for those.
+        fn GetAttributeValue(&self, attributeid: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
+            if attributeid == UIA_IsReadOnlyAttributeId {
+                return Ok(VARIANT::from(true));
+            }
+            Ok(VARIANT::from(unsafe { UiaGetReservedNotSupportedValue() }?))
+        }
+
+        /// One rectangle per visible line, in screen coordinates, as four doubles each.
+        fn GetBoundingRectangles(&self) -> Result<*mut SAFEARRAY> {
+            let mut origin = POINT { x: 0, y: 0 };
+            unsafe {
+                let _ = ClientToScreen(self.hwnd, &mut origin);
+            }
+            let (start, end) = (self.start.get(), self.end.get());
+            let rects: Vec<(f32, f32, f32, f32)> = with_doc_id(self.doc, |doc| {
+                gridtext::line_rects(doc, start, end)
+                    .into_iter()
+                    .map(|(x, y, w, h)| (x + doc.pane_left, y + doc.pane_top, w, h))
+                    .collect()
+            })
+            .unwrap_or_default();
+            let array = unsafe { SafeArrayCreateVector(VT_R8, 0, (rects.len() * 4) as u32) };
+            if array.is_null() {
+                return Err(Error::from_hresult(E_FAIL));
+            }
+            for (i, (x, y, w, h)) in rects.into_iter().enumerate() {
+                let values = [
+                    f64::from(origin.x) + f64::from(x),
+                    f64::from(origin.y) + f64::from(y),
+                    f64::from(w),
+                    f64::from(h),
+                ];
+                for (j, value) in values.iter().enumerate() {
+                    let index = (i * 4 + j) as i32;
+                    let put = unsafe {
+                        SafeArrayPutElement(array, &index, value as *const f64 as *const _)
+                    };
+                    if let Err(why) = put {
+                        unsafe {
+                            let _ = SafeArrayDestroy(array);
+                        }
+                        return Err(why);
+                    }
+                }
+            }
+            Ok(array)
+        }
+
+        fn GetEnclosingElement(&self) -> Result<IRawElementProviderSimple> {
+            let pane = with_shell(|s| s.document.panes().iter().position(|d| d.id == self.doc))
+                .ok_or_else(|| Error::from_hresult(E_FAIL))?;
+            Ok(Element {
+                hwnd: self.hwnd,
+                kind: Kind::Grid(pane),
+            }
+            .into())
+        }
+
+        fn GetText(&self, maxlength: i32) -> Result<BSTR> {
+            let max = usize::try_from(maxlength).map_or(TEXT_CAP, |m| m.min(TEXT_CAP));
+            let (start, end) = (self.start.get(), self.end.get());
+            let text = with_doc_id(self.doc, |doc| {
+                textunit::text(&DocText(doc), start, end, max)
+            })
+            .unwrap_or_default();
+            Ok(BSTR::from(text))
+        }
+
+        fn Move(&self, unit: TextUnit, count: i32) -> Result<i32> {
+            let unit = self.unit(unit);
+            let (start, end) = (self.start.get(), self.end.get());
+            let moved = with_doc_id(self.doc, |doc| {
+                textunit::move_range(&DocText(doc), start, end, unit, count)
+            });
+            Ok(moved.map_or(0, |(first, last, moved)| {
+                self.start.set(first);
+                self.end.set(last);
+                moved
+            }))
+        }
+
+        fn MoveEndpointByUnit(
+            &self,
+            endpoint: TextPatternRangeEndpoint,
+            unit: TextUnit,
+            count: i32,
+        ) -> Result<i32> {
+            let unit = self.unit(unit);
+            let from = self.endpoint(endpoint);
+            let moved = with_doc_id(self.doc, |doc| {
+                textunit::move_endpoint(&DocText(doc), from, unit, count)
+            });
+            Ok(moved.map_or(0, |(at, moved)| {
+                self.set_endpoint(endpoint, at);
+                moved
+            }))
+        }
+
+        fn MoveEndpointByRange(
+            &self,
+            endpoint: TextPatternRangeEndpoint,
+            targetrange: Option<&ITextRangeProvider>,
+            targetendpoint: TextPatternRangeEndpoint,
+        ) -> Result<()> {
+            let other = peer(targetrange)?;
+            if other.doc != self.doc {
+                return Err(Error::from_hresult(E_INVALIDARG));
+            }
+            self.set_endpoint(endpoint, other.endpoint(targetendpoint));
+            Ok(())
+        }
+
+        /// The range becomes the selection; a degenerate one becomes the caret.
+        fn Select(&self) -> Result<()> {
+            let hwnd = self.hwnd;
+            let (start, end) = (self.start.get(), self.end.get());
+            with_doc_id_mut(self.doc, |s, pane| {
+                let doc = s.document.panes_mut().get_mut(pane)?;
+                let (first, last) = (
+                    gridtext::position_of(doc, start),
+                    gridtext::position_of(doc, end),
+                );
+                doc.selection = Some(if start == end {
+                    Selection::at(first)
+                } else {
+                    Selection::stream(first, last)
+                });
+                s.retitle(hwnd);
+                Some(())
+            });
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            Ok(())
+        }
+
+        /// One selection at a time — `SupportedTextSelection` says so — and Microsoft's answer
+        /// for adding a second is `UIA_E_INVALIDOPERATION`.
+        fn AddToSelection(&self) -> Result<()> {
+            Err(Error::from_hresult(HRESULT(0x8013_1509_u32 as i32)))
+        }
+
+        fn RemoveFromSelection(&self) -> Result<()> {
+            Err(Error::from_hresult(HRESULT(0x8013_1509_u32 as i32)))
+        }
+
+        /// The range's first row at the top of the pane, or its last row at the bottom.
+        fn ScrollIntoView(&self, aligntotop: BOOL) -> Result<()> {
+            let hwnd = self.hwnd;
+            let top = aligntotop.as_bool();
+            let row = if top {
+                self.start.get().row
+            } else {
+                self.end.get().row
+            };
+            with_doc_id_mut(self.doc, |s, pane| {
+                let doc = s.document.panes_mut().get_mut(pane)?;
+                let grid = doc.view.grid_mut();
+                let page = grid.page_rows().max(1);
+                grid.scroll_to_row(if top {
+                    row
+                } else {
+                    row.saturating_sub(page - 1)
+                });
+                s.sync_scrollbar(hwnd);
+                Some(())
+            });
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            Ok(())
+        }
+
+        /// No embedded objects, so no children.
+        fn GetChildren(&self) -> Result<*mut SAFEARRAY> {
+            let array = unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, 0) };
+            if array.is_null() {
+                return Err(Error::from_hresult(E_FAIL));
+            }
+            Ok(array)
+        }
+    }
+
+    /// What a pane's caret and selection are, before any of it becomes text positions: the document,
+    /// the selection, the current row and where the view is scrolled to.
+    ///
+    /// **Turning that into positions can read the file** — an endpoint off the screen is a row the
+    /// painter's window does not hold — and the comparison below runs every frame, so it compares
+    /// this instead and converts only what moved. The scroll is in it because the caret's place on
+    /// the screen moves when the rows do.
+    pub type Signature = (
+        u64,
+        Option<Selection>,
+        Option<u64>,
+        tailhawk_core::grid::Scroll,
+    );
+
+    fn signature(doc: &Document) -> Signature {
+        (
+            doc.id,
+            doc.selection,
+            doc.current_row(),
+            doc.view.grid().scroll(),
+        )
+    }
+
+    /// The system caret, a row high and drawing nothing: **created from a bitmap of zero bits and
+    /// shown**, because a caret that is never shown is not reported by `GetGUIThreadInfo`, and the
+    /// clients that follow a caret rather than UI Automation's events ask that. Tailhawk rules the
+    /// current row itself, so a second blinking bar over it would be one too many.
+    pub fn make_caret(hwnd: HWND, row_px: f32) {
+        use windows::Win32::Graphics::Gdi::CreateBitmap;
+        use windows::Win32::UI::WindowsAndMessaging::{CreateCaret, ShowCaret};
+        let height = row_px.max(1.0) as i32;
+        // A monochrome bitmap's scanlines are two-byte aligned: two zero bytes a row.
+        let bits = vec![0u8; 2 * height.max(1) as usize];
+        let blank = unsafe {
+            CreateBitmap(
+                1,
+                height,
+                1,
+                1,
+                Some(bits.as_ptr() as *const core::ffi::c_void),
+            )
+        };
+        drop_caret();
+        unsafe {
+            let _ = CreateCaret(hwnd, blank, 1, height);
+            let _ = ShowCaret(hwnd);
+        }
+        CARET_BITMAP.with(|kept| kept.set(blank));
+    }
+
+    /// Takes the caret away with the focus, and the bitmap with it — `DestroyCaret` does not.
+    pub fn drop_caret() {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
+        use windows::Win32::UI::WindowsAndMessaging::DestroyCaret;
+        unsafe {
+            let _ = DestroyCaret();
+        }
+        CARET_BITMAP.with(|kept| {
+            let bitmap = kept.replace(windows::Win32::Graphics::Gdi::HBITMAP::default());
+            if !bitmap.is_invalid() {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                }
+            }
+        });
+    }
+
+    thread_local! {
+        /// The caret's bitmap, kept because [`make_caret`] owns it and `DestroyCaret` does not
+        /// delete it.
+        static CARET_BITMAP: std::cell::Cell<windows::Win32::Graphics::Gdi::HBITMAP> =
+            std::cell::Cell::new(windows::Win32::Graphics::Gdi::HBITMAP::default());
+    }
+
+    /// `TextSelectionChanged` for each shown pane whose caret or selection moved since the last
+    /// frame — Microsoft's rule that it "must be raised whenever the selection of text changes, or
+    /// whenever the insertion point (caret) moves" — and the system caret put where the text's
+    /// caret is, for the clients that follow that instead.
+    ///
+    /// **Called after the frame, outside the shell's borrow**, because a client handling the event
+    /// calls straight back into this provider, and a provider that could not borrow the shell would
+    /// answer it with nothing.
+    pub fn raise_selection_changes(hwnd: HWND) {
+        let (changed, caret) = STATE.with(|s| {
+            let Ok(mut state) = s.try_borrow_mut() else {
+                return (Vec::new(), None);
+            };
+            let Some(shell) = state.as_mut() else {
+                return (Vec::new(), None);
+            };
+            let now: Vec<Signature> = shell.document.panes().iter().map(signature).collect();
+            let changed: Vec<usize> = now
+                .iter()
+                .enumerate()
+                .filter(|(i, sign)| shell.uia_selections.get(*i) != Some(*sign))
+                .map(|(i, _)| i)
+                .collect();
+            shell.uia_selections = now;
+            let focused = shell.document.focused_pane();
+            let caret = changed
+                .contains(&focused)
+                .then(|| {
+                    let doc = shell.document.panes().get(focused)?;
+                    let (at, _) = gridtext::selection_range(doc)?;
+                    let (x, y, _, _) = *gridtext::line_rects(doc, at, at).first()?;
+                    Some(((doc.pane_left + x) as i32, (doc.pane_top + y) as i32))
+                })
+                .flatten();
+            (changed, caret)
+        });
+        if let Some((x, y)) = caret {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetCaretPos(x, y);
+            }
+        }
+        if changed.is_empty() || !unsafe { UiaClientsAreListening() }.as_bool() {
+            return;
+        }
+        for pane in changed {
+            let element: IRawElementProviderSimple = Element {
+                hwnd,
+                kind: Kind::Grid(pane),
+            }
+            .into();
+            unsafe {
+                let _ = UiaRaiseAutomationEvent(&element, UIA_Text_TextSelectionChangedEventId);
+            }
         }
     }
 }
@@ -9811,6 +10509,27 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             });
             LRESULT(0)
         }
+        // The system caret, for the clients that follow it rather than UI Automation's text
+        // events: a one-pixel bar a row high, never shown — the painter rules the current row
+        // itself — and moved after every frame by `uia::raise_selection_changes`.
+        windows::Win32::UI::WindowsAndMessaging::WM_SETFOCUS => {
+            let row_h = STATE
+                .with(|s| {
+                    s.try_borrow()
+                        .ok()
+                        .and_then(|state| state.as_ref().map(|sh| sh.cell_h))
+                })
+                .unwrap_or(16.0);
+            uia::make_caret(hwnd, row_h);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            def_proc(hwnd, msg, wparam, lparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_KILLFOCUS => {
+            uia::drop_caret();
+            def_proc(hwnd, msg, wparam, lparam)
+        }
         WM_PAINT => {
             let (painted, again) = STATE.with(|s| {
                 s.borrow_mut()
@@ -9828,6 +10547,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     shell.sync_scrollbar(hwnd);
                 }
             });
+            uia::raise_selection_changes(hwnd);
             if painted {
                 // The swapchain owns the pixels, so there is no BeginPaint/EndPaint pair here;
                 // the update region still has to be cleared or the loop spins on WM_PAINT.
@@ -11271,6 +11991,7 @@ fn main() -> Result<()> {
             pending_find: false,
             pending_filter: None,
             pending_filter_edit: None,
+            uia_selections: Vec::new(),
             pending_format: false,
             pending_columns: false,
             pending_regroup: false,

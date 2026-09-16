@@ -45,8 +45,17 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    anything, so a source that cannot answer leaves the user with a status-bar message where their
    windows were, and the scrollback is gone either way. Not exercised against live Loki — the
    configured source still has no secret.
-3. **The rest of `UX-REVIEW.md`**, worst first: the grid's text is absent from the accessibility
-   tree. **The filter panel is done (2026-09-15):** `filterpanel::FilterPanel` is a check-box
+3. **The rest of `UX-REVIEW.md`**, worst first. **Both of the review's *large* findings are now
+   done.** The grid's text is in the accessibility tree since 2026-09-15: `tailhawk-core`'s
+   `textunit.rs` resolves UI Automation's text units over the view's rows — a position is a view row
+   and a byte on a grapheme boundary — and `gridtext.rs` answers them from a live document, reading
+   a row off the screen through `LogSet::read_row` without disturbing the window the painter draws
+   from. Each shown pane is a *Document* element with the Text pattern; the caret is a degenerate
+   range at `current_row`, it moves a hidden system caret, and `TextSelectionChanged` is raised
+   after the frame that moved it. **Knowingly left:** §14.1's live-tail announcement — the explicit
+   *read new lines* command — and `TextChanged`, both deliberately absent while follow mode stays
+   quiet; `FindText` searches a row at a time and at most 100,000 rows; a text range is bound to a
+   pane by position, so one kept across a tab switch reads the pane that is there now. **The filter panel is done (2026-09-15):** `filterpanel::FilterPanel` is a check-box
    `SysListView32` in a child dialog, reached by `F6` and left by `F6` or `Esc`; `Space` toggles,
    `Enter` or a double-click edits, `Delete` removes, the row menu has the rest including
    `Move up` / `Move down`. **It has no buttons, by the owner's rule** — "the only time a command

@@ -85,6 +85,40 @@ try {
     Check 'Edit > Edit filter is greyed with nothing selected' (-not (Find-MenuItem $bar 'Edit' 'Edit filter').Enabled)
     Check 'Edit > Remove filter is greyed with nothing selected' (-not (Find-MenuItem $bar 'Edit' 'Remove filter').Enabled)
 
+    # **The log's text, readable by a screen reader** — `SPEC.md` §14.1's grid text provider. Each
+    # shown pane is a Document with the Text pattern. The checks agree with each other rather than
+    # with the file, because a recognised format reads as its aligned columns, not as its raw lines:
+    # the caret's line is one line, a line move moves, the visible lines have rectangles inside the
+    # window, and the point in the middle of the first of them reads back as that same line.
+    $TU = [System.Windows.Automation.Text.TextUnit]
+    $grid = ById $root 'grid-0'
+    Check 'the log is a Document' ($grid.Current.ControlType.ProgrammaticName -eq 'ControlType.Document')
+    $text = $grid.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+    $whole = $text.DocumentRange.GetText(4000)
+    Check 'its document range reads the log' ($whole.Length -gt 20 -and $whole.Contains("`n"))
+    $selection = $text.GetSelection()
+    Check 'the caret is a range of its own' ($selection.Count -eq 1)
+    if ($selection.Count -ge 1) {
+        $caret = $selection[0].Clone()
+        $caret.ExpandToEnclosingUnit($TU::Line)
+        $line = $caret.GetText(-1)
+        Check 'the caret expands to one line' ($line.Length -gt 0 -and $line.TrimEnd("`n").IndexOf("`n") -lt 0)
+        Check 'a line move reports moving' ($caret.Move($TU::Line, 1) -eq 1)
+    }
+    $visible = $text.GetVisibleRanges()
+    $rects = $visible[0].GetBoundingRectangles()
+    $window = $root.Current.BoundingRectangle
+    Check 'the visible lines have rectangles inside the window' ($rects.Count -gt 1 -and ($rects | Where-Object { -not $window.Contains($_.TopLeft) }).Count -eq 0)
+    if ($rects.Count -gt 0) {
+        $first = $rects[0]
+        $middle = New-Object System.Windows.Point(($first.Left + 4), ($first.Top + $first.Height / 2))
+        $hit = $text.RangeFromPoint($middle)
+        $hit.ExpandToEnclosingUnit($TU::Line)
+        $top = $visible[0].Clone()
+        $top.ExpandToEnclosingUnit($TU::Line)
+        Check 'a point on the first line reads back as that line' ($hit.GetText(-1) -eq $top.GetText(-1))
+    }
+
     if ($SecondLog -ne $Log) {
         $tab0 = ById $root 'tab-0'
         $sp = $tab0.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
