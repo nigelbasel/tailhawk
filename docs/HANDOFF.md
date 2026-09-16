@@ -54,8 +54,11 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    range at `current_row`, it moves a hidden system caret, and `TextSelectionChanged` is raised
    after the frame that moved it. **Knowingly left:** §14.1's live-tail announcement — the explicit
    *read new lines* command — and `TextChanged`, both deliberately absent while follow mode stays
-   quiet; `FindText` searches a row at a time and at most 100,000 rows; a text range is bound to a
-   pane by position, so one kept across a tab switch reads the pane that is there now. **The filter panel is done (2026-09-15):** `filterpanel::FilterPanel` is a check-box
+   quiet; `FindText` searches a row at a time and at most 100,000 rows; `GetText` is capped at a
+   mebibyte, so no one call reads a whole file on the window's thread. **One small thing left
+   deliberately:** `uia::Element::GetRuntimeId` leaks its `SAFEARRAY` if `SafeArrayPutElement` ever
+   fails — the same defect the text provider's two arrays were fixed for, older than this work and
+   untouched by it. **The filter panel is done (2026-09-15):** `filterpanel::FilterPanel` is a check-box
    `SysListView32` in a child dialog, reached by `F6` and left by `F6` or `Esc`; `Space` toggles,
    `Enter` or a double-click edits, `Delete` removes, the row menu has the rest including
    `Move up` / `Move down`. **It has no buttons, by the owner's rule** — "the only time a command
