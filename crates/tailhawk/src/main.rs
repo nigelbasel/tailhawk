@@ -206,6 +206,10 @@ struct Document {
     /// tail that writes this document's spill, and shown by `describe`. `None` until the tail has
     /// written something.
     lag: Option<tailhawk_core::loki::Nanos>,
+    /// Whether an answer from this document's source was cut off by the limit it was asked under —
+    /// `LOKI.md` §6. **It never goes back to false**: a window already in the scrollback stays one
+    /// nobody saw the whole of, so every count over it is a floor from then on.
+    answers_cut: bool,
     /// Where a remote source's records landed, when this document is one — see [`Document::remote`].
     remote_spill: Option<std::path::PathBuf>,
     /// The source this document is a view of: its **name** — the settings key, which is what says
@@ -605,10 +609,13 @@ impl Document {
     /// `query` is the source as this document was opened with — the settings source rewritten by
     /// `apps::with_apps` for the applications the user picked. It is kept so `Interleave` and
     /// `Separate` can regroup the windows without asking the server again what it holds.
-    fn remote(&mut self, source: &str, spill: &std::path::Path, query: &str) {
+    fn remote(&mut self, source: &str, spill: &std::path::Path, query: &str, cut: bool) {
         self.summary = source.to_owned();
         self.remote_spill = Some(spill.to_path_buf());
         self.remote_source = Some((source.to_owned(), query.to_owned()));
+        // The opening window can be cut before the tail has polled once — `LOKI.md` §6, and the
+        // first live query returned exactly its limit and said nothing about it.
+        self.answers_cut = cut;
     }
 
     /// The line §6.2 defines a format from, and the lines it previews over: the top visible row
@@ -709,6 +716,7 @@ impl Document {
             remote_spill: None,
             remote_source: None,
             lag: None,
+            answers_cut: false,
             selection: None,
             dragging: false,
             finder: Finder::default(),
@@ -777,6 +785,7 @@ impl Document {
             remote_spill: None,
             remote_source: None,
             lag: None,
+            answers_cut: false,
             selection: None,
             dragging: false,
             finder: Finder::default(),
@@ -1499,11 +1508,14 @@ impl Document {
         // **The find state goes first**, because it is the part that changes while the user is
         // watching and the part a truncated title must not lose. Everything after it is the
         // document, which is what the window said before there was a search.
-        let find = match self.finder.describe() {
+        let find = match self.finder.describe(self.answers_cut) {
             Some(text) => format!("{text} — "),
             None => String::new(),
         };
-        let filter = match self.filtering.describe(self.set.total_rows()) {
+        let filter = match self
+            .filtering
+            .describe(self.set.total_rows(), self.answers_cut)
+        {
             Some(text) => format!("{text} — "),
             None => String::new(),
         };
@@ -1556,12 +1568,21 @@ impl Document {
             (true, Some(behind)) => format!(" · {}", tail::lag_text(behind)),
             _ => String::new(),
         };
+        // **`LOKI.md` §6: an answer that was cut is said, and goes on being said.** Loki returns at
+        // most `limit` records and sets no flag when it stops there, so a window that came back full
+        // is one nobody has seen the whole of — and this window stays in the scrollback. A notice
+        // said once would scroll away; this stands beside the lag for as long as the document does.
+        let cut = if self.answers_cut {
+            " · answers cut at the limit — narrow the time range or the selector"
+        } else {
+            ""
+        };
         let following = if self.stream_done || !sort.is_empty() {
             String::new()
         } else if self.view.grid().is_following() {
-            format!("● following{lagging} — ")
+            format!("● following{lagging}{cut} — ")
         } else {
-            format!("‖ paused · Ctrl+End to follow{lagging} — ")
+            format!("‖ paused · Ctrl+End to follow{lagging}{cut} — ")
         };
         format!(
             "{following}{sort}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
@@ -2725,18 +2746,29 @@ impl Finder {
     /// The Find dialog's count line — what the streaming pass knows right now, said where the
     /// user is looking. A refused pattern is reported here first, because the title is behind
     /// the dialog when the mistake is made.
-    fn dialog_status(&self) -> String {
+    fn dialog_status(&self, at_least: bool) -> String {
         Self::status_line(
             self.error.as_deref(),
             self.query.is_empty(),
             self.matches.len(),
             self.running.is_some(),
+            at_least,
         )
     }
 
     /// [`Finder::dialog_status`]'s decision, free of the worker handle so a test can reach every
     /// arm.
-    fn status_line(error: Option<&str>, no_query: bool, matches: usize, running: bool) -> String {
+    ///
+    /// **`at_least` is `LOKI.md` §6 reaching the dialog.** The title bar hedges its count over a
+    /// source whose answers Loki cut; the dialog shows the same number a line away, and an exact one
+    /// there would contradict the standing marker beside it.
+    fn status_line(
+        error: Option<&str>,
+        no_query: bool,
+        matches: usize,
+        running: bool,
+        at_least: bool,
+    ) -> String {
         if let Some(error) = error {
             return error.to_owned();
         }
@@ -2746,9 +2778,10 @@ impl Finder {
         match (matches, running) {
             (0, true) => "searching…".to_owned(),
             (0, false) => "no matches".to_owned(),
+            (1, false) if at_least => "at least 1 match".to_owned(),
             (1, false) => "1 match".to_owned(),
-            (n, true) => format!("{n} matches so far"),
-            (n, false) => format!("{n} matches"),
+            (n, true) => format!("{} matches so far", count_text(n, at_least)),
+            (n, false) => format!("{} matches", count_text(n, at_least)),
         }
     }
 
@@ -2909,7 +2942,7 @@ impl Finder {
     /// Everything §7.4 obliges a search to disclose is here: that a pass is still running, that it
     /// was capped, that lines were too slow to search, and — the one a user would otherwise read as
     /// "no matches" — that the pattern did not compile.
-    fn describe(&self) -> Option<String> {
+    fn describe(&self, at_least: bool) -> Option<String> {
         if let Some(error) = &self.error {
             return Some(format!("► {} — {error}", self.shown()));
         }
@@ -2920,8 +2953,10 @@ impl Finder {
         match (self.current, self.matches.len()) {
             (_, 0) if self.running.is_some() => text.push_str(" — searching…"),
             (_, 0) => text.push_str(" — no matches"),
-            (Some(at), n) => text.push_str(&format!(" — {} of {n}", at + 1)),
-            (None, n) => text.push_str(&format!(" — {n} matches")),
+            (Some(at), n) => {
+                text.push_str(&format!(" — {} of {}", at + 1, count_text(n, at_least)))
+            }
+            (None, n) => text.push_str(&format!(" — {} matches", count_text(n, at_least))),
         }
         if self.running.is_some() && !self.matches.is_empty() {
             text.push_str(&format!(", scanning ({} lines)", self.scanned));
@@ -2990,6 +3025,20 @@ fn window_title(document: Option<&str>) -> String {
 fn frame_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TAILHAWK_FRAME_STATS").is_some())
+}
+
+/// A count of things found in the view, as it may honestly be written.
+///
+/// **`LOKI.md` §6: a count over an answer Loki cut is a floor, not a total.** The chips and the
+/// search run client-side, over whatever was fetched; if the fetch stopped at its limit there are
+/// matching records that were never returned, and a bare number there reads exactly like a local
+/// file's exact one. A local file's count is untouched, because nothing cut it.
+fn count_text(n: usize, at_least: bool) -> String {
+    if at_least {
+        format!("at least {n}")
+    } else {
+        n.to_string()
+    }
 }
 
 fn status_line(
@@ -3227,7 +3276,7 @@ impl Filtering {
     /// The title's filter fragment, or `None` when no filter is in play.
     ///
     /// See [`NAMED_CHIPS`] for where naming the filters gives way to counting them.
-    fn describe(&self, total_rows: u64) -> Option<String> {
+    fn describe(&self, total_rows: u64, at_least: bool) -> Option<String> {
         if let Some(error) = &self.error {
             return Some(format!("▼ {error}"));
         }
@@ -3258,7 +3307,10 @@ impl Filtering {
         }
         let mut text = format!("▼{text}");
         if self.filtered() {
-            text.push_str(&format!(" · {} of {total_rows}", self.kept.len()));
+            text.push_str(&format!(
+                " · {} of {total_rows}",
+                count_text(self.kept.len(), at_least)
+            ));
             if self.running.is_some() {
                 let pct = (self.scanned * 100)
                     .checked_div(total_rows)
@@ -5594,16 +5646,16 @@ impl Shell {
         &mut self,
         hwnd: HWND,
         path: std::path::PathBuf,
-        remote: Option<(String, std::path::PathBuf, String)>,
+        remote: Option<(String, std::path::PathBuf, String, bool)>,
     ) {
         self.file = Some(match &remote {
-            Some((source, _, _)) => format!("opening {source}…"),
+            Some((source, _, _, _)) => format!("opening {source}…"),
             None => format!("opening {}…", path.display()),
         });
         self.reading.push(spawn_open(move || {
             let mut doc = Document::open(&path)?;
-            if let Some((source, spill, query)) = remote {
-                doc.remote(&source, &spill, &query);
+            if let Some((source, spill, query, cut)) = remote {
+                doc.remote(&source, &spill, &query, cut);
             }
             Ok(doc)
         }));
@@ -6738,7 +6790,10 @@ impl Shell {
         // the Count button's answer for free, and it has to move before the early return below.
         if changed && !self.find_dialog.is_invalid() {
             if let Some(doc) = self.document.as_ref() {
-                dialog::set_find_status(self.find_dialog, &doc.finder.dialog_status());
+                dialog::set_find_status(
+                    self.find_dialog,
+                    &doc.finder.dialog_status(doc.answers_cut),
+                );
             }
         }
         if !changed {
@@ -8900,6 +8955,9 @@ fn landed_records(
     // holding exactly `limit`, indistinguishable from a window that happened to hold that many. The
     // first live query returned exactly 1,000 of 1,000 and said nothing, which is precisely the
     // "fewer lines, no error" failure this project keeps calling the worst kind.
+    // **One rule for both paths.** The opening window and every poll after it are cut the same way
+    // and by the same limit, so they ask the same question — `tail::was_cut`.
+    let cut = tail::was_cut(pulled.records, REMOTE_LIMIT);
     if pulled.dropped > 0 {
         set_notice(
             hwnd,
@@ -8908,7 +8966,7 @@ fn landed_records(
                 pulled.records, pulled.dropped
             ),
         );
-    } else if pulled.records as u32 >= REMOTE_LIMIT {
+    } else if cut {
         set_notice(
             hwnd,
             format!(
@@ -8948,7 +9006,7 @@ fn landed_records(
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             // Named after the source, not after the part of the spill it happens to open on.
-            shell.open_named(hwnd, path, Some((name, spill_dir, query)));
+            shell.open_named(hwnd, path, Some((name, spill_dir, query, cut)));
         }
     });
 }
@@ -9584,7 +9642,7 @@ pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
             doc.find();
             false
         };
-        dialog::set_find_status(hdlg, &doc.finder.dialog_status());
+        dialog::set_find_status(hdlg, &doc.finder.dialog_status(doc.answers_cut));
         if moved {
             shell.sync_scrollbar(owner);
         }
@@ -10438,17 +10496,21 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 // close in an order the tails know nothing about.
                 if !shell.tails.is_empty() {
                     if let Some(now) = tail::now_nanos() {
-                        let behind: Vec<(std::path::PathBuf, Option<i64>)> = shell
+                        let behind: Vec<(std::path::PathBuf, Option<i64>, bool)> = shell
                             .tails
                             .iter()
-                            .map(|(dir, tail)| (dir.clone(), tail.behind(now)))
+                            .map(|(dir, tail)| (dir.clone(), tail.behind(now), tail.cut()))
                             .collect();
                         for (_, doc) in shell.document.all_mut() {
                             let Some(spill) = doc.remote_spill.clone() else {
                                 continue;
                             };
-                            if let Some((_, lag)) = behind.iter().find(|(dir, _)| *dir == spill) {
+                            if let Some((_, lag, cut)) =
+                                behind.iter().find(|(dir, _, _)| *dir == spill)
+                            {
                                 doc.lag = *lag;
+                                // Never back to false: see `Document::answers_cut`.
+                                doc.answers_cut |= *cut;
                             }
                         }
                     }
@@ -12388,6 +12450,7 @@ mod tests {
             "live-identity-and-campaigns",
             &spill,
             r#"{environment="live"}"#,
+            false,
         );
         assert_eq!(doc.summary, "live-identity-and-campaigns");
         let title = doc.describe();
@@ -12712,18 +12775,40 @@ mod tests {
     #[test]
     fn the_dialogs_count_line_reports_the_pass_as_it_stands() {
         assert_eq!(
-            Finder::status_line(Some("pattern refused"), false, 0, false),
+            Finder::status_line(Some("pattern refused"), false, 0, false, false),
             "pattern refused"
         );
-        assert_eq!(Finder::status_line(None, true, 0, false), "");
-        assert_eq!(Finder::status_line(None, false, 0, true), "searching…");
-        assert_eq!(Finder::status_line(None, false, 0, false), "no matches");
-        assert_eq!(Finder::status_line(None, false, 1, false), "1 match");
+        assert_eq!(Finder::status_line(None, true, 0, false, false), "");
         assert_eq!(
-            Finder::status_line(None, false, 41, true),
+            Finder::status_line(None, false, 0, true, false),
+            "searching…"
+        );
+        assert_eq!(
+            Finder::status_line(None, false, 0, false, false),
+            "no matches"
+        );
+        assert_eq!(Finder::status_line(None, false, 1, false, false), "1 match");
+        // `LOKI.md` §6 in the dialog: the same number the title bar hedges.
+        assert_eq!(
+            Finder::status_line(None, false, 1, false, true),
+            "at least 1 match"
+        );
+        assert_eq!(
+            Finder::status_line(None, false, 41, false, true),
+            "at least 41 matches"
+        );
+        assert_eq!(
+            Finder::status_line(None, false, 41, true, true),
+            "at least 41 matches so far"
+        );
+        assert_eq!(
+            Finder::status_line(None, false, 41, true, false),
             "41 matches so far"
         );
-        assert_eq!(Finder::status_line(None, false, 41, false), "41 matches");
+        assert_eq!(
+            Finder::status_line(None, false, 41, false, false),
+            "41 matches"
+        );
     }
 
     /// The four ways a query reaches the engine: literal, regex, and each with whole-word
@@ -12770,7 +12855,7 @@ mod tests {
         finder.outcome = Some(Outcome::Capped);
         finder.truncated = 3;
 
-        let text = finder.describe().expect("a query is in play");
+        let text = finder.describe(false).expect("a query is in play");
         assert!(text.contains("2 of 2"), "{text}");
         assert!(text.contains("capped"), "{text}");
         assert!(text.contains("3 lines too slow"), "{text}");
@@ -12781,12 +12866,12 @@ mod tests {
             error: Some("unclosed group".to_owned()),
             ..Finder::default()
         };
-        let text = refused.describe().expect("an error is in play");
+        let text = refused.describe(false).expect("an error is in play");
         assert!(text.contains("unclosed group"), "{text}");
         assert!(!text.contains("no matches"), "{text}");
 
         // And with no query at all there is nothing to say.
-        assert!(Finder::default().describe().is_none());
+        assert!(Finder::default().describe(false).is_none());
     }
 
     /// A search over a real file, through the document, ending on screen as spans.
@@ -13200,6 +13285,58 @@ mod tests {
         assert_eq!(
             status_line(None, Some("a"), None, Some("b"), Some("⚠ rules: c")),
             "a — b — ⚠ rules: c"
+        );
+    }
+
+    /// **A cut on the opening window reaches the document it opens**, before the tail has polled
+    /// once: `landed_records` decides it, `Document::remote` carries it, and the status says it.
+    /// The tick that ORs in a later cut is plumbing this cannot reach, but the opening path is the
+    /// one that first found a live query returning exactly its limit and saying nothing.
+    #[test]
+    fn a_cut_opening_window_marks_the_document_it_opens() {
+        let path = scratch_log("tailhawk_cut_open_test.log", 20);
+        let spill = path.parent().expect("a directory").to_path_buf();
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.remote("a-source", &spill, r#"{environment="live"}"#, false);
+        assert!(!doc.answers_cut, "an answer under the limit is not cut");
+        doc.remote("a-source", &spill, r#"{environment="live"}"#, true);
+        assert!(doc.answers_cut);
+        assert!(
+            doc.describe().contains("answers cut at the limit"),
+            "{}",
+            doc.describe()
+        );
+    }
+
+    /// **A count over an answer that was cut is a floor** — `LOKI.md` §6's rule that a client-side
+    /// count over a truncated window must never read like a local file's exact one.
+    #[test]
+    fn a_count_over_a_cut_answer_reads_as_at_least() {
+        assert_eq!(count_text(40, false), "40");
+        assert_eq!(count_text(40, true), "at least 40");
+        assert_eq!(count_text(0, true), "at least 0");
+    }
+
+    /// **And the cut itself is said, standing, for as long as the document is open.** Loki returns
+    /// at most its limit and sets no flag when it stops there, so the window in the scrollback is
+    /// one nobody has seen the whole of; a notice said once would scroll away from the user who
+    /// most needs it.
+    #[test]
+    fn a_source_whose_answer_was_cut_says_so_in_the_status() {
+        let path = scratch_log("tailhawk_cut_answer_test.log", 40);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(
+            !doc.describe().contains("answers cut"),
+            "a local file is not cut by anything"
+        );
+        doc.answers_cut = true;
+        let said = doc.describe();
+        assert!(said.contains("answers cut at the limit"), "{said}");
+        assert!(
+            said.contains("narrow the time range or the selector"),
+            "the remedy is named too: {said}"
         );
     }
 

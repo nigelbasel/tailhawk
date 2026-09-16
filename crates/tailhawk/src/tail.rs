@@ -51,6 +51,16 @@ pub fn caught_up(records: usize) -> bool {
     (records as u64) < TAIL_LIMIT as u64
 }
 
+/// Whether an answer was cut off by the limit it was asked under.
+///
+/// **A page that comes back with exactly `limit` records is indistinguishable from one that
+/// returned everything** — Loki sets no truncated flag, which `LOKI.md` §6 calls the worst failure
+/// this feature can have. So a full answer is taken as cut: whatever the window held beyond the
+/// limit was not returned, and nothing else in the system will ever say so.
+pub fn was_cut(records: usize, limit: u32) -> bool {
+    limit > 0 && records as u64 >= limit as u64
+}
+
 /// How many recent spill lines are remembered for de-duplication.
 ///
 /// Bounded by count rather than by time because a count is what a ring can hold without a clock:
@@ -218,6 +228,10 @@ pub struct Tail {
     /// the worker learns it and the UI thread reads it on the follow tick; an atomic rather than a
     /// channel because a stale reading is worthless — only the latest one means anything.
     newest: Arc<AtomicI64>,
+    /// Whether any poll has come back at its limit — [`was_cut`], `LOKI.md` §6. Shared the same way
+    /// and for the same reason as `newest`, and **it never goes back to false**: the window it
+    /// happened in is in the scrollback for as long as the document is.
+    cut: Arc<AtomicBool>,
 }
 
 impl Tail {
@@ -226,6 +240,12 @@ impl Tail {
     pub fn behind(&self, now: Nanos) -> Option<Nanos> {
         let newest = self.newest.load(Ordering::Relaxed);
         (newest > 0).then(|| now.saturating_sub(newest))
+    }
+
+    /// Whether Loki has cut any answer this tail has asked for — `LOKI.md` §6, read on the follow
+    /// tick beside the lag.
+    pub fn cut(&self) -> bool {
+        self.cut.load(Ordering::Relaxed)
     }
 
     /// Starts tailing `source` into `spill`, resuming after `since`.
@@ -248,6 +268,8 @@ impl Tail {
         let flag = Arc::clone(&stop);
         let newest = Arc::new(AtomicI64::new(since));
         let mark = Arc::clone(&newest);
+        let cut = Arc::new(AtomicBool::new(false));
+        let cut_mark = Arc::clone(&cut);
         let name = source.name.clone();
         // The opening pull's lines are what the first overlap would fetch again; seeded here so the
         // first poll after opening writes nothing twice.
@@ -298,6 +320,13 @@ impl Tail {
                                 "{name}: {} label value(s) longer than 4 KiB were cut to fit",
                                 pulled.truncated
                             ));
+                        }
+                        // **§6's rule, the one the feature turns on.** An answer that came back at
+                        // the limit was cut there, and Loki says nothing about it; the mark stands
+                        // for the rest of the document's life because that window is in the
+                        // scrollback and every client-side count over it is a floor from now on.
+                        if was_cut(pulled.records, TAIL_LIMIT) {
+                            cut_mark.store(true, Ordering::Relaxed);
                         }
                         // Behind is judged on what Loki returned, repeats included: the limit
                         // was spent on them all.
@@ -384,7 +413,7 @@ impl Tail {
                 }
             }
         });
-        Tail { stop, newest }
+        Tail { stop, newest, cut }
     }
 }
 
@@ -425,6 +454,27 @@ pub fn now_nanos() -> Option<Nanos> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A full answer is a cut answer.** Loki sets no truncated flag, so a count that comes back
+    /// exactly at the limit is the only signal there is — and a client that reads it as "that was
+    /// all" goes on to report counts over a window it never saw the whole of.
+    #[test]
+    fn an_answer_at_the_limit_is_taken_as_cut() {
+        assert!(
+            !was_cut(0, TAIL_LIMIT),
+            "nothing came back, nothing was cut"
+        );
+        assert!(!was_cut(TAIL_LIMIT as usize - 1, TAIL_LIMIT));
+        assert!(was_cut(TAIL_LIMIT as usize, TAIL_LIMIT));
+        assert!(
+            was_cut(TAIL_LIMIT as usize + 1, TAIL_LIMIT),
+            "more than was asked for is still an answer that stopped somewhere"
+        );
+        assert!(
+            !was_cut(5, 0),
+            "a limit of nothing asks for nothing and cuts nothing"
+        );
+    }
 
     /// **The window starts before the newest record held and ends before now.** Records reach
     /// Loki's index seconds after their own timestamps, so a window that started at the newest
@@ -570,12 +620,14 @@ mod tests {
         let quiet = Tail {
             stop: Arc::new(AtomicBool::new(false)),
             newest: Arc::new(AtomicI64::new(0)),
+            cut: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(quiet.behind(1_000), None);
 
         let running = Tail {
             stop: Arc::new(AtomicBool::new(false)),
             newest: Arc::new(AtomicI64::new(1_000_000_000)),
+            cut: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(running.behind(3_000_000_000), Some(2_000_000_000));
         assert_eq!(

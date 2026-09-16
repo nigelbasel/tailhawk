@@ -146,6 +146,14 @@ this *worse* by hiding page boundaries behind something that looks exactly like 
 > an exact number to **"at least N"**. A local file's "7 matches" is exact; this must never look like
 > it.
 
+**Built 2026-09-16.** `tail::was_cut` is the rule, asked by the opening window and by every poll
+under the same limit; `Document::answers_cut` carries it and never goes back to false, because the
+window it happened in stays in the scrollback. The status bar says it standing, beside the lag —
+*"answers cut at the limit — narrow the time range or the selector"* — rather than as a notice that
+scrolls away, and `count_text` renders the filter's `N of M` and the search's `N matches` as
+**at least N** for as long as it stands. The banner is the status bar because that is the persistent
+surface this program has; a local file is untouched, because nothing cut it.
+
 Other rules:
 
 - **Never push down a predicate on a field outside the source's discovered field set** (from
