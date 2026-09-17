@@ -75,13 +75,25 @@ impl std::fmt::Display for PullFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PullFault::Origin(why) => write!(f, "The source's URL {why}."),
-            PullFault::Address(_) => f.write_str("That URL names an address Tailhawk will not contact."),
+            // **Which rule refused it, not merely that one did.** `AddressFault` distinguishes
+            // loopback from a link-local address from the cloud metadata service, and those are
+            // three different mistakes with three different remedies — the same argument the
+            // transport arms below carry their cause for.
+            PullFault::Address(why) => {
+                write!(f, "That URL names an address Tailhawk will not contact — it {why}.")
+            }
             PullFault::Insecure => f.write_str("That URL is http; a token may only be sent over https."),
             PullFault::TokenOrigin(why) => write!(f, "The token URL {why}."),
             PullFault::NoSecret => f.write_str(
-                "No secret is stored for this source — open Settings ▸ Remote sources and paste it.",
+                "No secret is stored for this source — open Tools ▸ Remote sources and paste it.",
             ),
-            PullFault::TokenTransport(_) => f.write_str("Could not reach the token endpoint."),
+            // The same reason the `Wire` arm below carries its cause: "could not reach it" names
+            // the half that failed and nothing a person could act on. Whether this Windows has no
+            // WinHTTP, the name resolved somewhere §7 refuses, or the server answered a redirect
+            // are different problems with different remedies, and the fault is holding the answer.
+            PullFault::TokenTransport(why) => {
+                write!(f, "Could not reach the token endpoint: {why}.")
+            }
             PullFault::TokenRefused { status: 401 | 400 } => {
                 f.write_str("The token endpoint rejected the client secret.")
             }
@@ -91,7 +103,7 @@ impl std::fmt::Display for PullFault {
             PullFault::TokenUnreadable => {
                 f.write_str("The token endpoint answered with something that is not a token.")
             }
-            PullFault::QueryTransport(_) => f.write_str("Could not reach Loki."),
+            PullFault::QueryTransport(why) => write!(f, "Could not reach Loki: {why}."),
             PullFault::QueryRefused { status: 401 | 403 } => {
                 f.write_str("Loki refused the token — check the scope the client is allowed.")
             }
@@ -100,7 +112,12 @@ impl std::fmt::Display for PullFault {
             // hiding it behind one sentence cost a morning: every tail poll was failing and the
             // status bar could only say that it had.
             PullFault::Wire(why) => write!(f, "Loki's answer could not be read: {why}"),
-            PullFault::Label(_) => f.write_str("That is not a label name Loki would recognise."),
+            // **Not the reader's mistake.** The label is `APP_LABEL`, a constant this program
+            // supplies, so this branch means a bug here — which is what the variant's own
+            // documentation says a few lines up, while the sentence it printed said the opposite.
+            PullFault::Label(_) => f.write_str(
+                "Tailhawk asked Loki for a label name it would not accept. That is a fault here, not in the source.",
+            ),
             PullFault::LabelAnswer => {
                 f.write_str("Loki's list of applications could not be read.")
             }
@@ -394,5 +411,58 @@ mod tests {
             "reaching the token endpoint and reaching Loki are different failures"
         );
         assert!(said(PullFault::QueryRefused { status: 503 }).contains("503"));
+
+        // **The menu path must be one that exists.** This message said `Settings ▸ Remote sources`
+        // for eight days after the Settings menu became Tools — an instruction a user could follow
+        // to a menu that was not there. `menubar.rs` builds `&Remote sources…` under `&Tools`, so
+        // that is the path, and this asserts the whole of it rather than the item's name alone.
+        assert!(
+            said(PullFault::NoSecret).contains("Tools ▸ Remote sources"),
+            "the path names the menu it is actually under: {}",
+            said(PullFault::NoSecret)
+        );
+        assert!(
+            !said(PullFault::NoSecret).contains("Settings"),
+            "and never the menu that no longer exists"
+        );
+
+        // **The last arm that was handed a fault and discarded it.** Not one of the three findings
+        // this batch set out to fix — a review asked what was left inconsistent afterwards, and
+        // this was: `AddressFault` says which address rule refused the URL, and "will not contact"
+        // alone leaves a person guessing between loopback, link-local and a metadata service.
+        let address = said(PullFault::Address(AddressFault::Metadata));
+        assert!(
+            address.contains("cloud metadata service"),
+            "the address rule that refused it travels with the refusal: {address}"
+        );
+
+        // **A transport arm holds its cause and used to throw it away.** The `Wire` arm already
+        // interpolates the inner fault, and hiding that one cost a morning of tail polls failing
+        // with a status bar that could only say they had.
+        for said in [
+            said(PullFault::TokenTransport(NetFault::NoTransport)),
+            said(PullFault::QueryTransport(NetFault::NoTransport)),
+        ] {
+            assert!(
+                said.contains("WinHTTP"),
+                "the cause travels with the failure: {said}"
+            );
+        }
+
+        // **Not the user's mistake.** The label name is `APP_LABEL`, a constant this program
+        // supplies; a sentence blaming whoever is reading for it is blaming them for a Tailhawk
+        // bug. (Routing this away from the status bar altogether belongs with finding 11, which
+        // owns the call site.)
+        // **Asserted whole, not by substring.** The first version of this checked that one dead
+        // phrase was absent and the word `Tailhawk` present, which a sentence still blaming the
+        // reader passes easily — "The label name Tailhawk was given is wrong." satisfies both. A
+        // review broke it exactly that way, so the sentence is pinned as a sentence.
+        assert_eq!(
+            said(PullFault::Label(
+                tailhawk_core::loki::LabelFault::NotALabelName
+            )),
+            "Tailhawk asked Loki for a label name it would not accept. \
+             That is a fault here, not in the source.",
+        );
     }
 }

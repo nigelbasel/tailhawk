@@ -78,6 +78,21 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    through `Get-StatusText` in `tools/Screen.ps1`. `verify-uia.ps1` and `verify-recent.ps1` still
    read the title, for the file name, which it still carries.
 
+   **The status-bar messages are where the rest of the small findings live** — the review says so
+   itself — and the first batch landed 2026-09-17, in `pull.rs`: rows 10, 23 and 24. The `No secret`
+   notice told the reader to open **`Settings ▸ Remote sources`**, a menu that stopped existing on
+   2026-09-09 when finding 1 renamed it to Tools, so for eight days the program shipped an
+   instruction nobody could follow; its test now asserts the whole menu path rather than the item's
+   name, which is what let it rot unnoticed. Both transport arms threw away the cause they were
+   holding — `TokenTransport(_)` and `QueryTransport(_)` — where the neighbouring `Wire` arm has
+   always interpolated it; they carry it now, so "could not reach Loki" says *why*. And
+   `PullFault::Label` no longer blames the reader for a label name this program supplies as a
+   constant: the variant's own doc comment already called it "ours, not the user's… a bug here",
+   while the sentence beneath it said the opposite. **Left open on purpose:** row 24's *routing* —
+   that fault should not reach the status bar at all — belongs with row 11, which owns that call
+   site; and rows 25-28 are the same class of wording defect in `main.rs` and `stdin.rs`, kept out
+   of this commit so it stayed one file and one concern.
+
 4. **`Filtering::describe`'s zero still reads `at least 0 of 900`, and that is left alone on
    purpose — it wants the owner's word, not a fix.** The *search*'s zero was a genuinely unhedged
    claim: `no matches` never consulted `at_least` at all, so it spoke for the whole log over a
