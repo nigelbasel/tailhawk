@@ -1536,10 +1536,26 @@ impl Document {
             None => String::new(),
             Some(t) => match (&t.error, t.live, t.done) {
                 (Some(e), _, _) => format!("⚠ export failed: {e} — "),
-                (None, true, _) => format!("⇥ saving → {} ({} lines) — ", t.name(), t.written),
-                (None, false, true) => format!("✓ exported {} lines → {} — ", t.written, t.name()),
+                (None, true, _) => {
+                    format!(
+                        "⇥ saving → {} ({}) — ",
+                        t.name(),
+                        counted(t.written, "line")
+                    )
+                }
+                (None, false, true) => {
+                    format!(
+                        "✓ exported {} → {} — ",
+                        counted(t.written, "line"),
+                        t.name()
+                    )
+                }
                 (None, false, false) => {
-                    format!("⇥ exporting → {} ({} lines) — ", t.name(), t.written)
+                    format!(
+                        "⇥ exporting → {} ({}) — ",
+                        t.name(),
+                        counted(t.written, "line")
+                    )
                 }
             },
         };
@@ -1585,11 +1601,11 @@ impl Document {
             format!("‖ paused · Ctrl+End to follow{cut} — ")
         };
         format!(
-            "{following}{sort}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
+            "{following}{sort}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {}, {}",
             self.summary,
             self.set.charset().name(),
-            self.set.total_rows(),
-            self.set.bytes()
+            counted(self.set.total_rows(), "line"),
+            counted(self.set.bytes(), "byte")
         )
     }
 
@@ -2809,10 +2825,20 @@ impl Finder {
         }
         match (matches, running) {
             (0, _) => Self::nothing_found(running, at_least).to_owned(),
-            (1, false) if at_least => "at least 1 match".to_owned(),
-            (1, false) => "1 match".to_owned(),
-            (n, true) => format!("{} matches so far", count_text(n, at_least)),
-            (n, false) => format!("{} matches", count_text(n, at_least)),
+            // **No separate arm for one match.** There used to be two, for `1 match` and `at least
+            // 1 match`, and they only covered a *finished* pass — so one match found while the
+            // pass was still running fell through to the plural and said "1 matches so far". Two
+            // copies of one rule is how that happened; there is one now.
+            (n, true) => format!(
+                "{} {} so far",
+                count_text(n, at_least),
+                noun_for(n as u64, "match")
+            ),
+            (n, false) => format!(
+                "{} {}",
+                count_text(n, at_least),
+                noun_for(n as u64, "match")
+            ),
         }
     }
 
@@ -2989,10 +3015,14 @@ impl Finder {
             (Some(at), n) => {
                 text.push_str(&format!(" — {} of {}", at + 1, count_text(n, at_least)))
             }
-            (None, n) => text.push_str(&format!(" — {} matches", count_text(n, at_least))),
+            (None, n) => text.push_str(&format!(
+                " — {} {}",
+                count_text(n, at_least),
+                noun_for(n as u64, "match")
+            )),
         }
         if self.running.is_some() && !self.matches.is_empty() {
-            text.push_str(&format!(", scanning ({} lines)", self.scanned));
+            text.push_str(&format!(", scanning ({})", counted(self.scanned, "line")));
         }
         match self.outcome {
             // §7.4's cap: there are matches that were never reported, so the count is a floor.
@@ -3003,7 +3033,10 @@ impl Finder {
         }
         if self.truncated > 0 {
             // §7.4's "pattern too slow, truncated", counted rather than hidden.
-            text.push_str(&format!(", {} lines too slow to search", self.truncated));
+            text.push_str(&format!(
+                ", {} too slow to search",
+                counted(self.truncated, "line")
+            ));
         }
         Some(text)
     }
@@ -3020,7 +3053,7 @@ impl Finder {
 /// this function existing.** The description and the notice used to share one field, `Shell::file`,
 /// which `status_text` read only when there was no document to describe — so every message written
 /// there while a file was open could never be seen. Six of them: "rules closed unsaved" (§10's
-/// requirement that discarding an unsaved set *say* so), "rules not saved: …" when the profile is
+/// requirement that discarding an unsaved set *say* so), the rules-not-saved notice when the
 /// read-only, "no line to define a format from", "format wizard closed — nothing saved", "name the
 /// format first", and a split that failed. Each was set, each overwrote nothing, and each was
 /// discarded on the next repaint without ever reaching a pixel.
@@ -3066,6 +3099,60 @@ fn frame_stats_enabled() -> bool {
 /// search run client-side, over whatever was fetched; if the fetch stopped at its limit there are
 /// matching records that were never returned, and a bare number there reads exactly like a local
 /// file's exact one. A local file's count is untouched, because nothing cut it.
+/// `n` of a thing, with the noun in the number it actually is — `1 line`, `2 lines`.
+///
+/// **Six format strings carrying seven counts said "1 lines", and this serves all six**: the tee's
+/// three fragments; the file's own `N lines, N bytes`, which is two counts in one string and the
+/// worst of them, because it is on screen for every document all the time rather than only during
+/// an export; and the two counts [`Finder::describe`] appends, for lines being scanned and lines
+/// too slow to search. Two of the six were covered by no test at all, and a third had a test
+/// asserting `✓ exported 1 lines` — which passed for as long as the defect existed, being the
+/// shape of test that agrees with what it covers.
+///
+/// **`Finder`'s own count lines take [`noun_for`] instead**, and the reason is worth keeping: they
+/// were excluded from this at first on the grounds that they already had the singular right. They
+/// did not. `status_line` had explicit arms for one match that only applied to a *finished* pass,
+/// so one match found mid-pass read "1 matches so far", and `describe`'s no-match-current arm read
+/// "— 1 matches"; neither was reachable by any test that existed. They cannot use `counted`
+/// because `count_text` has already put `LOKI.md` §6's "at least N" where the number goes, so they
+/// take the noun rule on its own.
+///
+/// In production this is passed only `line` and `byte`; `match` is [`noun_for`]'s. Of the rest,
+/// only **`file`** is handled elsewhere and correctly — `LogSet::describe` and
+/// `RollingSet::describe` special-case one of a thing themselves. There is no count of "source"
+/// anywhere in the program, and **"record" is still wrong in three places** (`main.rs`'s Loki
+/// notices, recorded in `docs/HANDOFF.md` as left for a follow-up), so this comment claiming they
+/// were all pluralised elsewhere was the second thing it overclaimed.
+///
+/// The caller passes the singular. One gets it unchanged; anything else — zero included, because
+/// English counts zero with the plural — gets `s`, or `es` after a sibilant (`s`, `x`, `z`, `ch`,
+/// `sh`), so `match` becomes `matches` rather than `matchs`. That is the whole rule: it covers
+/// every noun this is actually given — `line`, `byte`, and `match` through [`noun_for`] — and
+/// nothing irregular, which is why it takes the word rather than a table.
+///
+/// It is a function so that there is one of it. A test asserting `matchs` is what the first draft
+/// of this had instead.
+fn counted(n: u64, noun: &str) -> String {
+    format!("{n} {}", noun_for(n, noun))
+}
+
+/// The noun alone, in the number `n` puts it in — `line`, `lines`.
+///
+/// **Separate from [`counted`] because two callers already have their number formatted.**
+/// `Finder`'s count lines put `count_text`'s `LOKI.md` §6 hedge where the digits go — "at least 41"
+/// — and then hard-coded the plural noun beside it, so "1 matches so far" was reachable and was
+/// reached. They need the noun rule without the number, which is this; everything else wants both,
+/// which is `counted`.
+fn noun_for(n: u64, noun: &str) -> String {
+    if n == 1 {
+        return noun.to_owned();
+    }
+    let sibilant = ["s", "x", "z", "ch", "sh"]
+        .iter()
+        .any(|ending| noun.ends_with(ending));
+    format!("{noun}{}", if sibilant { "es" } else { "s" })
+}
+
 fn count_text(n: usize, at_least: bool) -> String {
     if at_least {
         format!("at least {n}")
@@ -5321,7 +5408,18 @@ impl Shell {
         self.placeholders = placeholders;
         header::trace("paint exit");
         if let Err(e) = &drawn {
-            self.notice = Some(format!("paint: {e}"));
+            // **The goal, not the routine** — `paint:` was the name of the function that failed.
+            //
+            // **And it says rendering has stopped, because it has.** The first wording here
+            // promised "the display device is being rebuilt", which is not true of this program:
+            // `self.pending` is armed once in `main`, every other assignment to it is `None`, and
+            // nothing outside that one-shot worker constructs a `Renderer`. So dropping the
+            // renderer below is terminal for the run — the window stays up painting stage one,
+            // which §3.2 requires, but it will not draw a frame again. A reassuring sentence about
+            // a recovery that cannot happen is worse than the function name it replaced.
+            self.notice = Some(format!(
+                "Tailhawk could not draw this frame — {e}. Rendering has stopped; restart Tailhawk to draw again."
+            ));
         }
         if drawn.is_err() {
             // The renderer rebuilds a lost device itself, so an error here means it tried and
@@ -5769,7 +5867,9 @@ impl Shell {
                     self.rebuild_highlighter(&mut doc);
                     self.document.split(doc);
                 }
-                Err(e) => self.notice = Some(format!("split: {e}")),
+                Err(e) => {
+                    self.notice = Some(format!("This tab could not be opened a second time — {e}."))
+                }
             }
         }
         self.retitle(hwnd);
@@ -6206,7 +6306,14 @@ impl Shell {
         // §10: a read-only profile is a state, not an impossibility. Say so rather than let the
         // title go on claiming the set is unsaved with no reason given.
         if let Err(e) = std::fs::write(&target, self.rules_editor.to_toml()) {
-            self.notice = Some(format!("rules not saved: {e}"));
+            // **Name the file and give the remedy.** `std::io::Error`'s text on Windows is "Access
+            // is denied. (os error 5)", which says nothing about *which* file or what to do; §10
+            // treats a read-only profile as a state rather than an impossibility, and a state is
+            // something a person can change once they know where it lives.
+            self.notice = Some(format!(
+                "The highlight rules could not be saved to \"{}\" — {e}. Check that the file is not read-only.",
+                target.display()
+            ));
             return;
         }
         self.rules_editor.mark_saved();
@@ -13449,6 +13556,95 @@ mod tests {
         );
     }
 
+    /// **A count and its noun must agree even when the count is hedged.** `count_text` renders
+    /// `LOKI.md` §6's "at least N" floor, and the arms that use it hard-coded the plural noun
+    /// beside it — so one match found while a pass is still running read "1 matches so far", and a
+    /// single match the view never moved to read "— 1 matches". Neither was reachable by the tests
+    /// that existed: `status_line` was only ever asked for one match with the pass *finished*, and
+    /// `describe`'s no-wrap tests all used two matches.
+    #[test]
+    fn a_hedged_count_still_agrees_with_its_noun() {
+        assert_eq!(
+            Finder::status_line(None, false, 1, true, false),
+            "1 match so far"
+        );
+        assert_eq!(
+            Finder::status_line(None, false, 1, true, true),
+            "at least 1 match so far"
+        );
+        assert_eq!(
+            Finder::status_line(None, false, 2, true, false),
+            "2 matches so far"
+        );
+
+        // `current: None` with one match: the no-wrap case where the only match sits before the row
+        // the search started from, so nothing was worth showing and the cursor never moved.
+        let finder = Finder {
+            query: "x".to_owned(),
+            matches: vec![Match {
+                line: 4,
+                start: 0,
+                end: 1,
+            }],
+            ..Finder::default()
+        };
+        assert_eq!(
+            finder.describe(false).expect("a query is in play"),
+            "► x — 1 match"
+        );
+    }
+
+    /// **A file of one line is not "1 lines".** The composed status line says how big the source
+    /// is, and that fragment had the defect in the most-read place in the program — it is on screen
+    /// for every document, all the time, rather than only while an export is running.
+    #[test]
+    fn a_one_line_file_is_summarised_in_the_singular() {
+        let path = scratch_log("tailhawk_counted_singular_test.log", 1);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let said = doc.describe();
+        assert!(said.contains("1 line,"), "the file summary: {said}");
+        assert!(!said.contains("1 lines"), "{said}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The search's own counts follow the same rule.** `Finder::describe` appends how many lines
+    /// were too slow to search, which §7.4 requires it to disclose — and disclosing it as
+    /// "1 lines" undercuts the disclosure. Reachable in a test because it needs only `truncated`;
+    /// its sibling `", scanning ({} lines)"` is not, because that one sits behind
+    /// `running.is_some()` and `Running` has no test constructor.
+    #[test]
+    fn one_line_too_slow_to_search_is_said_in_the_singular() {
+        let finder = Finder {
+            query: "x".to_owned(),
+            truncated: 1,
+            ..Finder::default()
+        };
+        let said = finder.describe(false).expect("a query is in play");
+        assert!(said.contains("1 line too slow"), "{said}");
+    }
+
+    /// **One is singular, everything else is not — including zero.** English puts zero with the
+    /// plural ("0 lines"), which is the one case a naive `if n > 1` gets wrong and which a status
+    /// bar reaches often: an export that matched nothing, a file with no records.
+    #[test]
+    fn a_count_says_its_noun_in_the_number_it_is() {
+        assert_eq!(counted(1, "line"), "1 line");
+        assert_eq!(counted(2, "line"), "2 lines");
+        assert_eq!(counted(0, "line"), "0 lines", "zero is plural in English");
+        assert_eq!(counted(1, "file"), "1 file");
+        // **`matches`, not `matchs`.** The first version of this test asserted the misspelling and
+        // called it "regular nouns only" — which would have made it the specified output, and
+        // `Finder::status_line` counts matches, so it would have reached the screen.
+        assert_eq!(counted(11, "match"), "11 matches");
+        assert_eq!(counted(2, "box"), "2 boxes");
+        assert_eq!(
+            counted(2, "byte"),
+            "2 bytes",
+            "and the ordinary case still just takes s"
+        );
+    }
+
     /// **A count over an answer that was cut is a floor** — `LOKI.md` §6's rule that a client-side
     /// count over a truncated window must never read like a local file's exact one.
     #[test]
@@ -13761,7 +13957,11 @@ mod tests {
         assert!(tee.done && tee.error.is_none(), "{:?}", tee.error);
         assert_eq!(tee.written, 1);
         assert!(
-            doc.describe().contains("✓ exported 1 lines"),
+            // **One line is not "1 lines".** This assertion pinned the ungrammatical text for as
+            // long as the text existed, which is the shape of test that claims coverage while
+            // agreeing with the defect. The sibling assertion below keeps `3 lines`, so the plural
+            // direction is held still by a test I did not have to add.
+            doc.describe().contains("✓ exported 1 line "),
             "{}",
             doc.describe()
         );

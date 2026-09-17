@@ -93,6 +93,61 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    site; and rows 25-28 are the same class of wording defect in `main.rs` and `stdin.rs`, kept out
    of this commit so it stayed one file and one concern.
 
+   **The `main.rs` half followed the same day** — rows 25, 26 and 28. The renderer and split-pane
+   notices said `paint: {e}` and `split: {e}`, which are the names of the functions that failed and
+   tell a reader nothing to act on; they name the goal now and keep the cause. A failed rules save
+   said only `rules not saved: <OS text>`, where the OS text on Windows is "Access is denied. (os
+   error 5)" — it names the file and says to check it is not read-only, which §10 treats as a state
+   rather than an impossibility. **Row 28 undercounted itself and that is the interesting part:** it
+   named three tee fragments, and there were **six format strings carrying seven counts** all saying
+   "1 lines" — the three fragments, the *file summary* (lines and bytes both, and that one is on
+   screen for every document all the time rather than only during an export), and the two counts
+   `Finder::describe` appends. Two of the six were covered by no test at all. One pure
+   `counted(n, noun)` serves all six: one is singular, everything else plural — zero included,
+   because English counts zero with the plural — with `es` after a sibilant, so `match` becomes
+   `matches`. `Finder::status_line` is a seventh site, and **it was excluded on a premise that
+   turned out to be false** — see the paragraph below: it did not already have the singular right,
+   and it now takes the rule through `noun_for`. **Knowingly untested:** `Finder::describe`'s `scanning (N lines)` fragment, which
+   sits behind `running.is_some()` — `Running` has private fields and no test constructor, the same
+   branch an earlier review found unreachable when it broke that function's guard order.
+
+   **The review of that batch caught two things worth recording, one of them a defect I introduced.**
+   The reworded paint notice said *"the display device is being rebuilt"*, which this program does
+   not do: `Shell::pending` is armed once in `main`, every other assignment to it is `None`, and
+   nothing outside that one-shot worker builds a `Renderer` — so dropping the renderer is terminal
+   for the run. A reassuring sentence about a recovery that cannot happen is worse than the `paint:`
+   prefix it replaced; it says rendering has stopped now. The second: `Finder::status_line` was
+   excluded from `counted` because it "already had the singular right", and it did not — its
+   explicit one-match arms applied only to a *finished* pass, so one match found mid-pass read
+   **"1 matches so far"**, and `describe`'s no-current arm read **"— 1 matches"**. Both are fixed
+   through a `noun_for` that gives the noun without the number, which is what those two need because
+   `count_text` has already put §6's hedge where the digits go.
+
+   **Found by the same sweep and deliberately left**, so they are findable rather than rediscovered
+   from the screen: `dialog.rs:1115` renders "1 applications, 1 chosen" for a source with one
+   discovered application; `main.rs:9117` and `main.rs:9132` say "1 records"; and `main.rs:9125`
+   appears to have lost its noun altogether — *"the newest 41 in the last hour"*. The first three are
+   the same one-line defect as this batch; the last is a missing word and wants a moment's thought
+   about what it meant to say. A second review added two more of the `paint:`/`split:` shape:
+   `main.rs:773-774`'s `stdin: {e}`, which reaches the status bar through `Shell::file`, and
+   `stdin.rs:669`'s `spill: {e}`, which reaches it through *stream failed*. So the sweep was not
+   exhaustive of the class, and a follow-up should grep for `format!("<word>: {` rather than trust
+   the row list.
+
+   **⚠ The status bar goes permanently dark the moment the renderer is lost, and nothing in the
+   review's rows says so.** Found while checking whether the reworded paint notice was truthful:
+   `paint_inner` computes `status_text()` *before* it touches the renderer, and the only
+   `bar.set(&status)` in the program sits inside the `Some(renderer)` branch — so on the failing
+   frame the bar still shows the pre-failure text, and on every frame afterwards `paint_inner`
+   returns before reaching that call, because `self.renderer` is `None` and nothing rebuilds it.
+   Counts, follow state, find progress and every notice stop updating for the life of the process.
+   **Neither the old `paint: {e}` nor its replacement can ever be read**, which makes the wording
+   question moot and the real defect structural: a message surface that cannot report the failure of
+   the thing it depends on. `SPEC.md` §3.2 forbids dying on device trouble and the window does stay
+   up — painting the class brush, no text — so a user sees a blank window and reasonably concludes
+   it hung. This wants its own piece of work: either the status bar is set outside the renderer
+   branch, or the notice needs a surface that does not depend on D3D at all.
+
 4. **`Filtering::describe`'s zero still reads `at least 0 of 900`, and that is left alone on
    purpose — it wants the owner's word, not a fix.** The *search*'s zero was a genuinely unhedged
    claim: `no matches` never consulted `at_least` at all, so it spoke for the whole log over a
