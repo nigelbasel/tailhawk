@@ -692,7 +692,7 @@ it. The flagship differentiator, and the place where a naive implementation look
 │░░│ 09:14:04.112     │ ▌jobs      │ INF │ Job.Runner  │ Retry scheduled                   │  ← settling band
 │░░│ 09:14:04.118     │ ▌gateway   │ INF │ Gw.Proxy    │ 502 returned to client            │     (dimmed)
 ├───────────────────────────────────────────────────────────────────────────────────────────┤
-│ ⬤ Following · lagging 2s │ 4 sources │ ⚠ gateway: no timezone — using local ▾             │
+│ ⬤ Following · current to 2s ago │ 4 sources │ ⚠ gateway: no timezone — using local ▾      │
 └───────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -703,8 +703,15 @@ Four design decisions carry the honesty principle:
   writers (Serilog batching, NLog `AsyncWrapper`) emit out of timestamp order by up to their flush
   interval, so without this the viewport jumps under the cursor once a second and the feature reads as
   buggy.
-- **The lag is stated**, in the status bar: `lagging 2s`. The reorder window is adjustable from the
-  command bar.
+- **The lag is stated**, in the status bar: `current to 2s ago` — the age of the newest record held,
+  said as a fact rather than as a verdict on the tail. A remote window is deliberately held back of
+  the clock, so a healthy tail always shows a figure; wording that called that figure a fault would
+  accuse the tail of one every follow tick. Not `complete to`, which would promise nothing arrives
+  behind the mark. **A paused tail does not show it.** The figure tracks the tail's head, not the
+  rows on screen, so beside `Ctrl+End to follow` it answers a question about the state the reader
+  has just been told how to return to — while the *answers cut* warning stays on a paused line,
+  because that one is about the scrollback they are actually reading. The reorder window is
+  adjustable from the command bar.
 - **Timezone problems are surfaced, not guessed.** A source whose format carries no zone (log4net
   `%date`, RFC 3164) shows a warning chip with a one-click per-source timezone override. A source that
   cannot participate at all (Serilog console default has *no date*) is shown greyed in the source list

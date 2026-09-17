@@ -227,18 +227,27 @@ impl Backoff {
 /// and it grows on its own while nothing arrives, which is the honest reading of a source that has
 /// stopped answering.
 ///
-/// Sub-second is `lagging <1s` rather than a figure in milliseconds. The poll interval is five
-/// seconds and the window's own lag another five, so `lagging 340ms` would be precision this design
-/// does not have. A negative age is the server's clock disagreeing with ours and reads as no lag,
-/// never as a negative one.
+/// **It says `current to 2s ago`, not `lagging 2s`.** The number is the same; what changed is that
+/// one states a fact and the other passes judgement on it. [`LAG_NANOS`] holds every window thirty
+/// seconds back of the clock on purpose, so a perfectly healthy tail sits at half a minute by
+/// design — and the old wording accused it of lagging, once every follow tick, for working
+/// correctly. `current to` is also the answer to the question someone watching a deploy actually
+/// has: how far has this read up to. It is deliberately not `complete to`, which would promise that
+/// nothing more will ever arrive behind the mark; late-indexed records can and do.
+///
+/// Sub-second is `current to <1s ago` rather than a figure in milliseconds. The poll interval is
+/// five seconds and the window's own lag another thirty, so `340ms` would be precision this design
+/// does not have — and with that floor in place the sub-second case is unreachable from a running
+/// tail, surviving only for the clock disagreement below. A negative age is the server's clock
+/// disagreeing with ours and reads as no lag, never as a negative one.
 pub fn lag_text(behind: Nanos) -> String {
     const SECOND: Nanos = 1_000_000_000;
     let seconds = behind.max(0) / SECOND;
     match seconds {
-        0 => "lagging <1s".to_owned(),
-        s if s < 60 => format!("lagging {s}s"),
-        s if s < 3_600 => format!("lagging {}m {}s", s / 60, s % 60),
-        s => format!("lagging {}h {}m", s / 3_600, (s % 3_600) / 60),
+        0 => "current to <1s ago".to_owned(),
+        s if s < 60 => format!("current to {s}s ago"),
+        s if s < 3_600 => format!("current to {}m {}s ago", s / 60, s % 60),
+        s => format!("current to {}h {}m ago", s / 3_600, (s % 3_600) / 60),
     }
 }
 
@@ -648,21 +657,29 @@ mod tests {
         assert!(b.should_say(), "a fresh outage is fresh news");
     }
 
-    /// `UI-DESIGN.md` §4 asks for `lagging 2s`, and the shape of the number matters as much as the
-    /// number: a tail is five seconds of poll plus five of window lag, so milliseconds would be
-    /// precision this design does not have, and a negative age is a clock disagreement rather than
-    /// a tail that is ahead of the source.
+    /// `UI-DESIGN.md` §4 asks for the age of the newest record, and the shape of the number matters
+    /// as much as the number: a tail is five seconds of poll plus thirty of window lag, so
+    /// milliseconds would be precision this design does not have, and a negative age is a clock
+    /// disagreement rather than a tail that is ahead of the source. The sub-second cases are pinned
+    /// for that disagreement alone — [`LAG_NANOS`] puts them out of a running tail's reach.
     #[test]
     fn the_lag_is_said_in_units_the_tail_actually_has() {
         const SECOND: Nanos = 1_000_000_000;
-        assert_eq!(lag_text(2 * SECOND), "lagging 2s");
-        assert_eq!(lag_text(SECOND - 1), "lagging <1s");
-        assert_eq!(lag_text(0), "lagging <1s");
-        assert_eq!(lag_text(-4 * SECOND), "lagging <1s", "a clock disagreement");
-        assert_eq!(lag_text(59 * SECOND), "lagging 59s");
-        assert_eq!(lag_text(90 * SECOND), "lagging 1m 30s");
-        assert_eq!(lag_text(3_600 * SECOND), "lagging 1h 0m");
-        assert_eq!(lag_text(7_900 * SECOND), "lagging 2h 11m");
+        assert_eq!(lag_text(2 * SECOND), "current to 2s ago");
+        assert_eq!(lag_text(59 * SECOND), "current to 59s ago");
+        assert_eq!(lag_text(60 * SECOND), "current to 1m 0s ago");
+        assert_eq!(lag_text(90 * SECOND), "current to 1m 30s ago");
+        assert_eq!(lag_text(3_599 * SECOND), "current to 59m 59s ago");
+        assert_eq!(lag_text(3_600 * SECOND), "current to 1h 0m ago");
+        assert_eq!(lag_text(7_900 * SECOND), "current to 2h 11m ago");
+
+        assert_eq!(lag_text(SECOND - 1), "current to <1s ago");
+        assert_eq!(lag_text(0), "current to <1s ago");
+        assert_eq!(
+            lag_text(-4 * SECOND),
+            "current to <1s ago",
+            "a clock disagreement"
+        );
     }
 
     /// **A tail that has not written anything is starting, not lagging.** Reporting a lag from the

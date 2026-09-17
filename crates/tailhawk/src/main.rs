@@ -1582,7 +1582,7 @@ impl Document {
         } else if self.view.grid().is_following() {
             format!("● following{lagging}{cut} — ")
         } else {
-            format!("‖ paused · Ctrl+End to follow{lagging}{cut} — ")
+            format!("‖ paused · Ctrl+End to follow{cut} — ")
         };
         format!(
             "{following}{sort}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {} lines, {} bytes",
