@@ -2759,6 +2759,24 @@ impl Finder {
     /// [`Finder::dialog_status`]'s decision, free of the worker handle so a test can reach every
     /// arm.
     ///
+    /// What a search with nothing to show says, for both count lines at once.
+    ///
+    /// **It is a function rather than two matching pairs of arms because one of those pairs could
+    /// not be tested.** [`Finder::describe`] reads `self.running`, whose inner type has no test
+    /// constructor, so its "still searching" guard was reachable only by driving a real search
+    /// worker — and a review proved the two guards could be swapped with the whole suite still
+    /// passing. [`Finder::status_line`] takes `running` as a plain `bool` for exactly this reason.
+    ///
+    /// **Still running outranks the hedge.** A pass that has not finished has not found nothing; it
+    /// has found nothing *yet*, and either other answer states a conclusion it has not reached.
+    fn nothing_found(running: bool, at_least: bool) -> &'static str {
+        match (running, at_least) {
+            (true, _) => "searching…",
+            (false, true) => "no matches in what was fetched",
+            (false, false) => "no matches",
+        }
+    }
+
     /// **`at_least` is `LOKI.md` §6 reaching the dialog.** The title bar hedges its count over a
     /// source whose answers Loki cut; the dialog shows the same number a line away, and an exact one
     /// there would contradict the standing marker beside it.
@@ -2776,8 +2794,7 @@ impl Finder {
             return String::new();
         }
         match (matches, running) {
-            (0, true) => "searching…".to_owned(),
-            (0, false) => "no matches".to_owned(),
+            (0, _) => Self::nothing_found(running, at_least).to_owned(),
             (1, false) if at_least => "at least 1 match".to_owned(),
             (1, false) => "1 match".to_owned(),
             (n, true) => format!("{} matches so far", count_text(n, at_least)),
@@ -2951,8 +2968,10 @@ impl Finder {
         }
         let mut text = format!("► {}", self.shown());
         match (self.current, self.matches.len()) {
-            (_, 0) if self.running.is_some() => text.push_str(" — searching…"),
-            (_, 0) => text.push_str(" — no matches"),
+            (_, 0) => {
+                text.push_str(" — ");
+                text.push_str(Self::nothing_found(self.running.is_some(), at_least));
+            }
             (Some(at), n) => {
                 text.push_str(&format!(" — {} of {}", at + 1, count_text(n, at_least)))
             }
@@ -12787,6 +12806,12 @@ mod tests {
             Finder::status_line(None, false, 0, false, false),
             "no matches"
         );
+        // §6's hardest case: "no matches" is the most exact claim this program makes, and over a
+        // cut answer it is a claim about the page Loki returned, not about the log.
+        assert_eq!(
+            Finder::status_line(None, false, 0, false, true),
+            "no matches in what was fetched"
+        );
         assert_eq!(Finder::status_line(None, false, 1, false, false), "1 match");
         // `LOKI.md` §6 in the dialog: the same number the title bar hedges.
         assert_eq!(
@@ -12808,6 +12833,48 @@ mod tests {
         assert_eq!(
             Finder::status_line(None, false, 41, false, false),
             "41 matches"
+        );
+    }
+
+    /// **A search that found nothing over a cut answer has not searched the log.** `LOKI.md` §6
+    /// downgrades every client-side count over a truncated window from an exact number, and zero
+    /// is the count that most needs it: every other arm here already routes through `count_text`
+    /// and hedges, while "no matches" — the most absolute claim this program makes — did not,
+    /// because it never consulted `at_least` at all.
+    #[test]
+    fn a_search_that_found_nothing_over_a_cut_answer_says_what_it_searched() {
+        let finder = Finder {
+            query: "boom".to_owned(),
+            ..Finder::default()
+        };
+        assert_eq!(
+            finder.describe(false).expect("a query is in play"),
+            "► boom — no matches",
+            "a local file was cut by nothing and the claim is exact"
+        );
+        assert_eq!(
+            finder.describe(true).expect("a query is in play"),
+            "► boom — no matches in what was fetched"
+        );
+    }
+
+    /// **The two kinds of nothing a search can have, pinned in one place.** A pass still running
+    /// has not found nothing, it has found nothing *yet*; and over an answer Loki cut, "no matches"
+    /// is a claim about the page that came back rather than about the log. Both count lines used to
+    /// make this decision separately, and `describe`'s copy could only be reached by driving a real
+    /// search worker — which is why swapping its two guards passed all 198 tests.
+    #[test]
+    fn a_search_with_nothing_to_show_says_which_kind_of_nothing() {
+        assert_eq!(Finder::nothing_found(true, false), "searching…");
+        assert_eq!(
+            Finder::nothing_found(true, true),
+            "searching…",
+            "a pass still running has reached no conclusion to hedge"
+        );
+        assert_eq!(Finder::nothing_found(false, false), "no matches");
+        assert_eq!(
+            Finder::nothing_found(false, true),
+            "no matches in what was fetched"
         );
     }
 

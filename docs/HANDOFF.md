@@ -78,6 +78,18 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    through `Get-StatusText` in `tools/Screen.ps1`. `verify-uia.ps1` and `verify-recent.ps1` still
    read the title, for the file name, which it still carries.
 
+4. **`Filtering::describe`'s zero still reads `at least 0 of 900`, and that is left alone on
+   purpose — it wants the owner's word, not a fix.** The *search*'s zero was a genuinely unhedged
+   claim: `no matches` never consulted `at_least` at all, so it spoke for the whole log over a
+   window nobody had seen the whole of. That is fixed (2026-09-17) — it reads `no matches in what
+   was fetched`, and both count lines now take that decision from one pure `Finder::nothing_found`,
+   because the copy inside `describe` could only be reached by driving a real search worker and a
+   review proved its two guards could be swapped with all 198 tests still passing. The **filter's**
+   zero is a different thing: it already routes through `count_text`, so it obeys `LOKI.md` §6 to
+   the letter and states nothing false — it is merely vacuous, since every count is at least zero.
+   Changing it means departing from the *"at least N"* form §6 names in those words, which is a
+   decision about the contract rather than a defect in it. Ask before rewording.
+
 **A note on the two subagent reviews this session**, because both earned their keep: the toolbar
 review found that the chosen dropdown id was being *run* inside comctl32's `TBN_DROPDOWN` — a modal
 dialog inside a control's own click processing — and that a reference into the control's memory was

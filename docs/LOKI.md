@@ -151,7 +151,10 @@ under the same limit; `Document::answers_cut` carries it and never goes back to 
 window it happened in stays in the scrollback. The status bar says it standing, beside the lag —
 *"answers cut at the limit — narrow the time range or the selector"* — rather than as a notice that
 scrolls away, and `count_text` renders the filter's `N of M` and the search's `N matches` as
-**at least N** for as long as it stands. The banner is the status bar because that is the persistent
+**at least N** for as long as it stands. **A search that finds nothing says *no matches in what was
+fetched*** — 2026-09-17, and it was the one count the rule had not reached: zero never passed through
+`count_text`, so the most absolute claim the program makes was also the only one still speaking for
+the whole log. The banner is the status bar because that is the persistent
 surface this program has; a local file is untouched, because nothing cut it.
 
 Other rules:
