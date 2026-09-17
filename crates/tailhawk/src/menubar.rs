@@ -171,6 +171,25 @@ pub const ID_FORMAT_BASE: u32 = 10_200;
 /// `LOKI.md`'s remote sources: `ID_SOURCE_BASE + n` opens the n-th configured source. A range,
 /// because the sources are data the user named rather than commands the register knows.
 pub const ID_SOURCE_BASE: u32 = 10_400;
+/// Format's column submenus — `Sort by`, `Top N by`, `Filter on` — one range each.
+///
+/// **`BASE + n` names the n-th *shown* column, never the layout index.** `HeaderColumn`'s own
+/// documentation records why, because it was a defect once: a box list skips hidden columns and
+/// ends with the message, so "item 2" is not "column 2" the moment anything is hidden. The shell
+/// resolves `n` back through `header_columns()` when the item is chosen, exactly as
+/// `ID_FORMAT_BASE` resolves through [`crate::format_menu_of`] — which is what keeps the menu and
+/// the dispatch agreeing about what the n-th entry meant.
+///
+/// These exist because the four column-scoped acts carry a payload — `Command::SortBy(column,
+/// desc)` and `Command::TopN(column)` are not in `Command::LISTED` by value, for the same reason
+/// [`ID_UNLISTED`] exists — and until now they were reachable only by right-clicking the header,
+/// which no keyboard can do.
+pub const ID_SORT_COL_BASE: u32 = 10_500;
+pub const ID_TOPN_COL_BASE: u32 = 10_600;
+pub const ID_FILTER_COL_BASE: u32 = 10_700;
+/// How many columns any one of those submenus will list. The ranges are 100 apart, so this bounds
+/// each of them well clear of the next.
+pub const MAX_MENU_COLUMNS: usize = 64;
 /// §2.4's context-menu items — the ones whose subject is *where the menu was summoned* (a column,
 /// a selection, a panel row) rather than anything the id alone could name. The caller resolves the
 /// subject before tracking and dispatches these against it.
@@ -354,6 +373,69 @@ pub struct BarState {
 ///
 /// **The names are the user's**, so an ampersand in one is doubled: `AppendMenuW` reads a single
 /// `&` as a mnemonic marker, and a source called `R&D` would otherwise be drawn `RD`.
+/// One of Format's column submenus: an item per shown column, in the order they are shown.
+///
+/// **Numbered rather than lettered, the way the recent files are.** The labels are the file's own
+/// field names, so two shown columns starting with the same letter is ordinary rather than
+/// unlucky — and a mnemonic collision is not cosmetic here, because `Menu::mnemonic` answers with
+/// the first match and the second item becomes unreachable by the very key drawn under it.
+/// Microsoft's keyboard guidance asks for numeric access keys on dynamic menu items for exactly
+/// this reason. An `&` in a column's own name is doubled so it draws as itself.
+///
+/// `ticks` marks the column the rows are sorted by. `Sort by` wants that indicator; `Top N by` and
+/// `Filter on` have nothing to indicate, because no column is ever "currently topped".
+pub fn column_menu_of(
+    columns: &[tailhawk_core::rows::HeaderColumn],
+    base: u32,
+    ticks: bool,
+) -> Vec<tailhawk_core::menu::Item> {
+    use tailhawk_core::menu::Item;
+    let mut items: Vec<Item> = columns
+        .iter()
+        .take(MAX_MENU_COLUMNS)
+        .enumerate()
+        .map(|(n, column)| {
+            let label = format!("{}  {}", column_number(n), column.label.replace('&', "&&"));
+            if ticks {
+                Item::check(&label, "", base + n as u32, column.sort.is_some())
+            } else {
+                Item::command(&label, "", base + n as u32)
+            }
+        })
+        .collect();
+    // **A cap that cannot be seen is a lie about the list.** `Format::w3c` builds a column per
+    // field named in the file's own `#Fields:` line and caps nothing — that line belongs to
+    // whoever configured the server — so more columns than an id range holds is a real file. The
+    // remote dialog says when a server offered more than it listed and a capped search says
+    // "capped, there are more"; silently ending at the sixty-fourth would say nothing at all.
+    if let Some(dropped) = columns
+        .len()
+        .checked_sub(MAX_MENU_COLUMNS)
+        .filter(|n| *n > 0)
+    {
+        items.push(
+            Item::command(&format!("{dropped} more, not listed"), "", ID_UNLISTED).disabled(),
+        );
+    }
+    items
+}
+
+/// The numbered mnemonic for the n-th dynamic entry: `&1` through `&9`, then `1&0`, and a bare
+/// number after that.
+///
+/// **Past the tenth there is deliberately no mnemonic.** [`recent_label`] stops at ten because the
+/// recent files themselves do; a column list runs to [`MAX_MENU_COLUMNS`], and `&11` would claim
+/// the `1` that the first entry already holds — which is the collision this numbering exists to
+/// prevent, and `Menu::mnemonic` answering with the first match is what would make the later item
+/// unreachable by the key drawn beneath it.
+fn column_number(n: usize) -> String {
+    match n {
+        0..=8 => format!("&{}", n + 1),
+        9 => "1&0".to_owned(),
+        n => format!("{}", n + 1),
+    }
+}
+
 pub fn remote_menu_of(sources: &[String]) -> Vec<tailhawk_core::menu::Item> {
     use tailhawk_core::menu::Item;
     let mut items: Vec<Item> = sources
@@ -401,6 +483,10 @@ pub fn menu_bar(
     state: BarState,
     recent: &[String],
     sources: &[String],
+    // **Not `columns`**: this function already binds that name to a bool — whether the document has
+    // any columns at all — and a parameter of the same name is silently shadowed by it. The slice
+    // was unreachable here for three compiles, saying so only as an `unused variable` warning.
+    header_columns: &[tailhawk_core::rows::HeaderColumn],
 ) -> tailhawk_core::menu::Menu {
     use tailhawk_core::menu::{Item, Menu};
     let cmd = |label: &str, key: &str, c: Command| Item::command(label, key, command_id(c));
@@ -656,6 +742,31 @@ pub fn menu_bar(
                 on(cmd("Select &columns…", "", Command::SelectColumns), columns),
                 on(cmd("&Reset columns", "", Command::ResetColumns), columns),
                 on(cmd("Clear &sort", "", Command::ClearSort), columns),
+                Item::separator(),
+                // §1.2's discoverability rule reaching the four acts that were mouse-only, and
+                // `UX-REVIEW.md` finding 3: the header owns them, no keyboard can right-click it,
+                // and each needs a subject column that no id alone can name.
+                on(
+                    Item::submenu(
+                        "Sor&t by",
+                        column_menu_of(header_columns, ID_SORT_COL_BASE, true),
+                    ),
+                    columns,
+                ),
+                on(
+                    Item::submenu(
+                        &format!("To&p {} by", crate::TOP_N),
+                        column_menu_of(header_columns, ID_TOPN_COL_BASE, false),
+                    ),
+                    columns,
+                ),
+                on(
+                    Item::submenu(
+                        "Filter &on",
+                        column_menu_of(header_columns, ID_FILTER_COL_BASE, false),
+                    ),
+                    columns,
+                ),
             ],
         ),
         Item::submenu(
@@ -735,6 +846,146 @@ fn compact_path(path: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture column. `HeaderColumn` has no `Default`, and the cell geometry is nothing a menu
+    /// reads — `title` and `label` are kept deliberately different because they are different in
+    /// life: the title is what a filter is written against, the label is what is drawn.
+    fn col(
+        title: &str,
+        label: &str,
+        column: usize,
+        sort: Option<bool>,
+    ) -> tailhawk_core::rows::HeaderColumn {
+        tailhawk_core::rows::HeaderColumn {
+            title: title.to_owned(),
+            label: label.to_owned(),
+            column,
+            start: 0,
+            cells: 8,
+            content: 7,
+            sort,
+        }
+    }
+
+    /// **The column-scoped acts reach the keyboard through Format.**
+    ///
+    /// `Sort ascending`, `Top N by` and `Filter on` could be reached only by right-clicking the
+    /// column header, and `UX-REVIEW.md` finding 3 is that no keyboard can do that — the header is
+    /// not a tab stop, and making it one would put focus on a control that handles no keyboard
+    /// messages and draws no focus indicator. They cannot be plain register commands either,
+    /// because each needs a subject column and `Command::SortBy` carries it, so `Command::LISTED`
+    /// cannot hold them by value. Submenus listing the columns are the answer, built the way File
+    /// builds its recent files.
+    #[test]
+    fn format_offers_the_column_scoped_acts_as_submenus() {
+        let columns = [
+            col("timestamp", "Timestamp", 0, None),
+            col("level", "Level", 3, Some(false)),
+        ];
+        let menu = menu_bar(
+            None,
+            BarState {
+                toolbar: true,
+                ..BarState::default()
+            },
+            &[],
+            &[],
+            &columns,
+        );
+        let format = menu
+            .items()
+            .iter()
+            .position(|i| i.text() == "Format")
+            .expect("Format is on the bar");
+        let items = menu.at(&[format]).expect("Format opens").to_vec();
+        for wanted in ["Sort by", "Filter on"] {
+            assert!(
+                items.iter().any(|i| i.text().contains(wanted)),
+                "Format offers {wanted}, but holds {:?}",
+                items.iter().map(|i| i.text()).collect::<Vec<_>>()
+            );
+        }
+        let at = items
+            .iter()
+            .position(|i| i.text().contains("Sort by"))
+            .expect("Sort by is there");
+        let listed = menu.at(&[format, at]).expect("Sort by opens").to_vec();
+        assert_eq!(listed.len(), 2, "one entry per shown column");
+        assert_eq!(listed[1].text(), "2  Level");
+        assert!(listed[1].checked, "and it marks the column in force");
+    }
+
+    /// **A submenu that cannot list every column says so.**
+    ///
+    /// [`MAX_MENU_COLUMNS`] bounds each id range, and a W3C file's `#Fields:` line is the server
+    /// operator's rather than ours — `Format::w3c` builds a column per field named there with no
+    /// cap of its own, so more columns than the range holds is a real file, not a hypothetical.
+    /// Dropping the rest in silence is the one thing this project refuses: the remote dialog says
+    /// when a server offered more than it listed, and a capped search says "capped, there are
+    /// more", for exactly this reason.
+    #[test]
+    fn a_column_submenu_says_when_it_could_not_list_them_all() {
+        let columns: Vec<tailhawk_core::rows::HeaderColumn> = (0..MAX_MENU_COLUMNS + 5)
+            .map(|i| col(&format!("f{i}"), &format!("F{i}"), i, None))
+            .collect();
+        let items = column_menu_of(&columns, ID_SORT_COL_BASE, false);
+        assert_eq!(
+            items.len(),
+            MAX_MENU_COLUMNS + 1,
+            "every column the range holds, and one line saying what was left out"
+        );
+        let last = items.last().expect("a trailing item");
+        assert!(!last.enabled, "it names nothing to choose");
+        assert!(
+            last.text().contains('5'),
+            "it says how many were not listed: {}",
+            last.text()
+        );
+    }
+
+    /// **Format's column submenus list the shown columns, numbered, and id them by position.**
+    ///
+    /// The id is the position in *this* list rather than the layout index, which `HeaderColumn`'s
+    /// own documentation records as having been a defect once: a box list skips hidden columns, so
+    /// "item 2" is not "column 2" the moment anything is hidden. The numbering is the recent
+    /// files' convention, for the reason [`column_menu_of`] gives — a file's own field names
+    /// collide on first letters as a matter of course, and a collision makes the second item
+    /// unreachable by the key drawn under it.
+    #[test]
+    fn a_column_submenu_numbers_the_shown_columns_and_ids_them_by_position() {
+        let columns = [
+            col("timestamp", "Timestamp", 0, None),
+            col("level", "Level", 3, Some(false)),
+            col("mess&age", "Mess&age", 7, None),
+        ];
+
+        let sorting = column_menu_of(&columns, ID_SORT_COL_BASE, true);
+        assert_eq!(sorting.len(), 3, "one item per shown column");
+        assert_eq!(
+            sorting[0].text(),
+            "1  Timestamp",
+            "numbered, and drawn by the label rather than the filter-facing title"
+        );
+        assert_eq!(sorting[0].id, Some(ID_SORT_COL_BASE));
+        assert_eq!(
+            sorting[1].id,
+            Some(ID_SORT_COL_BASE + 1),
+            "the id is the position in the shown list, not the layout column 3"
+        );
+        assert!(sorting[1].checked, "the sorted column carries the tick");
+        assert!(!sorting[0].checked);
+        assert_eq!(
+            sorting[2].label, "&3  Mess&&age",
+            "the number is the mnemonic, and an ampersand in a field name is doubled"
+        );
+
+        let topping = column_menu_of(&columns, ID_TOPN_COL_BASE, false);
+        assert_eq!(topping[1].id, Some(ID_TOPN_COL_BASE + 1));
+        assert!(
+            !topping[1].checked,
+            "no column is ever currently topped, so nothing is ticked here"
+        );
+    }
 
     /// The header menu's facts: the active direction is the ticked one, Clear sort is dead
     /// without a sort anywhere, and the column's own name is in the items that act on it.
@@ -862,6 +1113,7 @@ mod tests {
             },
             &[],
             &[],
+            &[],
         );
         let file = menu.at(&[0]).expect("File opens").to_vec();
         let remote = file
@@ -892,6 +1144,7 @@ mod tests {
                     regroup_separates: separates,
                     ..BarState::default()
                 },
+                &[],
                 &[],
                 &[],
             )
@@ -1025,6 +1278,7 @@ mod tests {
             },
             &[],
             &[],
+            &[],
         );
         let mut keys = Vec::new();
         advertised(menu.items(), &mut keys);
@@ -1055,6 +1309,7 @@ mod tests {
                 toolbar: true,
                 ..BarState::default()
             },
+            &[],
             &[],
             &[],
         );
@@ -1094,6 +1349,7 @@ mod tests {
                 toolbar: true,
                 ..BarState::default()
             },
+            &[],
             &[],
             &[],
         )
@@ -1139,6 +1395,7 @@ mod tests {
                     },
                     &[],
                     &[],
+                    &[],
                 ),
             ),
             (
@@ -1151,6 +1408,28 @@ mod tests {
                     },
                     &recent,
                     &[],
+                    &[],
+                ),
+            ),
+            // **And a third shape, for the same reason the second exists.** Format's column
+            // submenus are built from data, so a bar with no columns is a *different menu* from
+            // the one anybody using the application sees — which is precisely how `Clear recent
+            // files` kept its collision with `Close Tab` hidden for a month.
+            (
+                "with columns",
+                menu_bar(
+                    None,
+                    BarState {
+                        toolbar: true,
+                        ..BarState::default()
+                    },
+                    &[],
+                    &[],
+                    &[
+                        col("timestamp", "Timestamp", 0, None),
+                        col("level", "Level", 1, Some(false)),
+                        col("message", "Message", 2, None),
+                    ],
                 ),
             ),
         ] {
@@ -1199,6 +1478,7 @@ mod tests {
             },
             &[],
             &[],
+            &[],
         );
         let mut bare: Vec<String> = Vec::new();
         for top in 0..menu.items().len() {
@@ -1228,6 +1508,7 @@ mod tests {
                 toolbar: true,
                 ..BarState::default()
             },
+            &[],
             &[],
             &[],
         );
@@ -1283,6 +1564,12 @@ mod tests {
             ID_CLEAR_RECENT,
             ID_RECENT_BASE,
             ID_RECENT_BASE + tailhawk_core::settings::RECENT_MAX as u32 - 1,
+            ID_SORT_COL_BASE,
+            ID_SORT_COL_BASE + MAX_MENU_COLUMNS as u32 - 1,
+            ID_TOPN_COL_BASE,
+            ID_TOPN_COL_BASE + MAX_MENU_COLUMNS as u32 - 1,
+            ID_FILTER_COL_BASE,
+            ID_FILTER_COL_BASE + MAX_MENU_COLUMNS as u32 - 1,
             ID_UNLISTED,
         ] {
             assert_eq!(command_of(id), None, "id {id} collides with the register");
@@ -1300,6 +1587,7 @@ mod tests {
                 toolbar: true,
                 ..BarState::default()
             },
+            &[],
             &[],
             &[],
         );
@@ -1324,6 +1612,7 @@ mod tests {
                 ..Default::default()
             },
             &paths,
+            &[],
             &[],
         );
         let file = menu.at(&[0]).expect("File opens").to_vec();
@@ -1378,6 +1667,7 @@ mod tests {
             },
             &[],
             &[],
+            &[],
         );
         let file = menu.at(&[0]).expect("File").to_vec();
         assert!(
@@ -1404,6 +1694,7 @@ mod tests {
                     toolbar: true,
                     ..Default::default()
                 },
+                &[],
                 &[],
                 &[],
             );

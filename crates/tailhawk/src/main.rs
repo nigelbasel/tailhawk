@@ -2487,6 +2487,20 @@ impl Document {
         None
     }
 
+    /// The layout column the n-th *shown* column is, for a menu whose ids are positions.
+    ///
+    /// **The two index spaces are not the same, and confusing them was a defect once** —
+    /// [`HeaderColumn::column`](tailhawk_core::rows::HeaderColumn::column) carries the warning: a
+    /// box list skips hidden columns and ends with the message, so "item 2" is not "column 2" the
+    /// moment anything is hidden. Format's column submenus id their entries by position, exactly as
+    /// `ID_FORMAT_BASE` does, and this is the resolution back into the model's index space.
+    ///
+    /// A function rather than an index inside [`Shell::menu_choose`], so that a test can reach it
+    /// without a window — which is the only way the hidden-column case can be pinned at all.
+    fn column_at(&self, shown: usize) -> Option<usize> {
+        self.header_columns().get(shown).map(|box_| box_.column)
+    }
+
     /// The header cell under pane-relative `x`.
     fn header_cell(&self, x: f32) -> usize {
         let cell_w = self.view.hgrid().cell_width().max(1.0);
@@ -6395,6 +6409,59 @@ impl Shell {
                 .contains(&id) =>
             {
                 self.pending_pull = Some((id - menubar::ID_SOURCE_BASE) as usize);
+                true
+            }
+            // Format's column submenus — `UX-REVIEW.md` finding 3. The id is a **position in the
+            // shown columns**, which `Document::column_at` resolves back into the layout's index
+            // space; handing the position straight to the command would act on the wrong column
+            // the moment anything is hidden, and every visible column would still look right.
+            id if (menubar::ID_SORT_COL_BASE
+                ..menubar::ID_SORT_COL_BASE + menubar::MAX_MENU_COLUMNS as u32)
+                .contains(&id) =>
+            {
+                let at = (id - menubar::ID_SORT_COL_BASE) as usize;
+                // **`cycle_sort`, not a rule of its own.** Choosing a column here is the same act
+                // as clicking its header, and the header's cycle has three states — unsorted,
+                // ascending, descending, then cleared. An inline flip re-derived two of them and
+                // could never reach the third, so a user who had learned "choose it again to
+                // clear" from the header would never get there from the menu. It also read the
+                // direction off the layout's copy rather than `filtering.sort`, which is the one
+                // `cycle_sort` trusts and the two part company under a top-N.
+                let column = self.document.as_ref().and_then(|doc| doc.column_at(at));
+                match (column, self.document.as_mut()) {
+                    (Some(column), Some(doc)) => doc.cycle_sort(column),
+                    _ => false,
+                }
+            }
+            id if (menubar::ID_TOPN_COL_BASE
+                ..menubar::ID_TOPN_COL_BASE + menubar::MAX_MENU_COLUMNS as u32)
+                .contains(&id) =>
+            {
+                let at = (id - menubar::ID_TOPN_COL_BASE) as usize;
+                match self.document.as_ref().and_then(|doc| doc.column_at(at)) {
+                    Some(column) => self.run(hwnd, Command::TopN(column)),
+                    None => false,
+                }
+            }
+            id if (menubar::ID_FILTER_COL_BASE
+                ..menubar::ID_FILTER_COL_BASE + menubar::MAX_MENU_COLUMNS as u32)
+                .contains(&id) =>
+            {
+                let at = (id - menubar::ID_FILTER_COL_BASE) as usize;
+                // **The title, never the label.** A filter is written against the field's own
+                // name; `Timestamp:` against a field called `timestamp` matches nothing.
+                let title = self
+                    .document
+                    .as_ref()
+                    .and_then(|doc| doc.header_columns().get(at).map(|box_| box_.title.clone()));
+                let Some(title) = title else {
+                    return false;
+                };
+                if let Some(doc) = self.document.as_mut() {
+                    doc.show_filters = true;
+                    doc.filtering.error = None;
+                }
+                self.pending_filter = Some((Polarity::Include, Some(title)));
                 true
             }
             id if (menubar::ID_FORMAT_BASE..menubar::ID_FORMAT_BASE + 64).contains(&id) => {
@@ -11199,6 +11266,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             },
                             &shell.settings.recent,
                             &shell.source_names(),
+                            &shell
+                                .document
+                                .as_ref()
+                                .map(|d| d.header_columns())
+                                .unwrap_or_default(),
                         )
                     })
                 });
@@ -12180,6 +12252,7 @@ fn main() -> Result<()> {
                 ..Default::default()
             },
             &recent,
+            &[],
             &[],
         )) {
             unsafe {
@@ -13423,6 +13496,7 @@ mod tests {
                 },
                 &[],
                 &[],
+                &[],
             );
             for top in 0..menu.items().len() {
                 let Some(items) = menu.at(&[top]) else {
@@ -13480,6 +13554,7 @@ mod tests {
                     toolbar: true,
                     ..Default::default()
                 },
+                &[],
                 &[],
                 &[],
             );
@@ -13785,6 +13860,77 @@ mod tests {
             "Timestamp",
             "the status bar's 'sorted by' reads as the header does"
         );
+    }
+
+    /// **A menu id is a position; a command needs a column.** Format's `Sort by`, `Top N by` and
+    /// `Filter on` list the shown columns and id their entries by position, so the dispatch has to
+    /// resolve that position back through `header_columns()` — and the only time the two differ is
+    /// when something is hidden, which is why this hides one. With column 0 gone, shown position 0
+    /// *is* layout column 1, and a dispatch that passed the position straight to
+    /// `Command::SortBy` would sort the wrong column while every visible column still looked right.
+    #[test]
+    fn a_column_submenus_position_resolves_to_the_layout_column() {
+        // Its own fixture, for the reason the neighbouring test spells out: two tests sharing a
+        // `%TEMP%` path raced in the parallel suite and cost an afternoon to attribute.
+        let path = std::env::temp_dir().join("tailhawk_column_at_test.log");
+        std::fs::write(
+            &path,
+            "2026-08-17 09:14:03.884 +01:00 [INF] Zenith.Dispatcher Dispatching job 41981\n\
+             2026-08-17 09:14:04.120 +01:00 [ERR] Zenith.Dispatcher Failed\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let n = doc
+            .layout
+            .as_ref()
+            .expect("Serilog is detected")
+            .widths
+            .len();
+
+        assert_eq!(
+            doc.column_at(0),
+            Some(0),
+            "nothing hidden: position is index"
+        );
+        assert_eq!(doc.column_at(1), Some(1));
+
+        {
+            let layout = doc.layout.as_mut().expect("a layout");
+            let defaults = layout.widths.clone();
+            let mut rows = crate::chooser::rows_of(layout);
+            rows[0].shown = false;
+            assert!(
+                crate::chooser::apply(layout, &defaults, &rows),
+                "hide column 0"
+            );
+        }
+        doc.lay_out((8.0, 10.0), (800, 300));
+
+        assert_eq!(
+            doc.column_at(0),
+            Some(1),
+            "column 0 is hidden, so the first entry of the menu is layout column 1"
+        );
+        assert_eq!(doc.column_at(1), Some(2));
+        assert_eq!(
+            doc.column_at(0),
+            doc.header_columns().first().map(|b| b.column),
+            "and it agrees with the boxes the header draws from"
+        );
+
+        // **Past the end names no column**, asserted last on purpose. It is the cheapest way for a
+        // broken mapping to die, so a mutation report attributes the kill to it and a reader
+        // concludes the hidden-column cases above are decoration. They are not: a mapping that
+        // returned the position while still bounds-checking survives every assertion before the
+        // hide and only those catch it.
+        assert_eq!(doc.column_at(n), None, "past the end names no column");
+        assert_eq!(
+            doc.column_at(n - 1),
+            None,
+            "and with one hidden the list is shorter by one"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
