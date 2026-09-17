@@ -13722,7 +13722,13 @@ mod tests {
 
     #[test]
     fn a_header_box_carries_its_layout_column_and_skips_a_hidden_one() {
-        let path = std::env::temp_dir().join("tailhawk_header_boxes_test.log");
+        // **Its own fixture, and that is not fussiness.** This wrote the same path as
+        // `the_header_boxes_name_every_column_and_sit_on_the_resize_boundaries`, and the two run in
+        // parallel: one writes two lines, the other forty, and whichever lost the race left the
+        // other asserting against a file it had not written. It passed alone every time and failed
+        // in the full suite about one run in three — the shape that reads as "someone else's change
+        // broke a test" and costs an afternoon to attribute.
+        let path = std::env::temp_dir().join("tailhawk_header_box_hidden_test.log");
         std::fs::write(
             &path,
             "2026-08-17 09:14:03.884 +01:00 [INF] Zenith.Dispatcher Dispatching job 41981\n\

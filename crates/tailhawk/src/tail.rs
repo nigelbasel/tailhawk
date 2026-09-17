@@ -147,14 +147,35 @@ pub fn window_after(since: Nanos, floor: Nanos, now: Nanos) -> Option<Window> {
 
 /// How far behind the clock the window ends. A record indexed within this of its own timestamp is
 /// never missed; one indexed later is caught by the overlap for as long as the overlap reaches.
-pub const LAG_NANOS: Nanos = 5 * 1_000_000_000;
+///
+/// **Thirty seconds is the measurement, not a number that feels live.** The estate was measured
+/// indexing some records about that long after their own timestamps at the worst moment of a busy
+/// hour, and a window ending nearer the clock crosses off ground those records have not reached
+/// yet — permanently, because the mark only moves forward. This was five seconds until 2026-09-16,
+/// and everything indexed later than about six was lost silently.
+///
+/// **A sweep was built to catch them instead of paying this, and the arithmetic killed it.** One
+/// request a minute is about thirty-three records a second against a source writing nine hundred,
+/// so it re-asked the same leading couple of seconds of its ninety-second band every cycle — a few
+/// per cent of it — and its answer, coming back at the limit every time, latched §6's "answers cut"
+/// banner on for a reason nobody could see. A cursor walking the band does not rescue it either:
+/// two seconds of coverage a minute takes forty minutes to cross ninety. The lag is complete where
+/// the sweep was partial, adds no request, and needs no de-duplication.
+///
+/// **What it costs is liveness, and the cost is on screen rather than hidden:** the newest record a
+/// tail holds is now normally this far behind, and [`lag_text`] says so in the status bar.
+pub const LAG_NANOS: Nanos = 30 * 1_000_000_000;
 
 /// How far before the newest record held each window starts again. **Sized to what a poll can
 /// afford, and measured**: live runs at ~900 records a second, so five seconds of overlap was
 /// 4,500 repeats against a limit of 2,000 — every poll came back full of nothing new and the tail
 /// advanced tens of milliseconds per cycle. One second is ~900, leaving the limit room for what is
-/// actually new; the lag already holds the window back past typical indexing delay, so this only
-/// has to cover jitter beyond it.
+/// actually new.
+///
+/// **It is [`LAG_NANOS`] that carries the indexing delay, not this.** Since the lag became the
+/// estate's measured worst case rather than five seconds, a record indexed late is still inside the
+/// window when the window is asked for, and the overlap is left doing the one job it can afford:
+/// covering the jitter of a request that took longer than the interval it was meant to fit in.
 pub const OVERLAP_NANOS: Nanos = 1_000_000_000;
 
 /// How long to wait after a poll that failed.
@@ -493,6 +514,38 @@ mod tests {
         );
         assert_eq!(w.end, now - LAG_NANOS, "held back by the lag");
         assert!(w.start < w.end);
+    }
+
+    /// **The lag is the measurement, not a round number that feels live.** The estate was measured
+    /// indexing some records about thirty seconds after their own timestamps at the worst moment of
+    /// a busy hour, and a window that ends nearer the clock than that crosses off ground those
+    /// records have not reached yet — for ever, because the mark only moves forward.
+    ///
+    /// **A sweep was built to catch them instead, and the arithmetic killed it:** one request a
+    /// minute is about thirty-three records a second against a source writing nine hundred, so it
+    /// re-asked the same leading seconds of the band every cycle and covered a few per cent of it.
+    /// The lag is complete where the sweep was partial, and it costs liveness, which the status bar
+    /// says out loud.
+    #[test]
+    fn the_lag_covers_the_index_delay_the_estate_was_measured_at() {
+        let second = 1_000_000_000;
+        let measured_worst_case = 30 * second;
+        assert!(
+            LAG_NANOS >= measured_worst_case,
+            "a window ending {}s back cannot hold a record indexed {}s late",
+            LAG_NANOS / second,
+            measured_worst_case / second
+        );
+
+        // And the window still ends where the lag puts it, with room to ask for something.
+        let since = 100 * second;
+        let now = 200 * second;
+        let w = window_after(since, 0, now).expect("a window");
+        assert_eq!(w.end, now - LAG_NANOS);
+        assert!(
+            w.start < w.end,
+            "a lag that swallowed the window would stall the tail"
+        );
     }
 
     /// A mark near the epoch cannot overlap into negative time.
