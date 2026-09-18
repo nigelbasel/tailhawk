@@ -178,6 +178,58 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    the bar is set outside those gates, or the notice needs a surface that does not depend on either.
    Until then, messages on that path are worth writing correctly but nobody will read them.
 
+   **Fixed 2026-09-18, and one line did both gates.** `bar.set(&status)` is now called immediately
+   after `status_text()` and *before* `self.renderer.as_mut()`, so neither the renderer guard nor
+   the `pane_count == 0` return stands between the composed text and the control. Nothing there
+   needs a device — `StatusBar::set` is a message to the control's own window with an equality
+   guard inside it — so a frame that changes nothing still costs nothing. What remains in the
+   layout block is `resize()` and `band_height()`, which genuinely do belong to the frame.
+   **`bar.resize()` came with it, and that was the other half.** It forwards `WM_SIZE` so the
+   control retakes the bottom strip of the parent's *current* client rectangle, and it had exactly
+   one call site — also past the `pane_count == 0` return. A window resized before the first file
+   was ever opened therefore left the bar at its launch width. Blank, that was invisible; carrying
+   text it would not be, so the fix above is precisely what would have turned it into a visible
+   fault. Both now run unconditionally before the renderer is asked for, and the layout block keeps
+   only `band_height()`.
+
+   **That half was measured, not reasoned about, and it was real.** A review raised it as a
+   plausible-but-unverified path, so the harness resizes the window before any file is opened and
+   compares the bar's own `GetWindowRect` against the parent's `GetClientRect` — a screenshot could
+   not tell you where the strip ends, and `WM_GETTEXT` says nothing about geometry. The binary from
+   before the change: **1417px of bar against a 1052px client**, out by 365. After: **1052 against
+   1052**. So the bar really did keep its launch width for the whole of a first run, and the text
+   hoist would have made that visible the moment anything was written into it.
+
+   **Proved on the desktop, because nothing in the unit suite can see it:** `status_text` composes
+   the right words either way and the defect was *which call is reached*. `tools/verify-no-document.ps1`
+   launches the binary with no file — the binary from before the change answers `''`, the one after
+   answers `hardware`. `tools/verify-open.ps1` was re-run to confirm the ordinary path with a
+   document is unaffected. **What that harness proves, exactly:** `Screen.ps1`'s `[StatusText]::Of`
+   finds the `msctls_statusbar32` child and reads it with `WM_GETTEXT`, so it establishes that the
+   text reached the control — not that a person can see it, nor that the bar is correctly docked.
+   It does discriminate: it would have failed before this change and passes after. But "reads the
+   real control" is the strongest claim available, and reading the screen is not it.
+
+   **One framing of mine that a review corrected:** the hoist was justified partly on costing
+   nothing per frame, which overstated the case. `status_text()` was *already* built on every
+   `WM_PAINT` including when the renderer is gone — unchanged by this — so the only new work is an
+   `Option::as_mut` and an equality-guarded `SendMessageW`. Cheap, but the saving was never where
+   the justification put it.
+
+   **Two corrections to what is written above, both mine.** The route described — "the commonest
+   case there is, `producer | tailhawk`" — is **wrong**, and I repeated it in a commit message
+   before testing it. A closed or empty stdin does *not* make `Document::from_pipe` fail: the pipe
+   opens, a document is created, and the bar renders normally. `from_pipe` has to genuinely error
+   (spill creation, `GetStdHandle`, thread spawn, indexing), which an external producer cannot
+   force. The gate was real and the blank bar was real; the way in was not. Launching with **no
+   file at all** reaches it in one step, which is every first run and every moment after the last
+   tab closes. The first harness I wrote for this asserted the failing-pipe story, passed against
+   the *pre-hoist* binary, and was deleted: a harness that cannot fail is worse than none.
+
+   **And the renderer half is only half fixed.** The status bar can now report a device loss,
+   because the call precedes that guard too. The window still draws nothing afterwards — the
+   renderer is never rebuilt, `pending` is armed once in `main` — so that part stands as written.
+
    **A follow-up the same review turned up:** once that gate is fixed, `tailhawk-core`'s nested
    errors leak straight through the new wording — `Pump::start` can fail with `sid:`,
    `token user:`, `process token:`, `sid text:`, `spill security descriptor:` or `stdin pump:`

@@ -5111,6 +5111,24 @@ impl Shell {
         // The strip and the status are the shell's knowledge, handed to the document that draws them.
         let strip = (self.document.labels(), self.document.active);
         let status = self.status_text();
+        // **The bar is written before a renderer is asked for, and that is the whole of the fix.**
+        // This call used to live in the layout block below, behind two gates: the early return
+        // here when the device is gone, and the `pane_count == 0` return inside the closure. So
+        // the status bar could not report either failure that stops a document existing — a
+        // renderer that died, or a pipe that never opened — and went blank for the life of the
+        // process, which is the one moment its text matters most. Nothing here needs a device:
+        // `set` is a message to the control's own window with an equality guard inside it, so a
+        // frame that changes nothing still costs nothing.
+        if let Some(bar) = self.statusbar.as_mut() {
+            // **Re-docked here too, and that is the other half of the same defect.** `resize`
+            // forwards `WM_SIZE` so the control retakes the bottom strip of the parent's *current*
+            // client rectangle, and its only other call site was past the `pane_count == 0`
+            // return — so a window resized before the first file was ever opened left the bar at
+            // its launch width. While the bar was blank that was invisible; carrying text it would
+            // not be, which is to say the fix above is what would have made it a visible fault.
+            bar.resize();
+            bar.set(&status);
+        }
 
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
@@ -5198,8 +5216,9 @@ impl Shell {
                 // of nothing over it.
                 let status_px = match self.statusbar.as_mut() {
                     Some(bar) => {
-                        bar.resize();
-                        bar.set(&status);
+                        // The text was set and the bar re-docked above, before the renderer was
+                        // asked for and unconditionally, so by here it has already happened this
+                        // frame. What is left is the layout arithmetic, which does belong here.
                         bar.band_height() as f32
                     }
                     None => 0.0,
