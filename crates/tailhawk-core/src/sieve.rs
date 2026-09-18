@@ -127,7 +127,8 @@ pub fn start(
                     &tx,
                 )
             })
-            .map_err(|e| crate::Error(format!("starting the filter worker: {e}")))?
+            // Reaches the status bar through `Filtering::error`, beside the chips it belongs to.
+            .map_err(|e| crate::Error(format!("the filter could not be started — {e}")))?
     };
     Ok(Running {
         cancel,

@@ -230,6 +230,35 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    because the call precedes that guard too. The window still draws nothing afterwards — the
    renderer is never rebuilt, `pending` is armed once in `main` — so that part stands as written.
 
+   **What the hoist made worth finishing, 2026-09-18.** Before it, several messages on the
+   no-document path were dead text; now they are read, so the batch after it swept what the hoist
+   exposed. `regroup_notice` is extracted and tested: both branches said **"1 applications"** for a
+   single ticked application, and they said it inline in a function needing an `HWND` and the
+   `STATE` borrow, so nothing could reach them. The four worker-start errors are reworded — the
+   sort, search, filter and export ones, each traced to a surface first: `sort.rs`'s reaches the
+   status bar through `describe_sort`, which *prefixes* it, so "starting the sort worker" read as
+   `↕ sorted by level: starting the sort worker: …` — the routine named twice and the fault not at
+   all. **`scanner.rs:138` is deliberately untouched:** `scan worker:` has no shell caller at all,
+   so rewording it would be writing for nobody.
+
+   **"1 applications" is not reachable, and the story of that is the part worth keeping.** I ruled
+   it out first — "guarded above 1" — then talked myself out of that on a second reading, recorded
+   the reversal here as a discovery, and extracted `regroup_notice` on the strength of it. A review
+   then checked what neither reading had: `apps::regroup_of` returns `Separate` only when
+   `here.apps.len() > 1` (`apps.rs:469`) and `Interleave` only through `(apps.len() > 1).then_some`
+   (`apps.rs:490`), `regroup_now` returns early on the `None`, and
+   `there_is_nothing_to_regroup_alone_or_unnarrowed` has asserted it all along. **My first judgement
+   was right and my correction was wrong** — and the entry that stood here was itself an instance
+   of the thing it warned about: a plausible line of reasoning, stated confidently, never run. The
+   extraction stays, on its merits — one place instead of two, and a count that cannot disagree
+   with its noun — but it is a tidy-up, not a defect fixed, and this record should not tell the next
+   session otherwise.
+
+   The honest version of the lesson survives intact: everything *measured* this stretch — the blank
+   bar, `1417px against a 1052px client`, a closed pipe that opens a document perfectly well, and
+   now this guard — contradicted what reading had suggested. Twice that favoured me and once it did
+   not, which is the point: the direction of the error is not predictable, only the remedy is.
+
    **A follow-up the same review turned up:** once that gate is fixed, `tailhawk-core`'s nested
    errors leak straight through the new wording — `Pump::start` can fail with `sid:`,
    `token user:`, `process token:`, `sid text:`, `spill security descriptor:` or `stdin pump:`

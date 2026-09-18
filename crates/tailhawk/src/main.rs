@@ -3145,6 +3145,29 @@ fn frame_stats_enabled() -> bool {
 /// all three were wrong in a different way: two said "1 records", the middle one had lost its noun
 /// altogether — *"the newest 41 in the last hour"* names nothing — and the first said "1 more
 /// **were** returned", so the verb disagreed as well as the noun.
+/// What regrouping a remote source's applications says it did.
+///
+/// **A function for the same reason [`pull_notice`] is one** — both branches sat inline in a
+/// function needing an `HWND` and the `STATE` borrow, so nothing could reach them, and both
+/// hard-coded the plural noun.
+///
+/// **The singular is not reachable today, and saying otherwise was my second mistake about it.**
+/// `apps::regroup_of` returns `Separate` only when `here.apps.len() > 1` and `Interleave` only
+/// through `(apps.len() > 1).then_some(..)`, and `regroup_now` returns early on the `None` — which
+/// is asserted by `there_is_nothing_to_regroup_alone_or_unnarrowed`. So "1 applications" was dead
+/// text. I ruled that correctly the first time, then talked myself out of it on a second reading
+/// and recorded the reversal as though it were the discovery. This is the plural rule applied for
+/// its own sake: one place instead of two, and a count that cannot disagree with its noun if a
+/// future caller does pass one.
+fn regroup_notice(name: &str, count: usize, separate: bool) -> String {
+    let moved = counted(count as u64, "application");
+    if separate {
+        format!("{name}: {moved}, one window each — each fetches the last hour again")
+    } else {
+        format!("{name}: {moved} in one window — it fetches the last hour again")
+    }
+}
+
 fn pull_notice(name: &str, records: usize, dropped: usize, cut: bool) -> String {
     let held = counted(records as u64, "record");
     if dropped > 0 {
@@ -8609,21 +8632,8 @@ fn regroup_now(hwnd: HWND) {
     for (source, label) in opening {
         open_remote(hwnd, source, label);
     }
-    set_notice(
-        hwnd,
-        if separate {
-            format!(
-                "{}: {opened} applications, one window each — each fetches the last hour again",
-                source.name
-            )
-        } else {
-            format!(
-                "{}: {} applications in one window — it fetches the last hour again",
-                source.name,
-                apps.len()
-            )
-        },
-    );
+    let moved = if separate { opened } else { apps.len() };
+    set_notice(hwnd, regroup_notice(&source.name, moved, separate));
 }
 
 /// Drops the `Open remote` button's menu under the button, and runs what was chosen.
@@ -13668,6 +13678,31 @@ mod tests {
         };
         let said = finder.describe(false).expect("a query is in play");
         assert!(said.contains("1 line too slow"), "{said}");
+    }
+
+    /// **Regrouping one application would not be "1 applications".** The singular cannot be
+    /// reached through the UI — `apps::regroup_of` refuses to plan anything for a lone application
+    /// — so this pins the rule rather than a live defect, and the plural cases are the ones that
+    /// run. Worth having both: the branches were inline and untestable until now, and a count that
+    /// cannot disagree with its noun costs nothing to keep.
+    #[test]
+    fn regrouping_counts_the_applications_it_moved() {
+        assert_eq!(
+            regroup_notice("live", 1, true),
+            "live: 1 application, one window each — each fetches the last hour again"
+        );
+        assert_eq!(
+            regroup_notice("live", 4, true),
+            "live: 4 applications, one window each — each fetches the last hour again"
+        );
+        assert_eq!(
+            regroup_notice("live", 1, false),
+            "live: 1 application in one window — it fetches the last hour again"
+        );
+        assert_eq!(
+            regroup_notice("live", 9, false),
+            "live: 9 applications in one window — it fetches the last hour again"
+        );
     }
 
     /// **What a window of history fetched, and what it is not telling you.** `LOKI.md` §6 turns on

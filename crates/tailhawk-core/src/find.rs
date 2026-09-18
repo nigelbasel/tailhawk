@@ -156,7 +156,9 @@ pub fn start(
         std::thread::Builder::new()
             .name("tailhawk-search".to_owned())
             .spawn(move || run(work, options, &cancel, &tx))
-            .map_err(|e| crate::Error(format!("starting the search worker: {e}")))?
+            // Reaches the title and the find dialog through `Finder::error`, where a refused
+            // pattern also lands — so it reads beside what the user typed, not beside a routine.
+            .map_err(|e| crate::Error(format!("the search could not be started — {e}")))?
     };
 
     Ok(Running {

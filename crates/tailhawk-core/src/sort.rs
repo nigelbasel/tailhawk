@@ -174,7 +174,13 @@ pub fn start(
         std::thread::Builder::new()
             .name("tailhawk-sort".to_owned())
             .spawn(move || run(members, keep, from, to, format, order, &cancel, &tx))
-            .map_err(|e| crate::Error(format!("starting the sort worker: {e}")))?
+            // **Written to compose, not to read alone.** `describe_sort` prefixes this with what
+            // the user asked for, so the sentence they see is `↕ sorted by level ▼: {this}`. The
+            // old text named the routine — "starting the sort worker" — and the first rewording
+            // named the subject the prefix had already established, giving "sorted by level: the
+            // sort could not be started". The sibling message in this slot ("needs 2 M rows or
+            // fewer — filter first") is the shape to match: say only what the prefix has not.
+            .map_err(|e| crate::Error(format!("could not be started — {e}")))?
     };
     Ok(Running {
         cancel,

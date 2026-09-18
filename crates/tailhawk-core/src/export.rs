@@ -97,7 +97,10 @@ pub fn start(
         std::thread::Builder::new()
             .name("tailhawk-export".to_owned())
             .spawn(move || run(members, keep, from, to, file, &cancel, &tx))
-            .map_err(|e| crate::Error(format!("starting the export worker: {e}")))?
+            // Reaches the status bar as `⚠ export failed: {this}`, where the user is watching a
+            // file they asked for fill up — so the prefix has already said both "export" and
+            // "failed", and naming either again is the doubling `sort.rs` carries a note about.
+            .map_err(|e| crate::Error(format!("could not be started — {e}")))?
     };
     Ok(Running {
         cancel,
