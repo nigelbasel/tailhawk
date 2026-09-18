@@ -666,7 +666,12 @@ impl Pump {
                         // **The spill failed, not the pipe.** A full disk here loses log content
                         // silently otherwise: the window would show what arrived and stop, looking
                         // exactly like a producer that finished.
-                        outcome = StreamEnd::Failed(format!("spill: {e}"));
+                        // **`spill:` is this file's word for its own temporary, not the reader's.**
+                        // It surfaces as "stream failed: …" beside the document, where the thing
+                        // that failed is the copy being kept on disk, not the pipe.
+                        outcome = StreamEnd::Failed(format!(
+                            "the records could not be written to the temporary file — {e}"
+                        ));
                         break;
                     }
                     counted.fetch_add(read as u64, Ordering::Relaxed);

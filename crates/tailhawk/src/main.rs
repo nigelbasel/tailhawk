@@ -770,8 +770,13 @@ impl Document {
     /// and `Follow::after_build` already seeds line 0 for one — the case that had its own bug and
     /// its own test back when following was written.
     fn from_pipe() -> std::result::Result<Self, String> {
-        let pump = Pump::start().map_err(|e| format!("stdin: {e}"))?;
-        let set = LogSet::open_single(pump.path()).map_err(|e| format!("stdin: {e}"))?;
+        // **`stdin:` was the name of the source, not a sentence.** This reaches the status bar
+        // through `Shell::file`, so it is read by whoever piped something in and found nothing
+        // opened — the two halves fail for different reasons and now say which.
+        let pump =
+            Pump::start().map_err(|e| format!("The piped input could not be started — {e}."))?;
+        let set = LogSet::open_single(pump.path())
+            .map_err(|e| format!("The piped input could not be opened — {e}."))?;
         let (detection, layout) = detect_set(&set, None);
         let opened_from = None;
         Ok(Self {
@@ -3132,6 +3137,36 @@ fn frame_stats_enabled() -> bool {
 ///
 /// It is a function so that there is one of it. A test asserting `matchs` is what the first draft
 /// of this had instead.
+/// What one window of Loki history says it fetched, and what is missing from it — `LOKI.md` §6's
+/// disclosure as one sentence.
+///
+/// **A function because the three branches are a decision, and the shell should carry only the
+/// answer.** Inline in the middle of opening a remote source they could not be tested at all, and
+/// all three were wrong in a different way: two said "1 records", the middle one had lost its noun
+/// altogether — *"the newest 41 in the last hour"* names nothing — and the first said "1 more
+/// **were** returned", so the verb disagreed as well as the noun.
+fn pull_notice(name: &str, records: usize, dropped: usize, cut: bool) -> String {
+    let held = counted(records as u64, "record");
+    if dropped > 0 {
+        // **Both, when both are true.** This used to return here and never reach `cut`, so a
+        // window over Tailhawk's own cap *and* cut at Loki's limit reported the local shortfall as
+        // though the figure were exact. §6 calls that disclosure the single most important rule in
+        // the feature, and being told about a nearer shortfall is not a substitute for it: the two
+        // are different losses, one this program's and one the server's.
+        let verb = if dropped == 1 { "was" } else { "were" };
+        let also = if cut {
+            " — and there are probably more that Loki did not return"
+        } else {
+            ""
+        };
+        return format!("{name}: {held}; {dropped} more {verb} returned than Tailhawk keeps{also}");
+    }
+    if cut {
+        return format!("{name}: the newest {held} in the last hour — there are probably more");
+    }
+    format!("{name}: {held} in the last hour")
+}
+
 fn counted(n: u64, noun: &str) -> String {
     format!("{n} {}", noun_for(n, noun))
 }
@@ -6429,7 +6464,11 @@ impl Shell {
         let format = match wizard.compile() {
             Ok(format) => format,
             Err(why) => {
-                self.file = Some(format!("format not saved: {why}"));
+                // **Nothing was saved because nothing compiled** — this fires before a file is
+                // opened or a path is even chosen, so "format not saved" named the wrong event.
+                self.file = Some(format!(
+                    "That format definition could not be compiled — {why}."
+                ));
                 return;
             }
         };
@@ -6449,7 +6488,13 @@ impl Shell {
         }
         // §10: a read-only profile is a state, not an impossibility.
         if let Err(e) = std::fs::write(&target, tailhawk_core::wizard::to_toml(&defs)) {
-            self.file = Some(format!("format not saved: {e}"));
+            // The real save failure, and the same remedy the highlight rules give: §10 treats a
+            // read-only profile as a state, and a state is something a person can change once they
+            // know where it lives.
+            self.file = Some(format!(
+                "The format could not be saved to \"{}\" — {e}. Check that the file is not read-only.",
+                target.display()
+            ));
             return;
         }
         if let Some(doc) = self.document.as_mut() {
@@ -9151,28 +9196,10 @@ fn landed_records(
     // **One rule for both paths.** The opening window and every poll after it are cut the same way
     // and by the same limit, so they ask the same question — `tail::was_cut`.
     let cut = tail::was_cut(pulled.records, REMOTE_LIMIT);
-    if pulled.dropped > 0 {
-        set_notice(
-            hwnd,
-            format!(
-                "{name}: {} records; {} more were returned than Tailhawk keeps",
-                pulled.records, pulled.dropped
-            ),
-        );
-    } else if cut {
-        set_notice(
-            hwnd,
-            format!(
-                "{name}: the newest {} in the last hour — there are probably more",
-                pulled.records
-            ),
-        );
-    } else {
-        set_notice(
-            hwnd,
-            format!("{name}: {} records in the last hour", pulled.records),
-        );
-    }
+    set_notice(
+        hwnd,
+        pull_notice(&name, pulled.records, pulled.dropped, cut),
+    );
     // The query this window is a view of, kept before the source moves into the tail: `Interleave`
     // and `Separate` regroup the windows from it without asking the server anything.
     let query = source.query.clone();
@@ -13622,6 +13649,60 @@ mod tests {
         };
         let said = finder.describe(false).expect("a query is in play");
         assert!(said.contains("1 line too slow"), "{said}");
+    }
+
+    /// **What a window of history fetched, and what it is not telling you.** `LOKI.md` §6 turns on
+    /// this sentence: a window cut at the limit looks exactly like one that happened to hold that
+    /// many, so the disclosure is the only thing standing between a reader and a confident wrong
+    /// answer. All three branches were inline in `open_remote` where nothing could reach them.
+    #[test]
+    fn a_pull_says_what_it_fetched_and_what_is_missing() {
+        assert_eq!(
+            pull_notice("live", 41, 0, false),
+            "live: 41 records in the last hour"
+        );
+        assert_eq!(
+            pull_notice("live", 1, 0, false),
+            "live: 1 record in the last hour"
+        );
+
+        // Cut at the limit: the noun went missing here entirely.
+        assert_eq!(
+            pull_notice("live", 1000, 0, true),
+            "live: the newest 1000 records in the last hour — there are probably more"
+        );
+        assert_eq!(
+            pull_notice("live", 1, 0, true),
+            "live: the newest 1 record in the last hour — there are probably more"
+        );
+
+        // Tailhawk's own cap, where the verb has to agree as well as the noun.
+        assert_eq!(
+            pull_notice("live", 2000, 3, false),
+            "live: 2000 records; 3 more were returned than Tailhawk keeps"
+        );
+        assert_eq!(
+            pull_notice("live", 2000, 1, false),
+            "live: 2000 records; 1 more was returned than Tailhawk keeps"
+        );
+
+        assert_eq!(
+            pull_notice("live", 1, 1, false),
+            "live: 1 record; 1 more was returned than Tailhawk keeps",
+            "the count in this branch agrees too — it was only ever tested at 2000"
+        );
+
+        // **Both facts when both are true.** The inline version returned on `dropped` and never
+        // reached `cut`, so a window over Tailhawk's cap *and* cut at Loki's limit reported the
+        // local shortfall as though the figure were exact. §6 calls that disclosure the single
+        // most important rule in the feature: the reader has to be told Loki may have held back
+        // more than was ever fetched, and being told about a second, nearer shortfall is not a
+        // substitute for it.
+        assert_eq!(
+            pull_notice("live", 1000, 5, true),
+            "live: 1000 records; 5 more were returned than Tailhawk keeps — and there are probably \
+             more that Loki did not return"
+        );
     }
 
     /// **One is singular, everything else is not — including zero.** English puts zero with the

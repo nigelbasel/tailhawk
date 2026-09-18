@@ -148,6 +148,44 @@ called that "a non standard way to show and hide columns", and it leaves one cel
    it hung. This wants its own piece of work: either the status bar is set outside the renderer
    branch, or the notice needs a surface that does not depend on D3D at all.
 
+   **The six evidenced sites landed 2026-09-18**, and every one was traced to a reader *before* being
+   reworded — the lesson from the paint notice, which was perfected over three passes and turns out
+   to be unreadable. `pull_notice(name, records, dropped, cut)` is a pure function now, and fixed
+   three faults at once where the three branches sat inline in `open_remote` with nothing able to
+   reach them: "1 records"; the middle branch that had lost its noun altogether — *"the newest 41 in
+   the last hour"*; and **"1 more `were` returned"**, where the verb disagreed as well as the noun.
+   That last one had been read past by me and by two reviews, and only became visible when a test
+   had to state the finished sentence. `apps_count_text` is extracted and tested the same way, and
+   the four prefix messages — `stdin:` twice, `spill:`, and both `format not saved:` — name what
+   happened instead of naming a function. One was mislabelled rather than merely prefixed: the first
+   `format not saved:` fires when `wizard.compile()` fails, before a file is opened or a path is
+   chosen, so **nothing had been saved** and the message described the wrong event entirely.
+
+   **The sweep lesson worth keeping.** `apps_count` escaped every sweep — the review's row list and
+   the shape-based grep that was meant to be exhaustive — because its text reaches a dialog control
+   through `SetDlgItemTextW` rather than the status bar. A sweep by *composition shape* cannot see
+   that. The next one goes by **destination**: everything that ends as user-visible text, whichever
+   surface it lands on.
+
+   **⚠ And the same trap caught me again, one gate along.** The review of that batch found the two
+   reworded `stdin:` messages are unreachable in the commonest case there is — `producer | tailhawk`
+   with no file argument. `bar.set(&status)` is the only call in the program that writes the status
+   bar, and it sits *after* an early return taken when `pane_count == 0`; a pipe that fails to open
+   never pushes a tab, so the count stays zero and the text never lands. The user gets the Welcome
+   screen and a blank bar. That is the renderer blackout's sibling — a different gate, the same
+   defect: **the status bar cannot report a failure that happens before there is a document to
+   report it beside.** Both belong to one piece of work, and the fix is the same shape for both:
+   the bar is set outside those gates, or the notice needs a surface that does not depend on either.
+   Until then, messages on that path are worth writing correctly but nobody will read them.
+
+   **A follow-up the same review turned up:** once that gate is fixed, `tailhawk-core`'s nested
+   errors leak straight through the new wording — `Pump::start` can fail with `sid:`,
+   `token user:`, `process token:`, `sid text:`, `spill security descriptor:` or `stdin pump:`
+   (`stdin.rs:561, 682, 801, 839, 856, 862-863`), so a restricted token would produce *"The piped
+   input could not be started — sid: Access is denied."* The same shape sits in `export.rs:100`,
+   `find.rs:159`, `sieve.rs:130`, `sort.rs:177` and `scanner.rs:138`. A sweep for
+   `Error(format!("<lowercase word>: {e}"))` inside the core crate is the way to find them all.
+
 4. **`Filtering::describe`'s zero still reads `at least 0 of 900`, and that is left alone on
    purpose — it wants the owner's word, not a fix.** The *search*'s zero was a genuinely unhedged
    claim: `no matches` never consulted `at_least` at all, so it spoke for the whole log over a

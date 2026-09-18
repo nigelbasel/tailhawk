@@ -1110,16 +1110,35 @@ fn apps_read(hdlg: HWND, data: &mut AppsPick) {
 /// The line under the list: how many are offered, how many are ticked, and — §6 — whether the
 /// server had more to offer than the list holds.
 fn apps_count(hdlg: HWND, data: &AppsPick) {
-    let chosen = data.list.chosen().len();
-    let offered = data.list.rows().len();
-    let mut text = format!("{offered} applications, {chosen} chosen");
-    if data.list.cut() {
+    set_dlg_text(
+        hdlg,
+        ID_A_COUNT,
+        &apps_count_text(
+            data.list.rows().len(),
+            data.list.chosen().len(),
+            data.list.cut(),
+        ),
+    );
+}
+
+/// The count line's words, apart from the control it is written to.
+///
+/// **A function so that it can be read by a test rather than only by a person looking at the
+/// dialog.** It said "1 applications, 1 chosen" for a source offering one application — the same
+/// defect as the six the status bar had, in the one place a `SetDlgItemTextW` hid it from every
+/// sweep that looked at status-bar text.
+fn apps_count_text(offered: usize, chosen: usize, cut: bool) -> String {
+    let mut text = format!(
+        "{}, {chosen} chosen",
+        crate::counted(offered as u64, "application")
+    );
+    if cut {
         text.push_str(&format!(
             " — the server offered more than {} and the rest are not listed",
             tailhawk_core::apps::MAX_APPS
         ));
     }
-    set_dlg_text(hdlg, ID_A_COUNT, &text);
+    text
 }
 
 const ID_C_LIST: u16 = 250;
@@ -4419,6 +4438,33 @@ fn format_state<'a>(hdlg: HWND) -> Option<&'a mut FormatState<'a>> {
 mod tests {
     use super::*;
     use crate::keymap::{KeymapRow, KeymapSection};
+
+    /// **One application is not "1 applications".** The picker's count line had the same defect the
+    /// status bar had in six places, and survived every sweep of it: the text goes to a dialog
+    /// control through `SetDlgItemTextW`, so nothing grepping for status-bar composition could see
+    /// it. The *cut* clause is `LOKI.md` §6's disclosure and is asserted here unchanged — a count
+    /// that is a floor must say so, and this test exists partly to stop a later tidy losing it.
+    #[test]
+    fn the_picker_counts_applications_in_the_number_there_are() {
+        assert_eq!(
+            apps_count_text(1, 1, false),
+            "1 application, 1 chosen",
+            "one of a thing, twice over"
+        );
+        assert_eq!(apps_count_text(78, 2, false), "78 applications, 2 chosen");
+        assert_eq!(
+            apps_count_text(0, 0, false),
+            "0 applications, 0 chosen",
+            "zero is plural in English"
+        );
+
+        let cut = apps_count_text(tailhawk_core::apps::MAX_APPS, 1, true);
+        assert!(
+            cut.starts_with("512 applications, 1 chosen — the server offered more than 512"),
+            "§6's disclosure survives, and the count still agrees: {cut}"
+        );
+        assert!(cut.ends_with("and the rest are not listed"), "{cut}");
+    }
 
     fn two_items() -> Vec<Item> {
         vec![
