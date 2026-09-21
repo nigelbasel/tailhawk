@@ -94,8 +94,8 @@ use windows::Win32::UI::Controls::Dialogs::{
     OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::{
-    SetScrollInfo, TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TDCBF_OK_BUTTON,
-    TDF_ALLOW_DIALOG_CANCELLATION, TDF_USE_HICON_MAIN,
+    SetScrollInfo, TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TDCBF_NO_BUTTON,
+    TDCBF_OK_BUTTON, TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_USE_HICON_MAIN,
 };
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::HiDpi::{
@@ -8830,6 +8830,15 @@ fn regroup_now(hwnd: HWND) {
     let Some((plan, source)) = plan else {
         return;
     };
+    // **Interleaving closes windows, so it asks first.** `regroup_question` decides whether there
+    // is a question worth asking: separating reopens everything it closes, and folding a single
+    // window is a repaint, so neither interrupts. Asked out here because the `STATE` borrow above
+    // has been released — a modal loop inside it is the panic every deferred dialog avoids.
+    if let Some(question) = tailhawk_core::apps::regroup_question(&plan) {
+        if !confirmed(hwnd, &question) {
+            return;
+        }
+    }
     let (closing, apps, separate) = match plan {
         tailhawk_core::apps::Regroup::Separate { tab, apps } => (vec![tab], apps, true),
         tailhawk_core::apps::Regroup::Interleave { tabs, apps } => (tabs, apps, false),
@@ -10517,6 +10526,30 @@ pub fn rules_dialog_closed(hdlg: HWND, owner: HWND) {
 /// an OK button and Esc to dismiss. Modal like [`ask_for_file`], and dispatched the same way.
 /// Everything it says comes through [`about::dialog_content`] from the tested mapping, so the
 /// native surface cannot disagree with the model.
+/// Asks `question` with Yes and No, and reports whether Yes was pressed.
+///
+/// **No is the answer to everything that is not a Yes**, including a machine whose comctl32
+/// refuses the dialog. A command that closes a reader's windows may not proceed because the
+/// question could not be put to them.
+fn confirmed(hwnd: HWND, question: &str) -> bool {
+    let title = wide("Tailhawk");
+    let instruction = wide(question);
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: hwnd,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
+        dwCommonButtons: TDCBF_YES_BUTTON | TDCBF_NO_BUTTON,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        pszMainInstruction: PCWSTR(instruction.as_ptr()),
+        ..Default::default()
+    };
+    let mut pressed = 0i32;
+    if unsafe { TaskDialogIndirect(&config, Some(&mut pressed), None, None) }.is_err() {
+        return false;
+    }
+    pressed == windows::Win32::UI::WindowsAndMessaging::IDYES.0
+}
+
 fn show_about(hwnd: HWND, sheet: &about::AboutSheet) {
     let title = wide("About Tailhawk");
     let instruction = wide(&sheet.title);

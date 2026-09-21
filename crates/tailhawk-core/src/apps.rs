@@ -493,6 +493,27 @@ pub fn regroup_of(tabs: &[Tab], active: usize) -> Option<Regroup> {
     })
 }
 
+/// What to ask before carrying out `plan`, or `None` when there is nothing worth asking about.
+///
+/// **Interleaving closes windows, and until 2026-09-21 it could not be observed doing so.** The
+/// command folds *every* open window of the source into one — that is what it is for — but the
+/// windows it takes may have been separated deliberately, and it closes them without a step in
+/// between. Nobody saw that while the identity bug meant `Interleave` was never offered; the
+/// moment it works, a reader with four windows on `live` can lose three of them to one click.
+///
+/// So the question is asked once, and only when it is a real question: folding a single window is
+/// a repaint, and separating one closes nothing that is not immediately reopened.
+pub fn regroup_question(plan: &Regroup) -> Option<String> {
+    match plan {
+        Regroup::Separate { .. } => None,
+        Regroup::Interleave { tabs, .. } if tabs.len() > 1 => Some(format!(
+            "Close {} windows and open one showing all of them together?",
+            tabs.len()
+        )),
+        Regroup::Interleave { .. } => None,
+    }
+}
+
 /// How many applications a remote source's name lists before it counts them instead.
 ///
 /// Three is what a title bar and a taskbar button can carry beside the source's own name. It is a
@@ -952,5 +973,40 @@ mod tests {
     #[test]
     fn no_choice_leaves_the_source_alone() {
         assert_eq!(source_label("live", &[]), "live");
+    }
+
+    /// **Interleaving several windows closes them, so it asks first — and says how many.**
+    ///
+    /// A count is the whole of what makes this a useful question. "Close some windows?" tells a
+    /// reader nothing they did not already know; "Close 4 windows" is the fact that decides it.
+    #[test]
+    fn folding_several_windows_asks_first_and_counts_them() {
+        let plan = Regroup::Interleave {
+            tabs: vec![0, 1, 2, 3],
+            apps: vec!["a".to_owned(), "b".to_owned()],
+        };
+        let asked = regroup_question(&plan).expect("closing four windows is worth a question");
+        assert!(asked.contains('4'), "the count is the point: {asked}");
+    }
+
+    /// The cases that are not a question: nothing is lost, so nothing is asked.
+    #[test]
+    fn a_command_that_closes_nothing_asks_nothing() {
+        assert_eq!(
+            regroup_question(&Regroup::Separate {
+                tab: 0,
+                apps: vec!["a".to_owned(), "b".to_owned()],
+            }),
+            None,
+            "separating reopens everything it closes"
+        );
+        assert_eq!(
+            regroup_question(&Regroup::Interleave {
+                tabs: vec![2],
+                apps: vec!["a".to_owned(), "b".to_owned()],
+            }),
+            None,
+            "folding one window into one window is a repaint"
+        );
     }
 }
