@@ -21,6 +21,85 @@ pub fn apply_theme(hwnd: windows::Win32::Foundation::HWND, dark: bool) {
     apply_theme_class(hwnd, dark, w!("DarkMode_Explorer"), w!("Explorer"));
 }
 
+/// Dresses a window **and every control inside it**, each in the class its own kind wants.
+///
+/// **One class for all of them does not work**, which is why this dispatches. An edit or a combo
+/// handed `DarkMode_Explorer` keeps a white field; the class that darkens a field's ground is
+/// `DarkMode_CFD`, the one the common file dialog uses. A list view needs `DarkMode_ItemsView`
+/// *and* its three colours set — the class dresses the scroll bars and the selection, not the
+/// ground, so a report list stays white without them. Statics are not themed at all: they are
+/// painted by their parent, through `WM_CTLCOLORSTATIC`.
+///
+/// The colours are passed in as `COLORREF`s rather than read here, so this module stays clear of
+/// the theme's own types — and so there is no third copy of `colourref` in the tree.
+pub fn apply_theme_tree(
+    hwnd: windows::Win32::Foundation::HWND,
+    dark: bool,
+    list_bg: u32,
+    list_ink: u32,
+) {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::EnumChildWindows;
+    apply_theme(hwnd, dark);
+    // Packed into one `LPARAM` because `EnumChildWindows` carries exactly one, and a pointer to a
+    // local would outlive nothing — the enumeration is synchronous and finishes before this does.
+    let packed = Box::into_raw(Box::new((dark, list_bg, list_ink)));
+    unsafe {
+        let _ = EnumChildWindows(hwnd, Some(dress_child), LPARAM(packed as isize));
+        drop(Box::from_raw(packed));
+    }
+}
+
+unsafe extern "system" fn dress_child(
+    hwnd: windows::Win32::Foundation::HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::BOOL {
+    use windows::core::w;
+    use windows::Win32::Foundation::{BOOL, LPARAM, WPARAM};
+    use windows::Win32::UI::Controls::{LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR};
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SendMessageW};
+
+    let (dark, list_bg, list_ink) = unsafe { *(lparam.0 as *const (bool, u32, u32)) };
+    let mut buffer = [0u16; 64];
+    let written = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    let class = String::from_utf16_lossy(&buffer[..written.max(0) as usize]);
+    match class.as_str() {
+        "Edit" | "ComboBox" => apply_theme_class(hwnd, dark, w!("DarkMode_CFD"), w!("CFD")),
+        "SysListView32" => {
+            apply_theme_class(hwnd, dark, w!("DarkMode_ItemsView"), w!("ItemsView"));
+            unsafe {
+                SendMessageW(hwnd, LVM_SETBKCOLOR, WPARAM(0), LPARAM(list_bg as isize));
+                SendMessageW(
+                    hwnd,
+                    LVM_SETTEXTBKCOLOR,
+                    WPARAM(0),
+                    LPARAM(list_bg as isize),
+                );
+                SendMessageW(hwnd, LVM_SETTEXTCOLOR, WPARAM(0), LPARAM(list_ink as isize));
+            }
+        }
+        // **A list view's header is a descendant, and needs the list's class, not Explorer's.**
+        // `EnumChildWindows` walks the whole tree rather than the immediate children, so the
+        // `SysHeader32` inside a report-view list arrives here — and the catch-all below would
+        // hand it `DarkMode_Explorer`, which [`apply_theme_class`]'s own note describes as leaving
+        // the band white with black text over a dark grid. `header.rs` and `main.rs` already make
+        // this exception for the grid's header; a review found the five dialogs with list views
+        // reproducing the defect it was written to fix.
+        "SysHeader32" => apply_theme_class(hwnd, dark, w!("DarkMode_ItemsView"), w!("ItemsView")),
+        // **Statics fall through to `Explorer` and take no visible harm from it** — what actually
+        // colours them is their parent's `WM_CTLCOLORSTATIC` answer.
+        //
+        // **Buttons take `Explorer`, and it is enough** — check boxes, radio buttons *and* push
+        // buttons all come back dark. That is worth saying because the expectation was the
+        // opposite: the menu bar's note in `docs/HANDOFF.md` records that Win32 offers no
+        // supported route to a dark menu, and the same was assumed of a push button. It is not so
+        // here, because `darkmode.rs` has already called `SetPreferredAppMode(ForceDark)` before
+        // any window exists, which is what lets comctl32 dress them. Screenshotted 2026-09-21.
+        _ => apply_theme(hwnd, dark),
+    }
+    BOOL(1)
+}
+
 /// The same, for a control whose dark class is not `Explorer`'s.
 ///
 /// **A header is the case that forced this.** `SetWindowTheme(header, "DarkMode_Explorer")` leaves

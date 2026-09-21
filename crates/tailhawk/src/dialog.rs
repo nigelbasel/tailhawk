@@ -793,7 +793,19 @@ unsafe extern "system" fn sources_proc(
     lparam: LPARAM,
 ) -> isize {
     match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
@@ -1265,7 +1277,19 @@ unsafe extern "system" fn columns_proc(
     lparam: LPARAM,
 ) -> isize {
     match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
@@ -1376,7 +1400,19 @@ pub fn show_columns_dialog(hwnd: HWND, data: &mut ColumnsPick) -> bool {
 
 unsafe extern "system" fn apps_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
     match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
@@ -2012,6 +2048,122 @@ fn rules_pick_colour(hdlg: HWND, state: &mut RulesState, which: tailhawk_core::r
 
 /// A colour as `COLORREF` — `0x00bbggrr`, which is the reverse of the `#rrggbb` the rules file
 /// and every other surface here use.
+/// Dresses a dialog and everything in it to match the app, and keeps the brush its
+/// `WM_CTLCOLOR*` answers need. Call from `WM_INITDIALOG`; the return value is untouched.
+///
+/// **`chrome_bg`, not `pane_bg`.** A dialog is chrome — the same family as the toolbar and the
+/// status bar — where the filter panel sits *inside* the log pane and takes the pane's ground.
+///
+/// **One brush per dialog, freed by [`drop_dialog_brush`] on `WM_DESTROY`.** `filterpanel.rs`
+/// carries the note explaining why: a brush shared between surfaces was deleted by whichever one
+/// closed first, and the rest went on painting with a freed GDI object.
+fn theme_dialog(hdlg: HWND) {
+    use windows::Win32::Graphics::Gdi::CreateSolidBrush;
+    let theme = tailhawk_core::theme::theme();
+    crate::controls::apply_theme_tree(
+        hdlg,
+        theme.dark,
+        colourref_theme(theme.pane_bg),
+        colourref_theme(theme.ink),
+    );
+    let solid = |c| unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(c)) };
+    let paint = Box::new(DialogPaint {
+        chrome: solid(colourref_theme(theme.chrome_bg)),
+        field: solid(colourref_theme(theme.field_bg)),
+    });
+    drop_dialog_brush(hdlg);
+    unsafe {
+        SetWindowLongPtrW(
+            hdlg,
+            windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+            Box::into_raw(paint) as isize,
+        );
+    }
+}
+
+/// The two brushes a themed dialog answers `WM_CTLCOLOR*` with.
+///
+/// **Two, because a field is not the ground.** The first screenshot of this work had a dark dialog
+/// with a white edit box sitting in it: `DarkMode_CFD` on an edit is documented in plenty of places
+/// and does not darken the field here. Painting it does. `GWLP_USERDATA` is one slot, so it holds a
+/// pointer to this pair rather than a single `HBRUSH`.
+struct DialogPaint {
+    /// The dialog's own ground, and what statics are drawn over.
+    chrome: windows::Win32::Graphics::Gdi::HBRUSH,
+    /// Edit boxes and list boxes — recessed, a shade off the ground, as a field should read.
+    field: windows::Win32::Graphics::Gdi::HBRUSH,
+}
+
+/// The `WM_CTLCOLORDLG | WM_CTLCOLORSTATIC` answer: the ink and ground, then the brush.
+///
+/// Returns `0` in the light theme, which is a dialog procedure's way of saying *not handled* — so
+/// the system paints it, and the light look is the system's own rather than a reproduction of it.
+fn dialog_colours(hdlg: HWND, msg: u32, wparam: WPARAM) -> isize {
+    use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HDC};
+    use windows::Win32::UI::WindowsAndMessaging::{WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX};
+    let theme = tailhawk_core::theme::theme();
+    if !theme.dark {
+        return 0;
+    }
+    let paint =
+        unsafe { GetWindowLongPtrW(hdlg, windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA) }
+            as *const DialogPaint;
+    if paint.is_null() {
+        return 0;
+    }
+    // A field is drawn on its own ground; everything else on the dialog's.
+    let field = msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX;
+    let ground = if field {
+        theme.field_bg
+    } else {
+        theme.chrome_bg
+    };
+    let dc = HDC(wparam.0 as *mut core::ffi::c_void);
+    unsafe {
+        SetTextColor(
+            dc,
+            windows::Win32::Foundation::COLORREF(colourref_theme(theme.ink)),
+        );
+        SetBkColor(
+            dc,
+            windows::Win32::Foundation::COLORREF(colourref_theme(ground)),
+        );
+        let brush = if field {
+            (*paint).field
+        } else {
+            (*paint).chrome
+        };
+        brush.0 as isize
+    }
+}
+
+/// Frees what [`theme_dialog`] created. Call from `WM_DESTROY`.
+fn drop_dialog_brush(hdlg: HWND) {
+    use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
+    let old = unsafe {
+        SetWindowLongPtrW(
+            hdlg,
+            windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+            0,
+        )
+    };
+    if old == 0 {
+        return;
+    }
+    let paint = unsafe { Box::from_raw(old as *mut DialogPaint) };
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(paint.chrome.0));
+        let _ = DeleteObject(HGDIOBJ(paint.field.0));
+    }
+}
+
+/// A theme colour as a `COLORREF`. Separate from [`colourref`] only because that one takes
+/// `highlight::Colour` and this takes `theme::Colour`; they are the same four floats.
+fn colourref_theme(c: tailhawk_core::theme::Colour) -> u32 {
+    let byte = |v: f32| u32::from((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    byte(c[0]) | (byte(c[1]) << 8) | (byte(c[2]) << 16)
+}
+
 fn colourref(c: tailhawk_core::highlight::Colour) -> u32 {
     let byte = |v: f32| u32::from((v.clamp(0.0, 1.0) * 255.0).round() as u8);
     byte(c[0]) | (byte(c[1]) << 8) | (byte(c[2]) << 16)
@@ -2030,7 +2182,19 @@ unsafe extern "system" fn rules_proc(
 ) -> isize {
     use tailhawk_core::ruleset::Cell;
     match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
@@ -2287,12 +2451,21 @@ unsafe extern "system" fn goto_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
+            theme_dialog(hdlg);
             // Focus goes to the box rather than to whichever button Windows would have picked,
-            // so the dialog is ready to be typed into. Returning 0 says the focus is already set.
+            // so the dialog is ready to be typed into. Returning 0 says the focus is already set,
+            // and theming above must not disturb that — it is why `theme_dialog` returns nothing.
             unsafe {
                 let _ = SetFocus(GetDlgItem(hdlg, i32::from(ID_G_LINE)).unwrap_or_default());
             }
             0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u16;
@@ -2336,6 +2509,7 @@ unsafe extern "system" fn goto_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam
             }
         }
         WM_DESTROY => {
+            drop_dialog_brush(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), 0);
             }
@@ -2444,7 +2618,19 @@ unsafe extern "system" fn prefs_proc(
     lparam: LPARAM,
 ) -> isize {
     match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
@@ -2510,7 +2696,19 @@ unsafe extern "system" fn keymap_proc(
     lparam: LPARAM,
 ) -> isize {
     match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             // One stop, past the widest keystroke column, in dialog units.
             let stop: u32 = 78;
             unsafe {
@@ -2779,7 +2977,17 @@ unsafe extern "system" fn find_proc(
     _lparam: LPARAM,
 ) -> isize {
     match msg {
-        WM_INITDIALOG => 1,
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
+        WM_INITDIALOG => {
+            theme_dialog(hdlg);
+            1
+        }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u16;
             match id {
@@ -2801,6 +3009,7 @@ unsafe extern "system" fn find_proc(
             }
         }
         WM_DESTROY => {
+            drop_dialog_brush(hdlg);
             crate::find_dialog_closed(hdlg);
             0
         }
@@ -3064,7 +3273,15 @@ unsafe extern "system" fn filter_proc(
     lparam: LPARAM,
 ) -> isize {
     match msg {
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             // The per-dialog state rides in a leaked box freed at WM_DESTROY; DWLP_USER carries
             // it, exactly as the other dialogs carry theirs.
             let edit = lparam.0 as *mut FilterEdit;
@@ -3220,6 +3437,7 @@ unsafe extern "system" fn filter_proc(
             }
         }
         WM_DESTROY => {
+            drop_dialog_brush(hdlg);
             let state = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) }
                 as *mut FilterState;
             if !state.is_null() {
@@ -4029,7 +4247,15 @@ unsafe extern "system" fn import_proc(
     lparam: LPARAM,
 ) -> isize {
     match msg {
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
@@ -4177,6 +4403,7 @@ unsafe extern "system" fn import_proc(
             1
         }
         WM_DESTROY => {
+            drop_dialog_brush(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), 0);
             }
@@ -4196,7 +4423,15 @@ unsafe extern "system" fn format_proc(
     lparam: LPARAM,
 ) -> isize {
     match msg {
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
         WM_INITDIALOG => {
+            theme_dialog(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
             }
@@ -4417,6 +4652,7 @@ unsafe extern "system" fn format_proc(
             1
         }
         WM_DESTROY => {
+            drop_dialog_brush(hdlg);
             unsafe {
                 SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), 0);
             }
