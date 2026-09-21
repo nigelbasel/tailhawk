@@ -626,10 +626,19 @@ impl Document {
     /// `query` is the source as this document was opened with — the settings source rewritten by
     /// `apps::with_apps` for the applications the user picked. It is kept so `Interleave` and
     /// `Separate` can regroup the windows without asking the server again what it holds.
-    fn remote(&mut self, source: &str, spill: &std::path::Path, query: &str, cut: bool) {
-        self.summary = source.to_owned();
+    ///
+    /// **`label` and `name` are two different things, and taking one for the other killed
+    /// regroup.** The label is what a reader sees — `live · 7 applications`, from
+    /// [`apps::source_label`](tailhawk_core::apps::source_label) — and changes with the
+    /// applications chosen. The name is the settings key the source is configured and its
+    /// credential stored under, and does not. `Interleave` and `Separate` resolve a tab back to a
+    /// configured source by that key, so handing them the label made the lookup compare
+    /// `"live · nurtur-gateway"` with `"live"`: it never matched, and both commands failed
+    /// silently, one of them from behind an enabled menu item.
+    fn remote(&mut self, label: &str, name: &str, spill: &std::path::Path, query: &str, cut: bool) {
+        self.summary = label.to_owned();
         self.remote_spill = Some(spill.to_path_buf());
-        self.remote_source = Some((source.to_owned(), query.to_owned()));
+        self.remote_source = Some((name.to_owned(), query.to_owned()));
         // The opening window can be cut before the tail has polled once — `LOKI.md` §6, and the
         // first live query returned exactly its limit and said nothing about it.
         self.answers_cut = cut;
@@ -6002,20 +6011,23 @@ impl Shell {
     /// The naming happens on the worker with the open rather than after it lands, because the
     /// document arrives through a channel and whatever reads it should never have to remember to
     /// finish building it.
+    ///
+    /// **The remote tuple carries the label and the name separately**, and `Document::remote` says
+    /// why: one is read and one is looked up, and this is where they used to be the same string.
     fn open_named(
         &mut self,
         hwnd: HWND,
         path: std::path::PathBuf,
-        remote: Option<(String, std::path::PathBuf, String, bool)>,
+        remote: Option<(String, String, std::path::PathBuf, String, bool)>,
     ) {
         self.file = Some(match &remote {
-            Some((source, _, _, _)) => format!("opening {source}…"),
+            Some((label, _, _, _, _)) => format!("opening {label}…"),
             None => format!("opening {}…", path.display()),
         });
         self.reading.push(spawn_open(move || {
             let mut doc = Document::open(&path)?;
-            if let Some((source, spill, query, cut)) = remote {
-                doc.remote(&source, &spill, &query, cut);
+            if let Some((label, name, spill, query, cut)) = remote {
+                doc.remote(&label, &name, &spill, &query, cut);
             }
             Ok(doc)
         }));
@@ -9432,6 +9444,11 @@ fn landed_records(
     // The query this window is a view of, kept before the source moves into the tail: `Interleave`
     // and `Separate` regroup the windows from it without asking the server anything.
     let query = source.query.clone();
+    // **And its configured name, taken here for the same reason and used for a different job.**
+    // `name` above is the *label* — the source and the applications chosen, as a reader sees it.
+    // This is the settings key, which is what `Interleave` and `Separate` look a tab back up by,
+    // and handing them the label instead is what made both of them fail in silence.
+    let key = source.name.clone();
     // **And now it tails.** Everything above is one window of history; this is what makes the
     // source live. The worker asks Loki for what is newer than the newest record just written and
     // appends it to this same spill, so the follow machinery that was already saying "● following"
@@ -9455,7 +9472,7 @@ fn landed_records(
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             // Named after the source, not after the part of the spill it happens to open on.
-            shell.open_named(hwnd, path, Some((name, spill_dir, query, cut)));
+            shell.open_named(hwnd, path, Some((name, key, spill_dir, query, cut)));
         }
     });
 }
@@ -12907,6 +12924,7 @@ mod tests {
 
         doc.remote(
             "live-identity-and-campaigns",
+            "live",
             &spill,
             r#"{environment="live"}"#,
             false,
@@ -13797,6 +13815,39 @@ mod tests {
         );
     }
 
+    /// **The label goes in the title; the source's *name* is what says two windows watch the same
+    /// place.** They are different strings the moment applications are chosen, and conflating them
+    /// is what killed regroup.
+    ///
+    /// `Format > Interleave` and `Format > Separate` both resolve the active tab back to a
+    /// configured source with `settings.sources.find(|s| s.name == name)`. That name arrives here
+    /// through `open_named`, which was handing over the *label* — so the lookup compared
+    /// `"live · nurtur-gateway"` against `"live"`, never matched, and the command returned in
+    /// silence with its menu item showing enabled. The other direction never even appeared,
+    /// because no two separately-opened tabs share a label and so nothing was ever found to fold.
+    ///
+    /// Both `Document::remote_source` and `apps::Tab` carried doc comments promising this field
+    /// held the settings key, which is presumably how it survived being wrong.
+    #[test]
+    fn a_remote_document_keeps_the_sources_name_apart_from_its_label() {
+        let path = scratch_log("tailhawk_remote_identity_test.log", 8);
+        let spill = path.parent().expect("a directory").to_path_buf();
+        let mut doc = Document::open(&path).expect("open");
+        doc.remote(
+            "live \u{b7} 7 applications",
+            "live",
+            &spill,
+            r#"{environment="live"}"#,
+            false,
+        );
+        assert_eq!(doc.summary, "live \u{b7} 7 applications", "the title reads");
+        assert_eq!(
+            doc.remote_source.as_ref().map(|(name, _)| name.as_str()),
+            Some("live"),
+            "the identity is the settings key, which is what regroup looks up"
+        );
+    }
+
     /// **A cut on the opening window reaches the document it opens**, before the tail has polled
     /// once: `landed_records` decides it, `Document::remote` carries it, and the status says it.
     /// The tick that ORs in a later cut is plumbing this cannot reach, but the opening path is the
@@ -13807,9 +13858,21 @@ mod tests {
         let spill = path.parent().expect("a directory").to_path_buf();
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
-        doc.remote("a-source", &spill, r#"{environment="live"}"#, false);
+        doc.remote(
+            "a-source",
+            "a-source",
+            &spill,
+            r#"{environment="live"}"#,
+            false,
+        );
         assert!(!doc.answers_cut, "an answer under the limit is not cut");
-        doc.remote("a-source", &spill, r#"{environment="live"}"#, true);
+        doc.remote(
+            "a-source",
+            "a-source",
+            &spill,
+            r#"{environment="live"}"#,
+            true,
+        );
         assert!(doc.answers_cut);
         assert!(
             doc.describe().contains("answers cut at the limit"),
@@ -15820,6 +15883,63 @@ mod tests {
     }
     /// V7's model: the shown tab is what every handler means by the document; cycling wraps; closing
     /// the last leaves an empty shell rather than a dangling index.
+    /// **The seam that broke: what `regroup_of` is handed as a tab's identity.**
+    ///
+    /// `Document::remote` keeping the name apart from the label is only half the fix — the other
+    /// half is that `regroup_tabs` reads the right one out again. Two windows on the same
+    /// configured source, labelled differently because different applications were chosen, must
+    /// arrive at `regroup_of` as one source; that is exactly what "no two separately-opened tabs
+    /// share a label" used to prevent, leaving `Interleave` permanently unoffered.
+    ///
+    /// The review that found the defect noted there was no test across this seam — only the
+    /// unit tests either side of it, each assuming the other end behaved.
+    #[test]
+    fn two_windows_of_one_source_reach_regroup_as_one_source() {
+        let a = scratch_log("tailhawk_regroup_a.log", 6);
+        let b = scratch_log("tailhawk_regroup_b.log", 6);
+        let spill = a.parent().expect("a directory").to_path_buf();
+        let mut tabs = Tabs::default();
+
+        let mut first = Document::open(&a).expect("a");
+        first.remote(
+            "live \u{b7} nurtur-gateway",
+            "live",
+            &spill,
+            r#"{environment="live", app=~"nurtur-gateway"}"#,
+            false,
+        );
+        let mut second = Document::open(&b).expect("b");
+        second.remote(
+            "live \u{b7} nurtur-identity-server",
+            "live",
+            &spill,
+            r#"{environment="live", app=~"nurtur-identity-server"}"#,
+            false,
+        );
+        tabs.push(first);
+        tabs.push(second);
+
+        let seen = tabs.regroup_tabs();
+        assert_eq!(seen.len(), 2);
+        for tab in &seen {
+            assert_eq!(
+                tab.source.as_deref(),
+                Some("live"),
+                "the identity must be the settings key, not the label"
+            );
+        }
+        // And with one identity between them, the two windows can be folded — the direction that
+        // could never be offered while the label stood in for the name.
+        assert!(
+            matches!(
+                tailhawk_core::apps::regroup_of(&seen, 0),
+                Some(tailhawk_core::apps::Regroup::Interleave { .. })
+            ),
+            "two windows of one source should offer to interleave: {:?}",
+            tailhawk_core::apps::regroup_of(&seen, 0)
+        );
+    }
+
     #[test]
     fn tabs_show_one_document_cycle_and_close_safely() {
         let a = scratch_log("tailhawk_tabs_a.log", 10);

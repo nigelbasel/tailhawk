@@ -14,7 +14,11 @@ right-hand side of the window.**
 Grouped into five pieces of work, in this order: columns, toolbar, status bar, title bar, help
 document. Two of the ten are questions rather than defects and are answered in the help document.
 
-**Done: columns (`86a5ac9`, green on all five jobs).** `Layout::from_sample` caps each column at
+**All ten have work against them and nine are landed, each green on all five CI jobs**: `86a5ac9`
+columns, `0906b71` status bar, `0ea06f6` the harness that reads it, `a08e3fd` toolbar, `f99d286`
+help document and F1, `1104e3e` the title bar. What each one was, below.
+
+**Columns (`86a5ac9`).** `Layout::from_sample` caps each column at
 `MAX_CELLS` but nothing capped the *row*, so a JSON telemetry record's label columns consumed the
 window and the message — which is last and takes "the rest of the row" — got none of it.
 `Layout::only_understood` hides the columns a `json-lines` format invented, keeping timestamp,
@@ -25,7 +29,28 @@ so widening the window brings columns back. `Document::columns_customised` is wh
 default rather than an owner of the widths — without it a file's remembered layout, restored by
 `apply_state` *before* the first `lay_out`, was discarded on every open.
 
-**Done, pending commit: the status bar is eight panes** — message, position, find, filter, view,
+**Item 8, "the toolbar buttons look amateur", is the one that is not finished, and it cannot be
+finished from here.** The measurable half is fixed — the glyphs were tinted with `theme().ink`,
+body-text grey, and comctl32 derived the disabled look from that, so every button read as dead.
+What is left is stroke weight, spacing, and whether a system icon font is the right choice at all,
+which is a judgement about taste. **The owner has been asked to look at the row and say what still
+reads badly; do not guess at it again.** The one concrete theory this session had — that the
+glyphs sat small and off-centre — was disproved by a screenshot.
+
+**`F1` opens the help document; the keyboard map moved to `Shift+F1`.** The owner: "f1 is
+traditioally the key for asking for help. This has been true since the earliest versions of
+windows ad DOS before it." Do not move it back.
+
+**A pre-existing defect found by review and fixed after it: regroup was dead in production.**
+`open_named` handed `Document::remote` the display label where the settings *name* belongs, so
+`regroup_now`'s `settings.sources.find(|s| s.name == name)` compared `"live · nurtur-gateway"`
+with `"live"` and never matched. `Format > Separate` showed enabled and did nothing; `Interleave`
+was never offered, because no two separately-opened tabs shared an identity to fold. Both
+`Document::remote_source` and `apps::Tab` carried doc comments promising the field held the
+settings key — which is presumably how it survived, and is worth remembering when a comment and a
+wiring disagree. `remote` takes `label` and `name` separately now.
+
+**Done: the status bar is eight panes** — message, position, find, filter, view,
 format, encoding, tail — decided by `statusbar::status_panes_of` and laid out by `edges_of`, both
 pure and tested. The GPU driver name is gone. **Read `UI-DESIGN.md` §1.1's new note before touching
 this**: the first cut had no field for the Loki lag, the export progress, the sort, the invisibles
@@ -40,12 +65,6 @@ write "format saved to …" and friends into it have never reached the screen. T
 is restored exactly as it was. Removing both is a follow-up, not something to fold into a status-bar
 commit.
 
-**Next:** the toolbar. The greying is `toolbar.rs:764` tinting every glyph with `theme().ink` — the
-colour *body text* is drawn in, a soft grey close to what Windows uses for a disabled icon, from
-which comctl32 then derives the disabled variant, leaving enabled and disabled a few percent apart.
-The "amateur" half is not yet proved: the glyphs are drawn with `DT_VCENTER` on an icon font's line
-metrics rather than centred on the glyph's own ink, which would sit them small and slightly high in
-their boxes — **confirm that against a screenshot before acting on it.**
 
 ---
 
