@@ -62,21 +62,46 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 
-// **Every pane, joined — not WM_GETTEXT.** The bar carried one composed sentence until
-// 2026-09-21 and now carries eight parts, and WM_GETTEXT answers for the first of them only.
-// A harness reading that would have seen the message pane and none of the facts, which is
-// exactly the half a readiness check needs. SB_GETPARTS with a null array reports the count.
+// **Every pane, joined — and the buffer has to live in Tailhawk's address space.**
+//
+// The bar carried one composed sentence until 2026-09-21 and now carries eight parts, so a
+// harness that reads it must read all of them: WM_GETTEXT answers for the first part only,
+// which is the message pane and none of the facts a readiness check waits on.
+//
+// The trap, which cost a desktop run to find: **SB_GETTEXT is a WM_USER-range message, and
+// Windows does not marshal those across processes.** USER32 marshals WM_GETTEXT — copying the
+// string between address spaces — precisely because it is a standard message; SB_GETTEXT is
+// not one, so the `lParam` pointer is passed through untouched and dereferenced inside
+// Tailhawk, where it means nothing. A StringBuilder here reads back empty, silently, against
+// any build. The fix is the documented one: allocate the buffer *in the target process* and
+// read it back. SB_GETPARTS with a null array is safe as it stands — it dereferences nothing
+// and only returns the count.
 public static class StatusText {
     public delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, StringBuilder l);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr addr, IntPtr size, uint type, uint prot);
+    [DllImport("kernel32.dll")]
+    static extern bool VirtualFreeEx(IntPtr p, IntPtr addr, IntPtr size, uint type);
+    [DllImport("kernel32.dll")]
+    static extern bool ReadProcessMemory(IntPtr p, IntPtr addr, byte[] buf, IntPtr n, out IntPtr read);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr h);
+
     const uint SB_GETPARTS = 0x0406;
     const uint SB_GETTEXTW = 0x040D;
+    const uint PROCESS_VM_OPERATION = 0x0008, PROCESS_VM_READ = 0x0010, PROCESS_VM_WRITE = 0x0020;
+    const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, MEM_RELEASE = 0x8000;
+    const uint PAGE_READWRITE = 0x04;
+    const int BYTES = 4096;
 
     public static IntPtr Bar(IntPtr window) {
         IntPtr bar = IntPtr.Zero;
@@ -95,14 +120,31 @@ public static class StatusText {
         if (bar == IntPtr.Zero) { return ""; }
         int parts = (int)SendMessageW(bar, SB_GETPARTS, IntPtr.Zero, IntPtr.Zero);
         if (parts <= 0) { parts = 1; }
+
+        uint pid;
+        GetWindowThreadProcessId(bar, out pid);
+        IntPtr proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, false, pid);
+        if (proc == IntPtr.Zero) { return ""; }
+        IntPtr remote = VirtualAllocEx(proc, IntPtr.Zero, (IntPtr)BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (remote == IntPtr.Zero) { CloseHandle(proc); return ""; }
+
         StringBuilder all = new StringBuilder();
-        for (int i = 0; i < parts; i++) {
-            StringBuilder text = new StringBuilder(1024);
-            SendMessageW(bar, SB_GETTEXTW, (IntPtr)i, text);
-            string one = text.ToString();
-            if (one.Length == 0) { continue; }
-            if (all.Length > 0) { all.Append(" | "); }
-            all.Append(one);
+        try {
+            for (int i = 0; i < parts; i++) {
+                SendMessageW(bar, SB_GETTEXTW, (IntPtr)i, remote);
+                byte[] buf = new byte[BYTES];
+                IntPtr read;
+                if (!ReadProcessMemory(proc, remote, buf, (IntPtr)BYTES, out read)) { continue; }
+                string one = Encoding.Unicode.GetString(buf);
+                int end = one.IndexOf('\0');
+                if (end >= 0) { one = one.Substring(0, end); }
+                if (one.Length == 0) { continue; }
+                if (all.Length > 0) { all.Append(" | "); }
+                all.Append(one);
+            }
+        } finally {
+            VirtualFreeEx(proc, remote, IntPtr.Zero, MEM_RELEASE);
+            CloseHandle(proc);
         }
         return all.ToString();
     }
