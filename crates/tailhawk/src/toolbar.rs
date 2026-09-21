@@ -27,10 +27,10 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT,
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
-    GetDC, GetGlyphIndicesW, ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DIB_RGB_COLORS, DT_CENTER, DT_NOCLIP, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HBITMAP, HDC,
-    HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    GetDC, GetGlyphIndicesW, GetSysColor, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNTEXT,
+    COLOR_GRAYTEXT, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_NOCLIP, DT_SINGLELINE,
+    DT_VCENTER, FW_NORMAL, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     ImageList_Add, ImageList_Create, ImageList_Destroy, InitCommonControlsEx, BTNS_AUTOSIZE,
@@ -825,7 +825,8 @@ impl Toolbar {
         // soft ink lands almost on top of the original — the owner's "every icon looks like it is
         // greyed out". [`icon_tints`] decides both, and `TB_SETDISABLEDIMAGELIST` is how a Win32
         // toolbar is told the second one rather than left to guess.
-        let (enabled, faded) = icon_tints(&tailhawk_core::theme::theme());
+        let (enabled, faded) =
+            unsafe { icon_tints(GetSysColor(COLOR_BTNTEXT), GetSysColor(COLOR_GRAYTEXT)) };
         let glyphs: Vec<char> = buttons.iter().map(|b| b.icon).collect();
         let fresh = icon_list(px, enabled, &glyphs);
         if let Some(list) = fresh {
@@ -1245,50 +1246,34 @@ pub fn state_bits(b: &ToolButton) -> u8 {
 
 /// The two colours the toolbar's glyphs are drawn in: enabled, then disabled, as `0x00RRGGBB`.
 ///
-/// **The owner, 2026-09-21: "every icon looks like it is greyed out".** The bar drew one image
-/// list tinted with `theme().ink` — the colour *body text* is drawn in, a soft grey — and left
-/// comctl32 to derive the disabled appearance from it, which it does by washing the bitmap out
-/// further. Starting from a grey, "washed out further" lands a few percent away, so every button
-/// looked disabled and the ones that *were* disabled looked no different.
+/// **The band is the system's, not the document's, and taking it for the document's is what made
+/// the icons invisible.** The owner reported twice — "every icon looks like it is greyed out",
+/// then, after a fix built on the document theme, "the toolbar colour is still grey". Measured on
+/// his machine the toolbar band is `255,255,255` while the grid beside it is `25,25,25`: Windows
+/// is in light app mode, so the menu and the rebar are native white, and only the parts Tailhawk
+/// paints itself are dark. Tinting from `theme().ink` drew a near-white glyph on a white band.
 ///
-/// So both are decided here instead. The enabled tint is the ink pushed to full strength — toward
-/// white on a dark chrome, toward black on a light one — because an icon is a shape read at a
-/// glance rather than a paragraph read at length, and wants more contrast than text, not less.
-/// The disabled tint is the ink blended most of the way into the chrome it sits on, which is what
-/// Windows' own disabled icons look like and is unmistakably not the enabled one.
-pub fn icon_tints(theme: &tailhawk_core::theme::Theme) -> (u32, Option<u32>) {
-    let pack = |c: [f32; 4]| {
-        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
-        (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
-    };
-    // **High Contrast gets the system's own foreground, and no second colour at all.**
-    //
-    // §11.2: "system colours are respected". `Theme::high_contrast` is built from the pair the
-    // user configured for accessibility and blends nothing — and a toolbar that mixed its own
-    // 65 % of white into that foreground would be painting a colour they did not choose, for
-    // precisely the readers who chose theirs deliberately. `None` leaves the faded list unsent,
-    // so comctl32 draws a disabled button by the system's rules, which under High Contrast is
-    // what respecting them means.
-    if theme.suppress_rules {
-        return (pack(theme.ink), None);
-    }
-    let mix = |a: [f32; 4], b: [f32; 4], t: f32| {
-        [
-            a[0] + (b[0] - a[0]) * t,
-            a[1] + (b[1] - a[1]) * t,
-            a[2] + (b[2] - a[2]) * t,
-            1.0,
-        ]
-    };
-    let full = if theme.dark {
-        [1.0, 1.0, 1.0, 1.0]
-    } else {
-        [0.0, 0.0, 0.0, 1.0]
-    };
-    (
-        pack(mix(theme.ink, full, 0.65)),
-        Some(pack(mix(theme.ink, theme.chrome_bg, 0.58))),
-    )
+/// So the colours come from the band the control actually sits on. `COLOR_BTNTEXT` and
+/// `COLOR_GRAYTEXT` are what every other Windows toolbar draws with, they track the app mode
+/// without being asked, and under High Contrast they are already the pair the reader configured —
+/// which is §11.2 satisfied by construction rather than by a special case.
+///
+/// The disabled colour is still *supplied* rather than derived, because that half of the original
+/// diagnosis holds: given one list, comctl32 washes it out, and from a soft ink that lands almost
+/// back on the enabled colour.
+pub fn icon_tints(button_text: u32, disabled_text: u32) -> (u32, Option<u32>) {
+    (rgb_of(button_text), Some(rgb_of(disabled_text)))
+}
+
+/// A `COLORREF` as [`draw_glyph`] wants it: `0x00BBGGRR` in, `0x00RRGGBB` out.
+///
+/// **Windows stores a colour with red in the low byte and this file's glyphs expect it in the
+/// high one**, so passing a `GetSysColor` result straight through would swap red and blue. The
+/// system's button text is usually black or white, where the swap is invisible — and then a
+/// coloured High Contrast scheme, which is exactly the reader who cannot afford it, gets the
+/// wrong one.
+fn rgb_of(colorref: u32) -> u32 {
+    ((colorref & 0xFF) << 16) | (colorref & 0xFF00) | ((colorref >> 16) & 0xFF)
 }
 
 /// How light a packed `0x00RRGGBB` is, 0.0 to 1.0 — Rec. 601 luma, which is what the eye reads.
@@ -1515,88 +1500,61 @@ mod tests {
         }
     }
 
-    /// **The defect the owner reported, as a property: the two states must look different.**
+    /// **Red and blue, the trap that only shows on a coloured scheme.**
     ///
-    /// One image list tinted with `theme().ink` left comctl32 to derive the disabled look by
-    /// washing the bitmap out, and from a soft grey that lands almost on top of the enabled one —
-    /// so every button read as dead. A quarter of the luma range apart is a difference nobody has
-    /// to squint at, and it is the thing that was actually wrong rather than any one colour.
+    /// `GetSysColor` answers a `COLORREF` — red in the *low* byte — and [`draw_glyph`] takes red
+    /// in the high one. Passing one straight to the other swaps them, which is invisible for the
+    /// black or white a button text usually is, and wrong for a High Contrast scheme that chose a
+    /// colour. This is the one place the two conventions meet.
     #[test]
-    fn an_enabled_icon_and_a_disabled_one_are_plainly_different_in_both_themes() {
-        for theme in [
-            tailhawk_core::theme::Theme::dark(),
-            tailhawk_core::theme::Theme::light(),
-        ] {
-            let (enabled, disabled) = icon_tints(&theme);
-            let disabled = disabled.expect("an ordinary theme supplies its own faded glyphs");
-            let gap = (luma(enabled) - luma(disabled)).abs();
+    fn a_system_colour_arrives_with_its_red_and_blue_the_right_way_round() {
+        // COLORREF 0x00BBGGRR: this is pure red as Windows writes it.
+        assert_eq!(rgb_of(0x0000_00FF), 0x00FF_0000);
+        // And pure blue.
+        assert_eq!(rgb_of(0x00FF_0000), 0x0000_00FF);
+        // Green is its own mirror, so it proves nothing on its own and is here to say so.
+        assert_eq!(rgb_of(0x0000_FF00), 0x0000_FF00);
+        // A colour with all three distinct, which is what a High Contrast scheme can hand over.
+        assert_eq!(rgb_of(0x0012_3456), 0x0056_3412);
+    }
+
+    /// **The icons take the colours of the band they are drawn on, which is the system's.**
+    ///
+    /// The owner reported grey icons twice. The first fix tinted them from `theme().ink` and the
+    /// second report was "the toolbar colour is still grey" — because Windows was in light app
+    /// mode, so the toolbar band measured `255,255,255` while the grid beside it measured
+    /// `25,25,25`, and a tint derived from the *document's* dark theme drew a near-white glyph on
+    /// a white band. Reading the system's own button text is what makes the glyph match its
+    /// ground in every app mode, and under High Contrast without a special case.
+    #[test]
+    fn the_glyphs_take_the_systems_button_text_and_its_disabled_grey() {
+        // A light app mode: near-black button text, mid grey for what cannot act.
+        let (enabled, faded) = icon_tints(0x0000_0000, 0x0069_6969);
+        assert_eq!(
+            enabled, 0x0000_0000,
+            "the glyph is the system's button text"
+        );
+        assert_eq!(faded, Some(0x0069_6969), "and the system's disabled grey");
+
+        // A dark app mode swaps the band and the text with it, and nothing here has to know.
+        let (enabled, faded) = icon_tints(0x00FF_FFFF, 0x0080_8080);
+        assert_eq!(enabled, 0x00FF_FFFF);
+        assert_eq!(faded, Some(0x0080_8080));
+    }
+
+    /// A disabled glyph must still be plainly different from an enabled one — the half of the
+    /// original diagnosis that held. The system's own pair satisfies it; this says so, so that a
+    /// future change back to a derived colour has to argue with a test.
+    #[test]
+    fn an_enabled_icon_and_a_disabled_one_are_plainly_different() {
+        for (text, grey) in [(0x0000_0000u32, 0x0069_6969u32), (0x00FF_FFFF, 0x0080_8080)] {
+            let (enabled, faded) = icon_tints(text, grey);
+            let faded = faded.expect("the system always has a disabled colour");
+            let gap = (luma(enabled) - luma(faded)).abs();
             assert!(
                 gap > 0.25,
-                "enabled {enabled:06X} and disabled {disabled:06X} are only {gap:.3} apart in \
-                 luma — which is the complaint, not the fix"
+                "enabled {enabled:06X} and disabled {faded:06X} are only {gap:.3} apart in luma"
             );
         }
-    }
-
-    /// An icon carries more contrast than the text beside it, in whichever direction the theme
-    /// runs — the ink is the floor for a glyph, not the target.
-    #[test]
-    fn an_enabled_icon_has_more_contrast_than_body_text_does() {
-        let dark = tailhawk_core::theme::Theme::dark();
-        let (enabled, _) = icon_tints(&dark);
-        assert!(
-            luma(enabled) > luma(pack_for_test(dark.ink)),
-            "on a dark chrome the glyph must be lighter than the ink"
-        );
-
-        let light = tailhawk_core::theme::Theme::light();
-        let (enabled, _) = icon_tints(&light);
-        assert!(
-            luma(enabled) < luma(pack_for_test(light.ink)),
-            "on a light chrome it must be darker"
-        );
-    }
-
-    fn pack_for_test(c: [f32; 4]) -> u32 {
-        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
-        (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
-    }
-
-    /// **§11.2: under High Contrast the system's colours are the only ones on screen.**
-    ///
-    /// `Theme::high_contrast` is built from the pair the reader configured for accessibility and
-    /// blends nothing; a toolbar mixing its own 65 % of white into that foreground would be
-    /// painting a colour they did not choose, for exactly the readers who chose theirs on
-    /// purpose. The first cut of `icon_tints` did that for every theme, and the two tests above
-    /// could not see it because neither passed it a High Contrast theme.
-    ///
-    /// No faded list either: comctl32 draws a disabled button by the system's rules, and under
-    /// High Contrast deferring to them *is* respecting them.
-    #[test]
-    fn high_contrast_gets_the_systems_own_colours_and_no_invented_ones() {
-        let theme = tailhawk_core::theme::Theme::high_contrast(
-            [1.0, 1.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0, 1.0],
-        );
-        let (enabled, faded) = icon_tints(&theme);
-        assert_eq!(
-            enabled,
-            pack_for_test(theme.ink),
-            "the glyph must be the system foreground exactly, not a blend of it"
-        );
-        assert_eq!(faded, None, "Windows decides what disabled looks like here");
-    }
-
-    /// The exact colours, so the packing is pinned rather than only ever compared with itself.
-    ///
-    /// The production value and the tests' bounds both go through the same round-and-shift, so an
-    /// error there would cancel out of every luma comparison above instead of failing one. These
-    /// two were worked out by hand from `Theme::dark()`'s ink and chrome and the two mix factors.
-    #[test]
-    fn the_dark_themes_tints_are_the_colours_the_arithmetic_says() {
-        let (enabled, faded) = icon_tints(&tailhawk_core::theme::Theme::dark());
-        assert_eq!(enabled, 0x00F4_F5F7);
-        assert_eq!(faded, Some(0x006D_7074));
     }
 }
