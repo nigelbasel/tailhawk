@@ -491,7 +491,7 @@ pub fn shortcut_id(key: u16, ctrl: bool, shift: bool) -> Option<u32> {
 pub fn menu_bar(
     doc: Option<&Document>,
     state: BarState,
-    recent: &[String],
+    recent: &[tailhawk_core::settings::Recent],
     sources: &[String],
     // **Not `columns`**: this function already binds that name to a bool — whether the document has
     // any columns at all — and a parameter of the same name is silently shadowed by it. The slice
@@ -832,8 +832,24 @@ pub fn menu_bar(
 /// One recent-file entry: the customary numbered mnemonic — `&1` through `&9`, then `1&0` — and
 /// the path. A literal `&` in the path is doubled so it draws as itself instead of underlining
 /// the next letter.
-fn recent_label(n: usize, path: &str) -> String {
-    let shown = compact_path(path, RECENT_LABEL_CHARS).replace('&', "&&");
+fn recent_label(n: usize, entry: &tailhawk_core::settings::Recent) -> String {
+    // **A source is not a path and must not be compacted like one.** `compact_path` elides the
+    // middle to keep a filename and a drive; a source's name has neither, and eliding it would
+    // take out the applications that say which window this was.
+    let shown = match entry {
+        tailhawk_core::settings::Recent::File(path) => compact_path(path, RECENT_LABEL_CHARS),
+        tailhawk_core::settings::Recent::Remote { source, apps } => {
+            let names: Vec<&str> = apps.iter().map(String::as_str).collect();
+            // **Capped, because `source_label` only counts once there are more than three.** Up to
+            // three it spells them out in full, and three long service names beside a long source
+            // name make a menu row twice the width of every file row beside it.
+            elide(
+                &tailhawk_core::apps::source_label(source, &names),
+                RECENT_LABEL_CHARS,
+            )
+        }
+    }
+    .replace('&', "&&");
     match n {
         9 => format!("1&0  {shown}"),
         n => format!("&{}  {shown}", n + 1),
@@ -842,6 +858,19 @@ fn recent_label(n: usize, path: &str) -> String {
 
 /// What fits on a menu row comfortably, in characters.
 const RECENT_LABEL_CHARS: usize = 48;
+
+/// Cuts `text` to `max` characters, marking the cut — for a label with no structure to preserve.
+///
+/// [`compact_path`] elides a path's *middle* because its two ends identify it: the drive and the
+/// filename. A source's name has no such shape — it reads left to right and the source comes
+/// first — so this keeps the head and says where it stopped.
+fn elide(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
 
 /// Elides the middle of a path that will not fit: the tail survives whole because the filename is
 /// the part that identifies the entry, and enough head survives to say which drive and root.
@@ -1399,7 +1428,9 @@ mod tests {
     /// recent files` claimed the `C` that `&Close Tab` already had.
     #[test]
     fn no_two_items_in_one_menu_share_a_mnemonic() {
-        let recent: Vec<String> = (1..=10).map(|n| format!("C:\\logs\\app{n}.log")).collect();
+        let recent: Vec<tailhawk_core::settings::Recent> = (1..=10)
+            .map(|n| tailhawk_core::settings::Recent::File(format!(r"C:\logs\app{n}.log")))
+            .collect();
         let mut clashes: Vec<String> = Vec::new();
 
         for (shape, menu) in [
@@ -1624,8 +1655,8 @@ mod tests {
         );
 
         let paths = vec![
-            r"C:\logs\newest.log".to_owned(),
-            r"C:\logs\older.log".to_owned(),
+            tailhawk_core::settings::Recent::File(r"C:\logs\newest.log".to_owned()),
+            tailhawk_core::settings::Recent::File(r"C:\logs\older.log".to_owned()),
         ];
         let menu = menu_bar(
             None,
@@ -1661,20 +1692,74 @@ mod tests {
     /// A path too long for a menu row loses its middle, never its filename.
     #[test]
     fn a_long_recent_path_keeps_its_filename() {
+        let file = |p: &str| tailhawk_core::settings::Recent::File(p.to_owned());
         let path = r"C:\a\deeply\nested\folder\structure\holding\seventy\characters\of\path\app-service.log";
-        let label = recent_label(0, path);
+        let label = recent_label(0, &file(path));
         assert!(label.ends_with("app-service.log"), "{label}");
         assert!(label.contains('…'), "{label}");
         assert!(
             label.chars().count() <= RECENT_LABEL_CHARS + 5,
             "{label} is still too wide for a menu row"
         );
-        let short = recent_label(1, r"C:\logs\b.log");
+        let short = recent_label(1, &file(r"C:\logs\b.log"));
         assert!(!short.contains('…'), "a short path is shown whole");
         // The tenth entry's mnemonic is the zero, the customary MRU shape.
-        assert!(recent_label(9, r"C:\x.log").starts_with("1&0"));
+        assert!(recent_label(9, &file(r"C:\x.log")).starts_with("1&0"));
         // A literal ampersand draws as itself.
-        assert!(recent_label(0, r"C:\a&b.log").contains("&&"));
+        assert!(recent_label(0, &file(r"C:\a&b.log")).contains("&&"));
+    }
+
+    /// **A remote entry is named, not compacted.**
+    ///
+    /// `compact_path` elides the middle of a path to keep the filename and the drive. A source has
+    /// neither, and running it through the same treatment would take out the applications — the
+    /// part that says which of several windows on one source this entry was.
+    #[test]
+    fn a_remote_recent_is_labelled_as_a_source_and_keeps_its_mnemonic() {
+        let one = tailhawk_core::settings::Recent::Remote {
+            source: "live".to_owned(),
+            apps: vec!["nurtur-gateway".to_owned()],
+        };
+        let label = recent_label(0, &one);
+        assert!(
+            label.starts_with("&1  "),
+            "the mnemonic is still there: {label}"
+        );
+        assert!(label.contains("live"), "{label}");
+        assert!(label.contains("nurtur-gateway"), "{label}");
+        assert!(!label.contains('…'), "a source is not elided: {label}");
+
+        // And a wide selection counts rather than listing, exactly as the title bar does.
+        let many = tailhawk_core::settings::Recent::Remote {
+            source: "live".to_owned(),
+            apps: (1..=9).map(|n| format!("service-{n}")).collect(),
+        };
+        let label = recent_label(1, &many);
+        assert!(label.contains("9 applications"), "{label}");
+    }
+
+    /// **A remote row is held to the same width as a file row.**
+    ///
+    /// `source_label` spells out up to three applications in full, so three long service names
+    /// beside a long source name make a row twice the width of every path beside it — a path being
+    /// compacted to 48 characters and this, until it was capped, not being compacted at all.
+    #[test]
+    fn a_wide_remote_recent_is_cut_to_the_width_a_file_row_keeps() {
+        let wide = tailhawk_core::settings::Recent::Remote {
+            source: "nurtur-identity-server-production".to_owned(),
+            apps: vec![
+                "nurtur-gateway-internal".to_owned(),
+                "nurtur-identity-worker".to_owned(),
+                "nurtur-campaign-orchestrator".to_owned(),
+            ],
+        };
+        let label = recent_label(0, &wide);
+        assert!(
+            label.chars().count() <= RECENT_LABEL_CHARS + 5,
+            "{label} is {} characters, wider than a file row",
+            label.chars().count()
+        );
+        assert!(label.contains('…'), "and it says where it was cut: {label}");
     }
 
     /// With no document open, everything that needs one is disabled — and `Open…` is not, or the

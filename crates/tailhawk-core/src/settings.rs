@@ -189,9 +189,108 @@ pub struct Settings {
     /// for large and small toolbars, that is a common option of standard windows apps".
     pub toolbar_large: Option<bool>,
     /// File ▸ Open Recent, newest first, at most [`RECENT_MAX`].
-    pub recent: Vec<String>,
+    pub recent: Vec<Recent>,
     /// The Find dialog's query history, newest first, at most [`FIND_MAX`].
     pub find_queries: Vec<String>,
+}
+
+/// One entry in File ▸ Open Recent: a file on disk, or a remote source and what was chosen from it.
+///
+/// **A remote source is as worth reopening as a file, and until 2026-09-21 only files were kept.**
+/// The owner: "I would also like the recently used files to allow supporting the recent remote
+/// opens." A remote open is not a path — it is a configured source plus the applications picked
+/// from it — so the list holds either, in one sequence, because recency runs across both.
+///
+/// **Written as `loki://source?apps=a,b`, and that scheme is chosen so it cannot be a path.** A
+/// Windows drive is one letter, so no file has ever begun `loki://`; anything that does is a
+/// remote entry and anything that does not is a file, with no flag to fall out of step with the
+/// value beside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recent {
+    File(String),
+    Remote { source: String, apps: Vec<String> },
+}
+
+/// The prefix that marks a recent entry as a remote source rather than a path.
+const REMOTE_SCHEME: &str = "loki://";
+
+/// What makes two recent entries the same entry rather than two.
+///
+/// **A path folds case; a source does not, and folding one would lose a window.** Windows opens
+/// `C:\LOGS\A.LOG` and `C:\logs\a.log` as one file, so the list must too. A Loki `app` value is a
+/// server-side string compared exactly — nothing in [`crate::apps`] folds it — and a source name
+/// is the key its credential is stored under, which `Shell::reopen_remote` matches exactly. So a
+/// reader who has `live` open on `Worker` and again on `worker` has two real windows, and folding
+/// the encoded form would quietly replace one with the other.
+///
+/// A path cannot begin `loki://`, so a file and a source can never collide here.
+fn identity_of(entry: &Recent) -> String {
+    match entry {
+        Recent::File(path) => path.to_lowercase(),
+        Recent::Remote { .. } => entry.encode(),
+    }
+}
+
+/// A source or application name with the two separators — and the escape itself — made safe.
+///
+/// **`%` goes first, and the order is the whole of why this is a function.** Unescaping walks the
+/// text once, so a `%` written after the separators had been encoded would be read as the start of
+/// an escape the name never contained.
+fn escape(text: &str) -> String {
+    text.replace('%', "%25")
+        .replace('?', "%3F")
+        .replace(',', "%2C")
+}
+
+/// The inverse, and it undoes `%` last for the reason [`escape`] does it first.
+fn unescape(text: &str) -> String {
+    text.replace("%3F", "?")
+        .replace("%2C", ",")
+        .replace("%25", "%")
+}
+
+impl Recent {
+    /// The entry as one line of the settings file.
+    pub fn encode(&self) -> String {
+        match self {
+            Recent::File(path) => path.clone(),
+            Recent::Remote { source, apps } if apps.is_empty() => {
+                format!("{REMOTE_SCHEME}{}", escape(source))
+            }
+            Recent::Remote { source, apps } => {
+                let apps: Vec<String> = apps.iter().map(|a| escape(a)).collect();
+                format!("{REMOTE_SCHEME}{}?apps={}", escape(source), apps.join(","))
+            }
+        }
+    }
+
+    /// The entry back from that line. Anything not carrying the scheme is a path, which is what
+    /// makes every settings file written before this reads correctly.
+    pub fn decode(text: &str) -> Recent {
+        let Some(rest) = text.strip_prefix(REMOTE_SCHEME) else {
+            return Recent::File(text.to_owned());
+        };
+        let (source, apps) = match rest.split_once("?apps=") {
+            // **Not filtered for empties.** `encode` writes `?apps=` only when there is at least
+            // one, so the marker's presence already says the list is non-empty — and dropping an
+            // empty name here would make `decode(encode(x))` differ from `x` for the one a
+            // hand-written `{app=""}` selector produces.
+            Some((source, apps)) => (source, apps.split(',').map(unescape).collect()),
+            None => (rest, Vec::new()),
+        };
+        Recent::Remote {
+            source: unescape(source),
+            apps,
+        }
+    }
+
+    /// The path, when this is a file — for the menu's compaction and for opening it.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Recent::File(path) => Some(path),
+            Recent::Remote { .. } => None,
+        }
+    }
 }
 
 /// How many files Open Recent keeps — the platform's customary MRU depth.
@@ -242,10 +341,10 @@ impl Settings {
     /// Puts `path` at the front of the recent list, moving it there if it is already present —
     /// compared case-insensitively, as Windows paths are — and dropping the oldest past
     /// [`RECENT_MAX`].
-    pub fn remember_recent(&mut self, path: &str) {
-        let folded = path.to_lowercase();
-        self.recent.retain(|p| p.to_lowercase() != folded);
-        self.recent.insert(0, path.to_owned());
+    pub fn remember_recent(&mut self, entry: Recent) {
+        let key = identity_of(&entry);
+        self.recent.retain(|e| identity_of(e) != key);
+        self.recent.insert(0, entry);
         self.recent.truncate(RECENT_MAX);
     }
 
@@ -315,7 +414,7 @@ impl Settings {
             }
         }
         if !self.recent.is_empty() {
-            let files: Vec<String> = self.recent.iter().map(|p| quote(p)).collect();
+            let files: Vec<String> = self.recent.iter().map(|e| quote(&e.encode())).collect();
             out.push_str(&format!("\n[recent]\nfiles = [{}]\n", files.join(", ")));
         }
         if !self.find_queries.is_empty() {
@@ -475,7 +574,7 @@ impl Settings {
                 },
                 Section::Recent => {
                     if key == "files" {
-                        settings.recent = array(value);
+                        settings.recent = array(value).iter().map(|s| Recent::decode(s)).collect();
                         settings.recent.truncate(RECENT_MAX);
                     }
                 }
@@ -706,30 +805,121 @@ mod tests {
     /// of one Windows path are one entry — paths compare case-insensitively on this platform.
     #[test]
     fn the_recent_list_remembers_in_order_and_dedupes_windows_paths() {
+        let file = |p: &str| Recent::File(p.to_owned());
         let mut s = Settings::default();
-        s.remember_recent(r"C:\logs\a.log");
-        s.remember_recent(r"C:\logs\b.log");
-        s.remember_recent(r"C:\LOGS\A.LOG");
+        s.remember_recent(file(r"C:\logs\a.log"));
+        s.remember_recent(file(r"C:\logs\b.log"));
+        s.remember_recent(file(r"C:\LOGS\A.LOG"));
         assert_eq!(
             s.recent,
-            vec![r"C:\LOGS\A.LOG".to_owned(), r"C:\logs\b.log".to_owned()],
+            vec![file(r"C:\LOGS\A.LOG"), file(r"C:\logs\b.log")],
             "re-opening moved a to the front under its new spelling, not a third entry"
         );
         let read = Settings::from_toml(&s.to_toml());
         assert_eq!(read.recent, s.recent, "the list survives the file");
     }
 
+    /// **A remote source sits in the same list as a file, and survives the file it is written to.**
+    ///
+    /// The owner's ask of 2026-09-21. One list rather than two, because recency runs across both —
+    /// and the round trip is through `to_toml`/`from_toml` rather than `encode`/`decode` alone,
+    /// since the quoting and the escaping are two layers that have to agree.
+    #[test]
+    fn a_remote_source_is_remembered_beside_the_files_and_survives_the_file() {
+        let mut s = Settings::default();
+        s.remember_recent(Recent::File(r"C:\logs\a.log".to_owned()));
+        s.remember_recent(Recent::Remote {
+            source: "live".to_owned(),
+            apps: vec!["nurtur-gateway".to_owned()],
+        });
+        // The same source narrowed differently is a different window, so a second entry.
+        s.remember_recent(Recent::Remote {
+            source: "live".to_owned(),
+            apps: vec!["nurtur-identity".to_owned()],
+        });
+        assert_eq!(s.recent.len(), 3, "{:?}", s.recent);
+
+        let read = Settings::from_toml(&s.to_toml());
+        assert_eq!(read.recent, s.recent, "the list survives the file");
+        assert!(
+            s.to_toml().contains("loki://live?apps=nurtur-gateway"),
+            "and is legible in it: {}",
+            s.to_toml()
+        );
+    }
+
+    /// **A path folds case; a source does not — and folding one loses a window.**
+    ///
+    /// Windows opens two spellings of a path as one file, so the list treats them as one entry.
+    /// A Loki `app` value is compared exactly by the server and by everything in `apps`, so `live`
+    /// on `Worker` and `live` on `worker` are two real windows; a dedupe that lower-cased the
+    /// encoded form replaced one with the other and the reader lost it from the list.
+    #[test]
+    fn two_sources_differing_only_in_case_are_two_entries() {
+        let of = |app: &str| Recent::Remote {
+            source: "live".to_owned(),
+            apps: vec![app.to_owned()],
+        };
+        let mut s = Settings::default();
+        s.remember_recent(of("Worker"));
+        s.remember_recent(of("worker"));
+        assert_eq!(s.recent.len(), 2, "{:?}", s.recent);
+
+        // While a path still folds, which is the behaviour this must not have cost.
+        let mut s = Settings::default();
+        s.remember_recent(Recent::File(r"C:\logs\a.log".to_owned()));
+        s.remember_recent(Recent::File(r"C:\LOGS\A.LOG".to_owned()));
+        assert_eq!(s.recent.len(), 1, "{:?}", s.recent);
+    }
+
+    /// An application named as the empty string survives the round trip, which it did not while
+    /// `decode` filtered empties out — reachable from a hand-written `{app=""}` selector.
+    #[test]
+    fn an_empty_application_name_is_not_quietly_dropped() {
+        let there = Recent::Remote {
+            source: "live".to_owned(),
+            apps: vec![String::new()],
+        };
+        assert_eq!(Recent::decode(&there.encode()), there);
+        // And a source with no applications at all is still distinct from that.
+        let none = Recent::Remote {
+            source: "live".to_owned(),
+            apps: Vec::new(),
+        };
+        assert_eq!(Recent::decode(&none.encode()), none);
+        assert_ne!(there, none);
+    }
+
+    /// **A settings file written before remote entries existed reads back unchanged.**
+    ///
+    /// The owner has a real file with real recents in it. Every one of them is a bare path, and a
+    /// bare path is a file — this is the half of the scheme that cannot be allowed to drift.
+    #[test]
+    fn an_older_files_recent_list_still_reads_as_files() {
+        let older =
+            "[recent]\nfiles = [\"C:\\\\logs\\\\a.log\", \"\\\\\\\\server\\\\share\\\\b.log\"]\n";
+        let read = Settings::from_toml(older);
+        assert_eq!(
+            read.recent,
+            vec![
+                Recent::File(r"C:\logs\a.log".to_owned()),
+                Recent::File(r"\\server\share\b.log".to_owned()),
+            ]
+        );
+    }
+
     /// Ten entries — the platform's customary MRU depth — and the oldest falls off.
     #[test]
     fn the_recent_list_holds_ten_newest() {
         let mut s = Settings::default();
+        let file = |p: String| Recent::File(p);
         for i in 0..12 {
-            s.remember_recent(&format!(r"C:\logs\{i}.log"));
+            s.remember_recent(file(format!(r"C:\logs\{i}.log")));
         }
         assert_eq!(s.recent.len(), RECENT_MAX);
-        assert_eq!(s.recent[0], r"C:\logs\11.log");
-        assert!(!s.recent.contains(&r"C:\logs\0.log".to_owned()));
-        assert!(!s.recent.contains(&r"C:\logs\1.log".to_owned()));
+        assert_eq!(s.recent[0], file(r"C:\logs\11.log".to_owned()));
+        assert!(!s.recent.contains(&file(r"C:\logs\0.log".to_owned())));
+        assert!(!s.recent.contains(&file(r"C:\logs\1.log".to_owned())));
     }
 
     /// The Find dialog's history: newest first, deduplicated **exactly** — case matters in a
@@ -766,16 +956,17 @@ mod tests {
     /// §12.4's per-key tier merge covers the list: an earlier tier's list wins whole.
     #[test]
     fn the_recent_list_merges_as_one_key() {
+        let file = |p: &str| Recent::File(p.to_owned());
         let mut under = Settings::default();
-        under.remember_recent(r"C:\old.log");
+        under.remember_recent(file(r"C:\old.log"));
         let mut over = Settings::default();
-        over.remember_recent(r"C:\new.log");
+        over.remember_recent(file(r"C:\new.log"));
         let merged = under.clone().merged_under(over);
-        assert_eq!(merged.recent, vec![r"C:\new.log".to_owned()]);
+        assert_eq!(merged.recent, vec![file(r"C:\new.log")]);
         let merged = under.merged_under(Settings::default());
         assert_eq!(
             merged.recent,
-            vec![r"C:\old.log".to_owned()],
+            vec![file(r"C:\old.log")],
             "an empty over-tier does not erase the list"
         );
     }
@@ -803,7 +994,7 @@ mod tests {
             font_size: Some(18),
             toolbar: Some(false),
             toolbar_large: Some(true),
-            recent: vec![r"C:\logs\app.log".to_owned()],
+            recent: vec![Recent::File(r"C:\logs\app.log".to_owned())],
             find_queries: vec!["ERROR".to_owned(), r"time\d+".to_owned()],
         };
         s.set_file(FileState {
@@ -1212,5 +1403,75 @@ mod tests {
         );
         assert_eq!(marked.sources[0].name, "live");
         assert_eq!(marked.sources[0].url, "https://example.com/loki");
+    }
+
+    /// **A path is never mistaken for a source, whatever it contains.**
+    ///
+    /// This is the whole reason the scheme is `loki://`: a Windows drive is one letter, so no real
+    /// path begins with it. A path that merely *mentions* it somewhere is still a path, which a
+    /// looser test — "contains" rather than "starts with" — would get wrong.
+    #[test]
+    fn a_file_entry_survives_the_round_trip_and_is_never_read_as_a_source() {
+        for path in [
+            r"C:\logs\service.log",
+            r"\\server\share\a,b.log",
+            r"C:\odd\loki://not-a-source.log",
+            "relative/with spaces.log",
+        ] {
+            let there = Recent::File(path.to_owned());
+            let back = Recent::decode(&there.encode());
+            assert_eq!(back, there, "{path} did not survive");
+            assert_eq!(back.path(), Some(path));
+        }
+    }
+
+    /// A settings file written before remote entries existed is all bare paths, and must still
+    /// read as files rather than as anything else.
+    #[test]
+    fn an_older_settings_files_bare_paths_are_files() {
+        assert_eq!(
+            Recent::decode(r"C:\logs\old.log"),
+            Recent::File(r"C:\logs\old.log".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_remote_entry_carries_its_source_and_its_applications() {
+        let there = Recent::Remote {
+            source: "live".to_owned(),
+            apps: vec!["nurtur-gateway".to_owned(), "nurtur-identity".to_owned()],
+        };
+        assert_eq!(
+            there.encode(),
+            "loki://live?apps=nurtur-gateway,nurtur-identity"
+        );
+        assert_eq!(Recent::decode(&there.encode()), there);
+        assert_eq!(there.path(), None, "a source is not a path to open");
+    }
+
+    /// A source opened with nothing narrowed keeps no application list, and must not grow an
+    /// empty one on the way back.
+    #[test]
+    fn a_remote_entry_with_no_applications_says_nothing_about_them() {
+        let there = Recent::Remote {
+            source: "live".to_owned(),
+            apps: Vec::new(),
+        };
+        assert_eq!(there.encode(), "loki://live");
+        assert_eq!(Recent::decode(&there.encode()), there);
+    }
+
+    /// **The separators are escaped, because a source's name is whatever the reader called it.**
+    ///
+    /// `?` ends the name and `,` ends an application, so a name containing either would otherwise
+    /// come back cut in half — and `%` has to be escaped first or unescaping would undo an escape
+    /// the name itself contained.
+    #[test]
+    fn a_name_containing_the_separators_comes_back_whole() {
+        let there = Recent::Remote {
+            source: "live? 50%".to_owned(),
+            apps: vec!["a,b".to_owned(), "100%".to_owned()],
+        };
+        assert_eq!(Recent::decode(&there.encode()), there);
     }
 }

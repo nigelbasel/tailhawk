@@ -4970,7 +4970,8 @@ impl Shell {
                     // or an unreadable file never enters the history.
                     if let Some(path) = document.path.as_ref() {
                         let path = path.to_string_lossy().into_owned();
-                        self.settings.remember_recent(&path);
+                        self.settings
+                            .remember_recent(tailhawk_core::settings::Recent::File(path));
                         self.save_settings(hwnd);
                     }
                     self.document.push(document);
@@ -5054,6 +5055,44 @@ impl Shell {
     /// back through `WM_GETTEXT` — it is not in the title any more.**
     ///
     /// The parts and their order are [`status_line`]'s, which is where they are tested.
+    /// Opens a remote source again from a recent entry, with the applications it was opened for.
+    ///
+    /// **A source can be renamed or deleted between one open and the next**, and the recent list
+    /// is not the configuration — it is a record of what was done. So a missing one says so rather
+    /// than opening nothing, which is the same courtesy the pick refuses a bad selector with.
+    fn reopen_remote(&mut self, hwnd: HWND, name: &str, apps: &[String]) {
+        let Some(source) = self
+            .settings
+            .sources
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+        else {
+            self.notice = Some(format!("{name}: that source is no longer configured."));
+            return;
+        };
+        let chosen: Vec<&str> = apps.iter().map(String::as_str).collect();
+        let query = if chosen.is_empty() {
+            source.query.clone()
+        } else {
+            match tailhawk_core::apps::with_apps(&source.query, &chosen) {
+                Ok(query) => query,
+                Err(_) => {
+                    self.notice = Some(format!(
+                        "{name}: this source's query is not a selector this can add to."
+                    ));
+                    return;
+                }
+            }
+        };
+        let label = tailhawk_core::apps::source_label(&source.name, &chosen);
+        open_remote(
+            hwnd,
+            tailhawk_core::settings::Source { query, ..source },
+            label,
+        );
+    }
+
     /// The status bar's eight panes for this frame.
     ///
     /// **The shell gathers facts; [`statusbar::status_panes_of`] decides what they read as.** The
@@ -6794,8 +6833,14 @@ impl Shell {
                 .contains(&id) =>
             {
                 let at = (id - menubar::ID_RECENT_BASE) as usize;
-                if let Some(path) = self.settings.recent.get(at).cloned() {
-                    self.open_path(hwnd, std::path::PathBuf::from(path));
+                match self.settings.recent.get(at).cloned() {
+                    Some(tailhawk_core::settings::Recent::File(path)) => {
+                        self.open_path(hwnd, std::path::PathBuf::from(path));
+                    }
+                    Some(tailhawk_core::settings::Recent::Remote { source, apps }) => {
+                        self.reopen_remote(hwnd, &source, &apps);
+                    }
+                    None => {}
                 }
                 true
             }
@@ -9382,10 +9427,21 @@ const REMOTE_LIMIT: u32 = 1_000;
 /// first version and it only became true on 2026-09-09. [`Shell::poll_fetch`] takes the records when
 /// they land and calls [`landed_records`], which is the half that needs the UI thread.
 fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: String) {
+    // **Remembered here, which is the one place every remote open passes through** — the picker's
+    // two branches, a regroup, and reopening from the list itself. The applications come from the
+    // query rather than from the caller, so an entry cannot record a different set than the window
+    // it opened. The owner's ask of 2026-09-21: "I would also like the recently used files to
+    // allow supporting the recent remote opens."
+    let entry = tailhawk_core::settings::Recent::Remote {
+        source: source.name.clone(),
+        apps: tailhawk_core::apps::apps_in(&source.query),
+    };
     let waiting = ask_for_records(source, label.clone());
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.fetching.push(waiting);
+            shell.settings.remember_recent(entry);
+            shell.save_settings(hwnd);
         }
     });
     set_notice(hwnd, format!("{label}: fetching the last hour…"));
