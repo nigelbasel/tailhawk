@@ -493,6 +493,36 @@ pub fn regroup_of(tabs: &[Tab], active: usize) -> Option<Regroup> {
     })
 }
 
+/// How many applications a remote source's name lists before it counts them instead.
+///
+/// Three is what a title bar and a taskbar button can carry beside the source's own name. It is a
+/// legibility threshold, not a limit on how many may be chosen — the same rule, and the same
+/// number, the status line already uses for filter chips.
+pub const NAMED_APPS: usize = 3;
+
+/// What a remote document is called when applications were chosen for it.
+///
+/// **The owner, 2026-09-21: "the title bar is useless then there are multiple remote sources
+/// selected."** It was `format!("{source} · {}", chosen.join(", "))`, so picking twenty services
+/// produced a title of twenty service names — which the window truncates, the taskbar truncates
+/// harder, and which is identical for its first sixty characters to the title of any other
+/// selection starting with the same service. Nothing in it could be read and nothing in it
+/// distinguished one window from another.
+///
+/// Named while they fit, counted once they do not — [`NAMED_APPS`]. One or two services are worth
+/// spelling out; twenty are worth counting, because the count is the only part anyone can read at
+/// that size and the source's own name is what tells the windows apart.
+///
+/// **The count is always plural**, and that is not an oversight: the naming branch covers every
+/// selection up to [`NAMED_APPS`], so the counted branch cannot be reached with one.
+pub fn source_label(source: &str, chosen: &[&str]) -> String {
+    match chosen.len() {
+        0 => source.to_owned(),
+        n if n <= NAMED_APPS => format!("{source} · {}", chosen.join(", ")),
+        n => format!("{source} · {n} applications"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +905,52 @@ mod tests {
                 apps: vec!["api".to_owned(), "worker".to_owned()],
             })
         );
+    }
+
+    /// **The owner's report of 2026-09-21, as a test.**
+    ///
+    /// A real selection from his estate: twenty-odd services whose names share a prefix. Joined,
+    /// they make a title that is truncated everywhere it is shown and identical to any other
+    /// selection's for as far as anyone can read. The count is the part that survives.
+    #[test]
+    fn many_applications_are_counted_rather_than_listed() {
+        let many: Vec<&str> = vec![
+            "nurtur-accounting-api",
+            "nurtur-admin-ui-api",
+            "nurtur-analytics-ui-api",
+            "nurtur-automation-api",
+            "nurtur-automation-job-manager",
+            "nurtur-identity-server",
+            "nurtur-gateway",
+        ];
+        assert_eq!(source_label("live", &many), "live · 7 applications");
+    }
+
+    /// One or two are worth spelling out — that is what tells two windows apart.
+    #[test]
+    fn a_few_applications_are_named() {
+        assert_eq!(
+            source_label("live", &["nurtur-gateway"]),
+            "live · nurtur-gateway"
+        );
+        assert_eq!(
+            source_label("live", &["nurtur-gateway", "nurtur-identity-server"]),
+            "live · nurtur-gateway, nurtur-identity-server"
+        );
+    }
+
+    /// The boundary, both sides of it, so the threshold is pinned rather than implied.
+    #[test]
+    fn the_threshold_is_where_naming_gives_way_to_counting() {
+        let three = ["a", "b", "c"];
+        assert_eq!(source_label("live", &three), "live · a, b, c");
+        let four = ["a", "b", "c", "d"];
+        assert_eq!(source_label("live", &four), "live · 4 applications");
+    }
+
+    /// A source with nothing chosen is just the source, with no trailing separator.
+    #[test]
+    fn no_choice_leaves_the_source_alone() {
+        assert_eq!(source_label("live", &[]), "live");
     }
 }

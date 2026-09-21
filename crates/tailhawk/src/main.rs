@@ -8810,7 +8810,10 @@ fn regroup_now(hwnd: HWND) {
                 query,
                 ..source.clone()
             },
-            format!("{} \u{b7} {}", source.name, group.join(", ")),
+            // The same rule the first open follows: named while they fit, counted once they do
+            // not. Interleaving twenty windows into one is exactly where the joined list stopped
+            // being readable, so it is exactly where this must not be a `join` either.
+            tailhawk_core::apps::source_label(&source.name, group),
         ));
     }
 
@@ -9305,7 +9308,7 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
             let names: Vec<&str> = chosen.iter().map(String::as_str).collect();
             match tailhawk_core::apps::with_apps(&source.query, &names) {
                 Ok(query) => {
-                    let label = format!("{} · {}", source.name, chosen.join(", "));
+                    let label = tailhawk_core::apps::source_label(&source.name, &names);
                     open_remote(
                         hwnd,
                         tailhawk_core::settings::Source { query, ..source },
@@ -9338,7 +9341,7 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
                             query,
                             ..source.clone()
                         },
-                        format!("{} \u{b7} {app}", source.name),
+                        tailhawk_core::apps::source_label(&source.name, &[app.as_str()]),
                     ),
                     Err(_) => set_notice(
                         hwnd,
