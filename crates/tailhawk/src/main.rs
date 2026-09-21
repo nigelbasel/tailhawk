@@ -258,6 +258,23 @@ struct Document {
     layout: Option<Layout>,
     /// The measured column widths, for `reset_columns` after a drag has changed them.
     column_defaults: Option<Vec<usize>>,
+    /// Whether the columns have been set deliberately, and so must survive a resize.
+    ///
+    /// **The fit is a default, not a policy, and this is what keeps it one.** Without it the
+    /// refit below owns the widths outright: a file's remembered layout — restored by
+    /// [`Document::apply_state`] *before* the first `lay_out` — is overwritten the moment the
+    /// window is first measured, and a drag or a tick in the Columns dialog is undone by the next
+    /// resize. A reader who has said what they want is not asked again until they ask for the
+    /// default back with *Reset columns*.
+    columns_customised: bool,
+    /// The width, in cells, the columns were last fitted to — `None` until they have been.
+    ///
+    /// **The fit is redone when this stops matching the window, and always from
+    /// `column_defaults`.** Fitting the already-fitted widths would be a ratchet: every squeeze
+    /// would stick, and widening the window would never bring a column back. Measuring from the
+    /// defaults each time makes the fit a function of the width alone, which is what lets a
+    /// dragged-out window restore the columns a narrow one had to hide.
+    fitted_for: Option<usize>,
     /// The column whose right edge is following the mouse, while the button is down.
     resizing: Option<usize>,
     /// The column whose title is being dragged to a new place, while the button is down.
@@ -647,6 +664,8 @@ impl Document {
         self.layout = None;
         self.header = None;
         self.column_defaults = None;
+        self.fitted_for = None;
+        self.columns_customised = false;
         self.filtering.sort = None;
         self.presented.clear();
     }
@@ -667,6 +686,8 @@ impl Document {
         let layout = Layout::from_sample(format, &lines);
         self.header = Some(layout.header());
         self.column_defaults = Some(layout.widths.clone());
+        self.fitted_for = None;
+        self.columns_customised = false;
         // A sort in force is keyed on a column of the layout that is going away, and the menu
         // lists that layout's columns to sort by. Both belong to the format, so both go with it.
         self.filtering.sort = None;
@@ -735,6 +756,8 @@ impl Document {
             filter_ctl: None,
             header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
+            fitted_for: None,
+            columns_customised: false,
             resizing: None,
             moving: None,
             chrome_h: 0.0,
@@ -809,6 +832,8 @@ impl Document {
             filter_ctl: None,
             header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
+            fitted_for: None,
+            columns_customised: false,
             resizing: None,
             moving: None,
             chrome_h: 0.0,
@@ -901,6 +926,29 @@ impl Document {
             if self.open_at_tail && rows > 0 {
                 self.view.grid_mut().scroll_to_bottom();
                 self.open_at_tail = false;
+            }
+        }
+
+        // **The columns are fitted to the room the row actually has.** Without this the widths are
+        // whatever the head sample measured, and a Loki telemetry line carrying four wide label
+        // columns spends the whole window before the message column begins — the owner's report of
+        // 2026-09-21, where the messages "are not visible as they are off the right hand side".
+        // `hgrid`'s viewport is already net of the gutter set just above, so this is the row's own
+        // room rather than the window's.
+        let budget = (self.view.hgrid().viewport_px() / cell_w.max(1.0)).max(0.0) as usize;
+        if !self.columns_customised && self.fitted_for != Some(budget) {
+            self.fitted_for = Some(budget);
+            if let Some(defaults) = self.column_defaults.clone() {
+                if let Some(layout) = self.layout.as_mut() {
+                    layout.widths = defaults;
+                    // Both halves of the owner's answer of 2026-09-21, in the order they have to
+                    // run: which columns are worth showing at all, and then whether what is left
+                    // fits the window. Running the fit first would spend the budget squeezing
+                    // columns that were about to be hidden anyway.
+                    layout.only_understood();
+                    layout.fit(budget);
+                }
+                self.header = self.layout.as_ref().map(Layout::header);
             }
         }
 
@@ -1275,6 +1323,10 @@ impl Document {
                 if state.columns.len() == layout.widths.len() {
                     layout.widths = state.columns.iter().map(|&w| w as usize).collect();
                     self.header = Some(layout.header());
+                    // §12.4's remembered view is a deliberate one, and this runs *before* the
+                    // document is first laid out — so without this the first frame's fit would
+                    // measure the window and throw the whole thing away.
+                    self.columns_customised = true;
                 }
             }
         }
@@ -2619,6 +2671,7 @@ impl Document {
             return false;
         }
         layout.widths[i] = width;
+        self.columns_customised = true;
         self.header = Some(layout.header());
         true
     }
@@ -2646,6 +2699,7 @@ impl Document {
             return false;
         }
         layout.widths[column] = measured;
+        self.columns_customised = true;
         self.header = Some(layout.header());
         true
     }
@@ -2655,7 +2709,13 @@ impl Document {
         self.layout.as_ref()?.widths.get(column).copied()
     }
 
-    /// Every column back to its measured width — the way to see a hidden column again.
+    /// Every column back to its measured width, which the next frame fits to the window again.
+    ///
+    /// **Clearing `fitted_for` is what makes this a reset rather than an undo.** The measured
+    /// widths are the ones that put the message off the right-hand edge, so handing them back bare
+    /// would answer "reset" with a layout that cannot be read. The fit is re-run instead, and the
+    /// Columns dialog — which is not re-fitted — is where a specific hidden column is ticked back
+    /// on deliberately.
     fn reset_columns(&mut self) -> bool {
         let Some(defaults) = self.column_defaults.clone() else {
             return false;
@@ -2667,6 +2727,8 @@ impl Document {
             return false;
         }
         layout.widths = defaults;
+        self.fitted_for = None;
+        self.columns_customised = false;
         self.header = Some(layout.header());
         true
     }
@@ -9703,6 +9765,9 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                                 // The header line the grid draws its columns from is derived from
                                 // the layout, exactly as `reset_columns` rebuilds it.
                                 doc.header = doc.layout.as_ref().map(|l| l.header());
+                                // Ticking a column on is the reader saying they want it, which
+                                // the next resize must not quietly take back.
+                                doc.columns_customised = true;
                             }
                         }
                         shell.retitle(hwnd);
@@ -14349,6 +14414,64 @@ mod tests {
             window_title(Some("")),
             "Tailhawk",
             "a document still opening has no name yet, and a dash before nothing is not a title"
+        );
+    }
+
+    /// A log whose lines Serilog detection accepts, for the fitting tests.
+    fn serilog_file(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(
+            &path,
+            "2026-08-17 09:14:03.884 +01:00 [INF] Zenith.Dispatcher Dispatching job 41981\n\
+             2026-08-17 09:14:04.120 +01:00 [ERR] Zenith.Dispatcher Failed\n",
+        )
+        .expect("write");
+        path
+    }
+
+    /// **The fit is a default, not an owner of the widths.**
+    ///
+    /// This is the defect the review of 2026-09-21 caught before it shipped: the refit ran from
+    /// the measured defaults whenever the window's cell budget changed, with nothing asking
+    /// whether the reader had already said what they wanted. A drag, a tick in the Columns
+    /// dialog, and — worst — a file's remembered layout restored by `apply_state` *before* the
+    /// first `lay_out` were all silently thrown away.
+    ///
+    /// The existing `column_boundaries_resize_and_reset_but_never_hide` could not catch it: it
+    /// lays out once, before it drags, so the refit never gets a second chance to run.
+    #[test]
+    fn a_deliberate_column_width_survives_the_next_resize() {
+        let path = serilog_file("tailhawk_column_fit_deliberate.log");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        assert!(doc.set_column_width(0, 12), "the drag must land");
+        doc.lay_out((8.0, 10.0), (400, 300));
+        assert_eq!(
+            doc.layout.as_ref().expect("layout").widths[0],
+            12,
+            "a width the reader set was taken back by a resize"
+        );
+    }
+
+    /// The other half, so the test above cannot be satisfied by never fitting at all: an
+    /// untouched layout narrowed past what it can hold does give way.
+    #[test]
+    fn an_untouched_layout_gives_way_when_the_window_cannot_hold_it() {
+        let path = serilog_file("tailhawk_column_fit_untouched.log");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let wide = doc.layout.as_ref().expect("layout").widths.clone();
+        assert!(wide[0] > 0, "the timestamp column starts shown: {wide:?}");
+        doc.lay_out((8.0, 10.0), (400, 300));
+        let narrow = doc.layout.as_ref().expect("layout").widths.clone();
+        assert_ne!(
+            wide, narrow,
+            "a window this narrow must cost the row something"
+        );
+        assert_eq!(
+            narrow.last(),
+            Some(&0),
+            "and the message keeps the rest of the row: {narrow:?}"
         );
     }
 

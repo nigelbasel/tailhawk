@@ -133,6 +133,17 @@ impl Format {
         self.first_line.as_str()
     }
 
+    /// Whether this format's columns are whatever keys the file carried, rather than a chosen set.
+    ///
+    /// **[`w3c`] is deliberately not one of these**, though it is also built from the file it
+    /// describes. A W3C header's fields were named by whoever configured the server, each one on
+    /// purpose, and there is no message column for them to crowd out. [`json_lines`] is the case
+    /// where a record wraps one message in a dozen identifier and label keys — which is what
+    /// [`Layout::only_understood`](crate::columns::Layout::only_understood) exists to answer.
+    pub fn has_invented_columns(&self) -> bool {
+        self.id == "json-lines"
+    }
+
     /// Whether `line` starts a record under this format — §6.4's rule.
     ///
     /// **The one-byte dispatch is `regex`'s own literal prefilter**: every pattern here is

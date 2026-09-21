@@ -370,6 +370,116 @@ impl Presentation {
     }
 }
 
+/// The least a column may be squeezed to before it is hidden instead.
+///
+/// Six cells holds a level word and the ellipsis that says a value was cut. Below that a column is
+/// noise occupying the room the message needs.
+pub const MIN_CELLS: usize = 6;
+
+/// The least the message column is left with, in cells.
+///
+/// The message is the reason the program exists, and a row showing every label and none of the
+/// message has failed at its job.
+pub const MIN_MESSAGE_CELLS: usize = 40;
+
+impl Layout {
+    /// Hides the columns a derived format merely found, keeping the ones it understood.
+    ///
+    /// A catalogue format's columns were chosen by hand and each earns its place. A format derived
+    /// from the file's own keys has no such warrant: Loki telemetry wraps one message in a dozen
+    /// identifier and label fields, and showing all of them is how the message ends up at the back
+    /// of a queue nobody can see the end of. Timestamp and level are kept, the message is last and
+    /// untouched, and everything else starts hidden — the Columns dialog is where a reader ticks
+    /// back the ones they actually want.
+    ///
+    /// **This is not [`Layout::fit`] and does not replace it.** `fit` answers "does this row fit
+    /// the window", which is a question about width; this answers "is this column worth a reader's
+    /// attention by default", which is a question about the format. A wide monitor makes the first
+    /// question go away and leaves the second exactly where it was.
+    ///
+    /// Reports whether anything changed. A format that did not invent its columns is left alone.
+    pub fn only_understood(&mut self) -> bool {
+        if !self.format.has_invented_columns() {
+            return false;
+        }
+        let before = self.widths.clone();
+        let last = self.widths.len().saturating_sub(1);
+        for i in 0..last {
+            let name = self.format.columns.get(i).copied().unwrap_or_default();
+            if name != crate::format::TS && name != crate::format::LEVEL {
+                self.widths[i] = 0;
+            }
+        }
+        self.widths != before
+    }
+
+    /// Fits the columns before the message into `budget` cells, so the message always has room.
+    ///
+    /// **One algorithm doing two jobs, because they are the same job.** Wide columns are capped
+    /// until the row fits; if it still will not fit with every column at [`MIN_CELLS`], trailing
+    /// columns are hidden and the cap is recomputed over what remains. Trimming and hiding are the
+    /// same decision taken at two depths, which is what lets a Loki telemetry line carrying four
+    /// sixty-cell label columns show its labels *and* its message rather than neither.
+    ///
+    /// The cap is max-min fair — it takes from the widest first — so a four-cell level column is
+    /// never trimmed to pay for a sixty-cell trace id. Columns already hidden stay hidden and cost
+    /// nothing, and the message column is never given a width.
+    ///
+    /// **Hiding walks the display order, not the column order**, and takes from the far end: the
+    /// column a reader's eye reaches last is the one they miss least. A layout whose columns have
+    /// been dragged into a new order therefore loses a different column than an untouched one,
+    /// which is the intended behaviour and is what `order` is for.
+    ///
+    /// The two searches are linear in the widest column, which is bounded by [`MAX_CELLS`] for any
+    /// layout that came from [`Layout::from_sample`]. A width set from somewhere else — a drag —
+    /// only makes the walk proportionally longer, never wrong.
+    ///
+    /// Reports whether anything changed.
+    pub fn fit(&mut self, budget: usize) -> bool {
+        let last = self.widths.len().saturating_sub(1);
+        if last == 0 {
+            return false;
+        }
+        let before = self.widths.clone();
+        let available = budget.saturating_sub(MIN_MESSAGE_CELLS);
+        let mut shown: Vec<usize> = self
+            .shown_order()
+            .iter()
+            .copied()
+            .filter(|i| *i < last && self.widths[*i] > 0)
+            .collect();
+
+        while let Some(&drop) = shown.last() {
+            let floor: usize = shown
+                .iter()
+                .map(|i| MIN_CELLS.min(self.widths[*i]) + GAP)
+                .sum();
+            if floor <= available {
+                break;
+            }
+            self.widths[drop] = 0;
+            shown.pop();
+        }
+
+        if !shown.is_empty() {
+            let room = available.saturating_sub(shown.len() * GAP);
+            let mut cap = shown.iter().map(|i| self.widths[*i]).max().unwrap_or(0);
+            while cap > 0 {
+                let spent: usize = shown.iter().map(|i| self.widths[*i].min(cap)).sum();
+                if spent <= room {
+                    break;
+                }
+                cap -= 1;
+            }
+            for i in &shown {
+                self.widths[*i] = self.widths[*i].min(cap);
+            }
+        }
+
+        self.widths != before
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +629,188 @@ mod tests {
         };
         assert_eq!(file.display_title(0), "date");
         assert_eq!(file.display_title(3), "cs(User-Agent)");
+    }
+
+    /// A layout whose widths are dictated rather than measured, for the fitting tests.
+    fn widths_of(widths: Vec<usize>) -> Layout {
+        let n = widths.len();
+        Layout {
+            format: by_id("serilog-file").expect("catalogue"),
+            widths,
+            order: (0..n.saturating_sub(1)).collect(),
+            sort: None,
+        }
+    }
+
+    /// What the columns before the message cost the row, gaps included, as the row pays it.
+    fn spent(layout: &Layout) -> usize {
+        let last = layout.widths.len().saturating_sub(1);
+        layout.widths[..last]
+            .iter()
+            .filter(|w| **w > 0)
+            .map(|w| w + GAP)
+            .sum()
+    }
+
+    #[test]
+    fn a_row_of_wide_labels_leaves_the_message_its_minimum() {
+        let mut layout = widths_of(vec![20, 30, 48, 48, 0]);
+        assert!(layout.fit(100));
+        // **The exact widths, not the budget bound.** "Spent no more than was available" is the
+        // algorithm's own invariant and holds for any implementation that respects it — including
+        // one that hides every label outright instead of capping them fairly. Four columns share
+        // the 52 cells left after 40 for the message and 8 of gap, which is 13 each.
+        assert_eq!(layout.widths, vec![13, 13, 13, 13, 0]);
+        assert!(
+            spent(&layout) + MIN_MESSAGE_CELLS <= 100,
+            "spent {} of 100 with {MIN_MESSAGE_CELLS} reserved: {:?}",
+            spent(&layout),
+            layout.widths
+        );
+    }
+
+    /// Hiding takes from the far end of the **display** order, which is not the column order once
+    /// a column has been dragged. With the order reversed the columns that go are 0 and 1, where
+    /// an implementation walking raw indices would have taken 3 and 2.
+    #[test]
+    fn hiding_follows_the_display_order_rather_than_the_column_order() {
+        let mut layout = widths_of(vec![30, 30, 30, 30, 0]);
+        layout.order = vec![3, 2, 1, 0];
+        assert!(layout.fit(60));
+        assert_eq!(layout.widths, vec![0, 0, 8, 8, 0]);
+    }
+
+    #[test]
+    fn the_cap_takes_from_the_widest_and_leaves_narrow_columns_alone() {
+        let mut layout = widths_of(vec![4, 6, 48, 48, 0]);
+        assert!(layout.fit(100));
+        assert_eq!(layout.widths, vec![4, 6, 21, 21, 0]);
+    }
+
+    #[test]
+    fn columns_that_cannot_fit_even_squeezed_are_hidden_from_the_end() {
+        let mut layout = widths_of(vec![30, 30, 30, 30, 30, 30, 0]);
+        assert!(layout.fit(60));
+        assert_eq!(layout.widths, vec![8, 8, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_row_that_already_fits_is_left_exactly_as_it_was() {
+        let mut layout = widths_of(vec![10, 8, 0]);
+        let before = layout.widths.clone();
+        assert!(!layout.fit(100));
+        assert_eq!(layout.widths, before);
+    }
+
+    #[test]
+    fn a_hidden_column_stays_hidden_and_costs_the_row_nothing() {
+        let mut layout = widths_of(vec![48, 0, 48, 0]);
+        assert!(layout.fit(100));
+        // **The exact widths, not a bound.** A hidden column stays at zero however the row is
+        // accounted for, so asserting only that catches nothing; what it must not do is charge the
+        // row a gap it never draws. Two shown columns pay 4 cells of gap and share the remaining
+        // 56, which is 28 each — counting the hidden one would leave 54 and give 27.
+        assert_eq!(layout.widths, vec![28, 0, 28, 0]);
+        assert!(spent(&layout) + MIN_MESSAGE_CELLS <= 100);
+    }
+
+    #[test]
+    fn the_message_column_is_never_given_a_width() {
+        let mut layout = widths_of(vec![48, 48, 48, 0]);
+        layout.fit(100);
+        assert_eq!(
+            layout.widths.last(),
+            Some(&0),
+            "the message column must stay on the rest of the row"
+        );
+    }
+
+    /// A derived JSON format over the keys a telemetry record actually carries.
+    fn telemetry() -> Layout {
+        use crate::detect::{JsonKey, JsonValue};
+        let keys: Vec<JsonKey> = [
+            "timestamp",
+            "level",
+            "message",
+            "traceId",
+            "spanId",
+            "service",
+            "namespace",
+            "pod",
+        ]
+        .iter()
+        .map(|name| JsonKey {
+            name: (*name).to_owned(),
+            value: JsonValue::Text,
+        })
+        .collect();
+        let f = crate::format::json_lines(&keys);
+        // A sample is not optional here: `from_sample` leaves a column no sampled line populated
+        // at zero, so an empty sample hides everything and the test would pass against an
+        // implementation that does nothing at all.
+        let sample = [concat!(
+            r#"{"timestamp":"2026-09-21T08:14:02.117Z","level":"INFO","#,
+            r#""message":"Dispatched job 41982","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","#,
+            r#""spanId":"00f067aa0ba902b7","service":"dispatch-api","namespace":"production","#,
+            r#""pod":"dispatch-api-7d9f4c8b6d-x2k9v"}"#
+        )
+        .to_owned()];
+        Layout::from_sample(f, &sample)
+    }
+
+    #[test]
+    fn a_derived_format_starts_with_only_the_columns_it_understood() {
+        let mut layout = telemetry();
+        assert!(
+            layout.widths[..layout.widths.len() - 1]
+                .iter()
+                .filter(|w| **w > 0)
+                .count()
+                > 2,
+            "the fixture must start with invented columns showing, or it proves nothing"
+        );
+        assert!(layout.only_understood());
+        let last = layout.widths.len() - 1;
+        for (i, w) in layout.widths[..last].iter().enumerate() {
+            let name = layout.format.columns[i];
+            let understood = name == crate::format::TS || name == crate::format::LEVEL;
+            assert_eq!(
+                *w > 0,
+                understood,
+                "column {i} ({name}) shown={} but understood={understood}",
+                *w > 0
+            );
+        }
+        assert_eq!(
+            layout.widths[last], 0,
+            "the message keeps the rest of the row"
+        );
+    }
+
+    #[test]
+    fn a_catalogue_format_keeps_every_column_it_was_given() {
+        // **`log4net`, not `serilog`.** Serilog's columns are `ts, level, msg` and nothing else,
+        // so "keep only the understood ones" keeps all three and the test passes against a rule
+        // applied to every format in the catalogue — which is precisely the mistake it is here to
+        // catch. `log4net` carries `thread` and `logger`, which the rule would hide.
+        let f = by_id("log4net").expect("catalogue");
+        let sample: Vec<String> = f.samples.iter().map(|(l, _)| l.to_string()).collect();
+        let mut layout = Layout::from_sample(f, &sample);
+        let last = layout.widths.len() - 1;
+        assert!(
+            layout.widths[..last].iter().all(|w| *w > 0),
+            "the fixture must start with every column showing: {:?}",
+            layout.widths
+        );
+        let before = layout.widths.clone();
+        assert!(!layout.only_understood());
+        assert_eq!(layout.widths, before);
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_the_message_alone_hides_every_label() {
+        let mut layout = widths_of(vec![10, 10, 0]);
+        assert!(layout.fit(20));
+        assert_eq!(layout.widths, vec![0, 0, 0]);
     }
 }
