@@ -1,5 +1,31 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-09-21: the dialogs are dark, and the product is finished
+
+**`50b223a`, green on all five jobs.** All eleven dialog procedures are themed —
+`controls::apply_theme_tree` walks a dialog's children with a per-class dispatch, and `dialog.rs`
+carries `theme_dialog`, `dialog_colours`, `drop_dialog_brush` and a two-brush `DialogPaint` behind
+`GWLP_USERDATA`. Photographed in dark: goto, find, rules.
+
+**Two assumptions corrected by looking rather than reasoning.** `DarkMode_CFD` darkens a `ComboBox`
+and leaves a plain `Edit` white, so the field is painted through `WM_CTLCOLOREDIT` — hence two
+brushes. And **push buttons do go dark**, because `darkmode.rs` calls `SetPreferredAppMode(ForceDark)`
+before any window exists; the menu-bar row below says Win32 offers no route to a dark *menu*, and a
+button is not the same family, though I assumed it was.
+
+**A leak a review caught and nothing else could have.** Ten of the eleven were wired by a script
+that added a `WM_DESTROY` arm where a procedure had none — and skipped the four that already had
+one, so Find, Filter, Import and Define Format each leaked two `HBRUSH`es and a `Box` per
+open/close. Find is modeless. All eleven free them now.
+
+**Left undone, deliberately:** a dialog open while Windows switches theme stays as it was — no
+procedure handles `WM_SETTINGCHANGE`, though `main.rs` does for the frame.
+
+**The owner declared the product finished on 2026-09-18** and is using this build. `UX-REVIEW.md` is
+advisory, not a backlog; `PLAN.md`'s M7/M7b/M8 are cut. The work below is history, not a queue.
+
+---
+
 ## ▶ Resume point — 2026-09-09, session 32: the UI against Microsoft's guidance
 
 The owner asked for two things this session, and the second is the larger:
