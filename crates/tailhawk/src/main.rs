@@ -6331,6 +6331,41 @@ impl Shell {
     }
 
     /// The facts §2.2's About box reports, gathered from the shell and handed to the pure mapping.
+    /// Opens the help document in whatever the reader uses to read HTML.
+    ///
+    /// **It is carried in the binary rather than fetched, and that is not a preference.**
+    /// `SPEC.md` §13.2 asserts this program makes no network calls, and CI is meant to hold it to
+    /// that; a Help menu that opened a hosted page would break the assertion the moment it was
+    /// clicked. `docs/help.html` is the source, `include_str!` puts it in the exe, and the exe
+    /// stays one portable file — the same reason `icon.rs` carries its PNGs instead of asking a
+    /// resource compiler for them.
+    ///
+    /// Written beside the temp directory because a browser opens a *file*, and reported on the
+    /// status bar if it cannot be, rather than a menu item that silently does nothing.
+    fn show_help(&mut self) {
+        const HELP: &str = include_str!("../../../docs/help.html");
+        let path = std::env::temp_dir().join("tailhawk-help.html");
+        if let Err(why) = std::fs::write(&path, HELP) {
+            self.notice = Some(format!("could not open the help: {why}"));
+            return;
+        }
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            ShellExecuteW(
+                None,
+                windows::core::w!("open"),
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                SW_SHOW,
+            );
+        }
+    }
+
     fn about_sheet(&self) -> about::AboutSheet {
         about::about_sheet_of(about::AboutFacts {
             version: version::VERSION,
@@ -6713,6 +6748,10 @@ impl Shell {
             }
             menubar::ID_ABOUT => {
                 self.pending_about = true;
+                true
+            }
+            menubar::ID_HELP => {
+                self.show_help();
                 true
             }
             menubar::ID_KEYMAP => {

@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tailhawk Help</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ground: #fbfaf8;
+    --panel: #ffffff;
+    --ink: #1c1d21;
+    --quiet: #5c6068;
+    --rule: #e2e0dc;
+    --accent: #b4531a;
+    --accent-quiet: #f3ece6;
+    --code-bg: #f4f2ef;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+    --text: -apple-system, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #121317;
+      --panel: #191b20;
+      --ink: #e0e3e7;
+      --quiet: #9aa0aa;
+      --rule: #2b2e36;
+      --accent: #e8944f;
+      --accent-quiet: #241c15;
+      --code-bg: #1e2027;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 16px/1.65 var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 62rem; margin: 0 auto; padding: 0 1.5rem 6rem; }
+  header.top {
+    border-bottom: 1px solid var(--rule);
+    padding: 3.5rem 0 2rem;
+    margin-bottom: 2.5rem;
+  }
+  header.top h1 {
+    margin: 0 0 .4rem;
+    font-size: 2.6rem;
+    letter-spacing: -.02em;
+    font-weight: 650;
+  }
+  header.top p { margin: 0; color: var(--quiet); font-size: 1.05rem; max-width: 46rem; }
+  nav.toc {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 3rem;
+  }
+  nav.toc h2 {
+    margin: 0 0 .75rem;
+    font-size: .75rem;
+    text-transform: uppercase;
+    letter-spacing: .09em;
+    color: var(--quiet);
+    font-weight: 600;
+  }
+  nav.toc ol {
+    margin: 0; padding: 0; list-style: none;
+    columns: 2; column-gap: 2.5rem;
+  }
+  nav.toc li { margin: .3rem 0; break-inside: avoid; }
+  nav.toc a { color: var(--ink); text-decoration: none; border-bottom: 1px solid transparent; }
+  nav.toc a:hover { border-bottom-color: var(--accent); }
+  section { margin: 0 0 3.5rem; scroll-margin-top: 1.5rem; }
+  h2 {
+    font-size: 1.6rem;
+    letter-spacing: -.01em;
+    margin: 0 0 1rem;
+    padding-bottom: .5rem;
+    border-bottom: 2px solid var(--accent);
+    display: inline-block;
+    font-weight: 620;
+  }
+  h3 { font-size: 1.1rem; margin: 2rem 0 .6rem; font-weight: 620; }
+  p, li { max-width: 46rem; }
+  code, kbd, .mono { font-family: var(--mono); font-size: .89em; }
+  code { background: var(--code-bg); padding: .12em .38em; border-radius: 4px; }
+  kbd {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: .1em .45em;
+    white-space: nowrap;
+    font-size: .85em;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; font-size: .95rem; }
+  th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--quiet); font-weight: 600; }
+  td:first-child { white-space: nowrap; }
+  .wrap { overflow-x: auto; }
+  .note {
+    background: var(--accent-quiet);
+    border-left: 3px solid var(--accent);
+    padding: .9rem 1.1rem;
+    margin: 1.25rem 0;
+    border-radius: 0 6px 6px 0;
+  }
+  .note p { margin: 0; }
+  .note strong { color: var(--accent); }
+  .screen {
+    font-family: var(--mono);
+    font-size: .8rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: .9rem 1.1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1rem 0 1.5rem;
+    color: var(--quiet);
+  }
+  footer { border-top: 1px solid var(--rule); padding-top: 1.5rem; color: var(--quiet); font-size: .9rem; }
+  @media (max-width: 40rem) { nav.toc ol { columns: 1; } header.top h1 { font-size: 2rem; } }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="top">
+  <h1>Tailhawk Help</h1>
+  <p>A log viewer for Windows: large files opened instantly, tails that keep up, and remote sources
+     read in the same window as the ones on disk.</p>
+</header>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#start">Getting started</a></li>
+    <li><a href="#opening">Opening files and remote sources</a></li>
+    <li><a href="#screen">Reading the screen</a></li>
+    <li><a href="#finding">Finding</a></li>
+    <li><a href="#filtering">Filtering</a></li>
+    <li><a href="#traces">Traces</a></li>
+    <li><a href="#columns">Columns and formats</a></li>
+    <li><a href="#rules">Highlight rules</a></li>
+    <li><a href="#export">Exporting and tailing to a file</a></li>
+    <li><a href="#keys">Keyboard reference</a></li>
+    <li><a href="#settings">Settings</a></li>
+    <li><a href="#trouble">Troubleshooting</a></li>
+  </ol>
+</nav>
+
+<section id="start">
+  <h2>Getting started</h2>
+  <p>Open a log with <kbd>Ctrl</kbd>+<kbd>O</kbd>, or drop a file on the window. Tailhawk does not
+     read the whole file to show it to you, so a multi-gigabyte log opens as fast as a small one.</p>
+  <p>If the file is still being written, Tailhawk follows it. Scroll up and following pauses so the
+     view stays where you put it; <kbd>Ctrl</kbd>+<kbd>End</kbd> jumps back to the tail and resumes.
+     The right-hand end of the status bar always says which of the two you are in.</p>
+  <p>You can also pipe into it:</p>
+  <div class="screen">some-command | tailhawk -</div>
+</section>
+
+<section id="opening">
+  <h2>Opening files and remote sources</h2>
+
+  <h3>Files</h3>
+  <p><strong>File &gt; Open</strong> (<kbd>Ctrl</kbd>+<kbd>O</kbd>) opens one log. The bottom of the
+     File menu lists the logs you opened recently. Tailhawk detects the text encoding itself —
+     UTF-8, UTF-16, and the Windows code pages — and the status bar names what it decided.</p>
+  <p>A log that rotates is followed across the rotation: when the writer starts a new file, Tailhawk
+     keeps reading, and the older parts stay in the scrollback.</p>
+
+  <h3>Remote sources</h3>
+  <p>The cloud button on the toolbar, and <strong>Tools &gt; Remote sources</strong>, open a Loki
+     source. Pick the labels you want and Tailhawk tails the result in the same window as a local
+     file — the same search, the same filters, the same columns.</p>
+  <div class="note">
+    <p><strong>Watch the right-hand end of the status bar.</strong> A remote tail says how far
+       behind it is — <span class="mono">&#9679; Following &middot; current to 30s ago</span>. A
+       source that has gone quiet and one Tailhawk cannot keep up with look identical without it.</p>
+  </div>
+  <p>Loki returns at most a fixed number of records per query and does not say when it stopped at
+     that limit. When Tailhawk sees a full answer it tells you, and every count taken over that
+     window is shown as a floor — <span class="mono">at least 47 matches</span>, not
+     <span class="mono">47 matches</span> — because there may be records it was never sent.</p>
+</section>
+
+<section id="screen">
+  <h2>Reading the screen</h2>
+
+  <h3>The toolbar</h3>
+  <p>Every button has a tooltip that says what it does. In order:</p>
+  <div class="wrap">
+  <table>
+    <thead><tr><th>Button</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Open</td><td>Open a log file.</td></tr>
+      <tr><td>Open remote</td><td>Connect to a Loki source. Drops a menu of the sources you have configured.</td></tr>
+      <tr><td>Find</td><td>Search the log.</td></tr>
+      <tr><td>Filter</td><td>Show or hide the filter panel. It is a toggle: pressed means the panel is showing.</td></tr>
+      <tr><td>Trace</td><td>Show only the lines sharing the current line's trace id. See <a href="#traces">Traces</a>.</td></tr>
+      <tr><td>Follow</td><td>Keep the newest lines in view as the log grows. A toggle.</td></tr>
+      <tr><td>Collapse continuation lines</td><td>Show only each record's first line, hiding stack traces and wrapped bodies. See <a href="#columns">Columns and formats</a>.</td></tr>
+      <tr><td>Detail</td><td>Show the selected record in its own window, field by field.</td></tr>
+      <tr><td>Rules</td><td>Edit the highlight rules.</td></tr>
+      <tr><td>Format</td><td>Choose how lines are split into columns.</td></tr>
+      <tr><td>Export</td><td>Write what you can see to a file.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>A button that cannot act right now is drawn faded rather than removed, so the row never moves
+     under your hand. <strong>View &gt; Toolbar</strong> hides it, and offers large icons.</p>
+
+  <h3>The status bar</h3>
+  <p>Eight panes, left to right. A pane with nothing to report is blank rather than absent, so each
+     fact stays in the same place.</p>
+  <div class="wrap">
+  <table>
+    <thead><tr><th>Pane</th><th>Shows</th></tr></thead>
+    <tbody>
+      <tr><td>Message</td><td>What just happened, and any warning that stands — an export finishing, rules that would not compile, a truncated remote answer.</td></tr>
+      <tr><td>Position</td><td>The line you are on, of how many there are.</td></tr>
+      <tr><td>Find</td><td>Which match you are on, of how many.</td></tr>
+      <tr><td>Filter</td><td>How many rows the filter kept, of how many there were.</td></tr>
+      <tr><td>View</td><td>Columns hidden, the sort in force, and whether invisible characters are revealed.</td></tr>
+      <tr><td>Format</td><td>The format Tailhawk detected, or chose.</td></tr>
+      <tr><td>Encoding</td><td>The text encoding it decided on.</td></tr>
+      <tr><td>Tail</td><td>Following, how far behind, or paused with the key that resumes it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>The gutter</h3>
+  <p>The numbers down the left are <em>physical</em> line numbers — where the line is in the file,
+     not where it is in the view. They do not renumber when a filter hides rows, so a number you
+     read here is the number you can go to with <kbd>Ctrl</kbd>+<kbd>G</kbd>. Bookmarks and
+     severity marks appear in the same column.</p>
+</section>
+
+<section id="finding">
+  <h2>Finding</h2>
+  <p><kbd>Ctrl</kbd>+<kbd>F</kbd> opens Find. <kbd>F3</kbd> steps to the next match,
+     <kbd>Shift</kbd>+<kbd>F3</kbd> to the previous, and <kbd>Esc</kbd> clears the search.</p>
+  <p>The search runs on a worker, so a large file stays responsive while it works; the Find pane on
+     the status bar counts matches as they are found and says <span class="mono">so far</span> until
+     the pass finishes.</p>
+  <p>Finding does not hide anything. To hide the lines you are not interested in, filter.</p>
+</section>
+
+<section id="filtering">
+  <h2>Filtering</h2>
+  <p>A filter hides rows in place. The rows are still in the file, the line numbers still say where
+     they are, and clearing the filter brings them straight back.</p>
+  <ul>
+    <li><kbd>Ctrl</kbd>+<kbd>L</kbd> adds an <strong>include</strong>: keep only lines matching this.</li>
+    <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> adds an <strong>exclude</strong>: drop lines matching this.</li>
+    <li><kbd>Esc</kbd> clears them all.</li>
+  </ul>
+  <p>Filters stack, and the filter panel — the funnel on the toolbar — lists them, lets you edit
+     and reorder them, and tick them off one at a time. Right-clicking a line offers
+     <strong>Filter to this text</strong> and <strong>Filter out this text</strong>, which is
+     usually quicker than typing.</p>
+
+  <h3>Collapsing continuation lines</h3>
+  <p>Many logs write one <em>record</em> across several physical lines: the first carries the
+     timestamp and the message, and the lines under it are the stack trace, or a pretty-printed
+     body. Those extra lines are <strong>continuations</strong>.</p>
+  <p><strong>Collapse continuation lines</strong> hides them, so a forty-line stack trace becomes
+     the one line that says what failed. It has no effect on a log where no format was detected,
+     because without a format there is no way to tell a continuation from a record.</p>
+</section>
+
+<section id="traces">
+  <h2>Traces</h2>
+  <p>Services that carry a trace or correlation id put the same id on every line belonging to one
+     request, across every service it touched.</p>
+  <p>Put the cursor on a line and press <kbd>Ctrl</kbd>+<kbd>T</kbd>, or use the Trace button, and
+     Tailhawk takes the id on that line and filters the view down to it. What you are left with is
+     that one request, in order, from wherever it went. If the line carries no id, nothing
+     happens.</p>
+  <p>It is an ordinary filter once applied, so <kbd>Esc</kbd> clears it.</p>
+</section>
+
+<section id="columns">
+  <h2>Columns and formats</h2>
+  <p>Tailhawk reads the head of a file, recognises the shape of the lines, and splits them into
+     aligned columns — a timestamp column, a level column, a message column, and whatever else the
+     format carries. The Format pane on the status bar names what it decided.</p>
+  <p>The raw line is never modified. Searching, filtering and <kbd>Ctrl</kbd>+<kbd>C</kbd> all work
+     on the text as it is in the file, whatever the columns are doing.</p>
+
+  <h3>Why some columns start hidden</h3>
+  <p>A JSON log invents a column for every key it carries. Telemetry records routinely carry a
+     dozen — trace ids, span ids, pod names, namespaces — around one message, and showing all of
+     them pushes the message off the right-hand edge where it cannot be read.</p>
+  <p>So for a format derived from a file's own keys, Tailhawk starts by showing the timestamp, the
+     level and the message, and hides the rest. The View pane on the status bar says how many are
+     hidden — <span class="mono">3 of 9 columns</span> — and
+     <strong>Format &gt; Select columns</strong> ticks any of them back on.</p>
+
+  <h3>Fitting the window</h3>
+  <p>Whatever columns are shown, the message keeps room. Wide columns are trimmed before narrow
+     ones, so a four-character level column is never squeezed to pay for a sixty-character trace id,
+     and if the window is too narrow to hold them all, the ones furthest right are hidden rather
+     than everything being shaved to nothing. Widen the window and they come back.</p>
+  <p>Drag a column's edge to resize it, double-click the edge to reset that one, and
+     <strong>Format &gt; Reset columns</strong> restores the lot. A width you set deliberately is
+     kept — resizing the window will not take it back.</p>
+
+  <h3>When nothing is detected</h3>
+  <p>If Tailhawk does not recognise the format, it shows the lines as they are written, which is
+     always correct and never wrong — just not aligned. <strong>Format &gt; Define format from a
+     line</strong> lets you point at a line and describe its shape, and what you define is
+     remembered for next time.</p>
+</section>
+
+<section id="rules">
+  <h2>Highlight rules</h2>
+  <p><kbd>Ctrl</kbd>+<kbd>K</kbd>, or the highlighter button, opens the rules. A rule is a pattern
+     and a colour: lines that match are drawn in it, so the thing you are hunting stands out while
+     you scroll past everything else.</p>
+  <p>Rules apply to every log you open, not just this one. A rule that will not compile is reported
+     on the status bar by name rather than being dropped quietly.</p>
+  <div class="note">
+    <p><strong>Under Windows High Contrast, highlight rules are switched off</strong> and the status
+       bar says so. High Contrast exists so that the system's colours are the only ones on screen;
+       a viewer that painted its own over them would defeat it.</p>
+  </div>
+</section>
+
+<section id="export">
+  <h2>Exporting and tailing to a file</h2>
+  <p><strong>File &gt; Export</strong> writes <em>what you can see</em> — the rows the current
+     filters kept, in the current order — to a file. It is the quickest way to hand someone the
+     fifty lines that matter instead of the whole log.</p>
+  <p>A live tee keeps writing as the log grows, so you can start one on a filtered view and leave
+     it running. Either way the Message pane counts the lines as they are written, and says when it
+     has finished or why it could not.</p>
+</section>
+
+<section id="keys">
+  <h2>Keyboard reference</h2>
+  <p><strong>Help &gt; Keyboard map</strong> (<kbd>Shift</kbd>+<kbd>F1</kbd>) shows this inside Tailhawk, always
+     current with the build you are running.</p>
+  <div class="wrap">
+  <table>
+    <thead><tr><th>Key</th><th>Does</th></tr></thead>
+    <tbody>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>Open a file</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>Search</td></tr>
+      <tr><td><kbd>F3</kbd> / <kbd>Shift</kbd>+<kbd>F3</kbd></td><td>Next / previous match</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Clear the search, or the filters</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>L</kbd></td><td>Add an include filter</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd></td><td>Add an exclude filter</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td><td>Follow this line's trace</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>D</kbd></td><td>Bookmark this line</td></tr>
+      <tr><td><kbd>F2</kbd> / <kbd>Shift</kbd>+<kbd>F2</kbd></td><td>Next / previous bookmark</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>Go to line</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Home</kbd></td><td>Go to the top</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>End</kbd></td><td>Jump to the tail and follow</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>C</kbd></td><td>Copy the selection</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>Highlight rules</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>\</kbd></td><td>Split the pane, or unsplit</td></tr>
+      <tr><td><kbd>F6</kbd></td><td>Move between panes and the filter panel</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Tab</kbd></td><td>Next tab</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>W</kbd></td><td>Close the tab</td></tr>
+      <tr><td><kbd>Alt</kbd>+<kbd>&rarr;</kbd></td><td>Forward to the next view</td></tr>
+      <tr><td><kbd>F1</kbd></td><td>This help</td></tr>
+      <tr><td><kbd>Shift</kbd>+<kbd>F1</kbd></td><td>Keyboard map</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="settings">
+  <h2>Settings</h2>
+  <p><strong>Tools &gt; Options</strong> holds the preferences; <strong>Tools &gt; Font</strong>
+     picks the face and size the log is drawn in. <strong>View &gt; Toolbar</strong> hides the
+     toolbar or switches it to large icons.</p>
+  <p>Tailhawk follows the Windows light and dark setting, and switches with it while it is running.
+     Each file's view — its column widths, its filters, where you were — is remembered and restored
+     when you open it again.</p>
+</section>
+
+<section id="trouble">
+  <h2>Troubleshooting</h2>
+
+  <h3>The messages are off the right-hand side</h3>
+  <p>This was a defect in builds before 21 September 2026, on logs whose records carry many fields.
+     It is fixed: the message column now keeps room whatever else is shown. If you still see it,
+     <strong>Format &gt; Reset columns</strong> restores the default layout.</p>
+
+  <h3>Columns I want are missing</h3>
+  <p>For JSON logs, Tailhawk starts with timestamp, level and message and hides the rest — see
+     <a href="#columns">Columns and formats</a>. The View pane on the status bar says how many are
+     hidden. <strong>Format &gt; Select columns</strong> ticks them back on, and a column you tick
+     on stays on.</p>
+
+  <h3>The window is not updating</h3>
+  <p>Check the right-hand end of the status bar. If it says <span class="mono">&#8214; Paused</span>
+     you have scrolled up and following has stopped; <kbd>Ctrl</kbd>+<kbd>End</kbd> resumes. If it
+     says <span class="mono">Stream complete</span>, the thing writing to the pipe has finished.</p>
+
+  <h3>A remote tail looks stale</h3>
+  <p>The Tail pane states the lag. If it keeps growing, Tailhawk is not keeping up with the source
+     or the source is not receiving; if it stops changing, the source has gone quiet. The two look
+     the same without the lag, which is why it is stated rather than implied.</p>
+
+  <h3>Counts say "at least"</h3>
+  <p>The remote query came back full, which means it stopped at its limit and there may be records
+     you were never sent. Narrow the time range or the selector and the counts become exact.</p>
+
+  <h3>The icons look wrong, or the buttons are words</h3>
+  <p>Tailhawk draws its toolbar from the Windows icon font. If that font is missing, or is missing
+     one of the symbols, it falls back to labelled buttons rather than drawing empty boxes.</p>
+</section>
+
+<footer>
+  <p>Tailhawk — a Windows log viewer. Help &gt; About names the build you are running.</p>
+</footer>
+
+</div>
+</body>
+</html>

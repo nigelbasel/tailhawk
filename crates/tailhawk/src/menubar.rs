@@ -146,6 +146,8 @@ pub const ID_UNLISTED: u32 = 9_000;
 pub const ID_EXIT: u32 = 10_001;
 pub const ID_KEYMAP: u32 = 10_003;
 pub const ID_ABOUT: u32 = 10_004;
+/// The help document — `docs/help.html`, carried in the binary and opened in the reader's browser.
+pub const ID_HELP: u32 = 10_012;
 /// Shown so the Edit menu reads as an Edit menu, and permanently disabled: Tailhawk is a viewer
 /// and nothing in it edits a log. See the Edit menu in [`menu_bar`].
 pub const ID_CUT: u32 = 10_005;
@@ -472,8 +474,16 @@ pub fn shortcut_id(key: u16, ctrl: bool, shift: bool) -> Option<u32> {
         // standard shortcut keys": the standard Edit menu gives `Ctrl+H` to Replace, and a viewer
         // that cannot replace anything should not be the program that takes the key.
         (k, true, false) if k == VK_K.0 => Some(command_id(Command::EditRules)),
-        // The key every Windows user tries first, on the only help this program has.
-        (k, false, false) if k == VK_F1.0 => Some(ID_KEYMAP),
+        // **`F1` is the help key, and has been since DOS.** The owner, 2026-09-21: "f1 is
+        // traditioally the key for asking for help. This has been true since the earliest
+        // versions of windows ad DOS before it." It pointed at the keyboard map while the map was
+        // the only help this program had; now that there is a document, the document has it, and
+        // the argument that the map held the key first is not a reason to keep a universal
+        // convention pointing somewhere else.
+        (k, false, false) if k == VK_F1.0 => Some(ID_HELP),
+        // `Shift+F1` is Windows' own second help key — What's This? — and is near enough in
+        // spirit for the map, which is still one keystroke away and still named on the menu.
+        (k, false, true) if k == VK_F1.0 => Some(ID_KEYMAP),
         _ => None,
     }
 }
@@ -807,9 +817,11 @@ pub fn menu_bar(
         Item::submenu(
             "&Help",
             vec![
-                // Both are available with no document open: a user who cannot remember how to open
-                // a file is exactly the user who needs the keyboard map.
-                Item::command("&Keyboard map", "F1", ID_KEYMAP),
+                // All three are available with no document open: a user who cannot remember how to
+                // open a file is exactly the user who needs the help.
+                Item::command("Tailhawk &Help", "F1", ID_HELP),
+                Item::separator(),
+                Item::command("&Keyboard map", "Shift+F1", ID_KEYMAP),
                 Item::separator(),
                 Item::command("&About Tailhawk", "", ID_ABOUT),
             ],
@@ -1285,7 +1297,7 @@ mod tests {
         assert!(keys.len() > 20, "the walk found the menus: {}", keys.len());
 
         // What `shortcut_id` answers, written the way a menu prints it.
-        let bound: Vec<&str> = ["Ctrl+K", "F1"].to_vec();
+        let bound: Vec<&str> = ["Ctrl+K", "F1", "Shift+F1"].to_vec();
         let unclaimed: Vec<String> = keys
             .iter()
             .filter(|(_, key)| !bound.contains(&key.as_str()) && !ELSEWHERE.contains(&key.as_str()))
@@ -1326,8 +1338,14 @@ mod tests {
             shortcut_id(VK_K.0, true, false),
             Some(command_id(Command::EditRules))
         );
-        assert_eq!(printed("Keyboard map"), "F1");
-        assert_eq!(shortcut_id(VK_F1.0, false, false), Some(ID_KEYMAP));
+        // **`F1` opens the help, and the map moved to `Shift+F1`.** The owner, 2026-09-21: "f1 is
+        // traditioally the key for asking for help. This has been true since the earliest
+        // versions of windows ad DOS before it." It pointed at the map only because the map was
+        // the only help there was.
+        assert_eq!(printed("Tailhawk Help"), "F1");
+        assert_eq!(shortcut_id(VK_F1.0, false, false), Some(ID_HELP));
+        assert_eq!(printed("Keyboard map"), "Shift+F1");
+        assert_eq!(shortcut_id(VK_F1.0, false, true), Some(ID_KEYMAP));
         assert_eq!(
             shortcut_id(VK_K.0, false, false),
             None,
@@ -1517,6 +1535,10 @@ mod tests {
         for (top, label) in [
             ("Tools", "Options"),
             ("Tools", "Font"),
+            // The owner asked for a help document off this menu on 2026-09-21, having had to ask
+            // what three of the toolbar's buttons did. It is enabled with nothing open, because
+            // a reader who cannot remember how to open a file is the one who needs it.
+            ("Help", "Tailhawk Help"),
             ("Help", "Keyboard map"),
             ("Help", "About Tailhawk"),
         ] {
