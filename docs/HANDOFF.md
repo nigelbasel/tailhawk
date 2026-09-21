@@ -14,9 +14,32 @@ right-hand side of the window.**
 Grouped into five pieces of work, in this order: columns, toolbar, status bar, title bar, help
 document. Two of the ten are questions rather than defects and are answered in the help document.
 
-**All ten have work against them and nine are landed, each green on all five CI jobs**: `86a5ac9`
-columns, `0906b71` status bar, `0ea06f6` the harness that reads it, `a08e3fd` toolbar, `f99d286`
-help document and F1, `1104e3e` the title bar. What each one was, below.
+**All ten have work against them and all are landed**: `86a5ac9` columns, `0906b71` status bar,
+`0ea06f6` the harness that reads it, `a08e3fd` toolbar, `f99d286` help document and F1, `1104e3e`
+the title bar, `c9a9b81` regroup, `0f48918` the toolbar *again*, `688c74c` recent remote opens.
+What each one was, below.
+
+**Then he installed and reported four of them still broken, and he was right about one.** The
+title and status bar were fixed at 14:26 and his binary was the 14:00 build — so two of the four
+were fixed in the repo and not in his hands, which is a reporting failure rather than a code one:
+**offer to put a build in front of him before saying something is fixed.**
+
+**The toolbar was genuinely still broken, and the first fix made it worse.** `icon_tints` derived
+its colours from `theme()` — the *document's* theme — and pushed the glyphs toward white. Measured
+on his machine the toolbar band is `255,255,255` and the menu band with it, while the grid is
+`25,25,25`: Windows is in light app mode, so the menu and rebar are native white and only what
+this program paints is dark. Near-white glyphs on a white band. They take `COLOR_BTNTEXT` and
+`COLOR_GRAYTEXT` now, which follow the app mode and are already the reader's own pair under High
+Contrast. Measured before 188 against 255, after 0 against 255.
+
+**Two traps that each cost a wrong conclusion, both now in `logs/agent.log`:**
+
+- **A running `tailhawk.exe` locks `target/release/tailhawk.exe`**, so `cargo build` fails with
+  `Access is denied. (os error 5)` — and a screenshot taken after that reads the *stale* binary.
+  Close the app before building, and check the artefact's mtime, not the build's tail.
+- **`cargo test … | tail` reports the exit status of `tail`.** A run with thirteen compile errors
+  came back "exited with code 0" and a grep for `test result` found nothing, which reads like
+  silence rather than failure. Redirect to a file, capture `$?`, *then* grep.
 
 **Columns (`86a5ac9`).** `Layout::from_sample` caps each column at
 `MAX_CELLS` but nothing capped the *row*, so a JSON telemetry record's label columns consumed the
@@ -30,12 +53,16 @@ default rather than an owner of the widths — without it a file's remembered la
 `apply_state` *before* the first `lay_out`, was discarded on every open.
 
 **Item 8, "the toolbar buttons look amateur", is the one that is not finished, and it cannot be
-finished from here.** The measurable half is fixed — the glyphs were tinted with `theme().ink`,
-body-text grey, and comctl32 derived the disabled look from that, so every button read as dead.
-What is left is stroke weight, spacing, and whether a system icon font is the right choice at all,
+finished from here.** The measurable half is fixed twice over — see the toolbar entry below. What
+is left is stroke weight, spacing, and whether a system icon font is the right choice at all,
 which is a judgement about taste. **The owner has been asked to look at the row and say what still
-reads badly; do not guess at it again.** The one concrete theory this session had — that the
-glyphs sat small and off-centre — was disproved by a screenshot.
+reads badly; do not guess at it again.** Two theories this session had were both disproved by
+looking: that the glyphs sat small and off-centre, and that tinting them from the document theme
+would help. **Screenshot and sample pixels before claiming anything about this row.**
+
+**An open question the owner has not answered**: opening a source as *separate windows* writes one
+recent entry per window, so eight applications can evict most of a ten-slot list in one action.
+Defensible, and deliberately left as it is rather than decided for him.
 
 **`F1` opens the help document; the keyboard map moved to `Shift+F1`.** The owner: "f1 is
 traditioally the key for asking for help. This has been true since the earliest versions of
@@ -57,6 +84,19 @@ this**: the first cut had no field for the Loki lag, the export progress, the so
 or the High Contrast warning, and rendered a paused tail as an empty pane — so it would have
 deleted §4's stated lag and §12's resume affordance from the product while `Document::describe`
 went on computing them. A review caught it.
+
+**Recent remote opens (`688c74c`).** `settings::Recent` is `File(path)` or `Remote { source, apps }`
+in one list, because recency runs across both, written into the existing `[recent]` array as
+`loki://source?apps=a,b` — a scheme no Windows path can begin, so an older settings file reads back
+unchanged. Remembering is in `open_remote`, the single point every remote open passes through, and
+the applications come from the query via `apps_in` so an entry cannot record a different set than
+the window it opened. **The dedupe folds case for a path and not for a source**: an `app` value is
+compared exactly by Loki and the source name is its credential's key, so `live`/`Worker` and
+`live`/`worker` are two windows and folding them lost one.
+
+**A review finding that was wrong, recorded so it is not "fixed" later**: it asked for
+`reopen_remote` to call `set_notice`. That takes `STATE.borrow_mut()` and `reopen_remote` already
+runs inside that borrow, so it would panic. Setting `self.notice` there is correct.
 
 **Known, older, and deliberately not changed here:** `Document::describe` and `Shell::file` are now
 display-dead. `describe` fed `Shell::file`, which the old composer used only as
