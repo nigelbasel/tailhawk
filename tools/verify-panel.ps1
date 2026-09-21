@@ -87,7 +87,12 @@ foreach ($theme in 'dark', 'light') {
         $wsh.SendKeys('{ESC}')
         Start-Sleep -Milliseconds 400
         $f = Focused
-        Check 'Esc returns the keyboard to the log' ($f -match 'TailhawkMain') $f
+        # **`TailhawkMain` stopped being the answer on 2026-09-16.** `9423540` gave the grid a UI
+        # Automation text provider that calls `SetFocus`, so the focused *element* is now the log
+        # Document rather than the bare window — which is a better answer to "is the keyboard on
+        # the log", and is why this check has been failing since the day after it last scored 8/8.
+        # Either shape passes: what must not happen is focus staying in the filter list.
+        Check 'Esc returns the keyboard to the log' ($f -match 'TailhawkMain|ControlType\.Document') $f
         Check 'still running' (-not $p.HasExited) ''
     }
     finally {

@@ -141,7 +141,7 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
         ToolButton {
             label: "Open remote",
             icon: icon::REMOTE,
-            tip: "Open remote source".to_owned(),
+            tip: tip_of("Open remote"),
             id: crate::menubar::ID_SOURCE_MENU,
             enabled: true,
             toggle: false,
@@ -229,20 +229,62 @@ pub fn toolbar_context_of(visible: bool, large: bool) -> Vec<tailhawk_core::menu
     ]
 }
 
-/// The tooltip for one button: what it is called, and the keys that reach it.
+/// The tip for a button with no [`Command`] behind it — a menu button, which has no shortcut.
+fn tip_of(label: &str) -> String {
+    match what_it_does(label) {
+        Some(text) => format!("{label} — {text}"),
+        None => label.to_owned(),
+    }
+}
+
+/// The tooltip for one button: what it is called, what it does, and the keys that reach it.
 ///
 /// The keys come from [`Command::LISTED`], which is the one register the menu also reads, so a
 /// tooltip cannot promise a shortcut the menu does not offer. A command with no shortcut says only
-/// its name rather than trailing an empty gap.
+/// its name and its description rather than trailing an empty gap.
 fn tip_for(label: &str, command: Command) -> String {
+    let said = tip_of(label);
     match Command::LISTED
         .iter()
         .find(|(c, _, _)| *c == command)
         .map(|(_, _, keys)| *keys)
     {
-        Some(keys) if !keys.is_empty() => format!("{label}\u{a0}\u{a0}({keys})"),
-        _ => label.to_owned(),
+        Some(keys) if !keys.is_empty() => format!("{said}\u{a0}\u{a0}({keys})"),
+        _ => said,
     }
+}
+
+/// What a toolbar button actually does, in the words a reader would use.
+///
+/// **A tooltip that repeats the button's own name is not a tooltip.** The owner, 2026-09-21, of a
+/// bar whose tips said `Filter`, `Trace` and `Collapse`: "I would also like to know what exatly
+/// does it mean to click on the Trace toolbar Icon, ad also what does collaps continuation lines
+/// mean … Its also not obvious what the filter toolbar does." He had the tooltips and they told
+/// him nothing, because each one was the label again with a shortcut after it.
+///
+/// Keyed on the label rather than the command so the row and this stay in step by construction:
+/// a button whose label is not here simply keeps its name, which is what an unmatched arm should
+/// do. The full explanations live in the help document; these are the one-line forms.
+fn what_it_does(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "Open" => "open a log file",
+        "Open remote" => "connect to a Loki source",
+        "Find" => "search the log",
+        "Filter" => "show or hide the filter panel",
+        "Trace" => "show only the lines sharing this line's trace id",
+        "Follow" => "keep the newest lines in view as the log grows",
+        // **The label the owner asked about by name**, 2026-09-21: "what does collaps
+        // continuation lines mean". A record can run to several physical lines — a stack trace, a
+        // pretty-printed body — and only the first carries the timestamp; this hides the rest.
+        "Collapse continuation lines" | "Collapse" => {
+            "show only each record's first line, hiding stack traces and wrapped bodies"
+        }
+        "Detail" => "show the selected record in its own window",
+        "Rules" => "edit the highlight rules",
+        "Format" => "choose how lines are split into columns",
+        "Export" => "write what you can see to a file",
+        _ => return None,
+    })
 }
 
 /// The glyphs, from Windows' own icon font — `Segoe Fluent Icons` on Windows 11, `Segoe MDL2
@@ -273,13 +315,25 @@ pub mod icon {
     pub const COLLAPSE: char = '\u{E70E}';
     /// `OpenPane` — the detail pane opens along an edge, which is what this draws.
     pub const DETAIL: char = '\u{E8A0}';
-    /// `Color` — a palette, for the highlight rules.
-    pub const RULES: char = '\u{E790}';
+    /// `Highlight` — a highlighter pen over a line, which is what a highlight rule does.
+    ///
+    /// **`Color` (`E790`) was a painter's palette and the owner said so**: "the toolbar using an
+    /// artists pallette for rulles is not sensible", 2026-09-21. A palette says *choose a colour*,
+    /// which is one control inside the rules editor rather than the thing the button opens; this
+    /// says *mark the lines that matter*, which is the feature.
+    pub const RULES: char = '\u{E7E6}';
     /// `ViewAll` — a grid of panes, for the format that makes the columns.
     pub const FORMAT: char = '\u{E8A9}';
     /// `Save` — export writes a file.
     pub const EXPORT: char = '\u{E74E}';
 }
+
+/// `TB_SETDISABLEDIMAGELIST` — the list a toolbar draws a button that cannot act from.
+///
+/// `WM_USER` is `0x0400` and this is fifty-four above it. Declared here because the `windows`
+/// crate does not bind it, and the value is the documented one. Without it comctl32 derives the
+/// faded bitmap itself, which is the defect [`icon_tints`] exists to fix.
+pub const TB_SETDISABLEDIMAGELIST: u32 = 0x0400 + 54;
 
 /// `TBN_GETINFOTIPW` — the toolbar asking its parent what a button's tooltip should say.
 ///
@@ -493,6 +547,11 @@ pub struct Toolbar {
     /// The glyphs the buttons draw, owned so they can be destroyed and rebuilt when the DPI or the
     /// theme changes. `None` means the icon font could not supply them and the row is words.
     images: Option<HIMAGELIST>,
+    /// The same glyphs faded, for the buttons that cannot act. Owned for the reason above.
+    ///
+    /// **Supplied rather than derived**: left to itself comctl32 washes the enabled bitmap out,
+    /// which from a soft ink is nearly the enabled colour again. See [`icon_tints`].
+    disabled: Option<HIMAGELIST>,
     /// Whether the icons are drawn in the larger of the two sizes. §2.3, the owner's ask of
     /// 2026-09-08.
     large: bool,
@@ -587,6 +646,7 @@ impl Toolbar {
             hwnd,
             font,
             images: None,
+            disabled: None,
             large: false,
             band: 0,
             shown: Vec::new(),
@@ -760,15 +820,34 @@ impl Toolbar {
         }
 
         let px = self.icon_px();
-        // The ink the grid draws with, so the toolbar belongs to the same window as the log.
-        let ink = tailhawk_core::theme::theme().ink;
-        let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
-        let colour = (byte(ink[0]) << 16) | (byte(ink[1]) << 8) | byte(ink[2]);
+        // **Two lists, because comctl32's derived one was the defect.** Given only an enabled
+        // list it makes the disabled appearance itself by washing the bitmap out, which from a
+        // soft ink lands almost on top of the original — the owner's "every icon looks like it is
+        // greyed out". [`icon_tints`] decides both, and `TB_SETDISABLEDIMAGELIST` is how a Win32
+        // toolbar is told the second one rather than left to guess.
+        let (enabled, faded) = icon_tints(&tailhawk_core::theme::theme());
         let glyphs: Vec<char> = buttons.iter().map(|b| b.icon).collect();
-        let fresh = icon_list(px, colour, &glyphs);
+        let fresh = icon_list(px, enabled, &glyphs);
         if let Some(list) = fresh {
             unsafe {
                 SendMessageW(self.hwnd, TB_SETIMAGELIST, WPARAM(0), LPARAM(list.0));
+                // **Sent every time, even when there is nothing to send.** A faded list that was
+                // not built — High Contrast asks for none, and GDI can refuse one — must not
+                // leave the previous row's list installed, or comctl32 goes on drawing disabled
+                // buttons from glyphs this row no longer has. Zero clears it and hands the
+                // decision back to the control, which is a degraded answer rather than a wrong
+                // one. The new list is installed before the old is destroyed, which is the
+                // ordering the enabled list keeps below and for the same reason.
+                let dim = faded.and_then(|colour| icon_list(px, colour, &glyphs));
+                SendMessageW(
+                    self.hwnd,
+                    TB_SETDISABLEDIMAGELIST,
+                    WPARAM(0),
+                    LPARAM(dim.map_or(0, |d| d.0)),
+                );
+                if let Some(old) = std::mem::replace(&mut self.disabled, dim) {
+                    let _ = ImageList_Destroy(old);
+                }
                 SendMessageW(
                     self.hwnd,
                     TB_SETBITMAPSIZE,
@@ -1089,6 +1168,9 @@ impl Drop for Toolbar {
             if let Some(images) = self.images.take() {
                 let _ = ImageList_Destroy(images);
             }
+            if let Some(dim) = self.disabled.take() {
+                let _ = ImageList_Destroy(dim);
+            }
             if !self.font.is_invalid() {
                 let _ = DeleteObject(HGDIOBJ(self.font.0));
             }
@@ -1159,6 +1241,64 @@ pub fn state_bits(b: &ToolButton) -> u8 {
         bits |= TBSTATE_CHECKED;
     }
     bits as u8
+}
+
+/// The two colours the toolbar's glyphs are drawn in: enabled, then disabled, as `0x00RRGGBB`.
+///
+/// **The owner, 2026-09-21: "every icon looks like it is greyed out".** The bar drew one image
+/// list tinted with `theme().ink` — the colour *body text* is drawn in, a soft grey — and left
+/// comctl32 to derive the disabled appearance from it, which it does by washing the bitmap out
+/// further. Starting from a grey, "washed out further" lands a few percent away, so every button
+/// looked disabled and the ones that *were* disabled looked no different.
+///
+/// So both are decided here instead. The enabled tint is the ink pushed to full strength — toward
+/// white on a dark chrome, toward black on a light one — because an icon is a shape read at a
+/// glance rather than a paragraph read at length, and wants more contrast than text, not less.
+/// The disabled tint is the ink blended most of the way into the chrome it sits on, which is what
+/// Windows' own disabled icons look like and is unmistakably not the enabled one.
+pub fn icon_tints(theme: &tailhawk_core::theme::Theme) -> (u32, Option<u32>) {
+    let pack = |c: [f32; 4]| {
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
+    };
+    // **High Contrast gets the system's own foreground, and no second colour at all.**
+    //
+    // §11.2: "system colours are respected". `Theme::high_contrast` is built from the pair the
+    // user configured for accessibility and blends nothing — and a toolbar that mixed its own
+    // 65 % of white into that foreground would be painting a colour they did not choose, for
+    // precisely the readers who chose theirs deliberately. `None` leaves the faded list unsent,
+    // so comctl32 draws a disabled button by the system's rules, which under High Contrast is
+    // what respecting them means.
+    if theme.suppress_rules {
+        return (pack(theme.ink), None);
+    }
+    let mix = |a: [f32; 4], b: [f32; 4], t: f32| {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+            1.0,
+        ]
+    };
+    let full = if theme.dark {
+        [1.0, 1.0, 1.0, 1.0]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    (
+        pack(mix(theme.ink, full, 0.65)),
+        Some(pack(mix(theme.ink, theme.chrome_bg, 0.58))),
+    )
+}
+
+/// How light a packed `0x00RRGGBB` is, 0.0 to 1.0 — Rec. 601 luma, which is what the eye reads.
+///
+/// Only the tests ask this: the tints themselves are computed in linear channels, and this is how
+/// "plainly different" is turned into a number a test can assert on.
+#[cfg(test)]
+fn luma(colour: u32) -> f32 {
+    let channel = |shift: u32| ((colour >> shift) & 0xFF) as f32 / 255.0;
+    0.299 * channel(16) + 0.587 * channel(8) + 0.114 * channel(0)
 }
 
 #[cfg(test)]
@@ -1334,6 +1474,9 @@ mod tests {
         assert_eq!(TBN_GETINFOTIPW as i32, -719);
         assert_eq!(TBN_DROPDOWN as i32, -710);
         assert_eq!(TBDDRET_DEFAULT, 0, "the drop-down was handled");
+        // WM_USER is 0x0400 and this is fifty-four above it, from commctrl.h. A wrong value here
+        // would send the faded list to whatever message that number happens to name.
+        assert_eq!(TB_SETDISABLEDIMAGELIST, 0x0436);
     }
 
     /// No two buttons share an id, because the shell dispatches on the id alone and a duplicate
@@ -1345,5 +1488,115 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), before);
+    }
+
+    /// **A tooltip that repeats the button's own name is not a tooltip.**
+    ///
+    /// The owner had these tips and still had to ask what Trace, Collapse and Filter did, because
+    /// every one of them was the label again with a shortcut after it. This holds the rule for
+    /// the whole row, including the menu buttons that build their tip by another path — a button
+    /// added without a description fails here rather than shipping as a name repeated twice.
+    #[test]
+    fn every_toolbar_tip_says_what_the_button_does_and_not_just_its_name() {
+        for button in toolbar_of(None) {
+            let said = button.tip.split('\u{a0}').next().unwrap_or_default();
+            assert!(
+                said.starts_with(button.label) && said.contains(" — "),
+                "{}: the tip explains nothing: {:?}",
+                button.label,
+                button.tip
+            );
+            assert!(
+                said.len() > button.label.len() + 6,
+                "{}: the description is too short to be one: {:?}",
+                button.label,
+                button.tip
+            );
+        }
+    }
+
+    /// **The defect the owner reported, as a property: the two states must look different.**
+    ///
+    /// One image list tinted with `theme().ink` left comctl32 to derive the disabled look by
+    /// washing the bitmap out, and from a soft grey that lands almost on top of the enabled one —
+    /// so every button read as dead. A quarter of the luma range apart is a difference nobody has
+    /// to squint at, and it is the thing that was actually wrong rather than any one colour.
+    #[test]
+    fn an_enabled_icon_and_a_disabled_one_are_plainly_different_in_both_themes() {
+        for theme in [
+            tailhawk_core::theme::Theme::dark(),
+            tailhawk_core::theme::Theme::light(),
+        ] {
+            let (enabled, disabled) = icon_tints(&theme);
+            let disabled = disabled.expect("an ordinary theme supplies its own faded glyphs");
+            let gap = (luma(enabled) - luma(disabled)).abs();
+            assert!(
+                gap > 0.25,
+                "enabled {enabled:06X} and disabled {disabled:06X} are only {gap:.3} apart in \
+                 luma — which is the complaint, not the fix"
+            );
+        }
+    }
+
+    /// An icon carries more contrast than the text beside it, in whichever direction the theme
+    /// runs — the ink is the floor for a glyph, not the target.
+    #[test]
+    fn an_enabled_icon_has_more_contrast_than_body_text_does() {
+        let dark = tailhawk_core::theme::Theme::dark();
+        let (enabled, _) = icon_tints(&dark);
+        assert!(
+            luma(enabled) > luma(pack_for_test(dark.ink)),
+            "on a dark chrome the glyph must be lighter than the ink"
+        );
+
+        let light = tailhawk_core::theme::Theme::light();
+        let (enabled, _) = icon_tints(&light);
+        assert!(
+            luma(enabled) < luma(pack_for_test(light.ink)),
+            "on a light chrome it must be darker"
+        );
+    }
+
+    fn pack_for_test(c: [f32; 4]) -> u32 {
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
+    }
+
+    /// **§11.2: under High Contrast the system's colours are the only ones on screen.**
+    ///
+    /// `Theme::high_contrast` is built from the pair the reader configured for accessibility and
+    /// blends nothing; a toolbar mixing its own 65 % of white into that foreground would be
+    /// painting a colour they did not choose, for exactly the readers who chose theirs on
+    /// purpose. The first cut of `icon_tints` did that for every theme, and the two tests above
+    /// could not see it because neither passed it a High Contrast theme.
+    ///
+    /// No faded list either: comctl32 draws a disabled button by the system's rules, and under
+    /// High Contrast deferring to them *is* respecting them.
+    #[test]
+    fn high_contrast_gets_the_systems_own_colours_and_no_invented_ones() {
+        let theme = tailhawk_core::theme::Theme::high_contrast(
+            [1.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        );
+        let (enabled, faded) = icon_tints(&theme);
+        assert_eq!(
+            enabled,
+            pack_for_test(theme.ink),
+            "the glyph must be the system foreground exactly, not a blend of it"
+        );
+        assert_eq!(faded, None, "Windows decides what disabled looks like here");
+    }
+
+    /// The exact colours, so the packing is pinned rather than only ever compared with itself.
+    ///
+    /// The production value and the tests' bounds both go through the same round-and-shift, so an
+    /// error there would cancel out of every luma comparison above instead of failing one. These
+    /// two were worked out by hand from `Theme::dark()`'s ink and chrome and the two mix factors.
+    #[test]
+    fn the_dark_themes_tints_are_the_colours_the_arithmetic_says() {
+        let (enabled, faded) = icon_tints(&tailhawk_core::theme::Theme::dark());
+        assert_eq!(enabled, 0x00F4_F5F7);
+        assert_eq!(faded, Some(0x006D_7074));
     }
 }
