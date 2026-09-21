@@ -3281,27 +3281,6 @@ fn count_text(n: usize, at_least: bool) -> String {
     }
 }
 
-fn status_line(
-    driver: Option<&str>,
-    described: Option<&str>,
-    file: Option<&str>,
-    notice: Option<&str>,
-    rules: Option<&str>,
-) -> String {
-    let mut text = String::new();
-    for part in [driver, described.or(file), notice, rules]
-        .into_iter()
-        .flatten()
-        .filter(|p| !p.is_empty())
-    {
-        if !text.is_empty() {
-            text.push_str(" — ");
-        }
-        text.push_str(part);
-    }
-    text
-}
-
 fn detect_set(set: &LogSet, path: Option<&std::path::Path>) -> (Detection, Option<Layout>) {
     let lines = match set.snapshot().last() {
         Some(newest) => detect::head_lines(&*newest.file, newest.charset),
@@ -4705,6 +4684,12 @@ struct Shell {
     rules_tiers: Vec<PathBuf>,
     /// The rules that did not compile, by name — shown in the status bar.
     rules_failed: Vec<String>,
+    /// What the status bar was last told to say, joined, for `SPEC.md` §14.1's provider.
+    ///
+    /// A screen reader asks the status element for a *value*, and a bar of eight parts has eight
+    /// of them. Keeping the joined form here means the provider reports what a sighted reader can
+    /// see rather than re-deriving it and drifting from the control.
+    status_shown: String,
     /// V9's rules editor — `UI-DESIGN.md` §5. On the shell rather than the document because the
     /// rules are the estate's, not one tab's.
     rules_editor: tailhawk_core::ruleset::Editor,
@@ -5060,46 +5045,144 @@ impl Shell {
     /// back through `WM_GETTEXT` — it is not in the title any more.**
     ///
     /// The parts and their order are [`status_line`]'s, which is where they are tested.
-    fn status_text(&self) -> String {
-        let rules_note = if self.rules_failed.is_empty() {
-            None
-        } else {
-            Some(format!("⚠ rules: {}", self.rules_failed.join("; ")))
+    /// The status bar's eight panes for this frame.
+    ///
+    /// **The shell gathers facts; [`statusbar::status_panes_of`] decides what they read as.** The
+    /// bar used to be handed one composed sentence, which is why it grew into the instrument
+    /// readout the owner called meaningless on 2026-09-21 — every fact the program held, joined
+    /// with dashes, in the order the string happened to be built.
+    ///
+    /// **The GPU driver name and the frame instrument are gone from the bar.** Neither is
+    /// something a person reading a log looks for; `TAILHAWK_FRAME_STATS` already exists for
+    /// whoever is chasing a frame, and the driver belongs with it rather than on screen always.
+    fn status_panes(&self) -> statusbar::StatusPanes {
+        let rules_note = (!self.rules_failed.is_empty())
+            .then(|| format!("⚠ rules: {}", self.rules_failed.join("; ")));
+        // **The frame instrument keeps its way back, on the pane a reader is already watching.**
+        // It was appended to the composed sentence; deleting it with the sentence would have made
+        // the claim above — that `TAILHAWK_FRAME_STATS` is where the frame numbers live — false.
+        let frames =
+            self.frames
+                .summary()
+                .filter(|_| frame_stats_enabled())
+                .map(|(p95, worst, over)| {
+                    let mut text =
+                        format!("frame p95 {p95:.1} ms, worst {worst:.1} ms, {over} over budget");
+                    let p = self.placeholders;
+                    if p.queued > 0 || p.refused > 0 || p.blanked > 0 {
+                        text.push_str(&format!(
+                            " — placeholders {} queued ({} distinct), {} refused, {} blanked, \
+                         {} landed, {} sheet-full, atlas holds {} blanks of {} slots, \
+                         {} painter builds",
+                            p.queued,
+                            p.distinct,
+                            p.refused,
+                            p.blanked,
+                            p.landed,
+                            p.sheet_full,
+                            p.held,
+                            p.capacity,
+                            p.builds
+                        ));
+                    }
+                    text
+                });
+        let said = match (self.notice.as_deref(), &frames) {
+            (Some(text), Some(frames)) => Some(format!("{text} — {frames}")),
+            (Some(text), None) => Some(text.to_owned()),
+            (None, Some(frames)) => Some(frames.clone()),
+            (None, None) => None,
         };
-        let described = self.document.as_ref().map(|doc| doc.describe());
-        let mut text = status_line(
-            self.driver.as_deref(),
-            described.as_deref(),
-            self.file.as_deref(),
-            self.notice.as_deref(),
-            rules_note.as_deref(),
-        );
-        // **The frame instrument, shown when `TAILHAWK_FRAME_STATS` asks for it.** M4 asks for
-        // "without dropped frames" and nothing in the product could say whether that held; the
-        // throughput rig could only measure how long the window took to answer a message, which
-        // counts a vsync-blocked Present the same as a seized thread.
-        if let Some((p95, worst, over)) = self.frames.summary().filter(|_| frame_stats_enabled()) {
-            text.push_str(&format!(
-                " — frame p95 {p95:.1} ms, worst {worst:.1} ms, {over} over budget"
-            ));
-            let p = self.placeholders;
-            if p.queued > 0 || p.refused > 0 || p.blanked > 0 {
-                text.push_str(&format!(
-                    " — placeholders {} queued ({} distinct), {} refused, {} blanked, {} landed, \
-                     {} sheet-full, atlas holds {} blanks of {} slots, {} painter builds",
-                    p.queued,
-                    p.distinct,
-                    p.refused,
-                    p.blanked,
-                    p.landed,
-                    p.sheet_full,
-                    p.held,
-                    p.capacity,
-                    p.builds
-                ));
+        let notice = said.as_deref();
+        let Some(doc) = self.document.as_ref() else {
+            // **`file` is what the bar says when there is no document**, exactly as the composed
+            // sentence had it: it took `described.or(file)`, so this field only ever reached the
+            // screen with nothing open — a failed open, a read that did not work. Its other
+            // writers ("format saved to …" and friends) were already shadowed by the description
+            // whenever a document *was* open, and still are; that is older than this change and
+            // is recorded in the handoff rather than quietly altered here.
+            return statusbar::status_panes_of(statusbar::StatusFacts {
+                notice: notice.or(self.file.as_deref()),
+                rules: rules_note.as_deref(),
+                ..statusbar::StatusFacts::default()
+            });
+        };
+        // E21: an export in flight or a live tee, with its count — the user asked for a file and
+        // the bar is where they watch it fill.
+        let tee = doc.tee.as_ref().map(|t| match (&t.error, t.live, t.done) {
+            (Some(e), _, _) => format!("⚠ export failed: {e}"),
+            (None, true, _) => format!("⇥ saving → {} ({})", t.name(), counted(t.written, "line")),
+            (None, false, true) => {
+                format!("✓ exported {} → {}", counted(t.written, "line"), t.name())
             }
-        }
-        text
+            (None, false, false) => {
+                format!(
+                    "⇥ exporting → {} ({})",
+                    t.name(),
+                    counted(t.written, "line")
+                )
+            }
+        });
+        let sorted = doc
+            .filtering
+            .sort
+            .as_ref()
+            .map(|s| doc.column_name(s.order.column))
+            .and_then(|name| doc.filtering.describe_sort(&name, doc.set.total_rows()));
+        // §4: "the lag is stated". Only a remote source has one — a local file is never behind.
+        let lag = match (doc.remote_spill.is_some(), doc.lag) {
+            (true, Some(behind)) => Some(tail::lag_text(behind)),
+            _ => None,
+        };
+        let tail = if doc.stream_done {
+            statusbar::Tail::Complete
+        } else if sorted.is_some() {
+            // E22: a sort holds the view still, so it is neither following nor paused.
+            statusbar::Tail::Held
+        } else if doc.view.grid().is_following() {
+            statusbar::Tail::Following {
+                lag: lag.as_deref(),
+            }
+        } else {
+            statusbar::Tail::Paused
+        };
+        let find = (!doc.finder.query.is_empty()).then(|| statusbar::FindFacts {
+            // The finder counts from zero and a reader counts from one.
+            current: doc.finder.current.map(|at| at + 1),
+            total: doc.finder.matches.len(),
+            running: doc.finder.running.is_some(),
+        });
+        // **`filtered()`, not `active()`.** `active()` is true for a sort as well, and `kept` is
+        // filled only by the filter machinery — so a sorted-but-unfiltered view reported
+        // "Filtered 0 of 419,501", which says every row was thrown away when none was.
+        let filter = doc
+            .filtering
+            .filtered()
+            .then(|| (doc.filtering.kept.len() as u64, doc.set.total_rows()));
+        let columns = doc.layout.as_ref().map(|layout| {
+            let last = layout.widths.len().saturating_sub(1);
+            // The message is always shown and is not in the tally of what could be hidden.
+            let shown = layout.widths[..last].iter().filter(|w| **w > 0).count() + 1;
+            (shown, layout.widths.len())
+        });
+        statusbar::status_panes_of(statusbar::StatusFacts {
+            notice,
+            tee: tee.as_deref(),
+            rules: rules_note.as_deref(),
+            contrast: theme().suppress_rules,
+            open: true,
+            caret_row: doc.caret_row().and_then(|row| doc.row_number(row)),
+            total_rows: doc.set.total_rows(),
+            find,
+            filter,
+            columns,
+            sorted: sorted.as_deref(),
+            invisibles: doc.view.cells().reveal_invisibles,
+            format: doc.detection.accepted.map(|format| format.name),
+            encoding: Some(doc.set.charset().name()),
+            tail,
+            cut: doc.answers_cut,
+        })
     }
 
     fn refresh_title(&self, hwnd: HWND) {
@@ -5195,7 +5278,14 @@ impl Shell {
         header::trace("paint enter");
         // The strip and the status are the shell's knowledge, handed to the document that draws them.
         let strip = (self.document.labels(), self.document.active);
-        let status = self.status_text();
+        let panes = self.status_panes();
+        self.status_shown = panes
+            .parts()
+            .iter()
+            .filter(|text| !text.is_empty())
+            .copied()
+            .collect::<Vec<&str>>()
+            .join(" | ");
         // **The bar is written before a renderer is asked for, and that is the whole of the fix.**
         // This call used to live in the layout block below, behind two gates: the early return
         // here when the device is gone, and the `pane_count == 0` return inside the closure. So
@@ -5212,7 +5302,7 @@ impl Shell {
             // its launch width. While the bar was blank that was invisible; carrying text it would
             // not be, which is to say the fix above is what would have made it a visible fault.
             bar.resize();
-            bar.set(&status);
+            bar.set_panes(&panes);
         }
 
         let Some(renderer) = self.renderer.as_mut() else {
@@ -7754,12 +7844,18 @@ mod uia {
             Err(Error::from_hresult(E_FAIL))
         }
 
+        /// **The bar's own panes, not `Document::status`.**
+        ///
+        /// `status` is cleared every frame in production — the drawn footer it fed went when the
+        /// bar became a real control — and is filled only by the screenshot harness. So this
+        /// reported an empty string to every screen reader, which `verify-uia.ps1` asserted
+        /// against by matching a word the harness path happened to produce. §14.1 asks the status
+        /// bar to be readable; reading what the control was actually told is what makes it so.
         fn Value(&self) -> Result<BSTR> {
             let kind = self.kind;
             let text = with_shell(|s| {
-                let doc = s.document.as_ref()?;
                 Some(match kind {
-                    Kind::Status => doc.status.clone(),
+                    Kind::Status => s.status_shown.clone(),
                     _ => String::new(),
                 })
             })
@@ -12344,6 +12440,7 @@ fn main() -> Result<()> {
             tabs: None,
             toolbar: None,
             statusbar: None,
+            status_shown: String::new(),
             show_toolbar: settings.toolbar.unwrap_or(true),
             large_icons: settings.toolbar_large.unwrap_or(false),
             drag_guide: None,
@@ -13615,44 +13712,46 @@ mod tests {
         assert!(open.show_filters, "a panel left open comes back open");
     }
 
-    /// A notice is shown beside the document's description, not instead of it.
+    /// A notice is shown beside what the document *is*, not instead of it.
     ///
     /// **This is the bug the rules harness found.** `Shell::file` carried two different things —
-    /// what the document is, and what just happened — and `status_text` read it only when there
-    /// was no document. So `close_rules_editor`'s "rules closed unsaved" was written into a field
-    /// nothing would read while a file was open, which is the only time it can be written. §10
-    /// asks for an unsaved set thrown away to say so; it said so into a variable.
+    /// what the document is, and what just happened — and the composed sentence read it only when
+    /// there was no document. So `close_rules_editor`'s "rules closed unsaved" was written into a
+    /// field nothing would read while a file was open, which is the only time it can be written.
+    /// §10 asks for an unsaved set thrown away to say so; it said so into a variable.
+    ///
+    /// **The guarantee is structural now rather than a property of how a string was joined.** The
+    /// notice has a pane and the document's facts have theirs, so neither can displace the other
+    /// however either is worded — which is the whole reason the bar is panes.
     #[test]
     fn a_notice_is_shown_beside_the_document_rather_than_instead_of_it() {
-        let line = status_line(
-            Some("hardware"),
-            Some("app.log: UTF-8 — 1 file"),
-            None,
-            Some("rules closed unsaved — Ctrl+K, Ctrl+S to save"),
-            None,
-        );
-        assert!(
-            line.contains("app.log") && line.contains("rules closed unsaved"),
-            "both, not one: {line}"
-        );
-        assert!(
-            line.find("app.log") < line.find("rules closed unsaved"),
-            "the document first, then what just happened: {line}"
-        );
-
-        // `file` still answers for a document that failed to open, which is the job it keeps.
-        let failed = status_line(None, None, Some("read failed"), None, None);
-        assert_eq!(failed, "read failed");
-
-        // And a description always wins over `file` when there is one — the reason `status_text`
-        // describes afresh rather than trusting a string built when the document landed.
-        let both = status_line(None, Some("described now"), Some("stale"), None, None);
-        assert_eq!(both, "described now");
-
-        assert_eq!(status_line(None, None, None, None, None), "");
+        let panes = statusbar::status_panes_of(statusbar::StatusFacts {
+            notice: Some("rules closed unsaved — Ctrl+K, Ctrl+S to save"),
+            open: true,
+            caret_row: Some(12),
+            total_rows: 900,
+            format: Some("Serilog"),
+            encoding: Some("UTF-8"),
+            ..statusbar::StatusFacts::default()
+        });
         assert_eq!(
-            status_line(None, Some("a"), None, Some("b"), Some("⚠ rules: c")),
-            "a — b — ⚠ rules: c"
+            panes.message,
+            "rules closed unsaved — Ctrl+K, Ctrl+S to save"
+        );
+        assert_eq!(panes.position, "Line 12 of 900");
+        assert_eq!(panes.format, "Serilog");
+        assert_eq!(panes.encoding, "UTF-8");
+
+        // A document that failed to open has no facts to report, and the failure is the message —
+        // the job `file` used to keep.
+        let failed = statusbar::status_panes_of(statusbar::StatusFacts {
+            notice: Some("read failed"),
+            ..statusbar::StatusFacts::default()
+        });
+        assert_eq!(failed.message, "read failed");
+        assert_eq!(
+            failed.position, "",
+            "there is no document to have a position in"
         );
     }
 

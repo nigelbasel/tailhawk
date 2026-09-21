@@ -1,5 +1,54 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-09-21: the owner reopened the workstream from real use
+
+**He used the build and came back with ten items**, which is what the section below anticipated.
+In his order: the toolbar icons all look greyed out; what does the **Trace** button do; what does
+**collapse continuation lines** mean; the title bar is useless with several remote sources; the
+status bar is meaningless and should be conventional rather than a debugging bar; an artist's
+palette is not a sensible icon for highlight rules; it is not obvious what **Filter** does; the
+toolbar buttons look amateur; there should be an HTML help document off the Help menu; and —
+the one that stops him reading logs at all — **tailing Loki telemetry, the messages are off the
+right-hand side of the window.**
+
+Grouped into five pieces of work, in this order: columns, toolbar, status bar, title bar, help
+document. Two of the ten are questions rather than defects and are answered in the help document.
+
+**Done: columns (`86a5ac9`, green on all five jobs).** `Layout::from_sample` caps each column at
+`MAX_CELLS` but nothing capped the *row*, so a JSON telemetry record's label columns consumed the
+window and the message — which is last and takes "the rest of the row" — got none of it.
+`Layout::only_understood` hides the columns a `json-lines` format invented, keeping timestamp,
+level and message; `Layout::fit` then caps what is left so the message always keeps
+`MIN_MESSAGE_CELLS`, max-min fair, hiding from the far end of the *display* order when even
+`MIN_CELLS` will not fit. Both run from the measured defaults whenever the width in cells changes,
+so widening the window brings columns back. `Document::columns_customised` is what keeps the fit a
+default rather than an owner of the widths — without it a file's remembered layout, restored by
+`apply_state` *before* the first `lay_out`, was discarded on every open.
+
+**Done, pending commit: the status bar is eight panes** — message, position, find, filter, view,
+format, encoding, tail — decided by `statusbar::status_panes_of` and laid out by `edges_of`, both
+pure and tested. The GPU driver name is gone. **Read `UI-DESIGN.md` §1.1's new note before touching
+this**: the first cut had no field for the Loki lag, the export progress, the sort, the invisibles
+or the High Contrast warning, and rendered a paused tail as an empty pane — so it would have
+deleted §4's stated lag and §12's resume affordance from the product while `Document::describe`
+went on computing them. A review caught it.
+
+**Known, older, and deliberately not changed here:** `Document::describe` and `Shell::file` are now
+display-dead. `describe` fed `Shell::file`, which the old composer used only as
+`described.or(file)` — so with a document open it was always shadowed, and the dozen sites that
+write "format saved to …" and friends into it have never reached the screen. The no-document path
+is restored exactly as it was. Removing both is a follow-up, not something to fold into a status-bar
+commit.
+
+**Next:** the toolbar. The greying is `toolbar.rs:764` tinting every glyph with `theme().ink` — the
+colour *body text* is drawn in, a soft grey close to what Windows uses for a disabled icon, from
+which comctl32 then derives the disabled variant, leaving enabled and disabled a few percent apart.
+The "amateur" half is not yet proved: the glyphs are drawn with `DT_VCENTER` on an icon font's line
+metrics rather than centred on the glyph's own ink, which would sit them small and slightly high in
+their boxes — **confirm that against a screenshot before acting on it.**
+
+---
+
 ## ▶ Resume point — 2026-09-21: the dialogs are dark, and the product is finished
 
 **`50b223a`, green on all five jobs.** All eleven dialog procedures are themed —
@@ -21,7 +70,8 @@ open/close. Find is modeless. All eleven free them now.
 **Left undone, deliberately:** a dialog open while Windows switches theme stays as it was — no
 procedure handles `WM_SETTINGCHANGE`, though `main.rs` does for the frame.
 
-**The owner declared the product finished on 2026-09-18** and is using this build. `UX-REVIEW.md` is
+**The owner declared the product finished on 2026-09-18** and used this build — see the section
+above, where he reopened the workstream with ten items from doing so. `UX-REVIEW.md` is
 advisory, not a backlog; `PLAN.md`'s M7/M7b/M8 are cut. The work below is history, not a queue.
 
 ---

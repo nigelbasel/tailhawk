@@ -5,8 +5,8 @@
 # never written: every first run showed a blank strip along the bottom, and any notice raised before
 # a file opened — a failed open, a failed pipe, a refused remote source — had nowhere to appear.
 #
-# Nothing in the unit suite can see this. `status_text` composes the right words either way; the
-# defect is *which call is reached*, so only a run reads the real control.
+# Nothing in the unit suite can see this. `status_panes_of` composes the right words either way;
+# the defect is *which call is reached*, so only a run reads the real control.
 #
 #   powershell tools/verify-no-document.ps1                  # the shipped binary
 #   powershell tools/verify-no-document.ps1 -Exe path\to.exe # a saved one, to see the old behaviour
@@ -37,8 +37,8 @@ try {
     $status = Get-StatusText $proc
     Write-Host "status bar with no document: '$status'"
 
-    # What it says is `status_text`'s business and the unit suite's. What this run proves is that
-    # the text reaches the control at all when no pane exists.
+    # What it says is `status_panes_of`s business and the unit suites. What this run proves is
+    # that the text reaches the control at all when no pane exists.
     if ([string]::IsNullOrWhiteSpace($status)) {
         $failures += 'the status bar is blank on the Welcome screen — the text never reached the control'
     }

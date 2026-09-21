@@ -62,6 +62,10 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 
+// **Every pane, joined — not WM_GETTEXT.** The bar carried one composed sentence until
+// 2026-09-21 and now carries eight parts, and WM_GETTEXT answers for the first of them only.
+// A harness reading that would have seen the message pane and none of the facts, which is
+// exactly the half a readiness check needs. SB_GETPARTS with a null array reports the count.
 public static class StatusText {
     public delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
@@ -69,9 +73,12 @@ public static class StatusText {
     static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, StringBuilder l);
-    const uint WM_GETTEXT = 0x000D;
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+    const uint SB_GETPARTS = 0x0406;
+    const uint SB_GETTEXTW = 0x040D;
 
-    public static string Of(IntPtr window) {
+    public static IntPtr Bar(IntPtr window) {
         IntPtr bar = IntPtr.Zero;
         EnumChildWindows(window, (h, l) => {
             StringBuilder c = new StringBuilder(64);
@@ -80,10 +87,24 @@ public static class StatusText {
             bar = h;
             return false;
         }, IntPtr.Zero);
+        return bar;
+    }
+
+    public static string Of(IntPtr window) {
+        IntPtr bar = Bar(window);
         if (bar == IntPtr.Zero) { return ""; }
-        StringBuilder text = new StringBuilder(4096);
-        SendMessageW(bar, WM_GETTEXT, (IntPtr)text.Capacity, text);
-        return text.ToString();
+        int parts = (int)SendMessageW(bar, SB_GETPARTS, IntPtr.Zero, IntPtr.Zero);
+        if (parts <= 0) { parts = 1; }
+        StringBuilder all = new StringBuilder();
+        for (int i = 0; i < parts; i++) {
+            StringBuilder text = new StringBuilder(1024);
+            SendMessageW(bar, SB_GETTEXTW, (IntPtr)i, text);
+            string one = text.ToString();
+            if (one.Length == 0) { continue; }
+            if (all.Length > 0) { all.Append(" | "); }
+            all.Append(one);
+        }
+        return all.ToString();
     }
 }
 '@
@@ -121,7 +142,10 @@ function Get-TailhawkExe {
 # SendKeys reaches it. Returns the process; its MainWindowHandle is the window.
 function Start-Tailhawk([string]$Log) {
     $proc = Start-Process (Get-TailhawkExe) -ArgumentList $Log -PassThru
-    $null = Wait-For { (Get-StatusText $proc) -match 'lines' } 'the window to open'
+    # **`Line N of M`, not `lines`.** The bar said `1192 lines, 419501 bytes` until 2026-09-21;
+    # the position pane says `Line 1,192 of 419,501` and the byte count is gone. Matching the
+    # pane that only exists once a document is open is still what "the window opened" means.
+    $null = Wait-For { (Get-StatusText $proc) -match 'Line [\d,]+ of' } 'the window to open'
     $hwnd = $proc.MainWindowHandle
     Write-Host "opened: $($proc.MainWindowTitle) | $(Get-StatusText $proc)"
 

@@ -63,7 +63,11 @@ try {
     # which is a native window with Windows' own UIA — verify-find.ps1 covers it behaviourally.
     $status = ById $root 'status'
     $sv = $status.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-    Check 'the status bar carries the status text' ($sv.Current.Value -match 'lines')
+    # **This used to match `lines`, a word only the screenshot harness ever put there.** The
+    # provider read `Document::status`, which production clears every frame, so the value was
+    # empty and the assertion passed only under `TAILHAWK_SHOT`. It reports the bar's own panes
+    # now, so a screen reader hears what the bar says and this matches what it hears.
+    Check 'the status bar carries the status text' ($sv.Current.Value -match 'Line [\d,]+ of')
 
     # **The filter panel is Windows controls since 2026-09-15**, so it is not our provider's to
     # describe, and this script's managed UIA client reports Windows' own children as unnamed panes.

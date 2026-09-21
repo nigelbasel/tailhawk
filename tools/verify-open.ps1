@@ -33,7 +33,7 @@ try {
     $proc.Refresh()
     if ($proc.HasExited) { $failures += 'the process exited when the dialog was dismissed' }
     Write-Host "after Esc: $((Get-StatusText $proc))"
-    if ((Get-StatusText $proc) -notmatch 'lines') { $failures += 'the window did not come back after the dialog' }
+    if ((Get-StatusText $proc) -notmatch 'Line [\d,]+ of') { $failures += 'the window did not come back after the dialog' }
     if ($failures) {
         $failures | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }
         $failed = $true

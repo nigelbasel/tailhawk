@@ -40,7 +40,7 @@ foreach ($theme in 'dark', 'light') {
     Write-Host "== $theme"
     $p = Start-Process -FilePath $exe -ArgumentList @('--stateless', '--new-instance', "--theme=$theme", '--filter=e', '--exclude=DEBUG', (Resolve-Path $Log).Path) -PassThru
     try {
-        $null = Wait-For { $p.Refresh(); $p.MainWindowHandle -ne 0 -and (Get-StatusText $p) -match 'lines' } 'the window' 20
+        $null = Wait-For { $p.Refresh(); $p.MainWindowHandle -ne 0 -and (Get-StatusText $p) -match 'Line [\d,]+ of' } 'the window' 20
         Start-Sleep -Milliseconds 1200
         $wsh = New-Object -ComObject WScript.Shell
         [void]$wsh.AppActivate($p.Id)

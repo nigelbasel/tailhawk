@@ -66,9 +66,21 @@ which no Windows application does. The owner reported both before any test did.
 
 **The bar is `msctls_statusbar32`.** What the table was reaching for was *live and clickable* rather
 than a row of dead text, and a real status bar carries **parts** and hit-tests them — so the chips
-survive as parts of a control instead of as drawing. The parts are not built yet; the bar carries
-one composed sentence today. Nothing here is drawn, so nothing here can lose a letter, and the bar
-docks itself along the bottom, which is what puts the scroll bar back above it.
+survive as parts of a control instead of as drawing. Nothing here is drawn, so nothing here can lose
+a letter, and the bar docks itself along the bottom, which is what puts the scroll bar back above it.
+
+**The parts arrived on 2026-09-21**, replacing the one composed sentence the bar carried until then.
+The owner, who had been using the build: it "is meaningless to me. It should be more like a
+conventional status bar, not just a debugging bar." There are eight — **message, position, find,
+filter, view, format, encoding, tail** — and each is silent when it has nothing to report, so the
+resting bar is quiet and the eye learns where each fact lives. `statusbar::status_panes_of` is the
+pure mapping and is where what they say is settled; the GPU driver name is no longer among them.
+
+The trap this walked into, recorded because it is not obvious: **a pane is a decision about what is
+worth showing, and a view-model with no field for a fact has taken that decision by accident.** The
+first cut had nowhere to put the Loki lag, the export progress, the sort or the revealed invisibles,
+and rendered a paused tail as an empty pane — which would have removed §4's stated lag and §12's
+resume affordance from the product while the code that computed them went on passing its tests.
 
 This is the general rule restated: **prefer the real control, and where a surface genuinely cannot
 be one, draw it only through `controls.rs`.**

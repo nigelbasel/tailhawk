@@ -116,20 +116,10 @@ fn crlf(text: &str) -> String {
 /// *Window management*: "the window title is the first thing a user reads in the taskbar", so the
 /// number is in it rather than in a label inside the window that a shrunken window would hide.
 pub fn title_of(view: &DetailView) -> String {
-    format!("Record {} — Detail", with_separators(view.line))
-}
-
-/// A line number a person can read at a glance: `1,204,915`.
-fn with_separators(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (at, c) in digits.chars().enumerate() {
-        if at > 0 && (digits.len() - at).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    format!(
+        "Record {} — Detail",
+        crate::statusbar::with_separators(view.line)
+    )
 }
 
 /// Which page can say anything about this record.
@@ -648,12 +638,12 @@ mod tests {
     }
 
     /// The title names the record, with the separators a person reads a line number by.
+    ///
+    /// The grouping itself is [`crate::statusbar::with_separators`]'s and is tested there; what
+    /// this holds is that the title asks for it at all.
     #[test]
     fn the_title_names_the_record() {
         let view = view_of(&detail(vec![], "x", vec![]), "x", false, true);
         assert_eq!(title_of(&view), "Record 1,204,915 — Detail");
-        assert_eq!(with_separators(0), "0");
-        assert_eq!(with_separators(999), "999");
-        assert_eq!(with_separators(1_000), "1,000");
     }
 }
