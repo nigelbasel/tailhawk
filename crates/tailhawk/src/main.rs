@@ -10160,21 +10160,37 @@ fn filter_columns(doc: &Document) -> Vec<dialog::FilterColumn> {
                 name: (*s).to_owned(),
             })
             .collect();
-    for column in doc.header_columns() {
-        // **`title` decides whether it is already listed, and `label` is what the list shows.**
-        // The owner, 2026-09-22: "Fiter surfaces should show friendly names." A Loki window is
-        // spilled as CLEF, so these are `@t`, `@l` and `@m` — which an expression must say and a
-        // reader should not have to. The header has read the friendly one since `9eb7217`; this is
-        // the surface that had not caught up.
-        let title = column.title;
-        if !title.is_empty()
-            && !title.contains(' ')
-            && !columns.iter().any(|c| c.name.eq_ignore_ascii_case(&title))
-        {
-            columns.push(dialog::FilterColumn {
-                label: column.label,
-                name: title,
-            });
+    // **Every column the format has, hidden ones included — the owner, 2026-09-22: "no filtering
+    // should show all columns, even if they are hidden."**
+    //
+    // This read `header_columns`, which is the *header band* and so skips a column of zero width
+    // — correct for drawing, wrong here. Since `86a5ac9` hid the columns a `json-lines` format
+    // invented, that silently took `app`, `environment` and `pod` out of the scope list on every
+    // Loki window: a reader could see a field in the detail pane and had no way to filter on it
+    // without first going to the Columns dialog to tick it back on. Hiding a column says it is not
+    // worth the width, not that it is not worth asking about.
+    //
+    // The layout's own order, which `shown_order` gives whatever the widths are, then the message.
+    if let Some(layout) = doc.layout.as_ref() {
+        let last = layout.widths.len().saturating_sub(1);
+        let order: Vec<usize> = layout
+            .shown_order()
+            .iter()
+            .copied()
+            .chain((!layout.format.columns.is_empty()).then_some(last))
+            .collect();
+        for i in order {
+            // `title` decides whether it is already listed; `label` is what the list shows.
+            let title = layout.title(i).to_owned();
+            if !title.is_empty()
+                && !title.contains(' ')
+                && !columns.iter().any(|c| c.name.eq_ignore_ascii_case(&title))
+            {
+                columns.push(dialog::FilterColumn {
+                    label: layout.display_title(i),
+                    name: title,
+                });
+            }
         }
     }
     columns
@@ -14666,15 +14682,27 @@ mod tests {
             "no CLEF shorthand in the scope list: {fields:?}"
         );
 
-        // **`app` is not offered, and that is `only_understood` rather than this change.**
-        // `filter_columns` builds from `header_columns`, which skips a column of zero width, and
-        // `86a5ac9` hides the columns a `json-lines` format invented so the message keeps the
-        // room. Ticking one back on in the Columns dialog brings it here too. Asserted so the
-        // coupling is visible: if hiding a column should stop scoping a filter to it is a
-        // question for the owner, and this is where the answer would change.
+        // **A hidden column is still offered — the owner answered on 2026-09-22: "no filtering
+        // should show all columns, even if they are hidden."**
+        //
+        // `app` is hidden on this document, because `86a5ac9` hides the columns a `json-lines`
+        // format invented so the message keeps its room. It is in the scope list all the same:
+        // hiding a column says it is not worth the width, not that it is not worth asking about,
+        // and a reader who can see a field in the detail pane should not have to visit the Columns
+        // dialog before filtering on it. The previous version of this asserted the opposite.
+        let app = fields
+            .iter()
+            .find(|f| f.name == "app")
+            .unwrap_or_else(|| panic!("a hidden column is still offered: {fields:?}"));
+        assert_eq!(
+            app.label, "app",
+            "verbatim, because Tailhawk did not name it"
+        );
         assert!(
-            !fields.iter().any(|f| f.name == "app"),
-            "a hidden column is not offered: {fields:?}"
+            doc.layout
+                .as_ref()
+                .is_some_and(|l| l.widths.iter().any(|w| *w == 0)),
+            "the fixture must actually have a hidden column, or this proves nothing"
         );
         assert_eq!(
             doc.column_name(0),
