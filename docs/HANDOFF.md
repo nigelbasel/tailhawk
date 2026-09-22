@@ -52,13 +52,16 @@ so widening the window brings columns back. `Document::columns_customised` is wh
 default rather than an owner of the widths — without it a file's remembered layout, restored by
 `apply_state` *before* the first `lay_out`, was discarded on every open.
 
-**Item 8, "the toolbar buttons look amateur", is the one that is not finished, and it cannot be
-finished from here.** The measurable half is fixed twice over — see the toolbar entry below. What
-is left is stroke weight, spacing, and whether a system icon font is the right choice at all,
-which is a judgement about taste. **The owner has been asked to look at the row and say what still
-reads badly; do not guess at it again.** Two theories this session had were both disproved by
-looking: that the glyphs sat small and off-centre, and that tinting them from the document theme
-would help. **Screenshot and sample pixels before claiming anything about this row.**
+**Item 8, "the toolbar buttons look amateur", is CLOSED — the owner, 2026-09-22: "Im happy with
+the look of the toolbar now."** It closed on his judgement rather than on a further change: the
+last thing done to that row was `0f48918`, which took the glyph colours from `COLOR_BTNTEXT` and
+`COLOR_GRAYTEXT` instead of from the document's theme.
+
+**The lesson from it stands whatever the row looks like now.** Two theories about those icons were
+put to him with confidence and both were wrong — that the glyphs sat small and off-centre, and
+that tinting them from the document theme would help. Each was settled in under a minute by a
+screenshot and a handful of pixel samples, after unit tests had agreed with the mistake.
+**Screenshot and sample pixels before claiming anything about what is on screen.**
 
 **An open question the owner has not answered**: opening a source as *separate windows* writes one
 recent entry per window, so eight applications can evict most of a ten-slot list in one action.
