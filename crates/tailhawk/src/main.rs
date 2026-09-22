@@ -10150,18 +10150,31 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
 
 /// The Filter dialog's column choices: the standard fields §7.2 always resolves, then the live
 /// format's own columns — the scope combo is the format speaking.
-fn filter_columns(doc: &Document) -> Vec<String> {
-    let mut columns: Vec<String> = ["level", "timestamp", "body", "source", "trace", "span"]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+fn filter_columns(doc: &Document) -> Vec<dialog::FilterColumn> {
+    // The model's own fields, which a filter names directly and which read the same either way.
+    let mut columns: Vec<dialog::FilterColumn> =
+        ["level", "timestamp", "body", "source", "trace", "span"]
+            .iter()
+            .map(|s| dialog::FilterColumn {
+                label: (*s).to_owned(),
+                name: (*s).to_owned(),
+            })
+            .collect();
     for column in doc.header_columns() {
+        // **`title` decides whether it is already listed, and `label` is what the list shows.**
+        // The owner, 2026-09-22: "Fiter surfaces should show friendly names." A Loki window is
+        // spilled as CLEF, so these are `@t`, `@l` and `@m` — which an expression must say and a
+        // reader should not have to. The header has read the friendly one since `9eb7217`; this is
+        // the surface that had not caught up.
         let title = column.title;
         if !title.is_empty()
             && !title.contains(' ')
-            && !columns.iter().any(|c| c.eq_ignore_ascii_case(&title))
+            && !columns.iter().any(|c| c.name.eq_ignore_ascii_case(&title))
         {
-            columns.push(title);
+            columns.push(dialog::FilterColumn {
+                label: column.label,
+                name: title,
+            });
         }
     }
     columns
@@ -14599,14 +14612,69 @@ mod tests {
         let message = boxes.last().expect("the message column");
         assert_eq!(message.title, "message");
         assert_eq!(message.label, "Message");
+        // **Both, and each in its own place — the owner's ask of 2026-09-22, "Fiter surfaces
+        // should show friendly names."** This asserted the opposite until then: that the dialog
+        // offered the raw name and *never* the label. What has not changed, and is the half that
+        // would break filtering if it did, is that the name an expression is written against is
+        // still the file's own spelling.
         let fields = filter_columns(&doc);
-        assert!(
-            fields.iter().any(|f| f == "message"),
-            "the filter dialog offers the raw name: {fields:?}"
+        let message = fields
+            .iter()
+            .find(|f| f.name == "message")
+            .unwrap_or_else(|| panic!("the message column is offered: {fields:?}"));
+        assert_eq!(
+            message.label, "Message",
+            "what the reader picks from the list"
         );
+        assert_eq!(message.name, "message", "what the expression says");
+    }
+
+    /// **The case the owner actually hit: a CLEF column, where the two names really differ.**
+    ///
+    /// `message`/`Message` differ only in case, so a dialog that showed the wrong one of the two
+    /// would look almost right. A Loki window is spilled as Serilog CLEF (`LOKI.md` §4), so its
+    /// fields are `@t`, `@l` and `@m` — and the gap between what a reader should see and what an
+    /// expression must say is the whole width of the feature.
+    #[test]
+    fn the_filter_dialog_offers_a_clef_column_by_its_readable_name() {
+        let path = std::env::temp_dir().join("tailhawk_filter_clef_test.log");
+        std::fs::write(
+            &path,
+            "{\"@t\":\"2026-09-22T06:00:00.0000000Z\",\"@l\":\"Information\",\
+             \"app\":\"nurtur-gateway\",\"@m\":\"one\"}\n\
+             {\"@t\":\"2026-09-22T06:00:01.0000000Z\",\"@l\":\"Error\",\
+             \"app\":\"nurtur-gateway\",\"@m\":\"two\"}\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 300));
+        let fields = filter_columns(&doc);
+
+        for (label, name) in [("Timestamp", "@t"), ("Level", "@l"), ("Message", "@m")] {
+            let found = fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is offered: {fields:?}"));
+            assert_eq!(
+                found.label, label,
+                "the readable name is what the list shows"
+            );
+        }
+        // And no wire shorthand is put in front of the reader.
         assert!(
-            !fields.iter().any(|f| f == "Message"),
-            "and never the label: {fields:?}"
+            !fields.iter().any(|f| f.label.starts_with('@')),
+            "no CLEF shorthand in the scope list: {fields:?}"
+        );
+
+        // **`app` is not offered, and that is `only_understood` rather than this change.**
+        // `filter_columns` builds from `header_columns`, which skips a column of zero width, and
+        // `86a5ac9` hides the columns a `json-lines` format invented so the message keeps the
+        // room. Ticking one back on in the Columns dialog brings it here too. Asserted so the
+        // coupling is visible: if hiding a column should stop scoping a filter to it is a
+        // question for the owner, and this is where the answer would change.
+        assert!(
+            !fields.iter().any(|f| f.name == "app"),
+            "a hidden column is not offered: {fields:?}"
         );
         assert_eq!(
             doc.column_name(0),

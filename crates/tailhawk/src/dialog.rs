@@ -3158,8 +3158,43 @@ pub fn create_find_dialog(owner: HWND, seed: &FindSeed, history: &[String]) -> H
 /// What the Filter dialog edits, in and out. `expression` seeds the box when editing an existing
 /// filter and carries the accepted §7.2 text back; `manual` records that the box is authoritative
 /// (an edit, or the user typed into it) until a structured control is touched again.
+/// One column the Filter dialog can scope to: what the list shows, and what the expression says.
+///
+/// **They are two different strings for a JSON or W3C file, and the owner asked for the readable
+/// one, 2026-09-22: "Fiter surfaces should show friendly names."** A Loki window is spilled as
+/// Serilog CLEF (`LOKI.md` §4), so its fields are `@t`, `@l` and `@m` — which a filter has to be
+/// written against, and which the list used to show. `9eb7217` gave the *header* the readable
+/// name; this gives it to the dialog without letting it reach the expression.
+///
+/// **A filter written as `Timestamp:` against a field named `@t` matches nothing**, which is why
+/// `HeaderColumn` keeps the pair apart and why this does too. [`scope_name`] is the one place that
+/// chooses between them, so the choice can be tested without a window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterColumn {
+    /// What the scope list shows — the heading a reader sees in the grid.
+    pub label: String,
+    /// What an expression is written against — the file's own spelling.
+    pub name: String,
+}
+
+/// The field an expression should name, for the scope combo's current selection.
+///
+/// **Pure, and separate, because the mistake it prevents compiles.** Item 0 of the combo is "any
+/// column", so a selection is `1 + index`; reading `label` here instead of `name` builds a filter
+/// against a field no file has, and the view empties with nothing to say why. Nothing in the
+/// dialog's own code path can be tested — it reads live controls — so the decision is lifted out
+/// to where it can be.
+pub fn scope_name(columns: &[FilterColumn], selected: i32) -> Option<&str> {
+    if selected <= 0 {
+        return None;
+    }
+    columns
+        .get(selected as usize - 1)
+        .map(|column| column.name.as_str())
+}
+
 pub struct FilterEdit {
-    pub columns: Vec<String>,
+    pub columns: Vec<FilterColumn>,
     pub include: bool,
     /// A column to open pre-scoped to — the header's "Filter on this column…" route.
     pub scope: Option<String>,
@@ -3170,7 +3205,7 @@ pub struct FilterEdit {
 
 /// The validation line: the model's own answer to the expression as it stands, plus §7.2's
 /// unknown-column warning checked against the live format's columns.
-fn filter_status(expression: &str, include: bool, columns: &[String]) -> String {
+fn filter_status(expression: &str, include: bool, columns: &[FilterColumn]) -> String {
     use tailhawk_core::filter::{Chip, Field, Polarity};
     let expression = expression.trim();
     if expression.is_empty() {
@@ -3186,7 +3221,9 @@ fn filter_status(expression: &str, include: bool, columns: &[String]) -> String 
         Ok(chip) => {
             for field in chip.predicate.fields() {
                 if let Field::Attribute(name) = field {
-                    if !columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                    // Against the name, never the label: the expression names a field as the file
+                    // spells it, so a warning about an unknown column must ask the same question.
+                    if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
                         return format!(
                             "Warning: this format has no column named \"{name}\" — an include \
                              with it matches nothing."
@@ -3229,11 +3266,7 @@ unsafe fn filter_recompose(hdlg: HWND, state: &mut FilterState) {
         SendDlgItemMessageW(hdlg, i32::from(id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
     };
     let value = read_dlg_text(hdlg, ID_F_VALUE);
-    let column = if scope > 0 {
-        edit.columns.get(scope as usize - 1).map(String::as_str)
-    } else {
-        None
-    };
+    let column = scope_name(&edit.columns, scope as i32);
     let expression = compose_filter(
         column,
         op.max(0) as usize,
@@ -3298,7 +3331,10 @@ unsafe extern "system" fn filter_proc(
                     LPARAM(any.as_ptr() as isize),
                 );
                 for column in &data.columns {
-                    let text = wsz(column);
+                    // **The label, not the name** — the heading the reader sees in the grid. What
+                    // an expression is written against is `name`, and `scope_name` is the only
+                    // thing that reads it.
+                    let text = wsz(&column.label);
                     SendDlgItemMessageW(
                         hdlg,
                         i32::from(ID_F_SCOPE),
@@ -3335,7 +3371,9 @@ unsafe extern "system" fn filter_proc(
                     if let Some(at) = data
                         .columns
                         .iter()
-                        .position(|c| c.eq_ignore_ascii_case(scope))
+                        // Against the name: the seed is the column as the file spells it, which
+                        // is what "Filter on this column…" carried before the list was readable.
+                        .position(|c| c.name.eq_ignore_ascii_case(scope))
                     {
                         SendDlgItemMessageW(
                             hdlg,
@@ -5210,6 +5248,53 @@ mod tests {
                 "{got:?} does not parse"
             );
         }
+    }
+
+    /// **The scope list shows the readable name and the expression says the file's own.**
+    ///
+    /// The owner asked for the friendly names on 2026-09-22. The mistake that asks for is reading
+    /// `label` where `name` belongs: it **compiles**, and it builds a filter against a field no
+    /// file has, so the view empties with nothing on screen to say why. The dialog's own path
+    /// reads live controls and cannot be tested, which is why the choice was lifted into
+    /// [`scope_name`] — and why this asserts on it rather than on a string the dialog produced.
+    #[test]
+    fn the_expression_is_scoped_by_the_field_name_not_the_heading() {
+        use tailhawk_core::filter::{Chip, Polarity};
+        let columns = vec![
+            FilterColumn {
+                label: "Timestamp".to_owned(),
+                name: "@t".to_owned(),
+            },
+            FilterColumn {
+                label: "app".to_owned(),
+                name: "app".to_owned(),
+            },
+        ];
+        // Item 0 is "any column", so a real selection starts at 1.
+        assert_eq!(scope_name(&columns, 0), None, "any column scopes nothing");
+        assert_eq!(scope_name(&columns, -1), None, "nothing selected");
+        assert_eq!(
+            scope_name(&columns, 1),
+            Some("@t"),
+            "the CLEF field, not the Timestamp the reader picked"
+        );
+        assert_eq!(scope_name(&columns, 2), Some("app"));
+        assert_eq!(
+            scope_name(&columns, 99),
+            None,
+            "past the end is not a panic"
+        );
+
+        // And what it hands over composes into a filter the model can actually parse.
+        let expression = compose_filter(scope_name(&columns, 1), 0, "2026", false, false);
+        assert!(
+            Chip::parse(&expression, Polarity::Include).is_ok(),
+            "{expression:?} does not parse"
+        );
+        assert!(
+            expression.contains("@t") && !expression.contains("Timestamp"),
+            "the field is the file's own spelling: {expression:?}"
+        );
     }
 
     /// The dialog data: current selections found, and a face in use but not installed still shown.
