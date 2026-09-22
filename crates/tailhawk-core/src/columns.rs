@@ -142,9 +142,31 @@ impl Layout {
         }
     }
 
-    /// Column `i`'s heading as a person reads it — see [`display_title`]. Verbatim when the format
-    /// carries `titles`, which it does exactly when its names are the file's own spelling.
+    /// Column `i`'s heading as a person reads it — see [`display_title`].
+    ///
+    /// **A key the format *understood* gets its readable name; one it merely found stays
+    /// verbatim.** The owner, 2026-09-22, seeing `@t`, `@l` and `@m` across his Loki columns: "why
+    /// is this?" Because Tailhawk wrote them. `lokiwire::clef_line` spills a window as Serilog
+    /// CLEF (`LOKI.md` §4), whose fields *are* `@t`/`@l`/`@m`, and the detector then read that
+    /// spill back and showed each key exactly as written — so the program was showing a reader its
+    /// own wire shorthand, having already decided in `understood_key` that `@t` means a timestamp.
+    ///
+    /// Verbatim remains right for every other key, and that is the half worth keeping: `app`,
+    /// `environment` and `pod` are the service's own words, a filter is written against them, and
+    /// renaming them would be Tailhawk second-guessing a file it did not write.
+    ///
+    /// The capture name is what decides it, not the spelling: `json_columns` binds an understood
+    /// key to the role's name — `ts`, `level`, `msg` — and leaves an invented one sanitised, so
+    /// "did this format understand column `i`" is already answered before this is asked.
     pub fn display_title(&self, i: usize) -> String {
+        let name = self.format.columns.get(i).copied().unwrap_or("");
+        let understood = matches!(
+            name,
+            crate::format::TS | crate::format::LEVEL | crate::format::MSG
+        );
+        if self.format.titles.is_some() && understood {
+            return display_title(column_title(name), false).into_owned();
+        }
         display_title(self.title(i), self.format.titles.is_some()).into_owned()
     }
 
@@ -629,6 +651,52 @@ mod tests {
         };
         assert_eq!(file.display_title(0), "date");
         assert_eq!(file.display_title(3), "cs(User-Agent)");
+    }
+
+    /// **A key the format understood is named; a key it merely found is left alone.**
+    ///
+    /// The owner asked on 2026-09-22 why his Loki columns were headed `@t`, `@l` and `@m`. Because
+    /// Tailhawk wrote them: `lokiwire::clef_line` spills a window as Serilog CLEF, whose fields are
+    /// exactly those, and the detector then read its own shorthand back and printed it. It had
+    /// already mapped `@t` to a timestamp in `understood_key` — the name was there all along.
+    ///
+    /// The other half must not move with it. `app` and `pod` are the service's words, a filter is
+    /// written against them, and Tailhawk renaming a key it does not understand would be guessing
+    /// about a file it did not write.
+    #[test]
+    fn a_clef_key_is_named_and_a_services_own_key_is_not() {
+        use crate::detect::{JsonKey, JsonValue};
+        let keys: Vec<JsonKey> = ["@t", "@l", "app", "pod", "@m"]
+            .iter()
+            .map(|name| JsonKey {
+                name: (*name).to_owned(),
+                value: JsonValue::Text,
+            })
+            .collect();
+        let format = crate::format::json_lines(&keys);
+        let layout = Layout {
+            format,
+            widths: vec![0; format.columns.len()],
+            order: (0..format.columns.len().saturating_sub(1)).collect(),
+            sort: None,
+        };
+        let shown: Vec<String> = (0..format.columns.len())
+            .map(|i| layout.display_title(i))
+            .collect();
+        assert!(shown.contains(&"Timestamp".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"Level".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"Message".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"app".to_owned()), "verbatim: {shown:?}");
+        assert!(shown.contains(&"pod".to_owned()), "verbatim: {shown:?}");
+        assert!(
+            !shown.iter().any(|t| t.starts_with('@')),
+            "no CLEF shorthand reaches a header: {shown:?}"
+        );
+
+        // **And the name a filter is written against is untouched**, which is the whole reason
+        // this is display-only: `title` still answers the file's own spelling.
+        let raw: Vec<&str> = (0..format.columns.len()).map(|i| layout.title(i)).collect();
+        assert!(raw.contains(&"@t"), "{raw:?}");
     }
 
     /// A layout whose widths are dictated rather than measured, for the fitting tests.
