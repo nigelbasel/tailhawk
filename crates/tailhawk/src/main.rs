@@ -4662,6 +4662,15 @@ struct Shell {
     pending_sources: bool,
     /// The remote source the user picked, waiting for the pull that must not run inside a borrow.
     pending_pull: Option<usize>,
+    /// A remote chosen from Open Recent — its source name and the applications it was opened for —
+    /// waiting for the open that must not run inside a borrow.
+    ///
+    /// **This one is here because it crashed.** [`open_remote`] takes a `STATE` borrow and
+    /// [`set_notice`] takes another, and [`Shell::menu_choose`] runs with the shell already
+    /// borrowed; calling straight through panicked on a live `RefCell` and took the process with
+    /// it. Every other route to a remote open was already deferred, so nothing exercised this one
+    /// until the owner chose the entry.
+    pending_reopen: Option<(String, Vec<String>)>,
     /// The running Loki tails, one per open remote source. Dropping one stops its thread.
     ///
     /// Held for the window's life alongside the spills they append to, and for the same reason:
@@ -5108,48 +5117,6 @@ impl Shell {
             }
         }
         settings::save(&self.settings_tiers, &self.settings, self.stateless);
-    }
-
-    /// **The status line, shown in the status bar, where a person reads it and a harness reads it
-    /// back through `WM_GETTEXT` — it is not in the title any more.**
-    ///
-    /// The parts and their order are [`status_line`]'s, which is where they are tested.
-    /// Opens a remote source again from a recent entry, with the applications it was opened for.
-    ///
-    /// **A source can be renamed or deleted between one open and the next**, and the recent list
-    /// is not the configuration — it is a record of what was done. So a missing one says so rather
-    /// than opening nothing, which is the same courtesy the pick refuses a bad selector with.
-    fn reopen_remote(&mut self, hwnd: HWND, name: &str, apps: &[String]) {
-        let Some(source) = self
-            .settings
-            .sources
-            .iter()
-            .find(|s| s.name == name)
-            .cloned()
-        else {
-            self.notice = Some(format!("{name}: that source is no longer configured."));
-            return;
-        };
-        let chosen: Vec<&str> = apps.iter().map(String::as_str).collect();
-        let query = if chosen.is_empty() {
-            source.query.clone()
-        } else {
-            match tailhawk_core::apps::with_apps(&source.query, &chosen) {
-                Ok(query) => query,
-                Err(_) => {
-                    self.notice = Some(format!(
-                        "{name}: this source's query is not a selector this can add to."
-                    ));
-                    return;
-                }
-            }
-        };
-        let label = tailhawk_core::apps::source_label(&source.name, &chosen);
-        open_remote(
-            hwnd,
-            tailhawk_core::settings::Source { query, ..source },
-            label,
-        );
     }
 
     /// The status bar's eight panes for this frame.
@@ -6897,8 +6864,10 @@ impl Shell {
                     Some(tailhawk_core::settings::Recent::File(path)) => {
                         self.open_path(hwnd, std::path::PathBuf::from(path));
                     }
+                    // Deferred for the same reason the source list below is: opening a remote
+                    // takes a `STATE` borrow of its own, and this runs inside one.
                     Some(tailhawk_core::settings::Recent::Remote { source, apps }) => {
-                        self.reopen_remote(hwnd, &source, &apps);
+                        self.pending_reopen = Some((source, apps));
                     }
                     None => {}
                 }
@@ -9489,12 +9458,49 @@ const REMOTE_WINDOW_NANOS: i64 = 60 * 60 * 1_000_000_000;
 /// screenful and not an export.
 const REMOTE_LIMIT: u32 = 1_000;
 
+/// The source and label a recent remote entry reopens, or the reason it cannot.
+///
+/// **A source can be renamed or deleted between one open and the next**, and the recent list is not
+/// the configuration — it is a record of what was done. So a missing one says so rather than opening
+/// nothing, which is the same courtesy the pick refuses a bad selector with.
+///
+/// The applications are narrowed back into the source's own selector rather than trusted from the
+/// entry, so a source whose query changed underneath the entry reopens against the query it has now.
+fn remote_to_reopen(
+    sources: &[tailhawk_core::settings::Source],
+    name: &str,
+    apps: &[String],
+) -> std::result::Result<(tailhawk_core::settings::Source, String), String> {
+    let Some(source) = sources.iter().find(|s| s.name == name).cloned() else {
+        return Err(format!("{name}: that source is no longer configured."));
+    };
+    let chosen: Vec<&str> = apps.iter().map(String::as_str).collect();
+    let query = if chosen.is_empty() {
+        source.query.clone()
+    } else {
+        match tailhawk_core::apps::with_apps(&source.query, &chosen) {
+            Ok(query) => query,
+            Err(_) => {
+                return Err(format!(
+                    "{name}: this source's query is not a selector this can add to."
+                ));
+            }
+        }
+    };
+    let label = tailhawk_core::apps::source_label(&source.name, &chosen);
+    Ok((tailhawk_core::settings::Source { query, ..source }, label))
+}
+
 /// §12.3: fetch a remote source and open what comes back as an ordinary document.
 ///
 /// **This asks and returns; the window keeps painting.** A token exchange and a query are two round
 /// trips and neither belongs on the message loop — the doc-comment here has claimed that since the
 /// first version and it only became true on 2026-09-09. [`Shell::poll_fetch`] takes the records when
 /// they land and calls [`landed_records`], which is the half that needs the UI thread.
+///
+/// **Every caller reaches this with no `STATE` borrow alive**, because it takes one of its own and
+/// [`set_notice`] takes another. That is not a style note: calling it from [`Shell::menu_choose`],
+/// which runs with the shell already borrowed, panicked on a live `RefCell` and killed the process.
 fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: String) {
     // **Remembered here, which is the one place every remote open passes through** — the picker's
     // two branches, a regroup, and reopening from the list itself. The applications come from the
@@ -9661,6 +9667,24 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         });
         if let Some(source) = source {
             open_picked(hwnd, source);
+        }
+        return true;
+    }
+    let reopening = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|shell| shell.pending_reopen.take())
+    });
+    if let Some((name, apps)) = reopening {
+        let sources = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|shell| shell.settings.sources.clone())
+                .unwrap_or_default()
+        });
+        match remote_to_reopen(&sources, &name, &apps) {
+            Ok((source, label)) => open_remote(hwnd, source, label),
+            Err(why) => set_notice(hwnd, why),
         }
         return true;
     }
@@ -12715,6 +12739,7 @@ fn main() -> Result<()> {
             pending_rules: false,
             pending_sources: false,
             pending_pull: None,
+            pending_reopen: None,
             spill_sets: Vec::new(),
             tails: Vec::new(),
             tail_notices: Vec::new(),
@@ -12927,6 +12952,79 @@ mod tests {
     use super::*;
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// A configured source, named and with a selector, and nothing else filled in — the reopen
+    /// decision reads those two fields and carries the rest through untouched.
+    fn a_source(name: &str, query: &str) -> tailhawk_core::settings::Source {
+        tailhawk_core::settings::Source {
+            name: name.to_owned(),
+            url: "https://example.invalid/loki".to_owned(),
+            token_url: String::new(),
+            client_id: String::new(),
+            scope: String::new(),
+            query: query.to_owned(),
+        }
+    }
+
+    /// Choosing a remote from Open Recent reopens the source it names, narrowed to the applications
+    /// the entry was recorded with, and labelled the way the window that made the entry was.
+    #[test]
+    fn a_recent_remote_reopens_its_source_narrowed_to_the_applications_it_recorded() {
+        let sources = [
+            a_source("live", "{environment=\"live\"}"),
+            a_source("dev", "{environment=\"dev\"}"),
+        ];
+        let apps = ["Worker".to_owned(), "Api".to_owned()];
+        let (source, label) = remote_to_reopen(&sources, "dev", &apps).expect("dev is configured");
+        assert_eq!(source.name, "dev");
+        assert_eq!(source.url, "https://example.invalid/loki");
+        assert!(
+            source.query.contains("environment=\"dev\""),
+            "the source's own selector must survive the narrowing: {}",
+            source.query
+        );
+        assert!(
+            source.query.contains("Worker") && source.query.contains("Api"),
+            "both recorded applications must be asked for: {}",
+            source.query
+        );
+        assert_eq!(label, "dev · Worker, Api");
+    }
+
+    /// An entry with no applications reopens the source as it stands. The distinction matters:
+    /// "no application chosen" means the source's own selector, not an empty one.
+    #[test]
+    fn a_recent_remote_with_no_applications_reopens_the_source_as_it_stands() {
+        let sources = [a_source("live", "{environment=\"live\"}")];
+        let (source, _) = remote_to_reopen(&sources, "live", &[]).expect("live is configured");
+        assert_eq!(source.query, "{environment=\"live\"}");
+    }
+
+    /// **The recent list is a record of what was done, not the configuration.** A source renamed or
+    /// deleted since the entry was made is named in the refusal, rather than opening nothing.
+    #[test]
+    fn a_recent_remote_whose_source_is_gone_says_so_rather_than_opening_nothing() {
+        let sources = [a_source("live", "{environment=\"live\"}")];
+        let why =
+            remote_to_reopen(&sources, "staging", &[]).expect_err("staging is not configured");
+        assert!(
+            why.contains("staging"),
+            "the refusal must name the source the reader chose: {why}"
+        );
+    }
+
+    /// A source whose query is not a selector cannot have an application added to it, and that is
+    /// said rather than opening the whole source and quietly ignoring the choice.
+    #[test]
+    fn a_recent_remote_whose_query_takes_no_selector_says_so() {
+        let sources = [a_source("odd", "|= \"boom\"")];
+        let apps = ["Worker".to_owned()];
+        let why = remote_to_reopen(&sources, "odd", &apps).expect_err("that query has no selector");
+        assert!(
+            why.contains("odd") && why.contains("selector"),
+            "the refusal must name the source and the reason: {why}"
+        );
+    }
 
     /// The two doors to the grid's size — Preferences and `ChooseFontW` — must agree on its unit
     /// and its range, and the conversion must invert the seeding exactly: an untouched OK returns
