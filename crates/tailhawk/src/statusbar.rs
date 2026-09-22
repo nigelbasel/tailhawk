@@ -385,6 +385,10 @@ pub struct StatusFacts<'a> {
     pub columns: Option<(usize, usize)>,
     /// The sort in force, already worded by `Filtering::describe_sort`.
     pub sorted: Option<&'a str>,
+    /// §7's trace, when the view is following one. **Said, because it is state a reader cannot
+    /// otherwise see**: a trace is not a chip and so does not appear in the filter panel, which is
+    /// the whole point of it — and §1.1 has no patience for a view narrowed by something invisible.
+    pub trace: Option<&'a str>,
     /// §6.4's revealed invisibles, which change what every row looks like.
     pub invisibles: bool,
     pub format: Option<&'a str>,
@@ -521,6 +525,7 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
             view.push(format!("{shown} of {total} columns"));
         }
     }
+    view.extend(facts.trace.map(|id| format!("▸ trace {id}")));
     view.extend(facts.sorted.map(str::to_owned));
     if facts.invisibles {
         view.push("¶ invisibles".to_owned());
@@ -748,6 +753,29 @@ mod tests {
             ..open()
         });
         assert_eq!(panes.tail, "● Following · current to 30s ago");
+    }
+
+    /// **A trace narrows the view and puts nothing in the filter panel, so the bar must say it.**
+    ///
+    /// That is the point of the owner's correction of 2026-09-21 — a trace is not one of the
+    /// reader's filters — and it is exactly what makes saying so necessary: without this the rows
+    /// are cut down by something with no representation anywhere on screen.
+    #[test]
+    fn a_trace_in_force_is_named_on_the_view_pane() {
+        let panes = status_panes_of(StatusFacts {
+            trace: Some("4bf92f3577b34da6"),
+            ..open()
+        });
+        assert!(
+            panes.view.contains("4bf92f3577b34da6"),
+            "the id, so a reader knows which: {:?}",
+            panes.view
+        );
+        assert_eq!(
+            status_panes_of(open()).view,
+            "",
+            "and nothing when no trace is being followed"
+        );
     }
 
     /// The view pane carries three facts of one kind, and joins only the ones that apply.

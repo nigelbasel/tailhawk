@@ -98,10 +98,17 @@ impl Drop for Running {
 /// `records_only` keeps only lines the format calls first lines — §6.4's "continuations are
 /// collapsed" — composed with the chips: a row survives if it is a first line *and* the chips keep
 /// it. Without a format it means nothing and keeps everything.
+///
+/// `trace` keeps only lines carrying that trace id, composed the same way.
+///
+/// **A trace is not a chip, and that is the owner's correction of 2026-09-21**: "I would have
+/// thought it more logical to simply have trace and untrace … having it basically add to the
+/// current filter is a bit strange." It used to push an include chip, so following a request put a
+/// row in the panel beside the filters a reader had written themselves, pressing the button twice
+/// added it twice, and nothing offered to take it off. It narrows the view like a filter and it
+/// belongs beside one here — but it is the program's state, not the reader's list.
 pub fn start(
-    chips: Chips,
-    format: Option<&'static Format>,
-    records_only: bool,
+    job: Job,
     members: Vec<Excerpt>,
     from: u64,
     to: u64,
@@ -113,20 +120,7 @@ pub fn start(
         let cancel = cancel.clone();
         std::thread::Builder::new()
             .name("tailhawk-filter".to_owned())
-            .spawn(move || {
-                run(
-                    Job {
-                        chips,
-                        format,
-                        records_only,
-                    },
-                    members,
-                    from..to,
-                    options,
-                    &cancel,
-                    &tx,
-                )
-            })
+            .spawn(move || run(job, members, from..to, options, &cancel, &tx))
             // Reaches the status bar through `Filtering::error`, beside the chips it belongs to.
             .map_err(|e| crate::Error(format!("the filter could not be started — {e}")))?
     };
@@ -137,12 +131,20 @@ pub fn start(
     })
 }
 
-/// The worker body: every member in row order, clipped to `[from, to)`, under one cancel flag.
 /// What one pass evaluates every line against.
-struct Job {
-    chips: Chips,
-    format: Option<&'static Format>,
-    records_only: bool,
+///
+/// **A struct rather than four more parameters**, since the trace joined the collapse and the
+/// chips: `start` took eight arguments and three of them were booleans and options in a row, which
+/// is a call whose arguments get transposed silently and which clippy refuses outright. These four
+/// are one thing — what narrows the view — and the worker already grouped them this way.
+#[derive(Default)]
+pub struct Job {
+    pub chips: Chips,
+    pub format: Option<&'static Format>,
+    /// §6.4's collapse: only the lines a format calls first lines.
+    pub records_only: bool,
+    /// §7's trace: only the lines carrying this id.
+    pub trace: Option<String>,
 }
 
 fn run(
@@ -153,6 +155,16 @@ fn run(
     cancel: &Cancel,
     tx: &Sender<Update>,
 ) {
+    // **Compiled once, and case-insensitively, because that is what the chip it replaced did.**
+    // §7.2 makes a text chip "case-insensitive substring over the whole record", and following a
+    // trace used to *be* such a chip — so a plain `contains` here would quietly match a narrower
+    // set of lines than the feature did before. `filter.rs` explains why it is a literal under
+    // `(?i)` rather than a fold per line: the fold is an allocation and a full-row pass per line,
+    // which is the cost of the whole sieve. `escape` makes an id that is not hex harmless.
+    let trace = job
+        .trace
+        .as_deref()
+        .and_then(|id| regex::Regex::new(&format!("(?i){}", regex::escape(id))).ok());
     let mut outcome = Outcome::Complete;
     for member in members {
         if cancel.cancelled() {
@@ -170,6 +182,7 @@ fn run(
             chips: &job.chips,
             format: job.format,
             records_only: job.records_only,
+            trace: trace.as_ref(),
             charset: member.charset,
             options,
             cancel: cancel.clone(),
@@ -211,6 +224,9 @@ struct Sieve<'a> {
     format: Option<&'static Format>,
     /// §6.4's collapse: drop lines that are not first lines under `format`.
     records_only: bool,
+    /// §7's trace: drop lines that do not carry this id, case-insensitively, as the chip this
+    /// replaced did. Compiled once by `run` and borrowed per member.
+    trace: Option<&'a regex::Regex>,
     charset: crate::encoding::Charset,
     options: SearchOptions,
     cancel: Cancel,
@@ -271,6 +287,12 @@ impl Sieve<'_> {
             self.cancel.flag(),
             |line, text| {
                 if self.records_only && self.format.is_some_and(|f| !f.is_first_line(text)) {
+                    kept.scanned += 1;
+                    return;
+                }
+                // Checked before the chips and before any parse: a trace narrows a file to one
+                // request, so it is the cheapest rejection available and the one that pays most.
+                if self.trace.is_some_and(|re| !re.is_match(text)) {
                     kept.scanned += 1;
                     return;
                 }
@@ -352,15 +374,90 @@ mod tests {
     }
 
     /// The owner's daily case: an include, an exclude, and both composing. §7.3's model.
+    /// **A trace narrows the view and composes with the chips, exactly as the collapse does.**
+    ///
+    /// The owner's correction of 2026-09-21 moved a trace out of the chip list and to here; this
+    /// is the half that says it still *works* — a request's lines survive, another request's do
+    /// not, and a chip the reader wrote still applies on top.
+    #[test]
+    fn a_trace_keeps_one_requests_lines_and_still_obeys_the_chips() {
+        let path = fixture("tailhawk_sieve_trace.log");
+        let text = "a=1 trace=aaa start\n\
+                    a=2 trace=bbb other request\n\
+                    a=3 trace=aaa boom\n\
+                    a=4 trace=aaa quiet\n";
+        let running = start(
+            Job {
+                chips: Chips::default(),
+                format: None,
+                records_only: false,
+                trace: Some("trace=aaa".to_owned()),
+            },
+            vec![excerpt(&path, text, 0)],
+            0,
+            4,
+            SearchOptions::default(),
+        )
+        .expect("start");
+        let (rows, scanned, _) = collect(&running);
+        assert_eq!(rows, [0, 2, 3], "only the lines of that one trace");
+        assert_eq!(scanned, 4, "every line is still examined");
+
+        // And a chip the reader wrote narrows it further rather than being replaced by it.
+        let running = start(
+            Job {
+                chips: chips(&["boom"], &[]),
+                format: None,
+                records_only: false,
+                trace: Some("trace=aaa".to_owned()),
+            },
+            vec![excerpt(&path, text, 0)],
+            0,
+            4,
+            SearchOptions::default(),
+        )
+        .expect("start");
+        let (rows, _, _) = collect(&running);
+        assert_eq!(rows, [2], "the trace and the chip compose");
+    }
+
+    /// **Case-insensitively, because the chip this replaced was.**
+    ///
+    /// §7.2 makes a text chip "case-insensitive substring over the whole record", and following a
+    /// trace used to *be* such a chip — so a plain `contains` would have matched a narrower set of
+    /// lines than the feature did before, silently and only for services that write an id in more
+    /// than one case.
+    #[test]
+    fn a_trace_matches_an_id_written_in_another_case() {
+        let path = fixture("tailhawk_sieve_trace_case.log");
+        let text = "trace=ABCDEF01 upper\ntrace=abcdef01 lower\ntrace=99999999 other\n";
+        let running = start(
+            Job {
+                trace: Some("abcdef01".to_owned()),
+                ..Job::default()
+            },
+            vec![excerpt(&path, text, 0)],
+            0,
+            3,
+            SearchOptions::default(),
+        )
+        .expect("start");
+        let (rows, _, _) = collect(&running);
+        assert_eq!(rows, [0, 1], "both spellings of the same id");
+    }
+
     #[test]
     fn include_then_exclude_over_a_real_file() {
         let path = fixture("tailhawk_sieve_basic.log");
         let text = "INFO start\nERROR boom\nDEBUG noise\nERROR again (retrying)\nWARN retrying\n";
         let members = vec![excerpt(&path, text, 0)];
         let running = start(
-            chips(&["error"], &["retrying"]),
-            None,
-            false,
+            Job {
+                chips: chips(&["error"], &["retrying"]),
+                format: None,
+                records_only: false,
+                trace: None,
+            },
             members,
             0,
             5,
@@ -384,9 +481,12 @@ mod tests {
         let path = fixture("tailhawk_sieve_none.log");
         let members = vec![excerpt(&path, "a\nb\nc\n", 0)];
         let running = start(
-            Chips::default(),
-            None,
-            false,
+            Job {
+                chips: Chips::default(),
+                format: None,
+                records_only: false,
+                trace: None,
+            },
             members,
             0,
             3,
@@ -409,9 +509,12 @@ mod tests {
             excerpt(&b, "x3\ny\ny\nx4\n", 3),
         ];
         let running = start(
-            chips(&["x"], &[]),
-            None,
-            false,
+            Job {
+                chips: chips(&["x"], &[]),
+                format: None,
+                records_only: false,
+                trace: None,
+            },
             members,
             0,
             7,
@@ -428,9 +531,12 @@ mod tests {
             excerpt(&b, "x3\ny\ny\nx4\n", 3),
         ];
         let running = start(
-            chips(&["x"], &[]),
-            None,
-            false,
+            Job {
+                chips: chips(&["x"], &[]),
+                format: None,
+                records_only: false,
+                trace: None,
+            },
             members,
             5,
             7,
@@ -455,9 +561,12 @@ mod tests {
         let text: String = (0..1000).map(|i| format!("row {i}\n")).collect();
         let members = vec![excerpt(&path, &text, 0)];
         let running = start(
-            chips(&["row"], &[]),
-            None,
-            false,
+            Job {
+                chips: chips(&["row"], &[]),
+                format: None,
+                records_only: false,
+                trace: None,
+            },
             members,
             0,
             1000,
@@ -498,9 +607,12 @@ mod tests {
             .collect();
         let members = vec![excerpt(&path, &text, 0)];
         let running = start(
-            chips(&["row"], &[]),
-            None,
-            false,
+            Job {
+                chips: chips(&["row"], &[]),
+                format: None,
+                records_only: false,
+                trace: None,
+            },
             members,
             0,
             200_000,
@@ -530,9 +642,12 @@ mod tests {
 
         let members = vec![excerpt(&path, text, 0)];
         let running = start(
-            chips(&["level >= Warning"], &[]),
-            Some(serilog),
-            false,
+            Job {
+                chips: chips(&["level >= Warning"], &[]),
+                format: Some(serilog),
+                records_only: false,
+                trace: None,
+            },
             members,
             0,
             3,
@@ -544,9 +659,12 @@ mod tests {
 
         let members = vec![excerpt(&path, text, 0)];
         let running = start(
-            chips(&["level >= Warning"], &[]),
-            None,
-            false,
+            Job {
+                chips: chips(&["level >= Warning"], &[]),
+                format: None,
+                records_only: false,
+                trace: None,
+            },
             members,
             0,
             3,

@@ -254,9 +254,10 @@ fn the_filter_worker_streams_survivors_from_a_snapshot_of_ten_gigabytes() {
 
     let began = Instant::now();
     let running = sieve::start(
-        chips,
-        None,
-        false,
+        sieve::Job {
+            chips,
+            ..sieve::Job::default()
+        },
         vec![excerpt],
         0,
         lines,

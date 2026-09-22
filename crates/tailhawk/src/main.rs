@@ -1813,6 +1813,7 @@ impl Document {
         ViewState {
             chips: self.filtering.chips.clone(),
             records_only: self.filtering.records_only,
+            trace: self.filtering.trace.clone(),
             row: self.view.grid().scroll().row,
         }
     }
@@ -1859,10 +1860,12 @@ impl Document {
     /// the row.
     fn apply_view_state(&mut self, state: ViewState) {
         let filter_changed = self.filtering.chips != state.chips
-            || self.filtering.records_only != state.records_only;
+            || self.filtering.records_only != state.records_only
+            || self.filtering.trace != state.trace;
         if filter_changed {
             self.filtering.chips = state.chips;
             self.filtering.records_only = state.records_only;
+            self.filtering.trace = state.trace;
             self.filtering.error = None;
             self.filtering.clear_results();
             self.refilter();
@@ -1883,13 +1886,31 @@ impl Document {
     /// Reports what to say when there is nothing to follow: a line with no trace id is the common
     /// case for a plain text log, and silence would look like a command that did nothing.
     fn follow_trace(&mut self) -> Option<String> {
+        // **Pressed again, it stops** — the owner's ask of 2026-09-21, and what every other state
+        // button on the row already does. Following used to add an include chip, so a second press
+        // added a second copy of the same id to the reader's own filter list.
+        if let Some(id) = self.filtering.trace.take() {
+            self.remember();
+            self.filtering.clear_results();
+            self.refilter();
+            return Some(format!("Stopped following trace {id}"));
+        }
         let row = self.caret_row()?;
         let file_row = self.filtering.file_row(row)?;
         let line = self.set.row_text(file_row)?;
         match tailhawk_core::trace::trace_id(line) {
             Some(id) => {
                 let id = id.to_owned();
-                self.add_chip(&id, Polarity::Include);
+                self.remember();
+                self.filtering.error = None;
+                self.filtering.trace = Some(id.clone());
+                self.filtering.clear_results();
+                // **Without this the button does nothing**, which is the failure the owner
+                // reported about Filter and which this change all but reintroduced for Trace:
+                // `clear_results` empties the survivors and only a pass refills them, so the state
+                // would say "following" while the grid went on showing what it showed before.
+                // `add_chip` — what this replaced — ended with the same call.
+                self.refilter();
                 Some(format!("Following trace {id}"))
             }
             None => Some("That line carries no trace id.".to_owned()),
@@ -2021,9 +2042,17 @@ impl Document {
         }
         self.remember();
         self.filtering.chips.chips.clear();
+        // **The trace goes with them, and `filtered()` is why this had to be said.** Widening that
+        // predicate to count a trace meant this guard stopped bailing on a document with no chips
+        // — so Esc on a traced view cleared nothing, left the trace on, and emptied the survivors
+        // into a blank grid that no pass would refill. "Clear filters" means all of them.
+        self.filtering.trace = None;
         self.filter_selected = None;
         self.filtering.error = None;
         self.filtering.clear_results();
+        // And a pass, for the same reason `follow_trace` needs one: the survivors are gone until
+        // something recomputes them, and an unfiltered view is still a row space to rebuild.
+        self.refilter();
         {
             let rows = self.view_rows();
             self.view.grid_mut().set_total_rows(rows);
@@ -2043,9 +2072,12 @@ impl Document {
             return;
         }
         match sieve::start(
-            self.filtering.chips.clone(),
-            self.detection.accepted,
-            self.filtering.records_only,
+            sieve::Job {
+                chips: self.filtering.chips.clone(),
+                format: self.detection.accepted,
+                records_only: self.filtering.records_only,
+                trace: self.filtering.trace.clone(),
+            },
             self.set.snapshot(),
             from,
             total,
@@ -3356,6 +3388,15 @@ struct Filtering {
     /// §6.4's collapse: only first lines are rows, continuations hidden. A row space like the
     /// chips', sieved by the same pass, so the two compose. Meaningless without a format.
     records_only: bool,
+    /// §7's trace: the id the view is following, when it is following one.
+    ///
+    /// **Beside the chips and not among them, which is the owner's correction of 2026-09-21**: "I
+    /// would have thought it more logical to simply have trace and untrace … having it basically
+    /// add to the current filter is a bit strange." Following a trace used to push an include
+    /// chip, so it landed in the panel among the filters a reader had written, a second press
+    /// added a second copy, and nothing took it off. Held here it composes with the chips exactly
+    /// as `records_only` does, and the button that sets it can clear it.
+    trace: Option<String>,
     /// The file rows that survive, ascending — the view's row space while `chips` is non-empty.
     kept: Vec<u64>,
     running: Option<sieve::Running>,
@@ -3399,9 +3440,10 @@ impl Filtering {
         self.filtered() || self.sorted().is_some()
     }
 
-    /// Whether the chips or the collapse are in play — the filter machinery's own question.
+    /// Whether the chips, the collapse or a trace are in play — the filter machinery's own
+    /// question, and the three things its pass composes.
     fn filtered(&self) -> bool {
-        !self.chips.chips.is_empty() || self.records_only
+        !self.chips.chips.is_empty() || self.records_only || self.trace.is_some()
     }
 
     /// The sorted rows, once a sort has landed.
@@ -3641,6 +3683,12 @@ struct History {
 struct ViewState {
     chips: Chips,
     records_only: bool,
+    /// §7's trace, so `Alt+<-` undoes following one and `Alt+->` redoes it.
+    ///
+    /// **It belongs here because `follow_trace` calls `remember`**, which promises the step is
+    /// undoable. Without the field the promise was empty: the history restored the chips and the
+    /// collapse and left the trace exactly as it was, on or off.
+    trace: Option<String>,
     row: u64,
 }
 
@@ -4968,7 +5016,18 @@ impl Shell {
                     self.rebuild_highlighter(&mut document);
                     // File ▸ Open Recent learns the file **here**, on success — a mistyped path
                     // or an unreadable file never enters the history.
-                    if let Some(path) = document.path.as_ref() {
+                    //
+                    // **A remote document's file is a spill part in `%TEMP%` and is not a recent
+                    // file.** `open_remote` has already remembered the *source*, which is the
+                    // thing worth reopening; the path beside it is
+                    // `tailhawk-spill-45456-00\part-000001.log`, which is deleted when the tail
+                    // ends and names nothing a reader would recognise. Remembering both filled
+                    // four of the owner's ten slots with spill parts and buried the source among
+                    // them — his report of 2026-09-21, "the recently used list does not seem to
+                    // include the remote source last used", where in fact it did and could not be
+                    // seen for the noise.
+                    let spill = document.remote_source.is_some();
+                    if let Some(path) = document.path.as_ref().filter(|_| !spill) {
                         let path = path.to_string_lossy().into_owned();
                         self.settings
                             .remember_recent(tailhawk_core::settings::Recent::File(path));
@@ -5225,6 +5284,7 @@ impl Shell {
             filter,
             columns,
             sorted: sorted.as_deref(),
+            trace: doc.filtering.trace.as_deref(),
             invisibles: doc.view.cells().reveal_invisibles,
             format: doc.detection.accepted.map(|format| format.name),
             encoding: Some(doc.set.charset().name()),
@@ -14707,6 +14767,95 @@ mod tests {
             window_title(Some("")),
             "Tailhawk",
             "a document still opening has no name yet, and a dash before nothing is not a title"
+        );
+    }
+
+    /// **Trace and untrace, and the reader's own filters left alone throughout.**
+    ///
+    /// The owner, 2026-09-21: "I would have thought it more logical to simply have trace and
+    /// untrace for sequential preses on the trace button having it basically add to the current
+    /// filter is a bit strange." It used to push an include chip, so following a request put a row
+    /// in the filter panel beside filters he had written, a second press added the same id again,
+    /// and nothing took it off. This pins all three halves of the correction: it toggles, it is
+    /// not a chip, and what the reader wrote survives it.
+    #[test]
+    fn following_a_trace_toggles_and_never_touches_the_readers_filters() {
+        let path = std::env::temp_dir().join("tailhawk_trace_toggle_test.log");
+        std::fs::write(
+            &path,
+            "{\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"msg\":\"one\"}\n\
+             {\"traceId\":\"00000000000000000000000000000000\",\"msg\":\"two\"}\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        assert_eq!(
+            doc.follow_trace().as_deref(),
+            Some("Following trace 4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert_eq!(
+            doc.filtering.trace.as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert!(
+            doc.filtering.chips.chips.is_empty(),
+            "a trace is not a chip and must not appear among them: {:?}",
+            doc.filtering.chips.chips
+        );
+        // **A pass was started, which is the half the first version of this test could not see.**
+        // Setting the state without one leaves `kept` empty and nothing to refill it, so the grid
+        // goes on showing what it showed before — the button-does-nothing failure the owner
+        // reported about Filter, which this very change nearly reintroduced for Trace. A review
+        // caught it; this is what would have.
+        assert!(
+            doc.filtering.running.is_some() || doc.filtering.covered > 0,
+            "following a trace must start a pass, or the view never changes"
+        );
+
+        // A filter the reader writes while a trace is in force is theirs, and composes with it.
+        doc.add_chip("msg", Polarity::Include);
+        assert_eq!(doc.filtering.chips.chips.len(), 1);
+
+        // Pressed again it stops, says so rather than silently doing nothing, and leaves the
+        // reader's filter exactly where it was.
+        assert_eq!(
+            doc.follow_trace().as_deref(),
+            Some("Stopped following trace 4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert_eq!(doc.filtering.trace, None);
+        assert_eq!(
+            doc.filtering.chips.chips.len(),
+            1,
+            "and the reader's filter is still theirs"
+        );
+    }
+
+    /// **`Esc` clears the trace along with the chips, and leaves a view that can be rebuilt.**
+    ///
+    /// Widening `Filtering::filtered()` to count a trace changed what `clear_filter` means: its
+    /// guard stopped bailing on a document with no chips, so on a traced view it cleared nothing,
+    /// left the trace on, emptied the survivors and started no pass — a blank grid with the trace
+    /// stuck, reached by the one key every reader presses to get out of trouble.
+    #[test]
+    fn clearing_the_filters_clears_a_trace_too() {
+        let path = std::env::temp_dir().join("tailhawk_trace_clear_test.log");
+        std::fs::write(
+            &path,
+            "{\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"msg\":\"one\"}\n\
+             {\"traceId\":\"00000000000000000000000000000000\",\"msg\":\"two\"}\n",
+        )
+        .expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(doc.follow_trace().is_some());
+        assert!(doc.filtering.trace.is_some());
+
+        doc.clear_filter();
+        assert_eq!(doc.filtering.trace, None, "Esc means all of them");
+        assert!(
+            !doc.filtering.filtered(),
+            "and the view is no longer narrowed by anything"
         );
     }
 

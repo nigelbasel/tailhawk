@@ -66,14 +66,19 @@ const LIST_PAD_PX: f32 = 6.0;
 /// The band's height for the native panel: the list inside its frame, or nothing when hidden.
 ///
 /// **The list grows a row per chip up to [`MAX_LIST_ROWS`] and then scrolls**, because a panel that
-/// grew without limit would take the log it is filtering off the screen. An empty list still shows
-/// one row, so the first filter has somewhere visible to land. `frame_px` is the list's border,
-/// top and bottom together, which the rows sit inside and must not be reserved from.
+/// grew without limit would take the log it is filtering off the screen. `frame_px` is the list's
+/// border, top and bottom together, which the rows sit inside and must not be reserved from.
+///
+/// **A panel with no filters in it takes no band at all.** It used to reserve one row so that the
+/// first filter "has somewhere visible to land" — but nothing lands there until a filter exists,
+/// so what a reader actually got was an empty dark strip across the bottom of the window. The
+/// owner, 2026-09-21: "filter just opens a single black line at the bottom … it is just
+/// confusing." Adding a filter is the Filter button's job now, and it opens a dialog.
 pub fn band_height(chips: usize, visible: bool, row_px: f32, frame_px: f32) -> f32 {
-    if !visible {
+    if !visible || chips == 0 {
         return 0.0;
     }
-    let rows = chips.clamp(1, MAX_LIST_ROWS) as f32;
+    let rows = chips.min(MAX_LIST_ROWS) as f32;
     RULE_PX + LIST_PAD_PX + frame_px + rows * row_px + LIST_PAD_PX
 }
 
@@ -620,10 +625,13 @@ mod tests {
         let (row, frame) = (18.0, 4.0);
         assert_eq!(band_height(5, false, row, frame), 0.0, "hidden");
         let one = band_height(1, true, row, frame);
+        // **The owner's "single black line at the bottom", 2026-09-21.** An empty list used to
+        // reserve a row for a filter to land in; nothing ever landed there before one existed, so
+        // what it drew was a dark strip with nothing in it.
         assert_eq!(
             band_height(0, true, row, frame),
-            one,
-            "an empty list still shows a row"
+            0.0,
+            "a panel with nothing in it takes no band"
         );
         assert_eq!(band_height(3, true, row, frame) - one, 2.0 * row);
         assert_eq!(

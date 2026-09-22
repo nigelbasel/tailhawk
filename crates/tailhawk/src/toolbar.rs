@@ -150,19 +150,26 @@ pub fn toolbar_of(doc: Option<&Document>) -> Vec<ToolButton> {
             dropdown: true,
         },
         verb("Find", icon::FIND, Command::Find, open, true),
-        // A toggle, not a verb, since 2026-09-03: the owner's answer to §2.5's open question. It
-        // reports whether the filter panel is shown, the way Follow reports following.
-        toggle(
-            "Filter",
-            icon::FILTER,
-            Command::ToggleFilters,
-            doc.is_some_and(|d| d.show_filters),
-            false,
-        ),
+        // **A verb again, and the reversal is the owner's**, 2026-09-21: "filter just opens a
+        // single black line at the bottom. This is suppsed to be a dialog of some sort." It was a
+        // toggle from 2026-09-03 that showed and hid the panel — but the panel *lists* filters and
+        // has no way to make one, so pressing Filter with none opened an empty strip and offered
+        // nothing to do about it. This adds a filter, which is what the word means on a toolbar;
+        // the panel is where they are then managed, and `View` still shows and hides it.
+        verb("Filter", icon::FILTER, Command::FilterInclude, open, false),
         // §7's rung one, on the bar because the owner asked for it there: "It would be good to have
         // a menu option and toolbar button for this to aid discoverability. secret handshakes are
         // not good." The menu already had it; a keystroke nobody can see was the whole complaint.
-        verb("Trace", icon::TRACE, Command::FollowTrace, open, false),
+        // **A toggle since 2026-09-21, because it has two states and a reader needs to leave one.**
+        // The owner: "I would have thought it more logical to simply have trace and untrace for
+        // sequential preses on the trace button". Pressed means the view is narrowed to one trace.
+        toggle(
+            "Trace",
+            icon::TRACE,
+            Command::FollowTrace,
+            doc.is_some_and(|d| d.filtering.trace.is_some()),
+            false,
+        ),
         toggle(
             "Follow",
             icon::FOLLOW,
@@ -270,8 +277,8 @@ fn what_it_does(label: &str) -> Option<&'static str> {
         "Open" => "open a log file",
         "Open remote" => "connect to a Loki source",
         "Find" => "search the log",
-        "Filter" => "show or hide the filter panel",
-        "Trace" => "show only the lines sharing this line's trace id",
+        "Filter" => "add a filter, to show only the lines you want",
+        "Trace" => "show only this line's trace; press again to stop",
         "Follow" => "keep the newest lines in view as the log grows",
         // **The label the owner asked about by name**, 2026-09-21: "what does collaps
         // continuation lines mean". A record can run to several physical lines — a stack trace, a
@@ -1373,7 +1380,11 @@ mod tests {
             .filter(|b| b.toggle)
             .map(|b| b.label)
             .collect();
-        assert_eq!(toggles, ["Filter", "Follow", "Collapse", "Detail"]);
+        // **Two changed hands on 2026-09-21 and both are worth keeping.** Filter left: a toggle
+        // reports a state, and the state it reported was whether a panel was showing — not what a
+        // reader means by "filter". Trace joined: it has two states and a reader needs a way out
+        // of one, which is what "trace and untrace for sequential preses" asked for.
+        assert_eq!(toggles, ["Trace", "Follow", "Collapse", "Detail"]);
     }
 
     /// **Every id is the menu's.** This is the test that keeps §1.2's one-command-one-path rule
@@ -1388,7 +1399,9 @@ mod tests {
         let expected = [
             Command::OpenFile,
             Command::Find,
-            Command::ToggleFilters,
+            // `FilterInclude` since 2026-09-21, not `ToggleFilters`: the button adds a filter
+            // rather than showing the panel that lists them.
+            Command::FilterInclude,
             Command::FollowTrace,
             Command::FollowTail,
             Command::ToggleCollapse,
