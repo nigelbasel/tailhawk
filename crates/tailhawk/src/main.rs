@@ -5014,7 +5014,7 @@ impl Shell {
                             // must not leave the user with detection's answer and no idea their
                             // memory was ignored.
                             Some(Err(why)) => {
-                                self.file = Some(format!(
+                                self.notice = Some(format!(
                                     "⚠ remembered format {name:?} for {glob} did not compile: {why}"
                                 ));
                             }
@@ -5047,12 +5047,12 @@ impl Shell {
                 }
                 Ok(Err(e)) => {
                     self.reading.remove(i);
-                    self.file = Some(e);
+                    self.notice = Some(e);
                     landed = true;
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.reading.remove(i);
-                    self.file = Some("read failed".to_owned());
+                    self.notice = Some("read failed".to_owned());
                     landed = true;
                 }
                 Err(TryRecvError::Empty) => i += 1,
@@ -6745,9 +6745,11 @@ impl Shell {
 
     /// Closes the box. Nothing is applied that was not saved: the definition is the artefact, and
     /// §6.2's Cancel means the document is left exactly as it was found.
-    fn close_wizard(&mut self) {
+    fn close_wizard(&mut self, saved: bool) {
         if self.wizard.take().is_some() {
-            self.notice = Some("format wizard closed — nothing saved".to_owned());
+            if let Some(note) = wizard_closed_note(saved) {
+                self.notice = Some(note.to_owned());
+            }
         }
         self.wizard_found.clear();
     }
@@ -6773,7 +6775,7 @@ impl Shell {
             Err(why) => {
                 // **Nothing was saved because nothing compiled** — this fires before a file is
                 // opened or a path is even chosen, so "format not saved" named the wrong event.
-                self.file = Some(format!(
+                self.notice = Some(format!(
                     "That format definition could not be compiled — {why}."
                 ));
                 return;
@@ -6798,7 +6800,7 @@ impl Shell {
             // The real save failure, and the same remedy the highlight rules give: §10 treats a
             // read-only profile as a state, and a state is something a person can change once they
             // know where it lives.
-            self.file = Some(format!(
+            self.notice = Some(format!(
                 "The format could not be saved to \"{}\" — {e}. Check that the file is not read-only.",
                 target.display()
             ));
@@ -6808,7 +6810,7 @@ impl Shell {
             doc.adopt_format(format);
         }
         self.wizard = None;
-        self.file = Some(format!("format saved to {}", target.display()));
+        self.notice = Some(format!("format saved to {}", target.display()));
         self.retitle(hwnd);
     }
 
@@ -9458,6 +9460,16 @@ const REMOTE_WINDOW_NANOS: i64 = 60 * 60 * 1_000_000_000;
 /// screenful and not an export.
 const REMOTE_LIMIT: u32 = 1_000;
 
+/// The line the bar is left with when the format wizard goes away, or `None` to leave standing
+/// whatever the save itself just said.
+///
+/// **A save's own outcome outlives the wizard it was about.** "Nothing saved" is only true when
+/// nothing was saved, and writing it unconditionally is how a *successful* save came to report
+/// the opposite of what had happened.
+fn wizard_closed_note(saved: bool) -> Option<&'static str> {
+    (!saved).then_some("format wizard closed — nothing saved")
+}
+
 /// The source and label a recent remote entry reopens, or the reason it cannot.
 ///
 /// **A source can be renamed or deleted between one open and the next**, and the recent list is not
@@ -10000,16 +10012,12 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.wizard = Some(wizard);
-                    if let Err(why) = &outcome {
-                        shell.notice = Some(why.clone());
-                    }
                     if saved {
                         shell.save_format(hwnd);
-                        let reason = shell.file.clone();
-                        shell.close_wizard();
-                        shell.file = reason;
-                    } else {
-                        shell.close_wizard();
+                    }
+                    shell.close_wizard(saved);
+                    if let Err(why) = &outcome {
+                        shell.notice = Some(why.clone());
                     }
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
@@ -10106,21 +10114,12 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.wizard = Some(wizard);
-                    if let Err(why) = &outcome {
-                        shell.notice = Some(why.clone());
-                    }
-                    // **Whatever happened, the drawn overlay does not come back.** `save_format`
-                    // clears the wizard when it succeeds; the path where it does not — a profile
-                    // that cannot be written — would otherwise answer a failed save by painting
-                    // §6.2's old sheet over the grid. Its reason outlives the wizard it was about,
-                    // so it is carried past the close rather than replaced by "nothing saved".
                     if saved {
                         shell.save_format(hwnd);
-                        let reason = shell.file.clone();
-                        shell.close_wizard();
-                        shell.file = reason;
-                    } else {
-                        shell.close_wizard();
+                    }
+                    shell.close_wizard(saved);
+                    if let Err(why) = &outcome {
+                        shell.notice = Some(why.clone());
                     }
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
@@ -12952,6 +12951,24 @@ mod tests {
     use super::*;
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// **A save that worked must not be reported as "nothing saved".** The wizard's closing line
+    /// used to be written unconditionally, over the top of whatever the save had just said, so the
+    /// one outcome the user most needs confirmed was the one the bar contradicted.
+    #[test]
+    fn closing_the_wizard_after_a_save_leaves_the_save_to_speak() {
+        assert_eq!(wizard_closed_note(true), None);
+    }
+
+    /// Cancel still says so — a box that closes in silence is the "command that appears to do
+    /// nothing" §10 asks this codebase to avoid.
+    #[test]
+    fn cancelling_the_wizard_says_nothing_was_saved() {
+        assert_eq!(
+            wizard_closed_note(false),
+            Some("format wizard closed — nothing saved")
+        );
+    }
 
     /// A configured source, named and with a selector, and nothing else filled in — the reopen
     /// decision reads those two fields and carries the rest through untouched.
