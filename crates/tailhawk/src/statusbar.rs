@@ -346,6 +346,10 @@ pub enum Tail<'a> {
     Paused,
     /// A pipe that reached its end is not paused, it is done.
     Complete,
+    /// A pipe that **stopped because the read failed**, which is not the same thing as one that
+    /// finished — `PLAN.md` asks a pipe source to tell those apart, and a reader who cannot is a
+    /// reader who trusts a truncated log.
+    Failed { why: &'a str },
 }
 
 /// What one frame knows, as the status bar needs it.
@@ -534,6 +538,7 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
     let tail = match facts.tail {
         Tail::Held => String::new(),
         Tail::Complete => "Stream complete".to_owned(),
+        Tail::Failed { why } => format!("⚠ Stream failed: {why}"),
         // §12: the way back is named, because a paused tail whose pane says only "Paused" leaves
         // the reader to discover the key that resumes it.
         Tail::Paused => "‖ Paused — Ctrl+End".to_owned(),
@@ -731,6 +736,14 @@ mod tests {
         assert_eq!(of(Tail::Following { lag: None }), "● Following");
         assert_eq!(of(Tail::Paused), "‖ Paused — Ctrl+End");
         assert_eq!(of(Tail::Complete), "Stream complete");
+        assert_eq!(
+            of(Tail::Failed {
+                why: "the pipe was closed by the producer"
+            }),
+            "⚠ Stream failed: the pipe was closed by the producer",
+            "a stream that broke must not read as one that finished — a reader who cannot tell \
+             them apart is a reader who trusts a truncated log"
+        );
         assert_eq!(
             of(Tail::Held),
             "",

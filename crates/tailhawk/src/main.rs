@@ -5208,18 +5208,21 @@ impl Shell {
             (true, Some(behind)) => Some(tail::lag_text(behind)),
             _ => None,
         };
-        let tail = if doc.stream_done {
-            statusbar::Tail::Complete
-        } else if sorted.is_some() {
-            // E22: a sort holds the view still, so it is neither following nor paused.
-            statusbar::Tail::Held
-        } else if doc.view.grid().is_following() {
-            statusbar::Tail::Following {
-                lag: lag.as_deref(),
-            }
-        } else {
-            statusbar::Tail::Paused
-        };
+        let stream_failed = doc
+            .pump
+            .as_ref()
+            .and_then(Pump::outcome)
+            .and_then(|end| match end {
+                StreamEnd::Failed(why) => Some(why),
+                StreamEnd::Complete => None,
+            });
+        let tail = tail_state(
+            stream_failed.as_deref(),
+            doc.stream_done,
+            sorted.is_some(),
+            doc.view.grid().is_following(),
+            lag.as_deref(),
+        );
         let find = (!doc.finder.query.is_empty()).then(|| statusbar::FindFacts {
             // The finder counts from zero and a reader counts from one.
             current: doc.finder.current.map(|at| at + 1),
@@ -9460,6 +9463,34 @@ const REMOTE_WINDOW_NANOS: i64 = 60 * 60 * 1_000_000_000;
 /// screenful and not an export.
 const REMOTE_LIMIT: u32 = 1_000;
 
+/// Which state the tail pane is in.
+///
+/// **A failure outranks a finish, because `Pump::finished` is true for both.** That flag says the
+/// reading thread stopped, not that it succeeded — so a `done` that does not first exclude a
+/// failure is what made a pipe that *broke* report "Stream complete", while the reason it broke was
+/// computed into a field nothing read. `PLAN.md` asks a pipe source to tell the two apart, and a
+/// reader who cannot is a reader who trusts a truncated log.
+///
+/// The `None` in the `Complete` arm is what enforces that, not the order the arms are written in:
+/// every arm matches on the whole tuple, so this cannot be broken by rearranging it.
+///
+/// E22: a sort holds the view still, so it is neither following nor paused.
+fn tail_state<'a>(
+    failed: Option<&'a str>,
+    done: bool,
+    sorted: bool,
+    following: bool,
+    lag: Option<&'a str>,
+) -> statusbar::Tail<'a> {
+    match (failed, done, sorted, following) {
+        (None, true, _, _) => statusbar::Tail::Complete,
+        (Some(why), _, _, _) => statusbar::Tail::Failed { why },
+        (None, false, true, _) => statusbar::Tail::Held,
+        (None, false, false, true) => statusbar::Tail::Following { lag },
+        (None, false, false, false) => statusbar::Tail::Paused,
+    }
+}
+
 /// The line the bar is left with when the format wizard goes away, or `None` to leave standing
 /// whatever the save itself just said.
 ///
@@ -12951,6 +12982,44 @@ mod tests {
     use super::*;
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// **A pump that failed is finished too, so the failure has to be asked about first.** Both a
+    /// clean end and a broken read set `stream_done`; testing it first reported a stream that
+    /// broke as one that completed, and threw the reason away.
+    #[test]
+    fn a_stream_that_broke_is_not_a_stream_that_finished() {
+        assert_eq!(
+            tail_state(Some("read failed: handle closed"), true, false, false, None),
+            statusbar::Tail::Failed {
+                why: "read failed: handle closed"
+            }
+        );
+    }
+
+    /// The other four states, so the ordering above cannot be "fixed" by making failure swallow
+    /// them: a sort still holds, a live tail still follows with its lag, and scrolled-back is
+    /// still paused.
+    #[test]
+    fn the_tail_state_is_decided_in_one_place() {
+        assert_eq!(
+            tail_state(None, true, false, false, None),
+            statusbar::Tail::Complete
+        );
+        assert_eq!(
+            tail_state(None, false, true, true, None),
+            statusbar::Tail::Held
+        );
+        assert_eq!(
+            tail_state(None, false, false, true, Some("current to 30s ago")),
+            statusbar::Tail::Following {
+                lag: Some("current to 30s ago")
+            }
+        );
+        assert_eq!(
+            tail_state(None, false, false, false, None),
+            statusbar::Tail::Paused
+        );
+    }
 
     /// **A save that worked must not be reported as "nothing saved".** The wizard's closing line
     /// used to be written unconditionally, over the top of whatever the save had just said, so the
