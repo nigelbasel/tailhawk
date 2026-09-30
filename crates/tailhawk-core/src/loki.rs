@@ -607,6 +607,10 @@ pub struct Token {
     pub access_token: String,
     /// Seconds the token is good for, as the server said. Zero when it did not say.
     pub expires_in: u64,
+    /// The refresh token, when the server issued one — which it does for a user sign-in that asked
+    /// for `offline_access`, and does not for a client-credentials exchange, where re-presenting
+    /// the secret is the refresh. **A credential**, stored like one.
+    pub refresh_token: Option<String>,
 }
 
 /// The request that exchanges a client secret for a bearer token — **without the secret**.
@@ -658,12 +662,166 @@ pub fn token_from_json(body: &str) -> Option<Token> {
     Some(Token {
         access_token,
         expires_in: json_number(body, "expires_in").unwrap_or(0),
+        refresh_token: json_string(body, "refresh_token").filter(|t| !t.is_empty()),
     })
 }
 
 /// The largest token response that will be looked at. A JWT is a few kilobytes; this is generous
 /// and exists so the scan is bounded before it begins.
 pub const MAX_TOKEN_RESPONSE: usize = 64 * 1024;
+
+/// RFC 8628's grant type, spelled as the specification spells it.
+pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// RFC 8628 §3.2: the poll interval to use when the server names none.
+pub const DEVICE_INTERVAL_DEFAULT: u64 = 5;
+
+/// RFC 8628 §3.5: what a `slow_down` adds to the interval. The specification is explicit that this
+/// *increases* the interval rather than replacing it, and that it never goes back down.
+pub const DEVICE_SLOW_DOWN_STEP: u64 = 5;
+
+/// RFC 8628 §3.2: what the device-authorization endpoint answered.
+///
+/// **`user_code` and the verification URI are for the reader's eyes**, and `device_code` is not:
+/// it is the credential this client polls with, and anything that shows a grant to a person shows
+/// the first two and never the third.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceGrant {
+    /// The code this client polls the token endpoint with. **A credential.**
+    pub device_code: String,
+    /// The short code the person types at the verification URI.
+    pub user_code: String,
+    /// Where the person goes to approve it.
+    pub verification_uri: String,
+    /// The same place with the code already in it, when the server offers one. Optional in the
+    /// specification, so a client that requires it is a client that breaks against a compliant
+    /// server.
+    pub verification_uri_complete: Option<String>,
+    /// Seconds until the grant stops being pollable.
+    pub expires_in: u64,
+    /// Seconds to wait between polls, already defaulted to [`DEVICE_INTERVAL_DEFAULT`].
+    pub interval: u64,
+}
+
+/// What one poll of the token endpoint means.
+///
+/// **`Pending` and `SlowDown` are not failures**, and that is the whole reason this is a type
+/// rather than a `Result`. RFC 8628 §3.5 defines them as the ordinary answers while a person is
+/// still typing their password, and a client that treats an error document as an error would give
+/// up on the first one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Poll {
+    /// The person approved it and the server issued a token.
+    Granted(Token),
+    /// Still waiting for the person. Poll again after the interval.
+    Pending,
+    /// Polling too fast. Add [`DEVICE_SLOW_DOWN_STEP`] and poll again.
+    SlowDown,
+    /// The grant timed out. A new device authorization is needed.
+    Expired,
+    /// The person said no.
+    Denied,
+    /// Anything else, with the server's own `error` value when it sent one.
+    Failed(String),
+}
+
+/// RFC 8628 §3.1: the request that starts a device authorization.
+///
+/// **No secret and no PKCE.** A device-flow client is public: there is nothing to prove possession
+/// of, and the `device_code` the server returns is itself the secret for the poll that follows.
+pub fn device_request(origin: &Origin, client_id: &str, scope: &str) -> Request {
+    let mut body = format!("client_id={}", form_encode(client_id));
+    if !scope.is_empty() {
+        body.push_str(&format!("&scope={}", form_encode(scope)));
+    }
+    Request {
+        method: "POST",
+        url: origin.mounted_url(),
+        body,
+        content_type: Some("application/x-www-form-urlencoded"),
+    }
+}
+
+/// Reads RFC 8628 §3.2's response, defaulting `interval` the way the specification says to.
+///
+/// Returns `None` when there is no `device_code` or no `user_code` — including when the server
+/// answered with an error document, which is what a client id the server does not know looks like.
+pub fn device_grant_from_json(body: &str) -> Option<DeviceGrant> {
+    if body.len() > MAX_TOKEN_RESPONSE {
+        return None;
+    }
+    let device_code = json_string(body, "device_code").filter(|t| !t.is_empty())?;
+    let user_code = json_string(body, "user_code").filter(|t| !t.is_empty())?;
+    let verification_uri = json_string(body, "verification_uri").unwrap_or_default();
+    Some(DeviceGrant {
+        device_code,
+        user_code,
+        verification_uri,
+        verification_uri_complete: json_string(body, "verification_uri_complete")
+            .filter(|t| !t.is_empty()),
+        expires_in: json_number(body, "expires_in").unwrap_or(0),
+        interval: json_number(body, "interval")
+            .filter(|i| *i > 0)
+            .unwrap_or(DEVICE_INTERVAL_DEFAULT),
+    })
+}
+
+/// RFC 8628 §3.4: one poll of the token endpoint.
+pub fn device_poll_request(origin: &Origin, client_id: &str, device_code: &str) -> Request {
+    Request {
+        method: "POST",
+        url: origin.mounted_url(),
+        body: format!(
+            "grant_type={}&client_id={}&device_code={}",
+            form_encode(DEVICE_GRANT_TYPE),
+            form_encode(client_id),
+            form_encode(device_code)
+        ),
+        content_type: Some("application/x-www-form-urlencoded"),
+    }
+}
+
+/// RFC 8628 §3.5: what the token endpoint's answer to a poll means.
+///
+/// **Read from the body, not from the status code.** The specification has the server answer a
+/// pending poll with HTTP 400 and `error: authorization_pending`, so a client that branches on the
+/// status first sees a failure every few seconds and never gets to the word that says otherwise.
+pub fn poll_outcome(body: &str) -> Poll {
+    if let Some(token) = token_from_json(body) {
+        return Poll::Granted(token);
+    }
+    match json_string(body, "error").unwrap_or_default().as_str() {
+        "authorization_pending" => Poll::Pending,
+        "slow_down" => Poll::SlowDown,
+        "expired_token" => Poll::Expired,
+        "access_denied" => Poll::Denied,
+        "" => Poll::Failed("the server's answer held neither a token nor an error".to_owned()),
+        other => Poll::Failed(other.to_owned()),
+    }
+}
+
+/// RFC 6749 §6: exchange a refresh token for a new access token.
+///
+/// **A tail outlives its access token.** `LOKI.md` §5's tail runs for hours and an expiry of an
+/// hour is ordinary, so without this a remote source stops returning records mid-session and looks
+/// like a source that went quiet.
+pub fn refresh_request(origin: &Origin, client_id: &str, refresh_token: &str) -> Request {
+    Request {
+        method: "POST",
+        url: origin.mounted_url(),
+        body: format!(
+            "grant_type=refresh_token&client_id={}&refresh_token={}",
+            form_encode(client_id),
+            form_encode(refresh_token)
+        ),
+        content_type: Some("application/x-www-form-urlencoded"),
+    }
+}
+
+/// The interval after a `slow_down`, which only ever grows.
+pub fn slowed(interval: u64) -> u64 {
+    interval.saturating_add(DEVICE_SLOW_DOWN_STEP)
+}
 
 /// The string value of `key`, honouring backslash escapes so a token containing a quote cannot cut
 /// the scan short.
@@ -1083,6 +1241,143 @@ mod tests {
         assert!(odd.body.contains("client_id=a+b%26c") || odd.body.contains("client_id=a%20b%26c"));
     }
 
+    /// An origin for the device and token endpoints, so each test below says what it is about
+    /// rather than re-parsing a URL.
+    fn an_endpoint() -> Origin {
+        Origin::parse("https://identity.example.com/connect", Provenance::Imported)
+            .expect("a plain https origin with a mount prefix")
+    }
+
+    /// **RFC 8628 §3.1 asks for the client id and the scope, and nothing else.** A device-flow
+    /// client is public: there is no secret to send and none is sent, which is the entire reason
+    /// the owner asked for this over a pasted client secret.
+    #[test]
+    fn a_device_authorization_asks_only_for_the_client_and_the_scope() {
+        let request = device_request(&an_endpoint(), "tailhawk", "telemetry:read offline_access");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.content_type,
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(
+            request.body,
+            "client_id=tailhawk&scope=telemetry%3Aread+offline_access"
+        );
+        assert!(!request.body.contains("client_secret"));
+
+        // An empty scope is omitted rather than sent blank, exactly as the token request does it.
+        assert_eq!(
+            device_request(&an_endpoint(), "tailhawk", "").body,
+            "client_id=tailhawk"
+        );
+    }
+
+    /// The grant is read, and `interval` defaults the way §3.2 says rather than to zero — a zero
+    /// would poll in a tight loop, which is the one behaviour the interval exists to prevent.
+    #[test]
+    fn a_device_grant_is_read_and_its_interval_defaulted() {
+        let body = r#"{"device_code":"dc","user_code":"WDJB-MJHT",
+            "verification_uri":"https://identity.example.com/device",
+            "verification_uri_complete":"https://identity.example.com/device?user_code=WDJB-MJHT",
+            "expires_in":900,"interval":5}"#;
+        let grant = device_grant_from_json(body).expect("a well-formed grant");
+        assert_eq!(grant.device_code, "dc");
+        assert_eq!(grant.user_code, "WDJB-MJHT");
+        assert_eq!(
+            grant.verification_uri,
+            "https://identity.example.com/device"
+        );
+        assert_eq!(
+            grant.verification_uri_complete.as_deref(),
+            Some("https://identity.example.com/device?user_code=WDJB-MJHT")
+        );
+        assert_eq!(grant.expires_in, 900);
+        assert_eq!(grant.interval, 5);
+
+        // §3.2 makes both `interval` and `verification_uri_complete` optional. A server that sends
+        // neither is compliant, and a client that needs them is not.
+        let spare = r#"{"device_code":"d","user_code":"U",
+            "verification_uri":"https://i.example/d","expires_in":600}"#;
+        let grant = device_grant_from_json(spare).expect("a minimal but compliant grant");
+        assert_eq!(grant.interval, DEVICE_INTERVAL_DEFAULT);
+        assert_eq!(grant.verification_uri_complete, None);
+
+        // An error document is not a grant. An unknown client id looks exactly like this.
+        assert_eq!(
+            device_grant_from_json(r#"{"error":"invalid_client"}"#),
+            None
+        );
+    }
+
+    /// **§3.5's answers, each one of them.** `authorization_pending` and `slow_down` arrive with
+    /// HTTP 400 while a person is still signing in, so reading the status instead of the body
+    /// would make every poll look like a failure.
+    #[test]
+    fn every_poll_answer_the_specification_defines_is_told_apart() {
+        assert_eq!(
+            poll_outcome(r#"{"error":"authorization_pending"}"#),
+            Poll::Pending
+        );
+        assert_eq!(poll_outcome(r#"{"error":"slow_down"}"#), Poll::SlowDown);
+        assert_eq!(poll_outcome(r#"{"error":"expired_token"}"#), Poll::Expired);
+        assert_eq!(poll_outcome(r#"{"error":"access_denied"}"#), Poll::Denied);
+        assert_eq!(
+            poll_outcome(r#"{"error":"invalid_client"}"#),
+            Poll::Failed("invalid_client".to_owned())
+        );
+        assert_eq!(
+            poll_outcome(r#"{"access_token":"t","expires_in":60,"refresh_token":"r"}"#),
+            Poll::Granted(Token {
+                access_token: "t".to_owned(),
+                expires_in: 60,
+                refresh_token: Some("r".to_owned()),
+            })
+        );
+
+        // Neither a token nor a recognised error. Saying so beats guessing at either.
+        assert!(matches!(poll_outcome("{}"), Poll::Failed(_)));
+    }
+
+    /// The poll carries the grant type spelled as RFC 8628 spells it — a URN, which must be
+    /// form-encoded or the colons end up in the body raw.
+    #[test]
+    fn a_poll_names_the_grant_type_the_specification_defines() {
+        let request = device_poll_request(&an_endpoint(), "tailhawk", "dc");
+        assert_eq!(request.method, "POST");
+        assert!(
+            request
+                .body
+                .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"),
+            "the grant type must be form-encoded: {}",
+            request.body
+        );
+        assert!(request.body.contains("device_code=dc"));
+        assert!(request.body.contains("client_id=tailhawk"));
+        assert!(!request.body.contains("client_secret"));
+    }
+
+    /// A refresh is RFC 6749 §6, and it is what keeps an hours-long tail alive past the access
+    /// token's hour.
+    #[test]
+    fn a_refresh_exchanges_the_refresh_token_and_nothing_else() {
+        let request = refresh_request(&an_endpoint(), "tailhawk", "r/t+v");
+        assert_eq!(request.method, "POST");
+        assert!(request.body.contains("grant_type=refresh_token"));
+        assert!(
+            request.body.contains("refresh_token=r%2Ft%2Bv"),
+            "the refresh token is form-encoded: {}",
+            request.body
+        );
+        assert!(!request.body.contains("client_secret"));
+    }
+
+    /// §3.5: a `slow_down` *increases* the interval and it never comes back down.
+    #[test]
+    fn a_slow_down_only_ever_lengthens_the_wait() {
+        assert_eq!(slowed(5), 5 + DEVICE_SLOW_DOWN_STEP);
+        assert!(slowed(slowed(5)) > slowed(5));
+    }
+
     /// **The token endpoint is a second origin and gets §7's checks.** Its path is provider
     /// configuration rather than one of ours, so it arrives as the mount prefix — and everything
     /// `Origin::parse` refuses for a Loki base is refused here too.
@@ -1118,8 +1413,16 @@ mod tests {
             token_from_json(good),
             Some(Token {
                 access_token: "abc.def.ghi".to_owned(),
-                expires_in: 3600
+                expires_in: 3600,
+                refresh_token: None
             })
+        );
+
+        // A client-credentials answer carries no refresh token, and a user sign-in does.
+        let user = r#"{"access_token":"a","expires_in":60,"refresh_token":"r"}"#;
+        assert_eq!(
+            token_from_json(user).and_then(|t| t.refresh_token),
+            Some("r".to_owned())
         );
 
         // Order does not matter, and whitespace does not either.
