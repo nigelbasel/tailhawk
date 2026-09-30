@@ -69,6 +69,13 @@ pub enum PullFault {
     Label(tailhawk_core::loki::LabelFault),
     /// Loki answered the label call with something this could not read as a list of values.
     LabelAnswer,
+    /// The source signs the reader in, and there is no sign-in to use — either none was ever made,
+    /// or it expired and could not be renewed without asking again.
+    ///
+    /// **Not an error the caller reports and stops at.** It is the signal to start a sign-in, which
+    /// is why it is told apart from [`PullFault::NoSecret`]: that one is a configuration mistake a
+    /// person has to go and fix, and this one is a thing the application asks for and then carries on.
+    NotSignedIn,
 }
 
 impl std::fmt::Display for PullFault {
@@ -87,6 +94,7 @@ impl std::fmt::Display for PullFault {
             PullFault::NoSecret => f.write_str(
                 "No secret is stored for this source — open Tools ▸ Remote sources and paste it.",
             ),
+            PullFault::NotSignedIn => f.write_str("You are not signed in to this source."),
             // The same reason the `Wire` arm below carries its cause: "could not reach it" names
             // the half that failed and nothing a person could act on. Whether this Windows has no
             // WinHTTP, the name resolved somewhere §7 refuses, or the server answered a redirect
@@ -265,6 +273,9 @@ fn fetch_token(source: &Source) -> Result<String, PullFault> {
         Origin::parse(&source.token_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
     refuse_insecure(&at)?;
     refuse_literal_address(&at).map_err(PullFault::Address)?;
+    if source.signs_in() {
+        return signed_in_token(source, &at);
+    }
     let secret = crate::secrets::load(&source.name).ok_or(PullFault::NoSecret)?;
     if secret.is_empty() {
         return Err(PullFault::NoSecret);
@@ -281,6 +292,59 @@ fn fetch_token(source: &Source) -> Result<String, PullFault> {
     loki::token_from_json(&answer.body)
         .map(|token| token.access_token)
         .ok_or(PullFault::TokenUnreadable)
+}
+
+/// Unix seconds now, or zero if the clock is before 1970 and the question is meaningless.
+pub fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// The bearer token for a source that signs the reader in.
+///
+/// **Three outcomes, and the third is not a failure.** A stored token that is still good is used as
+/// it stands; one that has expired is renewed silently with its refresh token, because a tail that
+/// stopped every hour to ask again would be worse than the client secret it replaced; and when
+/// there is neither, [`PullFault::NotSignedIn`] tells the caller to ask the reader rather than
+/// reporting that something broke.
+fn signed_in_token(source: &Source, at: &Origin) -> Result<String, PullFault> {
+    let held = crate::secrets::load_tokens(&source.name).ok_or(PullFault::NotSignedIn)?;
+    if crate::secrets::usable(&held, now_seconds()) {
+        return Ok(held.access);
+    }
+    let refresh = held.refresh.ok_or(PullFault::NotSignedIn)?;
+    let request = loki::refresh_request(at, &source.client_id, &refresh);
+    // **No credential on the request itself.** A public client has none, and the refresh token is
+    // in the body where `LOKI.md` §7 wants a credential rather than in a URL a proxy would log.
+    let answer =
+        net::send(&request, Provenance::Imported, Auth::None).map_err(PullFault::TokenTransport)?;
+    if answer.status != 200 {
+        // **A refused refresh is "sign in again", not "the server is broken".** A refresh token is
+        // one-time-use with a sliding window on this estate, so a renewal that is refused means the
+        // session is over — which is a thing to ask the reader about, not an error to report.
+        crate::secrets::forget_tokens(&source.name);
+        return Err(PullFault::NotSignedIn);
+    }
+    let renewed = loki::token_from_json(&answer.body).ok_or(PullFault::TokenUnreadable)?;
+    let keep = crate::secrets::Tokens {
+        access: renewed.access_token.clone(),
+        // **The new refresh token, or the old one.** Duende rotates refresh tokens by default, and
+        // keeping the spent one would work exactly once more and then sign the reader out.
+        refresh: renewed.refresh_token.or(Some(refresh)),
+        expires_at: expiry_from(renewed.expires_in),
+    };
+    crate::secrets::store_tokens(&source.name, &keep);
+    Ok(renewed.access_token)
+}
+
+/// The absolute moment a token issued now stops being any use, or zero when the server said nothing.
+pub fn expiry_from(expires_in: u64) -> u64 {
+    if expires_in == 0 {
+        return 0;
+    }
+    now_seconds().saturating_add(expires_in)
 }
 
 #[cfg(test)]

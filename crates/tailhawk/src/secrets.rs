@@ -37,6 +37,101 @@ const PREFIX: &str = "Tailhawk/loki/";
 /// before it stops being a name.
 const NAME_MAX: usize = 64;
 
+/// The prefix the tokens from a sign-in are filed under.
+///
+/// **A second target rather than a second field in the first**, so that revoking a sign-in and
+/// removing a client secret are separate gestures in Control Panel — and so that a source which
+/// switches from a secret to signing in does not have one silently overwrite the other.
+const TOKENS_PREFIX: &str = "Tailhawk/loki-tokens/";
+
+/// What a sign-in leaves behind: the token a query carries, the token that renews it, and when the
+/// first stops being any use.
+///
+/// **`expires_at` is absolute, not a duration.** A duration is only meaningful beside the moment it
+/// was measured, and this is written to a store that outlives the process — the one thing a
+/// remembered `expires_in: 3600` cannot tell a later run is whether the hour has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tokens {
+    /// The bearer value a query carries. **A credential.**
+    pub access: String,
+    /// The token that buys a new access token without asking the reader again, when the server
+    /// issued one. **A credential.**
+    pub refresh: Option<String>,
+    /// Unix seconds at which `access` stops being accepted, or zero when the server did not say.
+    pub expires_at: u64,
+}
+
+/// Whether `name` can be part of a credential target — the shared rule for both prefixes.
+fn nameable(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > NAME_MAX || trimmed != name {
+        return false;
+    }
+    let usable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ');
+    name.chars().all(usable)
+}
+
+/// The Credential Manager target the sign-in tokens for `name` live at.
+pub fn tokens_target_for(name: &str) -> Option<String> {
+    nameable(name).then(|| format!("{TOKENS_PREFIX}{name}"))
+}
+
+/// The three fields as one blob.
+///
+/// **Refuses a newline in the access token rather than writing an ambiguous blob.** The format is
+/// positional, so a newline inside the first field would move every field after it — and the value
+/// that came back would be a token the server never issued, which fails as a 401 and sends the
+/// reader to look at the server. Nothing the specification allows in a token contains one; this is
+/// here so that if something ever does, it fails loudly at the write instead of quietly at the read.
+pub fn encode_tokens(tokens: &Tokens) -> Option<String> {
+    if tokens.access.contains('\n') {
+        return None;
+    }
+    Some(format!(
+        "v1\n{}\n{}\n{}",
+        tokens.expires_at,
+        tokens.access,
+        tokens.refresh.as_deref().unwrap_or_default()
+    ))
+}
+
+/// Reads back what [`encode_tokens`] wrote, and `None` for anything else.
+///
+/// **The version line is checked rather than skipped.** This store is user-visible by design, so
+/// the blob can be replaced by hand or left behind by a future version, and a positional format
+/// read out of order yields a plausible string rather than an error.
+pub fn decode_tokens(text: &str) -> Option<Tokens> {
+    let mut parts = text.splitn(4, '\n');
+    if parts.next()? != "v1" {
+        return None;
+    }
+    let expires_at = parts.next()?.parse().ok()?;
+    let access = parts.next()?.to_owned();
+    if access.is_empty() {
+        return None;
+    }
+    // The remainder, so a refresh token carrying a newline survives the round trip even though an
+    // access token carrying one is refused at the write.
+    let refresh = parts.next().unwrap_or_default();
+    Some(Tokens {
+        access,
+        refresh: (!refresh.is_empty()).then(|| refresh.to_owned()),
+        expires_at,
+    })
+}
+
+/// Whether `tokens` is still worth sending, given the moment `now` in unix seconds.
+///
+/// **A minute of headroom, because the token is checked here and used after two round trips.** A
+/// token with four seconds left passes a bare comparison and is refused by the server by the time
+/// it arrives, which reads as "signed in but not allowed" rather than "time to renew".
+pub fn usable(tokens: &Tokens, now: u64) -> bool {
+    tokens.expires_at == 0 || tokens.expires_at > now.saturating_add(EXPIRY_HEADROOM)
+}
+
+/// Seconds of headroom [`usable`] insists on.
+pub const EXPIRY_HEADROOM: u64 = 60;
+
 /// The Credential Manager target name for a source, or `None` if the name cannot be one.
 ///
 /// **The only key the store has**, which is why it is composed here and tested rather than built
@@ -48,15 +143,7 @@ const NAME_MAX: usize = 64;
 /// hold `/`, which is the separator this scheme uses, nor a backslash, nor control characters, nor
 /// leading or trailing space.
 pub fn target_for(name: &str) -> Option<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.len() > NAME_MAX || trimmed != name {
-        return None;
-    }
-    let usable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ');
-    if !name.chars().all(usable) {
-        return None;
-    }
-    Some(format!("{PREFIX}{name}"))
+    nameable(name).then(|| format!("{PREFIX}{name}"))
 }
 
 /// Stores `secret` against `name`, replacing whatever was there. Reports whether it landed.
@@ -65,9 +152,34 @@ pub fn target_for(name: &str) -> Option<String> {
 /// a length, the value is a base64 client secret, and round-tripping it through UTF-16 would only
 /// add a conversion that could be got wrong in one direction.
 pub fn store(name: &str, secret: &str) -> bool {
-    let Some(target) = target_for(name) else {
-        return false;
-    };
+    match target_for(name) {
+        Some(target) => write_at(&target, secret),
+        None => false,
+    }
+}
+
+/// Keeps what a sign-in returned, against `name`, replacing whatever was there.
+pub fn store_tokens(name: &str, tokens: &Tokens) -> bool {
+    match (tokens_target_for(name), encode_tokens(tokens)) {
+        (Some(target), Some(blob)) => write_at(&target, &blob),
+        _ => false,
+    }
+}
+
+/// What a sign-in left against `name`, or `None` if there is nothing usable there.
+pub fn load_tokens(name: &str) -> Option<Tokens> {
+    decode_tokens(&read_at(&tokens_target_for(name)?)?)
+}
+
+/// Forgets the sign-in against `name`. This is what signing out means.
+pub fn forget_tokens(name: &str) -> bool {
+    match tokens_target_for(name) {
+        Some(target) => delete_at(&target),
+        None => false,
+    }
+}
+
+fn write_at(target: &str, secret: &str) -> bool {
     let mut target: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     let mut who: Vec<u16> = "tailhawk"
         .encode_utf16()
@@ -135,7 +247,10 @@ pub fn decode_blob(bytes: &[u8]) -> Option<String> {
 /// process only as the `String` handed back — which the caller is expected to drop as soon as the
 /// request carrying it has been sent, exactly as `net.rs` treats a token.
 pub fn load(name: &str) -> Option<String> {
-    let target = target_for(name)?;
+    read_at(&target_for(name)?)
+}
+
+fn read_at(target: &str) -> Option<String> {
     let target: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     let mut out = std::ptr::null_mut();
     unsafe {
@@ -167,9 +282,13 @@ pub fn load(name: &str) -> Option<String> {
 /// Reports `true` when there is no longer a credential under that name — including when there was
 /// none to begin with, which is the answer a caller asking "make sure this is gone" wants.
 pub fn forget(name: &str) -> bool {
-    let Some(target) = target_for(name) else {
-        return false;
-    };
+    match target_for(name) {
+        Some(target) => delete_at(&target),
+        None => false,
+    }
+}
+
+fn delete_at(target: &str) -> bool {
     let target: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     match unsafe { CredDeleteW(PWSTR(target.as_ptr() as *mut u16), CRED_TYPE_GENERIC, 0) } {
         Ok(()) => true,
@@ -180,6 +299,98 @@ pub fn forget(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sign-in survives being written and read back, refresh token and all.
+    #[test]
+    fn what_a_sign_in_left_comes_back_whole() {
+        let tokens = Tokens {
+            access: "header.payload.signature".to_owned(),
+            refresh: Some("ref-1234".to_owned()),
+            expires_at: 1_777_000_000,
+        };
+        let blob = encode_tokens(&tokens).expect("an ordinary token encodes");
+        assert_eq!(decode_tokens(&blob), Some(tokens));
+
+        // A client-credentials source has no refresh token, and absence must come back as absence
+        // rather than as an empty string somebody later sends to the server.
+        let bare = Tokens {
+            access: "a".to_owned(),
+            refresh: None,
+            expires_at: 0,
+        };
+        assert_eq!(
+            decode_tokens(&encode_tokens(&bare).expect("encodes")),
+            Some(bare)
+        );
+    }
+
+    /// **The version line is checked, and the store is user-visible, so this is not hypothetical.**
+    /// A blob typed into Control Panel by hand, or left by a later version, must read as nothing
+    /// rather than as a plausible token.
+    #[test]
+    fn a_blob_this_did_not_write_is_not_read_as_a_sign_in() {
+        assert_eq!(decode_tokens(""), None);
+        assert_eq!(decode_tokens("just-a-secret"), None);
+        assert_eq!(
+            decode_tokens("v2\n0\na\n"),
+            None,
+            "a later format is not guessed at"
+        );
+        assert_eq!(decode_tokens("v1\nnotanumber\na\n"), None);
+        assert_eq!(
+            decode_tokens("v1\n0\n\n"),
+            None,
+            "no access token is no sign-in"
+        );
+    }
+
+    /// A newline in the access token would shift every field after it, so it is refused at the
+    /// write rather than producing a blob that reads back as a different token.
+    #[test]
+    fn an_access_token_carrying_a_newline_is_refused_rather_than_mangled() {
+        assert_eq!(
+            encode_tokens(&Tokens {
+                access: "a\nb".to_owned(),
+                refresh: None,
+                expires_at: 0,
+            }),
+            None
+        );
+    }
+
+    /// **A token good for four more seconds is not good enough.** It is checked here and used after
+    /// a token exchange and a query, so a bare comparison hands the server something it will refuse
+    /// — which reads as "signed in but not allowed" rather than "time to renew".
+    #[test]
+    fn a_token_about_to_expire_is_already_not_worth_sending() {
+        let at = |expires_at| Tokens {
+            access: "a".to_owned(),
+            refresh: None,
+            expires_at,
+        };
+        assert!(usable(&at(2_000), 1_000), "half an hour left is fine");
+        assert!(!usable(&at(1_004), 1_000), "four seconds left is not");
+        assert!(!usable(&at(900), 1_000), "and neither is expired");
+        assert!(
+            usable(&at(0), 1_000),
+            "a server that named no expiry is trusted until it refuses"
+        );
+    }
+
+    /// The two kinds live at different targets, so revoking a sign-in and removing a client secret
+    /// are separate gestures and neither can overwrite the other.
+    #[test]
+    fn a_sign_in_and_a_client_secret_are_stored_apart() {
+        assert_eq!(target_for("live").as_deref(), Some("Tailhawk/loki/live"));
+        assert_eq!(
+            tokens_target_for("live").as_deref(),
+            Some("Tailhawk/loki-tokens/live")
+        );
+        // The name rule is the same one, and it is the shared `nameable`.
+        assert_eq!(tokens_target_for("bad/name"), None);
+        assert_eq!(tokens_target_for(" live"), None);
+        assert_eq!(tokens_target_for(""), None);
+    }
 
     /// **A source name is the whole key**, so anything that could make two names collide, escape the
     /// prefix, or reach a part of the store this application does not own is refused before it gets
