@@ -295,6 +295,7 @@ mod tests {
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
             query: "{environment=\"dev\"}".to_owned(),
+            device_url: String::new(),
         }
     }
 

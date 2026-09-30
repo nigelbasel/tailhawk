@@ -13049,6 +13049,7 @@ mod tests {
             client_id: String::new(),
             scope: String::new(),
             query: query.to_owned(),
+            device_url: String::new(),
         }
     }
 
