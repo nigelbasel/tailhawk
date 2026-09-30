@@ -94,8 +94,10 @@ use windows::Win32::UI::Controls::Dialogs::{
     OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::{
-    SetScrollInfo, TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TDCBF_NO_BUTTON,
-    TDCBF_OK_BUTTON, TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_USE_HICON_MAIN,
+    SetScrollInfo, TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOG_BUTTON,
+    TASKDIALOG_NOTIFICATIONS, TDCBF_CANCEL_BUTTON, TDCBF_NO_BUTTON, TDCBF_OK_BUTTON,
+    TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_CALLBACK_TIMER, TDF_USE_HICON_MAIN,
+    TDM_CLICK_BUTTON, TDN_BUTTON_CLICKED, TDN_TIMER,
 };
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::HiDpi::{
@@ -9289,6 +9291,13 @@ enum Fetched {
     },
     /// A fetch that failed, in the words the fault chose.
     Failed { name: String, why: String },
+    /// The source signs the reader in and there was no sign-in to use, so one has been started.
+    /// Carries what the reader has to approve.
+    SignInStarted {
+        source: tailhawk_core::settings::Source,
+        label: String,
+        grant: tailhawk_core::loki::DeviceGrant,
+    },
 }
 
 /// Runs `work` on a worker and hands the answer back through a channel the shell drains.
@@ -9342,6 +9351,20 @@ fn ask_for_records(source: tailhawk_core::settings::Source, label: String) -> Re
                 label,
                 pulled: Box::new(pulled),
                 window_end: window.end,
+            },
+            // **Not signed in is a thing to ask about, not a failure to report.** The same worker
+            // starts the sign-in, because it is one more round trip to the same identity server and
+            // hopping back to the UI thread in between would buy nothing.
+            Err(pull::PullFault::NotSignedIn) => match pull::begin_sign_in(&source) {
+                Ok(grant) => Fetched::SignInStarted {
+                    source,
+                    label,
+                    grant,
+                },
+                Err(why) => Fetched::Failed {
+                    name: label,
+                    why: why.to_string(),
+                },
             },
             // **The reason is shown, never swallowed.** Every fault says which half failed; a
             // source that silently opens nothing is the worst outcome available here.
@@ -10693,6 +10716,168 @@ fn confirmed(hwnd: HWND, question: &str) -> bool {
     pressed == windows::Win32::UI::WindowsAndMessaging::IDYES.0
 }
 
+/// What the sign-in box needs while it is open: the answer it is waiting for, and where the button
+/// sends the reader.
+/// **Shared, never uniquely borrowed.** `SendMessageW(TDM_CLICK_BUTTON)` re-enters this callback
+/// synchronously, and so can `ShellExecuteW` — so a `&mut` taken here would still be live when the
+/// nested call took a second one, which is two unique borrows of one object. `Cell` is what lets
+/// the answer be written through a shared reference instead.
+struct SigningIn {
+    waiting: std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+    /// Set once the worker answers, and read after the box closes.
+    answer: std::cell::Cell<Option<std::result::Result<(), String>>>,
+    /// The verification URI, already widened, so the callback allocates nothing.
+    open: Vec<u16>,
+}
+
+/// The id of the "Open the sign-in page" button. Above the common buttons' range, which is what
+/// `pButtons` ids have to be.
+const ID_SIGN_IN_OPEN: i32 = 1001;
+
+/// Drives the sign-in box: opens the page on request, and closes the box the moment the worker has
+/// an answer.
+///
+/// **The timer is what makes this not a modal dead end.** Without `TDF_CALLBACK_TIMER` the box
+/// would sit there after the reader had already approved the sign-in, waiting for a Cancel that
+/// means the opposite of what happened.
+unsafe extern "system" fn sign_in_callback(
+    hwnd: HWND,
+    msg: TASKDIALOG_NOTIFICATIONS,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+    data: isize,
+) -> windows::core::HRESULT {
+    let state = data as *mut SigningIn;
+    if state.is_null() {
+        return windows::core::HRESULT(0);
+    }
+    let state = unsafe { &*state };
+    match msg {
+        TDN_TIMER => {
+            if let Ok(answer) = state.waiting.try_recv() {
+                state.answer.set(Some(answer));
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                        hwnd,
+                        TDM_CLICK_BUTTON.0 as u32,
+                        WPARAM(windows::Win32::UI::WindowsAndMessaging::IDCANCEL.0 as usize),
+                        LPARAM(0),
+                    );
+                }
+            }
+            windows::core::HRESULT(0)
+        }
+        // **Opening the page must not close the box.** The reader needs the code while they are
+        // signing in, and `S_FALSE` is what tells the dialog to stay.
+        TDN_BUTTON_CLICKED if lparam.0 as i32 == ID_SIGN_IN_OPEN => {
+            unsafe {
+                ShellExecuteW(
+                    hwnd,
+                    windows::core::w!("open"),
+                    PCWSTR(state.open.as_ptr()),
+                    None,
+                    None,
+                    SW_SHOW,
+                );
+            }
+            windows::core::HRESULT(1)
+        }
+        _ => windows::core::HRESULT(0),
+    }
+}
+
+/// §12.4's sign-in: shows the code the identity server issued, waits for the reader to approve it,
+/// and opens the source when they have.
+///
+/// **The waiting is a worker and the window is only a window.** `pull::poll_sign_in` sleeps for
+/// seconds at a time between polls; on the message loop that is a frozen window for as long as
+/// somebody takes to find their password.
+///
+/// **Called outside every `STATE` borrow**, like every other thing here that pumps a modal loop.
+fn sign_in_dialog(
+    hwnd: HWND,
+    source: tailhawk_core::settings::Source,
+    label: String,
+    grant: tailhawk_core::loki::DeviceGrant,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    // **The worker stops when this box does.** Without it, cancelling left a thread polling for up
+    // to the grant's lifetime — and if the reader then approved the code in the browser tab they
+    // had already opened, it would have signed them in after they had said no.
+    let (keep_going, cancelled) = std::sync::mpsc::channel::<()>();
+    let polling = source.clone();
+    let asked = grant.clone();
+    std::thread::spawn(move || {
+        let _ = tx
+            .send(pull::poll_sign_in(&polling, &asked, &cancelled).map_err(|why| why.to_string()));
+    });
+
+    // The complete URI when the server offered one — it carries the code, so the reader only has to
+    // confirm rather than transcribe.
+    let where_to = grant
+        .verification_uri_complete
+        .clone()
+        .unwrap_or_else(|| grant.verification_uri.clone());
+    let state = SigningIn {
+        waiting: rx,
+        answer: std::cell::Cell::new(None),
+        open: wide(&where_to),
+    };
+
+    let title = wide("Sign in");
+    let instruction = wide(&format!("Sign in to {}", source.name));
+    let content = wide(&format!(
+        "Go to {}\r\n\r\nand enter the code\r\n\r\n{}\r\n\r\nThis window closes itself once you have.",
+        grant.verification_uri, grant.user_code
+    ));
+    let open_text = wide("Open the sign-in page");
+    let buttons = [TASKDIALOG_BUTTON {
+        nButtonID: ID_SIGN_IN_OPEN,
+        pszButtonText: PCWSTR(open_text.as_ptr()),
+    }];
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: hwnd,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_CALLBACK_TIMER,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        pszMainInstruction: PCWSTR(instruction.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        pfCallback: Some(sign_in_callback),
+        lpCallbackData: &state as *const SigningIn as isize,
+        ..Default::default()
+    };
+    let shown = unsafe { TaskDialogIndirect(&config, None, None, None) };
+    // Whatever happens next, the worker is told to stop.
+    drop(keep_going);
+    if shown.is_err() {
+        set_notice(
+            hwnd,
+            format!("{label}: the sign-in window could not be opened."),
+        );
+        return;
+    }
+    // **One last look before calling it cancelled.** The answer can land in the same instant the
+    // reader clicks Cancel, and reporting "cancelled" over a sign-in that had succeeded would be
+    // the bar contradicting what happened — the same fault `b973850` fixed in the wizard.
+    let answer = state
+        .answer
+        .take()
+        .or_else(|| state.waiting.try_recv().ok());
+    match answer {
+        // **Straight back to the open the reader asked for.** Signing in is not the thing they
+        // wanted; it is the toll on the way to it, and stopping here to make them click again
+        // would make the sign-in feel like the task.
+        Some(Ok(())) => open_remote(hwnd, source, label),
+        Some(Err(why)) => set_notice(hwnd, format!("{label}: {why}")),
+        // Cancelled. Said, because a window that closes with nothing on the bar is the "command
+        // that appears to do nothing" §10 asks this codebase to avoid.
+        None => set_notice(hwnd, format!("{label}: signing in was cancelled.")),
+    }
+}
+
 fn show_about(hwnd: HWND, sheet: &about::AboutSheet) {
     let title = wide("About Tailhawk");
     let instruction = wide(&sheet.title);
@@ -11147,6 +11332,13 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         pulled,
                         window_end,
                     } => landed_records(hwnd, source, label, *pulled, window_end),
+                    // Outside the borrow, like the picker beside it and for the same reason: it
+                    // pumps a modal loop of its own.
+                    Fetched::SignInStarted {
+                        source,
+                        label,
+                        grant,
+                    } => sign_in_dialog(hwnd, source, label, grant),
                     Fetched::Failed { name, why } => set_notice(hwnd, format!("{name}: {why}")),
                 }
             }

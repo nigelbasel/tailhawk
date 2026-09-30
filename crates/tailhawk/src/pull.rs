@@ -294,6 +294,113 @@ fn fetch_token(source: &Source) -> Result<String, PullFault> {
         .ok_or(PullFault::TokenUnreadable)
 }
 
+/// Asks the identity server to start a sign-in, and returns what the reader has to approve.
+///
+/// **The device endpoint is a third origin and gets §7's controls**, exactly as the token endpoint
+/// does: its whole URL is provider configuration, so it is parsed, refused `http`, and refused a
+/// literal address in the ranges §7 names.
+pub fn begin_sign_in(source: &Source) -> Result<loki::DeviceGrant, PullFault> {
+    let at =
+        Origin::parse(&source.device_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
+    refuse_insecure(&at)?;
+    refuse_literal_address(&at).map_err(PullFault::Address)?;
+    let request = loki::device_request(&at, &source.client_id, &source.scope);
+    let answer =
+        net::send(&request, Provenance::Imported, Auth::None).map_err(PullFault::TokenTransport)?;
+    if answer.status != 200 {
+        return Err(PullFault::TokenRefused {
+            status: answer.status,
+        });
+    }
+    loki::device_grant_from_json(&answer.body).ok_or(PullFault::TokenUnreadable)
+}
+
+/// Waits for the reader to approve `grant`, then keeps what the server issued.
+///
+/// **This blocks, and it must only ever be called on a worker.** It sleeps between polls for as
+/// long as the server asked, which is seconds at a time — on the message loop that would be a
+/// frozen window for the length of somebody typing their password.
+///
+/// **`slow_down` lengthens the wait rather than failing.** RFC 8628 defines it as an instruction,
+/// not an error, and a client that gave up on it would be one the server had asked to be patient.
+pub fn poll_sign_in(
+    source: &Source,
+    grant: &loki::DeviceGrant,
+    cancelled: &std::sync::mpsc::Receiver<()>,
+) -> Result<(), PullFault> {
+    let at =
+        Origin::parse(&source.token_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
+    refuse_insecure(&at)?;
+    refuse_literal_address(&at).map_err(PullFault::Address)?;
+    let request = loki::device_poll_request(&at, &source.client_id, &grant.device_code);
+    let mut interval = grant.interval;
+    // **Bounded by the grant's own lifetime, not by a count.** The server said how long the code is
+    // good for; polling past that is asking about something that no longer exists.
+    let give_up_at = now_seconds().saturating_add(grant.expires_in.max(1));
+    // **A blip must not end a sign-in somebody is halfway through.** RFC 8628 §3.5 has the client
+    // keep polling and back off; a single dropped connection or a gateway's 502 would otherwise
+    // throw away a code the reader is at that moment typing into a browser.
+    let mut blips = 0u32;
+    loop {
+        // **The wait is also how the box closing is noticed.** A dropped sender disconnects, which
+        // ends this within one interval instead of leaving a thread polling — and storing a
+        // sign-in — for the rest of the grant's life.
+        match cancelled.recv_timeout(std::time::Duration::from_secs(interval)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            _ => return Err(PullFault::NotSignedIn),
+        }
+        if now_seconds() >= give_up_at {
+            return Err(PullFault::NotSignedIn);
+        }
+        let answer = match net::send(&request, Provenance::Imported, Auth::None) {
+            Ok(answer) => answer,
+            Err(why) => {
+                blips += 1;
+                if blips > POLL_BLIPS_ALLOWED {
+                    return Err(PullFault::TokenTransport(why));
+                }
+                interval = loki::slowed(interval);
+                continue;
+            }
+        };
+        match loki::poll_outcome(&answer.body) {
+            loki::Poll::Granted(token) => {
+                let mut cache = access_cache()
+                    .lock()
+                    .unwrap_or_else(|held| held.into_inner());
+                remember(&mut cache, &source.name, token)?;
+                return Ok(());
+            }
+            loki::Poll::Pending => blips = 0,
+            loki::Poll::SlowDown => {
+                blips = 0;
+                interval = loki::slowed(interval);
+            }
+            loki::Poll::Expired | loki::Poll::Denied => return Err(PullFault::NotSignedIn),
+            // **A 5xx is the gateway, not the grant.** `poll_outcome` cannot tell an OAuth error
+            // document from a proxy's HTML, so the status is what separates "this sign-in is
+            // refused" from "this server is briefly unwell".
+            loki::Poll::Failed(_) if answer.status >= 500 => {
+                blips += 1;
+                if blips > POLL_BLIPS_ALLOWED {
+                    return Err(PullFault::TokenRefused {
+                        status: answer.status,
+                    });
+                }
+                interval = loki::slowed(interval);
+            }
+            loki::Poll::Failed(_) => {
+                return Err(PullFault::TokenRefused {
+                    status: answer.status,
+                })
+            }
+        }
+    }
+}
+
+/// How many consecutive unwell answers a sign-in tolerates before giving up on it.
+const POLL_BLIPS_ALLOWED: u32 = 3;
+
 /// Unix seconds now, or zero if the clock is before 1970 and the question is meaningless.
 pub fn now_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -310,33 +417,85 @@ pub fn now_seconds() -> u64 {
 /// there is neither, [`PullFault::NotSignedIn`] tells the caller to ask the reader rather than
 /// reporting that something broke.
 fn signed_in_token(source: &Source, at: &Origin) -> Result<String, PullFault> {
-    let held = crate::secrets::load_tokens(&source.name).ok_or(PullFault::NotSignedIn)?;
-    if crate::secrets::usable(&held, now_seconds()) {
-        return Ok(held.access);
+    // **The lock is held across the whole load-refresh-store, and that is its point.** These
+    // refresh tokens are single-use: an opening pull and a tail poll racing would each spend one,
+    // and the loser's would come back `invalid_grant` — signing the reader out mid-tail because two
+    // parts of this program asked at the same moment.
+    let mut cache = access_cache()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    if let Some(cached) = cache.get(&source.name) {
+        if crate::secrets::usable(cached, now_seconds()) {
+            return Ok(cached.access.clone());
+        }
     }
-    let refresh = held.refresh.ok_or(PullFault::NotSignedIn)?;
+    let refresh = crate::secrets::load_refresh(&source.name).ok_or(PullFault::NotSignedIn)?;
     let request = loki::refresh_request(at, &source.client_id, &refresh);
     // **No credential on the request itself.** A public client has none, and the refresh token is
     // in the body where `LOKI.md` §7 wants a credential rather than in a URL a proxy would log.
     let answer =
         net::send(&request, Provenance::Imported, Auth::None).map_err(PullFault::TokenTransport)?;
     if answer.status != 200 {
-        // **A refused refresh is "sign in again", not "the server is broken".** A refresh token is
-        // one-time-use with a sliding window on this estate, so a renewal that is refused means the
-        // session is over — which is a thing to ask the reader about, not an error to report.
-        crate::secrets::forget_tokens(&source.name);
-        return Err(PullFault::NotSignedIn);
+        // **Only `invalid_grant` ends a sign-in.** RFC 6749 §5.2 defines it as the spent, revoked or
+        // expired refresh token; a 503 or a rate limit is a reason to try again later, and throwing
+        // the credential away for one of those would sign the reader out over a blip.
+        if loki::oauth_error(&answer.body).as_deref() == Some("invalid_grant") {
+            crate::secrets::forget_refresh(&source.name);
+            cache.remove(&source.name);
+            return Err(PullFault::NotSignedIn);
+        }
+        return Err(PullFault::TokenRefused {
+            status: answer.status,
+        });
     }
     let renewed = loki::token_from_json(&answer.body).ok_or(PullFault::TokenUnreadable)?;
-    let keep = crate::secrets::Tokens {
-        access: renewed.access_token.clone(),
-        // **The new refresh token, or the old one.** Duende rotates refresh tokens by default, and
-        // keeping the spent one would work exactly once more and then sign the reader out.
-        refresh: renewed.refresh_token.or(Some(refresh)),
-        expires_at: expiry_from(renewed.expires_in),
-    };
-    crate::secrets::store_tokens(&source.name, &keep);
-    Ok(renewed.access_token)
+    let access = renewed.access_token.clone();
+    remember(&mut cache, &source.name, renewed)?;
+    Ok(access)
+}
+
+/// The access tokens this process holds, by source name.
+///
+/// **In memory rather than in the store, and that is forced rather than preferred.** `CredWriteW`
+/// refuses a blob over 2,560 bytes and a signed JWT access token from this estate is routinely more
+/// than half of that, so keeping it beside the refresh token would fail the write *after* the reader
+/// had approved the sign-in — and the device code is single-use, so the remedy would be to do the
+/// whole thing again. It is also the part worth keeping least: it expires within the hour, and the
+/// refresh token mints another.
+fn access_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, crate::secrets::Tokens>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, crate::secrets::Tokens>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Keeps what the server just issued: the refresh token in the store, the access token in memory.
+///
+/// **A rotated refresh token that cannot be written signs the reader out now rather than later.**
+/// Duende rotates them, so the one already in the store is spent — leaving it there would fail at
+/// some arbitrary later moment with no connection to what caused it.
+fn remember(
+    cache: &mut std::collections::HashMap<String, crate::secrets::Tokens>,
+    name: &str,
+    token: loki::Token,
+) -> Result<(), PullFault> {
+    if let Some(rotated) = token.refresh_token.as_deref() {
+        if !crate::secrets::store_refresh(name, rotated) {
+            crate::secrets::forget_refresh(name);
+            cache.remove(name);
+            return Err(PullFault::NotSignedIn);
+        }
+    }
+    cache.insert(
+        name.to_owned(),
+        crate::secrets::Tokens {
+            access: token.access_token,
+            refresh: None,
+            expires_at: expiry_from(token.expires_in),
+        },
+    );
+    Ok(())
 }
 
 /// The absolute moment a token issued now stops being any use, or zero when the server said nothing.

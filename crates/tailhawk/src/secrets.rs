@@ -21,8 +21,8 @@
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, FILETIME};
 use windows::Win32::Security::Credentials::{
-    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
-    CRED_TYPE_GENERIC,
+    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_MAX_CREDENTIAL_BLOB_SIZE,
+    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
 };
 
 /// The prefix every credential Tailhawk stores is filed under.
@@ -76,48 +76,32 @@ pub fn tokens_target_for(name: &str) -> Option<String> {
     nameable(name).then(|| format!("{TOKENS_PREFIX}{name}"))
 }
 
-/// The three fields as one blob.
+/// **Only the refresh token is written to the store, and the access token never is.**
 ///
-/// **Refuses a newline in the access token rather than writing an ambiguous blob.** The format is
-/// positional, so a newline inside the first field would move every field after it — and the value
-/// that came back would be a token the server never issued, which fails as a 401 and sends the
-/// reader to look at the server. Nothing the specification allows in a token contains one; this is
-/// here so that if something ever does, it fails loudly at the write instead of quietly at the read.
-pub fn encode_tokens(tokens: &Tokens) -> Option<String> {
-    if tokens.access.contains('\n') {
-        return None;
+/// `CredWriteW` refuses a blob over [`CRED_MAX_CREDENTIAL_BLOB_SIZE`] — 2,560 bytes — and a signed
+/// JWT access token from this estate's identity server is routinely one to two kilobytes. Keeping
+/// both in one credential would therefore fail **after** the reader had approved the sign-in, and
+/// the device code is single-use, so the remedy would be to do the whole thing again. A refresh
+/// token is a few hundred bytes and is the only part worth surviving the process anyway: the access
+/// token expires within the hour and is replaced from the refresh token on demand.
+pub fn store_refresh(name: &str, refresh: &str) -> bool {
+    match tokens_target_for(name) {
+        Some(target) => write_at(&target, refresh),
+        None => false,
     }
-    Some(format!(
-        "v1\n{}\n{}\n{}",
-        tokens.expires_at,
-        tokens.access,
-        tokens.refresh.as_deref().unwrap_or_default()
-    ))
 }
 
-/// Reads back what [`encode_tokens`] wrote, and `None` for anything else.
-///
-/// **The version line is checked rather than skipped.** This store is user-visible by design, so
-/// the blob can be replaced by hand or left behind by a future version, and a positional format
-/// read out of order yields a plausible string rather than an error.
-pub fn decode_tokens(text: &str) -> Option<Tokens> {
-    let mut parts = text.splitn(4, '\n');
-    if parts.next()? != "v1" {
-        return None;
+/// The refresh token held for `name`, or `None` when the reader is not signed in.
+pub fn load_refresh(name: &str) -> Option<String> {
+    read_at(&tokens_target_for(name)?).filter(|t| !t.is_empty())
+}
+
+/// Forgets the sign-in against `name`. This is what signing out means.
+pub fn forget_refresh(name: &str) -> bool {
+    match tokens_target_for(name) {
+        Some(target) => delete_at(&target),
+        None => false,
     }
-    let expires_at = parts.next()?.parse().ok()?;
-    let access = parts.next()?.to_owned();
-    if access.is_empty() {
-        return None;
-    }
-    // The remainder, so a refresh token carrying a newline survives the round trip even though an
-    // access token carrying one is refused at the write.
-    let refresh = parts.next().unwrap_or_default();
-    Some(Tokens {
-        access,
-        refresh: (!refresh.is_empty()).then(|| refresh.to_owned()),
-        expires_at,
-    })
 }
 
 /// Whether `tokens` is still worth sending, given the moment `now` in unix seconds.
@@ -158,28 +142,13 @@ pub fn store(name: &str, secret: &str) -> bool {
     }
 }
 
-/// Keeps what a sign-in returned, against `name`, replacing whatever was there.
-pub fn store_tokens(name: &str, tokens: &Tokens) -> bool {
-    match (tokens_target_for(name), encode_tokens(tokens)) {
-        (Some(target), Some(blob)) => write_at(&target, &blob),
-        _ => false,
-    }
-}
-
-/// What a sign-in left against `name`, or `None` if there is nothing usable there.
-pub fn load_tokens(name: &str) -> Option<Tokens> {
-    decode_tokens(&read_at(&tokens_target_for(name)?)?)
-}
-
-/// Forgets the sign-in against `name`. This is what signing out means.
-pub fn forget_tokens(name: &str) -> bool {
-    match tokens_target_for(name) {
-        Some(target) => delete_at(&target),
-        None => false,
-    }
-}
-
+/// **Refuses an oversized blob rather than letting `CredWriteW` fail opaquely.** The limit is the
+/// platform's, and a credential that silently fails to save is a reader who is signed out again on
+/// the next run with nothing to say why.
 fn write_at(target: &str, secret: &str) -> bool {
+    if secret.len() > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize {
+        return false;
+    }
     let mut target: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     let mut who: Vec<u16> = "tailhawk"
         .encode_utf16()
@@ -300,62 +269,30 @@ fn delete_at(target: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// A sign-in survives being written and read back, refresh token and all.
+    /// **The reason only the refresh token is stored, as an assertion rather than a comment.**
+    /// `CredWriteW` refuses a blob over 2,560 bytes and a signed JWT access token from this
+    /// estate's identity server is routinely one to two kilobytes — so a credential holding both
+    /// would fail *after* the reader had approved the sign-in, burning a single-use device code.
     #[test]
-    fn what_a_sign_in_left_comes_back_whole() {
-        let tokens = Tokens {
-            access: "header.payload.signature".to_owned(),
-            refresh: Some("ref-1234".to_owned()),
-            expires_at: 1_777_000_000,
-        };
-        let blob = encode_tokens(&tokens).expect("an ordinary token encodes");
-        assert_eq!(decode_tokens(&blob), Some(tokens));
-
-        // A client-credentials source has no refresh token, and absence must come back as absence
-        // rather than as an empty string somebody later sends to the server.
-        let bare = Tokens {
-            access: "a".to_owned(),
-            refresh: None,
-            expires_at: 0,
-        };
-        assert_eq!(
-            decode_tokens(&encode_tokens(&bare).expect("encodes")),
-            Some(bare)
+    fn a_realistic_access_token_would_not_have_fitted_beside_a_refresh_token() {
+        let access = "a".repeat(2200);
+        let refresh = "r".repeat(400);
+        assert!(
+            access.len() + refresh.len() > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize,
+            "the two together exceed what the store accepts, which is why only one is kept"
+        );
+        assert!(
+            refresh.len() <= CRED_MAX_CREDENTIAL_BLOB_SIZE as usize,
+            "and the one that is kept fits comfortably"
         );
     }
 
-    /// **The version line is checked, and the store is user-visible, so this is not hypothetical.**
-    /// A blob typed into Control Panel by hand, or left by a later version, must read as nothing
-    /// rather than as a plausible token.
+    /// An oversized value is refused here rather than by `CredWriteW`, because a credential that
+    /// silently fails to save is a reader signed out on the next run with nothing to say why.
     #[test]
-    fn a_blob_this_did_not_write_is_not_read_as_a_sign_in() {
-        assert_eq!(decode_tokens(""), None);
-        assert_eq!(decode_tokens("just-a-secret"), None);
-        assert_eq!(
-            decode_tokens("v2\n0\na\n"),
-            None,
-            "a later format is not guessed at"
-        );
-        assert_eq!(decode_tokens("v1\nnotanumber\na\n"), None);
-        assert_eq!(
-            decode_tokens("v1\n0\n\n"),
-            None,
-            "no access token is no sign-in"
-        );
-    }
-
-    /// A newline in the access token would shift every field after it, so it is refused at the
-    /// write rather than producing a blob that reads back as a different token.
-    #[test]
-    fn an_access_token_carrying_a_newline_is_refused_rather_than_mangled() {
-        assert_eq!(
-            encode_tokens(&Tokens {
-                access: "a\nb".to_owned(),
-                refresh: None,
-                expires_at: 0,
-            }),
-            None
-        );
+    fn an_oversized_value_is_refused_before_the_platform_refuses_it() {
+        let too_big = "x".repeat(CRED_MAX_CREDENTIAL_BLOB_SIZE as usize + 1);
+        assert!(!store_refresh("size-selftest", &too_big));
     }
 
     /// **A token good for four more seconds is not good enough.** It is checked here and used after

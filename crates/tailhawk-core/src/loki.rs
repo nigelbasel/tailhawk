@@ -752,18 +752,39 @@ pub fn device_grant_from_json(body: &str) -> Option<DeviceGrant> {
     }
     let device_code = json_string(body, "device_code").filter(|t| !t.is_empty())?;
     let user_code = json_string(body, "user_code").filter(|t| !t.is_empty())?;
-    let verification_uri = json_string(body, "verification_uri").unwrap_or_default();
+    // **The verification URI is checked here because the shell hands it to `ShellExecuteW`.** It
+    // arrives from a server named by a settings file, which `LOKI.md` §7 already treats as
+    // something that may have been sent to the user — and `ShellExecuteW` on `file:///…\x.exe` or
+    // `\\host\share\x` runs it. A grant whose URI is not https is not a grant.
+    let verification_uri = json_string(body, "verification_uri").filter(|u| is_https_url(u))?;
     Some(DeviceGrant {
         device_code,
         user_code,
         verification_uri,
+        // The same rule, and dropped rather than refused: it is an optional convenience, so a
+        // server that offers a bad one loses the convenience and not the sign-in.
         verification_uri_complete: json_string(body, "verification_uri_complete")
-            .filter(|t| !t.is_empty()),
-        expires_in: json_number(body, "expires_in").unwrap_or(0),
+            .filter(|u| is_https_url(u)),
+        // **A missing lifetime is a default, not a zero.** Zero made the poll give up before its
+        // first request, which reads to the user as a sign-in that failed instantly for no reason.
+        expires_in: json_number(body, "expires_in")
+            .filter(|s| *s > 0)
+            .unwrap_or(DEVICE_EXPIRY_DEFAULT),
         interval: json_number(body, "interval")
             .filter(|i| *i > 0)
             .unwrap_or(DEVICE_INTERVAL_DEFAULT),
     })
+}
+
+/// How long a device grant is assumed good for when the server does not say. RFC 8628 gives no
+/// default; fifteen minutes is what the specification's own examples use.
+pub const DEVICE_EXPIRY_DEFAULT: u64 = 900;
+
+/// Whether `url` is an absolute `https` URL with a host — the only thing this will put in front of
+/// a reader or hand to the shell.
+fn is_https_url(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
 }
 
 /// RFC 8628 §3.4: one poll of the token endpoint.
@@ -816,6 +837,16 @@ pub fn refresh_request(origin: &Origin, client_id: &str, refresh_token: &str) ->
         ),
         content_type: Some("application/x-www-form-urlencoded"),
     }
+}
+
+/// The OAuth `error` code in a failed answer, when there is one.
+///
+/// **Which error it is decides whether a stored sign-in is thrown away.** RFC 6749 §5.2 makes
+/// `invalid_grant` the one that means the refresh token is spent, revoked or expired; everything
+/// else — a 503, a rate limit, a misconfigured client — is a reason to try later rather than a
+/// reason to sign the reader out.
+pub fn oauth_error(body: &str) -> Option<String> {
+    json_string(body, "error").filter(|e| !e.is_empty())
 }
 
 /// The interval after a `slow_down`, which only ever grows.
@@ -1307,6 +1338,53 @@ mod tests {
             device_grant_from_json(r#"{"error":"invalid_client"}"#),
             None
         );
+    }
+
+    /// **A missing lifetime must not mean "already over".** A zero here made the poll give up
+    /// before its first request, which reads as a sign-in that failed instantly for no reason.
+    #[test]
+    fn a_grant_with_no_stated_lifetime_still_gets_one() {
+        let body =
+            r#"{"device_code":"d","user_code":"U","verification_uri":"https://i.example/d"}"#;
+        let grant = device_grant_from_json(body).expect("a grant");
+        assert_eq!(grant.expires_in, DEVICE_EXPIRY_DEFAULT);
+        assert!(grant.expires_in > 0, "a zero lifetime never polls once");
+    }
+
+    /// **The verification URI is handed to `ShellExecuteW`, so it is checked before it is trusted.**
+    /// It comes from a server named in a settings file, which §7 already treats as something that
+    /// may have been sent to the reader — and the shell will happily run a `file:` URL or a UNC path.
+    #[test]
+    fn a_verification_uri_that_is_not_https_is_refused_rather_than_opened() {
+        let with = |uri: &str| {
+            format!(
+                r#"{{"device_code":"d","user_code":"U","verification_uri":"{uri}","expires_in":600}}"#
+            )
+        };
+        assert!(device_grant_from_json(&with("https://i.example/device")).is_some());
+        for hostile in [
+            "file:///C:/Windows/System32/calc.exe",
+            r"\\attacker\share\x.exe",
+            "http://i.example/device",
+            "javascript:alert(1)",
+            "https://",
+            "https:///no-host",
+            "",
+        ] {
+            assert_eq!(
+                device_grant_from_json(&with(hostile)),
+                None,
+                "a grant naming {hostile:?} must not become a thing the shell opens"
+            );
+        }
+
+        // The complete URI is a convenience, so a bad one costs the convenience and not the
+        // sign-in: the grant still stands, without it.
+        let mixed = r#"{"device_code":"d","user_code":"U",
+            "verification_uri":"https://i.example/device",
+            "verification_uri_complete":"file:///C:/x.exe","expires_in":600}"#;
+        let grant = device_grant_from_json(mixed).expect("the sign-in survives");
+        assert_eq!(grant.verification_uri_complete, None);
     }
 
     /// **§3.5's answers, each one of them.** `authorization_pending` and `slow_down` arrive with
