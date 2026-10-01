@@ -395,6 +395,18 @@ pub struct StatusFacts<'a> {
     pub trace: Option<&'a str>,
     /// §6.4's revealed invisibles, which change what every row looks like.
     pub invisibles: bool,
+    /// How many files the view is reading as one, when it is more than one.
+    pub files: usize,
+    /// §5.5b: the rolled set's members disagree about their order, so the order being shown is an
+    /// assumption rather than a reading.
+    ///
+    /// **This is a warning and the only one of its kind.** Every other pane states what is; this
+    /// one says the rows may not be in the sequence they appear to be, which a reader comparing
+    /// timestamps needs and cannot work out for themselves. It was computed for a month and shown
+    /// to nobody, because it lived in `Document::describe`.
+    pub order_assumed: bool,
+    /// Members the set left out, which are rows the reader is not being shown.
+    pub omitted: usize,
     pub format: Option<&'a str>,
     pub encoding: Option<&'a str>,
     pub tail: Tail<'a>,
@@ -528,6 +540,15 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
         if shown < total {
             view.push(format!("{shown} of {total} columns"));
         }
+    }
+    if facts.files > 1 {
+        view.push(format!("{} files", facts.files));
+    }
+    if facts.omitted > 0 {
+        view.push(format!("{} older not indexed", facts.omitted));
+    }
+    if facts.order_assumed {
+        view.push("⚠ order assumed".to_owned());
     }
     view.extend(facts.trace.map(|id| format!("▸ trace {id}")));
     view.extend(facts.sorted.map(str::to_owned));
@@ -723,6 +744,38 @@ mod tests {
             ..open()
         });
         assert_eq!(some.view, "3 of 8 columns");
+    }
+
+    /// **The ordering warning reaches the screen, which it had not done since the bar became panes.**
+    ///
+    /// §5.5b's "ordering assumed" says the rows may not be in the sequence they appear to be — the
+    /// one fact here a reader cannot work out for themselves, and the one they need before they go
+    /// hunting a fault in the log. It was computed into `Document::describe` and read by nothing.
+    #[test]
+    fn a_set_whose_order_is_only_assumed_says_so() {
+        let of = |files, order_assumed, omitted| {
+            status_panes_of(StatusFacts {
+                files,
+                order_assumed,
+                omitted,
+                ..open()
+            })
+            .view
+        };
+        assert!(of(3, true, 0).contains("⚠ order assumed"));
+        assert!(
+            !of(3, false, 0).contains("order assumed"),
+            "a set that agrees about its order says nothing about it"
+        );
+        assert!(of(3, false, 0).contains("3 files"));
+        assert!(
+            !of(1, false, 0).contains("file"),
+            "one file is not a set and does not need counting"
+        );
+        assert!(
+            of(3, false, 2).contains("2 older not indexed"),
+            "rows the reader is not being shown are said"
+        );
     }
 
     /// **A paused tail says so, and says how to resume.**

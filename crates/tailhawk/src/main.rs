@@ -4664,6 +4664,13 @@ struct Shell {
     pending_sources: bool,
     /// The remote source the user picked, waiting for the pull that must not run inside a borrow.
     pending_pull: Option<usize>,
+    /// The exact `opening …` line currently on the bar, so it can be taken down again when the
+    /// document lands — and **only** if it is still the thing being shown.
+    ///
+    /// **Clearing the notice outright would wipe whatever the open had to say.** The remembered
+    /// format that would not compile is written as a notice a few statements before the document
+    /// arrives, and that warning has to survive the arrival it is about.
+    opening: Option<String>,
     /// A remote chosen from Open Recent — its source name and the applications it was opened for —
     /// waiting for the open that must not run inside a borrow.
     ///
@@ -5023,6 +5030,9 @@ impl Shell {
                             None => {}
                         }
                     }
+                    self.notice =
+                        notice_once_open_finished(self.notice.as_deref(), self.opening.as_deref());
+                    self.opening = None;
                     self.file = Some(document.describe());
                     self.rebuild_highlighter(&mut document);
                     // File ▸ Open Recent learns the file **here**, on success — a mistyped path
@@ -5050,11 +5060,13 @@ impl Shell {
                 Ok(Err(e)) => {
                     self.reading.remove(i);
                     self.notice = Some(e);
+                    self.opening = None;
                     landed = true;
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.reading.remove(i);
                     self.notice = Some("read failed".to_owned());
+                    self.opening = None;
                     landed = true;
                 }
                 Err(TryRecvError::Empty) => i += 1,
@@ -5258,6 +5270,9 @@ impl Shell {
             sorted: sorted.as_deref(),
             trace: doc.filtering.trace.as_deref(),
             invisibles: doc.view.cells().reveal_invisibles,
+            files: doc.set.members().len(),
+            order_assumed: doc.set.newest().disagreed(),
+            omitted: doc.set.omitted(),
             format: doc.detection.accepted.map(|format| format.name),
             encoding: Some(doc.set.charset().name()),
             tail,
@@ -6091,10 +6106,12 @@ impl Shell {
         path: std::path::PathBuf,
         remote: Option<(String, String, std::path::PathBuf, String, bool)>,
     ) {
-        self.file = Some(match &remote {
+        let opening = match &remote {
             Some((label, _, _, _, _)) => format!("opening {label}…"),
             None => format!("opening {}…", path.display()),
-        });
+        };
+        self.opening = Some(opening.clone());
+        self.notice = Some(opening);
         self.reading.push(spawn_open(move || {
             let mut doc = Document::open(&path)?;
             if let Some((label, name, spill, query, cut)) = remote {
@@ -9485,6 +9502,18 @@ const REMOTE_WINDOW_NANOS: i64 = 60 * 60 * 1_000_000_000;
 /// How many records one opening asks for. Below `loki::MAX_LIMIT`, because this is a first
 /// screenful and not an export.
 const REMOTE_LIMIT: u32 = 1_000;
+
+/// What the bar should say once an open has finished, one way or the other.
+///
+/// **Only the line this open put there is taken down.** Anything the open itself had to say — a
+/// remembered format that would not compile, a read that failed — was written over the `opening …`
+/// line and is the reason the reader is looking at the bar at all, so it stays.
+fn notice_once_open_finished(notice: Option<&str>, opening: Option<&str>) -> Option<String> {
+    match (notice, opening) {
+        (Some(shown), Some(put_there)) if shown == put_there => None,
+        _ => notice.map(str::to_owned),
+    }
+}
 
 /// Which state the tail pane is in.
 ///
@@ -12962,6 +12991,7 @@ fn main() -> Result<()> {
             pending_sources: false,
             pending_pull: None,
             pending_reopen: None,
+            opening: None,
             spill_sets: Vec::new(),
             tails: Vec::new(),
             tail_notices: Vec::new(),
@@ -13174,6 +13204,36 @@ mod tests {
     use super::*;
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// **The "opening…" line comes down when the file arrives, and nothing else does.**
+    ///
+    /// Two ways to get this wrong, and both are worse than leaving it alone: clear nothing and a
+    /// stale `opening X…` sits on the bar for the rest of the session; clear everything and the
+    /// warning the open itself produced — a remembered format that would not compile is written
+    /// moments before the document lands — disappears with it.
+    #[test]
+    fn an_opening_line_is_taken_down_by_the_file_arriving_and_nothing_else_is() {
+        let opening = "opening C:\\logs\\a.log…";
+        assert_eq!(
+            notice_once_open_finished(Some(opening), Some(opening)),
+            None,
+            "the line this open put there is the line it takes down"
+        );
+
+        let warning = "⚠ remembered format \"serilog\" for *.log did not compile: bad";
+        assert_eq!(
+            notice_once_open_finished(Some(warning), Some(opening)),
+            Some(warning.to_owned()),
+            "what the open had to say outlives the open"
+        );
+
+        // Nothing to take down, and nothing was put there: both are left exactly as found.
+        assert_eq!(notice_once_open_finished(None, Some(opening)), None);
+        assert_eq!(
+            notice_once_open_finished(Some(warning), None),
+            Some(warning.to_owned())
+        );
+    }
 
     /// **A pump that failed is finished too, so the failure has to be asked about first.** Both a
     /// clean end and a broken read set `stream_done`; testing it first reported a stream that
