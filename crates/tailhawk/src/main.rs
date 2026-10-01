@@ -3273,6 +3273,21 @@ fn regroup_notice(name: &str, count: usize, separate: bool) -> String {
     }
 }
 
+/// Where a remote source's records landed, said once when the document opens.
+///
+/// **`SPEC.md` §13.2 asks for this and it had stopped being said.** `Document::describe` carried
+/// "Loki, spilled to …" into a field the bar reads only with no document open, so the one statement
+/// the product makes about writing a copy of somebody's logs to their disk reached nobody. It is a
+/// notice rather than a pane because it is true for as long as the document lives and does not
+/// change — a permanent pane showing a `%TEMP%` path is the instrument readout the owner already
+/// rejected once.
+fn spilled_to(notice: String, spill: Option<&std::path::Path>) -> String {
+    match spill {
+        Some(dir) => format!("{notice} — spilled to {}", dir.display()),
+        None => notice,
+    }
+}
+
 fn pull_notice(name: &str, records: usize, dropped: usize, cut: bool) -> String {
     let held = counted(records as u64, "record");
     if dropped > 0 {
@@ -9665,7 +9680,10 @@ fn landed_records(
     let cut = tail::was_cut(pulled.records, REMOTE_LIMIT);
     set_notice(
         hwnd,
-        pull_notice(&name, pulled.records, pulled.dropped, cut),
+        spilled_to(
+            pull_notice(&name, pulled.records, pulled.dropped, cut),
+            path.parent(),
+        ),
     );
     // The query this window is a view of, kept before the source moves into the tail: `Interleave`
     // and `Separate` regroup the windows from it without asking the server anything.
@@ -13204,6 +13222,23 @@ mod tests {
     use super::*;
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// **§13.2's claim about writing somebody's logs to their disk is said, not merely true.**
+    /// `Document::describe` carried it into a field the bar reads only with no document open, so
+    /// the one place the product admits to spilling a copy of a remote source reached nobody.
+    #[test]
+    fn a_remote_document_says_where_its_records_landed() {
+        let said = spilled_to(
+            "live · Worker — 1,000 records".to_owned(),
+            Some(std::path::Path::new("C:\\Temp\\tailhawk-spill-123-00")),
+        );
+        assert!(said.starts_with("live · Worker — 1,000 records"), "{said}");
+        assert!(said.contains("tailhawk-spill-123-00"), "{said}");
+
+        // A local file spills nothing, and a notice that volunteered a path for one would be
+        // saying something untrue.
+        assert_eq!(spilled_to("agent.log".to_owned(), None), "agent.log");
+    }
 
     /// **The "opening…" line comes down when the file arrives, and nothing else does.**
     ///
