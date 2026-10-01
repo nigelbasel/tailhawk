@@ -1340,6 +1340,29 @@ mod tests {
         );
     }
 
+    /// **The estate's own identity server, in its own words.** Every other test here is written
+    /// from the specification; this one is the body `/connect/deviceauthorization` actually returned
+    /// on 2026-10-01, so the parser is checked against the server rather than against my reading of
+    /// RFC 8628. The `device_code` is a placeholder of the right shape — it is a credential, and
+    /// this repository is public.
+    #[test]
+    fn the_real_servers_answer_parses() {
+        let body = r#"{"device_code":"0000000000000000000000000000000000000000000000000000000000000000","user_code":"667094687","verification_uri":"https://identity-dev.nurtur.tech/device","verification_uri_complete":"https://identity-dev.nurtur.tech/device?userCode=667094687","expires_in":300,"interval":5}"#;
+        let grant = device_grant_from_json(body).expect("the server's own answer must parse");
+        assert_eq!(grant.user_code, "667094687");
+        assert_eq!(
+            grant.verification_uri,
+            "https://identity-dev.nurtur.tech/device"
+        );
+        assert_eq!(
+            grant.verification_uri_complete.as_deref(),
+            Some("https://identity-dev.nurtur.tech/device?userCode=667094687")
+        );
+        assert_eq!(grant.expires_in, 300);
+        assert_eq!(grant.interval, 5);
+        assert_eq!(grant.device_code.len(), 64);
+    }
+
     /// **A missing lifetime must not mean "already over".** A zero here made the poll give up
     /// before its first request, which reads as a sign-in that failed instantly for no reason.
     #[test]

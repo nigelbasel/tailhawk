@@ -299,14 +299,37 @@ fn fetch_token(source: &Source) -> Result<String, PullFault> {
 /// **The device endpoint is a third origin and gets §7's controls**, exactly as the token endpoint
 /// does: its whole URL is provider configuration, so it is parsed, refused `http`, and refused a
 /// literal address in the ranges §7 names.
+/// The client's own credential for a sign-in, when it has one.
+///
+/// **A device-flow client may be confidential, and this estate's is.** RFC 8628 is often read as
+/// implying a public client, but the grant says nothing of the sort: the *reader* authenticates in
+/// the browser, and the client authenticates however it already does. `tailhawk` is registered with
+/// `RequireClientSecret`, so its device-authorization and poll requests must carry the secret it has
+/// always carried — and that is the whole reason adding one grant type is the only change the server
+/// needs.
+///
+/// `None` when nothing is stored, which is a genuinely public client and equally valid.
+fn client_authentication(source: &Source) -> Option<String> {
+    crate::secrets::load(&source.name).filter(|secret| !secret.is_empty())
+}
+
+/// The borrow of [`client_authentication`]'s answer that `net::send` takes.
+fn as_auth(held: &Option<String>) -> Auth<'_> {
+    match held {
+        Some(secret) => Auth::ClientSecret(secret),
+        None => Auth::None,
+    }
+}
+
 pub fn begin_sign_in(source: &Source) -> Result<loki::DeviceGrant, PullFault> {
     let at =
         Origin::parse(&source.device_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
     refuse_insecure(&at)?;
     refuse_literal_address(&at).map_err(PullFault::Address)?;
     let request = loki::device_request(&at, &source.client_id, &source.scope);
-    let answer =
-        net::send(&request, Provenance::Imported, Auth::None).map_err(PullFault::TokenTransport)?;
+    let held = client_authentication(source);
+    let answer = net::send(&request, Provenance::Imported, as_auth(&held))
+        .map_err(PullFault::TokenTransport)?;
     if answer.status != 200 {
         return Err(PullFault::TokenRefused {
             status: answer.status,
@@ -333,6 +356,7 @@ pub fn poll_sign_in(
     refuse_insecure(&at)?;
     refuse_literal_address(&at).map_err(PullFault::Address)?;
     let request = loki::device_poll_request(&at, &source.client_id, &grant.device_code);
+    let held = client_authentication(source);
     let mut interval = grant.interval;
     // **Bounded by the grant's own lifetime, not by a count.** The server said how long the code is
     // good for; polling past that is asking about something that no longer exists.
@@ -352,7 +376,7 @@ pub fn poll_sign_in(
         if now_seconds() >= give_up_at {
             return Err(PullFault::NotSignedIn);
         }
-        let answer = match net::send(&request, Provenance::Imported, Auth::None) {
+        let answer = match net::send(&request, Provenance::Imported, as_auth(&held)) {
             Ok(answer) => answer,
             Err(why) => {
                 blips += 1;
@@ -431,10 +455,9 @@ fn signed_in_token(source: &Source, at: &Origin) -> Result<String, PullFault> {
     }
     let refresh = crate::secrets::load_refresh(&source.name).ok_or(PullFault::NotSignedIn)?;
     let request = loki::refresh_request(at, &source.client_id, &refresh);
-    // **No credential on the request itself.** A public client has none, and the refresh token is
-    // in the body where `LOKI.md` §7 wants a credential rather than in a URL a proxy would log.
-    let answer =
-        net::send(&request, Provenance::Imported, Auth::None).map_err(PullFault::TokenTransport)?;
+    let held = client_authentication(source);
+    let answer = net::send(&request, Provenance::Imported, as_auth(&held))
+        .map_err(PullFault::TokenTransport)?;
     if answer.status != 200 {
         // **Only `invalid_grant` ends a sign-in.** RFC 6749 §5.2 defines it as the spent, revoked or
         // expired refresh token; a 503 or a rate limit is a reason to try again later, and throwing
