@@ -197,7 +197,16 @@ jobs:
           # tests::a_local_file_session_never_loads_the_transport, which opens, indexes and reads a
           # local file and asserts winhttp.dll is still absent from the process module list.
           # That test is what replaces the proof this line gives up.
-          $allowed = @('winhttp.dll')
+          # ws2_32.dll was added on 2026-10-02, with the browser sign-in. SPEC.md 13.2 promises no
+          # OUTBOUND connection unless the user opens a remote source, and says nothing about a
+          # listening one - this blanket ban was a stricter proxy of our own making. The socket is
+          # bound to 127.0.0.1, accepts one redirect carrying an authorization code, answers with a
+          # fixed page and closes; it sends nothing anywhere, so the privacy claim is untouched, and
+          # RFC 8252 7.3 recommends exactly this for native applications.
+          # The behavioural half, as for winhttp, is
+          # loopback::tests::compiling_the_socket_in_does_not_open_one, which fails if anything
+          # links or resolves it without a sign-in.
+          $allowed = @('winhttp.dll', 'ws2_32.dll')
           $found = $dlls | Where-Object { $_ -match $transports } | Where-Object { $allowed -notcontains $_ }
           if ($found) { throw "SPEC.md 13.2: binary can open a network connection via $($found -join ', ')" }
           if ($allowed.Count -eq 0) { "zero network: no transport DLL is imported at all" }

@@ -69,6 +69,12 @@ pub enum PullFault {
     Label(tailhawk_core::loki::LabelFault),
     /// Loki answered the label call with something this could not read as a list of values.
     LabelAnswer,
+    /// The platform would not give unguessable bytes, so no sign-in can be started safely.
+    NoRandomness,
+    /// The loopback socket the browser redirects to could not be opened or did not answer.
+    Loopback(crate::loopback::LoopbackFault),
+    /// The browser came back, and not with a usable authorization code.
+    Callback(tailhawk_core::loki::CallbackFault),
     /// The source signs the reader in, and there is no sign-in to use — either none was ever made,
     /// or it expired and could not be renewed without asking again.
     ///
@@ -95,6 +101,21 @@ impl std::fmt::Display for PullFault {
                 "No secret is stored for this source — open Tools ▸ Remote sources and paste it.",
             ),
             PullFault::NotSignedIn => f.write_str("You are not signed in to this source."),
+            PullFault::NoRandomness => {
+                f.write_str("Windows would not provide the random bytes a sign-in needs.")
+            }
+            PullFault::Loopback(_) => f.write_str(
+                "The browser could not be given somewhere to send you back to — a port may be blocked.",
+            ),
+            PullFault::Callback(why) => match why {
+                tailhawk_core::loki::CallbackFault::Refused(said) => {
+                    write!(f, "The sign-in was refused: {said}.")
+                }
+                tailhawk_core::loki::CallbackFault::WrongState => {
+                    f.write_str("That sign-in answer was not for this request and was ignored.")
+                }
+                _ => f.write_str("The browser came back without a sign-in."),
+            },
             // The same reason the `Wire` arm below carries its cause: "could not reach it" names
             // the half that failed and nothing a person could act on. Whether this Windows has no
             // WinHTTP, the name resolved somewhere §7 refuses, or the server answered a redirect
@@ -294,21 +315,11 @@ fn fetch_token(source: &Source) -> Result<String, PullFault> {
         .ok_or(PullFault::TokenUnreadable)
 }
 
-/// Asks the identity server to start a sign-in, and returns what the reader has to approve.
-///
-/// **The device endpoint is a third origin and gets §7's controls**, exactly as the token endpoint
-/// does: its whole URL is provider configuration, so it is parsed, refused `http`, and refused a
-/// literal address in the ranges §7 names.
 /// The client's own credential for a sign-in, when it has one.
 ///
-/// **A device-flow client may be confidential, and this estate's is.** RFC 8628 is often read as
-/// implying a public client, but the grant says nothing of the sort: the *reader* authenticates in
-/// the browser, and the client authenticates however it already does. `tailhawk` is registered with
-/// `RequireClientSecret`, so its device-authorization and poll requests must carry the secret it has
-/// always carried — and that is the whole reason adding one grant type is the only change the server
-/// needs.
-///
-/// `None` when nothing is stored, which is a genuinely public client and equally valid.
+/// **An authorization-code client may be confidential, and this estate's was.** The reader
+/// authenticates in the browser; the client authenticates however it already does. `None` is a
+/// public client and equally valid — which is what `tailhawk` is now.
 fn client_authentication(source: &Source) -> Option<String> {
     crate::secrets::load(&source.name).filter(|secret| !secret.is_empty())
 }
@@ -321,12 +332,80 @@ fn as_auth(held: &Option<String>) -> Auth<'_> {
     }
 }
 
-pub fn begin_sign_in(source: &Source) -> Result<loki::DeviceGrant, PullFault> {
+/// A sign-in waiting for the reader to finish it in their browser.
+pub struct SignIn {
+    /// The socket the browser will redirect to. Closed when this is dropped.
+    redirect: crate::loopback::Redirect,
+    /// Where to send the browser.
+    pub url: String,
+    /// RFC 6749 §10.12's value, checked when the callback comes back.
+    state: String,
+    /// RFC 7636's pair. The verifier stays here until the exchange.
+    pkce: tailhawk_core::loki::Pkce,
+}
+
+impl SignIn {
+    /// A handle that closes the waiting socket, which is how a cancelled sign-in stops its worker.
+    pub fn redirect_closer(&self) -> crate::loopback::Closer {
+        self.redirect.closer()
+    }
+}
+
+/// Opens a loopback socket, mints the PKCE pair and the state, and returns the URL to open.
+///
+/// **Nothing has been sent anywhere when this returns.** It binds a socket and does arithmetic; the
+/// browser is the thing that makes the first request, which is why this can run without asking.
+pub fn begin_sign_in(source: &Source) -> Result<SignIn, PullFault> {
     let at =
-        Origin::parse(&source.device_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
+        Origin::parse(&source.auth_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
     refuse_insecure(&at)?;
     refuse_literal_address(&at).map_err(PullFault::Address)?;
-    let request = loki::device_request(&at, &source.client_id, &source.scope);
+
+    let verifier_bytes = crate::loopback::random_bytes().ok_or(PullFault::NoRandomness)?;
+    let state_bytes = crate::loopback::random_bytes().ok_or(PullFault::NoRandomness)?;
+    let pkce = tailhawk_core::loki::pkce_from(
+        &verifier_bytes,
+        &tailhawk_core::sha256::sha256(tailhawk_core::loki::base64url(&verifier_bytes).as_bytes()),
+    );
+    let state = tailhawk_core::loki::base64url(&state_bytes);
+
+    let redirect = crate::loopback::Redirect::open().map_err(PullFault::Loopback)?;
+    let url = tailhawk_core::loki::authorize_url(
+        &at,
+        &source.client_id,
+        &redirect.uri(),
+        &source.scope,
+        &state,
+        &pkce.challenge,
+    );
+    Ok(SignIn {
+        redirect,
+        url,
+        state,
+        pkce,
+    })
+}
+
+/// Waits for the browser's redirect, then exchanges the code for a token and keeps it.
+///
+/// **This blocks on `accept`, so it belongs on a worker** — it waits as long as somebody takes to
+/// sign in.
+pub fn finish_sign_in(source: &Source, signing_in: &SignIn) -> Result<(), PullFault> {
+    let target = signing_in.redirect.wait().map_err(PullFault::Loopback)?;
+    let code = tailhawk_core::loki::code_from_callback(&target, &signing_in.state)
+        .map_err(PullFault::Callback)?;
+
+    let at =
+        Origin::parse(&source.token_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
+    refuse_insecure(&at)?;
+    refuse_literal_address(&at).map_err(PullFault::Address)?;
+    let request = tailhawk_core::loki::code_exchange_request(
+        &at,
+        &source.client_id,
+        &code,
+        &signing_in.pkce.verifier,
+        &signing_in.redirect.uri(),
+    );
     let held = client_authentication(source);
     let answer = net::send(&request, Provenance::Imported, as_auth(&held))
         .map_err(PullFault::TokenTransport)?;
@@ -335,95 +414,13 @@ pub fn begin_sign_in(source: &Source) -> Result<loki::DeviceGrant, PullFault> {
             status: answer.status,
         });
     }
-    loki::device_grant_from_json(&answer.body).ok_or(PullFault::TokenUnreadable)
+    let issued =
+        tailhawk_core::loki::token_from_json(&answer.body).ok_or(PullFault::TokenUnreadable)?;
+    let mut cache = access_cache()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    remember(&mut cache, &source.name, issued)
 }
-
-/// Waits for the reader to approve `grant`, then keeps what the server issued.
-///
-/// **This blocks, and it must only ever be called on a worker.** It sleeps between polls for as
-/// long as the server asked, which is seconds at a time — on the message loop that would be a
-/// frozen window for the length of somebody typing their password.
-///
-/// **`slow_down` lengthens the wait rather than failing.** RFC 8628 defines it as an instruction,
-/// not an error, and a client that gave up on it would be one the server had asked to be patient.
-pub fn poll_sign_in(
-    source: &Source,
-    grant: &loki::DeviceGrant,
-    cancelled: &std::sync::mpsc::Receiver<()>,
-) -> Result<(), PullFault> {
-    let at =
-        Origin::parse(&source.token_url, Provenance::Imported).map_err(PullFault::TokenOrigin)?;
-    refuse_insecure(&at)?;
-    refuse_literal_address(&at).map_err(PullFault::Address)?;
-    let request = loki::device_poll_request(&at, &source.client_id, &grant.device_code);
-    let held = client_authentication(source);
-    let mut interval = grant.interval;
-    // **Bounded by the grant's own lifetime, not by a count.** The server said how long the code is
-    // good for; polling past that is asking about something that no longer exists.
-    let give_up_at = now_seconds().saturating_add(grant.expires_in.max(1));
-    // **A blip must not end a sign-in somebody is halfway through.** RFC 8628 §3.5 has the client
-    // keep polling and back off; a single dropped connection or a gateway's 502 would otherwise
-    // throw away a code the reader is at that moment typing into a browser.
-    let mut blips = 0u32;
-    loop {
-        // **The wait is also how the box closing is noticed.** A dropped sender disconnects, which
-        // ends this within one interval instead of leaving a thread polling — and storing a
-        // sign-in — for the rest of the grant's life.
-        match cancelled.recv_timeout(std::time::Duration::from_secs(interval)) {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            _ => return Err(PullFault::NotSignedIn),
-        }
-        if now_seconds() >= give_up_at {
-            return Err(PullFault::NotSignedIn);
-        }
-        let answer = match net::send(&request, Provenance::Imported, as_auth(&held)) {
-            Ok(answer) => answer,
-            Err(why) => {
-                blips += 1;
-                if blips > POLL_BLIPS_ALLOWED {
-                    return Err(PullFault::TokenTransport(why));
-                }
-                interval = loki::slowed(interval);
-                continue;
-            }
-        };
-        match loki::poll_outcome(&answer.body) {
-            loki::Poll::Granted(token) => {
-                let mut cache = access_cache()
-                    .lock()
-                    .unwrap_or_else(|held| held.into_inner());
-                remember(&mut cache, &source.name, token)?;
-                return Ok(());
-            }
-            loki::Poll::Pending => blips = 0,
-            loki::Poll::SlowDown => {
-                blips = 0;
-                interval = loki::slowed(interval);
-            }
-            loki::Poll::Expired | loki::Poll::Denied => return Err(PullFault::NotSignedIn),
-            // **A 5xx is the gateway, not the grant.** `poll_outcome` cannot tell an OAuth error
-            // document from a proxy's HTML, so the status is what separates "this sign-in is
-            // refused" from "this server is briefly unwell".
-            loki::Poll::Failed(_) if answer.status >= 500 => {
-                blips += 1;
-                if blips > POLL_BLIPS_ALLOWED {
-                    return Err(PullFault::TokenRefused {
-                        status: answer.status,
-                    });
-                }
-                interval = loki::slowed(interval);
-            }
-            loki::Poll::Failed(_) => {
-                return Err(PullFault::TokenRefused {
-                    status: answer.status,
-                })
-            }
-        }
-    }
-}
-
-/// How many consecutive unwell answers a sign-in tolerates before giving up on it.
-const POLL_BLIPS_ALLOWED: u32 = 3;
 
 /// Unix seconds now, or zero if the clock is before 1970 and the question is meaningless.
 pub fn now_seconds() -> u64 {
@@ -541,7 +538,7 @@ mod tests {
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
             query: "{environment=\"dev\"}".to_owned(),
-            device_url: String::new(),
+            auth_url: String::new(),
         }
     }
 

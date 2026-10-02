@@ -9333,7 +9333,7 @@ enum Fetched {
     SignInStarted {
         source: tailhawk_core::settings::Source,
         then: Resume,
-        grant: tailhawk_core::loki::DeviceGrant,
+        signing_in: pull::SignIn,
     },
 }
 
@@ -9356,10 +9356,10 @@ fn ask_for_apps(source: tailhawk_core::settings::Source) -> Receiver<Fetched> {
         // The label call is the first thing a remote open does, so it is where a reader who is not
         // signed in should be asked — not after a notice blaming Loki for refusing them.
         Err(pull::PullFault::NotSignedIn) => match pull::begin_sign_in(&source) {
-            Ok(grant) => Fetched::SignInStarted {
+            Ok(signing_in) => Fetched::SignInStarted {
                 source,
                 then: Resume::Pick,
-                grant,
+                signing_in,
             },
             Err(why) => {
                 let why = why.to_string();
@@ -9418,10 +9418,10 @@ fn ask_for_records(source: tailhawk_core::settings::Source, label: String) -> Re
             // starts the sign-in, because it is one more round trip to the same identity server and
             // hopping back to the UI thread in between would buy nothing.
             Err(pull::PullFault::NotSignedIn) => match pull::begin_sign_in(&source) {
-                Ok(grant) => Fetched::SignInStarted {
+                Ok(signing_in) => Fetched::SignInStarted {
                     source,
                     then: Resume::Records(label),
-                    grant,
+                    signing_in,
                 },
                 Err(why) => Fetched::Failed {
                     name: label,
@@ -10863,25 +10863,6 @@ unsafe extern "system" fn sign_in_callback(
     }
 }
 
-/// What the sign-in box says.
-///
-/// **Nothing about codes or addresses when the link carries the code.** The owner's words, 2026-10-02:
-/// the box "should just be asking if it can open a web page to login, no need for any of the other
-/// text" — and `verification_uri_complete` means the reader confirms rather than transcribes.
-///
-/// RFC 8628 §3.2 makes that URI optional, though, and a server that omits it leaves the code as the
-/// only way in. So the code appears exactly when it is the reader's only option, and never as
-/// decoration.
-fn sign_in_prompt(grant: &tailhawk_core::loki::DeviceGrant) -> String {
-    match &grant.verification_uri_complete {
-        Some(_) => "Tailhawk will open your browser so you can sign in.".to_owned(),
-        None => format!(
-            "Tailhawk will open your browser so you can sign in.\r\n\r\nEnter this code when asked: {}",
-            grant.user_code
-        ),
-    }
-}
-
 /// §12.4's sign-in: shows the code the identity server issued, waits for the reader to approve it,
 /// and opens the source when they have.
 ///
@@ -10894,26 +10875,17 @@ fn sign_in_dialog(
     hwnd: HWND,
     source: tailhawk_core::settings::Source,
     then: Resume,
-    grant: tailhawk_core::loki::DeviceGrant,
+    signing_in: pull::SignIn,
 ) {
     let (tx, rx) = std::sync::mpsc::channel();
-    // **The worker stops when this box does.** Without it, cancelling left a thread polling for up
-    // to the grant's lifetime — and if the reader then approved the code in the browser tab they
-    // had already opened, it would have signed them in after they had said no.
-    let (keep_going, cancelled) = std::sync::mpsc::channel::<()>();
-    let polling = source.clone();
-    let asked = grant.clone();
+    let where_to = signing_in.url.clone();
+    let closer = signing_in.redirect_closer();
+    let waiting_for = source.clone();
     std::thread::spawn(move || {
-        let _ = tx
-            .send(pull::poll_sign_in(&polling, &asked, &cancelled).map_err(|why| why.to_string()));
+        let _ =
+            tx.send(pull::finish_sign_in(&waiting_for, &signing_in).map_err(|why| why.to_string()));
     });
 
-    // The complete URI when the server offered one — it carries the code, so the reader only has to
-    // confirm rather than transcribe.
-    let where_to = grant
-        .verification_uri_complete
-        .clone()
-        .unwrap_or_else(|| grant.verification_uri.clone());
     let state = SigningIn {
         waiting: rx,
         answer: std::cell::Cell::new(None),
@@ -10922,7 +10894,7 @@ fn sign_in_dialog(
 
     let title = wide("Sign in");
     let instruction = wide(&format!("Sign in to {}", source.name));
-    let content = wide(&sign_in_prompt(&grant));
+    let content = wide("Tailhawk will open your browser so you can sign in.");
     let open_text = wide("Open the sign-in page");
     let buttons = [TASKDIALOG_BUTTON {
         nButtonID: ID_SIGN_IN_OPEN,
@@ -10944,8 +10916,8 @@ fn sign_in_dialog(
         ..Default::default()
     };
     let shown = unsafe { TaskDialogIndirect(&config, None, None, None) };
-    // Whatever happens next, the worker is told to stop.
-    drop(keep_going);
+    // Whatever happens next, the socket goes and the worker with it.
+    closer.close();
     if shown.is_err() {
         set_notice(
             hwnd,
@@ -11434,8 +11406,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     Fetched::SignInStarted {
                         source,
                         then,
-                        grant,
-                    } => sign_in_dialog(hwnd, source, then, grant),
+                        signing_in,
+                    } => sign_in_dialog(hwnd, source, then, signing_in),
                     Fetched::Failed { name, why } => set_notice(hwnd, format!("{name}: {why}")),
                 }
             }
@@ -13273,35 +13245,6 @@ mod tests {
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
 
-    /// **The box asks one thing and says nothing else.** The owner's words, 2026-10-02: it "should
-    /// just be asking if it can open a web page to login, no need for any of the other text". The
-    /// code and the address were noise, because the link already carries the code.
-    #[test]
-    fn the_sign_in_box_asks_to_open_a_browser_and_says_nothing_else() {
-        let grant = |complete: Option<&str>| tailhawk_core::loki::DeviceGrant {
-            device_code: "d".to_owned(),
-            user_code: "897659671".to_owned(),
-            verification_uri: "https://identity.example/device".to_owned(),
-            verification_uri_complete: complete.map(str::to_owned),
-            expires_in: 300,
-            interval: 5,
-        };
-
-        let said = sign_in_prompt(&grant(Some(
-            "https://identity.example/device?userCode=897659671",
-        )));
-        assert_eq!(said, "Tailhawk will open your browser so you can sign in.");
-        assert!(
-            !said.contains("897659671") && !said.contains("identity.example"),
-            "neither the code nor the address belongs here when the link carries the code: {said}"
-        );
-
-        // **Unless the server left the reader no other way in.** RFC 8628 §3.2 makes the complete
-        // URI optional, and then the code is the only thing that gets them signed in.
-        let bare = sign_in_prompt(&grant(None));
-        assert!(bare.contains("897659671"), "{bare}");
-    }
-
     /// **§13.2's claim about writing somebody's logs to their disk is said, not merely true.**
     /// `Document::describe` carried it into a field the bar reads only with no document open, so
     /// the one place the product admits to spilling a copy of a remote source reached nobody.
@@ -13415,7 +13358,7 @@ mod tests {
             client_id: String::new(),
             scope: String::new(),
             query: query.to_owned(),
-            device_url: String::new(),
+            auth_url: String::new(),
         }
     }
 

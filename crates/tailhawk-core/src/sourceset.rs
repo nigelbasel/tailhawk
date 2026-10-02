@@ -263,7 +263,7 @@ mod tests {
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
             query: format!("{{environment=\"{name}\"}}"),
-            device_url: String::new(),
+            auth_url: String::new(),
         }
     }
 
@@ -409,7 +409,7 @@ mod tests {
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
             query: query.to_owned(),
-            device_url: String::new(),
+            auth_url: String::new(),
         };
         let editor = Editor::new(
             vec![

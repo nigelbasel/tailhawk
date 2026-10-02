@@ -93,6 +93,19 @@ fn entry(
     unsafe { GetProcAddress(module, PCSTR(owned.as_ptr())) }.map(|f| f as *const core::ffi::c_void)
 }
 
+/// Whether `ws2_32.dll` is in this process yet.
+///
+/// **This is what makes §13.2's conditional checkable**, exactly as `net::transport_is_loaded` does
+/// for the outbound half: the claim is that nothing happens on the network unless the reader opens
+/// a remote source, and the only way to show it is that a run which never did leaves the library
+/// out of the module list altogether.
+pub fn sockets_are_loaded() -> bool {
+    let name: Vec<u16> = WS2_32_DLL.encode_utf16().collect();
+    unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR(name.as_ptr())) }
+        .map(|h: windows::Win32::Foundation::HMODULE| !h.is_invalid())
+        .unwrap_or(false)
+}
+
 fn winsock() -> Option<&'static Winsock> {
     WINSOCK
         .get_or_init(|| {
@@ -180,8 +193,36 @@ pub fn random_bytes() -> Option<[u8; 32]> {
 
 /// A socket bound to a free loopback port, waiting for one redirect.
 pub struct Redirect {
-    socket: SocketHandle,
+    /// **Shared, and emptied by whoever closes it first.** `accept` does not wake for a channel, so
+    /// cancelling a sign-in means closing the socket underneath it — which makes `accept` fail and
+    /// the worker return. Holding the handle behind a lock that is `take`n means the cancel and the
+    /// `Drop` cannot both close it, which on a handle the system may already have reused would be
+    /// closing somebody else's socket.
+    socket: std::sync::Arc<std::sync::Mutex<Option<SocketHandle>>>,
     port: u16,
+}
+
+/// Closes a [`Redirect`]'s socket from somewhere else, which is how a waiting `accept` is cancelled.
+#[derive(Clone)]
+pub struct Closer {
+    socket: std::sync::Arc<std::sync::Mutex<Option<SocketHandle>>>,
+}
+
+impl Closer {
+    /// Closes the socket if it is still open, and does nothing if it is not.
+    pub fn close(&self) {
+        close_once(&self.socket);
+    }
+}
+
+fn close_once(shared: &std::sync::Mutex<Option<SocketHandle>>) {
+    let taken = shared
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .take();
+    if let (Some(socket), Some(api)) = (taken, winsock()) {
+        unsafe { (api.close)(socket) };
+    }
 }
 
 /// Why a loopback redirect could not be set up or completed.
@@ -226,9 +267,16 @@ impl Redirect {
             return Err(LoopbackFault::Unavailable);
         }
         Ok(Redirect {
-            socket,
+            socket: std::sync::Arc::new(std::sync::Mutex::new(Some(socket))),
             port: u16::from_be(given.port),
         })
+    }
+
+    /// A handle that closes this socket from elsewhere, cancelling a waiting `accept`.
+    pub fn closer(&self) -> Closer {
+        Closer {
+            socket: self.socket.clone(),
+        }
     }
 
     /// The redirect URI to send the authorization server, naming the port it was given.
@@ -245,7 +293,9 @@ impl Redirect {
         let api = winsock().ok_or(LoopbackFault::NoSockets)?;
         let mut from = SockAddrIn::default();
         let mut from_size = std::mem::size_of::<SockAddrIn>() as i32;
-        let client = unsafe { (api.accept)(self.socket, &mut from, &mut from_size) };
+        let listening = *self.socket.lock().unwrap_or_else(|held| held.into_inner());
+        let listening = listening.ok_or(LoopbackFault::Nothing)?;
+        let client = unsafe { (api.accept)(listening, &mut from, &mut from_size) };
         if client == INVALID_SOCKET {
             return Err(LoopbackFault::Nothing);
         }
@@ -270,9 +320,7 @@ impl Drop for Redirect {
     /// the window in which a sign-in is in progress, and a leaked socket would widen it to the life
     /// of the process.
     fn drop(&mut self) {
-        if let Some(api) = winsock() {
-            unsafe { (api.close)(self.socket) };
-        }
+        close_once(&self.socket);
     }
 }
 
@@ -293,6 +341,21 @@ pub fn request_target(request: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Compiling the socket in does not open one**, which is the behavioural half of the CI
+    /// assertion that now admits `ws2_32.dll` to the allow-list. The static scan can only say the
+    /// name is in the binary; this says the library is not in a process that has not signed in —
+    /// and it would fail the moment anything resolved it eagerly or linked it statically.
+    ///
+    /// It is the same shape as `net::compiling_the_transport_in_does_not_load_it`, deliberately:
+    /// one assertion per library, each one naming the guarantee it protects.
+    #[test]
+    fn compiling_the_socket_in_does_not_open_one() {
+        assert!(
+            !sockets_are_loaded(),
+            "ws2_32.dll is in this process and nothing has signed in"
+        );
+    }
 
     /// **The request line, and nothing else.** A browser sends headers after it and this must not
     /// be confused by them, nor by a request that is not a redirect at all.
@@ -326,7 +389,7 @@ mod tests {
     #[test]
     fn the_redirect_uri_is_loopback_and_carries_its_port() {
         let pretend = Redirect {
-            socket: INVALID_SOCKET,
+            socket: std::sync::Arc::new(std::sync::Mutex::new(None)),
             port: 51789,
         };
         assert_eq!(pretend.uri(), "http://127.0.0.1:51789/callback");

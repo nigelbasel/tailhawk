@@ -96,13 +96,20 @@ pub struct Source {
     pub url: String,
     /// The OAuth2 token endpoint. Empty means the source needs no token.
     pub token_url: String,
-    /// RFC 8628's device-authorization endpoint. **Set, and the reader signs in as themselves;
-    /// empty, and the source uses the client secret in Credential Manager as it always has.**
+    /// The OAuth2 **authorization** endpoint. **Set, and the reader signs in as themselves in a
+    /// browser; empty, and the source uses the client secret in Credential Manager as it always
+    /// has.**
     ///
     /// This is the switch between the two, and it is a URL rather than a flag deliberately: the
-    /// endpoint has to be configured for the flow to work at all, so a separate `auth = "device"`
+    /// endpoint has to be configured for the flow to work at all, so a separate `auth = "browser"`
     /// would be a second thing to set that could disagree with the first.
-    pub device_url: String,
+    ///
+    /// **It named the device-authorization endpoint until 2026-10-02.** The device grant was built
+    /// and works against this estate's endpoints, but its *verification page* is not part of
+    /// Duende and this identity server does not have one — so the reader signed in and the code had
+    /// nowhere to be approved. The field was renamed rather than kept beside a second one, because
+    /// a configuration file carrying an endpoint nothing can use is a trap for whoever reads it next.
+    pub auth_url: String,
     /// The OAuth2 client id.
     pub client_id: String,
     /// The scope to request.
@@ -165,8 +172,8 @@ impl Source {
         // **Signing in needs all three, and saying so beats a poll that 404s.** The device
         // endpoint starts the sign-in and the token endpoint finishes it, so a source with one and
         // not the other is configured for neither flow.
-        if !self.device_url.trim().is_empty() {
-            if !is_https(&self.device_url) {
+        if !self.auth_url.trim().is_empty() {
+            if !is_https(&self.auth_url) {
                 return Some("The sign-in URL must begin with https://.");
             }
             if self.token_url.trim().is_empty() || self.client_id.trim().is_empty() {
@@ -182,7 +189,7 @@ impl Source {
     /// which request to build, whether to offer a Sign out — asks this rather than re-deriving it
     /// from an empty string, because two places deriving it is how they come to disagree.
     pub fn signs_in(&self) -> bool {
-        !self.device_url.trim().is_empty()
+        !self.auth_url.trim().is_empty()
     }
 }
 
@@ -465,8 +472,8 @@ impl Settings {
             if !s.token_url.is_empty() {
                 out.push_str(&format!("token_url = {}\n", quote(&s.token_url)));
             }
-            if !s.device_url.is_empty() {
-                out.push_str(&format!("device_url = {}\n", quote(&s.device_url)));
+            if !s.auth_url.is_empty() {
+                out.push_str(&format!("auth_url = {}\n", quote(&s.auth_url)));
             }
             if !s.client_id.is_empty() {
                 out.push_str(&format!("client_id = {}\n", quote(&s.client_id)));
@@ -628,7 +635,7 @@ impl Settings {
                             "name" => s.name = unquote(value),
                             "url" => s.url = unquote(value),
                             "token_url" => s.token_url = unquote(value),
-                            "device_url" => s.device_url = unquote(value),
+                            "auth_url" => s.auth_url = unquote(value),
                             "client_id" => s.client_id = unquote(value),
                             "scope" => s.scope = unquote(value),
                             "query" => s.query = unquote(value),
@@ -1019,7 +1026,7 @@ mod tests {
                 client_id: "tailhawk".to_owned(),
                 scope: "telemetry:read".to_owned(),
                 query: "{environment=\"dev\"}".to_owned(),
-                device_url: String::new(),
+                auth_url: String::new(),
             }],
             theme: Some("light".to_owned()),
             font: Some("Cascadia Mono".to_owned()),
@@ -1172,7 +1179,7 @@ mod tests {
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
             query: "{environment=~\"live|production\"}".to_owned(),
-            device_url: "https://identity-dev.example/connect/deviceauthorization".to_owned(),
+            auth_url: "https://identity-dev.example/connect/authorize".to_owned(),
         });
         s.sources.push(Source {
             name: "open".to_owned(),
@@ -1254,7 +1261,7 @@ mod tests {
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
             query: String::new(),
-            device_url: String::new(),
+            auth_url: String::new(),
         };
         assert_eq!(good.fault(), None, "a complete source is usable");
         assert!(
@@ -1266,7 +1273,7 @@ mod tests {
         // token endpoint finishes it, so one without the other is configured for neither flow —
         // and the poll would 404 at the point a person had already typed their password.
         let signs_in = Source {
-            device_url: "https://identity-dev.example/connect/deviceauthorization".to_owned(),
+            auth_url: "https://identity-dev.example/connect/authorize".to_owned(),
             ..good.clone()
         };
         assert_eq!(signs_in.fault(), None);
@@ -1274,7 +1281,7 @@ mod tests {
 
         assert!(
             Source {
-                device_url: "http://identity-dev.example/connect/deviceauthorization".to_owned(),
+                auth_url: "http://identity-dev.example/connect/authorize".to_owned(),
                 ..good.clone()
             }
             .fault()
