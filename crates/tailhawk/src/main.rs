@@ -9324,10 +9324,10 @@ enum Fetched {
     /// A fetch that failed, in the words the fault chose.
     Failed { name: String, why: String },
     /// The source signs the reader in and there was no sign-in to use, so one has been started.
-    /// Carries what the reader has to approve.
+    /// Carries what the reader has to approve, and what to go back to once they have.
     SignInStarted {
         source: tailhawk_core::settings::Source,
-        label: String,
+        then: Resume,
         grant: tailhawk_core::loki::DeviceGrant,
     },
 }
@@ -9348,6 +9348,19 @@ fn spawn_fetch(work: impl FnOnce() -> Fetched + Send + 'static) -> Receiver<Fetc
 fn ask_for_apps(source: tailhawk_core::settings::Source) -> Receiver<Fetched> {
     spawn_fetch(move || match pull::label_values(&source, APP_LABEL) {
         Ok(values) if !values.is_empty() => Fetched::Apps { source, values },
+        // The label call is the first thing a remote open does, so it is where a reader who is not
+        // signed in should be asked — not after a notice blaming Loki for refusing them.
+        Err(pull::PullFault::NotSignedIn) => match pull::begin_sign_in(&source) {
+            Ok(grant) => Fetched::SignInStarted {
+                source,
+                then: Resume::Pick,
+                grant,
+            },
+            Err(why) => {
+                let why = why.to_string();
+                Fetched::NoApps { source, why }
+            }
+        },
         Ok(_) => {
             let why = "Loki lists no applications for this source".to_owned();
             Fetched::NoApps { source, why }
@@ -9357,6 +9370,18 @@ fn ask_for_apps(source: tailhawk_core::settings::Source) -> Receiver<Fetched> {
             Fetched::NoApps { source, why }
         }
     })
+}
+
+/// What the reader was doing when the sign-in interrupted them.
+///
+/// **Signing in is the toll, not the task.** Whichever of the two things they asked for, they get
+/// it once they are signed in rather than being returned to the start.
+enum Resume {
+    /// They chose a source outright, so open it with this label.
+    Records(String),
+    /// They chose a source expecting to pick applications from it, so ask Loki again and show the
+    /// picker — which is what the label call was for when it found nobody signed in.
+    Pick,
 }
 
 /// Fetch the opening window of records for `source` — **on a worker**.
@@ -9390,7 +9415,7 @@ fn ask_for_records(source: tailhawk_core::settings::Source, label: String) -> Re
             Err(pull::PullFault::NotSignedIn) => match pull::begin_sign_in(&source) {
                 Ok(grant) => Fetched::SignInStarted {
                     source,
-                    label,
+                    then: Resume::Records(label),
                     grant,
                 },
                 Err(why) => Fetched::Failed {
@@ -10790,8 +10815,8 @@ const ID_SIGN_IN_OPEN: i32 = 1001;
 unsafe extern "system" fn sign_in_callback(
     hwnd: HWND,
     msg: TASKDIALOG_NOTIFICATIONS,
-    _wparam: WPARAM,
-    lparam: LPARAM,
+    wparam: WPARAM,
+    _lparam: LPARAM,
     data: isize,
 ) -> windows::core::HRESULT {
     let state = data as *mut SigningIn;
@@ -10816,7 +10841,7 @@ unsafe extern "system" fn sign_in_callback(
         }
         // **Opening the page must not close the box.** The reader needs the code while they are
         // signing in, and `S_FALSE` is what tells the dialog to stay.
-        TDN_BUTTON_CLICKED if lparam.0 as i32 == ID_SIGN_IN_OPEN => {
+        TDN_BUTTON_CLICKED if wparam.0 as i32 == ID_SIGN_IN_OPEN => {
             unsafe {
                 ShellExecuteW(
                     hwnd,
@@ -10833,6 +10858,25 @@ unsafe extern "system" fn sign_in_callback(
     }
 }
 
+/// What the sign-in box says.
+///
+/// **Nothing about codes or addresses when the link carries the code.** The owner's words, 2026-10-02:
+/// the box "should just be asking if it can open a web page to login, no need for any of the other
+/// text" — and `verification_uri_complete` means the reader confirms rather than transcribes.
+///
+/// RFC 8628 §3.2 makes that URI optional, though, and a server that omits it leaves the code as the
+/// only way in. So the code appears exactly when it is the reader's only option, and never as
+/// decoration.
+fn sign_in_prompt(grant: &tailhawk_core::loki::DeviceGrant) -> String {
+    match &grant.verification_uri_complete {
+        Some(_) => "Tailhawk will open your browser so you can sign in.".to_owned(),
+        None => format!(
+            "Tailhawk will open your browser so you can sign in.\r\n\r\nEnter this code when asked: {}",
+            grant.user_code
+        ),
+    }
+}
+
 /// §12.4's sign-in: shows the code the identity server issued, waits for the reader to approve it,
 /// and opens the source when they have.
 ///
@@ -10844,7 +10888,7 @@ unsafe extern "system" fn sign_in_callback(
 fn sign_in_dialog(
     hwnd: HWND,
     source: tailhawk_core::settings::Source,
-    label: String,
+    then: Resume,
     grant: tailhawk_core::loki::DeviceGrant,
 ) {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -10873,10 +10917,7 @@ fn sign_in_dialog(
 
     let title = wide("Sign in");
     let instruction = wide(&format!("Sign in to {}", source.name));
-    let content = wide(&format!(
-        "Go to {}\r\n\r\nand enter the code\r\n\r\n{}\r\n\r\nThis window closes itself once you have.",
-        grant.verification_uri, grant.user_code
-    ));
+    let content = wide(&sign_in_prompt(&grant));
     let open_text = wide("Open the sign-in page");
     let buttons = [TASKDIALOG_BUTTON {
         nButtonID: ID_SIGN_IN_OPEN,
@@ -10892,6 +10933,7 @@ fn sign_in_dialog(
         pszContent: PCWSTR(content.as_ptr()),
         cButtons: buttons.len() as u32,
         pButtons: buttons.as_ptr(),
+        nDefaultButton: ID_SIGN_IN_OPEN,
         pfCallback: Some(sign_in_callback),
         lpCallbackData: &state as *const SigningIn as isize,
         ..Default::default()
@@ -10902,7 +10944,7 @@ fn sign_in_dialog(
     if shown.is_err() {
         set_notice(
             hwnd,
-            format!("{label}: the sign-in window could not be opened."),
+            format!("{}: the sign-in window could not be opened.", source.name),
         );
         return;
     }
@@ -10917,11 +10959,14 @@ fn sign_in_dialog(
         // **Straight back to the open the reader asked for.** Signing in is not the thing they
         // wanted; it is the toll on the way to it, and stopping here to make them click again
         // would make the sign-in feel like the task.
-        Some(Ok(())) => open_remote(hwnd, source, label),
-        Some(Err(why)) => set_notice(hwnd, format!("{label}: {why}")),
+        Some(Ok(())) => match then {
+            Resume::Records(label) => open_remote(hwnd, source, label),
+            Resume::Pick => open_picked(hwnd, source),
+        },
+        Some(Err(why)) => set_notice(hwnd, format!("{}: {why}", source.name)),
         // Cancelled. Said, because a window that closes with nothing on the bar is the "command
         // that appears to do nothing" §10 asks this codebase to avoid.
-        None => set_notice(hwnd, format!("{label}: signing in was cancelled.")),
+        None => set_notice(hwnd, format!("{}: signing in was cancelled.", source.name)),
     }
 }
 
@@ -11383,9 +11428,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     // pumps a modal loop of its own.
                     Fetched::SignInStarted {
                         source,
-                        label,
+                        then,
                         grant,
-                    } => sign_in_dialog(hwnd, source, label, grant),
+                    } => sign_in_dialog(hwnd, source, then, grant),
                     Fetched::Failed { name, why } => set_notice(hwnd, format!("{name}: {why}")),
                 }
             }
@@ -13222,6 +13267,35 @@ mod tests {
     use super::*;
     use tailhawk_core::columns::GAP;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_OVERLAPPED};
+
+    /// **The box asks one thing and says nothing else.** The owner's words, 2026-10-02: it "should
+    /// just be asking if it can open a web page to login, no need for any of the other text". The
+    /// code and the address were noise, because the link already carries the code.
+    #[test]
+    fn the_sign_in_box_asks_to_open_a_browser_and_says_nothing_else() {
+        let grant = |complete: Option<&str>| tailhawk_core::loki::DeviceGrant {
+            device_code: "d".to_owned(),
+            user_code: "897659671".to_owned(),
+            verification_uri: "https://identity.example/device".to_owned(),
+            verification_uri_complete: complete.map(str::to_owned),
+            expires_in: 300,
+            interval: 5,
+        };
+
+        let said = sign_in_prompt(&grant(Some(
+            "https://identity.example/device?userCode=897659671",
+        )));
+        assert_eq!(said, "Tailhawk will open your browser so you can sign in.");
+        assert!(
+            !said.contains("897659671") && !said.contains("identity.example"),
+            "neither the code nor the address belongs here when the link carries the code: {said}"
+        );
+
+        // **Unless the server left the reader no other way in.** RFC 8628 §3.2 makes the complete
+        // URI optional, and then the code is the only thing that gets them signed in.
+        let bare = sign_in_prompt(&grant(None));
+        assert!(bare.contains("897659671"), "{bare}");
+    }
 
     /// **§13.2's claim about writing somebody's logs to their disk is said, not merely true.**
     /// `Document::describe` carried it into a field the bar reads only with no document open, so
