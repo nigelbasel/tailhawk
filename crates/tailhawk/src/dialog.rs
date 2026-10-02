@@ -1627,7 +1627,8 @@ fn rules_dialog_items() -> Vec<Item> {
             (R_LEFT, 147, 50, 14),
             WS_TABSTOP,
         ),
-        field(ID_R_FG, 149, 60, 55),
+        // A bordered box the colour is painted into, not a field spelling it out.
+        Item::new(Class::Static, "", ID_R_FG, (60, 147, 55, 14), WS_BORDER),
         Item::new(
             Class::Button,
             "Bac&kground…",
@@ -1635,7 +1636,7 @@ fn rules_dialog_items() -> Vec<Item> {
             (125, 147, 70, 14),
             WS_TABSTOP,
         ),
-        field(ID_R_BG, 149, 200, 55),
+        Item::new(Class::Static, "", ID_R_BG, (200, 147, 55, 14), WS_BORDER),
         check("&Enabled", ID_R_ENABLED, R_LEFT, 60),
         check("&Whole line", ID_R_WHOLE, 75, 70),
         check("&Ignore case", ID_R_CASE, 150, 75),
@@ -1643,7 +1644,7 @@ fn rules_dialog_items() -> Vec<Item> {
         Item::new(Class::Static, "", ID_R_ERROR, (R_LEFT, 186, 400, 16), 0),
         Item::new(
             Class::Button,
-            "&Save",
+            "OK",
             ID_R_SAVE,
             (303, 211, 50, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
@@ -1663,6 +1664,16 @@ fn rules_dialog_items() -> Vec<Item> {
 struct RulesState {
     owner: HWND,
     custom: [COLORREF; 16],
+    /// The two swatches' brushes, so the colour a rule uses is **shown** rather than spelled.
+    ///
+    /// **The owner's report of 2026-10-02**: *"after selecting a colur, that colour should be
+    /// showing, not its rgb value"*. The fields beside the pick buttons held `#ff0000`, which is
+    /// the one thing a reader choosing a colour does not need to read — and the list column beside
+    /// them had been showing a sample since `UX-REVIEW` 14, so the dialog disagreed with itself.
+    ///
+    /// Held here and freed on destroy, because a brush handed to `WM_CTLCOLORSTATIC` has to outlive
+    /// the message.
+    swatch: [Option<windows::Win32::Graphics::Gdi::HBRUSH>; 2],
 }
 
 thread_local! {
@@ -1716,6 +1727,7 @@ pub fn show_rules_dialog(owner: HWND) {
     let state = Box::into_raw(Box::new(RulesState {
         owner,
         custom: [COLORREF(0x00FF_FFFF); 16],
+        swatch: [None, None],
     }));
     unsafe {
         DialogBoxIndirectParamW(
@@ -1994,12 +2006,8 @@ fn rules_show_selected(hdlg: HWND) {
 
     let (name, pattern, fg, bg, enabled, whole, case, literal, error) = shown.unwrap_or_default();
     rules_quietly(|| unsafe {
-        for (id, text) in [
-            (ID_R_NAME, name.as_str()),
-            (ID_R_PATTERN, pattern.as_str()),
-            (ID_R_FG, fg.as_str()),
-            (ID_R_BG, bg.as_str()),
-        ] {
+        rules_set_swatches(hdlg, &fg, &bg);
+        for (id, text) in [(ID_R_NAME, name.as_str()), (ID_R_PATTERN, pattern.as_str())] {
             let w = wsz(text);
             let _ = SetDlgItemTextW(hdlg, i32::from(id), PCWSTR(w.as_ptr()));
         }
@@ -2111,6 +2119,61 @@ struct DialogPaint {
 ///
 /// Returns `0` in the light theme, which is a dialog procedure's way of saying *not handled* — so
 /// the system paints it, and the light look is the system's own rather than a reproduction of it.
+/// The colour a swatch should be painted, or `None` when the rule sets none.
+///
+/// **An unset colour shows nothing rather than guessing.** A rule may set only a background, and a
+/// swatch filled with the window's own colour would claim a choice nobody made.
+fn swatch_colour(text: &str) -> Option<u32> {
+    tailhawk_core::rules::colour(text).map(colourref)
+}
+
+/// Paints the two swatches to the colours the selected rule uses.
+///
+/// **An unset colour shows nothing rather than guessing.** A rule may set only a background, and a
+/// swatch filled with the window's own colour would claim a choice nobody made — so an empty value
+/// leaves the box unpainted and the theme draws it like any other static.
+///
+/// The old brush is freed only after the new one is in place, so nothing is ever handed a deleted
+/// handle.
+fn rules_set_swatches(hdlg: HWND, fg: &str, bg: &str) {
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject};
+    let Some(state) = rules_state(hdlg) else {
+        return;
+    };
+    for (slot, (id, text)) in [(ID_R_FG, fg), (ID_R_BG, bg)].into_iter().enumerate() {
+        let wanted = swatch_colour(text);
+        let previous = state.swatch[slot];
+        state.swatch[slot] = wanted
+            .map(|rgb| unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(rgb)) });
+        if let Some(old) = previous {
+            unsafe {
+                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(old.0));
+            }
+        }
+        if let Ok(control) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(control, None, true);
+            }
+        }
+    }
+}
+
+/// The brush for a swatch, when the control being drawn is one.
+///
+/// **Asked before [`dialog_colours`], and that matters**: that function returns early in light mode,
+/// so a swatch handled after it would be painted in dark mode only.
+fn rules_swatch_brush(hdlg: HWND, lparam: LPARAM) -> Option<isize> {
+    let control = HWND(lparam.0 as *mut core::ffi::c_void);
+    let id = unsafe { windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(control) } as u16;
+    let slot = match id {
+        ID_R_FG => 0,
+        ID_R_BG => 1,
+        _ => return None,
+    };
+    let state = rules_state(hdlg)?;
+    state.swatch[slot].map(|brush| brush.0 as isize)
+}
+
 fn dialog_colours(hdlg: HWND, msg: u32, wparam: WPARAM) -> isize {
     use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HDC};
     use windows::Win32::UI::WindowsAndMessaging::{WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX};
@@ -2204,6 +2267,9 @@ unsafe extern "system" fn rules_proc(
         | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
         | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
         | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            if let Some(brush) = rules_swatch_brush(hdlg, lparam) {
+                return brush;
+            }
             dialog_colours(hdlg, msg, wparam)
         }
         WM_INITDIALOG => {
@@ -2272,12 +2338,11 @@ unsafe extern "system" fn rules_proc(
             let selected = crate::rules_read(|editor| editor.selected());
 
             match (id, u32::from(code)) {
-                (ID_R_NAME | ID_R_PATTERN | ID_R_FG | ID_R_BG, EN_CHANGE) => {
-                    let cell = match id {
-                        ID_R_NAME => Cell::Name,
-                        ID_R_PATTERN => Cell::Pattern,
-                        ID_R_FG => Cell::Fg,
-                        _ => Cell::Bg,
+                (ID_R_NAME | ID_R_PATTERN, EN_CHANGE) => {
+                    let cell = if id == ID_R_NAME {
+                        Cell::Name
+                    } else {
+                        Cell::Pattern
                     };
                     let text = read_dlg_text(hdlg, id);
                     crate::rules_apply(owner, |editor| editor.set_cell(cell, &text));
@@ -2332,7 +2397,9 @@ unsafe extern "system" fn rules_proc(
                 }
                 (ID_R_SAVE, _) => {
                     crate::rules_save(owner);
-                    rules_refresh(hdlg, selected);
+                    unsafe {
+                        let _ = EndDialog(hdlg, 1);
+                    }
                     1
                 }
                 (IDCANCEL, _) => {
@@ -2357,6 +2424,14 @@ unsafe extern "system" fn rules_proc(
         WM_NCDESTROY => {
             if let Some(state) = rules_state(hdlg) {
                 let owner = state.owner;
+                // The swatch brushes are ours and go with the window that showed them.
+                for brush in state.swatch.iter_mut().filter_map(Option::take) {
+                    unsafe {
+                        let _ = windows::Win32::Graphics::Gdi::DeleteObject(
+                            windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0),
+                        );
+                    }
+                }
                 crate::rules_dialog_closed(hdlg, owner);
                 let raw = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) };
                 unsafe {
@@ -5347,6 +5422,35 @@ mod tests {
 
     const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
     const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+    /// **The swatch beside the pick button is painted, or it is left alone.**
+    ///
+    /// The owner's objection, 2026-10-02: *"after selecting a colur, that colour should be showing,
+    /// not its rgb value"* — the fields held `#d75f5f` while the list column beside them had been
+    /// showing a sample since 2026-08-27, so the dialog disagreed with itself about its own point.
+    ///
+    /// **An unset colour must show nothing.** A rule may set only a background, and a swatch filled
+    /// with some default would claim a choice nobody made.
+    #[test]
+    fn a_swatch_is_painted_only_when_the_rule_names_a_colour() {
+        // Byte order is `0x00BBGGRR` for a `COLORREF`, which is the reverse of how it is written.
+        assert_eq!(swatch_colour("#d75f5f"), Some(0x005F_5FD7));
+        assert_eq!(swatch_colour("#000000"), Some(0x0000_0000));
+        assert_eq!(swatch_colour("#ffffff"), Some(0x00FF_FFFF));
+
+        // `rules::colour` accepts the `#rgb` shorthand as well, which this assumed it did not —
+        // the test caught that, and the shorthand is what a hand-written rules file may hold.
+        assert_eq!(swatch_colour("#fff"), Some(0x00FF_FFFF));
+        assert_eq!(swatch_colour("#f00"), Some(0x0000_00FF), "red, in BGR");
+
+        for nothing in ["", "   ", "not a colour", "d75f5f", "#gggggg", "#ffff"] {
+            assert_eq!(
+                swatch_colour(nothing),
+                None,
+                "{nothing:?} is not a colour and must leave the box unpainted"
+            );
+        }
+    }
 
     /// **The Colour column shows a colour, not a description of one.**
     ///
