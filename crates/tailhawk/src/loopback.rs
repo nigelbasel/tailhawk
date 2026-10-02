@@ -84,6 +84,14 @@ unsafe impl Sync for Winsock {}
 static WINSOCK: OnceLock<Option<Winsock>> = OnceLock::new();
 static RANDOM: OnceLock<Option<RtlGenRandomFn>> = OnceLock::new();
 
+/// Resolves a symbol whose name already carries its terminator.
+fn entry_raw(
+    module: windows::Win32::Foundation::HMODULE,
+    symbol: &str,
+) -> Option<*const core::ffi::c_void> {
+    unsafe { GetProcAddress(module, PCSTR(symbol.as_ptr())) }.map(|f| f as *const core::ffi::c_void)
+}
+
 fn entry(
     module: windows::Win32::Foundation::HMODULE,
     symbol: &str,

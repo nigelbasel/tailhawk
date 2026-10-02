@@ -207,7 +207,16 @@ jobs:
           # loopback::tests::compiling_the_socket_in_does_not_open_one, which fails if anything
           # links or resolves it without a sign-in.
           $allowed = @('winhttp.dll', 'ws2_32.dll')
-          $found = $dlls | Where-Object { $_ -match $transports } | Where-Object { $allowed -notcontains $_ }
+          # **Matched by suffix, not by equality, and that is not a loosening.** The scan greps ASCII
+          # for anything ending `.dll`, and adjacent string literals in the binary have no separator
+          # between them - so `SystemFunction036` sitting immediately before `ws2_32.dll` was read as
+          # one token, `systemfunction036ws2_32.dll`, and failed the build for a library this list
+          # allows. Literal layout is the linker's business and not something the source can pin, so
+          # the check tolerates a prefix. The forbidden test above is unchanged and still matches on
+          # a substring, so a genuinely new transport cannot hide behind one.
+          $found = $dlls |
+            Where-Object { $_ -match $transports } |
+            Where-Object { $name = $_; -not ($allowed | Where-Object { $name.EndsWith($_) }) }
           if ($found) { throw "SPEC.md 13.2: binary can open a network connection via $($found -join ', ')" }
           if ($allowed.Count -eq 0) { "zero network: no transport DLL is imported at all" }
           else { "network capability limited to the reviewed allow-list: $($allowed -join ', ')" }
