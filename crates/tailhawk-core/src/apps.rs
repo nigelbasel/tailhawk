@@ -536,6 +536,72 @@ pub const NAMED_APPS: usize = 3;
 ///
 /// **The count is always plural**, and that is not an oversight: the naming branch covers every
 /// selection up to [`NAMED_APPS`], so the counted branch cannot be reached with one.
+/// The longest a saved entry's name may be.
+///
+/// **This is `secrets::NAME_MAX`, and the duplication is deliberate**: a source's name is also the
+/// key its credential is filed under, so a generated name that the store would refuse is a source
+/// that cannot hold a secret. Core cannot see the shell's constant, so the number is repeated here
+/// and the test below is what keeps them honest about it.
+pub const ENTRY_NAME_MAX: usize = 64;
+
+/// A name for a new entry saved from a chosen set of applications.
+///
+/// **Generated rather than asked for.** The entry appears in the cloud menu immediately, and
+/// renaming it is already a thing the sources dialog does — so a prompt would be a dialog in the
+/// way of the one gesture the owner asked for: *"a button in the picker"*.
+///
+/// **Only characters a source name may hold.** The name is also the credential key, so anything
+/// outside letters, digits, space and `- _ .` is dropped rather than carried into a store that
+/// would refuse it. That is why this cannot simply reuse [`source_label`], whose `·` is for reading.
+///
+/// A collision takes a numeric suffix, because two sources sharing a name share a credential
+/// silently — the fault `sourceset` already refuses, and one this must not create.
+pub fn saved_entry_name(base: &str, apps: &[&str], taken: &[String]) -> String {
+    let keep = |text: &str| -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ') {
+                    c
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let base = keep(base);
+    let listed = keep(&apps.join(" "));
+    let mut candidate = if apps.is_empty() {
+        base.clone()
+    } else if apps.len() <= NAMED_APPS && base.len() + listed.len() < ENTRY_NAME_MAX {
+        format!("{base} {listed}")
+    } else {
+        format!("{base} {} apps", apps.len())
+    };
+    if candidate.len() > ENTRY_NAME_MAX {
+        candidate.truncate(ENTRY_NAME_MAX);
+    }
+    let candidate = candidate.trim().to_owned();
+    if !taken.iter().any(|t| t == &candidate) {
+        return candidate;
+    }
+    for n in 2..1000 {
+        let suffix = format!(" {n}");
+        let room = ENTRY_NAME_MAX.saturating_sub(suffix.len());
+        let mut stem = candidate.clone();
+        if stem.len() > room {
+            stem.truncate(room);
+        }
+        let next = format!("{}{suffix}", stem.trim_end());
+        if !taken.iter().any(|t| t == &next) {
+            return next;
+        }
+    }
+    candidate
+}
+
 pub fn source_label(source: &str, chosen: &[&str]) -> String {
     match chosen.len() {
         0 => source.to_owned(),
@@ -553,6 +619,64 @@ mod tests {
     /// window to every environment at once, which is the failure this project keeps calling the
     /// worst kind — more data than asked for, with nothing to say so.
     #[test]
+    /// **A generated name has to be one a source may actually hold**, because it is also the key
+    /// the credential is filed under — so anything outside letters, digits, space and `- _ .` would
+    /// produce an entry the store refuses, and a secret that cannot be saved.
+    #[test]
+    fn a_saved_entry_is_named_something_a_source_can_be_called() {
+        let legal = |name: &str| {
+            !name.is_empty()
+                && name.len() <= ENTRY_NAME_MAX
+                && name.trim() == name
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+        };
+
+        let plain = saved_entry_name("live", &["Worker", "Api"], &[]);
+        assert_eq!(plain, "live Worker Api");
+        assert!(legal(&plain));
+
+        // **`source_label`'s `·` is for reading and would be refused here**, which is why this is a
+        // separate function rather than a reuse of it.
+        let awkward = saved_entry_name("live · prod", &["nurtur/gateway"], &[]);
+        assert!(legal(&awkward), "{awkward}");
+        assert!(
+            !awkward.contains('·') && !awkward.contains('/'),
+            "{awkward}"
+        );
+
+        // Named while they fit, counted once they do not — `source_label`'s own rule.
+        let many = saved_entry_name("live", &["a", "b", "c", "d"], &[]);
+        assert_eq!(many, "live 4 apps");
+
+        // A long base plus long applications still fits, because the store has a limit.
+        let long = saved_entry_name(&"b".repeat(60), &["application-with-a-long-name"], &[]);
+        assert!(legal(&long), "{} chars: {long}", long.len());
+    }
+
+    /// **A collision takes a suffix, because two sources sharing a name share a credential**
+    /// silently — a fault `sourceset` refuses, and one this must not create.
+    #[test]
+    fn a_saved_entry_never_takes_a_name_already_in_use() {
+        let taken = vec!["live Worker".to_owned(), "live Worker 2".to_owned()];
+        assert_eq!(
+            saved_entry_name("live", &["Worker"], &taken),
+            "live Worker 3"
+        );
+        assert_eq!(
+            saved_entry_name("live", &["Worker"], &[]),
+            "live Worker",
+            "nothing in the way, no suffix"
+        );
+
+        // Suffixing must not push it past the limit, so the stem gives way to the number.
+        let full = "x".repeat(ENTRY_NAME_MAX);
+        let next = saved_entry_name(&full, &[], &[full.clone()]);
+        assert!(next.len() <= ENTRY_NAME_MAX, "{} chars", next.len());
+        assert_ne!(next, full);
+    }
+
     fn every_other_matcher_survives_the_rewrite() {
         let out =
             with_apps(r#"{environment="live", cluster="ukwest"}"#, &["identity"]).expect("ok");

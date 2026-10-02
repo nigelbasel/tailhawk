@@ -9459,6 +9459,60 @@ fn ask_for_records(source: tailhawk_core::settings::Source, label: String) -> Re
 /// and an HTTP round trip; run here it froze the window, and the picker appeared out of a window
 /// that had stopped answering. [`Shell::poll_fetch`] is what opens the dialog when the answer
 /// arrives.
+/// Keeps the chosen applications as a cloud entry of their own, then opens it.
+///
+/// **The entry the reader started from is left alone.** They asked to save *a new* entry, so
+/// changing what the original remembers as well would be two edits for one gesture — which is why
+/// this does not go through [`remember_apps`].
+///
+/// **The name is generated and the credential is shared.** A new entry over the same Loki is the
+/// same server and the same sign-in, so it keeps the source's `url`, `auth_url`, `token_url`,
+/// `client_id` and `scope` — but not its *name*, which is the credential key. Renaming afterwards
+/// is what `Tools ▸ Remote sources` is for.
+fn save_as_entry(hwnd: HWND, source: &tailhawk_core::settings::Source, chosen: &[String]) {
+    let names: Vec<&str> = chosen.iter().map(String::as_str).collect();
+    let saved = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let shell = state.as_mut()?;
+        if shell.settings.sources.len() >= tailhawk_core::sourceset::MAX_SOURCES {
+            return None;
+        }
+        let taken: Vec<String> = shell
+            .settings
+            .sources
+            .iter()
+            .map(|existing| existing.name.clone())
+            .collect();
+        let entry = tailhawk_core::settings::Source {
+            name: tailhawk_core::apps::saved_entry_name(&source.name, &names, &taken),
+            apps: chosen.to_vec(),
+            ..source.clone()
+        };
+        shell.settings.sources.push(entry.clone());
+        Some(entry)
+    });
+    let Some(entry) = saved else {
+        set_notice(
+            hwnd,
+            format!(
+                "There is no room for another entry — {} is the limit.",
+                tailhawk_core::sourceset::MAX_SOURCES
+            ),
+        );
+        return;
+    };
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            shell.save_settings(hwnd);
+        }
+    });
+    set_notice(
+        hwnd,
+        format!("Saved as \"{}\" — it is in Open remote now.", entry.name),
+    );
+    open_remembered_or_pick(hwnd, entry);
+}
+
 /// Keeps the applications just chosen against the source they were chosen for, so the next open
 /// goes straight into them.
 ///
@@ -9573,7 +9627,9 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    remember_apps(hwnd, &source.name, &chosen);
+    if pick.choice != Some(dialog::Pick::SaveAs) {
+        remember_apps(hwnd, &source.name, &chosen);
+    }
     match pick.choice {
         Some(dialog::Pick::Interleaved) => {
             let names: Vec<&str> = chosen.iter().map(String::as_str).collect();
@@ -9594,6 +9650,13 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
                     ),
                 ),
             }
+        }
+        Some(dialog::Pick::SaveAs) => {
+            if chosen.is_empty() {
+                set_notice(hwnd, "Tick the applications to save first.".to_owned());
+                return;
+            }
+            save_as_entry(hwnd, &source, &chosen);
         }
         Some(dialog::Pick::Separate) => {
             // Each window is a tail of its own — a worker, a poll and a bounded spill — so a

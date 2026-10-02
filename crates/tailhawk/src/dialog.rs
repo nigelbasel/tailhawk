@@ -964,6 +964,7 @@ const ID_A_ALL: u16 = 241;
 const ID_A_NONE: u16 = 242;
 const ID_A_SEPARATE: u16 = 243;
 const ID_A_COUNT: u16 = 244;
+const ID_A_SAVE: u16 = 245;
 
 /// A list view's checkbox state lives in the state image, not in a style bit.
 const LVIS_STATEIMAGEMASK: u32 = 0xF000;
@@ -983,6 +984,11 @@ pub enum Pick {
     Interleaved,
     /// One document each — the owner's "run each in a separate log window".
     Separate,
+    /// Keep this selection as a cloud entry of its own, then open it.
+    ///
+    /// **The owner's answer of 2026-10-02** to where entries should be made: "a button in the
+    /// picker". He is already looking at the set he wants when the thought occurs.
+    SaveAs,
 }
 
 /// What the picker is handed and hands back.
@@ -1022,6 +1028,13 @@ fn apps_dialog_items() -> Vec<Item> {
             "&None",
             ID_A_NONE,
             (259, 38, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "Sa&ve as entry",
+            ID_A_SAVE,
+            (259, 56, 60, 14),
             WS_TABSTOP,
         ),
         Item::new(Class::Static, "", ID_A_COUNT, (7, 204, 246, 9), 0),
@@ -1494,12 +1507,12 @@ unsafe extern "system" fn apps_proc(hdlg: HWND, msg: u32, wparam: WPARAM, lparam
                     apps_count(hdlg, data);
                     1
                 }
-                1 | ID_A_SEPARATE => {
+                1 | ID_A_SEPARATE | ID_A_SAVE => {
                     apps_read(hdlg, data);
-                    data.choice = Some(if id == 1 {
-                        Pick::Interleaved
-                    } else {
-                        Pick::Separate
+                    data.choice = Some(match id {
+                        1 => Pick::Interleaved,
+                        ID_A_SAVE => Pick::SaveAs,
+                        _ => Pick::Separate,
                     });
                     unsafe {
                         let _ = EndDialog(hdlg, 1);
