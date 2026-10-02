@@ -25,6 +25,11 @@ mod gridtext;
 mod header;
 mod icon;
 mod keymap;
+/// Where the browser hands an authorization code back. **Nothing calls it yet** — the sign-in that
+/// will is the next slice — so the unused warnings are suppressed at the declaration, where the
+/// fact is visible rather than buried in the module.
+#[allow(dead_code)]
+mod loopback;
 mod menubar;
 /// The Loki transport. **Nothing calls it yet** — the source that will is the next slice — so the
 /// unused warnings are suppressed here, at the declaration, where the fact is visible rather than
