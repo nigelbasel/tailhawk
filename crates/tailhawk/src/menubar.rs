@@ -186,6 +186,14 @@ pub const ID_SOURCE_BASE: u32 = 10_400;
 /// desc)` and `Command::TopN(column)` are not in `Command::LISTED` by value, for the same reason
 /// [`ID_UNLISTED`] exists — and until now they were reachable only by right-clicking the header,
 /// which no keyboard can do.
+/// `File ▸ Open remote ▸ Choose applications`: `ID_SOURCE_PICK_BASE + n` asks the n-th source which
+/// applications it has and shows the picker, instead of opening it the way its entry remembers.
+///
+/// **A second range over the same list rather than a modifier on the first.** A source that
+/// remembers its applications opens straight into them, so without an explicit way back the set
+/// could be chosen once and never changed — and a menu is where a command belongs, rather than a
+/// shift-click nobody would find.
+pub const ID_SOURCE_PICK_BASE: u32 = 10_800;
 pub const ID_SORT_COL_BASE: u32 = 10_500;
 pub const ID_TOPN_COL_BASE: u32 = 10_600;
 pub const ID_FILTER_COL_BASE: u32 = 10_700;
@@ -446,6 +454,17 @@ pub fn remote_menu_of(sources: &[String]) -> Vec<tailhawk_core::menu::Item> {
         .map(|(n, name)| Item::command(&name.replace('&', "&&"), "", ID_SOURCE_BASE + n as u32))
         .collect();
     if !items.is_empty() {
+        items.push(Item::separator());
+        items.push(Item::submenu(
+            "Choose &applications",
+            sources
+                .iter()
+                .enumerate()
+                .map(|(n, name)| {
+                    Item::command(&name.replace('&', "&&"), "", ID_SOURCE_PICK_BASE + n as u32)
+                })
+                .collect(),
+        ));
         items.push(Item::separator());
     }
     items.push(Item::command(
@@ -1127,9 +1146,53 @@ mod tests {
 
         let two = remote_menu_of(&["live".to_owned(), "qa".to_owned()]);
         let text: Vec<String> = two.iter().map(|i| i.text()).collect();
-        assert_eq!(text, ["live", "qa", "", "Remote sources…"]);
+        assert_eq!(
+            text,
+            [
+                "live",
+                "qa",
+                "",
+                "Choose applications",
+                "",
+                "Remote sources…"
+            ]
+        );
         assert_eq!(two[0].id, Some(ID_SOURCE_BASE));
         assert_eq!(two[1].id, Some(ID_SOURCE_BASE + 1));
+    }
+
+    /// **The way back to the picker lists the same sources under its own ids.** An entry that
+    /// remembers its applications opens straight into them, so this submenu is the only way to
+    /// change the set — and it must name every source, not just the ones that remember something,
+    /// because a source with nothing remembered is also one whose picker a reader may want twice.
+    #[test]
+    fn choosing_applications_again_offers_every_source() {
+        let items = remote_menu_of(&["live".to_owned(), "qa".to_owned()]);
+        let choose = items
+            .iter()
+            .find(|i| i.text() == "Choose applications")
+            .expect("the submenu is there whenever any source is");
+        let inner: Vec<(String, Option<u32>)> =
+            choose.items.iter().map(|i| (i.text(), i.id)).collect();
+        assert_eq!(
+            inner,
+            [
+                ("live".to_owned(), Some(ID_SOURCE_PICK_BASE)),
+                ("qa".to_owned(), Some(ID_SOURCE_PICK_BASE + 1)),
+            ]
+        );
+
+        // **The two ranges must not overlap**, or choosing the picker would open the source and
+        // the reader would never see the list they asked for.
+        assert!(
+            ID_SOURCE_PICK_BASE >= ID_SOURCE_BASE + tailhawk_core::sourceset::MAX_SOURCES as u32,
+            "the pick range starts inside the open range"
+        );
+
+        // Nothing configured, nothing to choose from: no empty submenu.
+        assert!(remote_menu_of(&[])
+            .iter()
+            .all(|i| i.text() != "Choose applications"));
     }
 
     /// **A source the user called `R&D` is drawn `R&D`.** `AppendMenuW` reads a lone `&` as a

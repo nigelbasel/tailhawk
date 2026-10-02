@@ -4684,6 +4684,9 @@ struct Shell {
     pending_sources: bool,
     /// The remote source the user picked, waiting for the pull that must not run inside a borrow.
     pending_pull: Option<usize>,
+    /// The remote source whose applications the user wants to choose again, waiting for the same
+    /// reason: the label call is a credential read and two round trips.
+    pending_repick: Option<usize>,
     /// The exact `opening …` line currently on the bar, so it can be taken down again when the
     /// document lands — and **only** if it is still the thing being shown.
     ///
@@ -6924,6 +6927,13 @@ impl Shell {
                 .contains(&id) =>
             {
                 self.pending_pull = Some((id - menubar::ID_SOURCE_BASE) as usize);
+                true
+            }
+            id if (menubar::ID_SOURCE_PICK_BASE
+                ..menubar::ID_SOURCE_PICK_BASE + tailhawk_core::sourceset::MAX_SOURCES as u32)
+                .contains(&id) =>
+            {
+                self.pending_repick = Some((id - menubar::ID_SOURCE_PICK_BASE) as usize);
                 true
             }
             // Format's column submenus — `UX-REVIEW.md` finding 3. The id is a **position in the
@@ -9886,6 +9896,22 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         });
         if let Some(source) = source {
             open_remembered_or_pick(hwnd, source);
+        }
+        return true;
+    }
+    let repicking = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|shell| shell.pending_repick.take())
+    });
+    if let Some(at) = repicking {
+        let source = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.settings.sources.get(at).cloned())
+        });
+        if let Some(source) = source {
+            open_picked(hwnd, source);
         }
         return true;
     }
@@ -13106,6 +13132,7 @@ fn main() -> Result<()> {
             pending_rules: false,
             pending_sources: false,
             pending_pull: None,
+            pending_repick: None,
             pending_reopen: None,
             opening: None,
             spill_sets: Vec::new(),

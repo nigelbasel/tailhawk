@@ -223,12 +223,20 @@ impl Closer {
     }
 }
 
+/// **Asks for Winsock only when there is a socket to close**, which is not merely tidiness: calling
+/// `winsock()` resolves the library, so closing a `Redirect` that never opened one would put
+/// `ws2_32.dll` into a process that had not signed in — and
+/// [`tests::compiling_the_socket_in_does_not_open_one`] exists to catch exactly that. It caught
+/// this.
 fn close_once(shared: &std::sync::Mutex<Option<SocketHandle>>) {
     let taken = shared
         .lock()
         .unwrap_or_else(|held| held.into_inner())
         .take();
-    if let (Some(socket), Some(api)) = (taken, winsock()) {
+    let Some(socket) = taken else {
+        return;
+    };
+    if let Some(api) = winsock() {
         unsafe { (api.close)(socket) };
     }
 }
