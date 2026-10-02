@@ -854,6 +854,180 @@ pub fn slowed(interval: u64) -> u64 {
     interval.saturating_add(DEVICE_SLOW_DOWN_STEP)
 }
 
+/// RFC 4648 §5's base64url, **unpadded**.
+///
+/// The padding is dropped because every value this encodes travels in a URL or in an OAuth field
+/// where RFC 7636 §4.1 asks for exactly this alphabet, and `=` would have to be escaped on the way.
+pub fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((bytes.len() * 4).div_ceil(3));
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let triple = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        // One output character per 6 bits, and one fewer than four whenever the chunk was short —
+        // which is what "unpadded" means in practice.
+        for i in 0..chunk.len() + 1 {
+            let at = (triple >> (18 - 6 * i)) & 0x3f;
+            out.push(ALPHABET[at as usize] as char);
+        }
+    }
+    out
+}
+
+/// The PKCE pair: what the client keeps, and what it shows the authorization server.
+///
+/// **The verifier never leaves this machine until the exchange**, which is the whole of RFC 7636:
+/// an authorization code intercepted on its way back is useless without it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pkce {
+    /// Kept secret until the code is exchanged. **A credential.**
+    pub verifier: String,
+    /// The `S256` challenge sent with the authorization request.
+    pub challenge: String,
+}
+
+/// The PKCE pair for `random` (32 bytes) whose SHA-256 is `digest`.
+///
+/// **The hashing is the caller's**, because it is the only impure part and this module has no I/O
+/// and no platform in it. The shell hands in `bcrypt.dll`'s answer.
+///
+/// The verifier is the base64url of 32 bytes — 43 characters, the shortest RFC 7636 §4.1 permits,
+/// and every character already unreserved so nothing needs escaping on the way out.
+pub fn pkce_from(random: &[u8], digest: &[u8]) -> Pkce {
+    Pkce {
+        verifier: base64url(random),
+        challenge: base64url(digest),
+    }
+}
+
+/// RFC 6749 §4.1.1's authorization request, as a URL for the browser to open.
+///
+/// **A GET, and the only place in this product where that is right.** §7's privacy clause is about
+/// filter text a reader authored; these parameters are a client id, a scope and two opaque values
+/// the server just issued, and the authorization endpoint is defined to take them in the query.
+pub fn authorize_url(
+    origin: &Origin,
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    state: &str,
+    challenge: &str,
+) -> String {
+    let mut url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+        origin.mounted_url(),
+        form_encode(client_id),
+        form_encode(redirect_uri),
+        form_encode(state),
+        form_encode(challenge)
+    );
+    if !scope.is_empty() {
+        url.push_str(&format!("&scope={}", form_encode(scope)));
+    }
+    url
+}
+
+/// Why a callback did not yield an authorization code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackFault {
+    /// Not a callback for this application at all.
+    NotOurs,
+    /// **The `state` did not match the one sent.** RFC 6749 §10.12, and the reason it is checked
+    /// rather than merely sent: this callback arrives as a *command line*, so anyone who can start
+    /// a process can hand us one. There is no network for an attacker to be on.
+    WrongState,
+    /// The server said no, in its own word.
+    Refused(String),
+    /// A callback with neither a code nor an error in it.
+    Empty,
+}
+
+/// The authorization code in a `tailhawk://` callback, once `state` has been checked.
+pub fn code_from_callback(uri: &str, expected_state: &str) -> Result<String, CallbackFault> {
+    let query = uri
+        .split_once('?')
+        .map(|(_, q)| q)
+        .ok_or(CallbackFault::NotOurs)?;
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key {
+            "code" => code = Some(form_decode(value)),
+            "state" => state = Some(form_decode(value)),
+            "error" => error = Some(form_decode(value)),
+            _ => {}
+        }
+    }
+    // **State first, before the code is even looked at.** A forged callback carrying a valid-looking
+    // code must be refused on the state alone, and checking the code first would mean deciding what
+    // to do with a value we have already decided not to trust.
+    if state.as_deref() != Some(expected_state) {
+        return Err(CallbackFault::WrongState);
+    }
+    if let Some(why) = error {
+        return Err(CallbackFault::Refused(why));
+    }
+    code.filter(|c| !c.is_empty()).ok_or(CallbackFault::Empty)
+}
+
+/// RFC 6749 §4.1.3: exchange the authorization code for a token, proving possession of the verifier.
+pub fn code_exchange_request(
+    origin: &Origin,
+    client_id: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Request {
+    Request {
+        method: "POST",
+        url: origin.mounted_url(),
+        body: format!(
+            "grant_type=authorization_code&client_id={}&code={}&redirect_uri={}&code_verifier={}",
+            form_encode(client_id),
+            form_encode(code),
+            form_encode(redirect_uri),
+            form_encode(verifier)
+        ),
+        content_type: Some("application/x-www-form-urlencoded"),
+    }
+}
+
+/// The inverse of the form encoding, for reading values out of a callback's query.
+fn form_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                    Ok(byte) => out.push(byte),
+                    // Not a hex escape after all, so it is a literal per cent.
+                    Err(_) => out.push(b'%'),
+                }
+                i += 3;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The string value of `key`, honouring backslash escapes so a token containing a quote cannot cut
 /// the scan short.
 fn json_string(body: &str, key: &str) -> Option<String> {
@@ -1338,6 +1512,161 @@ mod tests {
             device_grant_from_json(r#"{"error":"invalid_client"}"#),
             None
         );
+    }
+
+    /// RFC 4648 §10's own vectors, in base64url and without padding — which is where the length of
+    /// the output differs from plain base64 and where a hand-written encoder gets it wrong.
+    #[test]
+    fn base64url_matches_the_specifications_vectors() {
+        assert_eq!(base64url(b""), "");
+        assert_eq!(base64url(b"f"), "Zg");
+        assert_eq!(base64url(b"fo"), "Zm8");
+        assert_eq!(base64url(b"foo"), "Zm9v");
+        assert_eq!(base64url(b"foob"), "Zm9vYg");
+        assert_eq!(base64url(b"fooba"), "Zm9vYmE");
+        assert_eq!(base64url(b"foobar"), "Zm9vYmFy");
+
+        // **The two characters that make it url-safe.** Plain base64 gives `+` and `/` here, both of
+        // which would have to be escaped in a query — the reason RFC 7636 asks for this alphabet.
+        assert_eq!(base64url(&[0xfb, 0xff, 0xbe]), "-_--");
+        assert!(!base64url(&[0xfb, 0xff, 0xbe]).contains(['+', '/', '=']));
+    }
+
+    /// A verifier is the 43 characters RFC 7636 §4.1 asks for, all of them already unreserved.
+    #[test]
+    fn a_pkce_verifier_is_the_shortest_the_specification_allows() {
+        let pair = pkce_from(&[0x41; 32], &[0x42; 32]);
+        assert_eq!(pair.verifier.len(), 43);
+        assert_eq!(pair.challenge.len(), 43);
+        assert!(
+            pair.verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
+            "every character must be unreserved: {}",
+            pair.verifier
+        );
+        assert_ne!(
+            pair.verifier, pair.challenge,
+            "the challenge is the digest, not the verifier — sending the verifier would defeat it"
+        );
+    }
+
+    /// The authorization request carries what RFC 6749 §4.1.1 and RFC 7636 §4.3 require, and the
+    /// redirect URI is encoded rather than left to the browser to interpret.
+    #[test]
+    fn an_authorize_url_carries_the_challenge_and_not_the_verifier() {
+        let at = Origin::parse("https://identity.example.com/connect", Provenance::Imported)
+            .expect("an https origin");
+        let url = authorize_url(
+            &at,
+            "tailhawk",
+            "tailhawk://auth/callback",
+            "telemetry:read offline_access",
+            "st4te",
+            "ch4llenge",
+        );
+        assert!(
+            url.starts_with("https://identity.example.com/connect?"),
+            "{url}"
+        );
+        for required in [
+            "response_type=code",
+            "client_id=tailhawk",
+            "code_challenge=ch4llenge",
+            "code_challenge_method=S256",
+            "state=st4te",
+            "redirect_uri=tailhawk%3A%2F%2Fauth%2Fcallback",
+            "scope=telemetry%3Aread+offline_access",
+        ] {
+            assert!(url.contains(required), "missing {required} in {url}");
+        }
+        assert!(
+            !url.contains("code_verifier"),
+            "the verifier must never travel with the authorization request: {url}"
+        );
+    }
+
+    /// **`state` is checked before the code is even read.** The callback arrives as a command line
+    /// from a registered URI scheme, so anyone who can start a process can hand us one — RFC 6749
+    /// §10.12's concern, without an attacker needing to be on a network at all.
+    #[test]
+    fn a_callback_with_the_wrong_state_is_refused_before_its_code_is_believed() {
+        let ours = "tailhawk://auth/callback?code=abc123&state=expected";
+        assert_eq!(
+            code_from_callback(ours, "expected"),
+            Ok("abc123".to_owned())
+        );
+
+        assert_eq!(
+            code_from_callback(
+                "tailhawk://auth/callback?code=abc123&state=forged",
+                "expected"
+            ),
+            Err(CallbackFault::WrongState)
+        );
+        assert_eq!(
+            code_from_callback("tailhawk://auth/callback?code=abc123", "expected"),
+            Err(CallbackFault::WrongState),
+            "no state at all is not a match"
+        );
+
+        // The server's refusal is reported in its own word, but only once the state proves the
+        // callback is ours to read.
+        assert_eq!(
+            code_from_callback(
+                "tailhawk://auth/callback?error=access_denied&state=expected",
+                "expected"
+            ),
+            Err(CallbackFault::Refused("access_denied".to_owned()))
+        );
+        assert_eq!(
+            code_from_callback(
+                "tailhawk://auth/callback?error=access_denied&state=forged",
+                "expected"
+            ),
+            Err(CallbackFault::WrongState),
+            "a forged callback is refused on the state even when it carries an error"
+        );
+
+        assert_eq!(
+            code_from_callback("tailhawk://auth/callback?state=expected", "expected"),
+            Err(CallbackFault::Empty)
+        );
+        assert_eq!(
+            code_from_callback("not-a-callback", "expected"),
+            Err(CallbackFault::NotOurs)
+        );
+
+        // A percent-escaped code survives the trip back.
+        assert_eq!(
+            code_from_callback(
+                "tailhawk://auth/callback?code=a%2Fb%2Bc&state=expected",
+                "expected"
+            ),
+            Ok("a/b+c".to_owned())
+        );
+    }
+
+    /// The exchange proves possession of the verifier, and carries no secret — the client is public.
+    #[test]
+    fn the_code_exchange_sends_the_verifier_and_no_secret() {
+        let at = Origin::parse(
+            "https://identity.example.com/connect/token",
+            Provenance::Imported,
+        )
+        .expect("an https origin");
+        let request = code_exchange_request(
+            &at,
+            "tailhawk",
+            "the-code",
+            "the-verifier",
+            "tailhawk://auth/callback",
+        );
+        assert_eq!(request.method, "POST");
+        assert!(request.body.contains("grant_type=authorization_code"));
+        assert!(request.body.contains("code=the-code"));
+        assert!(request.body.contains("code_verifier=the-verifier"));
+        assert!(!request.body.contains("client_secret"));
     }
 
     /// **The estate's own identity server, in its own words.** Every other test here is written
