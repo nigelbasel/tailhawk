@@ -42,6 +42,7 @@ pub mod search;
 pub mod selection;
 pub mod semantic;
 pub mod settings;
+pub mod sha256;
 pub mod sourceset;
 pub mod template;
 pub mod textunit;
