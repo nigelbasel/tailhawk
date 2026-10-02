@@ -536,6 +536,7 @@ mod tests {
             url: "https://telemetry.example/loki".to_owned(),
             token_url: "https://identity.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
+            apps: Vec::new(),
             scope: "telemetry:read".to_owned(),
             query: "{environment=\"dev\"}".to_owned(),
             auth_url: String::new(),

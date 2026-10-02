@@ -9449,6 +9449,81 @@ fn ask_for_records(source: tailhawk_core::settings::Source, label: String) -> Re
 /// and an HTTP round trip; run here it froze the window, and the picker appeared out of a window
 /// that had stopped answering. [`Shell::poll_fetch`] is what opens the dialog when the answer
 /// arrives.
+/// Keeps the applications just chosen against the source they were chosen for, so the next open
+/// goes straight into them.
+///
+/// **Written against the source's *name*, not its position**, because the sources dialog can
+/// reorder and delete entries between one open and the next — the same reason `Recent::Remote`
+/// stores a name. The save happens outside the borrow the decision was made in, like every other
+/// settings write here.
+fn remember_apps(hwnd: HWND, name: &str, chosen: &[String]) {
+    let changed = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let Some(shell) = state.as_mut() else {
+            return false;
+        };
+        let Some(source) = shell
+            .settings
+            .sources
+            .iter_mut()
+            .find(|source| source.name == name)
+        else {
+            return false;
+        };
+        if source.apps == chosen {
+            return false;
+        }
+        source.apps = chosen.to_vec();
+        true
+    });
+    if changed {
+        STATE.with(|s| {
+            if let Some(shell) = s.borrow_mut().as_mut() {
+                shell.save_settings(hwnd);
+            }
+        });
+    }
+}
+
+/// Opens a source the way its entry says to: straight into the applications it remembers, or by
+/// asking Loki which it has and showing the picker.
+///
+/// **The owner's ask of 2026-10-02, in his words**: *"remember which apps were selected the
+/// previous time so that a user doesnt have to reselect"*, and *"when opening with a preselected
+/// list, go straight to that list"*. So a remembered set is not a pre-ticked picker — it is no
+/// picker. Changing the set is `File ▸ Choose applications`, which is always available.
+///
+/// **A remembered set that no longer applies offers the picker rather than nothing.** A selector
+/// edited by hand since the apps were remembered is the way here, and refusing to open would leave
+/// the reader an entry that does nothing and no way to see why.
+fn open_remembered_or_pick(hwnd: HWND, source: tailhawk_core::settings::Source) {
+    if source.apps.is_empty() {
+        open_picked(hwnd, source);
+        return;
+    }
+    let chosen: Vec<&str> = source.apps.iter().map(String::as_str).collect();
+    match tailhawk_core::apps::with_apps(&source.query, &chosen) {
+        Ok(query) => {
+            let label = tailhawk_core::apps::source_label(&source.name, &chosen);
+            open_remote(
+                hwnd,
+                tailhawk_core::settings::Source { query, ..source },
+                label,
+            );
+        }
+        Err(_) => {
+            set_notice(
+                hwnd,
+                format!(
+                    "{}: its selector no longer takes an application — choose again.",
+                    source.name
+                ),
+            );
+            open_picked(hwnd, source);
+        }
+    }
+}
+
 fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
     let name = source.name.clone();
     let waiting = ask_for_apps(source);
@@ -9488,6 +9563,7 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    remember_apps(hwnd, &source.name, &chosen);
     match pick.choice {
         Some(dialog::Pick::Interleaved) => {
             let names: Vec<&str> = chosen.iter().map(String::as_str).collect();
@@ -9809,7 +9885,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                 .and_then(|shell| shell.settings.sources.get(at).cloned())
         });
         if let Some(source) = source {
-            open_picked(hwnd, source);
+            open_remembered_or_pick(hwnd, source);
         }
         return true;
     }
@@ -13356,6 +13432,7 @@ mod tests {
             url: "https://example.invalid/loki".to_owned(),
             token_url: String::new(),
             client_id: String::new(),
+            apps: Vec::new(),
             scope: String::new(),
             query: query.to_owned(),
             auth_url: String::new(),

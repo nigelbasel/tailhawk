@@ -110,6 +110,19 @@ pub struct Source {
     /// nowhere to be approved. The field was renamed rather than kept beside a second one, because
     /// a configuration file carrying an endpoint nothing can use is a trap for whoever reads it next.
     pub auth_url: String,
+    /// The applications this entry is for, remembered from the last time they were chosen.
+    ///
+    /// **Empty means "ask me".** Set, and the source opens straight into these without a picker —
+    /// the owner's ask of 2026-10-02: *"it would be good to remember which apps were selected the
+    /// previous time so that a user doesnt have to reselect a particular set of apps"*, and
+    /// *"when opening with a preselected list, go straight to that list"*.
+    ///
+    /// **It is also what makes several entries over one Loki possible**, which was the other half
+    /// of that ask. Two sources can share a URL and a selector and differ only here, each under its
+    /// own name in the cloud menu. The apps are kept *beside* the query rather than narrowed into
+    /// it, so the entry still follows the selector if that is edited later —
+    /// [`apps::with_apps`](crate::apps::with_apps) does the narrowing at the moment of opening.
+    pub apps: Vec<String>,
     /// The OAuth2 client id.
     pub client_id: String,
     /// The scope to request.
@@ -478,6 +491,10 @@ impl Settings {
             if !s.client_id.is_empty() {
                 out.push_str(&format!("client_id = {}\n", quote(&s.client_id)));
             }
+            if !s.apps.is_empty() {
+                let listed: Vec<String> = s.apps.iter().map(|a| quote(a)).collect();
+                out.push_str(&format!("apps = [{}]\n", listed.join(", ")));
+            }
             if !s.scope.is_empty() {
                 out.push_str(&format!("scope = {}\n", quote(&s.scope)));
             }
@@ -637,6 +654,7 @@ impl Settings {
                             "token_url" => s.token_url = unquote(value),
                             "auth_url" => s.auth_url = unquote(value),
                             "client_id" => s.client_id = unquote(value),
+                            "apps" => s.apps = array(value),
                             "scope" => s.scope = unquote(value),
                             "query" => s.query = unquote(value),
                             // **A `secret` key is read and thrown away.** Somebody will eventually
@@ -1024,6 +1042,7 @@ mod tests {
                 url: "https://telemetry-dev.example/loki".to_owned(),
                 token_url: "https://identity-dev.example/connect/token".to_owned(),
                 client_id: "tailhawk".to_owned(),
+                apps: Vec::new(),
                 scope: "telemetry:read".to_owned(),
                 query: "{environment=\"dev\"}".to_owned(),
                 auth_url: String::new(),
@@ -1177,6 +1196,7 @@ mod tests {
             url: "https://telemetry-dev.example/loki".to_owned(),
             token_url: "https://identity-dev.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
+            apps: Vec::new(),
             scope: "telemetry:read".to_owned(),
             query: "{environment=~\"live|production\"}".to_owned(),
             auth_url: "https://identity-dev.example/connect/authorize".to_owned(),
@@ -1252,6 +1272,55 @@ mod tests {
     /// **A source says why it cannot be used, while it is being typed.** The alternative is a
     /// query that fails later with whatever the server happened to say, which is a much worse place
     /// to learn that a URL was http or a client id was left blank.
+    /// **A remembered application set survives the round trip, and an empty one writes nothing.**
+    /// Empty means "ask me", so a source that has never had a choice made must not come back
+    /// carrying an empty list that reads as a deliberate selection of nothing.
+    #[test]
+    fn a_remembered_application_set_comes_back_whole() {
+        let mut s = Settings::default();
+        s.sources.push(Source {
+            name: "live-workers".to_owned(),
+            url: "https://telemetry.example/loki".to_owned(),
+            token_url: "https://identity.example/connect/token".to_owned(),
+            auth_url: "https://identity.example/connect/authorize".to_owned(),
+            client_id: "tailhawk".to_owned(),
+            apps: vec![
+                "nurtur-gateway".to_owned(),
+                "campaign-editor-api".to_owned(),
+            ],
+            scope: "telemetry:read".to_owned(),
+            query: "{environment=\"live\"}".to_owned(),
+        });
+        s.sources.push(Source {
+            name: "live-everything".to_owned(),
+            apps: Vec::new(),
+            ..s.sources[0].clone()
+        });
+
+        let text = s.to_toml();
+        assert!(
+            text.contains("apps = [\"nurtur-gateway\", \"campaign-editor-api\"]"),
+            "{text}"
+        );
+        let back = Settings::from_toml(&text);
+        assert_eq!(back.sources[0].apps, s.sources[0].apps);
+        assert!(
+            back.sources[1].apps.is_empty(),
+            "a source with nothing remembered must not grow an empty list"
+        );
+        assert_eq!(
+            text.matches("apps = ").count(),
+            1,
+            "only the entry that remembers something writes the key: {text}"
+        );
+
+        // **Two entries over one Loki, differing only in what they remember**, which is the other
+        // half of the ask: same URL, same selector, their own names.
+        assert_eq!(back.sources[0].url, back.sources[1].url);
+        assert_eq!(back.sources[0].query, back.sources[1].query);
+        assert_ne!(back.sources[0].name, back.sources[1].name);
+    }
+
     #[test]
     fn a_source_reports_the_first_thing_wrong_with_it() {
         let good = Source {
@@ -1259,6 +1328,7 @@ mod tests {
             url: "https://telemetry-dev.example/loki".to_owned(),
             token_url: "https://identity-dev.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
+            apps: Vec::new(),
             scope: "telemetry:read".to_owned(),
             query: String::new(),
             auth_url: String::new(),
@@ -1292,6 +1362,7 @@ mod tests {
             Source {
                 token_url: String::new(),
                 client_id: String::new(),
+                apps: Vec::new(),
                 ..signs_in.clone()
             }
             .fault()
@@ -1302,6 +1373,7 @@ mod tests {
         let unauthenticated = Source {
             token_url: String::new(),
             client_id: String::new(),
+            apps: Vec::new(),
             scope: String::new(),
             ..good.clone()
         };
@@ -1337,6 +1409,7 @@ mod tests {
         assert!(
             Source {
                 client_id: String::new(),
+                apps: Vec::new(),
                 ..good.clone()
             }
             .fault()
