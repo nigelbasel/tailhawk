@@ -868,8 +868,6 @@ pub fn base64url(bytes: &[u8]) -> String {
             chunk.get(2).copied().unwrap_or(0),
         ];
         let triple = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        // One output character per 6 bits, and one fewer than four whenever the chunk was short —
-        // which is what "unpadded" means in practice.
         for i in 0..chunk.len() + 1 {
             let at = (triple >> (18 - 6 * i)) & 0x3f;
             out.push(ALPHABET[at as usize] as char);
@@ -947,6 +945,10 @@ pub enum CallbackFault {
 }
 
 /// The authorization code in a `tailhawk://` callback, once `state` has been checked.
+///
+/// **The state is checked before the code is even looked at.** A forged callback carrying a
+/// valid-looking code is refused on the state alone, because reading the code first would mean
+/// deciding what to do with a value already known to be untrusted.
 pub fn code_from_callback(uri: &str, expected_state: &str) -> Result<String, CallbackFault> {
     let query = uri
         .split_once('?')
@@ -966,9 +968,6 @@ pub fn code_from_callback(uri: &str, expected_state: &str) -> Result<String, Cal
             _ => {}
         }
     }
-    // **State first, before the code is even looked at.** A forged callback carrying a valid-looking
-    // code must be refused on the state alone, and checking the code first would mean deciding what
-    // to do with a value we have already decided not to trust.
     if state.as_deref() != Some(expected_state) {
         return Err(CallbackFault::WrongState);
     }
