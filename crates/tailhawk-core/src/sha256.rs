@@ -50,10 +50,10 @@ pub fn sha256(message: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&((message.len() as u64) * 8).to_be_bytes());
 
-    for block in padded.chunks_exact(64) {
+    for block in padded.as_chunks::<64>().0 {
         // §6.2.2 step 1: the message schedule.
         let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {
@@ -96,7 +96,7 @@ pub fn sha256(message: &[u8]) -> [u8; 32] {
     }
 
     let mut out = [0u8; 32];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(h) {
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
         chunk.copy_from_slice(&word.to_be_bytes());
     }
     out
