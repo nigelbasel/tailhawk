@@ -40,6 +40,7 @@ mod menubar;
 mod net;
 mod prefs;
 mod pull;
+mod scrollbars;
 mod secrets;
 mod statusbar;
 mod tabstrip;
@@ -110,10 +111,10 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_B, VK_C, VK_CONTROL, VK_D,
-    VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G, VK_HOME, VK_I, VK_L,
-    VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_T,
-    VK_TAB, VK_UP, VK_W,
+    GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_B, VK_C,
+    VK_CONTROL, VK_D, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G, VK_HOME,
+    VK_I, VK_L, VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_SPACE, VK_T, VK_TAB, VK_UP, VK_W,
 };
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::Shell::{
@@ -125,9 +126,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
     SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
     ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_ARROW, MSG, NONCLIENTMETRICSW, SB_BOTTOM, SB_HORZ,
-    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
-    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
+    GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_ARROW, MSG, NONCLIENTMETRICSW, SB_BOTTOM, SB_CTL,
+    SB_ENDSCROLL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK,
+    SB_TOP, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
     SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP,
@@ -135,7 +136,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED,
     WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_HAND, IDC_SIZEWE, WM_SETCURSOR,
@@ -4599,6 +4600,14 @@ struct Shell {
     /// §1.1's status bar, as the real control. `None` only if it could not be created, in which
     /// case the window has no status bar rather than failing to open.
     statusbar: Option<statusbar::StatusBar>,
+    /// The two scroll bars, as controls inside the client area rather than the frame's own.
+    ///
+    /// **This is what makes the status bar the bottom-most element**, which it could not be while
+    /// the frame carried `WS_HSCROLL`: a standard scroll bar is non-client and therefore always
+    /// below the client area the status bar docks into. See `scrollbars.rs` for the report that
+    /// produced this and the documentation that settles it. `None` only if they could not be
+    /// created, in which case the window scrolls by keyboard and wheel as it always could.
+    scrollbars: Option<scrollbars::Bars>,
     /// Whether §2.3's row is shown. Remembered per §12.4; the default is shown.
     show_toolbar: bool,
     /// Whether that row draws its icons large. Remembered too; the default is small, which is
@@ -5429,6 +5438,7 @@ impl Shell {
         let (w, h) = Self::client_size(hwnd);
         let mut rasterised = 0;
         let mut placeholders = PlaceholderStats::default();
+        let mut settled_hbar: Option<bool> = None;
         let pane_count = self.document.panes().len();
         let drawn = renderer
             .attach(WindowHandle(hwnd.0 as isize), w, h)
@@ -5510,9 +5520,12 @@ impl Shell {
                     }
                     None => 0.0,
                 };
+                let thick = scrollbars::thickness(hwnd);
+                let want_hbar = Shell::hbar_wanted(self.document.as_ref());
+                let hbar_px = if want_hbar { thick.1 as f32 } else { 0.0 };
                 let boxes = pane_boxes(
-                    w as f32,
-                    (h as f32 - status_px).max(1.0),
+                    (w as f32 - thick.0 as f32).max(1.0),
+                    (h as f32 - status_px - hbar_px).max(1.0),
                     visible.len(),
                     layout,
                 );
@@ -5560,6 +5573,15 @@ impl Shell {
                     (None, _) => 0.0,
                 };
                 let strip_px = strip_px + toolbar_px;
+                if let Some(bars) = self.scrollbars.as_mut() {
+                    bars.place(scrollbars::layout(
+                        (w as i32, h as i32),
+                        strip_px as i32,
+                        status_px as i32,
+                        want_hbar,
+                        thick,
+                    ));
+                }
                 // §8's detail window, opened, fed and closed from the one place a frame knows what
                 // the caret is on. **The window is the shell's and the flag is the document's**: a
                 // record is what the *active* document's caret is on, so switching tabs moves the
@@ -5733,6 +5755,7 @@ impl Shell {
                 let laid = renderer.paint_panes(&refs, (w as f32, h as f32), &overlay)?;
                 rasterised = laid.rasterised;
                 placeholders = PlaceholderStats::from(&laid);
+                settled_hbar = Some(want_hbar);
                 Ok(())
             });
         // **Rasterising is a reason to draw again, and the request cannot be made from in here.**
@@ -5780,6 +5803,9 @@ impl Shell {
         // fetched, and the renderer's borrow has been given up, which is what puts this here rather
         // than beside the toolbar.
         self.sync_detail_window(hwnd);
+        if let Some(assumed) = settled_hbar {
+            self.settle_hbar(hwnd, assumed);
+        }
         true
     }
 
@@ -5862,7 +5888,7 @@ impl Shell {
     /// and scaling by row count would put the overflow in the future rather than removing it. The
     /// grid already speaks in fractions — `thumb_fraction` and `scroll_to_fraction` — so the
     /// scrollbar is a fraction at both ends and the row count never reaches Win32 at all.
-    fn sync_scrollbar(&self, hwnd: HWND) {
+    fn sync_scrollbar(&self) {
         let Some(doc) = self.document.as_ref() else {
             return;
         };
@@ -5885,8 +5911,51 @@ impl Shell {
             nPos: (grid.thumb_fraction() * SCROLL_RANGE as f32).round() as i32,
             nTrackPos: 0,
         };
-        unsafe { SetScrollInfo(hwnd, SB_VERT, &info, true) };
-        self.sync_hscrollbar(hwnd);
+        if let Some(bars) = self.scrollbars.as_ref() {
+            unsafe { SetScrollInfo(bars.vertical(), SB_CTL, &info, true) };
+        }
+        self.sync_hscrollbar();
+    }
+
+    /// Whether the horizontal bar should be on screen, and therefore whether a band is reserved
+    /// for it above the status bar.
+    ///
+    /// **The one predicate**, read by the layout and acted on only by [`scrollbars::Bars::place`].
+    /// `sync_hscrollbar` passes `SIF_DISABLENOSCROLL` so that Windows never forms a second opinion
+    /// about it; two deciders left either a dead band or a bar across the bottom rows, depending on
+    /// which way they disagreed.
+    ///
+    /// **It is necessarily one frame behind after a resize.** The viewport it asks about is a
+    /// product of the layout, and the band is an input to that layout, so there is no answer here
+    /// that is both current and non-circular. [`Shell::settle_hbar`] closes the gap by comparing
+    /// this against the truth once the panes have been laid out.
+    ///
+    /// **It takes the document rather than `&self`** because the paint pass calls it while holding
+    /// the renderer out of `self`, and a method on `self` would ask for the whole thing again.
+    fn hbar_wanted(doc: Option<&Document>) -> bool {
+        doc.is_some_and(|doc| doc.view.hgrid().overflows())
+    }
+
+    /// Asks for one more frame if the band reserved this frame was the wrong one.
+    ///
+    /// `assumed` is what [`Shell::hbar_wanted`] said before the layout ran. By the time this is
+    /// called the panes have been laid out and the `panes` borrow is over, so the same question now
+    /// has the current answer. If they differ, the band on screen is a frame stale — and without
+    /// this, widening a window until its longest line fits would leave a strip of nothing above the
+    /// status bar until something else happened to repaint. That is the same kind of dead band as
+    /// the defect `scrollbars.rs` exists to fix.
+    ///
+    /// **It cannot loop**: only a change in geometry makes the two disagree, and the frame after one
+    /// agrees.
+    fn settle_hbar(&self, hwnd: HWND, assumed: bool) {
+        if Shell::hbar_wanted(self.document.as_ref()) == assumed {
+            return;
+        }
+        // SAFETY: a live window handle; a null rectangle marks the whole client area and
+        // `InvalidateRect` retains nothing.
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
     }
 
     /// The horizontal bar — §1.2's missing mouse path for a line wider than the window.
@@ -5900,7 +5969,15 @@ impl Shell {
     /// Pixels rather than the vertical bar's fixed range: the horizontal extent is bounded by the
     /// widest line rather than by a row count that can reach 50 M, so it fits an `i32` directly and
     /// needs none of `SCROLL_RANGE`'s quantising.
-    fn sync_hscrollbar(&self, hwnd: HWND) {
+    ///
+    /// **`SIF_DISABLENOSCROLL` is passed here, which inverts the reasoning that held while the bar
+    /// belonged to the frame.** Leaving the flag off was once the only way to get a bar that hid
+    /// itself when a log fitted the window. Now the bar is a control, and [`Shell::hbar_wanted`]
+    /// with [`scrollbars::Bars::place`] already hide it — having also released the band it would
+    /// have occupied. Omitting the flag would make Windows a second decider, hiding or showing the
+    /// control on its own rounded arithmetic and disagreeing with a layout that had just reserved
+    /// space for it: a dead band one way, a bar over the bottom rows the other.
+    fn sync_hscrollbar(&self) {
         let Some(doc) = self.document.as_ref() else {
             return;
         };
@@ -5909,10 +5986,7 @@ impl Shell {
         let page = hgrid.viewport_px().round().max(1.0) as i32;
         let info = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            // No `SIF_DISABLENOSCROLL` here, unlike the vertical bar: a log that fits the window
-            // should have **no** horizontal bar rather than a dead full-width one, and leaving the
-            // flag off is what lets Windows hide it.
-            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL,
             nMin: 0,
             // `nMax` is inclusive while `nPage` is a count, so the usable travel is `nMax - nPage +
             // 1`. Off by one here and the last column can never quite be reached.
@@ -5921,14 +5995,16 @@ impl Shell {
             nPos: hgrid.offset_px().round().max(0.0) as i32,
             nTrackPos: 0,
         };
-        unsafe { SetScrollInfo(hwnd, SB_HORZ, &info, true) };
+        if let Some(bars) = self.scrollbars.as_ref() {
+            unsafe { SetScrollInfo(bars.horizontal(), SB_CTL, &info, true) };
+        }
     }
 
     /// Applies a navigation intent and asks for a frame only if the view moved.
     fn navigate(&mut self, hwnd: HWND, n: Navigate) {
         let moved = self.document.as_mut().is_some_and(|doc| doc.navigate(n));
         if moved {
-            self.sync_scrollbar(hwnd);
+            self.sync_scrollbar();
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -5980,7 +6056,7 @@ impl Shell {
                 }
             }
             self.retitle(hwnd);
-            self.sync_scrollbar(hwnd);
+            self.sync_scrollbar();
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -6009,7 +6085,7 @@ impl Shell {
         if key == VK_RETURN.0 {
             // V10: `Ctrl+Enter` opens and closes the record detail pane — `UI-DESIGN.md` §12.
             doc.detail.open = !doc.detail.open;
-            self.sync_scrollbar(hwnd);
+            self.sync_scrollbar();
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -6052,7 +6128,7 @@ impl Shell {
                 let rows = doc.view_rows();
                 doc.view.grid_mut().set_total_rows(rows);
             }
-            self.sync_scrollbar(hwnd);
+            self.sync_scrollbar();
             self.retitle(hwnd);
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
@@ -6194,7 +6270,7 @@ impl Shell {
         if !handled {
             return false;
         }
-        self.sync_scrollbar(hwnd);
+        self.sync_scrollbar();
         self.retitle(hwnd);
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
@@ -6219,7 +6295,7 @@ impl Shell {
             }
         }
         self.retitle(hwnd);
-        self.sync_scrollbar(hwnd);
+        self.sync_scrollbar();
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
         }
@@ -6615,7 +6691,7 @@ impl Shell {
 
     /// What every handled chrome key ends with: the scrollbar, the title and a repaint.
     fn after_chrome_key(&mut self, hwnd: HWND) -> bool {
-        self.sync_scrollbar(hwnd);
+        self.sync_scrollbar();
         self.retitle(hwnd);
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
@@ -7315,7 +7391,7 @@ impl Shell {
             return false;
         };
         if moved {
-            self.sync_scrollbar(hwnd);
+            self.sync_scrollbar();
         }
         self.retitle(hwnd);
         unsafe {
@@ -7360,7 +7436,7 @@ impl Shell {
         if below_strip {
             return false;
         }
-        self.sync_scrollbar(hwnd);
+        self.sync_scrollbar();
         self.retitle(hwnd);
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
@@ -7378,7 +7454,7 @@ impl Shell {
         if !changed {
             return;
         }
-        self.sync_scrollbar(hwnd);
+        self.sync_scrollbar();
         self.retitle(hwnd);
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
@@ -7404,7 +7480,7 @@ impl Shell {
         if !changed {
             return;
         }
-        self.sync_scrollbar(hwnd);
+        self.sync_scrollbar();
         self.retitle(hwnd);
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
@@ -7475,6 +7551,41 @@ fn set_title(hwnd: HWND, title: &str) {
 /// the paint keep running underneath it because it pumps our messages too.
 /// `UI-DESIGN.md` §14's first-run surface: what the window shows with no file — a line of
 /// welcome, how to open one, the recent files (a click opens one), and the claim §13.2 makes.
+/// Gives the keyboard back to the frame when a scroll bar has taken it.
+///
+/// **The one documented cost of scroll bar controls**: *"As a separate window, a scroll bar control
+/// takes direct input focus"*, which the frame's own bars did not. Without this, dragging the thumb
+/// would leave the keyboard on the bar — so `j`, `/` and every other key the grid answers would go
+/// to a control that only understands arrows, and the reader would have to click the grid to get
+/// their keyboard back. The tab strip avoids the same trap with `TCS_FOCUSNEVER`; there is no
+/// `SBS_` equivalent, so it is done here.
+///
+/// **Only when a bar actually holds it.** Calling `SetFocus` unconditionally on every scroll
+/// message would steal focus from whatever else legitimately had it — a find field, a dialog — and
+/// a wheel scroll produces these messages too.
+///
+/// **And only on `SB_ENDSCROLL`**, which is the code Windows sends when the user lets go. A scroll
+/// bar control runs a modal tracking loop while the thumb is held, and taking its focus part-way
+/// through that loop sends it `WM_KILLFOCUS` mid-drag — which risks ending the drag after a single
+/// step, and the same for auto-repeat on an arrow or in the page region. Waiting for the release is
+/// what makes that impossible rather than merely unlikely.
+fn keep_focus_off_the_bars(hwnd: HWND) {
+    // SAFETY: `GetFocus` and `SetFocus` take and return handles without retaining them; a null
+    // focus window is a normal answer and `owns` refuses it.
+    unsafe {
+        let focused = GetFocus();
+        let ours = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.scrollbars.as_ref())
+                .is_some_and(|bars| bars.owns(focused))
+        });
+        if ours {
+            let _ = SetFocus(hwnd);
+        }
+    }
+}
+
 /// Drawn by the same painter as a document, as rows of centred text.
 struct Welcome {
     lines: Vec<String>,
@@ -8091,7 +8202,7 @@ mod uia {
                 if i < s.document.len() {
                     s.document.active = i;
                     s.retitle(hwnd);
-                    s.sync_scrollbar(hwnd);
+                    s.sync_scrollbar();
                 }
                 Some(())
             });
@@ -8598,7 +8709,7 @@ mod uia {
                 } else {
                     row.saturating_sub(page - 1)
                 });
-                s.sync_scrollbar(hwnd);
+                s.sync_scrollbar();
                 Some(())
             });
             unsafe {
@@ -9255,7 +9366,7 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
                 doc.add_chip(&expression, polarity);
                 let rows = doc.view_rows();
                 doc.view.grid_mut().set_total_rows(rows);
-                shell.sync_scrollbar(hwnd);
+                shell.sync_scrollbar();
                 shell.retitle(hwnd);
                 true
             }
@@ -10217,7 +10328,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                             let rows = doc.view_rows();
                             doc.view.grid_mut().set_total_rows(rows);
                         }
-                        shell.sync_scrollbar(hwnd);
+                        shell.sync_scrollbar();
                         shell.retitle(hwnd);
                         unsafe {
                             let _ = InvalidateRect(hwnd, None, false);
@@ -10288,7 +10399,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                                 }
                             }
                         }
-                        shell.sync_scrollbar(hwnd);
+                        shell.sync_scrollbar();
                         shell.retitle(hwnd);
                         unsafe {
                             let _ = InvalidateRect(hwnd, None, false);
@@ -10599,7 +10710,7 @@ pub fn find_requested(hdlg: HWND, request: dialog::FindRequest) {
         };
         dialog::set_find_status(hdlg, &doc.finder.dialog_status(doc.answers_cut));
         if moved {
-            shell.sync_scrollbar(owner);
+            shell.sync_scrollbar();
         }
         shell.retitle(owner);
         unsafe {
@@ -10807,7 +10918,7 @@ pub fn filter_panel_changed(panel: HWND) {
         }
         // Retitled whether or not a box flipped: a selection in the other pane's list has just
         // made that pane the focused one, and the title names the focused document.
-        shell.sync_scrollbar(owner);
+        shell.sync_scrollbar();
         shell.retitle(owner);
         true
     });
@@ -10910,7 +11021,7 @@ pub fn filter_panel_context(panel: HWND, x: i32, y: i32) {
         if edit {
             shell.pending_filter_edit = Some(at);
         }
-        shell.sync_scrollbar(owner);
+        shell.sync_scrollbar();
         shell.retitle(owner);
         true
     });
@@ -11692,7 +11803,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     let mut state = s.borrow_mut();
                     if let Some(shell) = state.as_mut() {
                         shell.retitle(hwnd);
-                        shell.sync_scrollbar(hwnd);
+                        shell.sync_scrollbar();
                     }
                 });
                 unsafe {
@@ -11746,7 +11857,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // `paint` because the renderer is mutably borrowed for the whole of that function.
             STATE.with(|s| {
                 if let Some(shell) = s.borrow().as_ref() {
-                    shell.sync_scrollbar(hwnd);
+                    shell.sync_scrollbar();
                 }
             });
             uia::raise_selection_changes(hwnd);
@@ -12417,7 +12528,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 STATE.with(|s| {
                     if let Some(shell) = s.borrow_mut().as_mut() {
                         shell.retitle(hwnd);
-                        shell.sync_scrollbar(hwnd);
+                        shell.sync_scrollbar();
                     }
                 });
             }
@@ -12521,7 +12632,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         if let Some(shell) = s.borrow_mut().as_mut() {
                             shell.document.active = at.min(shell.document.len().saturating_sub(1));
                             shell.retitle(hwnd);
-                            shell.sync_scrollbar(hwnd);
+                            shell.sync_scrollbar();
                         }
                     });
                     unsafe {
@@ -12728,6 +12839,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return;
                 };
+                let bar = shell.scrollbars.as_ref().map(|b| b.vertical());
                 let Some(doc) = shell.document.as_mut() else {
                     return;
                 };
@@ -12757,8 +12869,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             fMask: SIF_TRACKPOS,
                             ..Default::default()
                         };
-                        unsafe { GetScrollInfo(hwnd, SB_VERT, &mut info) }
-                            .is_ok()
+                        bar.is_some_and(|b| unsafe { GetScrollInfo(b, SB_CTL, &mut info) }.is_ok())
                             .then(|| {
                                 let before = doc.view.grid().scroll();
                                 doc.view.grid_mut().scroll_to_fraction(
@@ -12771,12 +12882,15 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     _ => false,
                 };
                 if moved {
-                    shell.sync_scrollbar(hwnd);
+                    shell.sync_scrollbar();
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
             });
+            if code as i32 == SB_ENDSCROLL.0 {
+                keep_focus_off_the_bars(hwnd);
+            }
             LRESULT(0)
         }
         // The horizontal twin of the arm above — §1.2's mouse-only path to a line wider than the
@@ -12790,6 +12904,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let Some(shell) = state.as_mut() else {
                     return;
                 };
+                let bar = shell.scrollbars.as_ref().map(|b| b.horizontal());
                 let Some(doc) = shell.document.as_mut() else {
                     return;
                 };
@@ -12828,8 +12943,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                             fMask: SIF_TRACKPOS,
                             ..Default::default()
                         };
-                        unsafe { GetScrollInfo(hwnd, SB_HORZ, &mut info) }
-                            .is_ok()
+                        bar.is_some_and(|b| unsafe { GetScrollInfo(b, SB_CTL, &mut info) }.is_ok())
                             .then(|| {
                                 let before = doc.view.hgrid().offset_px();
                                 // No absolute setter on `HGrid`, so the move is expressed as the
@@ -12843,12 +12957,15 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     _ => false,
                 };
                 if moved {
-                    shell.sync_scrollbar(hwnd);
+                    shell.sync_scrollbar();
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
             });
+            if code as i32 == SB_ENDSCROLL.0 {
+                keep_focus_off_the_bars(hwnd);
+            }
             LRESULT(0)
         }
         // The user changed something in Windows' own settings. `"WindowMetrics"` is the UI font and
@@ -13179,6 +13296,7 @@ fn main() -> Result<()> {
             tabs: None,
             toolbar: None,
             statusbar: None,
+            scrollbars: None,
             status_shown: String::new(),
             show_toolbar: settings.toolbar.unwrap_or(true),
             large_icons: settings.toolbar_large.unwrap_or(false),
@@ -13259,7 +13377,7 @@ fn main() -> Result<()> {
             WINDOW_EX_STYLE::default(),
             class_name,
             windows::core::w!("Tailhawk"),
-            WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL,
+            WS_OVERLAPPEDWINDOW,
             placement.map_or(CW_USEDEFAULT, |w| w.x),
             placement.map_or(CW_USEDEFAULT, |w| w.y),
             placement.map_or(1280, |w| w.width.max(320)),
@@ -13287,11 +13405,13 @@ fn main() -> Result<()> {
     let strip = tabstrip::TabStrip::create(hwnd, instance);
     let bar = toolbar::Toolbar::create(hwnd, instance);
     let status = statusbar::StatusBar::new(hwnd, instance);
+    let bars = scrollbars::Bars::create(hwnd, instance);
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.tabs = strip;
             shell.toolbar = bar;
             shell.statusbar = status;
+            shell.scrollbars = bars;
         }
     });
 
