@@ -116,9 +116,17 @@ redistributable dependency. `cargo fmt --check` has broken the build on its own 
 The `tools/verify-*.ps1` harnesses drive the real binary. They need **`powershell`, not `pwsh`**,
 and a desktop session. `tools/verify-uia.ps1` is the exception — it needs no foreground.
 
-**A known flake:** `semantic::tests::a_screenful_costs_a_fraction_of_a_frame` fails under the full
-parallel suite on a loaded machine and passes alone and on CI. It is a timing criterion. Rerun it
-alone before blaming a change for it.
+**Two known flakes, both timing criteria:**
+`semantic::tests::a_screenful_costs_a_fraction_of_a_frame` and
+`paint::tests::the_layout_cost_does_not_scale_with_the_number_of_visible_columns`. Each fails under
+the full parallel suite on a loaded machine and passes alone and on CI. Rerun the named test alone
+before blaming a change for it.
+
+The second one was found on 2026-10-05 and reported `3.3x` against its `3.0x` ceiling — a *ratio*
+between a wide and a narrow layout, so a machine that is busy enough to perturb one measurement and
+not the other trips it. It passed alone immediately afterwards. Two is now enough of a pattern to
+say the general thing: **a failing assertion whose message quotes a duration or a ratio is a
+candidate for this, whatever its name**, and re-running it alone costs thirty seconds.
 
 ## Style
 

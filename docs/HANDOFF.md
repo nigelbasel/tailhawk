@@ -1,5 +1,69 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-05: the welcome list reads correctly, and there is one resize grip
+
+**Master `83cda63`, green on all five CI jobs by SHA. 269 shell + 972 core.**
+
+**Read this first, because it governs how the rest of these documents should be used.** The owner,
+2026-10-05: *"lets get something straight, you have implemented everything in this app, so there is
+no such thing as mine and yours. It is all yours"* — the second time he has said it. `CLEANROOM.md`
+§5's writer column was already right; the fault was in the language sessions use about the code.
+**And the harder half: `SPEC.md`, `UI-DESIGN.md`, `LOKI.md` and the provenance log are Claude's own
+writing, so none of them is an authority to cite back at him.** When one disagrees with what he is
+asking for, the document is what gets fixed. This is the same failure already recorded for Loki
+tailing, where a document's ordering kept being re-derived and offered back as a recommendation.
+
+### Three commits
+
+- **`270a1d4` — the welcome list shows the remote tails, and they open.** `Welcome::new` was fed
+  `settings.files` (every file whose column layout was saved, a remote tail's spill parts included)
+  instead of `settings.recent`, the curated list — so the surface showed temp paths with generated
+  names and none of the sources being tailed. `opens` was `Vec<Option<PathBuf>>`, so a remote row
+  could not have worked even with the right list: the click tried to open a file named
+  `loki://live?apps=…`. It holds `Recent` now. `Recent::is_spill` drops stale spill rows at parse —
+  **both shapes `stdin.rs` writes**, the piped stream's single file and a remote tail's directory of
+  parts, since only the directory form was caught at first. Recent rows get `IDC_HAND`, decided by
+  the same `entry_at` the click asks.
+- **`0abd05a` — the provenance row for `scrollbars.rs`, on its own and before the module.**
+  `CLEANROOM.md` §1.5 has slipped five times; a separate commit makes the ordering checkable.
+- **`83cda63` — the status bar is the bottom-most element with one grip.** The frame carried
+  `WS_VSCROLL | WS_HSCROLL`; Microsoft Learn: *"A standard scroll bar is located in the nonclient
+  area of a window"*, and `WS_HSCROLL` goes at the bottom of the client area — outside it — while
+  `msctls_statusbar32` docks inside. The hscroll strip was therefore permanently below the status
+  bar with the frame's sizing corner at its end, and the status bar drew its own `SBARS_SIZEGRIP`
+  above: two grips and a band beneath, exactly as reported, and **no layout arithmetic could have
+  lifted it.** Now two `SCROLLBAR` children inside the client area — what Notepad++, his own
+  comparison, does via its edit control. `scrollbars::layout` is pure;
+  `neither_bar_reaches_the_status_bars_strip` is named for the defect and mutation-checked.
+
+### Four unverified behaviours — they need a desktop and he was asked, not assumed
+
+The corner square and right-hand strip painting cleanly, a thumb drag surviving `SetFocus`, the band
+settling visibly on resize, and the vertical bar greying for a document that fits. The arithmetic has
+tests; none of them can see the screen. **The app has not been started — he had not answered.**
+
+### Open, and his call
+
+- Welcome-row link **styling**. `RowSource` gives `Welcome` only `row_text`/`row_number`, so per-row
+  colour needs a new trait method and painter support. Bound the hand cursor to the text extent at
+  the same time — `row_at_y` ignores x, so it currently spans the full row width.
+- `Document::describe` — 2 dead production callers, **36 call sites across 14 tests**.
+- The help document still describes none of the authentication.
+
+### Two things that cost real time and will again
+
+- **A test can stop running silently.** Inserting a test between an existing `#[test]` and its
+  function gave one test two attributes and left `every_other_matcher_survives_the_rewrite` with
+  none; it had not run for days while the suite count went *up*. Third occurrence of this
+  attribute-stealing mistake. In a `#[cfg(test)]` module, **"function is never used" and "duplicated
+  attribute" mean a test is not running.**
+- **`#[cfg(windows)]` and the portable core.** `SPILL_PREFIX` was briefly owned by `stdin.rs` and
+  read from the ungated `settings.rs`, which would have failed `portable-core`'s
+  `cargo check --target x86_64-unknown-linux-gnu`. A shared name belongs on the portable side.
+
+---
+
+
 ## ▶ Resume point — 2026-09-21: the owner reopened the workstream from real use
 
 **He used the build and came back with ten items**, which is what the section below anticipated.
