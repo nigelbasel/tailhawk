@@ -261,6 +261,17 @@ pub enum Recent {
 /// The prefix that marks a recent entry as a remote source rather than a path.
 const REMOTE_SCHEME: &str = "loki://";
 
+/// The name Tailhawk gives everything it spills to `%TEMP%` — the single file a piped stream goes
+/// to, and the directory of parts a remote tail fills. [`Recent::is_spill`] recognises either from
+/// a path alone, and `stdin.rs` builds both from this, so the two cannot drift apart.
+///
+/// **It lives here, on the portable side, although `stdin.rs` is what does the writing.** `stdin` is
+/// `#[cfg(windows)]` and this module is not, so a constant owned by `stdin` and read from here stops
+/// `tailhawk-core` compiling for Linux — which is `SPEC.md` §13's portability assertion and a CI job
+/// (`portable-core`) rather than a hypothetical. The *name* is portable knowledge; creating the file
+/// is the platform's work.
+pub(crate) const SPILL_PREFIX: &str = "tailhawk-spill-";
+
 /// What makes two recent entries the same entry rather than two.
 ///
 /// **A path folds case; a source does not, and folding one would lose a window.** Windows opens
@@ -297,6 +308,64 @@ fn unescape(text: &str) -> String {
 }
 
 impl Recent {
+    /// Whether this entry is a spill — a file Tailhawk itself wrote under `%TEMP%` to hold a
+    /// stream's lines, rather than a file anybody opened.
+    ///
+    /// **`stdin.rs` writes two shapes and both have to be caught.** A piped stream spills to a
+    /// single file, `tailhawk-spill-<pid>-<n>.log`; a remote tail spills into a *directory* of
+    /// parts, `tailhawk-spill-<pid>-<n>\part-NNNNNN.log`. So the last component is tested and so is
+    /// its parent — the parent because `part-000001.log` alone is a name anyone's log rotation might
+    /// use, and the file because the piped form has no spill directory above it.
+    ///
+    /// Both carry [`SPILL_PREFIX`], which is the one constant the naming comes from, so neither
+    /// shape can drift out of recognition without the other going with it.
+    ///
+    /// **Only that prefix, never "looks temporary".** Somebody tailing a log their own tool wrote to
+    /// `%TEMP%` is doing something ordinary and keeps their entry. The comparison folds case, as
+    /// [`identity_of`] does for paths, because a path that has been through a short name or a
+    /// hand-edited settings file is still the same file to Windows.
+    ///
+    /// A remote entry is never a spill: it names the source, which is the thing worth reopening.
+    pub fn is_spill(&self) -> bool {
+        let Recent::File(path) = self else {
+            return false;
+        };
+        let named_spill = |part: &str| {
+            part.get(..SPILL_PREFIX.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(SPILL_PREFIX))
+        };
+        path.rsplit(['\\', '/']).take(2).any(named_spill)
+    }
+
+    /// The entry as a reader should see it on the welcome surface.
+    ///
+    /// **The owner's report of 2026-10-05**: the list showed *"the temp directory with generated
+    /// file names"* and he was right that those were remote tails — a Loki window's document is a
+    /// spill part like `tailhawk-spill-52140-00\part-000001.log`, which names nothing anybody would
+    /// recognise. A remote entry reads as the source and the applications it was opened for, which
+    /// is what he asked to see instead.
+    ///
+    /// **A file keeps its path**, because for a file the path *is* the recognisable thing — but only
+    /// its last two components, since a recent list is for recognising rather than for auditing and
+    /// a full path pushes the name off the end of the line.
+    pub fn shown(&self) -> String {
+        match self {
+            Recent::File(path) => {
+                let parts: Vec<&str> = path.rsplit(['\\', '/']).take(2).collect();
+                match parts.len() {
+                    0 => path.clone(),
+                    1 => parts[0].to_owned(),
+                    _ => format!("{}\\{}", parts[1], parts[0]),
+                }
+            }
+            Recent::Remote { source, apps } if apps.is_empty() => format!("{source}  (Loki)"),
+            Recent::Remote { source, apps } => {
+                let named: Vec<&str> = apps.iter().map(String::as_str).collect();
+                format!("{}  (Loki)", crate::apps::source_label(source, &named))
+            }
+        }
+    }
+
     /// The entry as one line of the settings file.
     pub fn encode(&self) -> String {
         match self {
@@ -628,7 +697,11 @@ impl Settings {
                 },
                 Section::Recent => {
                     if key == "files" {
-                        settings.recent = array(value).iter().map(|s| Recent::decode(s)).collect();
+                        settings.recent = array(value)
+                            .iter()
+                            .map(|s| Recent::decode(s))
+                            .filter(|e| !e.is_spill())
+                            .collect();
                         settings.recent.truncate(RECENT_MAX);
                     }
                 }
@@ -873,6 +946,57 @@ mod tests {
         );
         let read = Settings::from_toml(&s.to_toml());
         assert_eq!(read.recent, s.recent, "the list survives the file");
+    }
+
+    /// **A spill part is never a recent file**, however it got into the list.
+    ///
+    /// The write side has refused to remember one since 2026-09-21, but the stored list still
+    /// carries four from before that — and they are the *worst* kind of stale entry, because the
+    /// directory is deleted when the tail ends, so the row names nothing and clicking it can only
+    /// fail. Dropping them on read is what finally clears them: the next save rewrites the list
+    /// without them.
+    ///
+    /// **Both spill shapes**, because `stdin.rs` writes two: a remote tail spills into a
+    /// *directory* of parts, and a piped stream spills to a single *file* beside it. They share
+    /// `SPILL_PREFIX` by construction, and only the directory form was caught when this was first
+    /// written — a piped document's path is the file form, and nothing else refuses it, so it would
+    /// have gone into the list and died there when the process exited.
+    ///
+    /// A `%TEMP%` path that is *not* a spill is left alone. Somebody tailing a log their own tool
+    /// wrote to the temp directory is doing something ordinary, and this must not reach for "looks
+    /// like a temporary file" when the shape it actually knows is "a file Tailhawk itself made".
+    #[test]
+    fn a_stale_spill_part_is_dropped_from_the_recent_list_on_read() {
+        let real = r"C:\logs\app.log";
+        let temp = r"C:\Users\x\AppData\Local\Temp\my-own.log";
+        let spill = r"C:\Users\x\AppData\Local\Temp\tailhawk-spill-52140-00\part-000001.log";
+        let piped = r"C:\Users\x\AppData\Local\Temp\tailhawk-spill-52140-00.log";
+        let shouted = r"C:\USERS\X\APPDATA\LOCAL\TEMP\TAILHAWK-SPILL-52140-01\PART-000001.LOG";
+        let mut s = Settings::default();
+        s.recent = vec![
+            Recent::File(spill.to_owned()),
+            Recent::File(piped.to_owned()),
+            Recent::File(real.to_owned()),
+            Recent::File(shouted.to_owned()),
+            Recent::File(temp.to_owned()),
+            Recent::Remote {
+                source: "live".to_owned(),
+                apps: Vec::new(),
+            },
+        ];
+        let read = Settings::from_toml(&s.to_toml());
+        assert_eq!(
+            read.recent,
+            vec![
+                Recent::File(real.to_owned()),
+                Recent::File(temp.to_owned()),
+                Recent::Remote {
+                    source: "live".to_owned(),
+                    apps: Vec::new()
+                }
+            ],
+            "both spill shapes went, the ordinary temp file and the remote stayed"
+        );
     }
 
     /// **A remote source sits in the same list as a file, and survives the file it is written to.**
@@ -1269,9 +1393,54 @@ mod tests {
         assert!(merged.sources.iter().any(|s| s.name == "mine"));
     }
 
-    /// **A source says why it cannot be used, while it is being typed.** The alternative is a
-    /// query that fails later with whatever the server happened to say, which is a much worse place
-    /// to learn that a URL was http or a client id was left blank.
+    /// **A remote entry reads as the source it is, not as the spill file it opens.**
+    ///
+    /// The report of 2026-10-05: the welcome list showed "the temp directory with generated file
+    /// names", and they really were remote tails — a Loki window's document is
+    /// `tailhawk-spill-52140-00\part-000001.log`-shaped, which names nothing a reader knows.
+    ///
+    /// Three cases, in the order they are asserted. A source opened with a chosen set of
+    /// applications names both, and never in the encoded form that belongs in the settings file. A
+    /// source opened whole says so without inventing an application list. And a file keeps only the
+    /// part a reader recognises, because a recent list is for recognising and a full path pushes the
+    /// name itself off the end of the row — which is also why a spill part still reads as a path,
+    /// and why the welcome surface has to take the curated list rather than `files`.
+    #[test]
+    fn a_recent_entry_reads_as_the_thing_a_reader_recognises() {
+        let remote = Recent::Remote {
+            source: "live".to_owned(),
+            apps: vec!["Worker".to_owned(), "Api".to_owned()],
+        };
+        let shown = remote.shown();
+        assert!(shown.starts_with("live"), "{shown}");
+        assert!(shown.contains("Worker"), "{shown}");
+        assert!(
+            shown.contains("(Loki)"),
+            "it says what kind of thing it is: {shown}"
+        );
+        assert!(
+            !shown.contains("loki://") && !shown.contains('?'),
+            "the encoded form is for the file, not the reader: {shown}"
+        );
+
+        let whole = Recent::Remote {
+            source: "live".to_owned(),
+            apps: Vec::new(),
+        };
+        assert_eq!(whole.shown(), "live  (Loki)");
+
+        assert_eq!(
+            Recent::File("C:\\logs\\api\\today.log".to_owned()).shown(),
+            "api\\today.log"
+        );
+        assert_eq!(Recent::File("today.log".to_owned()).shown(), "today.log");
+
+        assert_eq!(
+            Recent::File("C:\\Temp\\tailhawk-spill-52140-00\\part-000001.log".to_owned()).shown(),
+            "tailhawk-spill-52140-00\\part-000001.log"
+        );
+    }
+
     /// **A remembered application set survives the round trip, and an empty one writes nothing.**
     /// Empty means "ask me", so a source that has never had a choice made must not come back
     /// carrying an empty list that reads as a deliberate selection of nothing.
@@ -1321,6 +1490,9 @@ mod tests {
         assert_ne!(back.sources[0].name, back.sources[1].name);
     }
 
+    /// **A source says why it cannot be used, while it is being typed.** The alternative is a
+    /// query that fails later with whatever the server happened to say, which is a much worse place
+    /// to learn that a URL was http or a client id was left blank.
     #[test]
     fn a_source_reports_the_first_thing_wrong_with_it() {
         let good = Source {

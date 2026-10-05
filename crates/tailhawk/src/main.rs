@@ -138,7 +138,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_SIZEWE, WM_SETCURSOR,
+    DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_HAND, IDC_SIZEWE, WM_SETCURSOR,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PT_PEN, PT_TOUCH, SM_REMOTESESSION,
@@ -5465,14 +5465,8 @@ impl Shell {
                     if let Some(tabs) = self.tabs.as_mut() {
                         tabs.place(w as i32, 0, false);
                     }
-                    let recent: Vec<String> = self
-                        .settings
-                        .files
-                        .iter()
-                        .rev()
-                        .take(6)
-                        .map(|f| f.path.clone())
-                        .collect();
+                    let recent: Vec<tailhawk_core::settings::Recent> =
+                        self.settings.recent.iter().take(6).cloned().collect();
                     let welcome = Welcome::new(cell, (w, h), &recent, band);
                     let laid = renderer.paint_rows(&welcome.view, &welcome)?;
                     rasterised = laid.rasterised;
@@ -7484,8 +7478,12 @@ fn set_title(hwnd: HWND, title: &str) {
 /// Drawn by the same painter as a document, as rows of centred text.
 struct Welcome {
     lines: Vec<String>,
-    /// The path a row opens when clicked, for the "Recent" rows.
-    opens: Vec<Option<PathBuf>>,
+    /// What a row opens when clicked, for the "Recent" rows.
+    ///
+    /// **A `PathBuf` until 2026-10-05, which is why a remote row could not work.** The list held
+    /// encoded entries, so clicking `loki://live?apps=…` tried to open a *file* by that name. It
+    /// carries the entry itself now, and the shell acts on whichever kind it is.
+    opens: Vec<Option<tailhawk_core::settings::Recent>>,
     view: View,
 }
 
@@ -7496,7 +7494,18 @@ impl Welcome {
     /// drawn in. **A view with no chrome band never has [`RowSource::draw_chrome`] called on it** —
     /// `paint.rs` gates that call on `chrome_px() > 0` — so a `Welcome` that forgets this draws no
     /// menu bar however carefully it implements the method.
-    fn new(cell: (f32, f32), size: (u32, u32), recent: &[String], band_px: f32) -> Self {
+    ///
+    /// **`recent` is `settings.recent`, never `settings.files`.** The two are easy to confuse and
+    /// the wrong one was passed here until 2026-10-05: `files` remembers every file whose column
+    /// layout was saved, which includes a remote tail's spill parts, so the owner's welcome surface
+    /// listed `tailhawk-spill-52140-00\part-000001.log` six times over and none of the sources he
+    /// had actually been tailing. `recent` is the curated list, and it holds both kinds of entry.
+    fn new(
+        cell: (f32, f32),
+        size: (u32, u32),
+        recent: &[tailhawk_core::settings::Recent],
+        band_px: f32,
+    ) -> Self {
         let chrome_h = band_px;
         let (cell_w, row_h) = cell;
         let width_cells = ((size.0 as f32) / cell_w.max(1.0)).max(20.0) as usize;
@@ -7516,7 +7525,7 @@ impl Welcome {
         for text in [
             "Watch your logs like a hawk",
             "",
-            "Drop a log file here, or press Ctrl+O   (the menus above list everything Tailhawk does)",
+            "Drop a log file here, or press Ctrl+O",
             "",
         ] {
             lines.push(centre(text));
@@ -7525,9 +7534,9 @@ impl Welcome {
         if !recent.is_empty() {
             lines.push(left("Recent"));
             opens.push(None);
-            for path in recent {
-                lines.push(left(&format!("  {path}")));
-                opens.push(Some(PathBuf::from(path)));
+            for entry in recent {
+                lines.push(left(&format!("  {}", entry.shown())));
+                opens.push(Some(entry.clone()));
             }
             lines.push(String::new());
             opens.push(None);
@@ -7550,8 +7559,12 @@ impl Welcome {
         Self { lines, opens, view }
     }
 
-    /// The recent file a client `y` lands on, if any.
-    fn path_at(&self, y: f32) -> Option<PathBuf> {
+    /// The recent entry a client `y` lands on, if any.
+    ///
+    /// **Both the click and the cursor ask this**, which is what keeps them from disagreeing about
+    /// where a row is — the rows were asked for as hyperlinks, so the pointer becomes a hand over
+    /// exactly the rows a click would act on, and neither can drift from the other.
+    fn entry_at(&self, y: f32) -> Option<tailhawk_core::settings::Recent> {
         let row = self.view.grid().row_at_y(y)?;
         self.opens.get(row as usize).cloned().flatten()
     }
@@ -11959,11 +11972,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if (lparam.0 as u32 & 0xFFFF) as u16 != HTCLIENT {
                 return def_proc(hwnd, msg, wparam, lparam);
             }
-            let sizing = STATE.with(|s| {
+            let wanted = STATE.with(|s| {
                 let state = s.borrow();
-                let Some(shell) = state.as_ref() else {
-                    return false;
-                };
+                let shell = state.as_ref()?;
                 // A drag already in flight keeps the cursor whatever the pointer strays over: the
                 // slop is about a cell, and a resize that flickers back to an arrow mid-drag reads
                 // as having been dropped.
@@ -11972,7 +11983,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     .as_ref()
                     .is_some_and(|d| d.resizing.is_some())
                 {
-                    return true;
+                    return Some(IDC_SIZEWE);
                 }
                 let mut point = POINT::default();
                 // SAFETY: both take a pointer to a `POINT` we own, and neither retains it.
@@ -11980,28 +11991,32 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     if GetCursorPos(&mut point).is_err()
                         || !ScreenToClient(hwnd, &mut point).as_bool()
                     {
-                        return false;
+                        return None;
                     }
                 }
                 let (x, y) = (point.x as f32, point.y as f32);
-                let Some((pane, _, _)) = shell.pane_at(x, y) else {
-                    return false;
-                };
-                let Some(doc) = shell.document.panes().get(pane) else {
-                    return false;
-                };
+                if shell.document.panes().is_empty() {
+                    let over = shell
+                        .welcome
+                        .as_ref()
+                        .is_some_and(|w| w.entry_at(y).is_some());
+                    return over.then_some(IDC_HAND);
+                }
+                let (pane, _, _) = shell.pane_at(x, y)?;
+                let doc = shell.document.panes().get(pane)?;
                 // `Some(Some(_))` is a boundary; `Some(None)` is a title, which stays an arrow, as
                 // a list header does.
                 matches!(
                     doc.header_hit(x - doc.pane_left, y - doc.pane_top),
                     Some(Some(_))
                 )
+                .then_some(IDC_SIZEWE)
             });
-            if sizing {
+            if let Some(which) = wanted {
                 // SAFETY: a shared system cursor; `LoadCursorW` with a null instance and an
                 // `IDC_*` ordinal cannot fail in a way that matters, and the handle is not owned.
                 unsafe {
-                    if let Ok(cursor) = LoadCursorW(None, IDC_SIZEWE) {
+                    if let Ok(cursor) = LoadCursorW(None, which) {
                         SetCursor(cursor);
                     }
                 }
@@ -12154,8 +12169,15 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 // No document: the welcome surface — a click on a recent file opens it.
                 if shell.document.panes().is_empty() {
                     if msg == WM_LBUTTONDOWN {
-                        if let Some(path) = shell.welcome.as_ref().and_then(|w| w.path_at(y)) {
-                            shell.open_path(hwnd, path);
+                        if let Some(entry) = shell.welcome.as_ref().and_then(|w| w.entry_at(y)) {
+                            match entry {
+                                tailhawk_core::settings::Recent::File(path) => {
+                                    shell.open_path(hwnd, PathBuf::from(path));
+                                }
+                                tailhawk_core::settings::Recent::Remote { source, apps } => {
+                                    shell.pending_reopen = Some((source, apps));
+                                }
+                            }
                         }
                     }
                     return;
@@ -16680,8 +16702,12 @@ mod tests {
                 cell,
                 (w, h),
                 &[
-                    r"C:\logs\app.log".to_owned(),
-                    r"C:\logs\other.log".to_owned(),
+                    tailhawk_core::settings::Recent::File(r"C:\logs\app.log".to_owned()),
+                    tailhawk_core::settings::Recent::Remote {
+                        source: "live".to_owned(),
+                        apps: vec!["nurtur-gateway".to_owned(), "nurtur-print-api".to_owned()],
+                    },
+                    tailhawk_core::settings::Recent::File(r"C:\logs\other.log".to_owned()),
                 ],
                 renderer.chrome_line_height().unwrap_or(18.0),
             );

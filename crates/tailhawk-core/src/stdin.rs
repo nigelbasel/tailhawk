@@ -133,8 +133,12 @@ pub fn stdin() -> Stdin {
     }
 }
 
-/// Prefix every spill file shares, so [`reap_orphans`] can recognise one it did not create.
-const SPILL_PREFIX: &str = "tailhawk-spill-";
+/// Prefix every spill file shares, so [`reap_orphans`] can recognise one it did not create — and
+/// so [`crate::settings::Recent::is_spill`] can recognise one from a path with no document to ask.
+///
+/// Defined in `settings.rs` because that module is portable and this one is `#[cfg(windows)]`; see
+/// the constant's own documentation for why that way round.
+use crate::settings::SPILL_PREFIX;
 const SPILL_SUFFIX: &str = ".log";
 
 /// A temp file holding a stream's bytes, with §13.2's DACL and lifetime.

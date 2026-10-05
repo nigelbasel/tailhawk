@@ -614,11 +614,6 @@ pub fn source_label(source: &str, chosen: &[&str]) -> String {
 mod tests {
     use super::*;
 
-    /// **The user's own selector survives.** A source's query carries the environment they chose
-    /// and whatever else they narrowed by; an app choice that replaced it would silently widen the
-    /// window to every environment at once, which is the failure this project keeps calling the
-    /// worst kind — more data than asked for, with nothing to say so.
-    #[test]
     /// **A generated name has to be one a source may actually hold**, because it is also the key
     /// the credential is filed under — so anything outside letters, digits, space and `- _ .` would
     /// produce an entry the store refuses, and a secret that cannot be saved.
@@ -677,6 +672,11 @@ mod tests {
         assert_ne!(next, full);
     }
 
+    /// **The user's own selector survives.** A source's query carries the environment they chose
+    /// and whatever else they narrowed by; an app choice that replaced it would silently widen the
+    /// window to every environment at once, which is the failure this project keeps calling the
+    /// worst kind — more data than asked for, with nothing to say so.
+    #[test]
     fn every_other_matcher_survives_the_rewrite() {
         let out =
             with_apps(r#"{environment="live", cluster="ukwest"}"#, &["identity"]).expect("ok");
