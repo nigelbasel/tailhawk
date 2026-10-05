@@ -7675,8 +7675,15 @@ impl Welcome {
     /// **Both the click and the cursor ask this**, which is what keeps them from disagreeing about
     /// where a row is — the rows were asked for as hyperlinks, so the pointer becomes a hand over
     /// exactly the rows a click would act on, and neither can drift from the other.
+    ///
+    /// **The chrome band comes off the `y` first, and forgetting it is why clicking did nothing.**
+    /// `set_chrome_px` reserves the top of this surface for §2.3's toolbar and the rows are drawn
+    /// below it, but `Grid::row_at_y` is pure row arithmetic and knows nothing about chrome — handed
+    /// a raw client `y` it answers about two rows low, so a click landed on a blank line, the
+    /// footer, or past the end, and every one of those is `None`. A click *in* the band is still
+    /// `None`, because the subtraction goes negative and `row_at_y` refuses it.
     fn entry_at(&self, y: f32) -> Option<tailhawk_core::settings::Recent> {
-        let row = self.view.grid().row_at_y(y)?;
+        let row = self.view.grid().row_at_y(y - self.view.chrome_px())?;
         self.opens.get(row as usize).cloned().flatten()
     }
 }
@@ -14827,6 +14834,54 @@ mod tests {
             Some("live"),
             "the identity is the settings key, which is what regroup looks up"
         );
+    }
+
+    /// **A click on a recent row opens that row**, and the chrome band is why it did not.
+    ///
+    /// Reported 2026-10-05: *"When I click on an entry on the home page, nothing happens"*, while
+    /// the same sources opened from the toolbar — which placed the fault in this mapping rather
+    /// than in the opening. `Welcome` reserves a band for §2.3's toolbar with `set_chrome_px`, and
+    /// the rows are drawn *below* it, but `Grid::row_at_y` knows nothing about chrome: handed a raw
+    /// client `y` it answers with a row about two lower than the one under the pointer, so a click
+    /// landed on a blank, on the footer, or past the end. Every entry in the reporter's list was a
+    /// remote one, so every click went through the deferred path and failed silently.
+    ///
+    /// The assertion walks the band: for each row the surface says is an entry, the `y` that row is
+    /// *drawn* at must map back to it. That is the property the click and the hand cursor both need,
+    /// and it holds for any band height rather than for the one that happened to be on screen.
+    #[test]
+    fn a_click_on_a_recent_row_lands_on_that_row() {
+        let recent = vec![
+            tailhawk_core::settings::Recent::Remote {
+                source: "live".to_owned(),
+                apps: vec!["nurtur-gateway".to_owned()],
+            },
+            tailhawk_core::settings::Recent::File(r"C:\logs\app.log".to_owned()),
+            tailhawk_core::settings::Recent::Remote {
+                source: "qa".to_owned(),
+                apps: Vec::new(),
+            },
+        ];
+        let cell = (8.0_f32, 18.0_f32);
+        for band in [0.0_f32, 34.0, 36.0, 51.0] {
+            let w = Welcome::new(cell, (1200, 800), &recent, band);
+            let rows: Vec<usize> = (0..w.opens.len())
+                .filter(|i| w.opens[*i].is_some())
+                .collect();
+            assert_eq!(
+                rows.len(),
+                recent.len(),
+                "band {band}: every entry has a row"
+            );
+            for (n, row) in rows.iter().enumerate() {
+                let y = band + (*row as f32) * cell.1 + cell.1 / 2.0;
+                assert_eq!(
+                    w.entry_at(y).as_ref(),
+                    Some(&recent[n]),
+                    "band {band}: the click at y={y} on row {row} must open entry {n}"
+                );
+            }
+        }
     }
 
     /// **A cut on the opening window reaches the document it opens**, before the tail has polled
