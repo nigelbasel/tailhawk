@@ -15,7 +15,11 @@
 //!
 //! ## What is kept
 //!
-//! - `[appearance]` — `theme`: `dark`, `light` or `system`, when chosen.
+//! - `[appearance]` — `theme`: `dark`, `light` or `system`, when chosen. Also the preferences that
+//!   are not strictly appearance but share its table rather than earning a heading each:
+//!   `font`, `font_size`, `toolbar`, `toolbar_large`, and `remote_minutes` — how far back a remote
+//!   source fetches, which `File ▸ Open remote ▸ Fetch window` sets and a hand-edited value
+//!   overrides with any duration, not only one the menu offers.
 //! - `[window]` — `x`, `y`, `width`, `height`, `maximized`: where the window was.
 //! - `[[file]]` — `path`, `chips` (each `+text` or `-text`), `collapse`, `bookmarks` (file rows),
 //!   `labels` (each `n:text`), `columns` (widths in cells, zero meaning hidden), `column_order`
@@ -231,6 +235,15 @@ pub struct Settings {
     pub font_size: Option<u16>,
     /// §2.3: whether the toolbar row is shown. Absent means shown — the default is the row.
     pub toolbar: Option<bool>,
+    /// How far back a remote source fetches, in minutes. Absent means [`DEFAULT_REMOTE_MINUTES`].
+    ///
+    /// **This was a hard-coded hour with no way to change it**, while the status bar told anyone
+    /// whose answer came back cut to *"narrow the time range or the selector"* — naming two
+    /// remedies when only the selector existed. Reported 2026-10-05: *"there is no indication of
+    /// how they might do that"*, and the honest reading is that for the time range there was no
+    /// how. It is remembered rather than per-run because a reader who needs four hours needs four
+    /// hours again tomorrow.
+    pub remote_minutes: Option<u32>,
     /// §2.3: whether the toolbar draws its icons large. Absent means small, which is what every
     /// shell toolbar starts at. The owner's ask of 2026-09-08: "there should probably be an option
     /// for large and small toolbars, that is a common option of standard windows apps".
@@ -260,6 +273,43 @@ pub enum Recent {
 
 /// The prefix that marks a recent entry as a remote source rather than a path.
 const REMOTE_SCHEME: &str = "loki://";
+
+/// How far back a remote source fetches when nothing has been chosen — one hour, which is what the
+/// fixed constant was before there was a choice.
+pub const DEFAULT_REMOTE_MINUTES: u32 = 60;
+
+/// The fetch windows offered on the menu, longest label first in reading order.
+///
+/// **Data rather than a menu, so the choice and the fetch cannot disagree.** The menu is built from
+/// this and so is the check mark, and [`remote_minutes_of`] resolves whatever is stored against it —
+/// including a hand-edited settings file naming a duration that is not on the list, which is kept
+/// rather than silently rounded, because §12.4's file is explicitly something a user edits.
+pub const FETCH_WINDOWS: [(&str, u32); 5] = [
+    ("Last &15 minutes", 15),
+    ("Last &hour", 60),
+    ("Last &4 hours", 240),
+    ("Last &12 hours", 720),
+    ("Last &24 hours", 1440),
+];
+
+/// The fetch window in minutes: what was stored, or the default when nothing was.
+pub fn remote_minutes_of(stored: Option<u32>) -> u32 {
+    stored.filter(|m| *m > 0).unwrap_or(DEFAULT_REMOTE_MINUTES)
+}
+
+/// How a fetch window reads in a sentence — "the last 4 hours" — for the status bar and the notice.
+///
+/// Whole hours read as hours and anything else as minutes, because "the last 240 minutes" is a
+/// number a reader has to divide before it means anything.
+pub fn fetch_window_said(minutes: u32) -> String {
+    match (minutes, minutes % 60) {
+        (0, _) => "the last hour".to_owned(),
+        (1, _) => "the last minute".to_owned(),
+        (60, _) => "the last hour".to_owned(),
+        (m, 0) => format!("the last {} hours", m / 60),
+        (m, _) => format!("the last {m} minutes"),
+    }
+}
 
 /// The name Tailhawk gives everything it spills to `%TEMP%` — the single file a piped stream goes
 /// to, and the directory of parts a remote tail fills. [`Recent::is_spill`] recognises either from
@@ -470,6 +520,9 @@ impl Settings {
         if over.window.is_some() {
             self.window = over.window;
         }
+        if over.remote_minutes.is_some() {
+            self.remote_minutes = over.remote_minutes;
+        }
         if over.toolbar.is_some() {
             self.toolbar = over.toolbar;
         }
@@ -509,6 +562,7 @@ impl Settings {
         if self.theme.is_some()
             || self.font.is_some()
             || self.font_size.is_some()
+            || self.remote_minutes.is_some()
             || self.toolbar.is_some()
             || self.toolbar_large.is_some()
         {
@@ -521,6 +575,9 @@ impl Settings {
             }
             if let Some(size) = self.font_size {
                 out.push_str(&format!("font_size = {size}\n"));
+            }
+            if let Some(mins) = self.remote_minutes {
+                out.push_str(&format!("remote_minutes = {mins}\n"));
             }
             if let Some(shown) = self.toolbar {
                 out.push_str(&format!("toolbar = {shown}\n"));
@@ -684,6 +741,9 @@ impl Settings {
                     "theme" => settings.theme = Some(unquote(value)),
                     "font" => settings.font = Some(unquote(value)),
                     "font_size" => settings.font_size = value.parse().ok(),
+                    "remote_minutes" => {
+                        settings.remote_minutes = value.parse().ok().filter(|m: &u32| *m > 0)
+                    }
                     // Only the two spellings TOML has. Anything else leaves the key unset, which
                     // means the default rather than "hidden" — a typo must not silently take the
                     // row away, since the way back to it is the row's own menu item.
@@ -948,6 +1008,57 @@ mod tests {
         assert_eq!(read.recent, s.recent, "the list survives the file");
     }
 
+    /// **A fetch window reads as a reader would say it**, and survives the settings file.
+    ///
+    /// "the last 240 minutes" is a number somebody has to divide before it means anything, so whole
+    /// hours read as hours. The round trip matters because the choice is remembered: a reader who
+    /// needs four hours needs four hours again tomorrow, which is the whole reason this is a
+    /// setting rather than a per-run toggle.
+    ///
+    /// **The last case is a duration nobody offered.** §12.4's file is explicitly something a user
+    /// edits, so a hand-written seven minutes is honoured rather than rounded to the nearest menu
+    /// item — and the assertion checks that seven really is absent from the menu, so the case
+    /// cannot quietly stop testing what it is named for.
+    ///
+    /// The round trip also caught a defect in its own right: the `[appearance]` heading is written
+    /// only when one of its keys is set, and `remote_minutes` was missing from that condition — so
+    /// a reader who changed the fetch window and nothing else had the choice discarded on save.
+    #[test]
+    fn a_fetch_window_reads_as_a_sentence_and_is_remembered() {
+        assert_eq!(fetch_window_said(15), "the last 15 minutes");
+        assert_eq!(fetch_window_said(60), "the last hour");
+        assert_eq!(fetch_window_said(240), "the last 4 hours");
+        assert_eq!(fetch_window_said(1440), "the last 24 hours");
+        assert_eq!(
+            fetch_window_said(90),
+            "the last 90 minutes",
+            "not 1.5 hours"
+        );
+
+        assert_eq!(
+            remote_minutes_of(None),
+            DEFAULT_REMOTE_MINUTES,
+            "nothing chosen is the hour the constant used to be"
+        );
+        assert_eq!(
+            remote_minutes_of(Some(0)),
+            DEFAULT_REMOTE_MINUTES,
+            "a zero in a hand-edited file would fetch an empty window"
+        );
+        assert_eq!(remote_minutes_of(Some(240)), 240);
+
+        let mut s = Settings::default();
+        s.remote_minutes = Some(240);
+        assert_eq!(Settings::from_toml(&s.to_toml()).remote_minutes, Some(240));
+
+        let odd = Settings::from_toml("[appearance]\nremote_minutes = 7\n");
+        assert_eq!(remote_minutes_of(odd.remote_minutes), 7);
+        assert!(
+            !FETCH_WINDOWS.iter().any(|(_, m)| *m == 7),
+            "and it is genuinely not on the menu"
+        );
+    }
+
     /// **A spill part is never a recent file**, however it got into the list.
     ///
     /// The write side has refused to remember one since 2026-09-21, but the stored list still
@@ -1160,6 +1271,7 @@ mod tests {
                 height: 800,
                 maximized: false,
             }),
+            remote_minutes: Some(240),
             files: Vec::new(),
             sources: vec![Source {
                 name: "dev".to_owned(),

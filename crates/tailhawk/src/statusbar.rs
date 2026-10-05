@@ -465,6 +465,13 @@ impl StatusPanes {
 }
 
 /// The model → view-model mapping for the status bar: facts in, eight panes out.
+///
+/// **A remedy names where it is, not only what it is.** The cut-answer warning used to say "narrow
+/// the time range or the selector", and the report of 2026-10-05 was that *"there is no indication
+/// of how they might do that"* — truer than it sounded, because the fetch window was a constant
+/// with no control anywhere while the selector at least had a submenu. Both are items under
+/// `File ▸ Open remote` now, so the sentence can point at them; a warning that names an action the
+/// reader cannot find is worse than one that names none.
 pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
     // **What just happened, then what is happening, then what is wrong — and all of them, not
     // whichever was checked first.** The composed sentence gave the notice and the rules warning
@@ -474,7 +481,10 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
     said.extend(facts.notice);
     said.extend(facts.tee);
     if facts.cut {
-        said.push("⚠ answers cut at the limit — narrow the time range or the selector");
+        said.push(
+            "⚠ answers cut at the limit — File ▸ Open remote ▸ Fetch window for a shorter range, \
+             or ▸ Choose applications for fewer",
+        );
     }
     said.extend(facts.rules);
     if facts.contrast {

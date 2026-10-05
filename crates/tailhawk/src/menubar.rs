@@ -194,6 +194,11 @@ pub const ID_SOURCE_BASE: u32 = 10_400;
 /// could be chosen once and never changed — and a menu is where a command belongs, rather than a
 /// shift-click nobody would find.
 pub const ID_SOURCE_PICK_BASE: u32 = 10_800;
+
+/// `File ▸ Open remote ▸ Fetch window`: `ID_WINDOW_BASE + n` chooses the n-th of
+/// [`tailhawk_core::settings::FETCH_WINDOWS`]. Clear of every other range, which
+/// `the_id_ranges_cannot_collide` asserts rather than trusts.
+pub const ID_WINDOW_BASE: u32 = 10_900;
 pub const ID_SORT_COL_BASE: u32 = 10_500;
 pub const ID_TOPN_COL_BASE: u32 = 10_600;
 pub const ID_FILTER_COL_BASE: u32 = 10_700;
@@ -368,6 +373,11 @@ pub struct BarState {
     /// do. At any moment exactly one of these is the opposite of what is on screen, so offering
     /// both would mean offering one that does nothing.
     pub regroup_separates: Option<bool>,
+    /// The fetch window in minutes, for the check mark on `Open remote ▸ Fetch window`.
+    ///
+    /// Zero means nothing has been chosen, which `remote_minutes_of` resolves to the default — so a
+    /// defaulted `BarState` checks the hour rather than checking nothing.
+    pub remote_minutes: u32,
 }
 
 /// The configured remote sources as a menu, ending in the way to configure one.
@@ -446,7 +456,13 @@ fn column_number(n: usize) -> String {
     }
 }
 
-pub fn remote_menu_of(sources: &[String]) -> Vec<tailhawk_core::menu::Item> {
+/// `minutes` is the fetch window now in force, so exactly the one offering it carries the check.
+///
+/// **Both remedies the status bar names live here, side by side.** When an answer comes back cut
+/// the bar says to narrow the time range or the selector: `Choose applications` is the selector and
+/// `Fetch window` is the time range, which until 2026-10-05 was a constant with no menu item
+/// anywhere — so the advice named two remedies and only one of them could be followed.
+pub fn remote_menu_of(sources: &[String], minutes: u32) -> Vec<tailhawk_core::menu::Item> {
     use tailhawk_core::menu::Item;
     let mut items: Vec<Item> = sources
         .iter()
@@ -462,6 +478,16 @@ pub fn remote_menu_of(sources: &[String]) -> Vec<tailhawk_core::menu::Item> {
                 .enumerate()
                 .map(|(n, name)| {
                     Item::command(&name.replace('&', "&&"), "", ID_SOURCE_PICK_BASE + n as u32)
+                })
+                .collect(),
+        ));
+        items.push(Item::submenu(
+            "Fetch &window",
+            tailhawk_core::settings::FETCH_WINDOWS
+                .iter()
+                .enumerate()
+                .map(|(n, (label, mins))| {
+                    Item::check(label, "", ID_WINDOW_BASE + n as u32, *mins == minutes)
                 })
                 .collect(),
         ));
@@ -530,6 +556,7 @@ pub fn menu_bar(
         maximised,
         can_maximise,
         regroup_separates: _,
+        remote_minutes: _,
     } = state;
     let open = doc.is_some();
     let selected = doc.is_some_and(|d| d.has_selection());
@@ -554,7 +581,13 @@ pub fn menu_bar(
         // greyed**, because [`remote_menu_of`]'s last item is the dialog that configures the first
         // source. It used to disable itself when none was configured, which left the one command
         // this program exists for reachable only by knowing that Tools held the way in.
-        Item::submenu("Open re&mote source", remote_menu_of(sources)),
+        Item::submenu(
+            "Open re&mote source",
+            remote_menu_of(
+                sources,
+                tailhawk_core::settings::remote_minutes_of(Some(state.remote_minutes)),
+            ),
+        ),
         // §12.4's regroup, under the command that opened the windows it acts on.
         on(
             cmd(
@@ -1139,12 +1172,12 @@ mod tests {
     /// item nor the toolbar button is ever a dead end, and neither is ever greyed.
     #[test]
     fn the_remote_menu_always_ends_with_the_way_to_configure_one() {
-        let none = remote_menu_of(&[]);
+        let none = remote_menu_of(&[], 60);
         assert_eq!(none.len(), 1, "no sources, no separator, no blank menu");
         assert_eq!(none[0].text(), "Remote sources…");
         assert_eq!(none[0].id, Some(command_id(Command::EditSources)));
 
-        let two = remote_menu_of(&["live".to_owned(), "qa".to_owned()]);
+        let two = remote_menu_of(&["live".to_owned(), "qa".to_owned()], 60);
         let text: Vec<String> = two.iter().map(|i| i.text()).collect();
         assert_eq!(
             text,
@@ -1153,9 +1186,11 @@ mod tests {
                 "qa",
                 "",
                 "Choose applications",
+                "Fetch window",
                 "",
                 "Remote sources…"
-            ]
+            ],
+            "the two remedies a cut answer names sit together, above the separator"
         );
         assert_eq!(two[0].id, Some(ID_SOURCE_BASE));
         assert_eq!(two[1].id, Some(ID_SOURCE_BASE + 1));
@@ -1167,7 +1202,7 @@ mod tests {
     /// because a source with nothing remembered is also one whose picker a reader may want twice.
     #[test]
     fn choosing_applications_again_offers_every_source() {
-        let items = remote_menu_of(&["live".to_owned(), "qa".to_owned()]);
+        let items = remote_menu_of(&["live".to_owned(), "qa".to_owned()], 60);
         let choose = items
             .iter()
             .find(|i| i.text() == "Choose applications")
@@ -1190,9 +1225,81 @@ mod tests {
         );
 
         // Nothing configured, nothing to choose from: no empty submenu.
-        assert!(remote_menu_of(&[])
+        assert!(remote_menu_of(&[], 60)
             .iter()
             .all(|i| i.text() != "Choose applications"));
+    }
+
+    /// **The time range the status bar names is an item a reader can actually reach.**
+    ///
+    /// Reported 2026-10-05: the bar said to narrow the time range or the selector and *"there is no
+    /// indication of how they might do that"* — truer than it sounded, because the fetch window was
+    /// a constant with no control anywhere while the selector at least had a submenu. This asserts
+    /// the item exists, that exactly the chosen duration carries the check, and that its ids cannot
+    /// reach into any neighbouring range.
+    ///
+    /// **The range check is every pair, not the one pair that had an assertion.** Each range is a
+    /// base plus an index, so an overlap means one menu item silently running another's command.
+    /// There are eight ranges and the previous assertion compared two of them; `10_300` is still
+    /// unclaimed between `ID_FORMAT_BASE` and `ID_SOURCE_BASE`, which is exactly the sort of gap
+    /// somebody fills by eye.
+    #[test]
+    fn the_fetch_window_is_on_the_menu_and_checks_the_chosen_one() {
+        let items = remote_menu_of(&["live".to_owned()], 240);
+        let window = items
+            .iter()
+            .find(|i| i.text() == "Fetch window")
+            .expect("the submenu is there whenever any source is");
+        let inner: Vec<(String, Option<u32>, bool)> = window
+            .items
+            .iter()
+            .map(|i| (i.text(), i.id, i.checked))
+            .collect();
+        assert_eq!(
+            inner.len(),
+            tailhawk_core::settings::FETCH_WINDOWS.len(),
+            "built from the list, not from a second copy of it"
+        );
+        let checked: Vec<&String> = inner
+            .iter()
+            .filter(|(_, _, c)| *c)
+            .map(|(t, _, _)| t)
+            .collect();
+        assert_eq!(
+            checked,
+            ["Last 4 hours"],
+            "exactly the chosen one: {inner:?}"
+        );
+        for (n, (_, id, _)) in inner.iter().enumerate() {
+            assert_eq!(*id, Some(ID_WINDOW_BASE + n as u32));
+        }
+
+        let ranges = [
+            (ID_RECENT_BASE, 64u32),
+            (ID_FORMAT_BASE, 64),
+            (ID_SOURCE_BASE, tailhawk_core::sourceset::MAX_SOURCES as u32),
+            (ID_SORT_COL_BASE, 64),
+            (ID_TOPN_COL_BASE, 64),
+            (ID_FILTER_COL_BASE, 64),
+            (
+                ID_SOURCE_PICK_BASE,
+                tailhawk_core::sourceset::MAX_SOURCES as u32,
+            ),
+            (
+                ID_WINDOW_BASE,
+                tailhawk_core::settings::FETCH_WINDOWS.len() as u32,
+            ),
+        ];
+        for (i, (base_a, len_a)) in ranges.iter().enumerate() {
+            for (base_b, len_b) in ranges.iter().skip(i + 1) {
+                let clear = base_a + len_a <= *base_b || base_b + len_b <= *base_a;
+                assert!(clear, "{base_a}+{len_a} overlaps {base_b}+{len_b}");
+            }
+        }
+
+        assert!(remote_menu_of(&[], 60)
+            .iter()
+            .all(|i| i.text() != "Fetch window"));
     }
 
     /// **A source the user called `R&D` is drawn `R&D`.** `AppendMenuW` reads a lone `&` as a
@@ -1200,7 +1307,7 @@ mod tests {
     /// and a name that is all one word could take a mnemonic another item already owns.
     #[test]
     fn an_ampersand_in_a_source_name_survives_the_menu() {
-        let items = remote_menu_of(&["R&D".to_owned()]);
+        let items = remote_menu_of(&["R&D".to_owned()], 60);
         assert_eq!(items[0].label, "R&&D", "doubled for Windows");
         assert_eq!(items[0].text(), "R&D", "drawn as the user typed it");
     }
@@ -1227,7 +1334,7 @@ mod tests {
         assert!(remote.enabled, "never greyed: it is the way in");
         assert_eq!(
             remote.items.iter().map(|i| i.text()).collect::<Vec<_>>(),
-            remote_menu_of(&[])
+            remote_menu_of(&[], 60)
                 .iter()
                 .map(|i| i.text())
                 .collect::<Vec<_>>()

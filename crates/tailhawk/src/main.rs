@@ -126,17 +126,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
     SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
     ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_ARROW, MSG, NONCLIENTMETRICSW, SB_BOTTOM, SB_CTL,
-    SB_ENDSCROLL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK,
-    SB_TOP, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
-    SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT,
-    WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED,
-    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_APPSTARTING, IDC_ARROW, MSG, NONCLIENTMETRICSW,
+    SB_BOTTOM, SB_CTL, SB_ENDSCROLL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
+    SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS,
+    SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
+    SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT,
+    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT,
+    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_HAND, IDC_SIZEWE, WM_SETCURSOR,
@@ -5312,6 +5312,41 @@ impl Shell {
         })
     }
 
+    /// Chooses the `n`-th of [`tailhawk_core::settings::FETCH_WINDOWS`] as the fetch window.
+    ///
+    /// **This is the remedy the status bar names when an answer comes back cut.** Before it existed
+    /// the bar said to "narrow the time range or the selector" while the range was a constant with
+    /// no control anywhere — two remedies named, one of them reachable.
+    ///
+    /// **It takes effect on the next fetch rather than refetching what is open.** A tail that has
+    /// been running is scrollback somebody is reading, and discarding it to apply a preference is
+    /// not what choosing a duration asks for. The notice says which window now applies, so the
+    /// choice is not silent either — a setting that changes nothing visible reads as a setting that
+    /// did not take.
+    fn choose_fetch_window(&mut self, hwnd: HWND, n: usize) {
+        let Some((_, mins)) = tailhawk_core::settings::FETCH_WINDOWS.get(n) else {
+            return;
+        };
+        self.settings.remote_minutes = Some(*mins);
+        self.save_settings(hwnd);
+        self.notice = Some(format!(
+            "a remote source will fetch {} — File ▸ Open remote ▸ Fetch window",
+            tailhawk_core::settings::fetch_window_said(*mins)
+        ));
+    }
+
+    /// Whether anything the reader is waiting for is in flight.
+    ///
+    /// **All three stages, because the first one is the long one.** `fetching` is the Loki request,
+    /// `reading` the document being opened off the spill, and `opening` the name the status bar is
+    /// showing until the document lands. Only `opening` was ever visible anywhere, and it is set in
+    /// `open_path` — which for a remote source runs *after* the HTTP round trip has finished. So the
+    /// slowest part of opening a tail was the part with nothing to show for it, which is what the
+    /// 2026-10-05 report was about.
+    fn busy_opening(&self) -> bool {
+        !self.fetching.is_empty() || !self.reading.is_empty() || self.opening.is_some()
+    }
+
     fn refresh_title(&self, hwnd: HWND) {
         let name = self.document.as_ref().map(|doc| doc.summary.as_str());
         set_title(hwnd, &window_title(name));
@@ -6205,6 +6240,7 @@ impl Shell {
         };
         self.opening = Some(opening.clone());
         self.notice = Some(opening);
+        show_busy_pointer();
         self.reading.push(spawn_open(move || {
             let mut doc = Document::open(&path)?;
             if let Some((label, name, spill, query, cut)) = remote {
@@ -7006,6 +7042,14 @@ impl Shell {
                 self.pending_repick = Some((id - menubar::ID_SOURCE_PICK_BASE) as usize);
                 true
             }
+            id if (menubar::ID_WINDOW_BASE
+                ..menubar::ID_WINDOW_BASE
+                    + tailhawk_core::settings::FETCH_WINDOWS.len() as u32)
+                .contains(&id) =>
+            {
+                self.choose_fetch_window(hwnd, (id - menubar::ID_WINDOW_BASE) as usize);
+                true
+            }
             // Format's column submenus — `UX-REVIEW.md` finding 3. The id is a **position in the
             // shown columns**, which `Document::column_at` resolves back into the layout's index
             // space; handing the position straight to the command would act on the wrong column
@@ -7551,6 +7595,59 @@ fn set_title(hwnd: HWND, title: &str) {
 /// the paint keep running underneath it because it pumps our messages too.
 /// `UI-DESIGN.md` §14's first-run surface: what the window shows with no file — a line of
 /// welcome, how to open one, the recent files (a click opens one), and the claim §13.2 makes.
+/// Puts the busy pointer up at the moment work starts, without waiting for the pointer to move.
+///
+/// `WM_SETCURSOR` arrives on mouse movement, so a reader who clicks a recent entry and then holds
+/// still would see the old cursor for the whole fetch — the very span this is meant to report. One
+/// direct call covers that; every subsequent movement goes through [`pointer_for`], which also puts
+/// the cursor back when the work is done.
+fn show_busy_pointer() {
+    // SAFETY: a shared system cursor by ordinal; the handle is not owned and nothing is retained.
+    unsafe {
+        if let Ok(cursor) = LoadCursorW(None, IDC_APPSTARTING) {
+            SetCursor(cursor);
+        }
+    }
+}
+
+/// Which pointer the window wants, as a decision rather than as a `SetCursor` call.
+///
+/// A view-model in this file's sense: no `HWND`, no cursor handle, and therefore testable. The
+/// shell maps it to an `IDC_*` ordinal and nothing else decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pointer {
+    /// Work is in flight — a Loki fetch, a spill, a document being read.
+    Busy,
+    /// Over something that opens when clicked.
+    Link,
+    /// Over a column boundary that can be dragged.
+    SizeWE,
+    /// Nothing to say; the class cursor stands.
+    Default,
+}
+
+/// Picks the pointer, in the order the reader needs rather than the order the code happens to ask.
+///
+/// **`busy` wins**, and that is the whole point of the 2026-10-05 report: *"there is a delay before
+/// it does … I think there should be more feedback, even if it is just a wait cursor"*. Opening a
+/// remote source fetches an hour of records over HTTP before a single row exists, and for that whole
+/// span the window looked idle. A pointer that says "working" has to beat a pointer that says
+/// "clickable", because during the fetch both are true and only one of them is news.
+///
+/// `sizing` beats `link` for the same reason it beats everything else while a drag is live: a
+/// boundary under the pointer is a thing being *done*, not a thing being offered.
+fn pointer_for(busy: bool, sizing: bool, link: bool) -> Pointer {
+    if busy {
+        Pointer::Busy
+    } else if sizing {
+        Pointer::SizeWE
+    } else if link {
+        Pointer::Link
+    } else {
+        Pointer::Default
+    }
+}
+
 /// Gives the keyboard back to the frame when a scroll bar has taken it.
 ///
 /// **The one documented cost of scroll bar controls**: *"As a separate window, a scroll bar control
@@ -9125,21 +9222,26 @@ fn open_remote_menu(hwnd: HWND) -> bool {
     // **Everything the menu needs is read out of the borrow first.** `drop_corner` sends messages
     // and `track_context` pumps a modal loop; either inside a `STATE` borrow is the panic this
     // file's other deferred dialogs exist to avoid.
-    let (sources, bar) = STATE.with(|s| {
+    let (sources, bar, minutes) = STATE.with(|s| {
         let state = s.borrow();
         let Some(shell) = state.as_ref() else {
-            return (Vec::new(), None);
+            return (
+                Vec::new(),
+                None,
+                tailhawk_core::settings::remote_minutes_of(None),
+            );
         };
         (
             shell.source_names(),
             shell.toolbar.as_ref().map(|bar| bar.hwnd()),
+            tailhawk_core::settings::remote_minutes_of(shell.settings.remote_minutes),
         )
     });
     let Some((x, y)) = bar.and_then(|bar| toolbar::drop_corner(bar, menubar::ID_SOURCE_MENU))
     else {
         return false;
     };
-    let items = menubar::remote_menu_of(&sources);
+    let items = menubar::remote_menu_of(&sources, minutes);
     if let Some(id) = menubar::track_context(hwnd, &items, x, y) {
         // **Posted, not run.** This is called from inside comctl32's `TBN_DROPDOWN` handling, and
         // `Remote sources…` opens a modal dialog: running it here would put a second modal loop
@@ -9533,14 +9635,22 @@ enum Resume {
 /// Fetch the opening window of records for `source` — **on a worker**.
 ///
 /// `label` is what the document will be called: the source's name, or the application chosen for it.
-fn ask_for_records(source: tailhawk_core::settings::Source, label: String) -> Receiver<Fetched> {
+///
+/// `minutes` is how far back to ask, from `File ▸ Open remote ▸ Fetch window`. **It is a parameter
+/// rather than a constant read in here** so the one place that decides it is the settings, and the
+/// worker cannot disagree with the menu's check mark or with what the notice has just said.
+fn ask_for_records(
+    source: tailhawk_core::settings::Source,
+    label: String,
+    minutes: u32,
+) -> Receiver<Fetched> {
     spawn_fetch(move || {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         let window = tailhawk_core::loki::Window {
-            start: now - REMOTE_WINDOW_NANOS,
+            start: now - i64::from(minutes) * 60 * 1_000_000_000,
             end: now,
         };
         match pull::pull(
@@ -9822,8 +9932,6 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
     }
 }
 
-const REMOTE_WINDOW_NANOS: i64 = 60 * 60 * 1_000_000_000;
-
 /// How many records one opening asks for. Below `loki::MAX_LIMIT`, because this is a first
 /// screenful and not an export.
 const REMOTE_LIMIT: u32 = 1_000;
@@ -9921,6 +10029,11 @@ fn remote_to_reopen(
 /// **Every caller reaches this with no `STATE` borrow alive**, because it takes one of its own and
 /// [`set_notice`] takes another. That is not a style note: calling it from [`Shell::menu_choose`],
 /// which runs with the shell already borrowed, panicked on a live `RefCell` and killed the process.
+///
+/// **The notice names the window rather than assuming it.** It used to say "fetching the last
+/// hour…" because an hour was the only thing it could be; now that
+/// [`Shell::choose_fetch_window`] exists, a notice naming the wrong duration would be worse than
+/// one naming none — so the minutes are read here and the sentence is built from them.
 fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: String) {
     // **Remembered here, which is the one place every remote open passes through** — the picker's
     // two branches, a regroup, and reopening from the list itself. The applications come from the
@@ -9931,7 +10044,14 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
         source: source.name.clone(),
         apps: tailhawk_core::apps::apps_in(&source.query),
     };
-    let waiting = ask_for_records(source, label.clone());
+    let minutes = STATE.with(|s| {
+        tailhawk_core::settings::remote_minutes_of(
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.settings.remote_minutes),
+        )
+    });
+    let waiting = ask_for_records(source, label.clone(), minutes);
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.fetching.push(waiting);
@@ -9939,7 +10059,14 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
             shell.save_settings(hwnd);
         }
     });
-    set_notice(hwnd, format!("{label}: fetching the last hour…"));
+    set_notice(
+        hwnd,
+        format!(
+            "{label}: fetching {}…",
+            tailhawk_core::settings::fetch_window_said(minutes)
+        ),
+    );
+    show_busy_pointer();
     unsafe {
         SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
     }
@@ -12093,42 +12220,44 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let wanted = STATE.with(|s| {
                 let state = s.borrow();
                 let shell = state.as_ref()?;
+                let busy = shell.busy_opening();
                 // A drag already in flight keeps the cursor whatever the pointer strays over: the
                 // slop is about a cell, and a resize that flickers back to an arrow mid-drag reads
                 // as having been dropped.
-                if shell
+                let dragging = shell
                     .document
                     .as_ref()
-                    .is_some_and(|d| d.resizing.is_some())
-                {
-                    return Some(IDC_SIZEWE);
-                }
+                    .is_some_and(|d| d.resizing.is_some());
+                let (mut sizing, mut link) = (dragging, false);
                 let mut point = POINT::default();
                 // SAFETY: both take a pointer to a `POINT` we own, and neither retains it.
-                unsafe {
-                    if GetCursorPos(&mut point).is_err()
-                        || !ScreenToClient(hwnd, &mut point).as_bool()
-                    {
-                        return None;
+                let got = unsafe {
+                    GetCursorPos(&mut point).is_ok() && ScreenToClient(hwnd, &mut point).as_bool()
+                };
+                if got && !dragging {
+                    let (x, y) = (point.x as f32, point.y as f32);
+                    if shell.document.panes().is_empty() {
+                        link = shell
+                            .welcome
+                            .as_ref()
+                            .is_some_and(|w| w.entry_at(y).is_some());
+                    } else if let Some((pane, _, _)) = shell.pane_at(x, y) {
+                        // `Some(Some(_))` is a boundary; `Some(None)` is a title, which stays an
+                        // arrow, as a list header does.
+                        sizing = shell.document.panes().get(pane).is_some_and(|doc| {
+                            matches!(
+                                doc.header_hit(x - doc.pane_left, y - doc.pane_top),
+                                Some(Some(_))
+                            )
+                        });
                     }
                 }
-                let (x, y) = (point.x as f32, point.y as f32);
-                if shell.document.panes().is_empty() {
-                    let over = shell
-                        .welcome
-                        .as_ref()
-                        .is_some_and(|w| w.entry_at(y).is_some());
-                    return over.then_some(IDC_HAND);
+                match pointer_for(busy, sizing, link) {
+                    Pointer::Busy => Some(IDC_APPSTARTING),
+                    Pointer::SizeWE => Some(IDC_SIZEWE),
+                    Pointer::Link => Some(IDC_HAND),
+                    Pointer::Default => None,
                 }
-                let (pane, _, _) = shell.pane_at(x, y)?;
-                let doc = shell.document.panes().get(pane)?;
-                // `Some(Some(_))` is a boundary; `Some(None)` is a title, which stays an arrow, as
-                // a list header does.
-                matches!(
-                    doc.header_hit(x - doc.pane_left, y - doc.pane_top),
-                    Some(Some(_))
-                )
-                .then_some(IDC_SIZEWE)
             });
             if let Some(which) = wanted {
                 // SAFETY: a shared system cursor; `LoadCursorW` with a null instance and an
@@ -12444,6 +12573,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 maximised: shell.document.maximised(),
                                 can_maximise: shell.document.can_maximise(),
                                 regroup_separates: shell.regroup_separates(),
+                                remote_minutes: shell.settings.remote_minutes.unwrap_or(0),
                             },
                             &shell.settings.recent,
                             &shell.source_names(),
@@ -14833,6 +14963,35 @@ mod tests {
             doc.remote_source.as_ref().map(|(name, _)| name.as_str()),
             Some("live"),
             "the identity is the settings key, which is what regroup looks up"
+        );
+    }
+
+    /// **"Working" outranks "clickable", and that is the whole decision.**
+    ///
+    /// Reported 2026-10-05: clicking a recent entry opened the tail *"but there is a delay before it
+    /// does … I think there should be more feedback, even if it is just a wait cursor"*. During that
+    /// delay the pointer is still over the row it came from, so `link` and `busy` are both true —
+    /// and the one worth saying is the one the reader does not already know.
+    #[test]
+    fn the_busy_pointer_outranks_every_other_answer() {
+        assert_eq!(pointer_for(true, false, true), Pointer::Busy, "over a link");
+        assert_eq!(
+            pointer_for(true, true, false),
+            Pointer::Busy,
+            "over an edge"
+        );
+        assert_eq!(pointer_for(true, true, true), Pointer::Busy, "over both");
+        assert_eq!(
+            pointer_for(false, true, true),
+            Pointer::SizeWE,
+            "a drag beats an offer"
+        );
+        assert_eq!(pointer_for(false, false, true), Pointer::Link);
+        assert_eq!(pointer_for(false, true, false), Pointer::SizeWE);
+        assert_eq!(
+            pointer_for(false, false, false),
+            Pointer::Default,
+            "nothing to say leaves the class cursor alone"
         );
     }
 
