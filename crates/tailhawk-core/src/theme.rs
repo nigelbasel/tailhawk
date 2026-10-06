@@ -69,6 +69,18 @@ pub struct Theme {
     /// application; the text on it keeps its own ink except under High Contrast, where the fill is
     /// the system highlight and the ink must invert to stay legible.
     pub selection_bg: Colour,
+    /// The fill behind the row a row-wise command would act on, or `None` to rule it instead.
+    ///
+    /// **Two hairlines were not enough to read as "this line".** The owner, 2026-10-06: *"when I
+    /// click on a line, it doesnt show as selected, even though there are operations specific to
+    /// the selected line"* — and he was looking at the marker, which was a one-pixel rule above and
+    /// below. Every editor he is comparing it against fills the current line, so it is filled here
+    /// too, well below the selection's weight so the two can be told apart on one row.
+    ///
+    /// `None` under High Contrast, where the palette is three system colours and the only fill
+    /// available *is* the selection — a current-row fill there would claim bytes were selected.
+    /// That was the original objection to filling at all, and it is the half of it that survives.
+    pub current_row_bg: Option<Colour>,
     pub match_bg: Colour,
     pub current_match_bg: Colour,
     pub current_match_ink: Colour,
@@ -116,6 +128,7 @@ impl Theme {
             ink: [0.878, 0.890, 0.906, 1.0],
             selection_ink: None,
             selection_bg: [0.20, 0.36, 0.60, 1.0],
+            current_row_bg: Some([0.26, 0.28, 0.32, 1.0]),
             match_bg: [0.36, 0.29, 0.06, 1.0],
             current_match_bg: [0.95, 0.62, 0.16, 1.0],
             current_match_ink: [0.071, 0.078, 0.090, 1.0],
@@ -190,6 +203,7 @@ impl Theme {
             ink: [0.13, 0.14, 0.16, 1.0],
             selection_ink: None,
             selection_bg: [0.72, 0.82, 0.98, 1.0],
+            current_row_bg: Some([0.90, 0.92, 0.96, 1.0]),
             match_bg: [0.98, 0.90, 0.60, 1.0],
             current_match_bg: [0.98, 0.62, 0.16, 1.0],
             current_match_ink: [0.10, 0.08, 0.05, 1.0],
@@ -285,6 +299,7 @@ impl Theme {
             ink: foreground,
             selection_ink: Some(background),
             selection_bg: highlight,
+            current_row_bg: None,
             match_bg: highlight,
             current_match_bg: highlight,
             current_match_ink: background,

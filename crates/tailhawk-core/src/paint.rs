@@ -368,6 +368,11 @@ impl Painter {
     /// line up, and it does not become weaker because the cause is a font engine rather than a
     /// pending read. The row is skipped, [`Laid::failed_rows`] counts it, and the other forty-nine
     /// reach the screen.
+    /// **The caret's row is marked before anything on it is drawn**, so a selection on that row
+    /// overdraws the marker and the two are never confused. It is filled where
+    /// [`Theme::current_row_bg`] offers a colour and ruled where it does not — the fill reads as
+    /// "this line" the way the editors this sits beside do, and the rules are what High Contrast
+    /// gets, since its only fill is the selection's own.
     pub fn lay_out(&mut self, view: &View, tint: [f32; 4], source: &dyn RowSource) -> Result<Laid> {
         let mut total = Laid::default();
         let inset = view.top_inset();
@@ -385,26 +390,33 @@ impl Painter {
         let cell_w = self.cell_width();
         let caret_row = source.caret_row();
         for (row, y) in rows {
-            // The caret's row, ruled above and below rather than filled.
-            //
-            // **A fill would be wrong in two ways.** It would compete with the selection's fill for
-            // the same pixels on the same row, and under High Contrast — where the palette is three
-            // system colours — the only fill available is `highlight`, which *is* the selection.
-            // A rule is legible in every theme, is the focus idiom Windows already uses, and cannot
-            // be read as "these bytes are selected".
             if caret_row == Some(row) {
                 let width = gutter + view.hgrid().viewport_px();
                 let height = view.grid().row_height();
-                for edge in [y, y + height - 1.0] {
-                    self.instances.push(Instance {
-                        pos: [0.0, edge],
-                        size: [width, 1.0],
-                        tint: t.caret,
-                        mode: MODE_SOLID,
-                        ..Instance::default()
-                    });
+                match t.current_row_bg {
+                    Some(fill) => {
+                        self.instances.push(Instance {
+                            pos: [0.0, y],
+                            size: [width, height],
+                            tint: fill,
+                            mode: MODE_SOLID,
+                            ..Instance::default()
+                        });
+                        total.quads += 1;
+                    }
+                    None => {
+                        for edge in [y, y + height - 1.0] {
+                            self.instances.push(Instance {
+                                pos: [0.0, edge],
+                                size: [width, 1.0],
+                                tint: t.caret,
+                                mode: MODE_SOLID,
+                                ..Instance::default()
+                            });
+                        }
+                        total.quads += 2;
+                    }
                 }
-                total.quads += 2;
             }
             // The gutter: a mark and the physical line number, right-aligned, in a quieter ink.
             if gutter > 0.0 {
@@ -1607,7 +1619,7 @@ mod tests {
         drop(off);
     }
 
-    /// **The caret's row is ruled, and only the caret's row.**
+    /// **The caret's row is marked, and only the caret's row.**
     ///
     /// Written because the owner reported on 2026-08-27 that clicking a line gave no sign of which
     /// line had been clicked — and he was right: a single click places an *empty* selection, which
@@ -1615,11 +1627,17 @@ mod tests {
     /// The row was live in the model the whole time, deciding what `Ctrl+D` and `Define format from
     /// a line` acted on, with nothing on screen to say so.
     ///
+    /// **He reported it again on 2026-10-06**, against the fix: *"when I click on a line, it doesnt
+    /// show as selected"*. The marker was two one-pixel rules, which is the focus idiom for a list
+    /// item and not what a page of text reads as selected. So a theme that offers
+    /// `current_row_bg` gets a fill, and the rules remain only where no fill is safe — High
+    /// Contrast, whose only fill is the selection's own.
+    ///
     /// Goes through `lay_out` and inspects the instances for the same reason the selection test
     /// does: the half that was broken is the path from the source to the quads, and a test that
     /// calls `caret_row` directly cannot see it.
     #[test]
-    fn the_caret_row_is_ruled_above_and_below_and_no_other_row_is() {
+    fn the_caret_row_is_marked_and_no_other_row_is() {
         let Some((_off, mut painter)) = painter_or_skip("the_caret_row_is_ruled") else {
             return;
         };
@@ -1639,27 +1657,62 @@ mod tests {
         painter.begin_frame();
         painter.lay_out(&view, INK, &source).expect("lay out");
         let row_h = view.grid().row_height();
-        let rules: Vec<f32> = painter
+        let fill = Theme::dark()
+            .current_row_bg
+            .expect("the dark theme fills the current row");
+        let fills: Vec<&Instance> = painter
             .instances()
             .iter()
-            .filter(|i| i.mode == MODE_SOLID && i.tint == Theme::dark().caret && i.size[1] == 1.0)
-            .map(|i| i.pos[1])
+            .filter(|i| i.mode == MODE_SOLID && i.tint == fill)
             .collect();
 
-        assert_eq!(rules.len(), 2, "one rule above the caret row and one below");
-        let top = rules[0].min(rules[1]);
-        let bottom = rules[0].max(rules[1]);
+        assert_eq!(fills.len(), 1, "one row filled, the caret's");
+        let marker = fills[0];
         assert!(
-            (bottom - top - (row_h - 1.0)).abs() < 0.5,
-            "the two rules should bracket exactly one row: {top} and {bottom} against {row_h}"
+            (marker.size[1] - row_h).abs() < 0.5,
+            "it covers the row: {} against {row_h}",
+            marker.size[1]
         );
-        // The rule reaches across the gutter as well, or it looks like a column divider.
-        let wide = painter
-            .instances()
-            .iter()
-            .filter(|i| i.mode == MODE_SOLID && i.tint == Theme::dark().caret && i.size[1] == 1.0)
-            .all(|i| i.pos[0] == 0.0 && i.size[0] > view.hgrid().cell_width());
-        assert!(wide, "a rule that stops at the text is not a row marker");
+        assert!(
+            (marker.pos[1] - row_h).abs() < 0.5,
+            "and it is on row 1, not row 0: {}",
+            marker.pos[1]
+        );
+        assert_eq!(marker.pos[0], 0.0);
+        assert!(
+            marker.size[0] > view.hgrid().cell_width(),
+            "a marker that stops at the text is not a row marker"
+        );
+        assert_ne!(
+            fill,
+            Theme::dark().selection_bg,
+            "and it is not the selection's fill, or the two could not be told apart"
+        );
+    }
+
+    /// **Where no fill is safe the row is ruled instead.**
+    ///
+    /// High Contrast's palette is three system colours and its only fill is the selection's own, so
+    /// filling the current row there would claim bytes were selected. That was the original
+    /// objection to filling at all, and it is the half that survives.
+    #[test]
+    fn high_contrast_rules_the_caret_row_rather_than_filling_it() {
+        let ink = [1.0, 1.0, 1.0, 1.0];
+        let ground = [0.0, 0.0, 0.0, 1.0];
+        let highlight = [0.0, 0.4, 0.8, 1.0];
+        let hc = Theme::high_contrast(ink, ground, highlight);
+        assert!(
+            hc.current_row_bg.is_none(),
+            "no fill is offered, so the painter falls back to the rules"
+        );
+        assert_eq!(
+            hc.selection_bg, highlight,
+            "because the only fill it has is the selection's own"
+        );
+        assert!(
+            Theme::dark().current_row_bg.is_some() && Theme::light().current_row_bg.is_some(),
+            "while the ordinary themes do fill it"
+        );
     }
 
     /// **A row that nothing points at is not ruled.**

@@ -47,6 +47,14 @@ const SHARE_ALL: FILE_SHARE_MODE =
 /// `ERROR_SHARING_VIOLATION`. Named here because §5.1 requires it to be distinguished from every
 /// other open failure — it is unfixable from the reader side, so the remedy is writer-side advice
 /// rather than a retry.
+/// How many times [`LogFile::open_waiting`] retries a sharing violation, and how long it waits
+/// between tries — about a quarter of a second in all.
+///
+/// Long enough to ride out an append-and-close writer, short enough that a reader who really has
+/// been locked out gets told so rather than watching a window do nothing.
+const OPEN_RETRIES: u32 = 10;
+const OPEN_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
 const WIN32_SHARING_VIOLATION: u32 = 32;
 const WIN32_FILE_NOT_FOUND: u32 = 2;
 const WIN32_PATH_NOT_FOUND: u32 = 3;
@@ -59,6 +67,16 @@ pub enum FileError {
     /// The **writer** holds an exclusive handle. Nothing the reader does can fix this, so §5.1
     /// specifies presenting the writer-side remedy by name — `shared: true` for a Serilog file
     /// sink, `keepFileOpen="false"` for NLog, `MinimalLock` for log4net.
+    ///
+    /// **The `Display` impl now names all three, and did not until 2026-10-06.** It said the file
+    /// was held exclusively and stopped there, leaving the reader to work out that the fix is in
+    /// the *writer's* configuration rather than in Tailhawk — and there is nothing to do on this
+    /// side, since the share mode belongs to the writer's handle and taking it is forbidden. A
+    /// message that names no remedy is the same defect as a status line telling somebody to narrow
+    /// a time range it gives them no way to narrow.
+    ///
+    /// **Reaching this at all means the lock outlasted [`LogFile::open_waiting`]'s patience**, so a
+    /// reader who sees it is genuinely locked out rather than unlucky in their timing.
     ///
     /// No handle-stealing, no `NtDuplicateObject`.
     SharingViolation,
@@ -74,7 +92,9 @@ impl std::fmt::Display for FileError {
             FileError::SharingViolation => write!(
                 f,
                 "the application writing this file holds it exclusively, so it cannot be read \
-                 while it is open"
+                 while it is open — the fix is in the writer's configuration: Serilog needs \
+                 `shared: true`, NLog `keepFileOpen=\"false\"` or `concurrentWrites=\"true\"`, \
+                 log4net the `MinimalLock` locking model"
             ),
             FileError::NotFound => write!(f, "the file does not exist"),
             FileError::Io(m) => write!(f, "{m}"),
@@ -122,6 +142,39 @@ impl LogFile {
     /// Opens exactly as `SPEC.md` §5.1 specifies. There is no other open in the product.
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_share_mode(path, SHARE_ALL)
+    }
+
+    /// The same, but waiting out a **momentary** sharing violation.
+    ///
+    /// **§5.1 treats a sharing violation as permanent and that is only half true.** A writer that
+    /// holds its log open exclusively for its whole run is unfixable from here, which is what §5.1
+    /// describes and what the remedy table is for. But a writer that opens, appends and closes —
+    /// which is what `shared: true` and `keepFileOpen="false"` *produce*, and what any number of
+    /// loggers do by default — holds it exclusively for microseconds at a time. Opening during one
+    /// of those is a coin toss, and losing it refused the file outright.
+    ///
+    /// The owner hit exactly that on 2026-10-06 and said what the behaviour should have been: *"I
+    /// thought that the tail was supposed to open a file even if it was in use?"* It opened on his
+    /// next attempt, which is the whole proof that this was never the permanent case.
+    ///
+    /// §5.5 already gives a *missing* path `tail -F` semantics — keep waiting, never an error
+    /// dialog. A path that exists and is busy for an instant has a better claim on patience than
+    /// one that is not there at all.
+    ///
+    /// **Bounded, and short enough to be invisible.** It runs on the worker that opens the
+    /// document, so the window is not blocked; and a writer holding the file for longer than this
+    /// is the permanent case, which gets the remedy by name rather than a longer wait.
+    pub fn open_waiting(path: &Path) -> Result<Self> {
+        let mut attempt = 0;
+        loop {
+            match Self::open(path) {
+                Err(FileError::SharingViolation) if attempt < OPEN_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(OPEN_RETRY_PAUSE);
+                }
+                other => return other,
+            }
+        }
     }
 
     fn open_with_share_mode(path: &Path, share: FILE_SHARE_MODE) -> Result<Self> {
@@ -288,8 +341,15 @@ pub struct FileSource {
 }
 
 impl FileSource {
+    /// Opens a member of a set, waiting out a momentary sharing violation.
+    ///
+    /// [`LogFile::open_waiting`] rather than [`LogFile::open`] because this is the open a *reader
+    /// asked for*: a quarter-second of patience is invisible here and is the difference between
+    /// tailing a log and refusing it. The tail's own probe over rotation candidates keeps the
+    /// immediate open — it tries each of several paths in a loop, and waiting on every miss would
+    /// turn one lock into seconds of stall.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::from_file(LogFile::open(path)?)
+        Self::from_file(LogFile::open_waiting(path)?)
     }
 
     pub fn from_file(file: LogFile) -> Result<Self> {
@@ -552,6 +612,53 @@ pub(crate) mod tests {
 
         drop(exclusive);
         assert!(LogFile::open(&log).is_ok(), "and it opens once released");
+    }
+
+    /// **A momentary lock is waited out; a permanent one is reported with the remedy.**
+    ///
+    /// The owner, 2026-10-06, after a writer that appends and closes refused him an open: *"I
+    /// thought that the tail was supposed to open a file even if it was in use?"* — and it opened
+    /// on his next try, which is what proves the lock was transient rather than §5.1's permanent
+    /// case. A reader's open now waits a quarter of a second for it.
+    ///
+    /// The held half of this is deliberately *not* timing-dependent: the file stays exclusive for
+    /// the whole test, so the retry budget is guaranteed to run out and the error is the one a
+    /// genuinely locked-out reader gets. What it then asserts is §5.1's requirement that the
+    /// writer-side remedy be named — the message used to say only that the file was held.
+    #[test]
+    fn a_reader_waits_out_a_momentary_lock_and_is_told_the_remedy_for_a_lasting_one() {
+        let scratch = Scratch::new("waiting");
+        let log = scratch.join("busy.log");
+        fs::write(&log, b"one line\n").expect("write");
+
+        let exclusive = LogFile::open_with_share_mode(&log, FILE_SHARE_MODE(0))
+            .expect("the stand-in writer opens it exclusively and keeps it");
+        let started = std::time::Instant::now();
+        let refused = LogFile::open_waiting(&log);
+        let waited = started.elapsed();
+
+        match refused {
+            Err(FileError::SharingViolation) => {}
+            other => panic!("a lock held throughout is still refused, got {other:?}"),
+        }
+        assert!(
+            waited >= OPEN_RETRY_PAUSE,
+            "and it waited before giving up: {waited:?}"
+        );
+
+        let said = FileError::SharingViolation.to_string();
+        for remedy in ["shared: true", "keepFileOpen", "MinimalLock"] {
+            assert!(
+                said.contains(remedy),
+                "§5.1 wants the remedy by name and {remedy} is missing: {said}"
+            );
+        }
+
+        drop(exclusive);
+        assert!(
+            LogFile::open_waiting(&log).is_ok(),
+            "and it opens once released"
+        );
     }
 
     #[test]
