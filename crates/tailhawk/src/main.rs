@@ -1542,147 +1542,6 @@ impl Document {
         true
     }
 
-    /// The status bar's description of the document, rebuilt from the live state — every part of it except the name.
-    ///
-    /// §5.5b requires the inferred set be "shown in the UI for confirmation rather than silently
-    /// assumed", and the status bar is where that is shown. It names the oldest and newest member so
-    /// the direction can be checked against the folder, rather than asking the user to take the word
-    /// "ascending" on trust.
-    ///
-    /// **Rebuilt rather than cached because a set that rolls is a different set.** Freezing this at
-    /// open put "2 files … newest is `log_002.txt`" in the status bar of a window showing three, and a
-    /// stale confirmation is worse than none — it invites a check against a list that has moved on.
-    fn describe(&self) -> String {
-        let flag = if self.set.newest().disagreed() {
-            " (mixed?)"
-        } else {
-            ""
-        };
-        // §4.2: end of stream "is **not** an app exit". Saying so in the status bar is what stops a
-        // window that has stopped growing looking like a window that has hung.
-        // A pipe is one file by construction, so §5.5b's set description says nothing a user of it
-        // wants — the spill's path is already in `summary`, which is the part §13.2 asks for.
-        let source = match self.pump.as_ref().map(|p| (p.finished(), p.outcome())) {
-            // **A stream that broke does not look like one that finished**, which is the
-            // distinction `PLAN.md` asks a pipe source to make. A pipe cannot tell a producer that
-            // exited cleanly from one that was killed — both just close the handle — but it can
-            // tell either of those from a read or a spill that failed, and that is what this says.
-            Some((_, Some(StreamEnd::Failed(why)))) => format!(" — stream failed: {why}"),
-            Some((true, _)) => " — stream complete".to_string(),
-            Some((false, _)) => " — reading stdin".to_string(),
-            // **A remote source's parts are not a file list the user has any use for.** §5.5b's
-            // description names the members, which for a Loki tail is `part-000002.log` and its
-            // siblings — machinery, not information. What §13.2 does want said is where the fetched
-            // records landed, exactly as the pipe path says it above.
-            None => match &self.remote_spill {
-                Some(dir) => format!(" — Loki, spilled to {}", dir.display()),
-                None => format!(" — {}", self.set.describe()),
-            },
-        };
-        // **The find state goes first**, because it is the part that changes while the user is
-        // watching and the part a truncated title must not lose. Everything after it is the
-        // document, which is what the window said before there was a search.
-        let find = match self.finder.describe(self.answers_cut) {
-            Some(text) => format!("{text} — "),
-            None => String::new(),
-        };
-        let filter = match self
-            .filtering
-            .describe(self.set.total_rows(), self.answers_cut)
-        {
-            Some(text) => format!("{text} — "),
-            None => String::new(),
-        };
-        let reveal = if self.view.cells().reveal_invisibles {
-            "¶ revealing invisibles — "
-        } else {
-            ""
-        };
-        // §11.2: under High Contrast the user's highlight rules are off, and a chip says so.
-        let contrast = if theme().suppress_rules {
-            "⚑ High Contrast — highlight rules off — "
-        } else {
-            ""
-        };
-        // E21: an export in flight or a live tee, with its count — the user asked for a file and
-        // this is where they see it filling.
-        let tee = match &self.tee {
-            None => String::new(),
-            Some(t) => match (&t.error, t.live, t.done) {
-                (Some(e), _, _) => format!("⚠ export failed: {e} — "),
-                (None, true, _) => {
-                    format!(
-                        "⇥ saving → {} ({}) — ",
-                        t.name(),
-                        counted(t.written, "line")
-                    )
-                }
-                (None, false, true) => {
-                    format!(
-                        "✓ exported {} → {} — ",
-                        counted(t.written, "line"),
-                        t.name()
-                    )
-                }
-                (None, false, false) => {
-                    format!(
-                        "⇥ exporting → {} ({}) — ",
-                        t.name(),
-                        counted(t.written, "line")
-                    )
-                }
-            },
-        };
-        let format = match self.detection.describe() {
-            Some(text) => format!(" · {text}"),
-            None => String::new(),
-        };
-        // §12: scrolling up pauses following, and the affordance to resume must be visible — the
-        // "single most-wanted behaviour in every tail tool", and getting it wrong is very visible.
-        // A pipe that has finished is not paused, it is done.
-        // E22: a sort holds the view still, so it is neither following nor merely paused; the
-        // sort fragment says so and takes the lead's place.
-        let sort = self
-            .filtering
-            .sort
-            .as_ref()
-            .map(|s| self.column_name(s.order.column))
-            .and_then(|name| self.filtering.describe_sort(&name, self.set.total_rows()))
-            .map(|text| format!("{text} — "))
-            .unwrap_or_default();
-        // **`UI-DESIGN.md` §4: "the lag is stated".** A tail that is following says so, and for a
-        // remote source that is only half the answer — following *what*, how far behind? The lag is
-        // the age of the newest record the worker has written, so a source that has gone quiet and
-        // a source we are failing to keep up with both read honestly, and neither looks live.
-        let lagging = match (self.remote_spill.is_some(), self.lag) {
-            (true, Some(behind)) => format!(" · {}", tail::lag_text(behind)),
-            _ => String::new(),
-        };
-        // **`LOKI.md` §6: an answer that was cut is said, and goes on being said.** Loki returns at
-        // most `limit` records and sets no flag when it stops there, so a window that came back full
-        // is one nobody has seen the whole of — and this window stays in the scrollback. A notice
-        // said once would scroll away; this stands beside the lag for as long as the document does.
-        let cut = if self.answers_cut {
-            " · answers cut at the limit — narrow the time range or the selector"
-        } else {
-            ""
-        };
-        let following = if self.stream_done || !sort.is_empty() {
-            String::new()
-        } else if self.view.grid().is_following() {
-            format!("● following{lagging}{cut} — ")
-        } else {
-            format!("‖ paused · Ctrl+End to follow{cut} — ")
-        };
-        format!(
-            "{following}{sort}{contrast}{tee}{find}{filter}{reveal}{}: {}{flag}{source}{format}, {}, {}",
-            self.summary,
-            self.set.charset().name(),
-            counted(self.set.total_rows(), "line"),
-            counted(self.set.bytes(), "byte")
-        )
-    }
-
     /// Advances the source one tick: growth, rotation, rolls and retention, per §5.5 and §5.5b.
     ///
     /// **`was_following` is read before the row count changes, and that ordering is the whole of
@@ -2958,16 +2817,6 @@ impl Finder {
         }
     }
 
-    /// What the title shows for the query: the typed form when there is one, the engine form
-    /// when a path that predates the dialog set only that.
-    fn shown(&self) -> &str {
-        if self.label.is_empty() {
-            &self.query
-        } else {
-            &self.label
-        }
-    }
-
     /// Forgets the results, keeping the query. Cancels a running pass by dropping it.
     fn clear(&mut self) {
         self.running = None;
@@ -3108,53 +2957,6 @@ impl Finder {
             _ => None,
         };
         (true, show)
-    }
-
-    /// The title's find fragment, or `None` when no search is in play.
-    ///
-    /// Everything §7.4 obliges a search to disclose is here: that a pass is still running, that it
-    /// was capped, that lines were too slow to search, and — the one a user would otherwise read as
-    /// "no matches" — that the pattern did not compile.
-    fn describe(&self, at_least: bool) -> Option<String> {
-        if let Some(error) = &self.error {
-            return Some(format!("► {} — {error}", self.shown()));
-        }
-        if self.query.is_empty() {
-            return None;
-        }
-        let mut text = format!("► {}", self.shown());
-        match (self.current, self.matches.len()) {
-            (_, 0) => {
-                text.push_str(" — ");
-                text.push_str(Self::nothing_found(self.running.is_some(), at_least));
-            }
-            (Some(at), n) => {
-                text.push_str(&format!(" — {} of {}", at + 1, count_text(n, at_least)))
-            }
-            (None, n) => text.push_str(&format!(
-                " — {} {}",
-                count_text(n, at_least),
-                noun_for(n as u64, "match")
-            )),
-        }
-        if self.running.is_some() && !self.matches.is_empty() {
-            text.push_str(&format!(", scanning ({})", counted(self.scanned, "line")));
-        }
-        match self.outcome {
-            // §7.4's cap: there are matches that were never reported, so the count is a floor.
-            Some(Outcome::Capped) => text.push_str(" — capped, there are more"),
-            Some(Outcome::Cancelled) => text.push_str(" — cancelled"),
-            Some(Outcome::Failed(ref why)) => text.push_str(&format!(" — read failed: {why}")),
-            _ => {}
-        }
-        if self.truncated > 0 {
-            // §7.4's "pattern too slow, truncated", counted rather than hidden.
-            text.push_str(&format!(
-                ", {} too slow to search",
-                counted(self.truncated, "line")
-            ));
-        }
-        Some(text)
     }
 }
 
@@ -3565,59 +3367,6 @@ impl Filtering {
         let at = self.kept.partition_point(|&r| r < first);
         self.kept.splice(at..at, rows);
     }
-
-    /// The title's filter fragment, or `None` when no filter is in play.
-    ///
-    /// See [`NAMED_CHIPS`] for where naming the filters gives way to counting them.
-    fn describe(&self, total_rows: u64, at_least: bool) -> Option<String> {
-        if let Some(error) = &self.error {
-            return Some(format!("▼ {error}"));
-        }
-        let mut text = String::new();
-        if self.records_only {
-            text.push_str(" ▤ records");
-        }
-        // **Named while they fit, counted once they do not.** Two chips read `+error −retrying`,
-        // which says more than any count could; six spelled out crowd the format, the follow
-        // state, a sort and an export off the end of a status bar they all share. The panel lists
-        // them in full and has the room for it — this fragment only has to say that filters are in
-        // force and how much of the file survives them, which is what lets the panel be closed
-        // without §1.1's invisible state coming back.
-        let chips = &self.chips.chips;
-        if chips.len() > NAMED_CHIPS {
-            text.push_str(&format!(" {} filters", chips.len()));
-        } else {
-            for chip in chips {
-                let sign = match chip.polarity {
-                    Polarity::Include => '+',
-                    Polarity::Exclude => '−',
-                };
-                text.push_str(&format!(" {sign}{}", chip.source));
-            }
-        }
-        if text.is_empty() {
-            return None;
-        }
-        let mut text = format!("▼{text}");
-        if self.filtered() {
-            text.push_str(&format!(
-                " · {} of {total_rows}",
-                count_text(self.kept.len(), at_least)
-            ));
-            if self.running.is_some() {
-                let pct = (self.scanned * 100)
-                    .checked_div(total_rows)
-                    .map_or(100, |p| p.min(100));
-                text.push_str(&format!(" · scanning {pct}%"));
-            }
-            match self.outcome {
-                Some(Outcome::Cancelled) => text.push_str(" · cancelled"),
-                Some(Outcome::Failed(ref why)) => text.push_str(&format!(" · failed: {why}")),
-                _ => {}
-            }
-        }
-        Some(text)
-    }
 }
 
 /// The command bar — V14 on V8's surface: the find field, the chip row and the new-chip field,
@@ -3748,13 +3497,6 @@ const WM_DRAIN_DIALOGS: u32 = WM_APP + 8;
 
 /// The most states kept in either direction.
 const HISTORY_DEPTH: usize = 64;
-
-/// How many filters the status line names before it starts counting them instead.
-///
-/// Three is what fits beside everything else the line carries — the format and its confidence, the
-/// follow state, a sort, an export in flight — on a window of ordinary width. It is a legibility
-/// threshold, not a limit on filters.
-const NAMED_CHIPS: usize = 3;
 
 /// Every command the shell has, by name — what the menus list and what the keys dispatch, so a
 /// binding and a menu entry cannot disagree about what a name does.
@@ -5065,7 +4807,6 @@ impl Shell {
                     self.notice =
                         notice_once_open_finished(self.notice.as_deref(), self.opening.as_deref());
                     self.opening = None;
-                    self.file = Some(document.describe());
                     self.rebuild_highlighter(&mut document);
                     // File ▸ Open Recent learns the file **here**, on success — a mistyped path
                     // or an unreadable file never enters the history.
@@ -5227,6 +4968,34 @@ impl Shell {
                 ..statusbar::StatusFacts::default()
             });
         };
+        Shell::with_doc_facts(
+            doc,
+            statusbar::ShellFacts {
+                notice,
+                rules: rules_note.as_deref(),
+                contrast: theme().suppress_rules,
+            },
+            statusbar::status_panes_of,
+        )
+    }
+
+    /// Everything the status bar says about a **document**, handed to `f` as borrowed facts.
+    ///
+    /// **A callback because the facts borrow strings this builds.** `tee`, `sorted`, the lag and a
+    /// stream's failure are composed here and `StatusFacts` holds `&str` into them, so a function that
+    /// returned the facts would return borrows of its own locals. The callback keeps them alive for
+    /// exactly as long as the facts are used, with no owned mirror of the struct to drift.
+    ///
+    /// **It exists so a test can assert on what the bar shows.** The fourteen tests that used
+    /// `Document::describe` as their observable were reading a string nothing displayed — it was
+    /// composed into a field the bar reads only when no document is open. They ask this instead, which
+    /// is the same mapping the window uses; the caller overlays the shell's own facts — the notice, the
+    /// rules warning, High Contrast — because those are not the document's to know.
+    fn with_doc_facts<R>(
+        doc: &Document,
+        shell: statusbar::ShellFacts<'_>,
+        f: impl FnOnce(statusbar::StatusFacts<'_>) -> R,
+    ) -> R {
         // E21: an export in flight or a live tee, with its count — the user asked for a file and
         // the bar is where they watch it fill.
         let tee = doc.tee.as_ref().map(|t| match (&t.error, t.live, t.done) {
@@ -5269,11 +5038,21 @@ impl Shell {
             doc.view.grid().is_following(),
             lag.as_deref(),
         );
-        let find = (!doc.finder.query.is_empty()).then(|| statusbar::FindFacts {
+        let find_note = match doc.finder.outcome {
+            Some(Outcome::Capped) => Some("capped, there are more".to_owned()),
+            Some(Outcome::Cancelled) => Some("cancelled".to_owned()),
+            Some(Outcome::Failed(ref why)) => Some(format!("read failed: {why}")),
+            _ => None,
+        };
+        let searching = !doc.finder.query.is_empty() || doc.finder.error.is_some();
+        let find = searching.then(|| statusbar::FindFacts {
             // The finder counts from zero and a reader counts from one.
             current: doc.finder.current.map(|at| at + 1),
             total: doc.finder.matches.len(),
             running: doc.finder.running.is_some(),
+            error: doc.finder.error.as_deref(),
+            note: find_note.as_deref(),
+            truncated: doc.finder.truncated,
         });
         // **`filtered()`, not `active()`.** `active()` is true for a sort as well, and `kept` is
         // filled only by the filter machinery — so a sorted-but-unfiltered view reported
@@ -5288,16 +5067,17 @@ impl Shell {
             let shown = layout.widths[..last].iter().filter(|w| **w > 0).count() + 1;
             (shown, layout.widths.len())
         });
-        statusbar::status_panes_of(statusbar::StatusFacts {
-            notice,
+        f(statusbar::StatusFacts {
+            notice: shell.notice,
+            rules: shell.rules,
+            contrast: shell.contrast,
             tee: tee.as_deref(),
-            rules: rules_note.as_deref(),
-            contrast: theme().suppress_rules,
             open: true,
             caret_row: doc.caret_row().and_then(|row| doc.row_number(row)),
             total_rows: doc.set.total_rows(),
             find,
             filter,
+            filter_error: doc.filtering.error.as_deref(),
             columns,
             sorted: sorted.as_deref(),
             trace: doc.filtering.trace.as_deref(),
@@ -6046,18 +5826,20 @@ impl Shell {
         }
     }
 
-    /// Rebuilds the status line, and the title with it, from the document's live state.
+    /// Sets the window title from the document's live state.
     ///
-    /// **The cached string is refreshed from the document rather than edited**, because every part
-    /// of it except the file name can change while the window is open — the counts, the membership,
-    /// the stream state and now the find state. `Document::describe` is the one place that knows the
-    /// current answer, and a title assembled from remembered fragments is how "2 files … newest is
-    /// log_002.txt" survived onto a window showing three.
+    /// **It used to compose a status line here as well, and that string reached nothing.** The
+    /// description went into [`Shell::file`], which the bar reads *only when no document is open* —
+    /// so the one case it was built for could never see it. `Document::describe` existed for that
+    /// write and has gone with it; everything it computed that a reader needs now reaches the bar
+    /// through [`statusbar::status_panes_of`], which is rebuilt every frame from the live document
+    /// and cannot go stale the way a cached sentence did.
+    ///
+    /// **Kept as a name rather than folded into [`Shell::refresh_title`]** because twenty-eight call
+    /// sites say `retitle`, and the trace point is where a title change is looked for when one does
+    /// not happen. The two now do the same thing, which is why this says so.
     fn retitle(&mut self, hwnd: HWND) {
         header::trace("retitle enter");
-        if let Some(doc) = self.document.as_ref() {
-            self.file = Some(doc.describe());
-        }
         self.refresh_title(hwnd);
     }
 
@@ -11173,12 +10955,6 @@ pub fn rules_dialog_closed(hdlg: HWND, owner: HWND) {
             if shell.rules_dialog == hdlg {
                 shell.rules_dialog = HWND::default();
                 shell.close_rules_editor();
-                // **`refresh_title`, not `retitle`.** `retitle` recomputes `self.file` from the
-                // document before it draws — deliberately, so a stale fragment cannot survive onto
-                // a window it no longer describes — and that recomputation throws away the message
-                // `close_rules_editor` has just put there. §10 asks for an unsaved set thrown away
-                // to *say* so; calling `retitle` here said it into a variable and overwrote it in
-                // the same breath.
                 shell.refresh_title(owner);
             }
         }
@@ -14006,7 +13782,7 @@ mod tests {
         let path = scratch_log("tailhawk_no_transport.log", 200);
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 16.0), (800, 600));
-        let _ = doc.describe();
+        let _ = bar(&doc);
         let _ = doc.file_state();
         doc.bookmarks.insert(3);
         let _ = doc.has_columns();
@@ -14034,10 +13810,16 @@ mod tests {
             doc.summary, "tailhawk_remote_name.log",
             "an ordinary document is still called after its file"
         );
+        assert_eq!(
+            doc.set.members().len(),
+            1,
+            "one file, which the bar deliberately does not count — it says \"N files\" only when \
+             there is a set to confirm, and a lone file needs no confirming"
+        );
         assert!(
-            doc.describe().contains("1 file"),
-            "and still describes its set: {}",
-            doc.describe()
+            !bar(&doc).contains("1 file"),
+            "and so it does not say so: {}",
+            bar(&doc)
         );
 
         doc.remote(
@@ -14048,18 +13830,27 @@ mod tests {
             false,
         );
         assert_eq!(doc.summary, "live-identity-and-campaigns");
-        let title = doc.describe();
+        let shown = window_title(Some(&doc.summary));
         assert!(
-            title.contains("live-identity-and-campaigns"),
-            "the source names the document: {title}"
+            shown.contains("live-identity-and-campaigns"),
+            "the source names the window: {shown}"
+        );
+        assert_eq!(
+            doc.remote_spill.as_deref(),
+            Some(spill.as_path()),
+            "the document knows where its records landed"
         );
         assert!(
-            title.contains(&spill.display().to_string()),
-            "and the title says where the records landed: {title}"
+            spilled_to("fetched".to_owned(), doc.remote_spill.as_deref())
+                .contains(&spill.display().to_string()),
+            "and `spilled_to` is what says so — §13.2's one statement about writing a copy of \
+             somebody's logs to their own disk, which reaches the reader as a notice rather than \
+             through the bar's own panes"
         );
         assert!(
-            !title.contains("1 file"),
-            "the part list is not offered as the source description: {title}"
+            !bar(&doc).contains("1 file"),
+            "a remote tail's spill parts are not offered as a set description: {}",
+            bar(&doc)
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -14095,6 +13886,22 @@ mod tests {
             "a document whose tail this window does not hold is not a reason to do anything"
         );
     }
+    /// Everything the status bar says about `doc`, as one string to assert against.
+    ///
+    /// **This replaced `Document::describe` as the tests' observable, and the difference is the
+    /// point.** `describe` composed a sentence into `Shell::file`, which the bar reads *only when no
+    /// document is open* — so every test that asserted on it was reading a string the window could
+    /// never display. This goes through `status_panes_of`, the same mapping the window uses, so a
+    /// fact that stops reaching the screen now fails a test instead of passing one.
+    ///
+    /// `ShellFacts::default()` because the notice, the rules warning and High Contrast belong to the
+    /// window rather than the log; a test about a document should not have to invent them.
+    fn bar(doc: &Document) -> String {
+        Shell::with_doc_facts(doc, statusbar::ShellFacts::default(), |facts| {
+            statusbar::status_panes_of(facts).parts().join(" | ")
+        })
+    }
+
     fn scratch_log(name: &str, lines: usize) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(name);
         let mut text = String::new();
@@ -14424,14 +14231,11 @@ mod tests {
             ..Finder::default()
         };
         assert_eq!(
-            finder.describe(false).expect("a query is in play"),
-            "► boom — no matches",
+            finder.dialog_status(false),
+            "no matches",
             "a local file was cut by nothing and the claim is exact"
         );
-        assert_eq!(
-            finder.describe(true).expect("a query is in play"),
-            "► boom — no matches in what was fetched"
-        );
+        assert_eq!(finder.dialog_status(true), "no matches in what was fetched");
     }
 
     /// **The two kinds of nothing a search can have, pinned in one place.** A pass still running
@@ -14498,23 +14302,42 @@ mod tests {
         finder.outcome = Some(Outcome::Capped);
         finder.truncated = 3;
 
-        let text = finder.describe(false).expect("a query is in play");
-        assert!(text.contains("2 of 2"), "{text}");
+        let pane = |f: statusbar::FindFacts<'_>| {
+            statusbar::status_panes_of(statusbar::StatusFacts {
+                open: true,
+                find: Some(f),
+                ..statusbar::StatusFacts::default()
+            })
+            .find
+        };
+        let text = pane(statusbar::FindFacts {
+            current: finder.current.map(|at| at + 1),
+            total: finder.matches.len(),
+            note: Some("capped, there are more"),
+            truncated: finder.truncated,
+            ..statusbar::FindFacts::default()
+        });
+        assert!(text.contains("Match 2 of 2"), "{text}");
         assert!(text.contains("capped"), "{text}");
         assert!(text.contains("3 lines too slow"), "{text}");
 
-        // A pattern that would not compile must not read as "searched, found nothing".
-        let refused = Finder {
-            query: "(".to_owned(),
-            error: Some("unclosed group".to_owned()),
-            ..Finder::default()
-        };
-        let text = refused.describe(false).expect("an error is in play");
-        assert!(text.contains("unclosed group"), "{text}");
+        let refused = pane(statusbar::FindFacts {
+            error: Some("unclosed group"),
+            ..statusbar::FindFacts::default()
+        });
+        assert!(refused.contains("unclosed group"), "{refused}");
+        assert!(
+            !refused.contains("No matches"),
+            "a pattern that would not compile must not read as \"searched, found nothing\": \
+             {refused}"
+        );
         assert!(!text.contains("no matches"), "{text}");
 
-        // And with no query at all there is nothing to say.
-        assert!(Finder::default().describe(false).is_none());
+        assert_eq!(
+            Finder::default().dialog_status(false),
+            "",
+            "with no query at all there is nothing to say"
+        );
     }
 
     /// A search over a real file, through the document, ending on screen as spans.
@@ -15070,9 +14893,9 @@ mod tests {
         );
         assert!(doc.answers_cut);
         assert!(
-            doc.describe().contains("answers cut at the limit"),
+            bar(&doc).contains("answers cut at the limit"),
             "{}",
-            doc.describe()
+            bar(&doc)
         );
     }
 
@@ -15108,10 +14931,7 @@ mod tests {
             }],
             ..Finder::default()
         };
-        assert_eq!(
-            finder.describe(false).expect("a query is in play"),
-            "► x — 1 match"
-        );
+        assert_eq!(finder.dialog_status(false), "1 match");
     }
 
     /// **A file of one line is not "1 lines".** The composed status line says how big the source
@@ -15122,9 +14942,14 @@ mod tests {
         let path = scratch_log("tailhawk_counted_singular_test.log", 1);
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 300));
-        let said = doc.describe();
-        assert!(said.contains("1 line,"), "the file summary: {said}");
-        assert!(!said.contains("1 lines"), "{said}");
+        assert!(bar(&doc).contains("Line 1 of 1"), "{}", bar(&doc));
+        assert_eq!(
+            counted(1, "line"),
+            "1 line",
+            "the rule this test is named for"
+        );
+        assert_eq!(counted(2, "line"), "2 lines");
+        assert_eq!(counted(0, "line"), "0 lines");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -15140,8 +14965,18 @@ mod tests {
             truncated: 1,
             ..Finder::default()
         };
-        let said = finder.describe(false).expect("a query is in play");
+        let said = statusbar::status_panes_of(statusbar::StatusFacts {
+            open: true,
+            find: Some(statusbar::FindFacts {
+                total: 1,
+                truncated: finder.truncated,
+                ..statusbar::FindFacts::default()
+            }),
+            ..statusbar::StatusFacts::default()
+        })
+        .find;
         assert!(said.contains("1 line too slow"), "{said}");
+        assert!(!said.contains("1 lines"), "{said}");
     }
 
     /// **Regrouping one application would not be "1 applications".** The singular cannot be
@@ -15263,14 +15098,14 @@ mod tests {
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
         assert!(
-            !doc.describe().contains("answers cut"),
+            !bar(&doc).contains("answers cut"),
             "a local file is not cut by anything"
         );
         doc.answers_cut = true;
-        let said = doc.describe();
+        let said = bar(&doc);
         assert!(said.contains("answers cut at the limit"), "{said}");
         assert!(
-            said.contains("narrow the time range or the selector"),
+            said.contains("File ▸ Open remote ▸ Fetch window"),
             "the remedy is named too: {said}"
         );
     }
@@ -15560,9 +15395,9 @@ mod tests {
             // long as the text existed, which is the shape of test that claims coverage while
             // agreeing with the defect. The sibling assertion below keeps `3 lines`, so the plural
             // direction is held still by a test I did not have to add.
-            doc.describe().contains("✓ exported 1 line "),
+            bar(&doc).contains("✓ exported 1 line "),
             "{}",
-            doc.describe()
+            bar(&doc)
         );
         assert_eq!(std::fs::read_to_string(&out).expect("read"), "ERROR b\r\n");
         doc.poll_tee();
@@ -15599,9 +15434,9 @@ mod tests {
         assert_eq!(tee.written, 3, "{:?}", tee.error);
         assert_eq!(tee.covered, 6);
         assert!(
-            doc.describe().contains("⇥ saving → out.txt (3 lines)"),
+            bar(&doc).contains("⇥ saving → out.txt (3 lines)"),
             "{}",
-            doc.describe()
+            bar(&doc)
         );
         assert_eq!(
             std::fs::read_to_string(&out).expect("read"),
@@ -16232,7 +16067,7 @@ mod tests {
     /// panel, which is the surface that has room; this one only has to say that they are in force
     /// and how much of the file survives them.
     #[test]
-    fn many_filters_are_counted_in_the_status_line_rather_than_spelled_out() {
+    fn the_bar_counts_the_survivors_and_leaves_naming_filters_to_the_panel() {
         let path = scratch_log("tailhawk_filter_count_test.log", 300);
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
@@ -16240,22 +16075,23 @@ mod tests {
         filter_for(&mut doc, "line", Polarity::Include);
         filter_for(&mut doc, "log", Polarity::Include);
         filter_for(&mut doc, "record", Polarity::Include);
-        assert!(
-            doc.describe().contains("▼ +line +log +record"),
-            "three still fit: {}",
-            doc.describe()
-        );
-
         filter_for(&mut doc, "width", Polarity::Include);
-        let text = doc.describe();
-        assert!(text.contains("▼ 4 filters"), "four are counted: {text}");
-        assert!(
-            !text.contains("+line"),
-            "and are no longer spelled out: {text}"
-        );
+
+        let text = bar(&doc);
         assert!(
             text.contains(" of 300"),
-            "the survivors are still said: {text}"
+            "the survivors are what the bar reports: {text}"
+        );
+        for named in ["+line", "+log", "+record", "+width"] {
+            assert!(
+                !text.contains(named),
+                "the bar never spells a filter out: {text}"
+            );
+        }
+        assert_eq!(
+            doc.filtering.chips.chips.len(),
+            4,
+            "and all four are in force"
         );
     }
 
@@ -16289,21 +16125,13 @@ mod tests {
         assert_eq!(doc.row_text(1), Some("ERROR line 25 retrying"));
         assert_eq!(doc.row_text(11), Some("ERROR line 275 retrying"));
         assert_eq!(doc.row_text(12), None, "past the survivors");
-        assert!(
-            doc.describe().contains("▼ +error · 12 of 300"),
-            "{}",
-            doc.describe()
-        );
+        assert!(bar(&doc).contains("Filtered 12 of 300"), "{}", bar(&doc));
 
         filter_for(&mut doc, "retrying", Polarity::Exclude);
         assert_eq!(doc.filtering.kept.len(), 6);
         doc.lay_out((8.0, 10.0), (800, 200));
         assert_eq!(doc.row_text(1), Some("ERROR line 50 failed"));
-        assert!(
-            doc.describe().contains("▼ +error −retrying · 6 of 300"),
-            "{}",
-            doc.describe()
-        );
+        assert!(bar(&doc).contains("Filtered 6 of 300"), "{}", bar(&doc));
 
         // A search's matches are file rows; stepping to one lands on its view row.
         doc.finder.query = "line 100".to_owned();
@@ -16330,7 +16158,7 @@ mod tests {
         assert!(doc.view.grid().is_following());
         assert_eq!(doc.row_text(299), Some("INFO line 299 fine"));
         assert_eq!(doc.row_text(298), Some("INFO line 298 fine"));
-        assert!(doc.describe().contains("► "), "{}", doc.describe());
+        assert!(bar(&doc).contains("● Following"), "{}", bar(&doc));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -16344,11 +16172,7 @@ mod tests {
         filter_for(&mut doc, "/[unclosed/", Polarity::Include);
         assert!(!doc.filtering.active());
         assert!(doc.filtering.error.is_some());
-        assert!(
-            doc.describe().contains("▼ /[unclosed/"),
-            "{}",
-            doc.describe()
-        );
+        assert!(bar(&doc).contains("▼ /[unclosed/"), "{}", bar(&doc));
         assert_eq!(doc.view.grid().total_rows(), 20);
         let _ = std::fs::remove_file(&path);
     }
@@ -16415,11 +16239,7 @@ mod tests {
         let mut doc = Document::open(&path).expect("open the fixture");
         doc.lay_out((8.0, 10.0), (800, 200));
         assert_eq!(doc.detection.accepted.map(|f| f.id), Some("serilog-file"));
-        assert!(
-            doc.describe().contains("· Serilog (file) "),
-            "{}",
-            doc.describe()
-        );
+        assert!(bar(&doc).contains("Serilog (file)"), "{}", bar(&doc));
 
         filter_for(&mut doc, "level >= Warning", Polarity::Include);
         assert_eq!(doc.filtering.outcome, Some(Outcome::Complete));
@@ -16765,10 +16585,9 @@ mod tests {
             doc.header_text()
         );
         assert!(
-            doc.describe()
-                .contains("↕ sorted by Level ▲ · not following"),
+            bar(&doc).contains("↕ sorted by Level ▲ · not following"),
             "{}",
-            doc.describe()
+            bar(&doc)
         );
 
         // A second click on the same header: descending, errors first.
@@ -16797,11 +16616,7 @@ mod tests {
         }
         assert_eq!(doc.set.total_rows(), 13);
         assert_eq!(doc.view_rows(), 12, "the late row is held, not shown");
-        assert!(
-            doc.describe().contains("1 newer rows held"),
-            "{}",
-            doc.describe()
-        );
+        assert!(bar(&doc).contains("1 newer rows held"), "{}", bar(&doc));
 
         // A third click clears the sort: file order, and the late row is there.
         assert!(doc.cycle_sort(level));
@@ -16849,11 +16664,7 @@ mod tests {
             },
         );
         assert_eq!(doc.filtering.sorted().map(|r| r.to_vec()), Some(vec![0, 4]));
-        assert!(
-            doc.describe().contains("↕ top 2 by Level ▼"),
-            "{}",
-            doc.describe()
-        );
+        assert!(bar(&doc).contains("↕ top 2 by Level ▼"), "{}", bar(&doc));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -16889,7 +16700,11 @@ mod tests {
             [0, 1, 4],
             "three records, two frames hidden"
         );
-        assert!(doc.describe().contains("▤ records"), "{}", doc.describe());
+        assert!(
+            doc.is_collapsed(),
+            "collapsing is reported by the toolbar's latched Collapse toggle and the menu item, \
+             not by the status bar — `is_collapsed` is what both of those read"
+        );
 
         filter_for(&mut doc, "job", Polarity::Include);
         assert_eq!(
@@ -16978,9 +16793,9 @@ mod tests {
             doc.detection.candidates
         );
         assert!(
-            doc.describe().contains("Serilog (appsettings.json)"),
+            bar(&doc).contains("Serilog (appsettings.json)"),
             "{}",
-            doc.describe()
+            bar(&doc)
         );
         assert_eq!(
             doc.header_text()
@@ -17128,7 +16943,7 @@ mod tests {
                             top,
                         },
                     );
-                    assert!(doc.filtering.sorted().is_some(), "{}", doc.describe());
+                    assert!(doc.filtering.sorted().is_some(), "{}", bar(&doc));
                 }
                 "label" => {
                     let (n, text) = arg.split_once(':').expect("label:<n>:<text>");
@@ -17154,7 +16969,7 @@ mod tests {
                 other => panic!("unknown step {other:?}"),
             }
         }
-        doc.status = format!("hardware — {}", doc.describe());
+        doc.status = format!("hardware — {}", bar(&doc));
         // `TAILHAWK_SHOT_SPLIT=<chip>`: a second pane beside or under the first, filtered by the
         // chip. `TAILHAWK_SHOT_SIDE=1` divides the width instead of the height — **the only way
         // anything in this tree can render a side-by-side split**, and therefore the only way the

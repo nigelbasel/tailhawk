@@ -320,12 +320,26 @@ pub(crate) fn with_separators(n: u64) -> String {
 }
 
 /// What a find is doing, as the bar reports it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FindFacts {
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FindFacts<'a> {
     /// Which match the caret is on, counting from one; `None` before the first is stepped to.
     pub current: Option<usize>,
     pub total: usize,
     pub running: bool,
+    /// A pattern that did not compile, in the reader's own words.
+    ///
+    /// **§7.4 obliges a search to disclose this and the bar did not**, which is the worst of the
+    /// three: a pattern that failed to compile finds nothing, and "No matches" is exactly how a
+    /// reader would read an empty result. It was composed into `Finder::describe` and displayed
+    /// nowhere until 2026-10-06.
+    pub error: Option<&'a str>,
+    /// §7.4's other disclosures, already in words: the pass was capped and there are more, it was
+    /// cancelled, or the read failed. Rendered by the caller because the outcome type is the
+    /// shell's, not this module's.
+    pub note: Option<&'a str>,
+    /// §7.4's "pattern too slow, truncated" — lines the search gave up on, counted rather than
+    /// hidden, because a count the reader cannot see is a count that was never disclosed.
+    pub truncated: u64,
 }
 
 /// What the tail is doing — the state the last pane reports.
@@ -380,11 +394,23 @@ pub struct StatusFacts<'a> {
     /// The physical row the caret is on, counting from one, and the rows in the set.
     pub caret_row: Option<u64>,
     pub total_rows: u64,
-    pub find: Option<FindFacts>,
+    pub find: Option<FindFacts<'a>>,
     /// Rows a filter kept, of the rows there are. **Set only when a filter is in play** — a sort
     /// re-orders the same rows and keeps all of them, and reporting `Filtered 0 of N` for one is
     /// a lie about the document.
     pub filter: Option<(u64, u64)>,
+    /// A filter the reader typed that does not parse, in their own words.
+    ///
+    /// **It reached nothing until 2026-10-06.** `Filtering::error` was composed into
+    /// `Document::describe`, which wrote into a field the bar reads only with no document open — so
+    /// a malformed filter left the view standing and said nothing at all, against §10's rule that a
+    /// command appearing to do nothing is worse than one that says why it did not. Deleting
+    /// `describe` is what made the gap visible.
+    ///
+    /// It takes the filter pane rather than the message, and displaces the count: a filter that did
+    /// not parse has no count to report, and "Filtered 300 of 300" beside a broken expression would
+    /// read as though it had worked.
+    pub filter_error: Option<&'a str>,
     /// Columns shown, of the columns the format has.
     pub columns: Option<(usize, usize)>,
     /// The sort in force, already worded by `Filtering::describe_sort`.
@@ -464,7 +490,28 @@ impl StatusPanes {
     }
 }
 
+/// The three facts the **shell** owns rather than the document, for `Shell::with_doc_facts`.
+///
+/// **A struct so the document mapping can be asked for on its own.** A transient notice, the rules
+/// warning and High Contrast are properties of the window, not of the log in it — so a test that
+/// wants to know what the bar says about a *document* passes `ShellFacts::default()` and gets
+/// exactly that, through the same mapping the window uses.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ShellFacts<'a> {
+    pub notice: Option<&'a str>,
+    pub rules: Option<&'a str>,
+    pub contrast: bool,
+}
+
 /// The model → view-model mapping for the status bar: facts in, eight panes out.
+///
+/// **Three disclosures reach this bar for the first time**, because deleting `Document::describe`
+/// showed that each had only ever been composed into a string nothing displayed. A find whose
+/// pattern did not compile — the one a reader would otherwise read as "No matches". A filter that
+/// did not parse, which left the view standing and said nothing. And `LOKI.md` §6's hedge: over an
+/// answer the source cut, "No matches" is a *false claim*, because the records a match could be in
+/// may never have been fetched, so the pane says "No matches in what was fetched". The Find dialog
+/// has hedged that since §6 landed; the bar said the flat thing.
 ///
 /// **A remedy names where it is, not only what it is.** The cut-answer warning used to say "narrow
 /// the time range or the selector", and the report of 2026-10-05 was that *"there is no indication
@@ -521,7 +568,9 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
 
     let find = match facts.find {
         None => String::new(),
+        Some(f) if f.error.is_some() => format!("▲ {}", f.error.unwrap_or_default()),
         Some(f) if f.total == 0 && f.running => "Searching…".to_owned(),
+        Some(f) if f.total == 0 && facts.cut => "No matches in what was fetched".to_owned(),
         Some(f) if f.total == 0 => "No matches".to_owned(),
         Some(f) if f.running => format!(
             "{} {} so far",
@@ -537,10 +586,31 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
             ),
         },
     };
+    let find = match facts.find {
+        Some(f) if f.error.is_none() => {
+            let mut text = find;
+            if let Some(note) = f.note {
+                text.push_str(" — ");
+                text.push_str(note);
+            }
+            if f.truncated > 0 {
+                text.push_str(&format!(
+                    ", {} {} too slow to search",
+                    with_separators(f.truncated),
+                    if f.truncated == 1 { "line" } else { "lines" }
+                ));
+            }
+            text
+        }
+        _ => find,
+    };
 
-    let filter = match facts.filter {
-        Some((kept, total)) => format!("Filtered {} of {}", with_separators(kept), floor(total)),
-        None => String::new(),
+    let filter = match (facts.filter_error, facts.filter) {
+        (Some(why), _) => format!("▼ {why}"),
+        (None, Some((kept, total))) => {
+            format!("Filtered {} of {}", with_separators(kept), floor(total))
+        }
+        (None, None) => String::new(),
     };
 
     // A pane that reports "8 of 8" is a pane reporting nothing, and the owner's complaint about
@@ -692,6 +762,7 @@ mod tests {
                 current: Some(3),
                 total: 47,
                 running: false,
+                ..FindFacts::default()
             }),
             ..open()
         });
@@ -705,6 +776,7 @@ mod tests {
                 current: None,
                 total: 47,
                 running: true,
+                ..FindFacts::default()
             }),
             ..open()
         });
@@ -720,6 +792,7 @@ mod tests {
                 current: Some(3),
                 total: 47,
                 running: false,
+                ..FindFacts::default()
             }),
             filter: Some((12, 1_192)),
             cut: true,
