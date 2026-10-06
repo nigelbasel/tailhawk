@@ -22,14 +22,16 @@
 //! the cheap place to find out. **No test can settle it; it needs an eye on screen.**
 
 use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ};
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
+use windows::Win32::UI::WindowsAndMessaging::HMENU;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, SendMessageW, SetWindowPos, ShowWindow, SystemParametersInfoW,
     HWND_TOP, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WM_SETFONT, WS_CHILD,
-    WS_CLIPSIBLINGS,
+    SW_SHOWNA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT,
+    WS_CHILD, WS_CLIPSIBLINGS,
 };
 
 const TCM_FIRST: u32 = 0x1300;
@@ -50,6 +52,33 @@ const TCS_FOCUSNEVER: u32 = 0x0000_8000;
 
 /// The id the control answers to in `WM_NOTIFY`, so the shell can tell it from any other child.
 pub const ID_TABS: i32 = 4_100;
+
+/// The ids the per-tab close buttons answer to: `ID_TAB_CLOSE_BASE + n` closes the n-th tab.
+///
+/// Clear of [`ID_TABS`] and of the menu's ranges, which start at 10_100 — these are children of
+/// the tab control rather than of the window, so their `WM_COMMAND` reaches this module's subclass
+/// and never the shell's menu dispatch, but keeping them distinct costs nothing and a shared id is
+/// the sort of thing that only shows up as a wrong document closing.
+const ID_TAB_CLOSE_BASE: u32 = 4_200;
+
+/// How many close buttons an id may name, so a stray `WM_COMMAND` cannot be read as a tab index.
+/// A window with more tabs than this has other problems; `RECENT_MAX` is ten and a reader with
+/// sixty-four logs open is not closing them one button at a time.
+const MAX_CLOSERS: u32 = 64;
+
+/// The close button's side and the gap between it and the tab's right edge, at 96 DPI.
+///
+/// Small enough that it does not crowd the name, large enough to be a target: the Windows
+/// guideline is a minimum of about 16 pixels for a pointer, and this is scaled by the strip's DPI
+/// like everything else here.
+const CLOSE_PX: i32 = 16;
+const CLOSE_INSET: i32 = 3;
+
+/// `BS_FLAT` and `BS_PUSHBUTTON` — a button with no raised edge, which is what a close affordance
+/// inside a tab wants. The `windows` crate binds the button styles as plain `u32` constants rather
+/// than a typed set, so they are spelled here.
+const BS_PUSHBUTTON: u32 = 0x0000_0000;
+const BS_FLAT: u32 = 0x0000_8000;
 
 const TCM_GETITEMRECT: u32 = TCM_FIRST + 10;
 const TCM_HITTEST: u32 = TCM_FIRST + 13;
@@ -276,9 +305,49 @@ unsafe extern "system" fn drag_proc(
                 tell_parent(hwnd, WM_TAB_CLOSE, WPARAM(at), LPARAM(0));
             }
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u32;
+            if let Some(at) = id
+                .checked_sub(ID_TAB_CLOSE_BASE)
+                .filter(|at| *at < MAX_CLOSERS)
+            {
+                tell_parent(hwnd, WM_TAB_CLOSE, WPARAM(at as usize), LPARAM(0));
+                return windows::Win32::Foundation::LRESULT(0);
+            }
+        }
         _ => {}
     }
     unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+/// Where a tab's close button sits inside that tab, in the control's client pixels.
+///
+/// **`SysTabControl32` has neither a close button nor custom draw.** The documented list of
+/// controls offering `NM_CUSTOMDRAW` — header, list-view, rebar, toolbar, tooltip, trackbar,
+/// tree-view — does not include the tab control, so there is no stage at which an `×` could be
+/// drawn over a natively-drawn tab. The alternatives were owner-drawing every tab (taking over the
+/// appearance, dark mode included, which is how four toolbar iterations went wrong) or putting the
+/// glyph in the item's image list, where the control places it to the *left* of the label. The
+/// owner chose a real button per tab, 2026-10-06, so the tab stays native and the button is a
+/// standard control over its right edge.
+///
+/// **Right-aligned and vertically centred, and never outside the tab.** A tab narrower than the
+/// button plus its insets yields `None` rather than a button lying over the label or past the tab's
+/// edge: a tab that cannot show one does not get one, which is better than one that cannot be read.
+/// The width test demands room for the label as well as the button, or the two overlap and the name
+/// is the part that loses.
+///
+/// **The button reports through `WM_TAB_CLOSE`, the message the middle click already sends.** Being
+/// a child of the tab control rather than of the window, its `WM_COMMAND` arrives at this module's
+/// subclass and never at the shell's menu dispatch — so one close path serves both gestures and
+/// there is no second one to keep in step.
+pub fn close_button_at(tab: (i32, i32, i32, i32), size: i32, inset: i32) -> Option<(i32, i32)> {
+    let (x, y, w, h) = tab;
+    let size = size.max(1);
+    if w < size + inset * 2 + size || h < size {
+        return None;
+    }
+    Some((x + w - size - inset, y + (h - size) / 2))
 }
 
 /// Windows' tab control, holding one item per open document.
@@ -289,6 +358,14 @@ pub struct TabStrip {
     /// a rebuild resets the selection and flickers.
     shown: (Vec<String>, usize),
     visible: bool,
+    /// The module handle the close buttons are created from, kept because `place` needs it too.
+    instance: HINSTANCE,
+    /// One close button per tab, in tab order.
+    ///
+    /// **Children of the tab control, not of the window**, so they move with it and are clipped by
+    /// it — and so a click on one reaches this module's subclass rather than the shell's handler,
+    /// which is where the existing close already lives.
+    closers: Vec<HWND>,
 }
 
 impl TabStrip {
@@ -357,7 +434,92 @@ impl TabStrip {
             font,
             shown: (Vec::new(), usize::MAX),
             visible: false,
+            instance,
+            closers: Vec::new(),
         })
+    }
+
+    /// Makes the close buttons match the tabs, and puts each over its own tab's right edge.
+    ///
+    /// **Called after every `set` and every `place`**, because both can move a tab: filling changes
+    /// the widths and placing changes the control's own rectangle. The count is reconciled rather
+    /// than rebuilt, so a frame that changed nothing destroys and creates nothing.
+    ///
+    /// A tab with no room for a button — a long name in a narrow strip — simply has none, and the
+    /// button is hidden rather than left somewhere wrong. The menu's `Close tab` and the
+    /// middle-click both still work, so nothing becomes unreachable.
+    fn sync_closers(&mut self) {
+        let instance = self.instance;
+        let tabs = self.shown.0.len();
+        while self.closers.len() > tabs {
+            if let Some(dead) = self.closers.pop() {
+                // SAFETY: a live child window this module created and is giving up.
+                unsafe {
+                    let _ = DestroyWindow(dead);
+                }
+            }
+        }
+        while self.closers.len() < tabs {
+            let id = ID_TAB_CLOSE_BASE + self.closers.len() as u32;
+            // SAFETY: `BUTTON` is a system class and `self.hwnd` is a live control.
+            let made = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
+                    w!("\u{00d7}"),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_CLIPSIBLINGS.0 | BS_FLAT | BS_PUSHBUTTON),
+                    0,
+                    0,
+                    1,
+                    1,
+                    self.hwnd,
+                    HMENU(id as *mut core::ffi::c_void),
+                    instance,
+                    None,
+                )
+            };
+            match made {
+                Ok(h) => {
+                    unsafe {
+                        SendMessageW(h, WM_SETFONT, WPARAM(self.font.0 as usize), LPARAM(1));
+                    }
+                    self.closers.push(h);
+                }
+                Err(_) => break,
+            }
+        }
+
+        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd) }.max(96);
+        let size = (CLOSE_PX * dpi as i32 / 96).max(8);
+        let inset = (CLOSE_INSET * dpi as i32 / 96).max(1);
+        for (at, closer) in self.closers.iter().enumerate() {
+            let spot = self
+                .item_rect(at)
+                .and_then(|(x, y, w, h)| {
+                    close_button_at((x as i32, y as i32, w as i32, h as i32), size, inset)
+                })
+                .filter(|_| self.visible);
+            // SAFETY: both take a live child handle and retain nothing.
+            unsafe {
+                match spot {
+                    Some((x, y)) => {
+                        let _ = SetWindowPos(
+                            *closer,
+                            HWND_TOP,
+                            x,
+                            y,
+                            size,
+                            size,
+                            SWP_NOACTIVATE | SWP_NOZORDER,
+                        );
+                        let _ = ShowWindow(*closer, SW_SHOWNA);
+                    }
+                    None => {
+                        let _ = ShowWindow(*closer, SW_HIDE);
+                    }
+                }
+            }
+        }
     }
 
     /// Fills the control from the shell's labels, and marks which is current.
@@ -398,6 +560,7 @@ impl TabStrip {
             SendMessageW(self.hwnd, TCM_SETCURSEL, WPARAM(active), LPARAM(0));
         }
         self.shown = (labels.to_vec(), active);
+        self.sync_closers();
     }
 
     /// One tab's rectangle in the strip's own client coordinates, which are also the window's here
@@ -512,6 +675,7 @@ impl TabStrip {
             }
             self.visible = visible;
         }
+        self.sync_closers();
     }
 }
 
@@ -584,4 +748,52 @@ pub fn shell_font() -> HFONT {
         return HFONT::default();
     }
     unsafe { CreateFontIndirectW(&metrics.lfMessageFont) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The close button sits inside its tab, at the right, and never over the label.**
+    ///
+    /// The owner asked for a close icon on each tab, 2026-10-06, so that individual tabs can be
+    /// closed directly. The tab control offers neither a close button nor custom draw, so the
+    /// button is a real child window and this is the arithmetic that places it — the one part of
+    /// the feature that can be tested without a window.
+    #[test]
+    fn a_close_button_sits_at_the_right_of_its_tab() {
+        let tab = (10, 2, 120, 24);
+        let (x, y) = close_button_at(tab, 12, 4).expect("a tab this wide has room");
+        assert_eq!(x + 12, 10 + 120 - 4, "right-aligned inside the tab");
+        assert_eq!(y, 2 + (24 - 12) / 2, "and vertically centred");
+        assert!(x > 10, "and not over the tab's left edge");
+    }
+
+    /// **A tab too narrow to carry one does not get one.**
+    ///
+    /// Better than a button lying across the name or hanging past the tab's edge: the label is the
+    /// part a reader needs, and the menu and middle-click still close the tab.
+    #[test]
+    fn a_tab_with_no_room_gets_no_button() {
+        assert_eq!(close_button_at((0, 0, 20, 24), 12, 4), None, "too narrow");
+        assert_eq!(close_button_at((0, 0, 120, 8), 12, 4), None, "too short");
+        assert!(
+            close_button_at((0, 0, 36, 24), 12, 4).is_some(),
+            "and exactly enough room is enough"
+        );
+    }
+
+    /// **Every tab's button lands within that tab**, whatever the widths, so no button can be
+    /// clicked for the wrong document — which is the one failure of this shape that would be worse
+    /// than having no buttons at all.
+    #[test]
+    fn no_button_strays_into_a_neighbouring_tab() {
+        let tabs = [(0, 0, 90, 22), (90, 0, 140, 22), (230, 0, 60, 22)];
+        for (x, y, w, h) in tabs {
+            if let Some((bx, by)) = close_button_at((x, y, w, h), 12, 4) {
+                assert!(bx >= x && bx + 12 <= x + w, "inside horizontally: {bx}");
+                assert!(by >= y && by + 12 <= y + h, "and vertically: {by}");
+            }
+        }
+    }
 }
