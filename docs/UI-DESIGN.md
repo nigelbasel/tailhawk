@@ -240,7 +240,11 @@ bottom half stacks the panes, the left or right half sets them side by side, and
 split at all — it just shows that tab. Two panes is the limit, so a drop onto a pane that is already
 split is declined.
 
-**Menu bar and toolbar.** Two rows under the tab strip — see §2.2 and §2.3. Together they are the
+**Menu bar and toolbar.** The top two rows, with the tab strip **below** them — see §2.2 and §2.3.
+*(Corrected 2026-10-06. This said "two rows under the tab strip" and the code matched it, which the
+owner reported as wrong by convention: every application carrying both puts the toolbar above the
+tabs, because a toolbar acts on the window and the tabs choose what the window is showing.)*
+Together they are the
 **primary** interface per §1.1: every feature is reachable by mouse from one of them, and the palette
 is an accelerator over the top rather than the only door.
 
@@ -254,9 +258,26 @@ filter and format are reached the way the standard Windows applications reach th
   exactly as before. The match position (`3 of 41`) and the query live in the **status bar** while a
   search is active; the scrollbar's density marks are unchanged. Plain text by default; a
   "Regular expression" checkbox in the dialog replaces the `.*` toggle.
-- **Filters live in a docked panel** — *(refined 2026-08-24, the owner pointing at Visual Studio's
-  tool windows: filters are toggled constantly while reading, so a modal dialog would make every
-  toggle a round trip)*. A **fixed bottom panel**, TextAnalysisTool.NET's shape — the tool §7.3
+- **Filters are defined in a dialog** — *(settled 2026-10-06 by the owner, twice: "the filters
+  should be defined in a dialog, which will allow editing, adding and removing filters. The little
+  bar at the bottom is confusing and hard to notice", and then on the Visual Studio comparison this
+  entry used to lean on: "even if filters are a docked panel, the little line at the bottom is not
+  that. In visual studio, these are non-modal, dockable dialog boxes.")* A dialog of the Rules
+  editor's shape — one row per filter with its enabled mark, polarity and text, with add, edit and
+  remove, and **OK / Cancel / Apply**, Apply being the owner's: it is what lets a reader see the
+  effect of a change without closing. The dialog is movable, so it can be dragged clear of the rows
+  it is filtering.
+  **A non-modal, dockable editor is the eventual shape and is deliberately deferred**, because it
+  needs docking infrastructure this program does not have — the owner's call, 2026-10-06: "we can
+  consider that later, together with implementing a proper docking infrastructure, which we dont
+  currently have".
+  **How this entry came to say the opposite, recorded because the failure matters more than the
+  text.** It read "Filters live in a docked panel — *(refined 2026-08-24, the owner pointing at
+  Visual Studio's tool windows…)*", attributing the bottom panel to him. Every session after that
+  read it as settled and built on it, so his instruction was overwritten by a document claiming to
+  *be* his instruction — the same failure as `LOKI.md` §8's ordering. These documents are Claude's
+  writing and are never evidence of what the owner asked for.
+- ~~**A fixed bottom panel**~~, TextAnalysisTool.NET's shape — the tool §7.3
   already names as the model: one row per filter with a checkbox (checked = enabled), its
   include/exclude polarity, and its text; an add field; remove in place. `Ctrl+L` or
   View ▸ Filters shows it; it is hideable and its state is remembered per §12.4. It reuses the

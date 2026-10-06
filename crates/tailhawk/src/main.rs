@@ -125,18 +125,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetScrollInfo, GetSubMenu, GetWindow, GetWindowPlacement, IsDialogMessageW,
     IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
     SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_APPSTARTING, IDC_ARROW, MSG, NONCLIENTMETRICSW,
-    SB_BOTTOM, SB_CTL, SB_ENDSCROLL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
-    SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS,
-    SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SPI_GETWHEELSCROLLLINES,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
-    SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WINDOWPLACEMENT,
-    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT,
-    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SETICON,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_APPSTARTING, IDC_ARROW, MSG,
+    NONCLIENTMETRICSW, SB_BOTTOM, SB_CTL, SB_ENDSCROLL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+    SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
+    SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
+    SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOW, SW_SHOWMAXIMIZED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DPICHANGED, WM_DROPFILES, WM_GETOBJECT, WM_HSCROLL, WM_INITMENUPOPUP, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NOTIFY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_VSCROLL, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawMenuBar, GetCursorPos, SetCursor, ICON_SMALL, IDC_HAND, IDC_SIZEWE, WM_SETCURSOR,
@@ -4126,6 +4127,40 @@ impl Tabs {
         !self.tabs.is_empty()
     }
 
+    /// Brings the tab already showing `path` to the front, if one is, and says whether it did.
+    ///
+    /// **A second copy of a file is never what was wanted**, which the owner reported on
+    /// 2026-10-06 after the recent list gave him two tabs on one log: *"I dont think one wants the
+    /// same file open twice"*. Nothing checked, so every open made a tab.
+    ///
+    /// Case-insensitively, because Windows opens `C:\LOGS\A.LOG` and `C:\logs\a.log` as one file and
+    /// the recent list already folds case for exactly that reason.
+    ///
+    /// **It looks at every pane, not only the active one in each tab**, so a file shown in a split
+    /// is found too — and focuses that pane, since bringing the tab forward while the other half of
+    /// a split holds the file would look like nothing happened.
+    fn show_already_open(&mut self, path: &std::path::Path) -> bool {
+        let wanted = path.to_string_lossy().to_lowercase();
+        let found = self.tabs.iter().enumerate().find_map(|(tab, t)| {
+            t.panes
+                .iter()
+                .position(|doc| {
+                    doc.path
+                        .as_ref()
+                        .is_some_and(|p| p.to_string_lossy().to_lowercase() == wanted)
+                })
+                .map(|pane| (tab, pane))
+        });
+        let Some((tab, pane)) = found else {
+            return false;
+        };
+        self.active = tab;
+        if let Some(t) = self.tabs.get_mut(tab) {
+            t.focused = pane;
+        }
+        true
+    }
+
     fn cycle(&mut self, forward: bool) {
         let n = self.tabs.len();
         if n < 2 {
@@ -5288,7 +5323,7 @@ impl Shell {
                         (None, _) => 0.0,
                     };
                     if let Some(tabs) = self.tabs.as_mut() {
-                        tabs.place(w as i32, 0, false);
+                        tabs.place(0, w as i32, 0, false);
                     }
                     let recent: Vec<tailhawk_core::settings::Recent> =
                         self.settings.recent.iter().take(6).cloned().collect();
@@ -5347,30 +5382,10 @@ impl Shell {
                 // The real control's band, asked of it once per frame and handed to the pane that
                 // carries the strip. Placed here too, because this is where the width is known.
                 let guide = self.drag_guide.map(|(_, r)| r);
-                let want_strip = strip.0.len() > 1;
-                let strip_px = match (self.tabs.as_mut(), want_strip) {
-                    (Some(tabs), true) => {
-                        tabs.set(&strip.0, strip.1);
-                        let band = tabs.band_height(w as i32);
-                        tabs.place(w as i32, band, true);
-                        band as f32
-                    }
-                    (Some(tabs), false) => {
-                        // **Filled even while hidden**, so the control never holds a list the model
-                        // has moved on from. A split consumes a tab, which drops the strip to one
-                        // and hides it — and the control went on reporting the two items it had
-                        // when it was last visible. Nothing on screen was wrong, because it is
-                        // hidden; but anything asking the control what it holds got a stale answer,
-                        // which is exactly how a verification harness came to report that
-                        // drag-out-to-split had failed when it had in fact worked.
-                        tabs.set(&strip.0, strip.1);
-                        tabs.place(w as i32, 0, false);
-                        0.0
-                    }
-                    (None, _) => 0.0,
-                };
-                // §2.3's row, directly under the strip. Its band is asked of the control for the
-                // same reason the strip's is, and the two together are what the grid starts below.
+                // §2.3's row **first, at the top**, with the tab strip under it. The other way round
+                // until 2026-10-06, when the owner reported it as wrong by convention and was right:
+                // a toolbar acts on the window and tabs choose what the window shows, so every
+                // application carrying both puts the toolbar above.
                 let buttons = toolbar::toolbar_of(self.document.as_ref());
                 let large = self.large_icons;
                 let toolbar_px = match (self.toolbar.as_mut(), self.show_toolbar) {
@@ -5378,11 +5393,36 @@ impl Shell {
                         bar.set_large(large);
                         bar.set(&buttons);
                         let band = bar.band_height();
-                        bar.place(strip_px as i32, w as i32, band, true);
+                        bar.place(0, w as i32, band, true);
                         band as f32
                     }
                     (Some(bar), false) => {
                         bar.place(0, w as i32, 0, false);
+                        0.0
+                    }
+                    (None, _) => 0.0,
+                };
+                // **Shown whenever anything is open, even for one tab.** It used to hide itself
+                // below two, and closing one of two therefore took the whole control off screen —
+                // which read as having closed everything, the more so when the survivor was an
+                // empty file being tailed and its blank grid looked like the welcome surface. It is
+                // also where a per-tab close button has to live, and a control that disappears
+                // cannot carry one.
+                let want_strip = !strip.0.is_empty();
+                let strip_px = match (self.tabs.as_mut(), want_strip) {
+                    (Some(tabs), true) => {
+                        tabs.set(&strip.0, strip.1);
+                        let band = tabs.band_height(w as i32);
+                        tabs.place(toolbar_px as i32, w as i32, band, true);
+                        band as f32
+                    }
+                    (Some(tabs), false) => {
+                        // **Filled even while hidden**, so the control never holds a list the model
+                        // has moved on from. Anything asking the control what it holds would get a
+                        // stale answer, which is how a verification harness once reported that
+                        // drag-out-to-split had failed when it had in fact worked.
+                        tabs.set(&strip.0, strip.1);
+                        tabs.place(0, w as i32, 0, false);
                         0.0
                     }
                     (None, _) => 0.0,
@@ -5997,7 +6037,25 @@ impl Shell {
     /// Opens `path` in this window, replacing what is shown. The read runs on a worker as it does
     /// at start-up, and the status bar says "opening" until it lands — a large file takes seconds to
     /// index and a window that went blank without a word would look hung.
+    /// Opens `path`, or brings its tab forward when it is already open.
+    ///
+    /// **The already-open check is here rather than in `open_named`** so a remote source still gets
+    /// a window of its own: two tails of one source are two different questions about it, and their
+    /// spill parts are different files anyway. A *file* opened twice is the same file twice.
     fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
+        if self.document.show_already_open(&path) {
+            self.notice = Some(format!(
+                "{} is already open",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned())
+            ));
+            self.retitle(hwnd);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return;
+        }
         self.open_named(hwnd, path, None);
     }
 
@@ -13182,8 +13240,13 @@ fn main() -> Result<()> {
     // working window, so a refusal here is not worth failing to start over. See [`icon`].
     let (big_icon, small_icon) = icon::window_icons();
 
+    // **`CS_DBLCLKS`, without which three features could never have fired.** A window class that
+    // omits it is never sent `WM_LBUTTONDBLCLK` at all — a double click arrives as two ordinary
+    // button-downs — so the arms handling it were unreachable code: double-click to select a word,
+    // double-click a column divider to fit it, and triple-click to select a line, which arms itself
+    // only from `last_double` and so could never be reached either.
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
+        style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wndproc),
         hInstance: instance,
         hIcon: big_icon.unwrap_or_default(),
@@ -14787,6 +14850,41 @@ mod tests {
             Some("live"),
             "the identity is the settings key, which is what regroup looks up"
         );
+    }
+
+    /// **A file already open is brought forward, not opened again.**
+    ///
+    /// Reported 2026-10-06, after the recent list produced two tabs on one log: *"I dont think one
+    /// wants the same file open twice"*. The spelling is folded because Windows opens two
+    /// spellings of a path as one file, and a tab found in a split focuses that pane — bringing the
+    /// tab forward while the other half held the file would look like nothing happened.
+    #[test]
+    fn a_file_already_open_is_brought_forward_rather_than_opened_twice() {
+        let a = scratch_log("tailhawk_already_open_a.log", 4);
+        let b = scratch_log("tailhawk_already_open_b.log", 4);
+        let mut tabs = Tabs::default();
+        tabs.push(Document::open(&a).expect("open a"));
+        tabs.push(Document::open(&b).expect("open b"));
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.active, 1, "the newest is in front");
+
+        assert!(tabs.show_already_open(&a), "a is open");
+        assert_eq!(tabs.active, 0, "and is brought forward");
+        assert_eq!(tabs.len(), 2, "without a third tab");
+
+        let shouted = std::path::PathBuf::from(a.to_string_lossy().to_uppercase());
+        assert!(
+            tabs.show_already_open(&shouted),
+            "one file however it is spelled: {}",
+            shouted.display()
+        );
+
+        let absent = std::env::temp_dir().join("tailhawk_never_opened.log");
+        assert!(!tabs.show_already_open(&absent), "and a file that is not");
+        assert_eq!(tabs.active, 0, "so nothing moved");
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 
     /// **"Working" outranks "clickable", and that is the whole decision.**

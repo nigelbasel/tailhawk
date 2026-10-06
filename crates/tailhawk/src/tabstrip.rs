@@ -485,15 +485,21 @@ impl TabStrip {
         rect.top.clamp(1, 200)
     }
 
-    /// Puts the control across the top of the client area, or hides it when there is one tab.
-    pub fn place(&mut self, width: i32, height: i32, visible: bool) {
+    /// Puts the control across the client area at `top`, or hides it.
+    ///
+    /// **`top` is the toolbar's band, and it used to be zero.** The strip was the first row and
+    /// §2.3's toolbar sat underneath it, which the owner reported on 2026-10-06 as the wrong way
+    /// round: every application that has both puts the toolbar above the tabs, because the toolbar
+    /// acts on the window and the tabs choose what the window is showing. `UI-DESIGN.md` specified
+    /// the old order and has been corrected rather than cited.
+    pub fn place(&mut self, top: i32, width: i32, height: i32, visible: bool) {
         if visible {
             unsafe {
                 let _ = SetWindowPos(
                     self.hwnd,
                     HWND_TOP,
                     0,
-                    0,
+                    top.max(0),
                     width.max(0),
                     height.max(0),
                     SWP_NOACTIVATE | SWP_NOZORDER,
