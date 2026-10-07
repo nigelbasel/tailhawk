@@ -258,6 +258,11 @@ struct Document {
     /// §8.1's per-tab change indication: this document grew while another tab was shown. Set by
     /// the shell on the follow tick, cleared when the tab is shown, drawn as a dot on its tab.
     unseen: bool,
+    /// Lines per second, smoothed — what the tab strip's traffic bar is a picture of.
+    traffic_rate: f32,
+    /// The row count and tick of the last traffic sample, which the rate is the difference between.
+    traffic_rows: u64,
+    traffic_at: u32,
     /// What §6.3's detector made of the newest member's head — the format, if one was accepted,
     /// the candidates if not. Run on the worker that opens the file, from the head sample only;
     /// §6.3's mid and tail samples are not taken yet.
@@ -767,6 +772,9 @@ impl Document {
             strip_px: 0.0,
             status: String::new(),
             unseen: false,
+            traffic_rate: 0.0,
+            traffic_rows: 0,
+            traffic_at: 0,
             detection,
             header: layout.as_ref().map(Layout::header),
             id: next_document_id(),
@@ -843,6 +851,9 @@ impl Document {
             strip_px: 0.0,
             status: String::new(),
             unseen: false,
+            traffic_rate: 0.0,
+            traffic_rows: 0,
+            traffic_at: 0,
             detection,
             header: layout.as_ref().map(Layout::header),
             id: next_document_id(),
@@ -1548,6 +1559,38 @@ impl Document {
     /// Time-bounded rather than byte-bounded — see `Follow::poll_for`. 30 ms of a 100 ms tick leaves
     /// the message loop 70% idle and is what carries the 50 MB/s of `SPEC.md` §11.3's criterion; a
     /// single byte-budgeted scan per tick capped throughput at roughly 40 MB/s.
+    /// Updates the lines-per-second this document is receiving, for the tab strip's traffic bar.
+    ///
+    /// **Smoothed, because a tab strip is glanced at and a raw figure flickers.** A log arrives in
+    /// bursts — a flush, a request, a stack trace — and a bar driven by the last tick alone would
+    /// jump between full and empty while the traffic was steady. An exponential average over a few
+    /// seconds is what makes "this one is busy" readable at a glance, which is the whole ask.
+    ///
+    /// **It decays on quiet ticks as well as rising on busy ones**, which is why this is called
+    /// before the quiet return rather than after it: a tab that stops receiving has to lose its bar,
+    /// and one that only ever rose would keep a full bar on a log that died an hour ago.
+    ///
+    /// The first sample has nothing to measure against, and two ticks close enough together that
+    /// the division is meaningless are skipped rather than allowed to produce a spike. The average
+    /// is weighted towards its history, so one burst does not fill the bar and one gap does not
+    /// empty it.
+    fn sample_traffic(&mut self) {
+        let rows = self.set.total_rows();
+        let now = now_ms();
+        let was = std::mem::replace(&mut self.traffic_at, now);
+        let before = std::mem::replace(&mut self.traffic_rows, rows);
+        let elapsed = now.wrapping_sub(was);
+        if was == 0 || elapsed < 50 {
+            return;
+        }
+        let added = rows.saturating_sub(before) as f32;
+        let per_second = added * 1000.0 / elapsed as f32;
+        self.traffic_rate = self.traffic_rate * 0.7 + per_second * 0.3;
+        if self.traffic_rate < 0.05 {
+            self.traffic_rate = 0.0;
+        }
+    }
+
     fn poll_follow(&mut self) -> bool {
         header::trace("poll_follow enter");
         let was_following = self.view.grid().is_following();
@@ -1564,6 +1607,7 @@ impl Document {
         header::trace("poll_follow: set.poll enter");
         let polled = self.set.poll();
         header::trace("poll_follow: set.poll done");
+        self.sample_traffic();
         if polled.is_quiet() {
             // The rows did not move, but the title may still be wrong. §4.2's end of stream "is not
             // an app exit", and a window that stops updating without saying why looks like one that
@@ -4235,6 +4279,23 @@ impl Tabs {
         true
     }
 
+    /// Each tab's traffic, in tab order — the busiest of its panes.
+    ///
+    /// **The busiest pane, not their sum.** A tiled tab shows one bar, and what a reader wants to
+    /// know from it is whether anything behind it is busy; adding two quiet panes together to make
+    /// one apparently busy tab would say the opposite of the truth.
+    fn traffic_rates(&self) -> Vec<f32> {
+        self.tabs
+            .iter()
+            .map(|t| {
+                t.panes
+                    .iter()
+                    .map(|d| d.traffic_rate)
+                    .fold(0.0_f32, f32::max)
+            })
+            .collect()
+    }
+
     fn cycle(&mut self, forward: bool) {
         let n = self.tabs.len();
         if n < 2 {
@@ -5336,6 +5397,7 @@ impl Shell {
         header::trace("paint enter");
         // The strip and the status are the shell's knowledge, handed to the document that draws them.
         let strip = (self.document.labels(), self.document.active);
+        let traffic = self.document.traffic_rates();
         let panes = self.status_panes();
         self.status_shown = panes
             .parts()
@@ -5495,6 +5557,7 @@ impl Shell {
                         tabs.set(&strip.0, strip.1);
                         let band = tabs.band_height(w as i32);
                         tabs.place(toolbar_px as i32, w as i32, band, true);
+                        tabs.show_traffic(&traffic);
                         band as f32
                     }
                     (Some(tabs), false) => {

@@ -22,9 +22,12 @@
 //! the cheap place to find out. **No test can settle it; it needs an eye on screen.**
 
 use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, CreateSolidBrush, DeleteObject, HBRUSH, HFONT, HGDIOBJ,
+};
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::WindowsAndMessaging::HMENU;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -73,6 +76,9 @@ const MAX_CLOSERS: u32 = 64;
 /// like everything else here.
 const CLOSE_PX: i32 = 16;
 const CLOSE_INSET: i32 = 3;
+
+/// How thick a traffic bar is, at 96 DPI — a hairline that reads as a bar rather than a border.
+const BAR_PX: i32 = 3;
 
 /// `BS_FLAT` and `BS_PUSHBUTTON` — a button with no raised edge, which is what a close affordance
 /// inside a tab wants. The `windows` crate binds the button styles as plain `u32` constants rather
@@ -141,6 +147,12 @@ struct TcHitTest {
 }
 
 thread_local! {
+    /// The traffic bars' brush, so the subclass can answer `WM_CTLCOLORSTATIC` for them.
+    ///
+    /// **A thread-local because the subclass proc has no `self`.** It is the same shape the drag
+    /// state below uses, and it is sound because the bars are the *only* static children the strip
+    /// has — the close buttons are buttons and answer a different message.
+    static BAR_BRUSH: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     /// Which tab the pointer went down on, while a drag is in progress.
     static DRAGGING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Whether that drag has left the strip. Remembered because the button-up that ends it carries
@@ -305,6 +317,12 @@ unsafe extern "system" fn drag_proc(
                 tell_parent(hwnd, WM_TAB_CLOSE, WPARAM(at), LPARAM(0));
             }
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC => {
+            let brush = BAR_BRUSH.with(|b| b.get());
+            if brush != 0 {
+                return windows::Win32::Foundation::LRESULT(brush);
+            }
+        }
         windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u32;
             if let Some(at) = id
@@ -350,6 +368,27 @@ pub fn close_button_at(tab: (i32, i32, i32, i32), size: i32, inset: i32) -> Opti
     Some((x + w - size - inset, y + (h - size) / 2))
 }
 
+/// How wide a tab's traffic bar is, given its rate and the busiest tab's.
+///
+/// **Relative, because the question is comparative.** The owner asked for *"a small highlight bar
+/// on each tab as it gets traffic so at a glance the user can see if another tab is getting a lot
+/// of new traffic"* — which is a comparison between tabs, not a reading in lines per second. So the
+/// busiest tab fills its bar and every other is a fraction of it, and a window where everything is
+/// equally busy shows full bars rather than none.
+///
+/// **A rate of nothing is no bar at all.** A quiet tab drawing a one-pixel sliver would read as
+/// faint traffic rather than no traffic, and the point of the bar is to be scanned.
+///
+/// A visible floor otherwise: a tab at a hundredth of the busiest still gets a pixel or two, since
+/// "almost nothing" and "nothing" are different answers and the first deserves to be seen.
+pub fn traffic_width(rate: f32, busiest: f32, full: i32) -> i32 {
+    if rate.is_nan() || busiest.is_nan() || rate <= 0.0 || busiest <= 0.0 || full <= 0 {
+        return 0;
+    }
+    let share = (rate / busiest).clamp(0.0, 1.0);
+    ((share * full as f32).round() as i32).clamp(1, full)
+}
+
 /// Windows' tab control, holding one item per open document.
 pub struct TabStrip {
     hwnd: HWND,
@@ -360,6 +399,14 @@ pub struct TabStrip {
     visible: bool,
     /// The module handle the close buttons are created from, kept because `place` needs it too.
     instance: HINSTANCE,
+    /// One traffic bar per tab, in tab order — a coloured static along the tab's bottom edge.
+    ///
+    /// **A static with a brush, not drawing.** `SysTabControl32` supports no custom draw, so the
+    /// bar is a child window whose background is painted by answering `WM_CTLCOLORSTATIC` — the
+    /// pattern the rules editor's colour swatches already use. Nothing here draws by hand.
+    bars: Vec<HWND>,
+    /// The brush the bars are painted with, made once and freed on drop.
+    bar_brush: HBRUSH,
     /// One close button per tab, in tab order.
     ///
     /// **Children of the tab control, not of the window**, so they move with it and are clipped by
@@ -429,12 +476,16 @@ impl TabStrip {
                 0,
             );
         }
+        let brush = unsafe { CreateSolidBrush(COLORREF(0x0040_C040)) };
+        BAR_BRUSH.with(|b| b.set(brush.0 as isize));
         Some(TabStrip {
             hwnd,
             font,
             shown: (Vec::new(), usize::MAX),
             visible: false,
             instance,
+            bars: Vec::new(),
+            bar_brush: brush,
             closers: Vec::new(),
         })
     }
@@ -527,6 +578,79 @@ impl TabStrip {
     /// Rebuilds only when something actually changed: `TCM_DELETEALLITEMS` followed by inserts
     /// resets the selection and repaints the whole band, so doing it every frame would flicker and
     /// fight the user's own clicks.
+    /// Shows each tab's traffic as a bar along its bottom edge, scaled to the busiest.
+    ///
+    /// **Called every frame with the live rates**, because traffic is the one thing on a tab that
+    /// changes without anything else changing: the labels are the same, the selection is the same,
+    /// and `set` returns early on both. So this is separate from `set` rather than part of it.
+    pub fn show_traffic(&mut self, rates: &[f32]) {
+        let busiest = rates.iter().copied().fold(0.0_f32, f32::max);
+        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd) }.max(96);
+        let thick = (BAR_PX * dpi as i32 / 96).max(2);
+        while self.bars.len() > rates.len() {
+            if let Some(dead) = self.bars.pop() {
+                // SAFETY: a live child window this module created and is giving up.
+                unsafe {
+                    let _ = DestroyWindow(dead);
+                }
+            }
+        }
+        while self.bars.len() < rates.len() {
+            // SAFETY: `STATIC` is a system class and `self.hwnd` is a live control.
+            let made = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    PCWSTR::null(),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_CLIPSIBLINGS.0),
+                    0,
+                    0,
+                    1,
+                    1,
+                    self.hwnd,
+                    None,
+                    self.instance,
+                    None,
+                )
+            };
+            match made {
+                Ok(h) => self.bars.push(h),
+                Err(_) => break,
+            }
+        }
+        for (at, bar) in self.bars.iter().enumerate() {
+            let width = rates
+                .get(at)
+                .map(|rate| {
+                    self.item_rect(at)
+                        .map(|(_, _, w, _)| traffic_width(*rate, busiest, w as i32))
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let spot = self.item_rect(at).filter(|_| self.visible && width > 0);
+            // SAFETY: both take a live child handle and retain nothing.
+            unsafe {
+                match spot {
+                    Some((x, y, _, h)) => {
+                        let _ = SetWindowPos(
+                            *bar,
+                            HWND_TOP,
+                            x as i32,
+                            y as i32 + h as i32 - thick,
+                            width,
+                            thick,
+                            SWP_NOACTIVATE | SWP_NOZORDER,
+                        );
+                        let _ = ShowWindow(*bar, SW_SHOWNA);
+                    }
+                    None => {
+                        let _ = ShowWindow(*bar, SW_HIDE);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn set(&mut self, labels: &[String], active: usize) {
         if self.shown.0 == labels && self.shown.1 == active {
             return;
@@ -686,6 +810,9 @@ impl Drop for TabStrip {
             if !self.font.is_invalid() {
                 let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.font.0));
             }
+            if !self.bar_brush.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.bar_brush.0));
+            }
         }
     }
 }
@@ -795,5 +922,59 @@ mod tests {
                 assert!(by >= y && by + 12 <= y + h, "and vertically: {by}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+
+    /// **The busiest tab fills its bar and the others are a fraction of it.**
+    ///
+    /// Asked for on 2026-10-06: a bar on each tab so that at a glance a reader can see whether
+    /// another tab is getting a lot of new traffic. That is a comparison between tabs, so the
+    /// scale is relative — an absolute lines-per-second would need a legend to mean anything.
+    #[test]
+    fn the_busiest_tab_fills_its_bar_and_the_rest_are_relative() {
+        assert_eq!(traffic_width(100.0, 100.0, 40), 40, "the busiest fills it");
+        assert_eq!(
+            traffic_width(50.0, 100.0, 40),
+            20,
+            "half as busy, half as wide"
+        );
+        assert_eq!(traffic_width(100.0, 100.0, 40), traffic_width(7.0, 7.0, 40));
+    }
+
+    /// **No traffic is no bar**, because a one-pixel sliver on a quiet tab reads as faint traffic
+    /// rather than none — and the bar exists to be scanned, so a false positive costs more than a
+    /// missing one.
+    #[test]
+    fn a_quiet_tab_has_no_bar_at_all() {
+        assert_eq!(traffic_width(0.0, 100.0, 40), 0);
+        assert_eq!(traffic_width(100.0, 0.0, 40), 0, "nothing is busy yet");
+        assert_eq!(
+            traffic_width(f32::NAN, 100.0, 40),
+            0,
+            "and NaN is not traffic"
+        );
+        assert_eq!(traffic_width(-5.0, 100.0, 40), 0);
+    }
+
+    /// **Almost nothing is still something.** A tab at a hundredth of the busiest gets a pixel, so
+    /// the difference between a trickle and silence is visible — the two are different answers.
+    #[test]
+    fn a_trickle_is_still_drawn() {
+        assert_eq!(traffic_width(1.0, 1000.0, 40), 1);
+        assert!(traffic_width(1.0, 1_000_000.0, 40) >= 1);
+        assert_eq!(
+            traffic_width(500.0, 100.0, 40),
+            40,
+            "and nothing exceeds full"
+        );
+        assert_eq!(
+            traffic_width(10.0, 100.0, 0),
+            0,
+            "a tab with no room has none"
+        );
     }
 }
