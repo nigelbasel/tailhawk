@@ -1230,10 +1230,6 @@ impl Document {
             .collect()
     }
 
-    fn filters_open(&self) -> bool {
-        self.show_filters
-    }
-
     /// Whether the chips or the collapse are narrowing the rows — what `Clear filters` acts on.
     fn is_filtered(&self) -> bool {
         self.filtering.filtered()
@@ -1330,9 +1326,6 @@ impl Document {
         // in force with nothing saying so, and until the status line counted them the panel was
         // the only thing that could: hence `filters_hidden` is the newer half of a pair, and
         // honouring it is only safe because `▼ n filters · k of m` now says it too.
-        if !self.filtering.chips.chips.is_empty() && !state.filters_hidden {
-            self.show_filters = true;
-        }
         self.filtering.records_only = state.collapse && self.detection.accepted.is_some();
         self.filtering.error = None;
         self.bookmarks.extend(state.bookmarks.iter().copied());
@@ -1797,17 +1790,6 @@ impl Document {
                 self.filtering.error = None;
                 self.filtering.chips.chips.push(chip);
                 self.filtering.clear_results();
-                // **A filter brings its panel, and that belongs here rather than at each caller.**
-                // Two callers set the flag themselves immediately before calling this — the grid's
-                // *Filter to this text* and the Filter dialog's OK — and a third added later would
-                // have been a filter in force with nothing on screen saying so, which is §1.1's
-                // invisible state. One chip added, one panel shown, decided once.
-                //
-                // The four remaining `show_filters = true` in the shell are a different act: they
-                // open the panel *before* the Filter dialog, so the surface the filter will land in
-                // is already there while it is being composed. No chip exists at that point, so
-                // this is not the place for them.
-                self.show_filters = true;
                 self.refilter();
             }
             Err(e) => self.filtering.error = Some(format!("{text}: {e}")),
@@ -4557,6 +4539,10 @@ struct Shell {
     /// editor through [`rules_read`] — so a `STATE` borrow alive across the call is a re-entrant
     /// borrow, not merely a risk.
     pending_rules: bool,
+    /// §7's filters dialog, deferred for the same reason: it is modal and runs its own loop.
+    /// §7's filters dialog, deferred because it is modal and pumps its own message loop — a
+    /// `STATE` borrow held across that is the `RefCell` panic every pending flag here exists for.
+    pending_filters: bool,
     /// §12.4's remote sources dialog, deferred like every other so no `STATE` borrow is held
     /// while it pumps its own modal loop.
     pending_sources: bool,
@@ -4669,6 +4655,9 @@ struct Shell {
     /// V9's rules editor — `UI-DESIGN.md` §5. On the shell rather than the document because the
     /// rules are the estate's, not one tab's.
     rules_editor: tailhawk_core::ruleset::Editor,
+    /// §7's filters, as the dialog edits them. Opened fresh each time the dialog is shown, so a
+    /// Cancel leaves no trace and the next open starts from what is actually in force.
+    filters_editor: tailhawk_core::filter::Editor,
     /// V9's format wizard — `UI-DESIGN.md` §6.2. On the shell for the reason the rules editor is:
     /// a format definition outlives the tab that prompted it. `None` when the box is not up.
     wizard: Option<tailhawk_core::wizard::Wizard>,
@@ -6221,7 +6210,6 @@ impl Shell {
             self.pending_goto = true;
             true
         } else if ctrl && key == VK_L.0 {
-            doc.show_filters = true;
             doc.filtering.error = None;
             self.pending_filter = Some((
                 if shift {
@@ -7029,7 +7017,6 @@ impl Shell {
                     return false;
                 };
                 if let Some(doc) = self.document.as_mut() {
-                    doc.show_filters = true;
                     doc.filtering.error = None;
                 }
                 self.pending_filter = Some((Polarity::Include, Some(title)));
@@ -7211,7 +7198,6 @@ impl Shell {
             }
             Command::ClearSearch => doc.finder.clear(),
             Command::FilterInclude | Command::FilterExclude => {
-                doc.show_filters = true;
                 doc.filtering.error = None;
                 self.pending_filter = Some((
                     if command == Command::FilterInclude {
@@ -7223,7 +7209,7 @@ impl Shell {
                 ));
             }
             Command::ToggleFilters => {
-                doc.show_filters = !doc.show_filters;
+                self.pending_filters = true;
             }
             Command::ClearFilter => doc.clear_filter(),
             Command::EditFilter => {
@@ -9398,7 +9384,6 @@ fn context_menu(hwnd: HWND, sx: i32, sy: i32, on_header: Option<HWND>) {
             }
             (menubar::ID_CTX_FILTER_COLUMN, Under::Header { title, .. }) => {
                 if let Some(doc) = shell.document.as_mut() {
-                    doc.show_filters = true;
                     doc.filtering.error = None;
                 }
                 shell.pending_filter = Some((Polarity::Include, Some(title.clone())));
@@ -10256,6 +10241,15 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         }
         return true;
     }
+    let filters = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .is_some_and(|shell| std::mem::take(&mut shell.pending_filters))
+    });
+    if filters {
+        filters_open(hwnd);
+        return true;
+    }
     let rules = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
@@ -10841,6 +10835,59 @@ pub fn rules_apply(owner: HWND, act: impl FnOnce(&mut tailhawk_core::ruleset::Ed
 /// Reads the live rules editor — the rows a list view fills from, and the selected row's fields.
 pub fn rules_read<R>(read: impl FnOnce(&tailhawk_core::ruleset::Editor) -> R) -> Option<R> {
     STATE.with(|s| s.borrow().as_ref().map(|shell| read(&shell.rules_editor)))
+}
+
+/// Reads the filters dialog's editor, the shape `rules_read` has.
+pub fn filters_read<R>(read: impl FnOnce(&tailhawk_core::filter::Editor) -> R) -> Option<R> {
+    STATE.with(|s| s.borrow().as_ref().map(|shell| read(&shell.filters_editor)))
+}
+
+/// Edits it. Separate from [`filters_read`] because a `RefCell` will not lend both at once, and the
+/// dialog's verbs are writes with an answer — the fault from a text that would not parse.
+pub fn filters_write<R>(edit: impl FnOnce(&mut tailhawk_core::filter::Editor) -> R) -> Option<R> {
+    STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .map(|shell| edit(&mut shell.filters_editor))
+    })
+}
+
+/// The dialog's **Apply** and **OK**: puts the edited filters in force and refilters the view.
+///
+/// **The owner's button, and the reason the dialog has three.** *"if the filter dialog has an apply
+/// button, then it is easy for the user to see the effect of the filter changes"* — so this is
+/// reachable without closing, and the rows behind the dialog change while it is still up.
+pub fn filters_apply(owner: HWND) {
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            let chips = shell.filters_editor.commit();
+            if let Some(doc) = shell.document.as_mut() {
+                doc.filtering.chips = chips;
+                doc.filtering.error = None;
+                doc.refilter();
+                let rows = doc.view_rows();
+                doc.view.grid_mut().set_total_rows(rows);
+            }
+        }
+    });
+    unsafe {
+        let _ = InvalidateRect(owner, None, false);
+    }
+}
+
+/// Opens the dialog over the filters in force.
+pub fn filters_open(owner: HWND) {
+    STATE.with(|s| {
+        if let Some(shell) = s.borrow_mut().as_mut() {
+            let chips = shell
+                .document
+                .as_ref()
+                .map(|doc| doc.filtering.chips.clone())
+                .unwrap_or_default();
+            shell.filters_editor = tailhawk_core::filter::Editor::open(&chips);
+        }
+    });
+    dialog::show_filters_dialog(owner);
 }
 
 /// The dialog's **Save**: writes the personal tier and reloads, so what applies afterwards is what
@@ -13420,6 +13467,7 @@ fn main() -> Result<()> {
             pending_import: false,
             pending_goto: false,
             pending_rules: false,
+            pending_filters: false,
             pending_sources: false,
             pending_pull: None,
             pending_repick: None,
@@ -13445,6 +13493,7 @@ fn main() -> Result<()> {
             welcome: None,
             remembered,
             rules_editor: tailhawk_core::ruleset::Editor::default(),
+            filters_editor: tailhawk_core::filter::Editor::default(),
             wizard: None,
             wizard_found: Vec::new(),
             formats_tiers,
@@ -14850,41 +14899,43 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Closing the filter panel is remembered with the file, and honoured when it opens again.
+    /// **The filters survive a reopen; the panel that used to show them does not exist.**
     ///
-    /// **The open case is the one that must not regress.** Until the status line learned to count
-    /// filters, a remembered file *had* to bring its panel back, because the panel was the only
-    /// thing on screen saying the view was narrowed — §1.1's rule against invisible state. What
-    /// makes closing it safe now is `▼ n filters · k of m`, and that is why this asserts both
-    /// directions rather than only the new one.
+    /// This asserted that closing the bottom panel was remembered and honoured. The panel is gone —
+    /// the owner, 2026-10-06: *"the little bar at the bottom is confusing and hard to notice"*, and
+    /// filters are defined in a dialog now. So the half of it that still means something is that a
+    /// remembered file brings its *filters* back, which is what the reader actually cares about.
+    ///
+    /// The old test's own reasoning is why this is safe to lose: it said the panel once *had* to
+    /// reappear because it was the only thing on screen saying the view was narrowed, and that the
+    /// status line counting filters is what made closing it safe. The status line still counts them.
     #[test]
-    fn a_closed_filter_panel_comes_back_closed_and_an_open_one_open() {
+    fn a_remembered_file_brings_its_filters_back() {
         let path = scratch_log("tailhawk_panel_state_test.log", 300);
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
         filter_for(&mut doc, "line", Polarity::Include);
-        assert!(doc.show_filters, "adding a filter opens the panel");
+        assert_eq!(doc.filtering.chips.chips.len(), 1);
 
-        let left_open = doc.file_state().expect("a path to key by");
-        assert!(!left_open.filters_hidden);
-        doc.show_filters = false;
-        let left_closed = doc.file_state().expect("a path to key by");
-        assert!(left_closed.filters_hidden, "the choice is recorded");
+        let saved = doc.file_state().expect("a path to key by");
 
-        let mut closed = Document::open(&path).expect("reopen");
-        closed.lay_out((8.0, 10.0), (800, 200));
-        closed.apply_state(&left_closed);
+        let mut again = Document::open(&path).expect("reopen");
+        again.lay_out((8.0, 10.0), (800, 200));
+        again.apply_state(&saved);
         assert_eq!(
-            closed.filtering.chips.chips.len(),
+            again.filtering.chips.chips.len(),
             1,
-            "the filter came back"
+            "the filter came back with the file"
         );
-        assert!(!closed.show_filters, "and the panel stayed closed");
-
-        let mut open = Document::open(&path).expect("reopen");
-        open.lay_out((8.0, 10.0), (800, 200));
-        open.apply_state(&left_open);
-        assert!(open.show_filters, "a panel left open comes back open");
+        assert_eq!(
+            again.filtering.chips.chips[0].source, "line",
+            "and it is the same filter, not a placeholder"
+        );
+        assert!(
+            bar(&again).contains("Filtered"),
+            "which the status bar says, as it has since the panel stopped being the only sign: {}",
+            bar(&again)
+        );
     }
 
     /// A notice is shown beside what the document *is*, not instead of it.

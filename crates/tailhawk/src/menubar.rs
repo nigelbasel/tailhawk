@@ -576,7 +576,6 @@ pub fn menu_bar(
     let collapsed = doc.is_some_and(|d| d.is_collapsed());
     let invisibles = doc.is_some_and(|d| d.shows_invisibles());
     let detail = doc.is_some_and(|d| d.detail_open());
-    let filters = doc.is_some_and(|d| d.filters_open());
     let filtered = doc.is_some_and(|d| d.is_filtered());
     let chosen_filter = doc.is_some_and(|d| d.selected_filter().is_some());
     let saving = doc.is_some_and(|d| d.is_saving());
@@ -729,10 +728,7 @@ pub fn menu_bar(
                     cmd("&Pretty-print JSON", "", Command::TogglePretty),
                     open && detail,
                 ),
-                on(
-                    check("Filter pane&l", "", Command::ToggleFilters, filters),
-                    open,
-                ),
+                on(cmd("Fi&lters…", "", Command::ToggleFilters), open),
                 // §2.3: the row is hideable, and this is the only way back to it — so it is never
                 // disabled, whatever is or is not open.
                 // §2.3: the row is hideable, and this submenu is the only way back to it — so it

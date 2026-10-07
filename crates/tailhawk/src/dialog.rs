@@ -128,6 +128,18 @@ const ID_S_SCOPE: u16 = 217;
 const ID_S_SECRET: u16 = 218;
 const ID_S_QUERY: u16 = 219;
 const ID_S_FAULT: u16 = 220;
+
+/// §7's filters dialog. Its own range, clear of the sources editor above and the Define Format
+/// grid below, so a stray id cannot land on another dialog's control.
+const ID_V_LIST: u16 = 230;
+const ID_V_TEXT: u16 = 231;
+const ID_V_ADD: u16 = 232;
+const ID_V_REMOVE: u16 = 233;
+const ID_V_INCLUDE: u16 = 234;
+const ID_V_EXCLUDE: u16 = 235;
+const ID_V_ENABLED: u16 = 236;
+const ID_V_APPLY: u16 = 237;
+const ID_V_FAULT: u16 = 238;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -1573,6 +1585,133 @@ pub fn show_apps_dialog(hwnd: HWND, data: &mut AppsPick) -> bool {
 /// grid *is* the preview: every keystroke in the pattern recompiles the set and repaints the log
 /// underneath. The Find dialog had already established the shape here, so this follows it rather
 /// than `show_format_dialog`.
+/// §7's filters, as a dialog — the Rules editor's shape, which is the point.
+///
+/// **It replaces the strip along the bottom.** The owner, 2026-10-06: *"the filters should be
+/// defined in a dialog, which will allow editing, adding and removing filters. The little bar at
+/// the bottom is confusing and hard to notice"* — and, on the Visual Studio comparison the old
+/// design note leaned on, *"even if filters are a docked panel, the little line at the bottom is
+/// not that. In visual studio, these are non-modal, dockable dialog boxes."* A non-modal dockable
+/// editor is the eventual shape and waits on docking infrastructure this program does not have.
+///
+/// **Three commit buttons, and Apply is his.** *"if the filter dialog has an apply button, then it
+/// is easy for the user to see the effect of the filter changes"* — so the rows behind can be
+/// watched changing without first losing the dialog that changed them. The dialog is movable, so it
+/// can be dragged clear of what it is filtering.
+///
+/// **Include and exclude are a radio pair, not two checkboxes.** §7.2 makes a chip one or the
+/// other, and two independent boxes would offer a state the grammar has no meaning for. The fault
+/// line below them carries whatever `ParseError` says about the expression being typed, folded to
+/// the one line that fits.
+///
+/// **Add starts a filter as the word `new`**, which §7.2's grammar accepts and which therefore
+/// always parses, and selects it so the field it lands in is the field to type into. A row that
+/// could not parse would make the dialog's first act an error message.
+/// One list row per filter: **On, Polarity, Filter**.
+///
+/// Pure and separate, like `rules_row_cells`, because what it decides is a requirement rather than
+/// a drawing detail: §7.1 keeps a disabled filter's place *and its text* rather than dropping it,
+/// so "off" has to be a column and not an absence.
+pub fn filter_row_cells(editor: &tailhawk_core::filter::Editor) -> Vec<[String; 3]> {
+    editor
+        .rows()
+        .iter()
+        .map(|chip| {
+            [
+                if chip.enabled { "on" } else { "off" }.to_owned(),
+                match chip.polarity {
+                    tailhawk_core::filter::Polarity::Include => "include",
+                    tailhawk_core::filter::Polarity::Exclude => "exclude",
+                }
+                .to_owned(),
+                chip.source.clone(),
+            ]
+        })
+        .collect()
+}
+
+fn filters_dialog_items() -> Vec<Item> {
+    const BS_AUTORADIOBUTTON: u32 = 0x0009;
+    const WS_GROUP: u32 = 0x0002_0000;
+    let verb = |text: &str, id: u16, row: i16| {
+        Item::new(
+            Class::Button,
+            text,
+            id,
+            (R_VERB_X, 7 + row * 17, R_VERB_W, 14),
+            WS_TABSTOP,
+        )
+    };
+    vec![
+        Item::new(
+            Class::Named("SysListView32"),
+            "",
+            ID_V_LIST,
+            (R_LEFT, 7, R_LIST_W, 104),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ),
+        verb("&Add", ID_V_ADD, 0),
+        verb("&Remove", ID_V_REMOVE, 1),
+        Item::new(Class::Static, "&Filter:", 0xFFFF, (R_LEFT, 120, 40, 8), 0),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_V_TEXT,
+            (R_FIELD_X, 118, 252, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        Item::new(
+            Class::Button,
+            "&Include matching lines",
+            ID_V_INCLUDE,
+            (R_FIELD_X, 136, 140, 10),
+            WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "E&xclude matching lines",
+            ID_V_EXCLUDE,
+            (R_FIELD_X + 145, 136, 140, 10),
+            BS_AUTORADIOBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "&Enabled",
+            ID_V_ENABLED,
+            (R_FIELD_X, 152, 100, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        Item::new(
+            Class::Static,
+            "",
+            ID_V_FAULT,
+            (R_LEFT, 170, R_LIST_W, 18),
+            0,
+        ),
+        Item::new(
+            Class::Button,
+            "OK",
+            IDOK,
+            (R_VERB_X, 150, R_VERB_W, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (R_VERB_X, 167, R_VERB_W, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "A&pply",
+            ID_V_APPLY,
+            (R_VERB_X, 184, R_VERB_W, 14),
+            WS_TABSTOP,
+        ),
+    ]
+}
+
 fn rules_dialog_items() -> Vec<Item> {
     let label = |text: &str, y: i16, w: i16| {
         Item::new(Class::Static, text, 0xFFFF, (R_LEFT, y + 2, w, 8), 0)
@@ -1713,6 +1852,168 @@ fn rules_state(hdlg: HWND) -> Option<&'static mut RulesState> {
 /// under it as a pattern is typed. What modeless bought was scrolling the log while the box was
 /// open, and what it cost was a dialog that could be sent behind its owner and closed from the
 /// menu bar. Returns when the box has gone.
+/// Shows §7's filters dialog, modal over `owner`.
+///
+/// **Modal, with an Apply, rather than modeless.** The eventual shape is a non-modal dockable
+/// editor and it waits on docking infrastructure this program does not have — the owner's decision,
+/// 2026-10-06. Apply is what makes modal bearable meanwhile: a change can be seen without the
+/// dialog going away, and the dialog can be dragged off the rows it is filtering.
+pub fn show_filters_dialog(owner: HWND) {
+    let icc = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_LISTVIEW_CLASSES,
+    };
+    unsafe {
+        let _ = InitCommonControlsEx(&icc);
+    }
+    let t = template("Filters", 420, 204, &filters_dialog_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            owner,
+            Some(filters_proc),
+            LPARAM(owner.0 as isize),
+        );
+    }
+}
+
+unsafe extern "system" fn filters_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
+        WM_INITDIALOG => {
+            theme_dialog(hdlg);
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_LIST)) } {
+                unsafe {
+                    SendMessageW(
+                        list,
+                        LVM_SETEXTENDEDLISTVIEWSTYLE,
+                        WPARAM(0),
+                        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                    );
+                }
+            }
+            let at = crate::filters_read(|editor| editor.selected()).flatten();
+            filters_refresh(hdlg, at.or(Some(0)));
+            1
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == usize::from(ID_V_LIST) && header.code == LVN_ITEMCHANGED {
+                if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_LIST)) } {
+                    let at = lv_selected(list);
+                    let was = crate::filters_read(|e| e.selected()).flatten();
+                    if at != was {
+                        filters_take_field(hdlg);
+                        crate::filters_write(|editor| editor.select(at));
+                        filters_show_selected(hdlg);
+                    }
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            let owner = HWND(
+                unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) }
+                    as *mut core::ffi::c_void,
+            );
+            match (id, code) {
+                (ID_V_TEXT, EN_CHANGE) => {
+                    filters_take_field(hdlg);
+                    1
+                }
+                (ID_V_INCLUDE | ID_V_EXCLUDE, _) => {
+                    filters_take_field(hdlg);
+                    let at = crate::filters_read(|e| e.selected()).flatten();
+                    filters_refresh(hdlg, at);
+                    1
+                }
+                (ID_V_ENABLED, _) => {
+                    let on = unsafe {
+                        SendDlgItemMessageW(
+                            hdlg,
+                            i32::from(ID_V_ENABLED),
+                            BM_GETCHECK,
+                            WPARAM(0),
+                            LPARAM(0),
+                        )
+                        .0 == 1
+                    };
+                    let at = crate::filters_read(|e| e.selected()).flatten();
+                    if let Some(at) = at {
+                        crate::filters_write(|editor| editor.set_enabled(at, on));
+                    }
+                    filters_refresh(hdlg, at);
+                    1
+                }
+                (ID_V_ADD, _) => {
+                    let fault = crate::filters_write(|editor| {
+                        match editor.add("new", tailhawk_core::filter::Polarity::Include) {
+                            Ok(_) => String::new(),
+                            Err(e) => one_line(&e.to_string()),
+                        }
+                    })
+                    .unwrap_or_default();
+                    set_dlg_text(hdlg, ID_V_FAULT, &fault);
+                    let at = crate::filters_read(|e| e.selected()).flatten();
+                    filters_refresh(hdlg, at);
+                    if let Ok(field) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_TEXT)) } {
+                        unsafe {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(field);
+                        }
+                    }
+                    1
+                }
+                (ID_V_REMOVE, _) => {
+                    crate::filters_write(|editor| editor.remove());
+                    let at = crate::filters_read(|e| e.selected()).flatten();
+                    filters_refresh(hdlg, at);
+                    1
+                }
+                (ID_V_APPLY, _) => {
+                    crate::filters_apply(owner);
+                    1
+                }
+                (IDOK, _) => {
+                    crate::filters_apply(owner);
+                    unsafe {
+                        let _ = EndDialog(hdlg, IDOK as isize);
+                    }
+                    1
+                }
+                (IDCANCEL, _) => {
+                    unsafe {
+                        let _ = EndDialog(hdlg, IDCANCEL as isize);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
 pub fn show_rules_dialog(owner: HWND) {
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -1930,6 +2231,111 @@ pub fn rules_row_swatches(
 /// **Quiet throughout, because `lv_select` raises `LVN_ITEMCHANGED` synchronously** — the same
 /// notification a user's click raises. Without the guard the dialog would answer its own
 /// bookkeeping as though someone had clicked a row, and re-point every field from it.
+/// Rebuilds the filter list and points the fields at the selected row.
+///
+/// **One refresh, called by every verb**, for the reason the rules editor gives: the alternative is
+/// a dialog where some buttons update the screen and one ships broken.
+fn filters_refresh(hdlg: HWND, keep: Option<usize>) {
+    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_V_LIST)) }) else {
+        return;
+    };
+    let Some(rows) = crate::filters_read(filter_row_cells) else {
+        return;
+    };
+    lv_reset(list);
+    lv_column(list, 0, "On", 40);
+    lv_column(list, 1, "Polarity", 70);
+    lv_column(list, 2, "Filter", 300);
+    for (i, cells) in rows.iter().enumerate() {
+        lv_row(list, i as i32, cells);
+    }
+    if let Some(at) = keep.filter(|&a| a < rows.len()) {
+        lv_select(list, at);
+    }
+    filters_show_selected(hdlg);
+}
+
+/// Points the field, the polarity pair and the enabled box at the selected filter, greying them all
+/// when there is none — §10's empty state, one press of Remove away.
+fn filters_show_selected(hdlg: HWND) {
+    let shown = crate::filters_read(|editor| {
+        editor
+            .selected()
+            .and_then(|at| editor.rows().get(at))
+            .map(|chip| {
+                (
+                    chip.source.clone(),
+                    chip.polarity == tailhawk_core::filter::Polarity::Include,
+                    chip.enabled,
+                )
+            })
+    })
+    .flatten();
+
+    let has = shown.is_some();
+    for id in [
+        ID_V_TEXT,
+        ID_V_INCLUDE,
+        ID_V_EXCLUDE,
+        ID_V_ENABLED,
+        ID_V_REMOVE,
+    ] {
+        unsafe {
+            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), has);
+        }
+    }
+    let (text, include, enabled) = shown.unwrap_or_default();
+    set_dlg_text(hdlg, ID_V_TEXT, &text);
+    for (id, on) in [
+        (ID_V_INCLUDE, include && has),
+        (ID_V_EXCLUDE, !include && has),
+        (ID_V_ENABLED, enabled && has),
+    ] {
+        unsafe {
+            SendDlgItemMessageW(
+                hdlg,
+                i32::from(id),
+                BM_SETCHECK,
+                WPARAM(usize::from(on)),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// Reads the field and the pair back into the editor, reporting a fault rather than destroying the
+/// row it would have replaced.
+///
+/// **Called before the selection moves**, or an edit made to the row being left is lost the moment
+/// another row is clicked — which is the half of this the sources dialog learned the hard way.
+fn filters_take_field(hdlg: HWND) {
+    let text = dlg_text(hdlg, ID_V_TEXT);
+    let include = unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_V_INCLUDE),
+            BM_GETCHECK,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .0 == 1
+    };
+    let polarity = if include {
+        tailhawk_core::filter::Polarity::Include
+    } else {
+        tailhawk_core::filter::Polarity::Exclude
+    };
+    let fault = crate::filters_write(|editor| {
+        editor.set_polarity(polarity);
+        match editor.retext(&text) {
+            Ok(()) => String::new(),
+            Err(e) => one_line(&e.to_string()),
+        }
+    })
+    .unwrap_or_default();
+    set_dlg_text(hdlg, ID_V_FAULT, &fault);
+}
+
 fn rules_fill_list(hdlg: HWND, keep: Option<usize>) {
     let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_R_LIST)) }) else {
         return;
