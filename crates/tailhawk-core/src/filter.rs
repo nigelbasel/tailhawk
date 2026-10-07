@@ -523,6 +523,134 @@ impl Chips {
     }
 }
 
+/// The filters as a dialog edits them: the rows, which is selected, and what has not been applied.
+///
+/// **A dialog, not the bar along the bottom.** The owner, 2026-10-06, twice: *"the filters should be
+/// defined in a dialog, which will allow editing, adding and removing filters. The little bar at
+/// the bottom is confusing and hard to notice"*, and then — on the Visual Studio comparison the old
+/// design note leaned on — *"even if filters are a docked panel, the little line at the bottom is
+/// not that. In visual studio, these are non-modal, dockable dialog boxes."* A non-modal dockable
+/// editor is the eventual shape and waits on docking infrastructure this program does not have; a
+/// dialog is what it gets meanwhile.
+///
+/// **Edits a copy and commits on demand**, which is what gives the dialog an OK, a Cancel and an
+/// Apply. Apply is the owner's: *"if the filter dialog has an apply button, then it is easy for the
+/// user to see the effect of the filter changes"* — so a reader can watch a filter take effect
+/// without first losing the dialog that defined it.
+///
+/// Shaped after [`crate::ruleset::Editor`] deliberately, so the two dialogs behave the same way.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Editor {
+    rows: Vec<Chip>,
+    selected: Option<usize>,
+    /// Whether the rows differ from what was last committed, which is what makes `Apply` live.
+    dirty: bool,
+}
+
+impl Editor {
+    /// Opens the editor over the filters in force.
+    pub fn open(chips: &Chips) -> Self {
+        Self {
+            rows: chips.chips.clone(),
+            selected: (!chips.chips.is_empty()).then_some(0),
+            dirty: false,
+        }
+    }
+
+    pub fn rows(&self) -> &[Chip] {
+        &self.rows
+    }
+
+    pub fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Selects a row, or nothing. An index past the end selects nothing rather than panicking: the
+    /// list control's notifications and this model can disagree for one message after a removal.
+    pub fn select(&mut self, at: Option<usize>) {
+        self.selected = at.filter(|n| *n < self.rows.len());
+    }
+
+    /// Adds a filter, selects it, and reports where it went — or says why the text is not one.
+    ///
+    /// **The new row goes last and is selected**, because adding and then editing is one gesture
+    /// and a reader should not have to find what they just made.
+    pub fn add(&mut self, text: &str, polarity: Polarity) -> Result<usize, ParseError> {
+        let chip = Chip::parse(text, polarity)?;
+        self.rows.push(chip);
+        self.selected = Some(self.rows.len() - 1);
+        self.dirty = true;
+        Ok(self.rows.len() - 1)
+    }
+
+    /// Replaces the selected filter's text, keeping its polarity and enabled state.
+    ///
+    /// A text that does not parse leaves the row exactly as it was and returns the fault, so a
+    /// half-typed expression never destroys the one it is replacing.
+    pub fn retext(&mut self, text: &str) -> Result<(), ParseError> {
+        let Some(at) = self.selected else {
+            return Ok(());
+        };
+        let old = &self.rows[at];
+        let mut chip = Chip::parse(text, old.polarity)?;
+        chip.enabled = old.enabled;
+        if self.rows[at] != chip {
+            self.rows[at] = chip;
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Sets the selected filter's polarity, or its enabled mark.
+    pub fn set_polarity(&mut self, polarity: Polarity) {
+        if let Some(row) = self.selected.and_then(|at| self.rows.get_mut(at)) {
+            if row.polarity != polarity {
+                row.polarity = polarity;
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn set_enabled(&mut self, at: usize, enabled: bool) {
+        if let Some(row) = self.rows.get_mut(at) {
+            if row.enabled != enabled {
+                row.enabled = enabled;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Removes the selected filter and selects its neighbour.
+    ///
+    /// **The row after it, or the last one** — the same rule a list control follows, so removing
+    /// several in a row is a repeated press rather than a press and a re-aim.
+    pub fn remove(&mut self) -> bool {
+        let Some(at) = self.selected else {
+            return false;
+        };
+        self.rows.remove(at);
+        self.selected = if self.rows.is_empty() {
+            None
+        } else {
+            Some(at.min(self.rows.len() - 1))
+        };
+        self.dirty = true;
+        true
+    }
+
+    /// The filters to put in force, and a note that they now are.
+    pub fn commit(&mut self) -> Chips {
+        self.dirty = false;
+        Chips {
+            chips: self.rows.clone(),
+        }
+    }
+}
+
 /// Where a chip's text stopped making sense, and what was expected there.
 ///
 /// **The offset is the point.** A chip is a small text field the user is typing into, and "expected
@@ -1089,6 +1217,122 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::record::{ParseState, TraceContext};
+
+    fn chips_of(texts: &[(&str, Polarity)]) -> Chips {
+        Chips {
+            chips: texts
+                .iter()
+                .map(|(t, p)| Chip::parse(t, *p).expect("a plain word parses"))
+                .collect(),
+        }
+    }
+
+    /// **The editor adds, edits and removes, and nothing takes effect until it is committed.**
+    ///
+    /// Which is what makes the dialog's three buttons mean different things: Cancel is simply never
+    /// committing, and Apply is committing without closing — the owner's, 2026-10-06, so the effect
+    /// of a change can be seen while the dialog that made it is still open.
+    #[test]
+    fn the_editor_holds_its_changes_until_they_are_committed() {
+        let live = chips_of(&[("error", Polarity::Include)]);
+        let mut editor = Editor::open(&live);
+        assert_eq!(editor.rows().len(), 1);
+        assert_eq!(editor.selected(), Some(0), "the first row is selected");
+        assert!(!editor.dirty(), "and nothing has changed yet");
+
+        let at = editor.add("retry", Polarity::Exclude).expect("parses");
+        assert_eq!(at, 1, "added last");
+        assert_eq!(editor.selected(), Some(1), "and selected, ready to edit");
+        assert!(editor.dirty());
+        assert_eq!(live.chips.len(), 1, "the filters in force are untouched");
+
+        let applied = editor.commit();
+        assert_eq!(applied.chips.len(), 2);
+        assert!(!editor.dirty(), "committing settles it");
+    }
+
+    /// **A text that does not parse leaves the row it would have replaced alone.**
+    ///
+    /// Half-typed expressions are the normal state of a text field, and one of them destroying the
+    /// filter being edited would make the dialog hostile to use.
+    #[test]
+    fn a_filter_that_does_not_parse_changes_nothing() {
+        let mut editor = Editor::open(&chips_of(&[("error", Polarity::Include)]));
+        let before = editor.rows().to_vec();
+
+        assert!(editor.retext("(unclosed").is_err(), "it is refused");
+        assert_eq!(editor.rows(), before, "and the row stands");
+        assert!(!editor.dirty(), "with nothing to apply");
+
+        assert!(editor.add("(also unclosed", Polarity::Include).is_err());
+        assert_eq!(editor.rows().len(), 1, "and nothing was added");
+
+        editor.retext("warning").expect("this one parses");
+        assert_eq!(editor.rows()[0].source, "warning");
+        assert_eq!(
+            editor.rows()[0].polarity,
+            Polarity::Include,
+            "retext keeps the polarity it had"
+        );
+        assert!(editor.dirty());
+    }
+
+    /// **Removing selects the neighbour**, the rule a list control follows, so removing several is
+    /// a repeated press rather than a press and a re-aim.
+    #[test]
+    fn removing_a_filter_selects_the_next_one() {
+        let mut editor = Editor::open(&chips_of(&[
+            ("a", Polarity::Include),
+            ("b", Polarity::Include),
+            ("c", Polarity::Include),
+        ]));
+        editor.select(Some(1));
+        assert!(editor.remove());
+        assert_eq!(editor.rows().len(), 2);
+        assert_eq!(editor.selected(), Some(1), "what was after it, now at 1");
+        assert_eq!(editor.rows()[1].source, "c");
+
+        editor.select(Some(1));
+        assert!(editor.remove());
+        assert_eq!(
+            editor.selected(),
+            Some(0),
+            "the last row, once there is no after"
+        );
+
+        assert!(editor.remove());
+        assert_eq!(editor.selected(), None, "and nothing, once there are none");
+        assert!(!editor.remove(), "removing nothing is not a change");
+    }
+
+    /// **An enabled mark and a polarity are edits like any other**, and §7.1 keeps a disabled chip's
+    /// place and text rather than dropping it — so the round trip through the editor must too.
+    #[test]
+    fn the_enabled_mark_and_the_polarity_survive_a_commit() {
+        let mut editor = Editor::open(&chips_of(&[
+            ("a", Polarity::Include),
+            ("b", Polarity::Include),
+        ]));
+        editor.set_enabled(0, false);
+        editor.select(Some(1));
+        editor.set_polarity(Polarity::Exclude);
+
+        let out = editor.commit();
+        assert!(!out.chips[0].enabled, "still there, still off");
+        assert_eq!(out.chips[0].source, "a", "and still readable");
+        assert_eq!(out.chips[1].polarity, Polarity::Exclude);
+    }
+
+    /// A selection past the end selects nothing rather than panicking: a list control's
+    /// notification and this model can disagree for one message after a removal.
+    #[test]
+    fn a_selection_past_the_end_is_no_selection() {
+        let mut editor = Editor::open(&chips_of(&[("a", Polarity::Include)]));
+        editor.select(Some(9));
+        assert_eq!(editor.selected(), None);
+        editor.retext("b").expect("parses");
+        assert_eq!(editor.rows()[0].source, "a", "and edits nothing");
+    }
 
     fn record(raw: &str) -> Record {
         Record::unparsed(raw)

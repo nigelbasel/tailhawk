@@ -3558,6 +3558,18 @@ enum Command {
     ToolbarSmallIcons,
     /// The owner's arrangement model: the focused pane fills the frame, or the split comes back.
     ToggleMaximise,
+    /// `Window ▸ Tabbed`: the tiled tab's second pane goes back to a tab of its own.
+    ///
+    /// **These three exist because switching views was not discoverable.** The owner, 2026-10-06:
+    /// *"I havent yet seen the tiled view, and would like to be able to easily switch between the
+    /// two views"*. The tiling itself was reachable — dragging a tab off the strip, and `Ctrl+\`'s
+    /// `Split pane` under View — but nothing named the two arrangements or let him choose between
+    /// them, and `Split pane` splits a document with *itself* rather than tiling two logs.
+    ViewTabbed,
+    /// `Window ▸ Tile horizontally`: the shown document above the next one.
+    TileStacked,
+    /// `Window ▸ Tile vertically`: the shown document beside the next one.
+    TileSideBySide,
     /// §12.4's remote sources — the dialog that defines them and stores their secrets.
     EditSources,
     /// V9's rules editor — `UI-DESIGN.md` §5.
@@ -3678,6 +3690,9 @@ impl Command {
             "Maximise the focused pane, or restore the split",
             "",
         ),
+        (Command::ViewTabbed, "Tabbed", ""),
+        (Command::TileStacked, "Tile horizontally", ""),
+        (Command::TileSideBySide, "Tile vertically", ""),
         (Command::EditRules, "Highlight rules…", "Ctrl+K"),
         (Command::DefineFormat, "Define format from a line…", ""),
         (Command::ImportLayout, "Import layout from config…", ""),
@@ -3952,6 +3967,83 @@ impl Tabs {
         into.focused = if first { 0 } else { into.panes.len() - 1 };
         self.active = target;
         true
+    }
+
+    /// Tiles the shown document with the next one, in `layout`, and says whether it could.
+    ///
+    /// **The tiled view existed and had no way in but a gesture.** Dragging a tab off the strip
+    /// splits — `UI-DESIGN.md` §1069's "drag-out-to-split" — and that was the only route, so the
+    /// owner reported on 2026-10-06 that he had never seen the tiled view and wanted a way to
+    /// switch. A gesture nobody discovers is a feature nobody has.
+    ///
+    /// **Two panes, because that is what the model defines.** [`Tabs::can_split_into`] caps a tab at
+    /// two and records why: a third would need the model to say how the space is shared between
+    /// three, and it does not. So this tiles the shown document with *the next tab's*, rather than
+    /// gathering everything open into one tab.
+    ///
+    /// Already tiled, with the layout asked for, it does nothing and says so — the menu's mark reads
+    /// from the same state, so an item that is already true is already marked.
+    fn tile_with_next(&mut self, layout: PaneLayout) -> bool {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if tab.panes.len() == 2 {
+                if tab.layout == layout {
+                    return false;
+                }
+                tab.layout = layout;
+                return true;
+            }
+        }
+        let next = (self.active + 1) % self.len().max(1);
+        if !self.can_split_into(next, self.active) {
+            return false;
+        }
+        let zone = match layout {
+            PaneLayout::SideBySide => tailhawk_core::dropzone::Zone::Right,
+            PaneLayout::Stacked => tailhawk_core::dropzone::Zone::Below,
+        };
+        self.split_from(next, self.active, zone)
+    }
+
+    /// Puts a tiled tab's second pane back into a tab of its own, and says whether it could.
+    ///
+    /// The way back from [`Tabs::tile_with_next`], and what `Window ▸ Tabs` runs. The pane that
+    /// leaves becomes the tab after the one it came from, so the strip's order follows the panes'.
+    fn untile(&mut self) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        if tab.panes.len() < 2 {
+            return false;
+        }
+        let doc = tab.panes.remove(1);
+        tab.focused = 0;
+        let at = self.active + 1;
+        self.tabs.insert(
+            at,
+            Tab {
+                panes: vec![doc],
+                focused: 0,
+                layout: PaneLayout::default(),
+                maximised: false,
+            },
+        );
+        self.active = at;
+        true
+    }
+
+    /// Whether the shown tab is tiled, and how — for the `Window` menu's marks.
+    fn tiling(&self) -> Option<PaneLayout> {
+        self.tabs
+            .get(self.active)
+            .filter(|t| t.panes.len() > 1)
+            .map(|t| t.layout)
+    }
+
+    /// Whether the shown document could be tiled with another, which is what greys the items when
+    /// only one thing is open.
+    fn can_tile(&self) -> bool {
+        self.tiling().is_some()
+            || (self.len() > 1 && self.can_split_into((self.active + 1) % self.len(), self.active))
     }
 
     /// Whether the shown tab's focused pane fills the frame.
@@ -6992,6 +7084,20 @@ impl Shell {
                 self.toggle_split(hwnd);
                 return true;
             }
+            Command::ViewTabbed | Command::TileStacked | Command::TileSideBySide => {
+                let moved = match command {
+                    Command::ViewTabbed => self.document.untile(),
+                    Command::TileStacked => self.document.tile_with_next(PaneLayout::Stacked),
+                    _ => self.document.tile_with_next(PaneLayout::SideBySide),
+                };
+                if moved {
+                    self.retitle(hwnd);
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+                return true;
+            }
             Command::ToggleTheme => {
                 self.toggle_theme(hwnd);
                 return true;
@@ -7231,7 +7337,10 @@ impl Shell {
             | Command::ToolbarSmallIcons
             | Command::ToggleMaximise
             | Command::EditSources
-            | Command::CloseTab => {}
+            | Command::CloseTab
+            | Command::ViewTabbed
+            | Command::TileStacked
+            | Command::TileSideBySide => {}
         }
         self.after_chrome_key(hwnd)
     }
@@ -12408,6 +12517,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 can_maximise: shell.document.can_maximise(),
                                 regroup_separates: shell.regroup_separates(),
                                 remote_minutes: shell.settings.remote_minutes.unwrap_or(0),
+                                tiling: shell.document.tiling().map(|l| l == PaneLayout::Stacked),
+                                can_tile: shell.document.can_tile(),
                             },
                             &shell.settings.recent,
                             &shell.source_names(),
@@ -14850,6 +14961,63 @@ mod tests {
             Some("live"),
             "the identity is the settings key, which is what regroup looks up"
         );
+    }
+
+    /// **Tiling and untiling are each other's opposite, and reachable from a menu.**
+    ///
+    /// The owner, 2026-10-06: *"I havent yet seen the tiled view, and would like to be able to
+    /// easily switch between the two views"* — and he had not seen it because dragging a tab off
+    /// the strip was the only way in. A gesture nobody discovers is a feature nobody has.
+    ///
+    /// Two panes is the model's limit, recorded on `can_split_into`: a third would need the model to
+    /// say how space is shared between three. So this tiles with *the next* document rather than
+    /// gathering everything, and the test says so rather than leaving it to be discovered.
+    #[test]
+    fn tiling_and_untiling_are_opposites_and_stop_at_two_panes() {
+        let a = scratch_log("tailhawk_tile_a.log", 3);
+        let b = scratch_log("tailhawk_tile_b.log", 3);
+        let c = scratch_log("tailhawk_tile_c.log", 3);
+        let mut tabs = Tabs::default();
+        tabs.push(Document::open(&a).expect("a"));
+        assert!(
+            !tabs.can_tile(),
+            "one document cannot be tiled with anything"
+        );
+        assert_eq!(tabs.tiling(), None);
+
+        tabs.push(Document::open(&b).expect("b"));
+        tabs.active = 0;
+        assert!(tabs.can_tile(), "two can");
+        assert!(tabs.tile_with_next(PaneLayout::SideBySide));
+        assert_eq!(tabs.len(), 1, "two tabs became one tiled tab");
+        assert_eq!(tabs.tiling(), Some(PaneLayout::SideBySide));
+
+        assert!(tabs.tile_with_next(PaneLayout::Stacked));
+        assert_eq!(tabs.tiling(), Some(PaneLayout::Stacked));
+        assert!(
+            !tabs.tile_with_next(PaneLayout::Stacked),
+            "and asking for what is already true changes nothing"
+        );
+
+        tabs.push(Document::open(&c).expect("c"));
+        tabs.active = 0;
+        let _ = tabs.tile_with_next(PaneLayout::SideBySide);
+        assert_eq!(
+            tabs.panes().len(),
+            2,
+            "still two panes, as can_split_into's cap requires"
+        );
+        assert_eq!(tabs.len(), 2, "and the third document keeps its own tab");
+
+        tabs.active = 0;
+        assert!(tabs.untile(), "and the way back");
+        assert_eq!(tabs.tiling(), None);
+        assert_eq!(tabs.len(), 3, "the pane became a tab of its own");
+        assert!(!tabs.untile(), "untiling what is not tiled is not a change");
+
+        for p in [a, b, c] {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     /// **A file already open is brought forward, not opened again.**

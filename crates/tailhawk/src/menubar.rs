@@ -378,6 +378,15 @@ pub struct BarState {
     /// Zero means nothing has been chosen, which `remote_minutes_of` resolves to the default — so a
     /// defaulted `BarState` checks the hour rather than checking nothing.
     pub remote_minutes: u32,
+    /// How the window is arranged, for `Window`'s radio marks: `None` tabbed, `Some(true)` tiled
+    /// horizontally, `Some(false)` tiled vertically.
+    ///
+    /// A `bool` rather than `PaneLayout` because this module describes the *bar* and has no reason
+    /// to know the shell's layout type; the caller maps it.
+    pub tiling: Option<bool>,
+    /// Whether tiling is possible at all — one document has nothing to tile with, and the three
+    /// items are greyed rather than offered.
+    pub can_tile: bool,
 }
 
 /// The configured remote sources as a menu, ending in the way to configure one.
@@ -557,6 +566,8 @@ pub fn menu_bar(
         can_maximise,
         regroup_separates: _,
         remote_minutes: _,
+        tiling,
+        can_tile,
     } = state;
     let open = doc.is_some();
     let selected = doc.is_some_and(|d| d.has_selection());
@@ -864,6 +875,45 @@ pub fn menu_bar(
                 // **No ellipsis**: the guide lists Options among the commands whose implicit verb
                 // is to show a window, which therefore do not take one.
                 Item::command("&Options", "", ID_PREFS),
+            ],
+        ),
+        Item::submenu(
+            "&Window",
+            vec![
+                on(
+                    check("&Tabbed", "", Command::ViewTabbed, tiling.is_none()),
+                    can_tile,
+                ),
+                on(
+                    check(
+                        "Tile &horizontally",
+                        "",
+                        Command::TileStacked,
+                        tiling == Some(true),
+                    ),
+                    can_tile,
+                ),
+                on(
+                    check(
+                        "Tile &vertically",
+                        "",
+                        Command::TileSideBySide,
+                        tiling == Some(false),
+                    ),
+                    can_tile,
+                ),
+                Item::separator(),
+                on(
+                    check("&Maximise pane", "", Command::ToggleMaximise, maximised),
+                    can_maximise,
+                ),
+                on(
+                    cmd("Focus other pa&ne", "F6", Command::FocusOtherPane),
+                    open,
+                ),
+                on(cmd("&Split pane", "Ctrl+\\", Command::Split), open),
+                Item::separator(),
+                on(cmd("&Close tab", "Ctrl+W", Command::CloseTab), open),
             ],
         ),
         Item::submenu(
@@ -1228,6 +1278,67 @@ mod tests {
         assert!(remote_menu_of(&[], 60)
             .iter()
             .all(|i| i.text() != "Choose applications"));
+    }
+
+    /// **`Window` names the two arrangements and marks the one in force.**
+    ///
+    /// The owner, 2026-10-06: *"I havent yet seen the tiled view, and would like to be able to
+    /// easily switch between the two views"*. Every piece was already reachable and none of them
+    /// said what it was for — `Split pane` under View splits a document with *itself*, and tiling
+    /// two logs was a drag off the tab strip. What was missing was a menu that names tabbed and
+    /// tiled and says which you are looking at.
+    ///
+    /// Exactly one mark at a time, because exactly one describes the window — the same shape the
+    /// icon-size pair uses, and a trio of independent toggles would be a lie about the model.
+    ///
+    /// With one document there is nothing to tile with, so the three are **shown and greyed** rather
+    /// than hidden: §1.1's rule that a disabled item says "this program does that, just not now",
+    /// where an absent one says it does not do it at all.
+    #[test]
+    fn the_window_menu_marks_the_arrangement_in_force() {
+        let bar = |tiling, can_tile| {
+            let menu = menu_bar(
+                None,
+                BarState {
+                    tiling,
+                    can_tile,
+                    ..BarState::default()
+                },
+                &[],
+                &[],
+                &[],
+            );
+            let at = menu
+                .items()
+                .iter()
+                .position(|i| i.text() == "Window")
+                .expect("Window is on the bar");
+            menu.at(&[at]).expect("Window opens").to_vec()
+        };
+
+        for (tiling, expected) in [
+            (None, "Tabbed"),
+            (Some(true), "Tile horizontally"),
+            (Some(false), "Tile vertically"),
+        ] {
+            let items = bar(tiling, true);
+            let marked: Vec<String> = items
+                .iter()
+                .filter(|i| i.checked)
+                .map(|i| i.text())
+                .filter(|t| t.starts_with("Tab") || t.starts_with("Tile"))
+                .collect();
+            assert_eq!(marked, [expected.to_owned()], "for {tiling:?}");
+        }
+
+        let alone = bar(None, false);
+        for name in ["Tabbed", "Tile horizontally", "Tile vertically"] {
+            let item = alone
+                .iter()
+                .find(|i| i.text() == name)
+                .unwrap_or_else(|| panic!("{name} is listed"));
+            assert!(!item.enabled, "{name} is greyed with nothing to tile with");
+        }
     }
 
     /// **The time range the status bar names is an item a reader can actually reach.**
