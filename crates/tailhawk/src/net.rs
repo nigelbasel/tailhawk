@@ -46,6 +46,7 @@ type ConnectFn = unsafe extern "system" fn(Handle, PCWSTR, u16, u32) -> Handle;
 type OpenRequestFn =
     unsafe extern "system" fn(Handle, PCWSTR, PCWSTR, PCWSTR, PCWSTR, *const PCWSTR, u32) -> Handle;
 type SetOptionFn = unsafe extern "system" fn(Handle, u32, *const core::ffi::c_void, u32) -> i32;
+type SetTimeoutsFn = unsafe extern "system" fn(Handle, i32, i32, i32, i32) -> i32;
 type SendRequestFn = unsafe extern "system" fn(
     Handle,
     PCWSTR,
@@ -77,6 +78,7 @@ struct WinHttp {
     connect: ConnectFn,
     open_request: OpenRequestFn,
     set_option: SetOptionFn,
+    set_timeouts: SetTimeoutsFn,
     send_request: SendRequestFn,
     receive_response: ReceiveResponseFn,
     query_headers: QueryHeadersFn,
@@ -139,6 +141,11 @@ fn winhttp() -> Option<&'static WinHttp> {
                 set_option: unsafe {
                     std::mem::transmute::<*const core::ffi::c_void, SetOptionFn>(entry(
                         "WinHttpSetOption",
+                    )?)
+                },
+                set_timeouts: unsafe {
+                    std::mem::transmute::<*const core::ffi::c_void, SetTimeoutsFn>(entry(
+                        "WinHttpSetTimeouts",
                     )?)
                 },
                 send_request: unsafe {
@@ -499,6 +506,30 @@ impl Drop for Owned {
     }
 }
 
+/// How long a host name may take to resolve. **WinHTTP's own default for this one is no limit.**
+const RESOLVE_TIMEOUT_MS: i32 = 10_000;
+
+/// How long **one connection attempt** may take.
+///
+/// Per attempt, not per request: WinHTTP tries the addresses a host resolves to in turn, so the
+/// time a request can spend connecting is this multiplied by however many it finds. Kept low for
+/// that reason — a Loki behind a load balancer or a dual-stacked host is the ordinary case, not the
+/// exception, and a generous value here is the one that most easily adds up to a window that looks
+/// hung.
+const CONNECT_TIMEOUT_MS: i32 = 5_000;
+
+/// How long sending the request may take.
+const SEND_TIMEOUT_MS: i32 = 30_000;
+
+/// How long one read of the response may take.
+///
+/// **Deliberately longer than Loki's own query timeout**, which ships at one minute. A query heavy
+/// enough to reach that limit is one the server is about to explain — `context deadline exceeded`,
+/// a 504 — and a client that gave up at the same instant would replace that explanation with
+/// "reading the body failed". Of the two sentences, the server's is the one that tells the reader
+/// to narrow their window, so the server is given room to say it.
+const RECEIVE_TIMEOUT_MS: i32 = 90_000;
+
 struct Session(Owned);
 
 impl Session {
@@ -521,6 +552,32 @@ impl Session {
             return Err(failure("opening a session"));
         }
         let session = Session(Owned { api, handle });
+        // **Every stage is given a deadline, because one of WinHTTP's own is infinite.** Name
+        // resolution defaults to no timeout at all, so a source whose host does not resolve — a
+        // VPN that is down, a DNS server that is not answering — leaves the request thread blocked
+        // for as long as the process lives. Nothing above it can cancel a blocked request, so the
+        // window's busy pointer stays up and the status bar goes on saying it is fetching for ever.
+        // The owner met this on 2026-10-08: a remote open that sat under a wait cursor long enough
+        // that he reasonably concluded it had failed.
+        //
+        // Receive is the generous one. It is per read rather than for the whole response, and a
+        // Loki query over an hour of a busy stream genuinely takes tens of seconds to compute
+        // before the first byte comes back — a tight value here would turn a slow server into a
+        // broken one.
+        //
+        // **These govern every call this transport makes**, not only the opening fetch: the token
+        // exchange, the label enquiry and each of the tail's polls. That is right while the tail
+        // re-issues `query_range` on an interval, as it does; a future `/loki/api/v1/tail` would
+        // hold a response open for as long as it streamed and would have to set its own.
+        unsafe {
+            (api.set_timeouts)(
+                handle,
+                RESOLVE_TIMEOUT_MS,
+                CONNECT_TIMEOUT_MS,
+                SEND_TIMEOUT_MS,
+                RECEIVE_TIMEOUT_MS,
+            )
+        };
         let protocols = TLS12_AND_13;
         unsafe {
             (api.set_option)(

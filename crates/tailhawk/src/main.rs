@@ -221,10 +221,11 @@ struct Document {
     answers_cut: bool,
     /// Where a remote source's records landed, when this document is one — see [`Document::remote`].
     remote_spill: Option<std::path::PathBuf>,
-    /// The source this document is a view of: its **name** — the settings key, which is what says
-    /// two windows watch the same place — and the query it was opened with, narrowed to the
-    /// applications the user picked. What `Interleave` and `Separate` read.
-    remote_source: Option<(String, String)>,
+    /// The question this document is the answer to: the source's **name** — the settings key,
+    /// which is what says two windows watch the same place — the query it was opened with,
+    /// narrowed to the applications the user picked, and how far back it asked. What `Interleave`
+    /// and `Separate` read, and what says whether a new open would be this window again.
+    remote_source: Option<tailhawk_core::loki::Question>,
     /// The current selection, or `None` for "nothing selected".
     ///
     /// A caret — an empty selection at a click — is `Some`, not `None`: `Selection::at` exists so a
@@ -649,10 +650,21 @@ impl Document {
     /// configured source by that key, so handing them the label made the lookup compare
     /// `"live · nurtur-gateway"` with `"live"`: it never matched, and both commands failed
     /// silently, one of them from behind an enabled menu item.
-    fn remote(&mut self, label: &str, name: &str, spill: &std::path::Path, query: &str, cut: bool) {
+    /// `minutes` is how far back it asked, which is part of the question for the same reason the
+    /// query is: `File ▸ Open remote ▸ Fetch window` changes it and nothing else, so a window
+    /// fetched over an hour and one fetched over a day are two different views of one source.
+    fn remote(
+        &mut self,
+        label: &str,
+        name: &str,
+        spill: &std::path::Path,
+        query: &str,
+        minutes: u32,
+        cut: bool,
+    ) {
         self.summary = label.to_owned();
         self.remote_spill = Some(spill.to_path_buf());
-        self.remote_source = Some((name.to_owned(), query.to_owned()));
+        self.remote_source = Some(tailhawk_core::loki::Question::new(name, query, minutes));
         // The opening window can be cut before the tail has polled once — `LOKI.md` §6, and the
         // first live query returned exactly its limit and said nothing about it.
         self.answers_cut = cut;
@@ -4147,7 +4159,7 @@ impl Tabs {
             .iter()
             .map(
                 |tab| match tab.panes.first().and_then(|d| d.remote_source.as_ref()) {
-                    Some((source, query)) => tailhawk_core::apps::Tab::remote(source, query),
+                    Some(asked) => tailhawk_core::apps::Tab::remote(&asked.source, &asked.query),
                     None => tailhawk_core::apps::Tab::local(),
                 },
             )
@@ -4277,6 +4289,23 @@ impl Tabs {
             t.focused = pane;
         }
         true
+    }
+
+    /// Every remote question currently on screen, each paired with the tab holding it.
+    ///
+    /// **One entry per pane, not per tab**, because a tiled tab holds two documents and either of
+    /// them may be the one a new open would duplicate. A tab of a local file contributes nothing.
+    /// The index is the tab's, so an answer naming one can be brought forward.
+    fn remote_questions(&self) -> Vec<(usize, tailhawk_core::loki::Question)> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(at, tab)| {
+                tab.panes
+                    .iter()
+                    .filter_map(move |d| d.remote_source.clone().map(|asked| (at, asked)))
+            })
+            .collect()
     }
 
     /// Each tab's traffic, in tab order — the busiest of its panes.
@@ -4545,7 +4574,10 @@ struct Shell {
     reading: Vec<Receiver<std::result::Result<Document, String>>>,
     /// Loki requests in flight. **Every one of them used to run on this thread**, which is why
     /// opening a source froze the window for as many round trips as the source needed.
-    fetching: Vec<Receiver<Fetched>>,
+    ///
+    /// **Each one carries the question it is asking and when it went out** — see [`Asking`], which
+    /// says why both are needed.
+    fetching: Vec<Asking>,
     /// Watched folders — a directory and a glob; new matching files are adopted as tabs as they
     /// appear (§8.1). Scanned on the follow tick, every [`WATCH_EVERY_TICKS`].
     watching: Vec<Watch>,
@@ -4612,6 +4644,14 @@ struct Shell {
     /// The remote source whose applications the user wants to choose again, waiting for the same
     /// reason: the label call is a credential read and two round trips.
     pending_repick: Option<usize>,
+    /// The whole seconds the bar last reported for the longest request in flight, so a frame is
+    /// asked for when that number moves and not 250 times in between. `None` when nothing is in
+    /// flight — see [`Shell::mark_the_wait`].
+    waited: Option<u64>,
+    /// The remote question whose answer has landed and whose tab has not appeared yet. Set and
+    /// cleared with [`Shell::opening`], which it shadows exactly — see [`Shell::open_named`] for
+    /// why the gap between those two moments needs covering.
+    opening_question: Option<tailhawk_core::loki::Question>,
     /// The exact `opening …` line currently on the bar, so it can be taken down again when the
     /// document lands — and **only** if it is still the thing being shown.
     ///
@@ -4905,7 +4945,7 @@ impl Shell {
         let mut landed = Vec::new();
         let mut at = 0;
         while at < self.fetching.len() {
-            match self.fetching[at].try_recv() {
+            match self.fetching[at].answer.try_recv() {
                 Ok(answer) => {
                     self.fetching.remove(at);
                     landed.push(answer);
@@ -4984,6 +5024,7 @@ impl Shell {
                     self.notice =
                         notice_once_open_finished(self.notice.as_deref(), self.opening.as_deref());
                     self.opening = None;
+                    self.opening_question = None;
                     self.rebuild_highlighter(&mut document);
                     // File ▸ Open Recent learns the file **here**, on success — a mistyped path
                     // or an unreadable file never enters the history.
@@ -5011,12 +5052,14 @@ impl Shell {
                     self.reading.remove(i);
                     self.notice = Some(e);
                     self.opening = None;
+                    self.opening_question = None;
                     landed = true;
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.reading.remove(i);
                     self.notice = Some("read failed".to_owned());
                     self.opening = None;
+                    self.opening_question = None;
                     landed = true;
                 }
                 Err(TryRecvError::Empty) => i += 1,
@@ -5132,6 +5175,16 @@ impl Shell {
             (None, None) => None,
         };
         let notice = said.as_deref();
+        // **The seconds are read here, on the way to the bar**, so every repaint re-reads the clock
+        // and nothing has to remember to keep a string up to date. The device-poll timer is already
+        // running while anything is in flight, which is what makes the number visibly count.
+        let flight: Vec<(&str, u64)> = self
+            .fetching
+            .iter()
+            .map(|asking| (asking.said.as_str(), asking.since.elapsed().as_secs()))
+            .collect();
+        let fetching = tailhawk_core::loki::waiting_said(&flight);
+        let waiting = fetching.as_deref();
         let Some(doc) = self.document.as_ref() else {
             // **`file` is what the bar says when there is no document**, exactly as the composed
             // sentence had it: it took `described.or(file)`, so this field only ever reached the
@@ -5141,6 +5194,7 @@ impl Shell {
             // is recorded in the handoff rather than quietly altered here.
             return statusbar::status_panes_of(statusbar::StatusFacts {
                 notice: notice.or(self.file.as_deref()),
+                waiting,
                 rules: rules_note.as_deref(),
                 ..statusbar::StatusFacts::default()
             });
@@ -5149,6 +5203,7 @@ impl Shell {
             doc,
             statusbar::ShellFacts {
                 notice,
+                waiting,
                 rules: rules_note.as_deref(),
                 contrast: theme().suppress_rules,
             },
@@ -5246,6 +5301,7 @@ impl Shell {
         });
         f(statusbar::StatusFacts {
             notice: shell.notice,
+            waiting: shell.waiting,
             rules: shell.rules,
             contrast: shell.contrast,
             tee: tee.as_deref(),
@@ -5294,6 +5350,44 @@ impl Shell {
 
     /// Whether anything the reader is waiting for is in flight.
     ///
+    /// Asks for a frame when the elapsed-seconds count on a request in flight has moved on.
+    ///
+    /// The device poll runs every 4 ms and the sentence changes once a second, so this compares
+    /// what the bar last showed against what it would show now and invalidates only on a change —
+    /// 250 wakeups between frames rather than a frame per wakeup.
+    fn mark_the_wait(&mut self, hwnd: HWND) {
+        let longest = self
+            .fetching
+            .iter()
+            .map(|asking| asking.since.elapsed().as_secs())
+            .max();
+        if longest == self.waited {
+            return;
+        }
+        self.waited = longest;
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
+    /// Every question this window is already waiting on an answer to.
+    ///
+    /// **Three stages and all of them count**, which is the lesson of 2026-10-08: a request whose
+    /// stage nothing checked was a request a second click duplicated. `fetching` holds the ones
+    /// still on the wire. `opening_question` holds the one whose records have landed and whose tab
+    /// has not appeared yet — a gap of a spill write and a file read, during which neither the
+    /// requests nor the tabs hold it. The applications enquiry contributes a question keyed on the
+    /// source name with [`ENQUIRY`] in place of a selector, because asking a source what it holds
+    /// cannot collide with a *document* but collides perfectly well with the same enquiry twice:
+    /// two of those land two pickers, the second opening a modal loop inside the first.
+    fn questions_in_flight(&self) -> Vec<tailhawk_core::loki::Question> {
+        self.fetching
+            .iter()
+            .filter_map(|asking| asking.question.clone())
+            .chain(self.opening_question.clone())
+            .collect()
+    }
+
     /// **All three stages, because the first one is the long one.** `fetching` is the Loki request,
     /// `reading` the document being opened off the spill, and `opening` the name the status bar is
     /// showing until the document lands. Only `opening` was ever visible anywhere, and it is set in
@@ -5307,7 +5401,11 @@ impl Shell {
     fn refresh_title(&self, hwnd: HWND) {
         let name = self.document.as_ref().map(|doc| doc.summary.as_str());
         set_title(hwnd, &window_title(name));
-        if self.pending.is_none() && self.reading.is_empty() {
+        if !still_polling(
+            self.pending.is_some(),
+            self.reading.len(),
+            self.fetching.len(),
+        ) {
             stop_polling(hwnd);
         }
     }
@@ -6183,9 +6281,17 @@ impl Shell {
     /// index and a window that went blank without a word would look hung.
     /// Opens `path`, or brings its tab forward when it is already open.
     ///
-    /// **The already-open check is here rather than in `open_named`** so a remote source still gets
-    /// a window of its own: two tails of one source are two different questions about it, and their
-    /// spill parts are different files anyway. A *file* opened twice is the same file twice.
+    /// **The already-open check is here rather than in `open_named`** because a remote source's
+    /// own check is a different comparison: its file is a spill part with a name that means
+    /// nothing, so what identifies it is the question it answers. [`open_remote`] makes that
+    /// comparison before it asks the server anything, and `open_named` is downstream of both.
+    ///
+    /// **This comment used to argue the opposite** — that a remote source should always get a
+    /// window of its own, because "two tails of one source are two different questions about it".
+    /// Half right, and the half it got wrong cost the owner two identical job-dispatcher tabs on
+    /// 2026-10-08. Two tails are two questions when the *applications* or the *fetch window*
+    /// differ, which is exactly what [`tailhawk_core::loki::Question`] holds and compares. The same
+    /// source, the same applications and the same window is one question asked twice.
     fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
         if self.document.show_already_open(&path) {
             self.notice = Some(format!(
@@ -6212,23 +6318,30 @@ impl Shell {
     ///
     /// **The remote tuple carries the label and the name separately**, and `Document::remote` says
     /// why: one is read and one is looked up, and this is where they used to be the same string.
-    fn open_named(
-        &mut self,
-        hwnd: HWND,
-        path: std::path::PathBuf,
-        remote: Option<(String, String, std::path::PathBuf, String, bool)>,
-    ) {
+    fn open_named(&mut self, hwnd: HWND, path: std::path::PathBuf, remote: Option<Landing>) {
         let opening = match &remote {
-            Some((label, _, _, _, _)) => format!("opening {label}…"),
+            Some(landing) => format!("opening {}…", landing.label),
             None => format!("opening {}…", path.display()),
         };
         self.opening = Some(opening.clone());
+        // **Held until the tab appears, not until the answer lands.** Between the records arriving
+        // and the document being read off its spill, the question belongs to neither the requests
+        // in flight nor the tabs on screen — and a second ask in that gap would start the whole
+        // fetch again. See [`Shell::questions_in_flight`].
+        self.opening_question = remote.as_ref().map(|landing| landing.question.clone());
         self.notice = Some(opening);
         show_busy_pointer();
         self.reading.push(spawn_open(move || {
             let mut doc = Document::open(&path)?;
-            if let Some((label, name, spill, query, cut)) = remote {
-                doc.remote(&label, &name, &spill, &query, cut);
+            if let Some(landing) = remote {
+                doc.remote(
+                    &landing.label,
+                    &landing.question.source,
+                    &landing.spill,
+                    &landing.question.query,
+                    landing.question.minutes,
+                    landing.cut,
+                );
             }
             Ok(doc)
         }));
@@ -7644,6 +7757,24 @@ fn pointer_for(busy: bool, sizing: bool, link: bool) -> Pointer {
     } else {
         Pointer::Default
     }
+}
+
+/// Whether the device-poll timer must keep running: **anything a worker still owes this window.**
+///
+/// **This is the defect behind the owner's report of 2026-10-08**, and it was not the slow server I
+/// first blamed. [`Shell::refresh_title`] stops the timer once the window has nothing to wait for,
+/// and it decided that from the graphics device and the file reads alone — `fetching` was not in
+/// the condition at all. The device-poll timer is the *only* thing that drains a Loki answer, so a
+/// title rebuilt while a request was in flight killed the one tick that could have collected it:
+/// the answer sat unread in its channel for ever, the busy pointer stayed up because `fetching` was
+/// still occupied, and nothing opened. Clicking again set the timer afresh, which then drained
+/// **both** answers on the next tick — one open, two tabs, and the second ask looking like the only
+/// one that had worked.
+///
+/// A pure function rather than a condition inline in `refresh_title`, because what it got wrong was
+/// a missing term and a missing term is exactly what a test can hold it to.
+fn still_polling(device_pending: bool, reading: usize, fetching: usize) -> bool {
+    device_pending || reading > 0 || fetching > 0
 }
 
 /// Gives the keyboard back to the frame when a scroll bar has taken it.
@@ -9540,6 +9671,52 @@ fn set_notice(hwnd: HWND, text: String) {
 /// it is this one.
 const APP_LABEL: &str = "app";
 
+/// The selector an **applications enquiry** stands under, so that asking a source what it holds is
+/// a question of its own and two of them can be recognised as the same.
+///
+/// Not a selector any query could be: it exists so the enquiry occupies a slot in
+/// [`Shell::questions_in_flight`] beside the record fetches without ever matching one. The label
+/// call is the first and often slowest round trip a brand-new source makes, and until this existed
+/// it was the one stage the duplicate guard could not see — so the path every source the user has
+/// not opened before takes was the path that still produced two tabs.
+const ENQUIRY: &str = "\u{0}which applications";
+
+/// The remote facts an open carries, for a document that will be named after its source rather
+/// than after the spill part it happens to read.
+///
+/// **A struct rather than the five-tuple this was**, because adding the fetch window to the
+/// question made it six and nothing at either end said which `String` was which.
+struct Landing {
+    /// What a reader sees in the tab — `live · 7 applications`, not the settings key.
+    label: String,
+    /// The question this document answers. Its `source` is the settings key.
+    question: tailhawk_core::loki::Question,
+    /// The spill directory the records were written to.
+    spill: std::path::PathBuf,
+    /// Whether the opening window came back at the limit — `LOKI.md` §6.
+    cut: bool,
+}
+
+/// One Loki request on its way, and everything the window needs while it is.
+///
+/// **A request that cannot say what it is or how long it has been going is a request the window can
+/// only represent as a wait pointer**, which is what the owner was looking at on 2026-10-08 when he
+/// concluded an open had failed and asked for it again. The sentence and the instant are here so
+/// the bar can count; the question is here so a second ask for the same thing can be recognised as
+/// the same thing. See [`tailhawk_core::loki::waiting_said`] and
+/// [`tailhawk_core::loki::already_asked`].
+struct Asking {
+    /// The question this request is asking — a window of records, or, with [`ENQUIRY`] in place of
+    /// a selector, which applications the source has. `None` for a request that is neither.
+    question: Option<tailhawk_core::loki::Question>,
+    /// What the bar says about this request, without its elapsed time.
+    said: String,
+    /// When it went out, which is the only progress there is to report.
+    since: std::time::Instant,
+    /// Where the answer will arrive.
+    answer: Receiver<Fetched>,
+}
+
 /// What a worker asked Loki for, and what came back.
 ///
 /// **Every Loki request runs on a worker now, and this is what it hands back.** They used to run on
@@ -9565,6 +9742,10 @@ enum Fetched {
         label: String,
         pulled: Box<pull::Pulled>,
         window_end: tailhawk_core::loki::Nanos,
+        /// How far back this one asked. **Carried rather than re-read** from the settings when the
+        /// records land: `File ▸ Open remote ▸ Fetch window` can be changed while a fetch is in
+        /// flight, and the document must record the window it actually got.
+        minutes: u32,
     },
     /// A fetch that failed, in the words the fault chose.
     Failed { name: String, why: String },
@@ -9661,6 +9842,7 @@ fn ask_for_records(
                 label,
                 pulled: Box::new(pulled),
                 window_end: window.end,
+                minutes,
             },
             // **Not signed in is a thing to ask about, not a failure to report.** The same worker
             // starts the sign-in, because it is one more round trip to the same identity server and
@@ -9828,14 +10010,39 @@ fn open_remembered_or_pick(hwnd: HWND, source: tailhawk_core::settings::Source) 
 
 fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
     let name = source.name.clone();
+    let asking = tailhawk_core::loki::Question::new(&name, ENQUIRY, 0);
+    // **The enquiry is guarded like the fetch it precedes.** It is the first round trip a source
+    // the user has not opened before makes, and the slowest thing on screen while it runs; a second
+    // click used to send a second one, and because the picker is entered from the poll drain while
+    // the first picker's modal loop is pumping our messages, the second opened *inside* it.
+    if STATE.with(|s| {
+        s.borrow().as_ref().is_some_and(|shell| {
+            tailhawk_core::loki::already_asked(&[], &shell.questions_in_flight(), &asking)
+                != tailhawk_core::loki::Asked::No
+        })
+    }) {
+        set_notice(hwnd, format!("{name}: still asking what it holds."));
+        return;
+    }
     let waiting = ask_for_apps(source);
+    // **The sentence goes on the request, not in the notice slot.** The bar counts the seconds off
+    // whatever is in flight, and a copy of the same words in the notice would show it twice.
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
-            shell.fetching.push(waiting);
+            shell.fetching.push(Asking {
+                question: Some(asking),
+                said: format!("{name}: asking which applications it has…"),
+                since: std::time::Instant::now(),
+                answer: waiting,
+            });
+            shell.refresh_title(hwnd);
         }
     });
-    set_notice(hwnd, format!("{name}: asking which applications it has…"));
+    // The enquiry is a round trip like any other, and the pointer says so for the same reason the
+    // fetch's does — this is the stage that had neither a busy pointer nor a guard.
+    show_busy_pointer();
     unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
         SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
     }
 }
@@ -10032,6 +10239,52 @@ fn remote_to_reopen(
 /// [`Shell::choose_fetch_window`] exists, a notice naming the wrong duration would be worse than
 /// one naming none — so the minutes are read here and the sentence is built from them.
 fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: String) {
+    // **The same question twice is refused here**, before anything is remembered or asked for, and
+    // this is also the one place every remote open passes through. A fetch against a live server
+    // takes seconds, during which the only sign of life is the status bar and the busy pointer —
+    // so a user who concludes it is hung and clicks again is the ordinary case, not a mistake. It
+    // used to land them a second tab for the same source: the owner's report of 2026-10-08.
+    let minutes = STATE.with(|s| {
+        tailhawk_core::settings::remote_minutes_of(
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.settings.remote_minutes),
+        )
+    });
+    let asking = tailhawk_core::loki::Question::new(&source.name, &source.query, minutes);
+    match STATE.with(|s| {
+        s.borrow().as_ref().map(|shell| {
+            tailhawk_core::loki::already_asked(
+                &shell.document.remote_questions(),
+                &shell.questions_in_flight(),
+                &asking,
+            )
+        })
+    }) {
+        Some(tailhawk_core::loki::Asked::Fetching) => {
+            set_notice(hwnd, format!("{label} is already being fetched — waiting."));
+            return;
+        }
+        Some(tailhawk_core::loki::Asked::Open(tab)) => {
+            // **Bounds-checked like every other externally-driven tab switch**, and followed by
+            // the scroll-bar sync that makes it a switch rather than an assignment: the bars
+            // otherwise keep the previous tab's range until something unrelated syncs them.
+            STATE.with(|s| {
+                if let Some(shell) = s.borrow_mut().as_mut() {
+                    if tab < shell.document.len() {
+                        shell.document.active = tab;
+                        shell.sync_scrollbar();
+                    }
+                }
+            });
+            set_notice(hwnd, format!("{label} is already open."));
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return;
+        }
+        Some(tailhawk_core::loki::Asked::No) | None => {}
+    }
     // **Remembered here, which is the one place every remote open passes through** — the picker's
     // two branches, a regroup, and reopening from the list itself. The applications come from the
     // query rather than from the caller, so an entry cannot record a different set than the window
@@ -10041,30 +10294,27 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
         source: source.name.clone(),
         apps: tailhawk_core::apps::apps_in(&source.query),
     };
-    let minutes = STATE.with(|s| {
-        tailhawk_core::settings::remote_minutes_of(
-            s.borrow()
-                .as_ref()
-                .and_then(|shell| shell.settings.remote_minutes),
-        )
-    });
+    let said = format!(
+        "{label}: fetching {}…",
+        tailhawk_core::settings::fetch_window_said(minutes)
+    );
     let waiting = ask_for_records(source, label.clone(), minutes);
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
-            shell.fetching.push(waiting);
+            shell.fetching.push(Asking {
+                question: Some(asking),
+                said,
+                since: std::time::Instant::now(),
+                answer: waiting,
+            });
             shell.settings.remember_recent(entry);
             shell.save_settings(hwnd);
+            shell.refresh_title(hwnd);
         }
     });
-    set_notice(
-        hwnd,
-        format!(
-            "{label}: fetching {}…",
-            tailhawk_core::settings::fetch_window_said(minutes)
-        ),
-    );
     show_busy_pointer();
     unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
         SetTimer(hwnd, DEVICE_POLL_TIMER, DEVICE_POLL_MS, None);
     }
 }
@@ -10079,6 +10329,7 @@ fn landed_records(
     name: String,
     pulled: pull::Pulled,
     window_end: tailhawk_core::loki::Nanos,
+    minutes: u32,
 ) {
     // **A `SpillSet`, not a `Spill`.** A pipe ends and a tail does not, so the file this writes
     // cannot be one that only grows: `stdin.rs` rolls it into parts and deletes the oldest behind
@@ -10150,7 +10401,16 @@ fn landed_records(
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             // Named after the source, not after the part of the spill it happens to open on.
-            shell.open_named(hwnd, path, Some((name, key, spill_dir, query, cut)));
+            shell.open_named(
+                hwnd,
+                path,
+                Some(Landing {
+                    label: name,
+                    question: tailhawk_core::loki::Question::new(&key, &query, minutes),
+                    spill: spill_dir,
+                    cut,
+                }),
+            );
         }
     });
 }
@@ -11857,6 +12117,13 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     shell.poll_device(hwnd);
                     shell.poll_file(hwnd);
                     fetched = shell.poll_fetch(hwnd);
+                    // **This tick is what makes the fetch counter count.** Nothing else asks for a
+                    // frame while a request is in flight: `poll_device` invalidates only when it
+                    // adopts a device and `poll_file` only when a document lands, so without this
+                    // the bar painted `fetching … 0s` once and froze there for the whole fetch —
+                    // the very thing the counter was written to fix. Asked for once a second
+                    // rather than every 4 ms, because that is how often the sentence changes.
+                    shell.mark_the_wait(hwnd);
                 }
                 fetched
             });
@@ -11876,7 +12143,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         label,
                         pulled,
                         window_end,
-                    } => landed_records(hwnd, source, label, *pulled, window_end),
+                        minutes,
+                    } => landed_records(hwnd, source, label, *pulled, window_end, minutes),
                     // Outside the borrow, like the picker beside it and for the same reason: it
                     // pumps a modal loop of its own.
                     Fetched::SignInStarted {
@@ -13508,6 +13776,8 @@ fn main() -> Result<()> {
             driver: None,
             reading,
             fetching: Vec::new(),
+            waited: None,
+            opening_question: None,
             watching,
             ticks: 0,
             initial_chips,
@@ -14113,6 +14383,7 @@ mod tests {
             "live",
             &spill,
             r#"{environment="live"}"#,
+            60,
             false,
         );
         assert_eq!(doc.summary, "live-identity-and-campaigns");
@@ -15067,11 +15338,14 @@ mod tests {
             "live",
             &spill,
             r#"{environment="live"}"#,
+            60,
             false,
         );
         assert_eq!(doc.summary, "live \u{b7} 7 applications", "the title reads");
         assert_eq!(
-            doc.remote_source.as_ref().map(|(name, _)| name.as_str()),
+            doc.remote_source
+                .as_ref()
+                .map(|asked| asked.source.as_str()),
             Some("live"),
             "the identity is the settings key, which is what regroup looks up"
         );
@@ -15198,6 +15472,28 @@ mod tests {
         );
     }
 
+    /// **A Loki request in flight keeps the poll alive**, because the poll is what collects it.
+    ///
+    /// This is the test that was missing on 2026-10-08, when the owner reported a remote open that
+    /// sat under a wait pointer and never arrived, then a second ask that produced two tabs. The
+    /// condition it holds had only two of its three terms: a title rebuilt while a request was
+    /// outstanding stopped the timer, and the answer was never read.
+    #[test]
+    fn a_request_in_flight_keeps_the_poll_running() {
+        assert!(
+            still_polling(false, 0, 1),
+            "a Loki answer nobody is waiting for is a Loki answer nobody collects"
+        );
+        assert!(still_polling(false, 0, 3), "and so are three of them");
+        assert!(still_polling(true, 0, 0), "a device still being built");
+        assert!(still_polling(false, 2, 0), "files still being read");
+        assert!(still_polling(true, 1, 1), "all three at once");
+        assert!(
+            !still_polling(false, 0, 0),
+            "nothing owed means the timer must stop — a 4ms tick is not free"
+        );
+    }
+
     /// **A click on a recent row opens that row**, and the chrome band is why it did not.
     ///
     /// Reported 2026-10-05: *"When I click on an entry on the home page, nothing happens"*, while
@@ -15261,6 +15557,7 @@ mod tests {
             "a-source",
             &spill,
             r#"{environment="live"}"#,
+            60,
             false,
         );
         assert!(!doc.answers_cut, "an answer under the limit is not cut");
@@ -15269,6 +15566,7 @@ mod tests {
             "a-source",
             &spill,
             r#"{environment="live"}"#,
+            60,
             true,
         );
         assert!(doc.answers_cut);
@@ -17456,6 +17754,7 @@ mod tests {
             "live",
             &spill,
             r#"{environment="live", app=~"nurtur-gateway"}"#,
+            60,
             false,
         );
         let mut second = Document::open(&b).expect("b");
@@ -17464,6 +17763,7 @@ mod tests {
             "live",
             &spill,
             r#"{environment="live", app=~"nurtur-identity-server"}"#,
+            60,
             false,
         );
         tabs.push(first);
@@ -17487,6 +17787,66 @@ mod tests {
             ),
             "two windows of one source should offer to interleave: {:?}",
             tailhawk_core::apps::regroup_of(&seen, 0)
+        );
+    }
+
+    /// **What the duplicate guard is shown of the tabs**, which until now was wired up and never
+    /// asserted. Two things matter and only one of them is obvious: a tab holding a local file must
+    /// contribute no entry at all, or every local tab would look like a remote question with an
+    /// empty name; and a **tiled** tab must contribute both its panes, because either of them may
+    /// be the window a new open would duplicate. The first cut answered for the first pane only,
+    /// so re-asking for the source in the second pane opened a third tab for something already on
+    /// screen.
+    #[test]
+    fn every_pane_of_every_tab_offers_its_own_question() {
+        let a = scratch_log("tailhawk_questions_a.log", 4);
+        let b = scratch_log("tailhawk_questions_b.log", 4);
+        let c = scratch_log("tailhawk_questions_c.log", 4);
+        let spill = a.parent().expect("a directory").to_path_buf();
+        let mut tabs = Tabs::default();
+
+        tabs.push(Document::open(&a).expect("a"));
+        assert!(
+            tabs.remote_questions().is_empty(),
+            "a local file is not a question about a source"
+        );
+
+        let mut gateway = Document::open(&b).expect("b");
+        gateway.remote(
+            "live \u{b7} gateway",
+            "live",
+            &spill,
+            r#"{app=~"gateway"}"#,
+            60,
+            false,
+        );
+        tabs.push(gateway);
+        let mut dispatcher = Document::open(&c).expect("c");
+        dispatcher.remote(
+            "live \u{b7} job-dispatcher",
+            "live",
+            &spill,
+            r#"{app=~"job-dispatcher"}"#,
+            60,
+            false,
+        );
+        // The second pane of the second tab, which is the one that used to go unseen.
+        tabs.tabs[1].panes.push(dispatcher);
+
+        let seen = tabs.remote_questions();
+        assert_eq!(seen.len(), 2, "both panes answer: {seen:?}");
+        assert!(
+            seen.iter().all(|(at, _)| *at == 1),
+            "and both name the tab that holds them, not their own position: {seen:?}"
+        );
+        assert_eq!(
+            tailhawk_core::loki::already_asked(
+                &seen,
+                &[],
+                &tailhawk_core::loki::Question::new("live", r#"{app=~"job-dispatcher"}"#, 60)
+            ),
+            tailhawk_core::loki::Asked::Open(1),
+            "the pane behind the front one is still already open"
         );
     }
 

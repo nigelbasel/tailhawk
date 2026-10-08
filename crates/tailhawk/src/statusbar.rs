@@ -382,6 +382,14 @@ pub enum Tail<'a> {
 pub struct StatusFacts<'a> {
     /// The most recent thing that happened — an error, a format saved, a source opening.
     pub notice: Option<&'a str>,
+    /// A request still on its way to a remote source, with the seconds it has taken — the counting
+    /// half of the wait, from [`tailhawk_core::loki::waiting_said`].
+    ///
+    /// **Its own field rather than the notice**, because the notice is what *happened* and this is
+    /// what *is happening*: a fetch rewriting the notice every second would rub out the sentence
+    /// before it. Both land in the message pane, joined, so neither hides the other — the same
+    /// arrangement the rules warning already has.
+    pub waiting: Option<&'a str>,
     /// An export or a live tee, with its count — E21's "the user asked for a file and this is
     /// where they see it filling".
     pub tee: Option<&'a str>,
@@ -499,6 +507,8 @@ impl StatusPanes {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ShellFacts<'a> {
     pub notice: Option<&'a str>,
+    /// A remote request still in flight, already counted — see [`StatusFacts::waiting`].
+    pub waiting: Option<&'a str>,
     pub rules: Option<&'a str>,
     pub contrast: bool,
 }
@@ -526,6 +536,7 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
     // transient notice hide a standing warning for as long as it showed.
     let mut said: Vec<&str> = Vec::new();
     said.extend(facts.notice);
+    said.extend(facts.waiting);
     said.extend(facts.tee);
     if facts.cut {
         said.push(
@@ -682,6 +693,33 @@ mod tests {
             panes.parts()[1..],
             [""; 7],
             "a closed window must not leave stale facts on the bar: {panes:?}"
+        );
+    }
+
+    /// **A fetch in flight reaches the bar, and does not rub out the notice.** The counting
+    /// sentence was wired up on 2026-10-08 and nothing asserted it arrived anywhere; the whole
+    /// point of giving it a field of its own rather than overwriting the notice every second is
+    /// that both are still readable, so that is what this holds it to.
+    #[test]
+    fn a_request_in_flight_counts_in_the_message_pane_beside_the_notice() {
+        let panes = status_panes_of(StatusFacts {
+            notice: Some("format saved"),
+            waiting: Some("live \u{25b8} job-dispatcher: fetching the last hour\u{2026} 14s"),
+            ..open()
+        });
+        assert!(
+            panes.message.contains("format saved"),
+            "the notice survives: {}",
+            panes.message
+        );
+        assert!(
+            panes.message.contains("fetching the last hour\u{2026} 14s"),
+            "and the wait is counted beside it: {}",
+            panes.message
+        );
+        assert_eq!(
+            panes.position, "Line 1,192 of 419,501",
+            "and it displaces nothing else"
         );
     }
 
