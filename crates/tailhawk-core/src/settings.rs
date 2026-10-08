@@ -558,6 +558,24 @@ impl Settings {
         self.recent.truncate(RECENT_MAX);
     }
 
+    /// Drops one entry from the recent list, reporting whether it was there.
+    ///
+    /// **For an entry that can never work again**, which is the only honest reason to take a row
+    /// off a list the reader did not ask to edit: a remote entry naming a source that is no longer
+    /// in the configuration. Reported 2026-10-05 — it said so in the status bar and then offered
+    /// the same unopenable row every time after. A row that cannot be acted on is worse than no
+    /// row, because the reader keeps spending a click to find out.
+    ///
+    /// Not for an open that merely failed. A server that was down, a token that had expired, a file
+    /// on a disconnected share are all reasons to try again later, and forgetting those would make
+    /// the list lose exactly the entry the reader most wants back.
+    pub fn forget_recent(&mut self, entry: &Recent) -> bool {
+        let key = identity_of(entry);
+        let before = self.recent.len();
+        self.recent.retain(|e| identity_of(e) != key);
+        self.recent.len() != before
+    }
+
     /// Merges `over` onto `self`: `over`'s keys win, per §12.4's "earlier tier winning per key",
     /// with the earlier tier passed as `over`.
     pub fn merged_under(mut self, over: Settings) -> Settings {
@@ -1308,6 +1326,33 @@ mod tests {
             merged.recent,
             vec![file(r"C:\old.log")],
             "an empty over-tier does not erase the list"
+        );
+    }
+
+    /// **An entry that can never work again is taken off the list**, and only that kind.
+    #[test]
+    fn a_recent_entry_can_be_forgotten_without_disturbing_the_rest() {
+        let gone = Recent::Remote {
+            source: "nurtur-loki".to_owned(),
+            apps: Vec::new(),
+        };
+        let mut s = Settings::default();
+        s.remember_recent(Recent::File(r"C:\logs\a.log".to_owned()));
+        s.remember_recent(gone.clone());
+        s.remember_recent(Recent::File(r"C:\logs\b.log".to_owned()));
+
+        assert!(s.forget_recent(&gone), "it was there");
+        assert_eq!(
+            s.recent,
+            vec![
+                Recent::File(r"C:\logs\b.log".to_owned()),
+                Recent::File(r"C:\logs\a.log".to_owned()),
+            ],
+            "and the order of what is left is untouched"
+        );
+        assert!(
+            !s.forget_recent(&gone),
+            "forgetting it again reports that there was nothing to forget"
         );
     }
 

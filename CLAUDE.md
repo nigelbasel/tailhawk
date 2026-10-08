@@ -116,7 +116,14 @@ redistributable dependency. `cargo fmt --check` has broken the build on its own 
 The `tools/verify-*.ps1` harnesses drive the real binary. They need **`powershell`, not `pwsh`**,
 and a desktop session. `tools/verify-uia.ps1` is the exception — it needs no foreground.
 
-**Two known flakes, both timing criteria:**
+**Three known flakes. Two are timing criteria; the third polls a file for growth:**
+`stdin::tests::a_spill_is_an_ordinary_file_to_the_rest_of_the_product` asserts
+`polled.lines_added == 1` immediately after appending to a spill, so it depends on the write being
+visible to the next `settle()`. Seen failing once under the full release suite on 2026-10-08 and
+passing alone straight afterwards. **Nothing in it is a duration**, which is why the rule below
+needed widening: an assertion that depends on *when* something became visible flakes the same way
+one that measures how long it took.
+
 `semantic::tests::a_screenful_costs_a_fraction_of_a_frame` and
 `paint::tests::the_layout_cost_does_not_scale_with_the_number_of_visible_columns`. Each fails under
 the full parallel suite on a loaded machine and passes alone and on CI. Rerun the named test alone

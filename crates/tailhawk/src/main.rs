@@ -10213,6 +10213,51 @@ fn wizard_closed_note(saved: bool) -> Option<&'static str> {
     (!saved).then_some("format wizard closed — nothing saved")
 }
 
+/// Why a recent remote entry cannot be reopened — and, in the distinction between its two
+/// variants, whether the entry is worth keeping.
+///
+/// **A reason that cannot be acted on and a reason that can are different facts about a list.** A
+/// source that is gone from the configuration can never answer that entry again, however many times
+/// the reader clicks it; a source whose selector will not take applications is there, and editing
+/// the query makes the row work. Reported 2026-10-05: the bar said the source was no longer
+/// configured, and then the same unopenable row was offered every time after — so the message was
+/// right and the list learned nothing from it.
+///
+/// **This is deliberately not "the open failed".** A server that was down, a token that had
+/// expired, a share that was disconnected are all reasons to try again later, and forgetting those
+/// would take off the list exactly the entry the reader most wants back.
+#[derive(Debug)]
+enum CannotReopen {
+    /// No source of that name is configured any more. The entry is dead and is dropped.
+    Gone { name: String },
+    /// The source is there, but its query is not a selector applications can be added to.
+    NoSelector { name: String },
+}
+
+impl CannotReopen {
+    /// Whether the recent entry should be forgotten, rather than offered again next time.
+    fn the_entry_is_dead(&self) -> bool {
+        matches!(self, CannotReopen::Gone { .. })
+    }
+}
+
+impl std::fmt::Display for CannotReopen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // **It says the row has gone, because the row goes.** A sentence naming only the
+            // configuration would leave the reader watching a list change for no stated reason.
+            CannotReopen::Gone { name } => write!(
+                f,
+                "{name}: that source is no longer configured — removed from Open Recent."
+            ),
+            CannotReopen::NoSelector { name } => write!(
+                f,
+                "{name}: this source's query is not a selector this can add to."
+            ),
+        }
+    }
+}
+
 /// The source and label a recent remote entry reopens, or the reason it cannot.
 ///
 /// **A source can be renamed or deleted between one open and the next**, and the recent list is not
@@ -10225,9 +10270,11 @@ fn remote_to_reopen(
     sources: &[tailhawk_core::settings::Source],
     name: &str,
     apps: &[String],
-) -> std::result::Result<(tailhawk_core::settings::Source, String), String> {
+) -> std::result::Result<(tailhawk_core::settings::Source, String), CannotReopen> {
     let Some(source) = sources.iter().find(|s| s.name == name).cloned() else {
-        return Err(format!("{name}: that source is no longer configured."));
+        return Err(CannotReopen::Gone {
+            name: name.to_owned(),
+        });
     };
     let chosen: Vec<&str> = apps.iter().map(String::as_str).collect();
     let query = if chosen.is_empty() {
@@ -10236,9 +10283,9 @@ fn remote_to_reopen(
         match tailhawk_core::apps::with_apps(&source.query, &chosen) {
             Ok(query) => query,
             Err(_) => {
-                return Err(format!(
-                    "{name}: this source's query is not a selector this can add to."
-                ));
+                return Err(CannotReopen::NoSelector {
+                    name: name.to_owned(),
+                });
             }
         }
     };
@@ -10530,7 +10577,25 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         });
         match remote_to_reopen(&sources, &name, &apps) {
             Ok((source, label)) => open_remote(hwnd, source, label),
-            Err(why) => set_notice(hwnd, why),
+            Err(why) => {
+                // A row that can never be acted on comes off the list, here, where the attempt
+                // that proved it dead was made — not on a sweep at start-up, which would silently
+                // discard an entry whose source is merely absent from *this* settings tier.
+                if why.the_entry_is_dead() {
+                    STATE.with(|s| {
+                        if let Some(shell) = s.borrow_mut().as_mut() {
+                            let entry = tailhawk_core::settings::Recent::Remote {
+                                source: name.clone(),
+                                apps: apps.clone(),
+                            };
+                            if shell.settings.forget_recent(&entry) {
+                                shell.save_settings(hwnd);
+                            }
+                        }
+                    });
+                }
+                set_notice(hwnd, why.to_string());
+            }
         }
         return true;
     }
@@ -14199,14 +14264,43 @@ mod tests {
 
     /// **The recent list is a record of what was done, not the configuration.** A source renamed or
     /// deleted since the entry was made is named in the refusal, rather than opening nothing.
+    ///
+    /// **And the row comes off the list**, which it did not until 2026-10-08. Reported on the 5th:
+    /// the bar correctly said the source was no longer configured, and then the same unopenable row
+    /// was offered every time after — so the message was right and the list learned nothing from
+    /// it. The sentence says the row has gone, because a list that changes for no stated reason is
+    /// its own small mystery.
     #[test]
-    fn a_recent_remote_whose_source_is_gone_says_so_rather_than_opening_nothing() {
+    fn a_recent_remote_whose_source_is_gone_says_so_and_the_row_is_dropped() {
         let sources = [a_source("live", "{environment=\"live\"}")];
         let why =
             remote_to_reopen(&sources, "staging", &[]).expect_err("staging is not configured");
+        let said = why.to_string();
         assert!(
-            why.contains("staging"),
-            "the refusal must name the source the reader chose: {why}"
+            said.contains("staging"),
+            "the refusal must name the source the reader chose: {said}"
+        );
+        assert!(
+            said.contains("Open Recent"),
+            "and say where the row went: {said}"
+        );
+        assert!(
+            why.the_entry_is_dead(),
+            "a source that is gone can never answer this entry again"
+        );
+    }
+
+    /// **A reason that can be acted on keeps its row.** The source is configured; its query is the
+    /// thing in the way, and editing it makes the entry work — so forgetting the row here would
+    /// take away the only record of what the reader was looking at.
+    #[test]
+    fn a_recent_remote_that_could_work_later_keeps_its_row() {
+        let sources = [a_source("odd", "|= \"boom\"")];
+        let apps = ["Worker".to_owned()];
+        let why = remote_to_reopen(&sources, "odd", &apps).expect_err("that query has no selector");
+        assert!(
+            !why.the_entry_is_dead(),
+            "the source is there — this is fixable, not dead"
         );
     }
 
@@ -14216,10 +14310,12 @@ mod tests {
     fn a_recent_remote_whose_query_takes_no_selector_says_so() {
         let sources = [a_source("odd", "|= \"boom\"")];
         let apps = ["Worker".to_owned()];
-        let why = remote_to_reopen(&sources, "odd", &apps).expect_err("that query has no selector");
+        let said = remote_to_reopen(&sources, "odd", &apps)
+            .expect_err("that query has no selector")
+            .to_string();
         assert!(
-            why.contains("odd") && why.contains("selector"),
-            "the refusal must name the source and the reason: {why}"
+            said.contains("odd") && said.contains("selector"),
+            "the refusal must name the source and the reason: {said}"
         );
     }
 
