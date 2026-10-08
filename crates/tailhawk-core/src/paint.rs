@@ -73,6 +73,20 @@ use crate::highlight::Span;
 use crate::rows::RowSource;
 use crate::shape::Shaper;
 use crate::text::{Instance, TextPipeline, MODE_SOLID};
+
+/// How strongly the current row is washed over what is already drawn there.
+///
+/// **A wash, not a fill, and that is the fix for a real defect.** The marker used to be painted
+/// with the row, before its content — so on a row a highlight rule had coloured, the rule background
+/// painted straight over it and the only part that survived was the gutter, which the highlight does
+/// not reach. The owner reported exactly that: "when I have the rows coloured, the selection ony
+/// shows on the line number portion".
+///
+/// So it is drawn last and translucent, over everything on the row. The highlight colour shows
+/// through it rather than being replaced, which it must: the rule is saying something about the
+/// line, and a marker that hid it would trade one piece of information for another. The drag guide
+/// already relies on the same dual-source blend at a third of opacity.
+const CARET_ROW_WASH: f32 = 0.45;
 use crate::theme::theme;
 use crate::view::View;
 use crate::Result;
@@ -389,34 +403,10 @@ impl Painter {
         let gutter = view.gutter_px();
         let cell_w = self.cell_width();
         let caret_row = source.caret_row();
+        let mut caret_y = None;
         for (row, y) in rows {
             if caret_row == Some(row) {
-                let width = gutter + view.hgrid().viewport_px();
-                let height = view.grid().row_height();
-                match t.current_row_bg {
-                    Some(fill) => {
-                        self.instances.push(Instance {
-                            pos: [0.0, y],
-                            size: [width, height],
-                            tint: fill,
-                            mode: MODE_SOLID,
-                            ..Instance::default()
-                        });
-                        total.quads += 1;
-                    }
-                    None => {
-                        for edge in [y, y + height - 1.0] {
-                            self.instances.push(Instance {
-                                pos: [0.0, edge],
-                                size: [width, 1.0],
-                                tint: t.caret,
-                                mode: MODE_SOLID,
-                                ..Instance::default()
-                            });
-                        }
-                        total.quads += 2;
-                    }
-                }
+                caret_y = Some(y);
             }
             // The gutter: a mark and the physical line number, right-aligned, in a quieter ink.
             if gutter > 0.0 {
@@ -531,6 +521,34 @@ impl Painter {
         // skipped the *footer* — the filter panel and the status bar live in `draw_chrome` too,
         // and a filter was changing the rows with no visible surface saying so. Each band guards
         // itself; the painter does not second-guess which of them exist.
+        if let Some(y) = caret_y {
+            let width = gutter + view.hgrid().viewport_px();
+            let height = view.grid().row_height();
+            match t.current_row_bg {
+                Some(fill) => {
+                    self.instances.push(Instance {
+                        pos: [0.0, y],
+                        size: [width, height],
+                        tint: [fill[0], fill[1], fill[2], CARET_ROW_WASH],
+                        mode: MODE_SOLID,
+                        ..Instance::default()
+                    });
+                    total.quads += 1;
+                }
+                None => {
+                    for edge in [y, y + height - 1.0] {
+                        self.instances.push(Instance {
+                            pos: [0.0, edge],
+                            size: [width, 1.0],
+                            tint: t.caret,
+                            mode: MODE_SOLID,
+                            ..Instance::default()
+                        });
+                    }
+                    total.quads += 2;
+                }
+            }
+        }
         self.spans = spans;
         source.draw_chrome(self, view);
         spans = std::mem::take(&mut self.spans);
@@ -1657,17 +1675,36 @@ mod tests {
         painter.begin_frame();
         painter.lay_out(&view, INK, &source).expect("lay out");
         let row_h = view.grid().row_height();
-        let fill = Theme::dark()
+        let base = Theme::dark()
             .current_row_bg
-            .expect("the dark theme fills the current row");
-        let fills: Vec<&Instance> = painter
+            .expect("the dark theme marks the current row");
+        let wash = [base[0], base[1], base[2], CARET_ROW_WASH];
+        let at: Vec<usize> = painter
             .instances()
             .iter()
-            .filter(|i| i.mode == MODE_SOLID && i.tint == fill)
+            .enumerate()
+            .filter(|(_, i)| i.mode == MODE_SOLID && i.tint == wash)
+            .map(|(n, _)| n)
             .collect();
 
-        assert_eq!(fills.len(), 1, "one row filled, the caret's");
-        let marker = fills[0];
+        assert_eq!(at.len(), 1, "one row marked, the caret's");
+        let marker = &painter.instances()[at[0]];
+        assert!(
+            marker.tint[3] < 1.0,
+            "a marker that replaces what is under it hides the highlight: {:?}",
+            marker.tint
+        );
+        assert!(
+            at[0] > 0,
+            "and it is not the first thing drawn, or the row paints over it"
+        );
+        let drawn_before = painter.instances()[..at[0]]
+            .iter()
+            .any(|i| (i.pos[1] - marker.pos[1]).abs() < row_h / 2.0);
+        assert!(
+            drawn_before,
+            "something on that row is drawn before the marker, which is what it washes over"
+        );
         assert!(
             (marker.size[1] - row_h).abs() < 0.5,
             "it covers the row: {} against {row_h}",
@@ -1684,7 +1721,7 @@ mod tests {
             "a marker that stops at the text is not a row marker"
         );
         assert_ne!(
-            fill,
+            base,
             Theme::dark().selection_bg,
             "and it is not the selection's fill, or the two could not be told apart"
         );
