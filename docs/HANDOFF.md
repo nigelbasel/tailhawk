@@ -1,5 +1,140 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-08: he used it all day and reported fourteen things
+
+**Master `f482f25`, green on all five CI jobs by SHA. 285 shell + 997 core.**
+
+**Read the framing note under the 2026-10-05 resume point first.** It still governs: he has said
+twice that there is no "mine and yours" in this code, and the corollary is that `SPEC.md`,
+`UI-DESIGN.md`, `LOKI.md` and `CLEANROOM.md` are Claude's own writing and are never an authority to
+cite back at him. When one disagrees with what he is asking for, **the document is what gets fixed.**
+One of them did on this day — `Shell::open_path`'s doc comment had argued in prose that a remote
+source should always get a window of its own, and that argument was half wrong and cost him two
+identical tabs.
+
+**And a second standing permission, new on this day:** *"if you start the app from one of your builds,
+you can kill it."* An instance started from `target/release` is Claude's to stop; kill the pid from
+`Start-Process -PassThru`, never `Get-Process tailhawk | Stop-Process`, which would take his own
+install in `C:\Program Files\TailHawk` with it. Memory `tailhawk-kill-your-own-instances`.
+
+### The day's shape: fourteen reports, all landed
+
+In his order — welcome rows unclickable; no feedback during the open delay; a status message
+advising an impossible action; close-tab appearing to close everything; the same file opening twice;
+the toolbar below the tabs; "file in use" on a busy log; a clicked line not showing as selected;
+selection invisible on coloured rows; the filter bar at the bottom being "confusing and hard to
+notice"; no way to switch tabbed ↔ tiled; a Loki open that sat under a wait cursor and never
+arrived; two tabs for one source; and column choices on a Loki tail not surviving a restart.
+
+Eleven of those are in the commits from `2fd854f` to `176e397` and are described in their messages.
+The last three are the ones worth reading about here, because the first diagnosis was wrong.
+
+### `eac9d96` — a Loki answer nobody collects, and why "the server is slow" was the wrong answer
+
+He reported three things in sequence: a wait cursor sitting for a long time with no window, then a
+second click that worked but left the cursor busy, then **two job-dispatcher tabs**.
+
+The first diagnosis offered to him was that the fetch was merely slow and both had landed. Wrong,
+and it was reached by reasoning about the network before reading what cancelled the poll.
+`Shell::refresh_title` stops the device-poll timer once the window has nothing left to wait for, and
+it decided that from `pending` and `reading` alone — **`fetching` was never in the condition.** That
+4 ms tick is the only thing that drains a Loki answer, so a title rebuilt during a request killed the
+one tick that could have collected it: the answer sat unread in its channel, `fetching` stayed
+occupied so `busy_opening()` kept the pointer up, and nothing opened. Clicking again called `SetTimer`
+afresh and the next tick drained **both** answers. Every symptom, in order, from one missing term in
+one `if`.
+
+Now a pure `still_polling(device_pending, reading, fetching)` with the test that was missing. The
+general lesson, and it is the one to carry: **when something never arrives, read what cancels the
+thing that would deliver it before blaming the thing that produces it.**
+
+Three more fixes around it, two of which only exist because the component review caught them:
+
+- **The duplicate ask is refused on its own account**, through the new pure
+  `loki::already_asked`, at *every* stage a request can be in: on the wire, a landed answer whose tab
+  has not appeared yet (`Shell::opening_question`), and the **applications enquiry** — the first and
+  slowest round trip a source he has not opened before makes, which had neither a guard nor a busy
+  pointer. Two of those land two pickers, the second opening a modal loop inside the first. A tiled
+  tab answers for both panes.
+- **The fetch window is part of the question.** `loki::Question` is source + query + minutes, and the
+  third is not optional: the status bar's own cut-answer warning tells the reader to widen
+  `File ▸ Open remote ▸ Fetch window`, which takes effect on the *next* fetch — so without the
+  minutes in the key, the guard would have refused that next fetch as a duplicate and the remedy the
+  bar names could never be carried out. **A guard that blocks the advice the program gives is worse
+  than no guard.**
+- **`net.rs` set no WinHTTP timeouts at all**, and its resolve default is *no timeout*: a host that
+  will not resolve blocks a worker for the life of the process, with nothing able to cancel it.
+  `WinHttpSetTimeouts` is wired in as its own entry point rather than four hand-declared option
+  constants — §5 records two cases of a from-memory constant being plausible, confident and wrong.
+  Receive sits **above** Loki's own one-minute `querier.query_timeout` deliberately: a client that
+  gives up first replaces the server's explanation of *why* with "reading the body failed".
+
+### `f482f25` — a remote tail's layout, keyed on something that survives the run
+
+*"on the loki tail I selected the app and the severity, and then on restart, they are no longer
+showing … we should really persist these with the mru data"* — and his own answer was the fix.
+
+The state was saved **faithfully, every single time**. `Document::file_state` keyed it on
+`self.path`, and a remote tail's path is `%TEMP%\tailhawk-spill-<pid>-00\part-000001.log`. That
+directory is named after the process, so the key written on one run cannot exist on the next: the
+write succeeded and the read could never match. His settings file held **eight** such entries, one
+per remote open he had ever done, the most recent reading `columns = [30, 5, 0, 0, 0, 0, 0, 0, 0]` —
+exactly the two columns he had kept. Nothing was lost through carelessness; it was filed in a drawer
+that burns every run.
+
+`Document::state_key` is now the one answer both the save and the lookup read: a file's path, or
+`loki://source?apps=a,b` — the string the recent list already uses. Two consequences:
+`settings::fold_key` folds case for a path and **not** for a remote key (a source name is a
+credential key; an `app` value is compared exactly server-side), shared with the recent list's
+`identity_of` so the two cannot drift; and a spill key is refused outright while the ones already
+written are dropped on load.
+
+**Verified with him**: he chose app and environment, closed, and the file came back with one entry
+keyed `loki://nurtur-loki-live?apps=job-dispatcher`. He confirmed the reopen — *"ok, that worked ok"*.
+
+### What is verified on screen and what is not
+
+**Confirmed by him on this day:** the welcome rows open, the wait cursor appears during an open,
+selection shows on coloured rows, the toolbar sits above the tabs, a busy log opens, and the remote
+column layout survives a restart.
+
+**Still unseen by anyone:** the scroll-bar corner square and right-hand strip, a thumb drag
+surviving `SetFocus`, the band settling on resize, the vertical bar greying for a document that
+fits, the per-tab close buttons, the traffic bars, the Window menu's two arrangements, and the
+filters dialog's Apply. The arithmetic has tests; none of them can see the screen.
+
+### Open, and his call
+
+- **A dead recent entry is offered for ever.** An entry naming a source no longer in the
+  configuration says so in the status bar and then offers the same unopenable row next time. The
+  intended fix is to drop the entry when an open fails *for that reason* and say that it was dropped.
+  Identified 2026-10-05, still not done.
+- **`filterpanel.rs` is dead in fact but still compiled** — 670 lines and 3 tests. `show_filters` is
+  `false` at both construction sites and **nothing in the codebase sets it true**, so the panel is
+  never created; `band_height` returns `0.0` whenever it is hidden, which makes removing the band
+  reservation provably inert. ~15 call sites, two `Document` fields, and `FileState::filters_hidden`
+  (which is now always written `true` and means nothing). Removal is safe; it had not happened when
+  this was written.
+- The stale comment in `Document::apply_state` about chips bringing "their panel with them" describes
+  a panel that can no longer arrive. It goes with the removal above.
+- Welcome-row link **styling**, and binding the hand cursor to the text extent — `row_at_y` ignores
+  x, so it spans the full row width.
+- Real MDI with floating children stays parked with docking infrastructure, **by his decision**.
+  N-way tiling would need a model change: `can_split_into` caps at two panes.
+- The help document still describes none of the authentication.
+
+### Two things that cost real time on this day
+
+- **`cargo test --workspace` run twice at once fails in ways that look like real defects.** A test
+  unrelated to the change under test failed in a concurrent run and passed alone. The known-flake
+  rule in `CLAUDE.md` is about timing assertions; this is the simpler case of **two suites racing on
+  one machine**. Check for another run before believing a failure.
+- **A clean `cargo check` says nothing about the tests.** Not hit on this day, but the four earlier
+  occurrences are why every gate here is `cargo test --workspace`.
+
+---
+
+
 ## ▶ Resume point — 2026-10-05: the welcome list reads correctly, and there is one resize grip
 
 **Master `83cda63`, green on all five CI jobs by SHA. 269 shell + 972 core.**
