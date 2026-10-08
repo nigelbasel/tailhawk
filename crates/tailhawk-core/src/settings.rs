@@ -46,6 +46,16 @@ pub struct Window {
 /// How one file was being looked at.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileState {
+    /// What this state belongs to: a **file's path**, or, for a remote source, the same
+    /// `loki://source?apps=a,b` string the recent list holds it under.
+    ///
+    /// **A remote window is keyed on its source, not on its file**, because its file is a part of
+    /// a spill in `%TEMP%` whose directory is named after the process and gone on the next run.
+    /// Keyed on that, the owner's chosen columns were written faithfully every time and found
+    /// never — his report of 2026-10-08: *"on the loki tail I selected the app and the severity,
+    /// and then on restart, they are no longer showing"*, with his own answer, *"we should really
+    /// persist these with the mru data"*. The key is the recent entry's, so the thing the list
+    /// reopens and the thing whose layout is remembered are named identically.
     pub path: String,
     /// Chip texts with their polarity as the first character: `+error`, `-retry`.
     pub chips: Vec<String>,
@@ -322,6 +332,39 @@ pub fn fetch_window_said(minutes: u32) -> String {
 /// is the platform's work.
 pub(crate) const SPILL_PREFIX: &str = "tailhawk-spill-";
 
+/// Whether this path is one of Tailhawk's own spill files in `%TEMP%` — a piped stream's single
+/// file, or one part of a remote tail's rolling set.
+///
+/// Either the file or the directory above it may carry the name, because the two shapes differ:
+/// a pipe spills to `%TEMP%\tailhawk-spill-1234.log` and a remote tail to
+/// `%TEMP%\tailhawk-spill-1234-00\part-000001.log`.
+pub fn is_spill_path(path: &str) -> bool {
+    let named_spill = |part: &str| {
+        part.get(..SPILL_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(SPILL_PREFIX))
+    };
+    path.rsplit(['\\', '/']).take(2).any(named_spill)
+}
+
+/// How a remembered-state key is compared: **a path folds case, a source does not.**
+///
+/// The same rule [`identity_of`] applies to the recent list, and for the same reasons — Windows
+/// opens `C:\LOGS\A.LOG` and `C:\logs\a.log` as one file, while a Loki source name is the key its
+/// credential is stored under and an `app` value is a server-side string compared exactly. Folding
+/// a remote key would quietly merge a reader's `Worker` window with their `worker` one.
+///
+/// **One function so the two cannot drift.** The state keyed per file and the identity keyed per
+/// recent entry are now the same string for a remote source — that is the whole point of keying
+/// state on the entry — so a different answer here than there would mean a window whose layout is
+/// remembered under a name the recent list cannot produce.
+pub fn fold_key(key: &str) -> String {
+    if key.starts_with(REMOTE_SCHEME) {
+        key.to_owned()
+    } else {
+        key.to_lowercase()
+    }
+}
+
 /// What makes two recent entries the same entry rather than two.
 ///
 /// **A path folds case; a source does not, and folding one would lose a window.** Windows opens
@@ -333,10 +376,7 @@ pub(crate) const SPILL_PREFIX: &str = "tailhawk-spill-";
 ///
 /// A path cannot begin `loki://`, so a file and a source can never collide here.
 fn identity_of(entry: &Recent) -> String {
-    match entry {
-        Recent::File(path) => path.to_lowercase(),
-        Recent::Remote { .. } => entry.encode(),
-    }
+    fold_key(&entry.encode())
 }
 
 /// A source or application name with the two separators — and the escape itself — made safe.
@@ -377,14 +417,10 @@ impl Recent {
     ///
     /// A remote entry is never a spill: it names the source, which is the thing worth reopening.
     pub fn is_spill(&self) -> bool {
-        let Recent::File(path) = self else {
-            return false;
-        };
-        let named_spill = |part: &str| {
-            part.get(..SPILL_PREFIX.len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(SPILL_PREFIX))
-        };
-        path.rsplit(['\\', '/']).take(2).any(named_spill)
+        match self {
+            Recent::File(path) => is_spill_path(path),
+            Recent::Remote { .. } => false,
+        }
     }
 
     /// The entry as a reader should see it on the welcome surface.
@@ -465,18 +501,26 @@ pub const RECENT_MAX: usize = 10;
 pub const FIND_MAX: usize = 10;
 
 impl Settings {
-    /// The state for `path`, if any was kept.
-    pub fn file(&self, path: &str) -> Option<&FileState> {
-        self.files
-            .iter()
-            .find(|f| f.path.eq_ignore_ascii_case(path))
+    /// The state for `key`, if any was kept. A file's key is its path; a remote source's is the
+    /// same string the recent list holds it under — see [`FileState::path`].
+    pub fn file(&self, key: &str) -> Option<&FileState> {
+        let wanted = fold_key(key);
+        self.files.iter().find(|f| fold_key(&f.path) == wanted)
     }
 
-    /// Records the state for `path`, replacing what was there. A file with nothing to say — no
-    /// chips, no collapse — is forgotten rather than kept as an empty entry.
+    /// Records the state for one window, replacing what was there. A window with nothing to say —
+    /// no chips, no collapse — is forgotten rather than kept as an empty entry.
+    ///
+    /// **A spill path is never recorded.** Until 2026-10-08 a remote tail's state was keyed on the
+    /// part file it happened to be reading, in a `%TEMP%` directory named after the process; it
+    /// could never be read back, and every remote open left one more entry nothing would ever
+    /// match. Those are dropped on load; this is what stops new ones.
     pub fn set_file(&mut self, state: FileState) {
-        self.files
-            .retain(|f| !f.path.eq_ignore_ascii_case(&state.path));
+        if is_spill_path(&state.path) {
+            return;
+        }
+        let key = fold_key(&state.path);
+        self.files.retain(|f| fold_key(&f.path) != key);
         if !state.chips.is_empty()
             || state.collapse
             || !state.bookmarks.is_empty()
@@ -956,6 +1000,11 @@ pub fn load(tiers: &[PathBuf]) -> Settings {
             merged = merged.merged_under(Settings::from_toml(&text));
         }
     }
+    // **Entries keyed on a spill are dropped, and the next save writes the file without them.**
+    // A remote tail's state was keyed on its part file in `%TEMP%` until 2026-10-08, so a settings
+    // file written before this holds one dead entry per remote open — unmatchable, and growing
+    // without bound. Nothing is lost by forgetting them: they were never found.
+    merged.files.retain(|state| !is_spill_path(&state.path));
     merged
 }
 
@@ -1260,6 +1309,107 @@ mod tests {
             vec![file(r"C:\old.log")],
             "an empty over-tier does not erase the list"
         );
+    }
+
+    /// **A remote source's layout is remembered under its recent-list name**, which is the whole
+    /// of the owner's report of 2026-10-08: he chose the `app` and `severity` columns on a Loki
+    /// tail and found them gone on the next run. The state was written every time — keyed on the
+    /// spill part the tail happened to be reading, in a `%TEMP%` directory named after the
+    /// process, so the key could never occur again.
+    #[test]
+    fn a_remote_sources_layout_is_kept_under_the_name_the_recent_list_uses() {
+        let entry = Recent::Remote {
+            source: "nurtur-loki-live".to_owned(),
+            apps: vec!["job-dispatcher".to_owned()],
+        };
+        let mut s = Settings::default();
+        s.set_file(FileState {
+            path: entry.encode(),
+            columns: vec![0, 14, 9, 0],
+            column_order: vec![2, 0, 1],
+            ..FileState::default()
+        });
+
+        let found = s
+            .file(&entry.encode())
+            .expect("the window reopened from this entry must find its layout");
+        assert_eq!(found.columns, vec![0, 14, 9, 0], "including hidden columns");
+        assert_eq!(found.column_order, vec![2, 0, 1]);
+
+        let written = s.to_toml();
+        assert_eq!(
+            Settings::from_toml(&written)
+                .file(&entry.encode())
+                .map(|f| f.columns.clone()),
+            Some(vec![0, 14, 9, 0]),
+            "and it survives the round trip through the file"
+        );
+    }
+
+    /// **A source name's case is not folded, and this is why it matters.** `identity_of` already
+    /// argued it for the recent list — a source name is the key a credential is stored under and
+    /// an `app` value is compared exactly server-side — and the state key is now the same string,
+    /// so the two must answer alike or a window's layout would be remembered under a name its own
+    /// recent entry cannot produce.
+    #[test]
+    fn a_path_folds_case_and_a_source_does_not() {
+        let mut s = Settings::default();
+        s.set_file(FileState {
+            path: r"C:\LOGS\App.LOG".to_owned(),
+            collapse: true,
+            ..FileState::default()
+        });
+        assert!(
+            s.file(r"c:\logs\app.log").is_some(),
+            "one file, however it is spelled"
+        );
+
+        s.set_file(FileState {
+            path: "loki://live?apps=Worker".to_owned(),
+            collapse: true,
+            ..FileState::default()
+        });
+        s.set_file(FileState {
+            path: "loki://live?apps=worker".to_owned(),
+            bookmarks: vec![7],
+            ..FileState::default()
+        });
+        assert_eq!(
+            s.files.len(),
+            3,
+            "two applications that differ only in case are two windows: {:?}",
+            s.files
+        );
+        assert_eq!(
+            s.file("loki://live?apps=Worker").map(|f| f.collapse),
+            Some(true),
+            "and neither has taken the other's state"
+        );
+    }
+
+    /// **A spill is never recorded, and the ones already written are forgotten on load.** Every
+    /// remote open before 2026-10-08 left one entry keyed on a `%TEMP%` part file that nothing
+    /// could ever match, and nothing pruned them.
+    #[test]
+    fn state_keyed_on_a_spill_is_neither_kept_nor_written() {
+        let mut s = Settings::default();
+        s.set_file(FileState {
+            path: r"C:\Users\x\AppData\Local\Temp\tailhawk-spill-45456-00\part-000001.log"
+                .to_owned(),
+            collapse: true,
+            ..FileState::default()
+        });
+        assert!(
+            s.files.is_empty(),
+            "a key that cannot occur twice is not a key: {:?}",
+            s.files
+        );
+
+        assert!(is_spill_path(
+            r"C:\Temp\tailhawk-spill-45456-00\part-000001.log"
+        ));
+        assert!(is_spill_path(r"C:\Temp\tailhawk-spill-45456.log"));
+        assert!(!is_spill_path(r"C:\Users\nigel\.claude\logs\git-22.log"));
     }
 
     fn sample() -> Settings {

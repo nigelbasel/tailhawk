@@ -1287,8 +1287,30 @@ impl Document {
 
     /// How this file is being looked at, for §12.4's per-file state — `None` for a pipe, which has
     /// no path to key by. Chips carry their polarity as a leading `+` or `-`.
+    /// What this document's remembered state is filed under: a **file's path**, or, for a remote
+    /// source, the `loki://source?apps=a,b` string its recent entry uses.
+    ///
+    /// **One function, read by both the save and the lookup**, which is the part that was wrong
+    /// rather than missing. The state was always written and always keyed on `path`; for a remote
+    /// tail that is a spill part in a `%TEMP%` directory named after the process, so the write
+    /// succeeded and the read could not possibly match. Whatever this returns has to be the same
+    /// string on both sides of a restart, and a source's name is the only thing about a remote
+    /// window that is.
+    fn state_key(&self) -> Option<String> {
+        match self.remote_source.as_ref() {
+            Some(asked) => Some(
+                settings::Recent::Remote {
+                    source: asked.source.clone(),
+                    apps: tailhawk_core::apps::apps_in(&asked.query),
+                }
+                .encode(),
+            ),
+            None => Some(self.path.as_ref()?.to_string_lossy().into_owned()),
+        }
+    }
+
     fn file_state(&self) -> Option<settings::FileState> {
-        let path = self.path.as_ref()?.to_string_lossy().into_owned();
+        let path = self.state_key()?;
         let chips = self
             .filtering
             .chips
@@ -4985,11 +5007,12 @@ impl Shell {
                             filters_hidden: false,
                         });
                     }
-                    let key = document
-                        .path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned());
-                    let remembered = key.and_then(|k| self.settings.file(&k).cloned());
+                    // **`state_key`, not the path** — for a remote source those differ, and that
+                    // is why its remembered columns never came back. `Document::remote` has
+                    // already run on the worker, so a remote document knows its source here.
+                    let remembered = document
+                        .state_key()
+                        .and_then(|key| self.settings.file(&key).cloned());
                     if let Some(state) = remembered {
                         document.apply_state(&state);
                     }
@@ -18248,6 +18271,89 @@ mod tests {
         assert!(
             again.highlighter.set().rules[0].name == "Label 4",
             "the rule came back too"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A Loki tail's chosen columns come back on the next run**, which they did not until
+    /// 2026-10-08. The owner: *"on the loki tail I selected the app and the severity, and then on
+    /// restart, they are no longer showing … we should really persist these with the mru data"*.
+    ///
+    /// The state was saved faithfully every time. It was keyed on `Document::path`, which for a
+    /// remote tail is a part of a spill in a `%TEMP%` directory named after the process — so the
+    /// key written on Monday could not occur on Tuesday. This asserts the two things that make it
+    /// work: the key is the **recent entry's**, so the thing the welcome list reopens and the thing
+    /// whose layout is kept are named identically; and a round trip through the settings file
+    /// gives the columns back.
+    #[test]
+    fn a_remote_tails_columns_survive_a_restart() {
+        let path = serilog_file("tailhawk_remote_state.log");
+        let spill = path.parent().expect("a directory").to_path_buf();
+        let mut doc = Document::open(&path).expect("open");
+        doc.remote(
+            "nurtur-loki-live \u{b7} job-dispatcher",
+            "nurtur-loki-live",
+            &spill,
+            r#"{app=~"job-dispatcher"}"#,
+            60,
+            false,
+        );
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        let key = doc.state_key().expect("a remote document has a key");
+        assert_eq!(
+            key, "loki://nurtur-loki-live?apps=job-dispatcher",
+            "the key is the recent entry's, not the spill part's"
+        );
+        assert!(
+            !key.contains("tailhawk-spill"),
+            "a key naming %TEMP% is a key that cannot survive the run"
+        );
+
+        // The chooser hides a column by writing a width of zero, which is what the owner did.
+        let hidden: Vec<u64> = doc
+            .layout
+            .as_ref()
+            .map(|l| l.widths.iter().map(|&w| w as u64).collect())
+            .map(|mut widths: Vec<u64>| {
+                if let Some(first) = widths.first_mut() {
+                    *first = 0;
+                }
+                widths
+            })
+            .expect("a laid-out document has widths");
+        let mut settings = settings::Settings::default();
+        settings.set_file(settings::FileState {
+            path: key.clone(),
+            columns: hidden.clone(),
+            ..settings::FileState::default()
+        });
+
+        // A different run: a different spill directory, and nothing in common but the source.
+        let text = settings.to_toml();
+        let reloaded = settings::Settings::from_toml(&text);
+        let remembered = reloaded
+            .file(&key)
+            .cloned()
+            .expect("the next run must find it");
+        let mut again = Document::open(&path).expect("open again");
+        again.remote(
+            "nurtur-loki-live \u{b7} job-dispatcher",
+            "nurtur-loki-live",
+            &spill,
+            r#"{app=~"job-dispatcher"}"#,
+            60,
+            false,
+        );
+        again.lay_out((8.0, 10.0), (800, 200));
+        again.apply_state(&remembered);
+        assert_eq!(
+            again
+                .layout
+                .as_ref()
+                .map(|l| l.widths.iter().map(|&w| w as u64).collect::<Vec<_>>()),
+            Some(hidden),
+            "the hidden column is still hidden"
         );
         let _ = std::fs::remove_file(&path);
     }
