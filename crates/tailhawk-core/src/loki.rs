@@ -1389,6 +1389,99 @@ impl Follow {
     }
 }
 
+/// What one remote window is a view of, and therefore what makes two of them the same window.
+///
+/// **Three things, not one.** The source alone is not the question: two tails of one Loki source
+/// narrowed to different applications are two different questions and each deserves a window. Nor
+/// are the source and its query enough, because `File ▸ Open remote ▸ Fetch window` changes how far
+/// back an open asks and nothing else — so re-opening a source after widening the window is a new
+/// question about the same logs, and the one the status bar tells a reader to ask when it warns
+/// that an answer was cut at the limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// The configured source's name, which is its settings key.
+    pub source: String,
+    /// The selector the window is a view of, applications and all.
+    pub query: String,
+    /// How far back it asked, in minutes.
+    pub minutes: u32,
+}
+
+impl Question {
+    /// For the call sites that have the three parts loose.
+    pub fn new(source: &str, query: &str, minutes: u32) -> Question {
+        Question {
+            source: source.to_owned(),
+            query: query.to_owned(),
+            minutes,
+        }
+    }
+}
+
+/// Whether a remote source has already been asked the question a new open is about to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// Nothing is open or on its way for this question: go and fetch it.
+    No,
+    /// A request for exactly this is already in flight. A second one would land a second tab.
+    Fetching,
+    /// A tab is already showing exactly this. Its index, so the window can bring it forward.
+    Open(usize),
+}
+
+/// Has this exact question already been asked?
+///
+/// `open` pairs a tab index with each question that tab is showing — several for a tiled tab, and
+/// nothing at all for a tab holding a local file. `fetching` is every question still on its way,
+/// which includes the one belonging to an answer that has landed but whose tab has not appeared
+/// yet: between those two moments neither list would otherwise hold it, and the window would
+/// cheerfully start the whole fetch again.
+///
+/// **A request in flight answers before an open tab does.** A fetch takes seconds against a live
+/// server, and during those seconds the only thing the window can say is that it is fetching — so
+/// a user who concludes nothing happened and asks again is asking about the request, not about
+/// some tab. Telling them it is already open would answer a question they have not asked yet. This
+/// is the owner's report of 2026-10-08: a remote open that took long enough to look hung, a second
+/// click, and then two job-dispatcher tabs.
+pub fn already_asked(open: &[(usize, Question)], fetching: &[Question], want: &Question) -> Asked {
+    if fetching.iter().any(|asked| asked == want) {
+        return Asked::Fetching;
+    }
+    match open.iter().find(|(_, asked)| asked == want) {
+        Some((tab, _)) => Asked::Open(*tab),
+        None => Asked::No,
+    }
+}
+
+/// What the status bar says while requests are still in flight, or `None` when none are.
+///
+/// `flight` is one entry per request: the sentence it set out with, and how many whole seconds ago
+/// it set out.
+///
+/// **The seconds are the whole point of this function.** A fetch against a live Loki takes long
+/// enough that a sentence which never changes reads as a hung window, and the owner's report of
+/// 2026-10-08 was exactly that: a wait pointer and a line of text that had said the same thing for
+/// so long he concluded the open had failed, clicked again, and got a second tab. A number that
+/// visibly counts is the difference between "this is slow" and "this is broken" — and it is the
+/// only honest signal available, because Loki answers a range query all at once and there is no
+/// progress to report until it does.
+///
+/// **The longest wait is the one shown, and the rest are counted rather than listed.** The bar's
+/// message pane is shared with everything else that has something to say; what a reader wants from
+/// it is the worst wait in play, not a list. On a tie the earliest request wins, so the sentence
+/// does not swap about between two requests that have both been going the same whole number of
+/// seconds — which is every request's first second.
+pub fn waiting_said(flight: &[(&str, u64)]) -> Option<String> {
+    let (said, seconds) = flight
+        .iter()
+        .reduce(|longest, next| if next.1 > longest.1 { next } else { longest })?;
+    let mut text = format!("{said} {seconds}s");
+    if flight.len() > 1 {
+        text.push_str(&format!(" (+{} more)", flight.len() - 1));
+    }
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2577,5 +2670,141 @@ mod tests {
         assert_eq!(label_values_from_json(r#"{"data":["gateway]}"#), None);
         assert_eq!(label_values_from_json(r#"{"data":["a","#), None);
         assert_eq!(label_values_from_json(r#"{"data":["a\"#), None);
+    }
+
+    fn asking(source: &str, apps: &str) -> Question {
+        Question::new(source, &format!("{{app=\"{apps}\"}}"), 60)
+    }
+
+    #[test]
+    fn a_question_nothing_has_asked_is_fetched() {
+        assert_eq!(
+            already_asked(&[], &[], &asking("live", "job-dispatcher")),
+            Asked::No
+        );
+    }
+
+    #[test]
+    fn the_same_question_already_in_flight_is_not_asked_twice() {
+        let flight = [asking("live", "job-dispatcher")];
+        assert_eq!(
+            already_asked(&[], &flight, &asking("live", "job-dispatcher")),
+            Asked::Fetching
+        );
+    }
+
+    #[test]
+    fn the_same_question_already_open_names_its_tab() {
+        let open = [
+            (0, asking("other", "gateway")),
+            (2, asking("live", "job-dispatcher")),
+        ];
+        assert_eq!(
+            already_asked(&open, &[], &asking("live", "job-dispatcher")),
+            Asked::Open(2),
+            "the tab index is the answer, not the position in the list"
+        );
+    }
+
+    /// **A tiled tab holds two questions, and both of them count.** One entry per tab could only
+    /// ever answer for the first, so re-asking for the source in the second pane opened a third
+    /// tab for something already on screen.
+    #[test]
+    fn both_panes_of_a_tiled_tab_answer_for_themselves() {
+        let open = [
+            (0, asking("live", "job-dispatcher")),
+            (0, asking("live", "gateway")),
+        ];
+        assert_eq!(
+            already_asked(&open, &[], &asking("live", "gateway")),
+            Asked::Open(0)
+        );
+    }
+
+    #[test]
+    fn a_different_set_of_applications_is_a_different_question() {
+        let open = [(0, asking("live", "job-dispatcher"))];
+        let flight = [asking("live", "job-dispatcher")];
+        assert_eq!(
+            already_asked(&open, &flight, &asking("live", "gateway")),
+            Asked::No
+        );
+    }
+
+    /// **A widened fetch window is a new question**, and this is the test that keeps the status
+    /// bar's own advice reachable. When an answer comes back cut at the limit the bar says to try
+    /// `File ▸ Open remote ▸ Fetch window` — which takes effect on the *next* fetch. If the window
+    /// were not part of the question, that next fetch would be refused as a duplicate of the
+    /// narrow one already open, and the remedy the bar names could never be carried out.
+    #[test]
+    fn a_different_fetch_window_is_a_different_question() {
+        let open = [(0, Question::new("live", "{app=\"a\"}", 60))];
+        assert_eq!(
+            already_asked(&open, &[], &Question::new("live", "{app=\"a\"}", 1_440)),
+            Asked::No
+        );
+    }
+
+    #[test]
+    fn a_local_file_in_a_tab_is_no_answer_to_a_remote_question() {
+        assert_eq!(
+            already_asked(&[], &[], &asking("live", "a")),
+            Asked::No,
+            "a tab with no question in it contributes no entry at all"
+        );
+    }
+
+    #[test]
+    fn a_question_in_flight_beats_one_already_open() {
+        let open = [(0, asking("live", "a"))];
+        let flight = [asking("live", "a")];
+        assert_eq!(
+            already_asked(&open, &flight, &asking("live", "a")),
+            Asked::Fetching
+        );
+    }
+
+    #[test]
+    fn nothing_in_flight_says_nothing() {
+        assert_eq!(waiting_said(&[]), None);
+    }
+
+    #[test]
+    fn one_request_is_named_with_the_seconds_it_has_taken() {
+        assert_eq!(
+            waiting_said(&[("live: fetching the last hour…", 23)]),
+            Some("live: fetching the last hour… 23s".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_request_that_has_only_just_gone_out_still_shows_a_clock() {
+        assert_eq!(
+            waiting_said(&[("live: fetching the last hour…", 0)]),
+            Some("live: fetching the last hour… 0s".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_longest_wait_is_the_one_shown() {
+        let said = waiting_said(&[("quick: asking…", 1), ("slow: fetching…", 47)]);
+        assert_eq!(said, Some("slow: fetching… 47s (+1 more)".to_owned()));
+    }
+
+    #[test]
+    fn the_others_are_counted_rather_than_listed() {
+        let said = waiting_said(&[("a", 9), ("b", 2), ("c", 3)]);
+        assert_eq!(said, Some("a 9s (+2 more)".to_owned()));
+    }
+
+    /// **A tie goes to the earlier request**, so the sentence does not swap between two requests
+    /// that have both been going the same whole number of seconds — which is every request's first
+    /// second, and the one a reader is most likely to be watching.
+    #[test]
+    fn two_requests_of_the_same_age_do_not_swap_places() {
+        assert_eq!(
+            waiting_said(&[("first", 0), ("second", 0)]),
+            Some("first 0s (+1 more)".to_owned())
+        );
     }
 }
