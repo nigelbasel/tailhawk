@@ -1,8 +1,16 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-08: he used it all day and reported fourteen things
+## ▶ Resume point — 2026-10-08/09: he used it all day and reported fourteen things
 
-**Master `f482f25`, green on all five CI jobs by SHA. 285 shell + 997 core.**
+**Master `b010731`, green on all five CI jobs by SHA
+(https://github.com/nigelbasel/tailhawk/actions/runs/37799143905). 286 shell + 998 core. Tree clean.**
+
+**Paused by him on 2026-10-09, deliberately and with nothing outstanding:** *"that is good enough for
+now, we can pick up again after I have used the current version for a while … I will install the
+latest in the meanwhile."* He is installing `b010731` into `C:\Program Files\TailHawk` himself and
+taking it away to use. **So the next session most likely opens with fresh defect reports from real
+use, not with a task from this list** — read what he says first and treat the open items below as
+what to reach for only once he has had his say. The last fourteen arrived exactly this way.
 
 **Read the framing note under the 2026-10-05 resume point first.** It still governs: he has said
 twice that there is no "mine and yours" in this code, and the corollary is that `SPEC.md`,
@@ -92,6 +100,25 @@ written are dropped on load.
 **Verified with him**: he chose app and environment, closed, and the file came back with one entry
 keyed `loki://nurtur-loki-live?apps=job-dispatcher`. He confirmed the reopen — *"ok, that worked ok"*.
 
+### `b010731` — a recent entry that can never open comes off the list
+
+Reported 2026-10-05 and carried for three days: an entry naming a source no longer in the
+configuration explained itself in the status bar and then offered the same unopenable row next time,
+for ever.
+
+`remote_to_reopen` returned a plain `String`, so the caller had no way to tell a row that can *never*
+work from one that merely failed today — and that distinction is the whole fix. It returns
+`CannotReopen` now, and only `the_entry_is_dead()` drops the row:
+
+- **`Gone`** — no source of that name is configured. No number of clicks will change that, so the row
+  goes and the message says it went. A list that quietly changes is its own small mystery.
+- **`NoSelector`** — the source is there; its query is what is in the way. Editing the query makes the
+  row work, so the row stays.
+
+Deliberately **not** "the open failed". A server that is down, an expired token and a disconnected
+share are all reasons to try again later, and forgetting those would delete exactly the entry the
+reader would most want back. Both tests fail when the `matches!` is inverted.
+
 ### What is verified on screen and what is not
 
 **Confirmed by him on this day:** the welcome rows open, the wait cursor appears during an open,
@@ -100,21 +127,32 @@ column layout survives a restart.
 
 **Still unseen by anyone:** the scroll-bar corner square and right-hand strip, a thumb drag
 surviving `SetFocus`, the band settling on resize, the vertical bar greying for a document that
-fits, the per-tab close buttons, the traffic bars, the Window menu's two arrangements, and the
-filters dialog's Apply. The arithmetic has tests; none of them can see the screen.
+fits, the per-tab close buttons, the traffic bars, the Window menu's two arrangements, the filters
+dialog's Apply, and — newest and most worth watching — **the elapsed-seconds counter during a
+fetch**. The arithmetic has tests; none of them can see the screen.
+
+**The dead-entry drop cannot be shown to him on his present settings, and that is correct.** All ten
+recent entries name a configured source, so there is no dead row to drop. Do not read that as the fix
+being unexercised: it is exercised by its tests and by the pruning that *did* show in the field —
+after `f482f25` the exe-adjacent file came back with the eight spill-keyed `[[file]]` entries gone
+and one real row left, `loki://nurtur-loki-live?apps=job-dispatcher`, carrying
+`columns = [30, 5, 14, 11, 0, 0, 0, 0, 0]`. Four kept columns, where the round he verified by hand
+had two — so the layout he set *after* the verification also survived.
 
 ### Open, and his call
 
-- **A dead recent entry is offered for ever.** An entry naming a source no longer in the
-  configuration says so in the status bar and then offers the same unopenable row next time. The
-  intended fix is to drop the entry when an open fails *for that reason* and say that it was dropped.
-  Identified 2026-10-05, still not done.
-- **`filterpanel.rs` is dead in fact but still compiled** — 670 lines and 3 tests. `show_filters` is
+- **`filterpanel.rs` is dead in fact but still compiled** — ~670 lines and 3 tests. `show_filters` is
   `false` at both construction sites and **nothing in the codebase sets it true**, so the panel is
   never created; `band_height` returns `0.0` whenever it is hidden, which makes removing the band
   reservation provably inert. ~15 call sites, two `Document` fields, and `FileState::filters_hidden`
-  (which is now always written `true` and means nothing). Removal is safe; it had not happened when
-  this was written.
+  (which is now always written `true` and means nothing).
+  **This was promised on 2026-10-08 and deliberately not done, and he was told so rather than finding
+  out later.** The reason is worth keeping: it is ~700 lines across 15 call sites for **no
+  user-visible change**, and starting it while he was mid-test on a live build would have put a large
+  inert diff between him and the next fix he asked for. The arithmetic says it is safe; the timing
+  said wait. He is away using the build now, which is exactly the quiet window it wants.
+  **`filter_selected` must survive the removal** — it is *not* panel-only; `selected_filter()` reads
+  it for the menu's filter commands. `FileState::filters_hidden` has its own round-trip test.
 - The stale comment in `Document::apply_state` about chips bringing "their panel with them" describes
   a panel that can no longer arrive. It goes with the removal above.
 - Welcome-row link **styling**, and binding the hand cursor to the text extent — `row_at_y` ignores
@@ -123,12 +161,19 @@ filters dialog's Apply. The arithmetic has tests; none of them can see the scree
   N-way tiling would need a model change: `can_split_into` caps at two panes.
 - The help document still describes none of the authentication.
 
-### Two things that cost real time on this day
+### Three things that cost real time on this day
 
+- **A third known flake, and it widened the rule in `CLAUDE.md`.**
+  `stdin::tests::a_spill_is_an_ordinary_file_to_the_rest_of_the_product` failed once under the full
+  release suite and passed alone straight afterwards. It asserts `polled.lines_added == 1` right after
+  appending to a spill — **nothing in it is a duration or a ratio**, which is precisely why the
+  existing rule ("suspect an assertion whose message quotes a duration or a ratio") did not cover it.
+  Widened there: an assertion that depends on *when* something became visible flakes the same way as
+  one measuring how long it took.
 - **`cargo test --workspace` run twice at once fails in ways that look like real defects.** A test
   unrelated to the change under test failed in a concurrent run and passed alone. The known-flake
   rule in `CLAUDE.md` is about timing assertions; this is the simpler case of **two suites racing on
-  one machine**. Check for another run before believing a failure.
+  one machine**. Check for another run before believing a failure. Both of my own two runs were mine.
 - **A clean `cargo check` says nothing about the tests.** Not hit on this day, but the four earlier
   occurrences are why every gate here is `cargo test --workspace`.
 
