@@ -1,6 +1,31 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-13 (later): the dialog kept nothing you typed into it
+## ▶ Resume point — 2026-10-13: stopped for the day, with the dialog fixed and unseen
+
+**Master `059d0af`, green on all five CI jobs by SHA
+(https://github.com/nigelbasel/tailhawk/actions/runs/38414004442). 286 shell + 1006 core. Tree clean.**
+
+**He stopped for the day on 2026-10-13 with the three dialog defects fixed and pushed, and with the
+fix unseen on screen.** *"stopping for the day"* — no task was left half done and nothing is waiting
+on Claude. **So the next session most likely opens with what he found when he next ran it, not with a
+task from this file**: read what he says first, and treat everything below as what to reach for only
+once he has had his say. Every one of the last sixteen reports arrived exactly that way.
+
+**Two things about the state of his machine, because this day moved it and both are on the handoff
+rather than in anyone's head.** His roaming settings file —
+`C:\Users\nigel\AppData\Roaming\Tailhawk\tailhawk.settings.toml` — was renamed aside at his
+instruction to simulate a fresh install and **has been put back**, with both his Loki sources in it.
+But the **Credential Manager secrets are gone and cannot come back**: all three `Tailhawk/`
+credentials were deleted at his instruction, the two client secrets under `Tailhawk/<name>` and the
+refresh tokens under `Tailhawk/loki-tokens/<name>`. So his own sources are configured but **not
+signed in** — the first Loki open after this will send him through the browser again. That is the
+intended behaviour and not a defect to go hunting.
+
+To put the fresh-install state back for another run at it, rename that one file aside again; the
+exe-adjacent `target\release\tailhawk.settings.toml` holds only a font size and a window geometry,
+so the sources come from roaming and the rename alone is enough.
+
+### What the day was spent on — the dialog kept nothing you typed into it
 
 **286 shell + 1006 core, fmt and clippy clean, `portable-core` checked on the Linux target.**
 
