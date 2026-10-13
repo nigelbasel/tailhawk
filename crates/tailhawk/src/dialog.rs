@@ -17,7 +17,7 @@
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::COLORREF;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
 };
@@ -27,11 +27,11 @@ use windows::Win32::UI::Controls::{
     NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetDlgItem,
-    GetDlgItemInt, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SendMessageW,
-    SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, DLGTEMPLATE, SW_SHOW,
-    WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY,
-    WM_NOTIFY,
+    CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetClientRect,
+    GetDlgItem, GetDlgItemInt, GetDlgItemTextW, GetSystemMetrics, GetWindowLongPtrW,
+    SendDlgItemMessageW, SendMessageW, SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW,
+    ShowWindow, DLGTEMPLATE, SM_CXVSCROLL, SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY,
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
@@ -738,20 +738,65 @@ fn set_dlg_text(hdlg: HWND, id: u16, text: &str) {
     }
 }
 
+thread_local! {
+    /// Suppresses the `EN_CHANGE` that [`sources_show`]'s own writes fire, for the reason
+    /// `RULES_QUIET`, `FORMAT_QUIET` and `APPS_QUIET` exist — and this dialog was the one that
+    /// never got one.
+    ///
+    /// **What it cost was a client secret.** `sources_show` clears the secret box, the only handler
+    /// for that box is unconditional, and `set_secret("")` is the editor's deliberate encoding of
+    /// *this source has no secret* — so OK reached `secrets::forget` and `CredDeleteW` for a
+    /// credential nobody had touched. Select `dev`, type its secret, click `live`, press OK, and
+    /// `live`'s stored secret was deleted; the Secret column still read "stored" throughout,
+    /// because that flag is read from the store once when the dialog opens. It contradicted
+    /// `sourceset`'s own promise that editing a source must not silently wipe a credential.
+    ///
+    /// A `thread_local` rather than a field of [`SourcesEdit`] for the reason `RULES_QUIET` gives:
+    /// a `&mut SourcesEdit` and the pointer the re-entry reads out of `DWLP_USER` alias, and the
+    /// optimiser may drop a store it can prove nobody reads through that reference. Checking the
+    /// flag *before* `sources_state` is what keeps the re-entry from taking that second `&mut`.
+    static SOURCES_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `write`, with every `EN_CHANGE` it provokes marked as the dialog's own.
+fn sources_quietly<R>(write: impl FnOnce() -> R) -> R {
+    SOURCES_QUIET.with(|q| q.set(true));
+    let out = write();
+    SOURCES_QUIET.with(|q| q.set(false));
+    out
+}
+
 /// Fills the list from the editor's rows, keeping the selection.
 fn sources_fill(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
     let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) }) else {
         return;
     };
     lv_reset(list);
-    lv_column(list, 0, "Name", 90);
-    lv_column(list, 1, "URL", 250);
-    lv_column(list, 2, "Query", 140);
+    // The widths come from the width the list has rather than from five constants that did not
+    // fit in it — `sourceset::column_widths` says what went wrong and why `Problem` matters.
+    //
+    // **A vertical scrollbar's width comes off whether or not one is showing yet.** This runs on
+    // every keystroke, and the bar appears once the list outgrows its seven visible rows — so
+    // measuring the client area as it is would make the columns jump and a horizontal scrollbar
+    // flicker in and out while the reader types. Costing the bar always is steadier than being
+    // right about it sometimes.
+    let mut client = RECT::default();
+    let measured = if unsafe { GetClientRect(list, &mut client) }.is_ok() {
+        client.right - client.left
+    } else {
+        0
+    };
+    let bar = unsafe { GetSystemMetrics(SM_CXVSCROLL) };
+    let widths = tailhawk_core::sourceset::column_widths(measured - bar);
     // **Whether a secret is stored is a column, not a guess.** A source that is configured but has
     // never been given its secret is the commonest half-finished state there is, and without this
     // it looks identical to one that is ready.
-    lv_column(list, 3, "Secret", 60);
-    lv_column(list, 4, "Problem", 180);
+    for (at, title) in ["Name", "URL", "Query", "Secret", "Problem"]
+        .iter()
+        .enumerate()
+    {
+        lv_column(list, at as i32, title, widths[at]);
+    }
     for (i, row) in edit.rows().iter().enumerate() {
         lv_row(
             list,
@@ -845,12 +890,19 @@ unsafe extern "system" fn sources_proc(
                     );
                 }
             }
-            sources_fill(hdlg, &data.editor);
-            sources_show(hdlg, &data.editor);
+            sources_quietly(|| {
+                sources_fill(hdlg, &data.editor);
+                sources_show(hdlg, &data.editor);
+            });
             1
         }
         WM_NOTIFY => {
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            // `sources_fill` reselects the editor's own row, and `LVM_SETITEMSTATE` raises
+            // `LVN_ITEMCHANGED` synchronously — the re-entry `APPS_QUIET` documents.
+            if SOURCES_QUIET.with(|q| q.get()) {
+                return 0;
+            }
             if header.idFrom == usize::from(ID_S_LIST) && header.code == LVN_ITEMCHANGED {
                 let Some(data) = sources_state(hdlg) else {
                     return 0;
@@ -863,7 +915,7 @@ unsafe extern "system" fn sources_proc(
                             // being left are lost the moment the selection changes.
                             sources_read(hdlg, &mut data.editor);
                             data.editor.select(at);
-                            sources_show(hdlg, &data.editor);
+                            sources_quietly(|| sources_show(hdlg, &data.editor));
                         }
                     }
                 }
@@ -873,6 +925,12 @@ unsafe extern "system" fn sources_proc(
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u16;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            // **Before `sources_state`, not after.** This is the notification the dialog's own
+            // writes provoke, and taking the editor out of `DWLP_USER` here would be the second
+            // `&mut` to it while the write that caused this is still holding the first.
+            if code == EN_CHANGE && SOURCES_QUIET.with(|q| q.get()) {
+                return 1;
+            }
             let Some(data) = sources_state(hdlg) else {
                 return 0;
             };
@@ -888,8 +946,10 @@ unsafe extern "system" fn sources_proc(
                     EN_CHANGE,
                 ) => {
                     sources_read(hdlg, &mut data.editor);
-                    sources_fill(hdlg, &data.editor);
-                    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    sources_quietly(|| {
+                        sources_fill(hdlg, &data.editor);
+                        set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    });
                     return 1;
                 }
                 // **Offers the sign-in URL once the token URL is finished with**, and only into an
@@ -901,10 +961,16 @@ unsafe extern "system" fn sources_proc(
                         if let Some(beside) =
                             tailhawk_core::settings::authorize_beside(&dlg_text(hdlg, ID_S_TOKEN))
                         {
-                            set_dlg_text(hdlg, ID_S_AUTH, &beside);
+                            sources_quietly(|| set_dlg_text(hdlg, ID_S_AUTH, &beside));
                             sources_read(hdlg, &mut data.editor);
-                            sources_fill(hdlg, &data.editor);
-                            set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                            sources_quietly(|| {
+                                sources_fill(hdlg, &data.editor);
+                                set_dlg_text(
+                                    hdlg,
+                                    ID_S_FAULT,
+                                    data.editor.fault().unwrap_or_default(),
+                                );
+                            });
                         }
                     }
                     return 1;
@@ -912,8 +978,10 @@ unsafe extern "system" fn sources_proc(
                 (ID_S_ADD, BN_CLICKED) => {
                     sources_read(hdlg, &mut data.editor);
                     data.editor.add();
-                    sources_fill(hdlg, &data.editor);
-                    sources_show(hdlg, &data.editor);
+                    sources_quietly(|| {
+                        sources_fill(hdlg, &data.editor);
+                        sources_show(hdlg, &data.editor);
+                    });
                     unsafe {
                         if let Ok(field) = GetDlgItem(hdlg, i32::from(ID_S_NAME)) {
                             let _ = SetFocus(field);
@@ -930,8 +998,10 @@ unsafe extern "system" fn sources_proc(
                             data.forget.push(gone);
                         }
                     }
-                    sources_fill(hdlg, &data.editor);
-                    sources_show(hdlg, &data.editor);
+                    sources_quietly(|| {
+                        sources_fill(hdlg, &data.editor);
+                        sources_show(hdlg, &data.editor);
+                    });
                     return 1;
                 }
                 (1, BN_CLICKED) => {
@@ -943,6 +1013,10 @@ unsafe extern "system" fn sources_proc(
                         return 1;
                     }
                     data.store = data.editor.take_secret();
+                    // The row the dialog offers to type into is not a source until something is
+                    // typed into it. The secret is taken first, because that is the one thing a
+                    // row with no name can still be carrying.
+                    data.editor.discard_blank();
                     data.editor.saved();
                     data.accepted = true;
                     unsafe {

@@ -1,6 +1,53 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-13: the app left this machine, and the first thing it met was broken
+## ▶ Resume point — 2026-10-13 (later): the dialog kept nothing you typed into it
+
+**286 shell + 1006 core, fmt and clippy clean, `portable-core` checked on the Linux target.**
+
+**He deleted his settings file to test the fix above as a new reader would meet it, and the dialog
+threw away everything he typed — twice.** *"I have twice filled in the values and hit ok, and the
+dialg has dismissed without adding"*, then *"I just tried hitting add, and all it did was to clear
+the edit fields and added nothing at all"*.
+
+**One missing row, wearing three faces.** `Editor::edit` writes into `sources[selected]`; an empty
+set has no selected row, so every keystroke went nowhere — and `fault()` found nothing wrong with an
+empty set, so OK was a **valid save of nothing**. Add was no escape, because it appends a blank row
+and the shell repaints the fields *from* it, clearing the boxes. And the row it added was invisible:
+every field of a new source is empty, so the only cell with text was `Problem` — and five fixed
+widths summing to 720px inside a list 340 dialog units wide put that column off the right edge.
+
+**`open()` now offers a row, so the boxes have somewhere to write.** `discard_blank()` takes it back
+out on save unless something was typed into it; `fault()` forgives it so a reader who only looked can
+still press OK; `rows()` shows `(unnamed)`; `column_widths(total)` apportions the five widths to the
+width the list actually has.
+
+**He asked to be prompted — "it should at least ask me if I want to add" — and is not being
+prompted.** A dialog showing seven editable boxes should have a row behind them, and then there is
+nothing to ask. That was said to him rather than decided quietly, and it is the one place this
+departs from the report. If the row turns out to confuse rather than help, the prompt is still there
+to build.
+
+### The thing to tell him about, if he has not read it yet
+
+**The dialog has been deleting stored client secrets since it was written**, and the review found it
+three lines from the code being changed. `sources_show` clears the secret box, the only handler for
+that box is unconditional, and `set_secret("")` is the editor's encoding of *this source has no
+secret* — so select `dev`, type its secret, click `live`, press OK, and `live`'s credential was
+handed to `CredDeleteW`. The Secret column read "stored" throughout, because that flag is read from
+the store once when the dialog opens. Invisible to the owner only because his sources sign in rather
+than carry a secret, so there was never a client secret there to lose. Fixed by `SOURCES_QUIET`, the
+fourth instance of a pattern `dialog.rs` already had three of — and this dialog was the one without
+one. Checking the flag **before** `sources_state` also ends the re-entrant second `&mut` to the same
+`SourcesEdit`.
+
+**Unverified on screen, and it needs him:** the offered row and `(unnamed)` in the list; the Problem
+column now being readable; the columns not jumping as you type with eight or more sources; and that
+a secret typed for one source and then a click onto another no longer costs the second one its
+credential. The pure half is covered — 1006 core, with the drift test failing on the *credential*
+rather than on an index — but the `EN_CHANGE` suppression is shell state with no test, exactly like
+the three precedents.
+
+## ▶ Earlier that day — 2026-10-13: the app left this machine, and the first thing it met was broken
 
 **286 shell + 1001 core, fmt and clippy clean, `portable-core` checked on the Linux target.**
 

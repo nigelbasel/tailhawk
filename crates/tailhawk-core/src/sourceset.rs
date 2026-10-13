@@ -31,6 +31,33 @@ use crate::settings::Source;
 /// than none at all so a hand-edited settings file cannot make the list unusable.
 pub const MAX_SOURCES: usize = 64;
 
+/// Widths for the list's five columns — name, URL, query, secret, problem — apportioned to the
+/// width the list actually has.
+///
+/// **The widths were fixed, and did not fit.** 90 + 250 + 140 + 60 + 180 is 720px inside a list
+/// 340 dialog units wide, which is somewhere around 510 to 595px depending on the shell font — so
+/// `Problem` hung off the right-hand edge. That is the only column with anything in it for a row
+/// that has just been added, which is why adding one looked like adding nothing.
+///
+/// Each column is floored at something a word fits in, and the rest is shared out — so a list
+/// narrower than five such columns overflows and scrolls rather than producing a column too narrow
+/// to read or, as a first draft of this did, one of negative width. Zero is the width the shell
+/// reports when it cannot measure the list at all, so it is the one value that has to be safe.
+pub fn column_widths(total: i32) -> [i32; 5] {
+    const SHARE: [i32; 5] = [16, 30, 22, 10, 22];
+    const FLOOR: i32 = 36;
+    let total = total.max(FLOOR * SHARE.len() as i32);
+    let spare = i64::from(total - FLOOR * SHARE.len() as i32);
+    let mut out = [FLOOR; 5];
+    for (slot, share) in out.iter_mut().zip(SHARE) {
+        *slot += (spare * i64::from(share) / 100) as i32;
+    }
+    // The division's remainder goes on the widest column, so the row fills the list exactly rather
+    // than leaving a few pixels of dead ground beyond the last divider.
+    out[1] += total - out.iter().sum::<i32>();
+    out
+}
+
 /// One row as the list should draw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row<'a> {
@@ -85,11 +112,24 @@ impl Editor {
         self.dirty
     }
 
-    /// Opens on the first row.
+    /// Opens on the first row, making one if the set is empty.
+    ///
+    /// **A dialog that shows editable fields must have a row behind them.** Without the row the
+    /// fields were a form that discarded every keystroke: [`Self::edit`] writes into the selected
+    /// source and an empty set has none, so the owner filled the dialog in twice on a fresh install
+    /// and twice watched OK close it having saved nothing. Pressing **Add** afterwards only cleared
+    /// the boxes, because the shell repaints them from the new blank row.
+    ///
+    /// Offering the row is not a change to the set, so it deliberately leaves the editor clean —
+    /// and [`Self::discard_blank`] takes it back out again if nothing was ever typed into it.
     pub fn open(&mut self) {
         self.open = true;
         self.selected = 0;
         self.pending = None;
+        if self.sources.is_empty() {
+            self.sources.push(Source::default());
+            self.stored.push(false);
+        }
     }
 
     /// Closes, forgetting any secret typed but not saved.
@@ -132,7 +172,14 @@ impl Editor {
             .iter()
             .enumerate()
             .map(|(i, s)| Row {
-                name: &s.name,
+                // **A row with no name yet still has to look like a row.** Every field of a new
+                // source is empty, so drawn as stored it is a blank line — and the owner, having
+                // pressed Add, reported that it "added nothing at all".
+                name: if s.name.is_empty() {
+                    "(unnamed)"
+                } else {
+                    &s.name
+                },
                 url: &s.url,
                 query: if s.query.is_empty() {
                     "(everything)"
@@ -140,6 +187,12 @@ impl Editor {
                     &s.query
                 },
                 has_secret: self.stored.get(i).copied().unwrap_or(false),
+                // **A row's own fault, including a blank row's — and deliberately not the same
+                // question [`Self::fault`] answers.** That one decides whether the set can be
+                // saved and so forgives a row nobody typed into; this one describes the row, and
+                // "Give the source a name." is the most useful thing the list can say about the
+                // blank row it just offered. The two disagreeing about the blank row is the point,
+                // not an oversight to be tidied away.
                 fault: s.fault(),
             })
             .collect()
@@ -156,6 +209,41 @@ impl Editor {
         self.pending = None;
         self.dirty = true;
         true
+    }
+
+    /// Whether row `at` holds nothing at all — no field typed, and no secret typed against it.
+    ///
+    /// A source indistinguishable from a fresh blank one is the row [`Self::open`] offers before
+    /// anybody has used it. The secret is part of the question because a credential typed against
+    /// a nameless row has nowhere to be stored: that row must keep saying so rather than be
+    /// quietly dropped, which would be this whole defect over again in miniature.
+    fn is_blank_row(&self, at: usize) -> bool {
+        self.sources
+            .get(at)
+            .is_some_and(|s| *s == Source::default())
+            && !(at == self.selected && self.pending.as_deref().is_some_and(|s| !s.is_empty()))
+    }
+
+    /// Drops every row nobody typed anything into, so the offered row is not saved as a source.
+    ///
+    /// **The selection follows the row it was on.** A blank row removed from *below* the selection
+    /// shifts every row above it down one, and leaving the index alone would silently move the
+    /// selection to the next source along — which is how [`Self::take_secret`] would come to store
+    /// a credential against the wrong source, the mistake [`Self::select`] exists to prevent.
+    /// `self.selected` itself is left untouched until the end, because [`Self::is_blank_row`] asks
+    /// which row is selected and must get the same answer throughout.
+    pub fn discard_blank(&mut self) {
+        let mut selected = self.selected;
+        for at in (0..self.sources.len()).rev() {
+            if self.is_blank_row(at) {
+                self.sources.remove(at);
+                self.stored.remove(at);
+                if at < selected {
+                    selected -= 1;
+                }
+            }
+        }
+        self.selected = selected.min(self.sources.len().saturating_sub(1));
     }
 
     /// Removes the selected source. Reports the name it had, so the shell can forget its secret.
@@ -220,12 +308,20 @@ impl Editor {
 
     /// Why the set cannot be saved, or `None`. The first fault of any row, and duplicate names —
     /// which the rows themselves cannot see, because a name is only a duplicate next to another.
+    /// A row nobody has typed into is not judged at all — see [`Self::is_blank_row`]. A reader who
+    /// opens the dialog to look, touches nothing and presses OK must not be held there by a
+    /// complaint about the blank row they were offered.
     pub fn fault(&self) -> Option<&'static str> {
-        if let Some(fault) = self.sources.iter().find_map(|s| s.fault()) {
+        let used = || {
+            (0..self.sources.len())
+                .filter(|at| !self.is_blank_row(*at))
+                .map(|at| &self.sources[at])
+        };
+        if let Some(fault) = used().find_map(|s| s.fault()) {
             return Some(fault);
         }
         let mut seen: Vec<&str> = Vec::with_capacity(self.sources.len());
-        for source in &self.sources {
+        for source in used() {
             if seen.contains(&source.name.as_str()) {
                 return Some("Two sources share a name; each needs its own.");
             }
@@ -390,12 +486,20 @@ mod tests {
     }
 
     /// The list is bounded, and adding selects what was added so typing goes to the new row.
+    ///
+    /// Adding to a set that was empty lands on row **1**, not row 0: since 2026-10-13 [`open`]
+    /// offers a row to type into, so Add on a fresh dialog is a *second* row. The extra blank one
+    /// costs nothing — [`discard_blank`] takes every untyped row back out on save.
+    ///
+    /// [`open`]: Editor::open
+    /// [`discard_blank`]: Editor::discard_blank
     #[test]
     fn adding_selects_the_new_row_and_the_list_is_bounded() {
         let mut editor = Editor::new(Vec::new(), Vec::new());
         editor.open();
         assert!(editor.add());
-        assert_eq!(editor.selected(), 0);
+        assert_eq!(editor.selected(), 1);
+        assert_eq!(editor.sources().len(), 2);
         editor.edit(Field::Name, "dev");
         assert_eq!(editor.current().map(|s| s.name.as_str()), Some("dev"));
         assert!(editor.is_dirty());
@@ -405,6 +509,209 @@ mod tests {
         }
         assert!(!editor.add(), "the list is bounded");
         assert_eq!(editor.sources().len(), MAX_SOURCES);
+    }
+
+    /// **An editor opened with no sources had nowhere to put what you typed.** The owner filled the
+    /// fields in twice on a fresh install and hit OK, and both times the dialog shut having added
+    /// nothing: [`Editor::edit`] writes into the *selected* source, an empty set has none, so every
+    /// keystroke was discarded — and [`Editor::fault`] then found nothing wrong with an empty set,
+    /// so OK was a perfectly valid save of it. Pressing **Add** was no escape, because the shell
+    /// repaints the fields from the new blank row and so clears what had been typed.
+    ///
+    /// A dialog that shows seven editable boxes must have a row behind them. Offering the row is
+    /// not a change to the set, though, so it does not make the editor dirty.
+    #[test]
+    fn an_editor_opened_with_no_sources_has_a_row_to_type_into() {
+        let mut editor = Editor::new(Vec::new(), Vec::new());
+        editor.open();
+        assert_eq!(
+            editor.sources().len(),
+            1,
+            "an empty set opens on a row, or there is nowhere for a keystroke to land"
+        );
+        assert!(
+            editor.current().is_some(),
+            "and that row is the selected one"
+        );
+        assert!(
+            !editor.is_dirty(),
+            "a row offered is not a change made; Cancel must still discard cleanly"
+        );
+
+        editor.edit(Field::Name, "live");
+        assert_eq!(
+            editor.current().map(|s| s.name.as_str()),
+            Some("live"),
+            "this is the keystroke that used to go nowhere"
+        );
+        assert!(editor.is_dirty());
+    }
+
+    /// **A row nobody typed into is not a source.** It is the other half of opening on a row: a
+    /// reader who opens the dialog to look, touches nothing and presses OK must not be held there
+    /// by "Give the source a name." for a row they never asked for, and must not have a nameless
+    /// source written to their settings file either.
+    ///
+    /// A secret typed against it is the exception, and it has to be: dropping that row would
+    /// discard a credential silently, which is the very fault this whole change exists to fix. So
+    /// a row with a secret and no name keeps faulting until it has one.
+    #[test]
+    fn a_row_nobody_typed_into_is_not_a_source_and_is_not_saved() {
+        let mut editor = Editor::new(vec![Source::default()], vec![false]);
+        editor.open();
+        assert_eq!(editor.sources().len(), 1, "the row is there to be judged");
+        assert_eq!(
+            editor.fault(),
+            None,
+            "an untouched row is not a half-finished one"
+        );
+        editor.discard_blank();
+        assert!(
+            editor.sources().is_empty(),
+            "and it is not written to the settings file"
+        );
+
+        let mut typed = Editor::new(vec![Source::default()], vec![false]);
+        typed.open();
+        typed.set_secret("hunter2");
+        assert_eq!(
+            typed.fault(),
+            Some("Give the source a name."),
+            "a secret has nowhere to be stored without a name, so say so rather than drop it"
+        );
+        typed.discard_blank();
+        assert_eq!(
+            typed.sources().len(),
+            1,
+            "and the row survives, because discarding it would discard the secret with it"
+        );
+
+        let mut real = Editor::new(vec![source("live"), Source::default()], vec![true, false]);
+        real.open();
+        assert_eq!(
+            real.fault(),
+            None,
+            "a blank row beside a real one faults nobody"
+        );
+        real.discard_blank();
+        assert_eq!(real.sources().len(), 1, "and only the real one is saved");
+        assert_eq!(real.sources()[0].name, "live");
+
+        // End to end from the state the owner was actually in: nothing configured, the dialog
+        // offers a row, he fills it in, and that one source is what gets saved.
+        let mut fresh = Editor::new(Vec::new(), Vec::new());
+        fresh.open();
+        fresh.edit(Field::Name, "live");
+        fresh.edit(Field::Url, "https://telemetry.example/loki");
+        assert_eq!(fresh.fault(), None);
+        fresh.discard_blank();
+        assert_eq!(
+            fresh.sources().len(),
+            1,
+            "the row he typed into is a source"
+        );
+        assert_eq!(fresh.sources()[0].name, "live");
+    }
+
+    /// **The selection follows the row it was on, rather than the index it had.** Dropping a blank
+    /// row from below the selection shifts everything above it down one, so leaving the index alone
+    /// moves the selection silently to the *next* source — and [`Editor::take_secret`] reads the
+    /// selection for the name to store a credential against. That is how a secret typed for one
+    /// source comes to be written against another, which is the mistake [`Editor::select`] was
+    /// given its own doc comment to prevent.
+    #[test]
+    fn discarding_blank_rows_leaves_the_selection_on_the_source_it_was_on() {
+        let mut editor = Editor::new(
+            vec![Source::default(), source("dev"), source("live")],
+            vec![false, true, true],
+        );
+        editor.select(2);
+        assert_eq!(editor.current().map(|s| s.name.as_str()), Some("live"));
+
+        editor.discard_blank();
+        assert_eq!(
+            editor.current().map(|s| s.name.as_str()),
+            Some("live"),
+            "the blank row below it went, so the index has to come down with it"
+        );
+
+        // The shape that costs a credential: the blank row carrying the typed secret is the one
+        // kept, and it must still be the selected one afterwards or `take_secret` names the wrong
+        // source.
+        let mut carrying = Editor::new(
+            vec![Source::default(), Source::default(), source("live")],
+            vec![false, false, true],
+        );
+        carrying.select(1);
+        carrying.set_secret("hunter2");
+        carrying.discard_blank();
+        assert_eq!(
+            carrying.take_secret(),
+            Some((String::new(), "hunter2".to_owned())),
+            "the secret belongs to the nameless row it was typed into, not to live"
+        );
+    }
+
+    /// **A new row has to look like a row.** Every field of one is empty, so with the name shown
+    /// as it is stored the list draws a blank line — and the owner, having pressed Add, reported
+    /// that it "added nothing at all". The query column already substitutes a word for empty for
+    /// exactly this reason; the name is the column that says a row is there.
+    #[test]
+    fn a_row_with_no_name_yet_still_reads_as_a_row() {
+        let mut editor = Editor::new(vec![Source::default()], vec![false]);
+        editor.open();
+        let rows = editor.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].name, "(unnamed)",
+            "a blank line in the list reads as nothing having been added"
+        );
+        assert_eq!(rows[0].query, "(everything)");
+
+        editor.edit(Field::Name, "live");
+        assert_eq!(
+            editor.rows()[0].name,
+            "live",
+            "and a name, once given, is shown instead of standing in for one"
+        );
+    }
+
+    /// **The columns are apportioned to the width there is, not to a width that was hoped for.**
+    /// They were fixed at 90 + 250 + 140 + 60 + 180 = 720px inside a list 340 dialog units wide —
+    /// around 510 to 595px depending on the shell font — so `Problem` fell off the right-hand edge.
+    /// That is the one column with any text in a new row, which is why an added row looked like no
+    /// row at all.
+    #[test]
+    fn the_list_columns_fit_the_width_the_list_actually_has() {
+        for total in [320, 420, 510, 595, 720, 1200] {
+            let widths = column_widths(total);
+            let sum: i32 = widths.iter().sum();
+            assert_eq!(
+                sum, total,
+                "{widths:?} sums to {sum} and so does not fill {total}px exactly"
+            );
+            assert!(
+                widths.iter().all(|w| *w >= 36),
+                "{widths:?} has a column too narrow to read a word in"
+            );
+            assert!(
+                widths[1] > widths[0],
+                "{widths:?}: a URL is longer than a name"
+            );
+        }
+
+        // **Zero is what the shell reports when it cannot measure the list**, and a width shared
+        // out from nothing used to come back negative — the remainder was pushed onto the URL
+        // column after the floor had already overspent the total, so `LVM_INSERTCOLUMNW` was handed
+        // a `cx` of -4. A list too narrow for five readable columns overflows and scrolls instead.
+        for total in [i32::MIN, -20, 0, 1, 4, 5, 179] {
+            let widths = column_widths(total);
+            assert!(
+                widths.iter().all(|w| *w >= 36),
+                "{widths:?} from a total of {total} is not a width a column can have"
+            );
+        }
+        assert_eq!(column_widths(0), [36; 5]);
     }
 
     /// **A source created in the app can sign the reader in**, which it could not do before
