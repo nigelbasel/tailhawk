@@ -1,5 +1,103 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-13: the app left this machine, and the first thing it met was broken
+
+**286 shell + 1001 core, fmt and clippy clean, `portable-core` checked on the Linux target.**
+
+**The report that matters most this day came from someone who is not the owner.** He gave the
+installed app to a colleague, Marco, who *"tried to add the loki tail"* and got **no login screen**.
+
+**The cause was one missing enum variant, and the measure of it is that nothing was broken.**
+`begin_sign_in`, `finish_sign_in`, the PKCE pair, the loopback socket and `sign_in_dialog` were all
+built, tested and working. But `Source::signs_in()` reads `auth_url`, **`sourceset::Field` had no
+`AuthUrl` variant**, so the sources dialog could not set the one value that decides — and every
+source anyone created in the app answered "does not sign in", fell to the client-credentials branch,
+found no client secret in Credential Manager and reported `NoSecret`. The owner's own sources worked
+only because his settings file was **written by hand**.
+
+**So read this next bit as a method, not an anecdote.** A year of his own use could not find this,
+because he was the only person who could reach the path and he reached it without going through the
+dialog. **A feature whose only user is the person who seeded the configuration is untested, however
+much it is used.** The same question is worth asking of anything else here that a settings file can
+turn on.
+
+**And the message was the second half of the defect.** `NoSecret` said *"No secret is stored for this
+source — open Tools ▸ Remote sources and paste it"*, so the program told a new reader to go and
+obtain the one credential a person signing in as themselves should never be handed. It names the
+sign-in URL first now, and the secret second.
+
+### What landed
+
+- **`Field::AuthUrl`**, a Sign-in URL row in the dialog, and the pure `settings::authorize_beside`,
+  which offers the authorize endpoint conventionally beside a token endpoint so the field is
+  answerable by someone who has only ever been given the token URL. It fires on **`EN_KILLFOCUS`,
+  not `EN_CHANGE`**: `…/connect/token` matches part-way through typing `…/connect/tokens`, so a
+  guess written per keystroke leaves a stale URL in a field the reader never touched. It is a
+  suggestion into an empty box and never a correction — the convention is **wrong for Keycloak**
+  (`/protocol/openid-connect/auth`), which its own doc comment says.
+- **The welcome entries are links**, his second ask: *"they should ne underlined when hovered over
+  and be a different colour to the rest of the screen"*. `rows::inked_extent` → `Extent` is the one
+  pure answer read by three things that must agree — the colour span wants **bytes**, the underline
+  wants **cells**, and the hit test wants the same extent again. The ink is
+  `theme().semantic.url`, the colour a URL already gets inside a log line, so the surface gains no
+  new colour and inherits a contrast floor `theme.rs`'s tests already enforce on both grounds.
+- **`link_at` takes a point, not a `y`.** The hand cursor used to span the full row width, so it
+  promised a click anywhere along a line whose indent is spaces. A browser's link is its text.
+
+### Five faults of ours, all caught before the commit, and four were silent
+
+Two found by reading, three by the component review — and the review earned its keep this time, so
+**do not skip it on work that looks finished**.
+
+- **`chars().count()` is not this product's cell, and that made the new feature wrong for a real
+  user.** `CellModel::cell_count` sums cluster *widths* — `cell_count("日本語")` is 6 where
+  `chars().count()` is 3 — so an entry under `C:\logs\東京\` would have been underlined two cells
+  short of its own text, and the hand cursor would have given up before the link visibly ended.
+  That is the precise promise-the-screen-does-not-keep this extent exists to prevent, reintroduced
+  by measuring in the wrong unit. `inked_extent` takes the `CellModel` now; the test carries an
+  East Asian case and mutating the unit back fails it with 16 against 18.
+- **`ID_S_AUTH` was given 220, which `ID_S_FAULT` already held** — and this was the dangerous one.
+  `GetDlgItem` answers with whichever control template order puts first, and the new edit box
+  precedes the fault static, so `sources_show` would have written the fault text (usually `""`)
+  into the Sign-in URL box **every time the dialog opened**, and OK would then have persisted
+  `auth_url = ""` — destroying exactly the hand-written configuration that was the only one where
+  signing in worked. **The existing mnemonic test is now also a duplicate-id test**; mutating the id
+  back to 220 fails it by name.
+- **`authorize_beside("https://token")` suggested `https:/authorize`.** `rsplit_once('/')` split
+  the scheme's own second slash. The guard is now that what remains must itself still be an https
+  URL with a host — the same test the whole string already had to pass.
+- **`welcome_hover` was never cleared when the surface went away.** It is only written while there
+  are no panes, so opening a file and closing its tab brought the welcome screen back underlining a
+  stale row index — and the recent list having reordered, that index is now a *different* entry.
+- **`link_at` subtracted `chrome_px` where the painter adds `top_inset`** (`chrome_px + header_px`).
+  Equal today only because this surface never sets a header height, so it agreed by accident and
+  would have stopped agreeing silently. It asks for the painter's own number now.
+
+**Not fixed, and deliberately:** there is no `TrackMouseEvent`/`WM_MOUSELEAVE` anywhere in
+`main.rs`, so the underline stays lit while the pointer sits over another window. Adding a mouse-
+leave handler is new Win32 surface in the mouse path for a transient cosmetic state, and it cannot
+be checked without the screen. Worth doing when something else takes him into that code.
+
+### Unverified on screen
+
+The underline, its colour, and the sign-in dialog actually appearing for a source typed into the
+new field. **The sign-in is the one to put in front of a second person rather than to self-check**,
+because the whole defect was that the owner's own path through it was not the path anyone else takes.
+Everything here has tests; none of them can see the screen or hold a second person's Credential
+Manager.
+
+### Still open from this, and not done
+
+- **OpenID Connect discovery** — `GET {issuer}/.well-known/openid-configuration` returns
+  `authorization_endpoint` and `token_endpoint`, so one identity URL could fill both fields and the
+  Keycloak exception would disappear. Deliberately not built: it is a new HTTP call and a new
+  parser, where the defect was a missing enum variant. Worth doing, worth being asked for first.
+- The estate's `tailhawk` client registration is not in any repo — it lives in the identity server's
+  configuration. `RegexRedirectValidator` treats registered redirect URIs as **regexes**, which is
+  why an ephemeral loopback port is accepted and why the server side needed no work for Marco.
+
+---
+
 ## ▶ Resume point — 2026-10-08/09: he used it all day and reported fourteen things
 
 **Master `b010731`, green on all five CI jobs by SHA

@@ -184,6 +184,7 @@ impl Editor {
             Field::Name => &mut source.name,
             Field::Url => &mut source.url,
             Field::TokenUrl => &mut source.token_url,
+            Field::AuthUrl => &mut source.auth_url,
             Field::ClientId => &mut source.client_id,
             Field::Scope => &mut source.scope,
             Field::Query => &mut source.query,
@@ -241,11 +242,20 @@ impl Editor {
 }
 
 /// The editable fields of a source, so the dialog names one rather than passing an index.
+///
+/// **`AuthUrl` was missing until 2026-10-13, and its absence was a whole feature unreachable.**
+/// [`Source::signs_in`](crate::settings::Source::signs_in) is `!auth_url.is_empty()`, so a field
+/// that could not be set meant every source anyone created in the app answered "does not sign
+/// in" — and the authorization-code path, loopback socket, PKCE and sign-in dialog all built and
+/// all working, could never be entered. The owner's own sources had it only because his settings
+/// file was written by hand. The first person to be handed the app was told to paste a client
+/// secret instead, and had no login screen to find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Name,
     Url,
     TokenUrl,
+    AuthUrl,
     ClientId,
     Scope,
     Query,
@@ -395,6 +405,35 @@ mod tests {
         }
         assert!(!editor.add(), "the list is bounded");
         assert_eq!(editor.sources().len(), MAX_SOURCES);
+    }
+
+    /// **A source created in the app can sign the reader in**, which it could not do before
+    /// 2026-10-13: there was no [`Field`] for `auth_url`, so the editor had no way to set the one
+    /// value [`Source::signs_in`] reads, and the colleague the owner gave the app to got no login
+    /// screen — just an instruction to paste a client secret he had no reason to possess.
+    #[test]
+    fn a_source_typed_in_the_dialog_can_be_made_to_sign_in() {
+        let mut editor = Editor::new(vec![source("live")], vec![true]);
+        assert!(
+            !editor.sources()[0].signs_in(),
+            "a source with no sign-in URL presents a client secret instead"
+        );
+
+        editor.edit(Field::AuthUrl, "https://identity.example/connect/authorize");
+        assert!(
+            editor.sources()[0].signs_in(),
+            "and setting the field is what moves it onto the authorization-code path"
+        );
+        assert_eq!(
+            editor.sources()[0].auth_url,
+            "https://identity.example/connect/authorize",
+            "stored where pull::begin_sign_in reads it, not merely remembered by the dialog"
+        );
+        assert_eq!(
+            editor.fault(),
+            None,
+            "a complete sign-in source is not a half-configured one"
+        );
     }
 
     /// **Three sources against one Loki differ only by their selector**, which is the shape the

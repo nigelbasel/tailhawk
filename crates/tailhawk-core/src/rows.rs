@@ -539,6 +539,51 @@ impl Rows {
     }
 }
 
+/// Where a padded row's actual text sits, in both of the units the screen needs.
+///
+/// **One answer, read by three things that must agree.** The owner asked on 2026-10-13 for the
+/// welcome screen's recent entries to behave like links in a browser: a different colour,
+/// underlined on hover. That needs the run's **bytes** (a [`Span`](crate::highlight::Span) colours
+/// byte ranges), its **cells** (the underline is a filled rectangle placed by column), and the
+/// same extent again for the hit test — because the complaint recorded against the first version
+/// of those rows was that the hand cursor spanned the whole row width, the entry text having been
+/// centred or indented with spaces that are not part of the link. Three derivations of one
+/// extent would be three chances for the pointer to promise a click the row does not honour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extent {
+    /// Byte offsets within the row, for a colour span.
+    pub bytes: core::ops::Range<usize>,
+    /// Cell offsets within the row, for geometry and hit testing.
+    pub cells: core::ops::Range<usize>,
+}
+
+/// The extent of a row's text once its padding is discounted, or `None` for a blank row.
+///
+/// **Derived from the row as drawn rather than from how it was composed.** The welcome surface
+/// indents some rows and centres others, and a reader of this cannot tell which — so it asks the
+/// only question that holds for both: where does the ink start and stop. A layout change upstream
+/// cannot put this out of step with it.
+///
+/// **The cells come from [`CellModel`], and counting characters instead was wrong.** Caught in
+/// review before this shipped: a cell here is a cluster with a *width*, and `cell_count("日本語")`
+/// is 6 where `chars().count()` is 3. A recent entry under `C:\logs\東京\` would therefore have
+/// been underlined two cells short of its own text, and the hand cursor would have given up two
+/// cells before the link visibly ended — the precise promise-the-screen-does-not-keep this
+/// function exists to prevent, reintroduced by measuring in the wrong unit. A combining mark goes
+/// the other way and overhangs instead.
+pub fn inked_extent(cells: &crate::cell::CellModel, row: &str) -> Option<Extent> {
+    let inked = row.trim();
+    if inked.is_empty() {
+        return None;
+    }
+    let start = row.len() - row.trim_start().len();
+    let cells_before = cells.cell_at_byte(row, start);
+    Some(Extent {
+        bytes: start..start + inked.len(),
+        cells: cells_before..cells_before + cells.cell_count(inked),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +948,64 @@ after
             rows.last_error(),
             Some("the share went away"),
             "a broken read is indistinguishable from a short file without this"
+        );
+    }
+
+    /// **The link extent a browser-like row needs, measured off the row as drawn.** Asked for on
+    /// 2026-10-13: the welcome screen's recent entries should look and behave like URLs in a
+    /// browser. The indent is spaces, so a hit test on the row alone offers a hand cursor over
+    /// empty space the click will not act on — which is the defect this exists to make impossible.
+    #[test]
+    fn a_rows_ink_is_measured_in_bytes_for_colour_and_cells_for_geometry() {
+        let cells = crate::cell::CellModel::new();
+        let row = format!("{}  {}", " ".repeat(10), r"C:\logs\app.log");
+        let got = inked_extent(&cells, &row).expect("an entry row has ink");
+        assert_eq!(
+            &row[got.bytes.clone()],
+            r"C:\logs\app.log",
+            "the bytes a colour span is given cover the text and none of the padding"
+        );
+        assert_eq!(
+            got.cells,
+            12..27,
+            "and the cells start past all twelve spaces"
+        );
+
+        assert_eq!(
+            inked_extent(&cells, "   "),
+            None,
+            "a padded blank row has no link"
+        );
+        assert_eq!(inked_extent(&cells, ""), None, "nor an empty one");
+
+        // A source name can be non-ASCII, and the two units then disagree — which is the whole
+        // reason both are returned rather than one being recomputed from the other.
+        let wide = "  loki://köln?apps=w";
+        let got = inked_extent(&cells, wide).expect("ink");
+        assert_eq!(&wide[got.bytes.clone()], "loki://köln?apps=w");
+        assert_eq!(
+            got.cells.len(),
+            18,
+            "eighteen characters, nineteen bytes: {:?}",
+            got.bytes
+        );
+
+        // **A cell is not a character, and this is the case that proves the unit.** Caught in
+        // review: `chars().count()` would call this ink 11 cells wide where the painter draws it
+        // 14, so the underline would stop three cells short of its own text and the hand cursor
+        // would give up before the link visibly ended.
+        let east = r"  C:\logs\東京\a.log";
+        let got = inked_extent(&cells, east).expect("ink");
+        assert_eq!(&east[got.bytes.clone()], r"C:\logs\東京\a.log");
+        assert_eq!(
+            got.cells.len(),
+            cells.cell_count(r"C:\logs\東京\a.log"),
+            "the width the painter will draw, not the number of characters"
+        );
+        assert_eq!(
+            got.cells.len(),
+            18,
+            "sixteen characters, two of them double width"
         );
     }
 }

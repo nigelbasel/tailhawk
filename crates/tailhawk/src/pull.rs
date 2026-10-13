@@ -97,10 +97,19 @@ impl std::fmt::Display for PullFault {
             }
             PullFault::Insecure => f.write_str("That URL is http; a token may only be sent over https."),
             PullFault::TokenOrigin(why) => write!(f, "The token URL {why}."),
+            // **Both remedies, because this message sent the first new reader down the wrong
+            // one.** The owner gave the installed app to a colleague on 2026-10-13; he added a
+            // source, was told to paste a client secret, and never saw a login screen — the
+            // sources dialog had no sign-in-URL field, so `signs_in()` was false for everything
+            // he could create and this was the only answer the program had. Naming the sign-in
+            // URL first says which of the two is the ordinary case for a person.
             PullFault::NoSecret => f.write_str(
-                "No secret is stored for this source — open Tools ▸ Remote sources and paste it.",
+                "This source has no way to authenticate — open Tools ▸ Remote sources and give it \
+                 a sign-in URL to log in with, or paste a client secret.",
             ),
-            PullFault::NotSignedIn => f.write_str("You are not signed in to this source."),
+            PullFault::NotSignedIn => {
+                f.write_str("You are not signed in to this source — opening it will ask you to.")
+            }
             PullFault::NoRandomness => {
                 f.write_str("Windows would not provide the random bytes a sign-in needs.")
             }

@@ -127,6 +127,7 @@ const ID_S_CLIENT: u16 = 216;
 const ID_S_SCOPE: u16 = 217;
 const ID_S_SECRET: u16 = 218;
 const ID_S_QUERY: u16 = 219;
+const ID_S_AUTH: u16 = 221;
 const ID_S_FAULT: u16 = 220;
 
 /// §7's filters dialog. Its own range, clear of the sources editor above and the Define Format
@@ -640,13 +641,16 @@ const R_FIELD_X: i16 = 55;
 /// preview: nothing in the window changes as you type a URL, and the box carries a credential, so
 /// the shorter it is on screen the better.
 fn sources_dialog_items() -> Vec<Item> {
-    let label = |text: &str, y: i16| Item::new(Class::Static, text, 0xFFFF, (7, y + 2, 48, 8), 0);
+    // **54 rather than 48, because "Sign-in URL:" is the longest label here.** The field moves
+    // right by the same amount and loses the same width, so the right edge still lines up with the
+    // list above it.
+    let label = |text: &str, y: i16| Item::new(Class::Static, text, 0xFFFF, (7, y + 2, 54, 8), 0);
     let field = |id: u16, y: i16, style: u32| {
         Item::new(
             Class::Edit,
             "",
             id,
-            (57, y, 290, 12),
+            (63, y, 284, 12),
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | style,
         )
     };
@@ -675,26 +679,32 @@ fn sources_dialog_items() -> Vec<Item> {
         field(ID_S_URL, 122, 0),
         label("&Token URL:", 138),
         field(ID_S_TOKEN, 138, 0),
-        label("&Client id:", 154),
-        field(ID_S_CLIENT, 154, 0),
-        label("&Scope:", 170),
-        field(ID_S_SCOPE, 170, 0),
-        label("&Query:", 186),
-        field(ID_S_QUERY, 186, 0),
-        label("S&ecret:", 202),
-        field(ID_S_SECRET, 202, ES_PASSWORD),
+        // **Directly under the token URL, because that is where it comes from.** The two are one
+        // server's pair, this one is filled in from the other when it is left empty, and a reader
+        // who has never heard of an authorize endpoint needs to see them as a set rather than find
+        // this one three rows down among the client's own settings.
+        label("Si&gn-in URL:", 154),
+        field(ID_S_AUTH, 154, 0),
+        label("&Client id:", 170),
+        field(ID_S_CLIENT, 170, 0),
+        label("&Scope:", 186),
+        field(ID_S_SCOPE, 186, 0),
+        label("&Query:", 202),
+        field(ID_S_QUERY, 202, 0),
+        label("S&ecret:", 218),
+        field(ID_S_SECRET, 218, ES_PASSWORD),
         // The fault line, where the rules editor puts its own: what is wrong with the set, in the
         // words `sourceset::Editor::fault` chose, while it is being typed rather than when a query
         // fails.
-        Item::new(Class::Static, "", ID_S_FAULT, (7, 220, 340, 9), 0),
+        Item::new(Class::Static, "", ID_S_FAULT, (7, 236, 340, 9), 0),
         Item::new(
             Class::Button,
             "OK",
             1,
-            (293, 232, 54, 14),
+            (293, 248, 54, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
-        Item::new(Class::Button, "Cancel", 2, (353, 232, 60, 14), WS_TABSTOP),
+        Item::new(Class::Button, "Cancel", 2, (353, 248, 60, 14), WS_TABSTOP),
     ]
 }
 
@@ -771,6 +781,7 @@ fn sources_show(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
         (ID_S_NAME, current.name.as_str()),
         (ID_S_URL, current.url.as_str()),
         (ID_S_TOKEN, current.token_url.as_str()),
+        (ID_S_AUTH, current.auth_url.as_str()),
         (ID_S_CLIENT, current.client_id.as_str()),
         (ID_S_SCOPE, current.scope.as_str()),
         (ID_S_QUERY, current.query.as_str()),
@@ -790,6 +801,7 @@ fn sources_read(hdlg: HWND, edit: &mut tailhawk_core::sourceset::Editor) {
         (ID_S_NAME, Field::Name),
         (ID_S_URL, Field::Url),
         (ID_S_TOKEN, Field::TokenUrl),
+        (ID_S_AUTH, Field::AuthUrl),
         (ID_S_CLIENT, Field::ClientId),
         (ID_S_SCOPE, Field::Scope),
         (ID_S_QUERY, Field::Query),
@@ -871,12 +883,30 @@ unsafe extern "system" fn sources_proc(
                     return 1;
                 }
                 (
-                    ID_S_NAME | ID_S_URL | ID_S_TOKEN | ID_S_CLIENT | ID_S_SCOPE | ID_S_QUERY,
+                    ID_S_NAME | ID_S_URL | ID_S_TOKEN | ID_S_AUTH | ID_S_CLIENT | ID_S_SCOPE
+                    | ID_S_QUERY,
                     EN_CHANGE,
                 ) => {
                     sources_read(hdlg, &mut data.editor);
                     sources_fill(hdlg, &data.editor);
                     set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    return 1;
+                }
+                // **Offers the sign-in URL once the token URL is finished with**, and only into an
+                // empty box — never over something the reader typed. See `authorize_beside`: the
+                // field being unanswerable is what kept the whole authorization-code path out of
+                // reach for anyone whose settings file was not written by hand.
+                (ID_S_TOKEN, EN_KILLFOCUS) => {
+                    if dlg_text(hdlg, ID_S_AUTH).trim().is_empty() {
+                        if let Some(beside) =
+                            tailhawk_core::settings::authorize_beside(&dlg_text(hdlg, ID_S_TOKEN))
+                        {
+                            set_dlg_text(hdlg, ID_S_AUTH, &beside);
+                            sources_read(hdlg, &mut data.editor);
+                            sources_fill(hdlg, &data.editor);
+                            set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                        }
+                    }
                     return 1;
                 }
                 (ID_S_ADD, BN_CLICKED) => {
@@ -957,7 +987,7 @@ fn sources_state(hdlg: HWND) -> Option<*mut SourcesEdit> {
 /// Reports whether the set was accepted. The caller writes `editor.sources()` into its settings and
 /// takes `store` and `forget` to Credential Manager.
 pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
-    let t = template("Remote sources", 420, 252, &sources_dialog_items());
+    let t = template("Remote sources", 420, 268, &sources_dialog_items());
     unsafe {
         DialogBoxIndirectParamW(
             None,
@@ -3250,6 +3280,19 @@ const ES_PASSWORD: u32 = 0x0020;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const EN_CHANGE: u32 = 0x0300;
+/// An edit box losing the keyboard — when the sign-in URL is offered from the token URL.
+///
+/// **Not `EN_CHANGE`, deliberately.** A suggestion written on every keystroke is wrong for the
+/// whole time the reader is still typing: `…/connect/token` matches part-way through typing
+/// `…/connect/tokens`, so the sign-in field would be filled from a URL the reader had not finished
+/// writing and then left holding a stale guess. Waiting for the field to be done with means the
+/// suggestion is made once, from what they actually typed.
+///
+/// **The value was checked, not recalled** — `windows-0.58.0` defines `EN_KILLFOCUS` as `512`,
+/// which is this. §5 of `CLEANROOM.md` records two cases of a from-memory constant being
+/// plausible, confident and wrong; it is spelled out here rather than imported only to match
+/// `EN_CHANGE` directly above, and both could come from the crate instead.
+const EN_KILLFOCUS: u32 = 0x0200;
 /// A button's click notification.
 ///
 /// **Spelled out here because the absence of it was silent.** Written as a bare name in a `match`
@@ -5487,8 +5530,13 @@ mod tests {
     /// No two controls of one dialog claim the same mnemonic — the rule the menus keep, for the
     /// same reason: the second claimant is unreachable by the key drawn under it. `Pa&ttern` and
     /// `&Test` both wanted `t`, and the pattern box is read-only, so it gave the letter up.
+    ///
+    /// **And no two share an id**, which was added on 2026-10-13 after the Sign-in URL field was
+    /// given one `ID_S_FAULT` already held. Both halves are the same kind of fault: a control
+    /// that cannot be reached by the thing that is supposed to reach it, with nothing on screen
+    /// to say so.
     #[test]
-    fn no_two_controls_of_a_dialog_share_a_mnemonic() {
+    fn no_two_controls_of_a_dialog_share_a_mnemonic_or_an_id() {
         for (name, items) in [
             ("Define Format", format_dialog_items()),
             ("Import Layout", import_dialog_items()),
@@ -5527,6 +5575,27 @@ mod tests {
                 !seen.is_empty(),
                 "{name}: a dialog with no mnemonics at all"
             );
+
+            // **No two controls may share an id, and this caught a live one.** Adding the Sign-in
+            // URL field on 2026-10-13 gave it 220, which `ID_S_FAULT` already had. Nothing would
+            // have failed to compile and nothing would have looked wrong on screen: `GetDlgItem`
+            // answers with whichever control it finds first, so reading the sign-in URL would have
+            // returned the fault line's text and writing a fault would have overwritten what the
+            // reader had typed. A dialog's controls are addressed only by these numbers, so a
+            // duplicate is invisible until the symptom is somewhere else entirely.
+            let mut ids: Vec<u16> = items
+                .iter()
+                .map(|item| item.id)
+                .filter(|id| *id != 0xFFFF)
+                .collect();
+            ids.sort_unstable();
+            for pair in ids.windows(2) {
+                assert_ne!(
+                    pair[0], pair[1],
+                    "{name}: two controls share id {} — GetDlgItem can only reach one",
+                    pair[0]
+                );
+            }
         }
     }
 

@@ -4793,6 +4793,12 @@ struct Shell {
     rules_fixed: Vec<tailhawk_core::rules::Spec>,
     /// §14's first-run surface, kept while it is shown so a click on a recent file can be resolved.
     welcome: Option<Welcome>,
+    /// The welcome entry the pointer is over, so the next frame underlines it.
+    ///
+    /// **On the `Shell` rather than on `Welcome`, which is rebuilt every frame.** Kept as the row
+    /// index and compared before invalidating, so moving the pointer along one entry repaints
+    /// once on arrival rather than on every `WM_MOUSEMOVE` — the same economy as `Shell::waited`.
+    welcome_hover: Option<u64>,
     /// How long recent frames took. See [`Frames`].
     frames: Frames,
     /// Last frame's placeholder draws: glyphs queued, and glyphs the atlas has refused. The
@@ -5591,7 +5597,7 @@ impl Shell {
                     }
                     let recent: Vec<tailhawk_core::settings::Recent> =
                         self.settings.recent.iter().take(6).cloned().collect();
-                    let welcome = Welcome::new(cell, (w, h), &recent, band);
+                    let welcome = Welcome::new(cell, (w, h), &recent, band, self.welcome_hover);
                     let laid = renderer.paint_rows(&welcome.view, &welcome)?;
                     rasterised = laid.rasterised;
                     placeholders = PlaceholderStats::from(&laid);
@@ -5599,6 +5605,14 @@ impl Shell {
                     return Ok(());
                 }
                 self.welcome = None;
+                // **The hover goes with the surface, and this was a defect found in review.** The
+                // hover is only ever written while there are no panes, so opening a document left
+                // it set: close that tab and the welcome surface came back underlining a row the
+                // pointer was nowhere near — and because the file just opened has moved to the
+                // front of `settings.recent`, the row under that stale index is now a *different*
+                // entry. The one piece of state this feature keeps was also the only false thing
+                // the surface could say.
+                self.welcome_hover = None;
                 // **The metrics come from the measured face every frame, not once.** §3.1 requires
                 // integer cell advances re-derived at the current scale, and a DPI change between
                 // frames is exactly the case a cached cell would get wrong.
@@ -7844,6 +7858,11 @@ struct Welcome {
     /// encoded entries, so clicking `loki://live?apps=…` tried to open a *file* by that name. It
     /// carries the entry itself now, and the shell acts on whichever kind it is.
     opens: Vec<Option<tailhawk_core::settings::Recent>>,
+    /// The entry row the pointer is over, which is the only row drawn underlined.
+    ///
+    /// **Held here but owned by the `Shell`**, because this surface is rebuilt from scratch on
+    /// every frame — a hover kept on `Welcome` would be forgotten the moment it mattered.
+    hovering: Option<u64>,
     view: View,
 }
 
@@ -7865,6 +7884,7 @@ impl Welcome {
         size: (u32, u32),
         recent: &[tailhawk_core::settings::Recent],
         band_px: f32,
+        hovering: Option<u64>,
     ) -> Self {
         let chrome_h = band_px;
         let (cell_w, row_h) = cell;
@@ -7916,23 +7936,58 @@ impl Welcome {
         view.set_chrome_px(chrome_h);
         view.grid_mut().set_total_rows(lines.len() as u64);
         view.hgrid_mut().set_columns(width_cells as u64 + 1);
-        Self { lines, opens, view }
+        Self {
+            lines,
+            opens,
+            hovering,
+            view,
+        }
     }
 
-    /// The recent entry a client `y` lands on, if any.
+    /// The ink extent of an entry row, or `None` for a row that opens nothing.
+    ///
+    /// **The single answer the colour, the underline and the pointer all read.** Three derivations
+    /// of "where is the link" is three chances for the hand cursor to appear over something a
+    /// click does not act on, which is the shape of the defect this surface already had once.
+    fn link_on(&self, row: u64) -> Option<tailhawk_core::rows::Extent> {
+        self.opens.get(row as usize)?.as_ref()?;
+        tailhawk_core::rows::inked_extent(self.view.cells(), self.lines.get(row as usize)?)
+    }
+
+    /// The row whose **link text** a client point lands on.
     ///
     /// **Both the click and the cursor ask this**, which is what keeps them from disagreeing about
-    /// where a row is — the rows were asked for as hyperlinks, so the pointer becomes a hand over
-    /// exactly the rows a click would act on, and neither can drift from the other.
+    /// where a link is — the pointer becomes a hand over exactly what a click would act on, and
+    /// neither can drift from the other.
     ///
-    /// **The chrome band comes off the `y` first, and forgetting it is why clicking did nothing.**
-    /// `set_chrome_px` reserves the top of this surface for §2.3's toolbar and the rows are drawn
-    /// below it, but `Grid::row_at_y` is pure row arithmetic and knows nothing about chrome — handed
-    /// a raw client `y` it answers about two rows low, so a click landed on a blank line, the
-    /// footer, or past the end, and every one of those is `None`. A click *in* the band is still
-    /// `None`, because the subtraction goes negative and `row_at_y` refuses it.
-    fn entry_at(&self, y: f32) -> Option<tailhawk_core::settings::Recent> {
-        let row = self.view.grid().row_at_y(y - self.view.chrome_px())?;
+    /// **`x` is why this takes a point and not a `y`.** It answered about the whole row width
+    /// until 2026-10-13, which was visible the moment the owner asked for these rows to behave
+    /// like links in a browser: the entries are indented with spaces, so the pointer turned into a
+    /// hand — and a click opened a log — anywhere along a line that mostly looks blank. A
+    /// browser's link is its text, and so is this one.
+    ///
+    /// **The inset comes off the `y` first, and forgetting it is why clicking once did nothing.**
+    /// The rows are drawn below the band `set_chrome_px` reserves for §2.3's toolbar, but
+    /// `Grid::row_at_y` is pure row arithmetic and knows nothing about it — handed a raw client
+    /// `y` it answered about two rows low, so a click landed on a blank line, the footer, or past
+    /// the end, and every one of those is `None`. A point *in* the band is still `None`, because
+    /// the subtraction goes negative and `row_at_y` refuses it.
+    ///
+    /// **`top_inset()` rather than `chrome_px()`, which is what the painter adds.** The two are
+    /// equal on this surface only because it never sets a header height, so subtracting the
+    /// narrower of them happens to agree today and would silently stop agreeing the moment this
+    /// surface grew a header. Asking for the same number the painter uses costs nothing and
+    /// cannot drift.
+    fn link_at(&self, x: f32, y: f32) -> Option<u64> {
+        let row = self.view.grid().row_at_y(y - self.view.top_inset())?;
+        let extent = self.link_on(row)?;
+        let cell = ((x - self.view.gutter_px()) / self.view.hgrid().cell_width().max(1.0)) as usize;
+        extent.cells.contains(&cell).then_some(row)
+    }
+
+    /// What a click at a point opens, if it lands on an entry's text.
+    fn entry_at(&self, x: f32, y: f32) -> Option<tailhawk_core::settings::Recent> {
+        let row = self.link_at(x, y)?;
         self.opens.get(row as usize).cloned().flatten()
     }
 }
@@ -7944,6 +7999,55 @@ impl RowSource for Welcome {
 
     fn row_number(&self, _row: u64) -> Option<u64> {
         None
+    }
+
+    /// **The recent entries are drawn in the ink the product already uses for a URL.** Asked for
+    /// on 2026-10-13 — *"they should be underlined when hovered over and be a different colour to
+    /// the rest of the screen"*. `theme().semantic.url` rather than a colour invented here, so a
+    /// link on this surface and a URL inside a log line are the same colour, and because that one
+    /// is already held to a contrast floor against both grounds by `theme.rs`'s own tests.
+    fn row_spans(&self, row: u64, out: &mut Vec<tailhawk_core::highlight::Span>) {
+        out.clear();
+        let Some(extent) = self.link_on(row) else {
+            return;
+        };
+        out.push(tailhawk_core::highlight::Span {
+            start: extent.bytes.start,
+            end: extent.bytes.end,
+            fg: Some(tailhawk_core::theme::theme().semantic.url),
+            bg: None,
+        });
+    }
+
+    /// Underlines the entry the pointer is over, and nothing else.
+    ///
+    /// **Drawn here because `draw_chrome` runs after every row is laid out**, so a rule placed
+    /// under a line cannot be painted over by the text it belongs to. A `Span` carries a
+    /// foreground and a background and no notion of an underline, and widening it to carry one
+    /// would put a decoration nothing else in the product draws into the type every highlight
+    /// rule and search match flows through.
+    fn draw_chrome(&self, painter: &mut tailhawk_core::paint::Painter, view: &View) {
+        let Some(hovering) = self.hovering else {
+            return;
+        };
+        let Some(extent) = self.link_on(hovering) else {
+            return;
+        };
+        let Some(placed) = view.grid().visible().find(|p| p.row == hovering) else {
+            return;
+        };
+        let cell_w = painter.cell_width();
+        let row_h = view.grid().row_height();
+        // A hair under the row's bottom edge, and at least one device pixel tall however small
+        // the cell is — the same reasoning as every other rule this product draws.
+        let thickness = (row_h * 0.06).max(1.0);
+        painter.fill(
+            view.gutter_px() + extent.cells.start as f32 * cell_w,
+            placed.y + view.top_inset() + row_h - thickness * 2.0,
+            extent.cells.len() as f32 * cell_w,
+            thickness,
+            tailhawk_core::theme::theme().semantic.url,
+        );
     }
 }
 
@@ -12649,7 +12753,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         link = shell
                             .welcome
                             .as_ref()
-                            .is_some_and(|w| w.entry_at(y).is_some());
+                            .is_some_and(|w| w.link_at(x, y).is_some());
                     } else if let Some((pane, _, _)) = shell.pane_at(x, y) {
                         // `Some(Some(_))` is a boundary; `Some(None)` is a title, which stays an
                         // arrow, as a list header does.
@@ -12824,8 +12928,23 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let (x, y) = (x - px, y - py);
                 // No document: the welcome surface — a click on a recent file opens it.
                 if shell.document.panes().is_empty() {
+                    // **Repaints only when the entry under the pointer changes.** The underline is
+                    // the one thing a move can alter on this surface, so invalidating on every
+                    // `WM_MOUSEMOVE` would redraw the whole first-run screen for a pointer
+                    // crossing it on its way somewhere else.
+                    if msg == WM_MOUSEMOVE {
+                        let over = shell.welcome.as_ref().and_then(|w| w.link_at(x, y));
+                        if over != shell.welcome_hover {
+                            shell.welcome_hover = over;
+                            // SAFETY: invalidating our own window; no region and no retained
+                            // handle.
+                            unsafe {
+                                let _ = InvalidateRect(hwnd, None, false);
+                            }
+                        }
+                    }
                     if msg == WM_LBUTTONDOWN {
-                        if let Some(entry) = shell.welcome.as_ref().and_then(|w| w.entry_at(y)) {
+                        if let Some(entry) = shell.welcome.as_ref().and_then(|w| w.entry_at(x, y)) {
                             match entry {
                                 tailhawk_core::settings::Recent::File(path) => {
                                     shell.open_path(hwnd, PathBuf::from(path));
@@ -13912,6 +14031,7 @@ fn main() -> Result<()> {
             fling_tick: 0.0,
             fling_on: None,
             welcome: None,
+            welcome_hover: None,
             remembered,
             rules_editor: tailhawk_core::ruleset::Editor::default(),
             filters_editor: tailhawk_core::filter::Editor::default(),
@@ -15641,7 +15761,7 @@ mod tests {
         ];
         let cell = (8.0_f32, 18.0_f32);
         for band in [0.0_f32, 34.0, 36.0, 51.0] {
-            let w = Welcome::new(cell, (1200, 800), &recent, band);
+            let w = Welcome::new(cell, (1200, 800), &recent, band, None);
             let rows: Vec<usize> = (0..w.opens.len())
                 .filter(|i| w.opens[*i].is_some())
                 .collect();
@@ -15652,10 +15772,25 @@ mod tests {
             );
             for (n, row) in rows.iter().enumerate() {
                 let y = band + (*row as f32) * cell.1 + cell.1 / 2.0;
+                let extent = w.link_on(*row as u64).expect("an entry row has link text");
+                let on_text = (extent.cells.start as f32 + 0.5) * cell.0;
                 assert_eq!(
-                    w.entry_at(y).as_ref(),
+                    w.entry_at(on_text, y).as_ref(),
                     Some(&recent[n]),
                     "band {band}: the click at y={y} on row {row} must open entry {n}"
+                );
+                // **The indent is not the link.** Before 2026-10-13 it was: `entry_at` took only a
+                // `y`, so the hand cursor and the click both covered the full row width, and a
+                // press on apparently blank space opened a log.
+                assert_eq!(
+                    w.entry_at((extent.cells.start as f32 - 0.5) * cell.0, y),
+                    None,
+                    "band {band}: the space left of entry {n} opens nothing"
+                );
+                assert_eq!(
+                    w.entry_at((extent.cells.end as f32 + 0.5) * cell.0, y),
+                    None,
+                    "band {band}: nor the space right of it"
                 );
             }
         }
@@ -17656,6 +17791,7 @@ mod tests {
                     tailhawk_core::settings::Recent::File(r"C:\logs\other.log".to_owned()),
                 ],
                 renderer.chrome_line_height().unwrap_or(18.0),
+                None,
             );
             let pixels = renderer
                 .snapshot(w, h, &welcome.view, &welcome)

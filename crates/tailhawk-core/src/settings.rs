@@ -220,6 +220,41 @@ impl Source {
     }
 }
 
+/// The authorize endpoint that conventionally sits beside a token endpoint.
+///
+/// **This exists because a colleague could not sign in at all.** The sources dialog had no
+/// sign-in-URL field until 2026-10-13, so every source anyone created through the app had an empty
+/// `auth_url`, [`Source::signs_in`] answered `false` for all of them, and the whole
+/// authorization-code path was unreachable — the reader was told to paste a client secret instead.
+/// Adding the field fixes that; this function is what stops the field being a question most people
+/// cannot answer, because the token URL they already have usually names the authorize URL too.
+///
+/// **A suggestion, never a correction.** The caller offers it only into an empty field, and the
+/// reader can overwrite it. That matters because the convention is not universal: this replaces a
+/// final `token` segment with `authorize`, which is right for IdentityServer's
+/// `/connect/authorize` and Entra's `/oauth2/v2.0/authorize`, and **wrong for Keycloak**, whose
+/// authorize endpoint is `/protocol/openid-connect/auth`. A visible, editable wrong guess in a
+/// field the reader is already looking at costs them one correction; silence costs them the
+/// feature, which is what it has cost until now.
+pub fn authorize_beside(token_url: &str) -> Option<String> {
+    let trimmed = token_url.trim();
+    if !is_https(trimmed) {
+        return None;
+    }
+    let stem = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    let (before, last) = stem.rsplit_once('/')?;
+    // **`is_https(before)`, not `!before.is_empty()`, and the difference is a URL this invented.**
+    // `https://token` has no path at all, so `rsplit_once` splits it on the *second slash of the
+    // scheme* — handing back `https:/` and `token`, and suggesting `https:/authorize`. The dialog
+    // would then have written a malformed URL into a box the reader never touched and refused to
+    // close over it. Requiring what is left to still be an https URL with a host is the same test
+    // the whole string already had to pass.
+    if !last.eq_ignore_ascii_case("token") || !is_https(before) {
+        return None;
+    }
+    Some(format!("{before}/authorize"))
+}
+
 /// Whether `url` is an absolute https URL with a host.
 ///
 /// **`http` is refused rather than warned about.** A bearer token on a cleartext connection is a
@@ -1912,6 +1947,67 @@ mod tests {
             .fault()
             .is_some(),
             "the token endpoint is a second origin and gets the same rule"
+        );
+    }
+
+    /// **The suggestion that makes the new sign-in field answerable**, and the whole reason it
+    /// exists: the owner gave the installed app to a colleague on 2026-10-13, who added a Loki
+    /// source and was never offered a login. A reader who has a token URL almost always has the
+    /// authorize URL too — it is the same path with the last segment changed — so the dialog
+    /// offers it rather than asking for a URL most people would have to go and look up.
+    #[test]
+    fn the_authorize_url_beside_a_token_url_is_offered_but_never_guessed_from_nothing() {
+        assert_eq!(
+            authorize_beside("https://identity.nurtur.tech/connect/token").as_deref(),
+            Some("https://identity.nurtur.tech/connect/authorize"),
+            "IdentityServer's spelling, which is this estate's"
+        );
+        assert_eq!(
+            authorize_beside("https://login.example.com/x/oauth2/v2.0/token").as_deref(),
+            Some("https://login.example.com/x/oauth2/v2.0/authorize"),
+            "and Entra's, which differs only in the path above it"
+        );
+        assert_eq!(
+            authorize_beside("  https://identity.example/connect/token/  ").as_deref(),
+            Some("https://identity.example/connect/authorize"),
+            "a pasted URL carries whitespace and often a trailing slash"
+        );
+
+        assert_eq!(
+            authorize_beside("http://identity.example/connect/token"),
+            None,
+            "never suggest a cleartext sign-in: Source::fault would refuse it anyway"
+        );
+        assert_eq!(
+            authorize_beside("https://identity.example/connect/authorize"),
+            None,
+            "nothing to derive from a URL that does not end in a token segment"
+        );
+        assert_eq!(
+            authorize_beside("https://identity.example"),
+            None,
+            "a bare host names no endpoint"
+        );
+        // **A host that is itself called `token` must not be split on the scheme's own slash.**
+        // Found in review before this shipped: `rsplit_once` took `https://token` apart into
+        // `https:/` and `token` and suggested `https:/authorize` — a malformed URL written into a
+        // field the reader never touched, which `Source::fault` would then refuse to accept.
+        for mangled in ["https://token", "https://token/", "https://TOKEN"] {
+            assert_eq!(
+                authorize_beside(mangled),
+                None,
+                "{mangled} has no path to replace a segment of"
+            );
+        }
+        assert_eq!(
+            authorize_beside("https://mytoken/connect/token").as_deref(),
+            Some("https://mytoken/connect/authorize"),
+            "but a host merely ending in token is an ordinary host"
+        );
+        assert_eq!(
+            authorize_beside(""),
+            None,
+            "and an empty field suggests nothing"
         );
     }
 
