@@ -141,6 +141,7 @@ const ID_V_EXCLUDE: u16 = 235;
 const ID_V_ENABLED: u16 = 236;
 const ID_V_APPLY: u16 = 237;
 const ID_V_FAULT: u16 = 238;
+const ID_V_EDIT: u16 = 239;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -1755,7 +1756,13 @@ fn filters_dialog_items() -> Vec<Item> {
             WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         ),
         verb("&Add", ID_V_ADD, 0),
-        verb("&Remove", ID_V_REMOVE, 1),
+        // **The expression builder, on the row the list has selected.** The field below holds the
+        // expression as text, which is enough to change a word and no help at all in writing
+        // `level >= Warning` against a column whose spelling differs from its heading. That is
+        // what [`show_filter_dialog`] is for, and before this the only way to it was a command
+        // that opened it over no list at all.
+        verb("Edi&t…", ID_V_EDIT, 1),
+        verb("&Remove", ID_V_REMOVE, 2),
         Item::new(Class::Static, "&Filter:", 0xFFFF, (R_LEFT, 120, 40, 8), 0),
         Item::new(
             Class::Edit,
@@ -2017,7 +2024,26 @@ unsafe extern "system" fn filters_proc(
             }
             let at = crate::filters_read(|editor| editor.selected()).flatten();
             filters_refresh(hdlg, at.or(Some(0)));
+            // **A dialog opened to add exists so a filter can be typed.** `Ctrl+L` is one gesture,
+            // and it stays one only if the caret is already in the field — and the field already
+            // holds the offered row's placeholder, so it is selected too, or the first thing typed
+            // lands beside that word instead of over it. Returning 0 is how a dialog says it set
+            // the focus itself; the dialog manager would otherwise put it on the list.
+            if crate::filters_read(|editor| editor.offered().is_some()).unwrap_or(false) {
+                if let Ok(field) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_TEXT)) } {
+                    unsafe {
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(field);
+                        SendMessageW(field, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                    }
+                }
+                return 0;
+            }
             1
+        }
+        WM_NOTIFY if FILTERS_QUIET.with(|q| q.get()) => {
+            // `lv_select` raises `LVN_ITEMCHANGED` synchronously from inside the refill, and that
+            // re-entry would read the text box before the refill has written it.
+            0
         }
         WM_NOTIFY => {
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
@@ -2041,6 +2067,12 @@ unsafe extern "system" fn filters_proc(
                 unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) }
                     as *mut core::ffi::c_void,
             );
+            // **Checked before anything reads the editor**, the lesson `SOURCES_QUIET` records:
+            // the re-entry must turn back before it can take a second look at state the write is
+            // in the middle of.
+            if code == EN_CHANGE && FILTERS_QUIET.with(|q| q.get()) {
+                return 1;
+            }
             match (id, code) {
                 (ID_V_TEXT, EN_CHANGE) => {
                     filters_take_field(hdlg);
@@ -2071,14 +2103,15 @@ unsafe extern "system" fn filters_proc(
                     1
                 }
                 (ID_V_ADD, _) => {
-                    let fault = crate::filters_write(|editor| {
-                        match editor.add("new", tailhawk_core::filter::Polarity::Include) {
-                            Ok(_) => String::new(),
-                            Err(e) => one_line(&e.to_string()),
-                        }
-                    })
-                    .unwrap_or_default();
-                    set_dlg_text(hdlg, ID_V_FAULT, &fault);
+                    // **The same offer `Filter: include` arrives with**, so a row that appeared
+                    // because a button was pressed and a row that appeared because the dialog was
+                    // opened to add behave identically: both wait to be typed into, and neither
+                    // becomes a filter until something is.
+                    filters_take_field(hdlg);
+                    crate::filters_write(|editor| {
+                        editor.offer(tailhawk_core::filter::Polarity::Include)
+                    });
+                    set_dlg_text(hdlg, ID_V_FAULT, "");
                     let at = crate::filters_read(|e| e.selected()).flatten();
                     filters_refresh(hdlg, at);
                     if let Ok(field) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_TEXT)) } {
@@ -2090,6 +2123,57 @@ unsafe extern "system" fn filters_proc(
                 }
                 (ID_V_REMOVE, _) => {
                     crate::filters_write(|editor| editor.remove());
+                    let at = crate::filters_read(|e| e.selected()).flatten();
+                    filters_refresh(hdlg, at);
+                    1
+                }
+                (ID_V_EDIT, _) => {
+                    filters_take_field(hdlg);
+                    let seed = crate::filters_read(|editor| {
+                        editor
+                            .selected()
+                            .and_then(|at| editor.rows().get(at))
+                            .map(|chip| {
+                                (
+                                    chip.source.clone(),
+                                    chip.polarity == tailhawk_core::filter::Polarity::Include,
+                                )
+                            })
+                    })
+                    .flatten();
+                    // Read out and the borrow dropped before the nested dialog, which pumps its
+                    // own loop — a `STATE` borrow held across that is the `RefCell` panic.
+                    if let Some((expression, include)) = seed {
+                        let mut edit = FilterEdit {
+                            columns: crate::filters_columns(),
+                            include,
+                            scope: None,
+                            expression,
+                            manual: true,
+                            accepted: false,
+                        };
+                        if show_filter_dialog(hdlg, &mut edit) {
+                            let polarity = if edit.include {
+                                tailhawk_core::filter::Polarity::Include
+                            } else {
+                                tailhawk_core::filter::Polarity::Exclude
+                            };
+                            // **The text first.** A text that will not parse leaves the row exactly
+                            // as it was, and the polarity is part of "as it was" — changing it
+                            // anyway would half-apply an edit the dialog had just refused.
+                            let fault = crate::filters_write(|editor| {
+                                match editor.retext(&edit.expression) {
+                                    Ok(()) => {
+                                        editor.set_polarity(polarity);
+                                        String::new()
+                                    }
+                                    Err(e) => one_line(&e.to_string()),
+                                }
+                            })
+                            .unwrap_or_default();
+                            set_dlg_text(hdlg, ID_V_FAULT, &fault);
+                        }
+                    }
                     let at = crate::filters_read(|e| e.selected()).flatten();
                     filters_refresh(hdlg, at);
                     1
@@ -2330,16 +2414,50 @@ pub fn rules_row_swatches(
         .collect()
 }
 
-/// Rebuilds the list rows and nothing else.
+thread_local! {
+    /// Set while the Filters dialog writes its own controls, so the notifications that come back
+    /// are not read as the reader typing. **The sixth instance of this**, after `RULES_QUIET`,
+    /// `FORMAT_QUIET`, `APPS_QUIET`, `COLUMNS_QUIET` and `SOURCES_QUIET` — and this dialog was the
+    /// one without one.
+    ///
+    /// **What it cost was the polarity of every filter in the list.** `filters_show_selected`
+    /// writes the text box and sets the radio pair *afterwards*, so the `EN_CHANGE` from its own
+    /// write re-entered `filters_take_field`, which read the radios while they still described the
+    /// row being left — and wrote that answer onto the row just selected. Open `All filters…` over
+    /// an include filter and press OK, having touched nothing: both radios are still unchecked at
+    /// that moment, so the row was turned into an exclude filter and the view inverted. The radio
+    /// and the list's own Polarity column both read correctly throughout, because neither is
+    /// re-read after the clobber — there was nothing on screen to say so.
+    static FILTERS_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `write`, with every notification it provokes marked as the dialog's own.
 ///
-/// **Quiet throughout, because `lv_select` raises `LVN_ITEMCHANGED` synchronously** — the same
-/// notification a user's click raises. Without the guard the dialog would answer its own
-/// bookkeeping as though someone had clicked a row, and re-point every field from it.
+/// **Restores rather than clears**, unlike `sources_quietly`: [`filters_refresh`] ends by calling
+/// [`filters_show_selected`], which is quiet in its own right, and a plain `set(false)` on the way
+/// out of the inner call would unmute the rest of the outer one.
+fn filters_quietly<R>(write: impl FnOnce() -> R) -> R {
+    let was = FILTERS_QUIET.with(|q| q.replace(true));
+    let out = write();
+    FILTERS_QUIET.with(|q| q.set(was));
+    out
+}
+
 /// Rebuilds the filter list and points the fields at the selected row.
 ///
 /// **One refresh, called by every verb**, for the reason the rules editor gives: the alternative is
 /// a dialog where some buttons update the screen and one ships broken.
+///
+/// **Quiet throughout, because `lv_select` raises `LVN_ITEMCHANGED` synchronously** — the same
+/// notification a user's click raises. Without the guard the dialog answers its own bookkeeping as
+/// though someone had clicked a row, and re-points every field from it. **That sentence has been
+/// on this function since it was written and there was no guard**: two doc comments had run
+/// together here, the first describing protection the code did not have. It does now.
 fn filters_refresh(hdlg: HWND, keep: Option<usize>) {
+    filters_quietly(|| filters_refill(hdlg, keep));
+}
+
+fn filters_refill(hdlg: HWND, keep: Option<usize>) {
     let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_V_LIST)) }) else {
         return;
     };
@@ -2362,6 +2480,10 @@ fn filters_refresh(hdlg: HWND, keep: Option<usize>) {
 /// Points the field, the polarity pair and the enabled box at the selected filter, greying them all
 /// when there is none — §10's empty state, one press of Remove away.
 fn filters_show_selected(hdlg: HWND) {
+    filters_quietly(|| filters_fill_selected(hdlg));
+}
+
+fn filters_fill_selected(hdlg: HWND) {
     let shown = crate::filters_read(|editor| {
         editor
             .selected()
@@ -2383,13 +2505,18 @@ fn filters_show_selected(hdlg: HWND) {
         ID_V_EXCLUDE,
         ID_V_ENABLED,
         ID_V_REMOVE,
+        ID_V_EDIT,
     ] {
         unsafe {
             let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), has);
         }
     }
     let (text, include, enabled) = shown.unwrap_or_default();
-    set_dlg_text(hdlg, ID_V_TEXT, &text);
+    // **The pair and the box first, the text last.** `FILTERS_QUIET` is what actually makes this
+    // safe, and this order is what makes it safe without it: the text box is the only control here
+    // whose write notifies, and the handler it reaches reads the other three. In the other order —
+    // which is how this was written — the re-entry read a radio pair still describing the row
+    // being left and wrote that answer onto the row just selected.
     for (id, on) in [
         (ID_V_INCLUDE, include && has),
         (ID_V_EXCLUDE, !include && has),
@@ -2405,6 +2532,7 @@ fn filters_show_selected(hdlg: HWND) {
             );
         }
     }
+    set_dlg_text(hdlg, ID_V_TEXT, &text);
 }
 
 /// Reads the field and the pair back into the editor, reporting a fault rather than destroying the
@@ -3377,6 +3505,7 @@ const EN_KILLFOCUS: u32 = 0x0200;
 const BN_CLICKED: u32 = 0;
 const CBN_SELCHANGE: u32 = 1;
 const EM_GETSEL: u32 = 0x00B0;
+const EM_SETSEL: u32 = 0x00B1;
 
 /// Custom draw, which is how a standard list view is asked to paint one cell in chosen colours.
 ///
@@ -5616,6 +5745,7 @@ mod tests {
             ("Import Layout", import_dialog_items()),
             ("Filter", filter_dialog_items()),
             ("Highlight rules", rules_dialog_items()),
+            ("Filters", filters_dialog_items()),
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
             ("Applications", apps_dialog_items()),
@@ -5671,6 +5801,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The dialog filters are defined in shows the filters that are defined, and the verbs on
+    /// them.**
+    ///
+    /// The owner asked for a filter, got a form holding that one filter, and said so: *"the filter
+    /// dialog does not show me a list of filters, and no way to delete, edit or activate/deactivate
+    /// them"*. All four are controls here — a report list, Remove, an Enabled box and Edit….
+    ///
+    /// **What this does not see** is whether any of them is wired: a verb with no `WM_COMMAND` arm
+    /// would still pass. That the route he took now arrives here at all is
+    /// `every_way_of_asking_for_a_filter_opens_the_list_of_them`'s to assert, in `main.rs`.
+    #[test]
+    fn the_filters_dialog_lists_the_filters_and_the_verbs_on_them() {
+        let items = filters_dialog_items();
+        let at = |id: u16| {
+            items
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap_or_else(|| panic!("the dialog has no control {id}"))
+        };
+
+        assert!(
+            matches!(at(ID_V_LIST).class, Class::Named("SysListView32")),
+            "the filters in force are a list, not an absence"
+        );
+        assert!(
+            at(ID_V_LIST).style & LVS_REPORT != 0,
+            "in report mode, because On and Polarity are columns beside the text"
+        );
+        for (id, what) in [
+            (ID_V_REMOVE, "delete"),
+            (ID_V_EDIT, "edit"),
+            (ID_V_ENABLED, "activate/deactivate"),
+        ] {
+            assert!(
+                matches!(at(id).class, Class::Button),
+                "no way to {what} a filter"
+            );
+        }
+
+        // §7.1 keeps a disabled filter's place *and* its text rather than dropping it, so "off"
+        // has to be something a row can read — which is why it is a column and not an absence.
+        use tailhawk_core::filter::{Chip, Chips, Polarity};
+        let chip = |text: &str, polarity| Chip::parse(text, polarity).expect("a word parses");
+        let editor = tailhawk_core::filter::Editor::open(&Chips {
+            chips: vec![
+                chip("keep", Polarity::Include),
+                chip("drop", Polarity::Exclude),
+            ],
+        });
+        let rows = filter_row_cells(&editor);
+        assert_eq!(rows.len(), 2, "one row per filter");
+        assert_eq!(rows[0], ["on", "include", "keep"]);
+        assert_eq!(rows[1], ["on", "exclude", "drop"]);
     }
 
     /// The Filter dialog reads down one left edge. Every labelled field starts in the same column

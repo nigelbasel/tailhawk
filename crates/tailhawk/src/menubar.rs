@@ -577,7 +577,6 @@ pub fn menu_bar(
     let invisibles = doc.is_some_and(|d| d.shows_invisibles());
     let detail = doc.is_some_and(|d| d.detail_open());
     let filtered = doc.is_some_and(|d| d.is_filtered());
-    let chosen_filter = doc.is_some_and(|d| d.selected_filter().is_some());
     let saving = doc.is_some_and(|d| d.is_saving());
     let back = doc.is_some_and(|d| d.can_step(true));
     let forward = doc.is_some_and(|d| d.can_step(false));
@@ -667,12 +666,15 @@ pub fn menu_bar(
                     cmd("Filter: e&xclude", "Ctrl+Shift+L", Command::FilterExclude),
                     open,
                 ),
+                // **The list, beside the commands that add to it.** It sat under View, named for a
+                // panel, while `Edit filter…` and `Remove filter` sat here needing a chip selected
+                // — and the only surface that could select one was the panel View no longer opens,
+                // so both stood permanently greyed from 2b4036e until this. Removing a filter,
+                // retexting it and turning it off are all this dialog's own verbs now, which is
+                // where the owner looked for them: *"no way to delete, edit or
+                // activate/deactivate them"*.
+                on(cmd("&All filters…", "", Command::OpenFilters), open),
                 on(cmd("Clear filte&rs", "", Command::ClearFilter), filtered),
-                on(cmd("E&dit filter…", "", Command::EditFilter), chosen_filter),
-                on(
-                    cmd("Rem&ove filter", "", Command::RemoveFilter),
-                    chosen_filter,
-                ),
                 on(
                     cmd("&Edit last chip", "Ctrl+Shift+E", Command::EditLastChip),
                     filtered,
@@ -728,7 +730,6 @@ pub fn menu_bar(
                     cmd("&Pretty-print JSON", "", Command::TogglePretty),
                     open && detail,
                 ),
-                on(cmd("Fi&lters…", "", Command::ToggleFilters), open),
                 // §2.3: the row is hideable, and this is the only way back to it — so it is never
                 // disabled, whatever is or is not open.
                 // §2.3: the row is hideable, and this submenu is the only way back to it — so it

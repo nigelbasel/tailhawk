@@ -545,7 +545,14 @@ pub struct Editor {
     selected: Option<usize>,
     /// Whether the rows differ from what was last committed, which is what makes `Apply` live.
     dirty: bool,
+    /// The row that is only an offer: it exists so the field has somewhere to write, and it is not
+    /// a filter until something is typed into it. [`Self::commit`] leaves it out.
+    offered: Option<usize>,
 }
+
+/// What an offered row reads until it is typed into. **A word the grammar accepts**, because the
+/// dialog's first act cannot be an error message about a row the dialog itself just made.
+const OFFERED: &str = "new";
 
 impl Editor {
     /// Opens the editor over the filters in force.
@@ -554,7 +561,49 @@ impl Editor {
             rows: chips.chips.clone(),
             selected: (!chips.chips.is_empty()).then_some(0),
             dirty: false,
+            offered: None,
         }
+    }
+
+    /// Opens it with a row already waiting to be typed into, carrying `polarity`.
+    ///
+    /// **This is what `Filter: include` opens.** The owner asked for a filter and was given a form
+    /// holding that one filter and nothing else: *"the filter dialog does not show me a list of
+    /// filters, and no way to delete, edit or activate/deactivate them"*. There is one filter
+    /// surface, and asking to add arrives at the same list as asking to manage — the only
+    /// difference being the row already there, and which way round it is.
+    pub fn opened_to_add(chips: &Chips, polarity: Polarity) -> Self {
+        let mut editor = Self::open(chips);
+        editor.offer(polarity);
+        editor
+    }
+
+    /// Offers a row to type into, selects it, and says where it went.
+    ///
+    /// **Not dirty, and not committed**, which is the whole difference from [`Self::add`]: a row
+    /// nobody typed into is not a filter, so OK over an untouched offer puts nothing in force. The
+    /// sources dialog learned the same lesson the hard way — an empty set had no row for the fields
+    /// to write into, and every keystroke went nowhere.
+    ///
+    /// `None` only if [`OFFERED`] ever stops parsing, which a test holds it to.
+    pub fn offer(&mut self, polarity: Polarity) -> Option<usize> {
+        // **One offer at a time.** The dialog a `Ctrl+L` opens has an Add button in it, and a
+        // second offer would displace the first — which would stop being an offer at that moment
+        // and go into force on OK as a filter reading `new`. Asking again answers with the row
+        // already waiting, turned the way round that was asked for.
+        if let Some(at) = self.offered {
+            self.selected = Some(at);
+            if let Some(row) = self.rows.get_mut(at) {
+                row.polarity = polarity;
+            }
+            return Some(at);
+        }
+        let chip = Chip::parse(OFFERED, polarity).ok()?;
+        self.rows.push(chip);
+        let at = self.rows.len() - 1;
+        self.selected = Some(at);
+        self.offered = Some(at);
+        Some(at)
     }
 
     pub fn rows(&self) -> &[Chip] {
@@ -563,6 +612,15 @@ impl Editor {
 
     pub fn selected(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// The row that is only an offer, if there is one.
+    ///
+    /// The dialog asks because the caret belongs in the text field when a row is waiting to be
+    /// typed into — and because [`OFFERED`] is already in that field, so it has to be selected or
+    /// the first thing typed lands beside it rather than over it.
+    pub fn offered(&self) -> Option<usize> {
+        self.offered
     }
 
     pub fn dirty(&self) -> bool {
@@ -601,16 +659,31 @@ impl Editor {
         if self.rows[at] != chip {
             self.rows[at] = chip;
             self.dirty = true;
+            // Typed into, so no longer merely offered. **Only when the text actually differs:**
+            // the dialog fills this field programmatically whenever the selection moves, and that
+            // write comes back as a keystroke the control cannot distinguish from a typist's.
+            self.by_hand(at);
         }
         Ok(())
     }
 
     /// Sets the selected filter's polarity, or its enabled mark.
+    ///
+    /// **Either one retires an offer**, for the reason [`Self::retext`] does: three verbs can
+    /// change a row and a row changed by hand is no longer merely on offer. Without this, turning
+    /// a waiting row round and pressing OK produced no filter, and unticking `Enabled` made it
+    /// vanish rather than becoming a disabled one — which §7.1 says keeps its place and its text.
+    /// **Only when the value actually differs**, because the dialog asks for the value a row
+    /// already has every time it refills its controls.
     pub fn set_polarity(&mut self, polarity: Polarity) {
-        if let Some(row) = self.selected.and_then(|at| self.rows.get_mut(at)) {
+        let Some(at) = self.selected else {
+            return;
+        };
+        if let Some(row) = self.rows.get_mut(at) {
             if row.polarity != polarity {
                 row.polarity = polarity;
                 self.dirty = true;
+                self.by_hand(at);
             }
         }
     }
@@ -620,7 +693,15 @@ impl Editor {
             if row.enabled != enabled {
                 row.enabled = enabled;
                 self.dirty = true;
+                self.by_hand(at);
             }
+        }
+    }
+
+    /// Notes that row `at` was changed by hand, so it is a filter rather than an offer.
+    fn by_hand(&mut self, at: usize) {
+        if self.offered == Some(at) {
+            self.offered = None;
         }
     }
 
@@ -638,15 +719,30 @@ impl Editor {
         } else {
             Some(at.min(self.rows.len() - 1))
         };
+        self.offered = match self.offered {
+            Some(o) if o == at => None,
+            Some(o) if o > at => Some(o - 1),
+            keep => keep,
+        };
         self.dirty = true;
         true
     }
 
     /// The filters to put in force, and a note that they now are.
+    ///
+    /// **An offered row nobody typed into is left out**, so OK over the row the dialog itself put
+    /// there does not add a filter reading `new`. The row stays in the list — this is Apply as well
+    /// as OK, and a row vanishing from under the cursor on Apply would be its own defect.
     pub fn commit(&mut self) -> Chips {
         self.dirty = false;
         Chips {
-            chips: self.rows.clone(),
+            chips: self
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| self.offered != Some(*at))
+                .map(|(_, chip)| chip.clone())
+                .collect(),
         }
     }
 }
@@ -1722,5 +1818,215 @@ mod tests {
         for expr in ["timeout AND level >= Error", "timeout and level >= Error"] {
             assert_eq!(truth(expr, &r), Truth::True, "{expr}");
         }
+    }
+
+    /// **Asking for a filter opens the list the filter is going into, with the new row waiting.**
+    ///
+    /// The owner added one and got a form with a single filter in it: *"the filter dialog does not
+    /// show me a list of filters, and no way to delete, edit or activate/deactivate them"*. There is
+    /// one filter surface, and `Filter: include` arrives at it the same way `Filters…` does — the
+    /// difference being only that a row is already there to type into, carrying the polarity the
+    /// command named.
+    ///
+    /// **Not dirty from the seed row alone**, for the reason the sources editor is not: Cancel has
+    /// to be able to discard an offered row that nobody typed into.
+    #[test]
+    fn asking_to_add_a_filter_opens_the_whole_list_with_a_row_waiting() {
+        let live = chips_of(&[("error", Polarity::Include)]);
+        let editor = Editor::opened_to_add(&live, Polarity::Exclude);
+
+        assert_eq!(
+            editor.rows().len(),
+            2,
+            "the filters already in force are shown, not replaced by the new one"
+        );
+        assert_eq!(
+            editor.selected(),
+            Some(1),
+            "and the new row is the selected one, so the field types into it"
+        );
+        assert_eq!(
+            editor.rows()[1].polarity,
+            Polarity::Exclude,
+            "it carries the polarity the command asked for"
+        );
+        assert!(
+            editor.rows()[1].enabled,
+            "a filter you just asked for is on"
+        );
+
+        // An empty set is the case the sources dialog got wrong: the row has to exist for the
+        // field to have somewhere to write.
+        let first = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+        assert_eq!(first.rows().len(), 1);
+        assert_eq!(first.selected(), Some(0));
+    }
+
+    /// **The offered row is not a filter until something is typed into it.**
+    ///
+    /// Pressing OK straight over it would otherwise put a filter reading `new` in force — a filter
+    /// the reader never asked for, hiding every line that does not contain the word.
+    #[test]
+    fn a_row_nobody_typed_into_is_not_a_filter() {
+        let live = chips_of(&[("error", Polarity::Include)]);
+
+        let mut untouched = Editor::opened_to_add(&live, Polarity::Exclude);
+        assert!(
+            !untouched.dirty(),
+            "an offer is not a change: there is nothing to apply yet"
+        );
+        assert_eq!(
+            untouched.commit().chips,
+            live.chips,
+            "OK over an untouched offer puts exactly what was already in force"
+        );
+        assert_eq!(
+            untouched.rows().len(),
+            2,
+            "and the row stays in the list, because this is Apply as well as OK"
+        );
+
+        assert_eq!(
+            untouched.offered(),
+            Some(1),
+            "and it says which row it is, because the caret belongs in that row's field"
+        );
+
+        let mut typed = Editor::opened_to_add(&live, Polarity::Exclude);
+        typed.retext("retry").expect("parses");
+        assert!(typed.dirty(), "typing into it is a change");
+        assert_eq!(typed.offered(), None, "typed into, so no longer an offer");
+        let applied = typed.commit();
+        assert_eq!(applied.chips.len(), 2, "and it is a filter now");
+        assert_eq!(applied.chips[1].source, "retry");
+        assert_eq!(applied.chips[1].polarity, Polarity::Exclude);
+    }
+
+    /// **Asking twice for a row to type into leaves one row, not two.**
+    ///
+    /// `Ctrl+L` offers a row, and the dialog it opens has an **Add** button right there. Press it
+    /// without typing and a second offer would displace the first — which would stop being an
+    /// offer at that moment and go into force on OK as a filter reading `new`, hiding every line
+    /// without that word. There is one offer at a time.
+    #[test]
+    fn asking_twice_for_a_row_to_type_into_leaves_one() {
+        let live = chips_of(&[("error", Polarity::Include)]);
+        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        let first = editor.offered().expect("a row is waiting");
+
+        assert_eq!(
+            editor.offer(Polarity::Exclude),
+            Some(first),
+            "the row already waiting is the answer, not a second one"
+        );
+        assert_eq!(editor.rows().len(), 2, "so no row was added");
+        assert_eq!(editor.selected(), Some(first), "and it is the selected row");
+        assert_eq!(
+            editor.rows()[first].polarity,
+            Polarity::Exclude,
+            "asking again may change which way round it is"
+        );
+        assert_eq!(
+            editor.commit().chips,
+            live.chips,
+            "nothing reading `new` reached the view"
+        );
+
+        // Typed into, it is a filter — and *then* Add offers a fresh row.
+        editor.retext("retry").expect("parses");
+        let second = editor.offer(Polarity::Include).expect("a new offer");
+        assert_ne!(second, first, "the typed row is not reused");
+        assert_eq!(editor.rows().len(), 3);
+        assert_eq!(
+            editor.commit().chips.len(),
+            2,
+            "two filters: the one in force and the one typed"
+        );
+    }
+
+    /// **Turning the offered row round, or turning it off, is typing into it too.**
+    ///
+    /// Three verbs can change that row and only one of them retired the offer, so clicking
+    /// `Exclude matching lines` on a waiting row and pressing OK produced no filter at all, and
+    /// unticking `Enabled` made the row vanish instead of becoming a disabled filter — which §7.1
+    /// says keeps its place *and* its text. The dialog acknowledged the press and OK did nothing.
+    #[test]
+    fn turning_the_offered_row_round_or_off_makes_it_a_filter() {
+        let turned = {
+            let mut editor = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+            editor.set_polarity(Polarity::Exclude);
+            assert_eq!(
+                editor.offered(),
+                None,
+                "changed by hand, so no longer an offer"
+            );
+            editor.commit()
+        };
+        assert_eq!(turned.chips.len(), 1, "the row he turned round is a filter");
+        assert_eq!(turned.chips[0].polarity, Polarity::Exclude);
+
+        let switched_off = {
+            let mut editor = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+            editor.set_enabled(0, false);
+            assert_eq!(editor.offered(), None);
+            editor.commit()
+        };
+        assert_eq!(
+            switched_off.chips.len(),
+            1,
+            "§7.1: a disabled filter keeps its place and its text"
+        );
+        assert!(!switched_off.chips[0].enabled);
+
+        // The programmatic refills are what the dialog's quiet flag is for, and they ask for the
+        // value the row already has — which must leave the offer alone.
+        let mut untouched = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+        untouched.set_polarity(Polarity::Include);
+        untouched.set_enabled(0, true);
+        assert_eq!(
+            untouched.offered(),
+            Some(0),
+            "asking for what it already is changes nothing"
+        );
+        assert!(untouched.commit().chips.is_empty());
+    }
+
+    /// The word an offered row carries has to be one §7.2 accepts, or the dialog's first act is an
+    /// error message about a row the dialog itself made. [`Editor::offer`] can only fail if this
+    /// stops being true.
+    #[test]
+    fn the_offered_row_is_a_filter_the_grammar_accepts() {
+        assert!(
+            Chip::parse(OFFERED, Polarity::Include).is_ok(),
+            "`{OFFERED}` has to parse, or `offer` answers None and no row appears at all"
+        );
+        let mut editor = Editor::default();
+        assert_eq!(editor.offer(Polarity::Include), Some(0));
+        assert_eq!(
+            editor.rows()[0].source,
+            OFFERED,
+            "and it reads as that word"
+        );
+    }
+
+    /// Removing a row below the offered one keeps the offer pointing at the row it was made for —
+    /// the drift the sources editor was caught by, where a secret typed for one source would have
+    /// been stored against the next one along.
+    #[test]
+    fn removing_a_row_below_the_offer_does_not_move_the_offer() {
+        let live = chips_of(&[("a", Polarity::Include), ("b", Polarity::Include)]);
+        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        assert_eq!(editor.selected(), Some(2));
+
+        editor.select(Some(0));
+        assert!(editor.remove(), "the first real filter goes");
+        assert_eq!(editor.rows().len(), 2);
+
+        assert_eq!(
+            editor.commit().chips.len(),
+            1,
+            "what is left is `b` alone: the offer is still an offer, not a filter"
+        );
+        assert_eq!(editor.commit().chips[0].source, "b");
     }
 }

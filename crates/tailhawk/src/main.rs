@@ -3559,6 +3559,35 @@ const WM_DRAIN_DIALOGS: u32 = WM_APP + 8;
 /// The most states kept in either direction.
 const HISTORY_DEPTH: usize = 64;
 
+/// Why the filters dialog is opening.
+///
+/// **There is one filter surface and two ways in.** The owner asked for a filter and got a form
+/// holding that one filter: *"the filter dialog does not show me a list of filters, and no way to
+/// delete, edit or activate/deactivate them"*. Both ways in now reach the list; `Add` differs only
+/// in having a row already waiting, of the polarity the command named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FiltersIntent {
+    Manage,
+    Add(Polarity),
+}
+
+/// Which filter surface a command opens, and what is waiting in it when it does.
+///
+/// **Pure, because this is the decision that was wrong.** `Filter: include` opened a one-filter
+/// composer; `Filters…` opened the list; `Edit filter…` and `Remove filter` opened nothing at all,
+/// having been greyed since the panel that selected their subject stopped being created. A
+/// three-way split like that, spelled out at each of the three call sites that made it — the
+/// `Ctrl+L` key, the menu command and the panel — is one nobody can see whole. Spelled out here, a
+/// test can read it.
+fn filters_intent_of(command: Command) -> Option<FiltersIntent> {
+    match command {
+        Command::FilterInclude => Some(FiltersIntent::Add(Polarity::Include)),
+        Command::FilterExclude => Some(FiltersIntent::Add(Polarity::Exclude)),
+        Command::OpenFilters => Some(FiltersIntent::Manage),
+        _ => None,
+    }
+}
+
 /// Every command the shell has, by name — what the menus list and what the keys dispatch, so a
 /// binding and a menu entry cannot disagree about what a name does.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3570,7 +3599,10 @@ enum Command {
     ClearSearch,
     FilterInclude,
     FilterExclude,
-    ToggleFilters,
+    /// The filters dialog, over whatever is in force. **Named for what it does**: it opened a
+    /// panel once, and a command whose name says `Toggle` while it raises a modal dialog is the
+    /// kind of drift that left two of the items below permanently greyed.
+    OpenFilters,
     ClearFilter,
     /// The filter the panel's list has selected, in the Filter dialog. The owner, 2026-09-15:
     /// commands are on the menu bar, not on buttons inside a pane.
@@ -3662,10 +3694,8 @@ impl Command {
         (Command::ClearSearch, "Clear search", "Esc"),
         (Command::FilterInclude, "Add include filter", "Ctrl+L"),
         (Command::FilterExclude, "Add exclude filter", "Ctrl+Shift+L"),
-        (Command::ToggleFilters, "Filter panel", ""),
+        (Command::OpenFilters, "Filters…", ""),
         (Command::ClearFilter, "Clear filters", "Esc"),
-        (Command::EditFilter, "Edit the selected filter…", ""),
-        (Command::RemoveFilter, "Remove the selected filter", ""),
         (
             Command::ToggleCollapse,
             "Toggle records only (collapse continuations)",
@@ -4654,10 +4684,11 @@ struct Shell {
     /// editor through [`rules_read`] — so a `STATE` borrow alive across the call is a re-entrant
     /// borrow, not merely a risk.
     pending_rules: bool,
-    /// §7's filters dialog, deferred for the same reason: it is modal and runs its own loop.
     /// §7's filters dialog, deferred because it is modal and pumps its own message loop — a
     /// `STATE` borrow held across that is the `RefCell` panic every pending flag here exists for.
-    pending_filters: bool,
+    /// It carries **why** it is opening, because `Filter: include` and `Filters…` arrive at the
+    /// same list and differ only in whether a row is already waiting.
+    pending_filters: Option<FiltersIntent>,
     /// §12.4's remote sources dialog, deferred like every other so no `STATE` borrow is held
     /// while it pumps its own modal loop.
     pending_sources: bool,
@@ -6424,14 +6455,12 @@ impl Shell {
             true
         } else if ctrl && key == VK_L.0 {
             doc.filtering.error = None;
-            self.pending_filter = Some((
-                if shift {
-                    Polarity::Exclude
-                } else {
-                    Polarity::Include
-                },
-                None,
-            ));
+            // Through the same decision the menu goes through, rather than a second copy of it.
+            self.pending_filters = filters_intent_of(if shift {
+                Command::FilterExclude
+            } else {
+                Command::FilterInclude
+            });
             true
         } else {
             false
@@ -7410,19 +7439,9 @@ impl Shell {
                 }
             }
             Command::ClearSearch => doc.finder.clear(),
-            Command::FilterInclude | Command::FilterExclude => {
+            Command::FilterInclude | Command::FilterExclude | Command::OpenFilters => {
                 doc.filtering.error = None;
-                self.pending_filter = Some((
-                    if command == Command::FilterInclude {
-                        Polarity::Include
-                    } else {
-                        Polarity::Exclude
-                    },
-                    None,
-                ));
-            }
-            Command::ToggleFilters => {
-                self.pending_filters = true;
+                self.pending_filters = filters_intent_of(command);
             }
             Command::ClearFilter => doc.clear_filter(),
             Command::EditFilter => {
@@ -10759,10 +10778,10 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
     let filters = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
-            .is_some_and(|shell| std::mem::take(&mut shell.pending_filters))
+            .and_then(|shell| shell.pending_filters.take())
     });
-    if filters {
-        filters_open(hwnd);
+    if let Some(intent) = filters {
+        filters_open(hwnd, intent);
         return true;
     }
     let rules = STATE.with(|s| {
@@ -11357,6 +11376,18 @@ pub fn filters_read<R>(read: impl FnOnce(&tailhawk_core::filter::Editor) -> R) -
     STATE.with(|s| s.borrow().as_ref().map(|shell| read(&shell.filters_editor)))
 }
 
+/// The columns a filter expression may name, for the dialog's **Edit…** — the same list the
+/// composer gets when it is reached from a cell's context menu, so the two agree about what a
+/// column is called.
+pub fn filters_columns() -> Vec<dialog::FilterColumn> {
+    STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|shell| shell.document.as_ref().map(filter_columns))
+            .unwrap_or_default()
+    })
+}
+
 /// Edits it. Separate from [`filters_read`] because a `RefCell` will not lend both at once, and the
 /// dialog's verbs are writes with an answer — the fault from a text that would not parse.
 pub fn filters_write<R>(edit: impl FnOnce(&mut tailhawk_core::filter::Editor) -> R) -> Option<R> {
@@ -11390,8 +11421,9 @@ pub fn filters_apply(owner: HWND) {
     }
 }
 
-/// Opens the dialog over the filters in force.
-pub fn filters_open(owner: HWND) {
+/// Opens the dialog over the filters in force — with a row already waiting when the way in was
+/// `Filter: include` rather than `Filters…`.
+fn filters_open(owner: HWND, intent: FiltersIntent) {
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             let chips = shell
@@ -11399,7 +11431,12 @@ pub fn filters_open(owner: HWND) {
                 .as_ref()
                 .map(|doc| doc.filtering.chips.clone())
                 .unwrap_or_default();
-            shell.filters_editor = tailhawk_core::filter::Editor::open(&chips);
+            shell.filters_editor = match intent {
+                FiltersIntent::Manage => tailhawk_core::filter::Editor::open(&chips),
+                FiltersIntent::Add(polarity) => {
+                    tailhawk_core::filter::Editor::opened_to_add(&chips, polarity)
+                }
+            };
         }
     });
     dialog::show_filters_dialog(owner);
@@ -14007,7 +14044,7 @@ fn main() -> Result<()> {
             pending_import: false,
             pending_goto: false,
             pending_rules: false,
-            pending_filters: false,
+            pending_filters: None,
             pending_sources: false,
             pending_pull: None,
             pending_repick: None,
@@ -16042,13 +16079,63 @@ mod tests {
         );
     }
 
-    /// **Editing and removing a filter are menu commands, greyed until a filter is selected.** The
-    /// owner, 2026-09-15, of the push buttons the native panel was first given: "surely commands
-    /// should all be on menu and toolbar?" — and "the only time a command should not be on the menu
-    /// bar is if we have context menus". So the panel is a list and nothing else, and what its
-    /// buttons did is on the Edit menu, acting on the row the list has selected.
+    /// **Every way of asking for a filter arrives at the list of them.**
+    ///
+    /// This is the defect itself, stated as the decision it was: *"I just added a filter, but the
+    /// filter dialog does not show me a list of filters, and no way to delete, edit or
+    /// activate/deactivate them"*. `Filter: include` opened a composer holding the one filter being
+    /// made and nothing else — so what was already in force was invisible from the only surface he
+    /// had reached, and the verbs on it were in a dialog under another menu.
+    ///
+    /// Both ways in now answer with the same list; `Add` differs only in the row already waiting,
+    /// which is what makes `Ctrl+L` still one gesture rather than a dialog plus a button press.
     #[test]
-    fn the_edit_menu_edits_and_removes_the_selected_filter() {
+    fn every_way_of_asking_for_a_filter_opens_the_list_of_them() {
+        assert_eq!(
+            filters_intent_of(Command::FilterInclude),
+            Some(FiltersIntent::Add(Polarity::Include)),
+            "Ctrl+L arrives at the list with an include row waiting"
+        );
+        assert_eq!(
+            filters_intent_of(Command::FilterExclude),
+            Some(FiltersIntent::Add(Polarity::Exclude)),
+            "and Ctrl+Shift+L with an exclude one"
+        );
+        assert_eq!(
+            filters_intent_of(Command::OpenFilters),
+            Some(FiltersIntent::Manage),
+            "Edit ▸ All filters… opens the same list over what is already there"
+        );
+        // Not every command is about filters, and the ones that are not must not open it.
+        for other in [
+            Command::Find,
+            Command::ClearFilter,
+            Command::EditFilter,
+            Command::RemoveFilter,
+        ] {
+            assert_eq!(filters_intent_of(other), None, "{other:?} opens no dialog");
+        }
+    }
+
+    /// **A filter in force can be reached, and the route is never greyed.**
+    ///
+    /// This replaces a test that asserted the same thing about `Edit filter…` and `Remove filter`
+    /// — and proved nothing, because **it reached in and set `doc.filter_selected` itself**. Only
+    /// the filter panel ever set that field, and `show_filters` has been `false` with no assignment
+    /// anywhere since `2b4036e` took the panel's place with a dialog, so from that commit both
+    /// items were greyed in every state the program can actually be in. The owner met it as *"no
+    /// way to delete, edit or activate/deactivate them"*.
+    ///
+    /// So this test **never writes shell state**: it does only what a reader can do — add filters —
+    /// and asks the menu whether there is a way to them. The route is the dialog, whose own list
+    /// removes, retexts and disables a row; the two items that needed a selection nothing could
+    /// make are gone.
+    ///
+    /// The owner's rule that put them on the bar in the first place still holds — 2026-09-15, of
+    /// the push buttons the panel was first given: "surely commands should all be on menu and
+    /// toolbar?" The dialog is not a pane with buttons in it; it is where filters are defined.
+    #[test]
+    fn a_filter_in_force_can_be_reached_from_the_menu() {
         fn enabled(doc: &Document, label: &str) -> bool {
             let menu = menubar::menu_bar(
                 Some(doc),
@@ -16071,32 +16158,52 @@ mod tests {
             panic!("no menu item labelled {label}");
         }
 
+        fn present(doc: &Document, label: &str) -> bool {
+            let menu = menubar::menu_bar(
+                Some(doc),
+                menubar::BarState {
+                    toolbar: true,
+                    ..Default::default()
+                },
+                &[],
+                &[],
+                &[],
+            );
+            (0..menu.items().len())
+                .filter_map(|top| menu.at(&[top]))
+                .any(|items| items.iter().any(|i| i.label == label))
+        }
+
         let path = scratch_log("tailhawk_filter_menu_test.log", 50);
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
+
+        // **Deliberately ungated beyond a document being open** — the dialog is also how the first
+        // filter gets made, so gating it on there being one would be the trap this came from. So
+        // this one assertion is the whole claim; asserting it again with filters in force would be
+        // the same assertion twice, and reads as a state distinction the item does not have.
         assert!(
-            !enabled(&doc, "E&dit filter…"),
-            "no filters, nothing to edit"
+            enabled(&doc, "&All filters…"),
+            "the filters dialog is reachable, filters or no filters"
         );
-        assert!(!enabled(&doc, "Rem&ove filter"), "nor to remove");
+        assert!(
+            !enabled(&doc, "Clear filte&rs"),
+            "with nothing filtered there is nothing to clear"
+        );
 
         doc.add_chip("line", Polarity::Include);
         doc.add_chip("9", Polarity::Exclude);
         assert!(
-            !enabled(&doc, "E&dit filter…"),
-            "filters but none selected: which would it edit?"
+            enabled(&doc, "Clear filte&rs"),
+            "and now there is — the one filter item that does turn on what is in force"
         );
-        assert!(!enabled(&doc, "Rem&ove filter"));
 
-        doc.filter_selected = Some(1);
-        assert!(enabled(&doc, "E&dit filter…"));
-        assert!(enabled(&doc, "Rem&ove filter"));
-
-        doc.filter_selected = Some(7);
-        assert!(
-            !enabled(&doc, "Rem&ove filter"),
-            "a selection past the end is no selection"
-        );
+        for gone in ["E&dit filter…", "Rem&ove filter"] {
+            assert!(
+                !present(&doc, gone),
+                "{gone} needed a chip selection no surface could make, so it is not offered"
+            );
+        }
     }
 
     /// A menu item that could not do anything is greyed, not offered.

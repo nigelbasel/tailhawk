@@ -1,6 +1,126 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-13: stopped for the day, with the dialog fixed and unseen
+## ▶ Resume point — 2026-10-15: there were two filter dialogs, and the one you could find had no list
+
+**288 shell + 1012 core, fmt and clippy clean, `portable-core` checked on the Linux target.**
+
+**He added a filter and the dialog showed him the filter and nothing else:** *"I jut added a filter,
+but tjhe filter dialog does not show me a list of filters, and no way to delete, edit or
+activate/deactivate them"*.
+
+**Both halves of that were true, and the second half had been true for eight days.** There were two
+filter dialogs. `show_filter_dialog` composes **one** filter — include/exclude, column, match,
+value, regex, case, the expression validated as you type — and has no list, because it was never a
+list. `show_filters_dialog` **is** the list, with Add, Remove, an Enabled box and the Apply he asked
+for. Every route a reader would take — `Ctrl+L`, the toolbar's Filter button, `Edit ▸ Filter:
+include` — opened the first. The second was under **View**, named `Fi&lters…` after a panel that no
+longer exists. He cannot have been in the list, because its own Add would have put a row in front of
+him.
+
+**And the two commands that would have answered him were dead.** `Edit ▸ Edit filter…` and `Edit ▸
+Remove filter` are gated on `selected_filter()`, which reads `filter_selected`, which **only the
+filter panel ever set** — and `show_filters` has been `false` with no assignment anywhere since
+`2b4036e` replaced that panel with the dialog. So from 2026-10-07 to this change both items were
+greyed in every state the program can actually be in. That is the *"no way to delete, edit or
+activate/deactivate them"* half, exactly.
+
+**The test asserting they worked is what let it through.** It set `doc.filter_selected = Some(1)`
+itself and then checked the menu — so it passed while no code path on earth could reach that state.
+This is the third time this project has been bitten by a test asserting on state it supplied; it is
+replaced by one that writes no shell state and does only what a reader can do.
+
+### What it is now
+
+**One surface, two ways in.** `filters_intent_of(Command)` is pure and tested: `Filter: include` →
+`Add(Include)`, `Filter: exclude` → `Add(Exclude)`, `All filters…` → `Manage`. The decision used to
+be spelled out at three call sites — the `Ctrl+L` key, the menu command and the panel — which is how
+it drifted; now `Ctrl+L` goes through the same function the menu does.
+
+**A row waiting, that is not yet a filter.** `Editor::opened_to_add` offers a row of the right
+polarity, selected, so the field has somewhere to write — and `commit` leaves it out until something
+is typed into it, so OK over an untouched offer does not put a filter reading `new` in force and hide
+every line without that word. `retext` un-offers it **only when the text actually differs**, because
+the dialog refills that field whenever the selection moves and `EN_CHANGE` cannot tell that write
+from a typist's. The dialog's own **Add** button now seeds the same offer, so a row that appeared
+because a button was pressed behaves like one that appeared because the dialog opened to add.
+
+**There is one offer at a time, and this diff did not have that rule until it was re-read.**
+`offer` added a second row while `offered` can only name one — so the first stopped being an offer
+the moment the second displaced it, and `commit` would have put a filter reading `new` in force.
+Two presses reach it: `Ctrl+L`, then **Add** with nothing typed, then OK. It was exactly the defect
+the offer exists to prevent, found by reading the diff rather than by a test, and
+`asking_twice_for_a_row_to_type_into_leaves_one` now pins it.
+
+**The composer is kept, as `Edi&t…` on the selected row.** A text box is enough to change a word and
+no help at all in writing `level >= Warning` against a column whose spelling differs from its
+heading. Before this, the only way to it was a command that opened it over no list at all.
+
+**On the menu:** `Edit ▸ &All filters…` now sits beside `Filter: include` / `Filter: exclude`, where
+the filter commands live. `View ▸ Fi&lters…` is gone, and so are the two greyed items.
+
+### The review found a live defect three lines from this, and it is the one to read about
+
+**This dialog was the only one in `dialog.rs` with no quiet flag.** `RULES_QUIET`, `FORMAT_QUIET`,
+`APPS_QUIET`, `COLUMNS_QUIET` and `SOURCES_QUIET` all exist, and `SOURCES_QUIET` was added two days
+ago for the same reason. `filters_show_selected` wrote the text box and set the radio pair
+*afterwards* — so the `EN_CHANGE` from its own write re-entered `filters_take_field`, which read the
+radios while they still described the row being **left**, and wrote that answer onto the row just
+**selected**.
+
+**So `Edit ▸ All filters…` followed by OK, touching nothing, inverted a filter.** At
+`WM_INITDIALOG` both radios are unchecked, so the answer read back is "exclude", and an include
+filter became an exclude one — the view then showing every line that used to be hidden. Clicking any
+row of the other polarity did the same to it. The radio and the list's own Polarity column read
+correctly the whole time, because neither is re-read after the clobber; there was nothing on screen
+to say so.
+
+**It was latent while only `View ▸ Filters…` reached that dialog, and this change makes it the
+primary surface** — so without the fix this commit would have shipped a silent filter inversion on
+the commonest gesture in the program. `FILTERS_QUIET` is the sixth instance of the pattern;
+`filters_quietly` **restores** the previous value rather than clearing, because `filters_refresh`
+nests `filters_show_selected` and a plain `set(false)` on the way out of the inner call would unmute
+the rest of the outer one. The radios are also written before the text now, so that ordering is no
+longer load-bearing.
+
+**And the doc comment on `filters_refresh` already claimed the guard existed.** Two doc comments had
+run together, and the first described protection the code never had: *"Quiet throughout… without the
+guard the dialog would answer its own bookkeeping as though someone had clicked a row."* It is true
+now. A comment asserting a safety property is worth no more than a test that sets its own state.
+
+**`set_polarity` and `set_enabled` did not retire an offer either**, so turning a waiting row round
+and pressing OK produced no filter at all, and unticking `Enabled` made the row vanish rather than
+becoming the disabled filter §7.1 describes. All three verbs go through one private `by_hand` now.
+**Known and left:** pasting exactly the word `new` over the placeholder in one notification leaves
+the row an offer, because "typed into" is defined as "the text differs". Typing it retires the offer
+on the first keystroke. Tracking interaction instead would break the save-on-leave that
+`filters_take_field` performs for the row being left.
+
+### What to know before touching this again
+
+- **`filterpanel.rs` is still there and still inert** — 670 lines, `FilterPanel::create` never
+  called, because `show_filters` is `false` and nothing assigns it. Its removal is his call and has
+  been recorded as such since 2026-10-09. `pending_filter_edit` and `Command::EditFilter` /
+  `Command::RemoveFilter` stay dead with it; they are dispatched only from that file.
+- **The Filters dialog was not in `no_two_controls_of_a_dialog_share_a_mnemonic_or_an_id`** and every
+  other dialog was. Adding it failed immediately on the `Edi&t…` verb — `&Edit…` as first written
+  collided with `&Enabled`. The gap was real and is closed.
+- **The release suite cannot be run twice at once, and that is not a flake.** Two overlapping
+  `cargo test --release --workspace` runs produced `the file does not exist` on a scratch log, and
+  three produced dozens of failures across unrelated modules — including `secrets::tests`, which
+  reads and writes the **real Credential Manager**. Every one passed on a single clean run (288 +
+  1012). A first failure here was written up as a file-visibility flake of the documented
+  `stdin::tests::a_spill_is_an_ordinary_file_to_the_rest_of_the_product` kind; it was not, it was
+  two of my own runs sharing `scratch_log` names. **Finish one run before starting the next**, and
+  distrust any suite-wide failure that arrives while another run is in flight.
+
+**Unverified on screen, and it needs him:** that `Ctrl+L` now lands in the list with a row waiting;
+that typing into that row updates the list as it goes; that `Edi&t…` opens the composer on the right
+row and brings its expression back; that OK over an untouched offered row adds nothing; and that
+`Edit ▸ &All filters…` is where he would look. The pure half is covered — the routing, the offer,
+the index drift and the dialog's own template all have tests — but the `WM_COMMAND` wiring is shell
+state with no test, like every dialog proc in this program.
+
+## ▶ Earlier — 2026-10-13: stopped for the day, with the sources dialog fixed and unseen
 
 **Master `059d0af`, green on all five CI jobs by SHA
 (https://github.com/nigelbasel/tailhawk/actions/runs/38414004442). 286 shell + 1006 core. Tree clean.**
