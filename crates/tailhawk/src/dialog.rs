@@ -142,6 +142,29 @@ const ID_V_ENABLED: u16 = 236;
 const ID_V_APPLY: u16 = 237;
 const ID_V_FAULT: u16 = 238;
 const ID_V_EDIT: u16 = 239;
+/// The rest of §7's dialog, from 260 because the apps picker took 240–245 and the column chooser
+/// 250–252 while this one held ten ids.
+const ID_V_REGEX: u16 = 260;
+const ID_V_CASE: u16 = 261;
+const ID_V_REMOVE_ALL: u16 = 262;
+const ID_V_UP: u16 = 263;
+const ID_V_DOWN: u16 = 264;
+const ID_V_ON_INCLUDE: u16 = 265;
+const ID_V_ON_EXCLUDE: u16 = 266;
+const ID_V_OFF_INCLUDE: u16 = 267;
+const ID_V_OFF_EXCLUDE: u16 = 268;
+
+/// The Filters dialog's own grid, in dialog units.
+const V_DIALOG_W: i16 = 420;
+const V_DIALOG_H: i16 = 233;
+const V_LEFT: i16 = 7;
+const V_FIELD_X: i16 = 61;
+const V_LIST_W: i16 = 300;
+const V_VERB_X: i16 = 313;
+const V_VERB_W: i16 = 100;
+/// The four bulk buttons sit two by two under the list — enable and disable down, include and
+/// exclude across — because at one row of four the longest of them does not fit its button.
+const V_BULK_W: i16 = 148;
 /// The Define Format dialog's grid, in dialog units — as [`F_FIELD_X`] and friends are the
 /// Filter dialog's.
 const W_LEFT: i16 = 7;
@@ -868,7 +891,7 @@ unsafe extern "system" fn sources_proc(
                         list,
                         LVM_SETEXTENDEDLISTVIEWSTYLE,
                         WPARAM(0),
-                        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                        LPARAM(LVS_EX_FULLROWSELECT as isize),
                     );
                 }
             }
@@ -1693,114 +1716,159 @@ pub fn show_apps_dialog(hwnd: HWND, data: &mut AppsPick) -> bool {
 /// **Add starts a filter as the word `new`**, which §7.2's grammar accepts and which therefore
 /// always parses, and selects it so the field it lands in is the field to type into. A row that
 /// could not parse would make the dialog's first act an error message.
-/// One list row per filter: **On, Polarity, Filter**.
+/// One list row per filter: **Filter, Match case, Regular expression, Type**.
 ///
 /// Pure and separate, like `rules_row_cells`, because what it decides is a requirement rather than
-/// a drawing detail: §7.1 keeps a disabled filter's place *and its text* rather than dropping it,
-/// so "off" has to be a column and not an absence.
-pub fn filter_row_cells(editor: &tailhawk_core::filter::Editor) -> Vec<[String; 3]> {
+/// a drawing detail. §7.1 keeps a disabled filter's place *and its text* rather than dropping it —
+/// which is the row's check box, and why "off" cannot be an absence — and the two middle columns
+/// are [`phrase_of`](tailhawk_core::filter::phrase_of)'s reading of the filter's own text, so what
+/// the list says about a row is what the boxes above it say when that row is selected.
+///
+/// **An em dash, not `No`, for an expression that is not a phrase.** `level >= Warning` is neither
+/// a regular expression nor case-sensitive-or-not; answering `No` twice would be two small
+/// untruths, and the dash says the question does not arise.
+pub fn filter_row_cells(editor: &tailhawk_core::filter::Editor) -> Vec<[String; 4]> {
     editor
         .rows()
         .iter()
         .map(|chip| {
+            let phrase = tailhawk_core::filter::phrase_of(&chip.source);
+            let yes_no = |yes: bool| {
+                if phrase.structured {
+                    "—"
+                } else if yes {
+                    "Yes"
+                } else {
+                    "No"
+                }
+                .to_owned()
+            };
             [
-                if chip.enabled { "on" } else { "off" }.to_owned(),
+                chip.source.clone(),
+                yes_no(phrase.match_case),
+                yes_no(phrase.regex),
                 match chip.polarity {
-                    tailhawk_core::filter::Polarity::Include => "include",
-                    tailhawk_core::filter::Polarity::Exclude => "exclude",
+                    tailhawk_core::filter::Polarity::Include => "Include",
+                    tailhawk_core::filter::Polarity::Exclude => "Exclude",
                 }
                 .to_owned(),
-                chip.source.clone(),
             ]
         })
         .collect()
 }
 
+/// The dialog, laid out as the owner asked for it on 2026-10-16: the phrase and what it is across
+/// the top, the filters themselves filling the middle, the verbs on them down the right, and the
+/// four bulk acts under the list.
+///
+/// **Modelled on Hoo WinTail's *Set Include & Exclude Filters*, from a screenshot he supplied** —
+/// `CLEANROOM.md` §3 allows that product as observable behaviour, which a screenshot of its running
+/// window is. What is taken is the arrangement: a phrase box with the per-filter options beside it,
+/// one list carrying every filter with a check box for its enabled mark, the acts as buttons down
+/// the right rather than hidden in a context menu, and Enable/Disable all. What is **not** taken is
+/// its model — our filters are §7.2 expressions, not phrases with flags, so `Edit…` keeps the
+/// column-aware composer and the two option boxes are readings of the expression rather than state
+/// stored beside it. Import and Export are left out: this program has no filter file to import.
 fn filters_dialog_items() -> Vec<Item> {
     const BS_AUTORADIOBUTTON: u32 = 0x0009;
     const WS_GROUP: u32 = 0x0002_0000;
-    let verb = |text: &str, id: u16, row: i16| {
+    let verb = |text: &str, id: u16, y: i16| {
         Item::new(
             Class::Button,
             text,
             id,
-            (R_VERB_X, 7 + row * 17, R_VERB_W, 14),
+            (V_VERB_X, y, V_VERB_W, 14),
             WS_TABSTOP,
         )
     };
+    // The option row starts at the left edge rather than under the phrase box: "Regular
+    // expression" and a radio pair do not fit in what is left beside a label.
+    let option = |text: &str, id: u16, x: i16, w: i16| {
+        Item::new(
+            Class::Button,
+            text,
+            id,
+            (x, 25, w, 10),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        )
+    };
+    let bulk = |text: &str, id: u16, x: i16, y: i16| {
+        Item::new(Class::Button, text, id, (x, y, V_BULK_W, 14), WS_TABSTOP)
+    };
     vec![
         Item::new(
-            Class::Named("SysListView32"),
-            "",
-            ID_V_LIST,
-            (R_LEFT, 7, R_LIST_W, 104),
-            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            Class::Static,
+            "Filter p&hrase:",
+            0xFFFF,
+            (V_LEFT, 9, 52, 8),
+            0,
         ),
-        verb("&Add", ID_V_ADD, 0),
-        // **The expression builder, on the row the list has selected.** The field below holds the
-        // expression as text, which is enough to change a word and no help at all in writing
-        // `level >= Warning` against a column whose spelling differs from its heading. That is
-        // what [`show_filter_dialog`] is for, and before this the only way to it was a command
-        // that opened it over no list at all.
-        verb("Edi&t…", ID_V_EDIT, 1),
-        verb("&Remove", ID_V_REMOVE, 2),
-        Item::new(Class::Static, "&Filter:", 0xFFFF, (R_LEFT, 120, 40, 8), 0),
         Item::new(
             Class::Edit,
             "",
             ID_V_TEXT,
-            (R_FIELD_X, 118, 252, 12),
+            (V_FIELD_X, 7, V_LEFT + V_LIST_W - V_FIELD_X, 12),
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
         ),
+        option("E&nable", ID_V_ENABLED, V_LEFT, 35),
+        option("&Match case", ID_V_CASE, 48, 51),
+        option("Re&gular expression", ID_V_REGEX, 105, 83),
         Item::new(
             Class::Button,
-            "&Include matching lines",
+            "&Include",
             ID_V_INCLUDE,
-            (R_FIELD_X, 136, 140, 10),
+            (194, 25, 39, 10),
             WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON,
         ),
         Item::new(
             Class::Button,
-            "E&xclude matching lines",
+            "E&xclude",
             ID_V_EXCLUDE,
-            (R_FIELD_X + 145, 136, 140, 10),
+            (239, 25, 39, 10),
             BS_AUTORADIOBUTTON,
         ),
         Item::new(
-            Class::Button,
-            "&Enabled",
-            ID_V_ENABLED,
-            (R_FIELD_X, 152, 100, 10),
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            Class::Named("SysListView32"),
+            "",
+            ID_V_LIST,
+            (V_LEFT, 42, V_LIST_W, 126),
+            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         ),
+        bulk("Ena&ble all include", ID_V_ON_INCLUDE, V_LEFT, 173),
+        bulk("Enabl&e all exclude", ID_V_ON_EXCLUDE, 159, 173),
+        bulk("Disab&le all include", ID_V_OFF_INCLUDE, V_LEFT, 190),
+        bulk("Disable all ex&clude", ID_V_OFF_EXCLUDE, 159, 190),
         Item::new(
             Class::Static,
             "",
             ID_V_FAULT,
-            (R_LEFT, 170, R_LIST_W, 18),
+            (V_LEFT, 210, V_LIST_W, 16),
             0,
         ),
         Item::new(
             Class::Button,
             "OK",
             IDOK,
-            (R_VERB_X, 150, R_VERB_W, 14),
+            (V_VERB_X, 7, V_VERB_W, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
         Item::new(
             Class::Button,
             "Cancel",
             IDCANCEL,
-            (R_VERB_X, 167, R_VERB_W, 14),
+            (V_VERB_X, 24, V_VERB_W, 14),
             WS_TABSTOP,
         ),
-        Item::new(
-            Class::Button,
-            "A&pply",
-            ID_V_APPLY,
-            (R_VERB_X, 184, R_VERB_W, 14),
-            WS_TABSTOP,
-        ),
+        verb("A&pply", ID_V_APPLY, 41),
+        verb("Ne&w", ID_V_ADD, 65),
+        verb("&Remove", ID_V_REMOVE, 82),
+        verb("Remove &all", ID_V_REMOVE_ALL, 99),
+        verb("&Up", ID_V_UP, 123),
+        verb("&Down", ID_V_DOWN, 140),
+        // **The expression builder, on the row the list has selected.** The phrase box holds the
+        // expression as text, which is enough to change a word and no help at all in writing
+        // `level >= Warning` against a column whose spelling differs from its heading.
+        verb("Edi&t…", ID_V_EDIT, 164),
     ]
 }
 
@@ -1958,7 +2026,7 @@ pub fn show_filters_dialog(owner: HWND) {
     unsafe {
         let _ = InitCommonControlsEx(&icc);
     }
-    let t = template("Filters", 420, 204, &filters_dialog_items());
+    let t = template("Filters", V_DIALOG_W, V_DIALOG_H, &filters_dialog_items());
     unsafe {
         DialogBoxIndirectParamW(
             None,
@@ -1999,7 +2067,7 @@ unsafe extern "system" fn filters_proc(
                         list,
                         LVM_SETEXTENDEDLISTVIEWSTYLE,
                         WPARAM(0),
-                        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES) as isize),
                     );
                 }
             }
@@ -2021,6 +2089,20 @@ unsafe extern "system" fn filters_proc(
             }
             1
         }
+        // Painting is answered before the quiet guard, as the rules editor's is and for the same
+        // reason: the guard exists to ignore selections the dialog made itself, and a repaint is
+        // not a selection. Suppressing it would leave the rows undimmed for as long as the list
+        // was being rebuilt — which is every keystroke.
+        WM_NOTIFY
+            if unsafe { &*(lparam.0 as *const NMHDR) }.idFrom == usize::from(ID_V_LIST)
+                && unsafe { &*(lparam.0 as *const NMHDR) }.code == NM_CUSTOMDRAW =>
+        {
+            let answer = filters_custom_draw(lparam);
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_MSGRESULT), answer);
+            }
+            1
+        }
         WM_NOTIFY if FILTERS_QUIET.with(|q| q.get()) => {
             // `lv_select` raises `LVN_ITEMCHANGED` synchronously from inside the refill, and that
             // re-entry would read the text box before the refill has written it.
@@ -2030,12 +2112,52 @@ unsafe extern "system" fn filters_proc(
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
             if header.idFrom == usize::from(ID_V_LIST) && header.code == LVN_ITEMCHANGED {
                 if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_LIST)) } {
+                    // **The check boxes are read first and unconditionally, not in an `else`.**
+                    // One `LVN_ITEMCHANGED` can carry both a new selection and a new check state —
+                    // clicking the box of a row that is not the selected one is exactly that — and
+                    // treating the two as alternatives dropped the tick. Nothing on screen said so
+                    // either: the next refill writes every box back from the model, so the tick
+                    // appeared to take and then reverted a keystroke later.
+                    //
+                    // The control reports *that* a state changed and not which way, so every row's
+                    // box is handed to the model, which ignores the ones that already agree — and
+                    // so leaves an offered row an offer. Working out which box moved is the
+                    // reading that can come out the wrong way round.
+                    let rows = crate::filters_read(|e| e.rows().len()).unwrap_or(0);
+                    // Bounded by what the list actually holds, as the apps picker's own read is:
+                    // `lv_checked` answers `false` for a row the control does not have, and false
+                    // means *turn that filter off*.
+                    let shown =
+                        unsafe { SendMessageW(list, LVM_GETITEMCOUNT, WPARAM(0), LPARAM(0)) }.0
+                            as usize;
+                    let shown = shown.min(rows);
+                    let checks: Vec<bool> =
+                        (0..shown).map(|i| lv_checked(list, i as i32)).collect();
+                    let changed = crate::filters_write(|editor| {
+                        let before: Vec<bool> = editor
+                            .rows()
+                            .iter()
+                            .take(shown)
+                            .map(|c| c.enabled)
+                            .collect();
+                        for (i, on) in checks.iter().enumerate() {
+                            editor.set_enabled(i, *on);
+                        }
+                        before != checks
+                    })
+                    .unwrap_or(false);
                     let at = lv_selected(list);
                     let was = crate::filters_read(|e| e.selected()).flatten();
                     if at != was {
                         filters_take_field(hdlg);
                         crate::filters_write(|editor| editor.select(at));
                         filters_show_selected(hdlg);
+                    } else if changed {
+                        filters_show_selected(hdlg);
+                        unsafe {
+                            let _ =
+                                windows::Win32::Graphics::Gdi::InvalidateRect(list, None, false);
+                        }
                     }
                 }
             }
@@ -2057,6 +2179,16 @@ unsafe extern "system" fn filters_proc(
             match (id, code) {
                 (ID_V_TEXT, EN_CHANGE) => {
                     filters_take_field(hdlg);
+                    // **The row and the two option boxes keep up, and the text box is not
+                    // touched.** `/err/i` typed into the phrase box is a regular expression from
+                    // the moment it parses, and the row and the boxes should say so — but a full
+                    // refresh writes this very control and would throw the caret to the end on
+                    // every keystroke, and rebuilding the list would reset its scroll besides.
+                    // One row's cells, which is all that can have changed.
+                    filters_quietly(|| {
+                        filters_fill_row(hdlg);
+                        filters_fill_options(hdlg);
+                    });
                     1
                 }
                 (ID_V_INCLUDE | ID_V_EXCLUDE, _) => {
@@ -2080,6 +2212,44 @@ unsafe extern "system" fn filters_proc(
                     if let Some(at) = at {
                         crate::filters_write(|editor| editor.set_enabled(at, on));
                     }
+                    filters_refresh(hdlg, at);
+                    1
+                }
+                (ID_V_CASE | ID_V_REGEX, _) => {
+                    if filters_take_option(hdlg) {
+                        let at = crate::filters_read(|e| e.selected()).flatten();
+                        filters_refresh(hdlg, at);
+                    } else {
+                        // The phrase box is mid-edit and does not parse. The box the reader just
+                        // clicked goes back to what the filter still says, and what they were
+                        // typing is left where it is.
+                        filters_quietly(|| filters_fill_options(hdlg));
+                    }
+                    1
+                }
+                (ID_V_UP | ID_V_DOWN, _) => {
+                    filters_take_field(hdlg);
+                    crate::filters_write(|editor| editor.move_selected(id == ID_V_DOWN));
+                    let at = crate::filters_read(|e| e.selected()).flatten();
+                    filters_refresh(hdlg, at);
+                    1
+                }
+                (ID_V_REMOVE_ALL, _) => {
+                    crate::filters_write(|editor| editor.remove_all());
+                    set_dlg_text(hdlg, ID_V_FAULT, "");
+                    filters_refresh(hdlg, None);
+                    1
+                }
+                (ID_V_ON_INCLUDE | ID_V_ON_EXCLUDE | ID_V_OFF_INCLUDE | ID_V_OFF_EXCLUDE, _) => {
+                    filters_take_field(hdlg);
+                    let polarity = if id == ID_V_ON_INCLUDE || id == ID_V_OFF_INCLUDE {
+                        tailhawk_core::filter::Polarity::Include
+                    } else {
+                        tailhawk_core::filter::Polarity::Exclude
+                    };
+                    let on = id == ID_V_ON_INCLUDE || id == ID_V_ON_EXCLUDE;
+                    crate::filters_write(|editor| editor.set_all(polarity, on));
+                    let at = crate::filters_read(|e| e.selected()).flatten();
                     filters_refresh(hdlg, at);
                     1
                 }
@@ -2365,6 +2535,49 @@ fn rules_custom_draw(lparam: LPARAM) -> isize {
     answer.code()
 }
 
+/// A filter that is off is drawn in the hint ink — the whole row, text and columns alike.
+///
+/// **§7.1 keeps a disabled filter's place and its text**, which means the list has to show two
+/// kinds of row that differ in one check box. The check box is the statement; this is what makes it
+/// legible at a glance across a dozen filters, and it is the one thing taken straight from the
+/// owner's WinTail screenshot, where the disabled filters are grey.
+///
+/// `dim` is passed in rather than read here so the decision stays a pure one — the theme is a
+/// global and this is the part worth testing.
+pub fn filters_dim_for(stage: u32, at: usize, enabled: &[bool], dim: u32) -> Swatch {
+    match stage {
+        CDDS_PREPAINT => Swatch::Items,
+        // The whole row at once: `clrText` set at item stage carries every column, and there is no
+        // one cell this belongs to the way the rules editor's swatch belongs to Colour.
+        CDDS_ITEMPREPAINT => match enabled.get(at) {
+            Some(false) => Swatch::Tint(Some(dim), None),
+            _ => Swatch::Leave,
+        },
+        _ => Swatch::Leave,
+    }
+}
+
+/// Answers one stage of the filters list's custom-draw conversation.
+fn filters_custom_draw(lparam: LPARAM) -> isize {
+    let draw = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
+    let enabled =
+        crate::filters_read(|editor| editor.rows().iter().map(|c| c.enabled).collect::<Vec<_>>())
+            .unwrap_or_default();
+    let answer = filters_dim_for(
+        draw.nmcd.dwDrawStage.0,
+        draw.nmcd.dwItemSpec,
+        &enabled,
+        colourref_theme(tailhawk_core::theme::theme().field_hint),
+    );
+    // **The selection state is kept**, where the rules editor's swatch drops it: a disabled filter
+    // that is also the selected one should still read as selected, and the highlight saying so
+    // over dim text is the right answer rather than a swatch's problem.
+    if let Swatch::Tint(Some(fg), _) = answer {
+        draw.clrText = COLORREF(fg);
+    }
+    answer.code()
+}
+
 /// The Colour column's index in the rules list — the one cell custom draw claims.
 const RULES_COLOUR_COLUMN: i32 = 3;
 
@@ -2439,23 +2652,55 @@ fn filters_refresh(hdlg: HWND, keep: Option<usize>) {
 }
 
 fn filters_refill(hdlg: HWND, keep: Option<usize>) {
+    filters_fill_list(hdlg, keep);
+    filters_fill_selected(hdlg);
+}
+
+/// The list alone, without touching a single field.
+///
+/// **Separate because the text box is being typed into.** A refresh that reaches
+/// [`filters_fill_selected`] writes `ID_V_TEXT`, and writing an edit control moves its caret to the
+/// end — so the full refresh cannot run on `EN_CHANGE`, and before this nothing did, leaving the
+/// row's own text and the two option boxes behind by however much had been typed.
+fn filters_fill_list(hdlg: HWND, keep: Option<usize>) {
     let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_V_LIST)) }) else {
         return;
     };
     let Some(rows) = crate::filters_read(filter_row_cells) else {
         return;
     };
+    let Some(enabled) =
+        crate::filters_read(|editor| editor.rows().iter().map(|c| c.enabled).collect::<Vec<_>>())
+    else {
+        return;
+    };
     lv_reset(list);
-    lv_column(list, 0, "On", 40);
-    lv_column(list, 1, "Polarity", 70);
-    lv_column(list, 2, "Filter", 300);
+    // The widths come from the width the list has, for the reason `sources_fill` gives — and the
+    // scrollbar is costed whether or not one is showing, so the columns do not jump as filters are
+    // added.
+    let mut client = RECT::default();
+    let measured = if unsafe { GetClientRect(list, &mut client) }.is_ok() {
+        client.right - client.left
+    } else {
+        0
+    };
+    let bar = unsafe { GetSystemMetrics(SM_CXVSCROLL) };
+    let widths = tailhawk_core::filter::column_widths(measured - bar);
+    for (at, title) in ["Filter", "Match case", "Regular expression", "Type"]
+        .iter()
+        .enumerate()
+    {
+        lv_column(list, at as i32, title, widths[at]);
+    }
     for (i, cells) in rows.iter().enumerate() {
         lv_row(list, i as i32, cells);
+        // §7.1's enabled mark, as the check box in the first column: the mark the old panel drew
+        // as `[x]`, now the one a list view draws for itself.
+        lv_check(list, i as i32, enabled[i]);
     }
     if let Some(at) = keep.filter(|&a| a < rows.len()) {
         lv_select(list, at);
     }
-    filters_show_selected(hdlg);
 }
 
 /// Points the field, the polarity pair and the enabled box at the selected filter, greying them all
@@ -2474,30 +2719,54 @@ fn filters_fill_selected(hdlg: HWND) {
                     chip.source.clone(),
                     chip.polarity == tailhawk_core::filter::Polarity::Include,
                     chip.enabled,
+                    tailhawk_core::filter::phrase_of(&chip.source),
                 )
             })
     })
     .flatten();
 
     let has = shown.is_some();
-    for id in [
-        ID_V_TEXT,
-        ID_V_INCLUDE,
-        ID_V_EXCLUDE,
-        ID_V_ENABLED,
-        ID_V_REMOVE,
-        ID_V_EDIT,
+    let rows = crate::filters_read(|editor| editor.rows().len()).unwrap_or(0);
+    let at = crate::filters_read(|editor| editor.selected()).flatten();
+    // **The moves grey at the ends of the list rather than disappearing**, so the pair keeps its
+    // shape from row to row — and `Remove all` is nothing to press with nothing in the list.
+    for (id, on) in [
+        (ID_V_TEXT, has),
+        (ID_V_INCLUDE, has),
+        (ID_V_EXCLUDE, has),
+        (ID_V_ENABLED, has),
+        (ID_V_REMOVE, has),
+        (ID_V_EDIT, has),
+        (ID_V_UP, at.is_some_and(|a| a > 0)),
+        (ID_V_DOWN, at.is_some_and(|a| a + 1 < rows)),
+        (ID_V_REMOVE_ALL, rows > 0),
     ] {
         unsafe {
-            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), has);
+            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), on);
         }
     }
-    let (text, include, enabled) = shown.unwrap_or_default();
-    // **The pair and the box first, the text last.** `FILTERS_QUIET` is what actually makes this
+    // **A control that disables itself takes the keyboard with it.** `Down` on the last row,
+    // `Up` on the first and `Remove all` on anything all grey the very button that was just
+    // pressed — and Windows leaves a disabled window holding the focus, which means no focus at
+    // all: the dialog stops answering `Tab`, `Space` and `Esc` until something is clicked. So
+    // whenever the focused control has just been turned off, the keyboard goes to the list, which
+    // is where the next act is anyway.
+    unsafe {
+        let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+        if !focused.is_invalid()
+            && !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(focused).as_bool()
+        {
+            if let Ok(list) = GetDlgItem(hdlg, i32::from(ID_V_LIST)) {
+                let _ = SetFocus(list);
+            }
+        }
+    }
+    let (text, include, enabled, _) = shown.unwrap_or_default();
+    // **The pair and the boxes first, the text last.** `FILTERS_QUIET` is what actually makes this
     // safe, and this order is what makes it safe without it: the text box is the only control here
-    // whose write notifies, and the handler it reaches reads the other three. In the other order —
-    // which is how this was written — the re-entry read a radio pair still describing the row
-    // being left and wrote that answer onto the row just selected.
+    // whose write notifies, and the handler it reaches reads the others. In the other order — which
+    // is how this was written — the re-entry read a radio pair still describing the row being left
+    // and wrote that answer onto the row just selected.
     for (id, on) in [
         (ID_V_INCLUDE, include && has),
         (ID_V_EXCLUDE, !include && has),
@@ -2513,7 +2782,107 @@ fn filters_fill_selected(hdlg: HWND) {
             );
         }
     }
+    filters_fill_options(hdlg);
     set_dlg_text(hdlg, ID_V_TEXT, &text);
+}
+
+/// Rewrites the selected row's four cells from the model, and nothing else.
+///
+/// The one thing a keystroke in the phrase box can change on screen, written the cheap way: see
+/// [`lv_set_row`] for why a refill is the wrong tool for a list somebody is typing into.
+fn filters_fill_row(hdlg: HWND) {
+    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_V_LIST)) }) else {
+        return;
+    };
+    let Some(Some((at, cells))) = crate::filters_read(|editor| {
+        let at = editor.selected()?;
+        Some((at, filter_row_cells(editor).into_iter().nth(at)?))
+    }) else {
+        return;
+    };
+    lv_set_row(list, at as i32, &cells);
+}
+
+/// Points the two option boxes at what the selected filter's text actually says.
+///
+/// **Its own function because `EN_CHANGE` needs exactly this and nothing else.** `/err/i` is a
+/// regular expression from the keystroke that closes it, and the boxes should say so while the
+/// phrase box is still being typed into — which rules out any refresh that writes that box.
+///
+/// **Neither box is offered for an expression that is not a phrase.** `level >= Warning` is not a
+/// regular expression and is not case-sensitive-or-not; a tick would wrap a comparison in slashes
+/// and turn it into a search for its own spelling. `Edit…` is the route for those.
+fn filters_fill_options(hdlg: HWND) {
+    let phrase = crate::filters_read(|editor| {
+        editor
+            .selected()
+            .and_then(|at| editor.rows().get(at))
+            .map(|chip| tailhawk_core::filter::phrase_of(&chip.source))
+    })
+    .flatten();
+    let offered = phrase.as_ref().is_some_and(|p| !p.structured);
+    let (regex, match_case) = phrase
+        .map(|p| (p.regex, p.match_case))
+        .unwrap_or((false, false));
+    for (id, on) in [
+        (ID_V_CASE, match_case && offered),
+        (ID_V_REGEX, regex && offered),
+    ] {
+        unsafe {
+            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), offered);
+            SendDlgItemMessageW(
+                hdlg,
+                i32::from(id),
+                BM_SETCHECK,
+                WPARAM(usize::from(on)),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// Rewrites the selected filter when one of the two option boxes is clicked.
+///
+/// **The words survive the rewrite**: `filter::phrase_source` composes and `phrase_of` reads, and
+/// the two are inverses, which is why they are one pair of functions in the model rather than two
+/// in the dialog. What *does* change is the kind of filter, when the only way to say what the box
+/// asks for is a different kind — `Match case` over plain text, which the grammar can only express
+/// as a regex.
+///
+/// **It answers `false` when the phrase box holds something that will not parse.** The box is
+/// committed on every keystroke, so a fault means the model still holds the *previous* text — and
+/// rewriting that and refilling the dialog would throw away what the reader was in the middle of
+/// typing. The caller leaves the box alone and puts the tick back instead.
+fn filters_take_option(hdlg: HWND) -> bool {
+    let typed = dlg_text(hdlg, ID_V_TEXT);
+    let parses = typed.trim().is_empty()
+        || tailhawk_core::filter::Chip::parse(&typed, tailhawk_core::filter::Polarity::Include)
+            .is_ok();
+    if !parses {
+        return false;
+    }
+    let checked = |id: u16| unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
+    };
+    let regex = checked(ID_V_REGEX);
+    let match_case = checked(ID_V_CASE);
+    let fault = crate::filters_write(|editor| {
+        let Some(chip) = editor.selected().and_then(|at| editor.rows().get(at)) else {
+            return String::new();
+        };
+        let phrase = tailhawk_core::filter::phrase_of(&chip.source);
+        if phrase.structured {
+            return String::new();
+        }
+        let source = tailhawk_core::filter::phrase_source(&phrase.text, regex, match_case);
+        match editor.retext(&source) {
+            Ok(()) => String::new(),
+            Err(e) => one_line(&e.to_string()),
+        }
+    })
+    .unwrap_or_default();
+    set_dlg_text(hdlg, ID_V_FAULT, &fault);
+    true
 }
 
 /// Reads the field and the pair back into the editor, reporting a fault rather than destroying the
@@ -2902,7 +3271,7 @@ unsafe extern "system" fn rules_proc(
                         list,
                         LVM_SETEXTENDEDLISTVIEWSTYLE,
                         WPARAM(0),
-                        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                        LPARAM(LVS_EX_FULLROWSELECT as isize),
                     );
                 }
             }
@@ -3240,27 +3609,13 @@ pub fn compose_filter(
     regex: bool,
     match_case: bool,
 ) -> String {
-    use tailhawk_core::filter::{Chip, Polarity, Predicate};
     let value = value.trim();
     let Some(column) = column else {
-        if regex {
-            return if match_case {
-                format!("/{value}/")
-            } else {
-                format!("/{value}/i")
-            };
-        }
-        if match_case {
-            // The grammar's only case-sensitive form is a regex without the `i` flag.
-            return format!("/{}/", tailhawk_core::search::Pattern::escape(value));
-        }
-        // Plain text — verbatim when the parser reads it as text, quoted when it would read as
-        // an expression, because "timeout" and "level >= Warning" must both mean their letters.
-        let as_typed = Chip::parse(value, Polarity::Include);
-        return match as_typed {
-            Ok(chip) if matches!(chip.predicate, Predicate::Text { .. }) => value.to_owned(),
-            _ => format!("\"{}\"", value.replace('"', "")),
-        };
+        // **The whole-record case is `filter::phrase_source`**, which is the same decision the
+        // Filters dialog's own `Regular expression` and `Match case` boxes make — and it is in the
+        // model so that the reading beside it, `phrase_of`, is the exact inverse of one function
+        // rather than the approximate inverse of two.
+        return tailhawk_core::filter::phrase_source(value, regex, match_case);
     };
     // A column value: numbers and severity-looking names ride bare (severity banding needs the
     // bare name), anything else is quoted.
@@ -3524,7 +3879,6 @@ const DWLP_MSGRESULT: i32 = 0;
 pub const LVS_REPORT: u32 = 0x0001;
 pub const LVS_SINGLESEL: u32 = 0x0004;
 pub const LVS_SHOWSELALWAYS: u32 = 0x0008;
-const LVS_EX_GRIDLINES: u32 = 0x0001;
 pub const LVS_EX_FULLROWSELECT: u32 = 0x0020;
 pub const LVS_EX_CHECKBOXES: u32 = 0x0004;
 const LVM_FIRST: u32 = 0x1000;
@@ -4561,6 +4915,96 @@ pub(crate) fn lv_column(list: HWND, at: i32, title: &str, width: i32) {
             LPARAM(&mut col as *mut LVCOLUMNW as isize),
         );
     }
+    // **Only beside the first column.** The header is created by this very insert and lives as
+    // long as the control, so dressing it again for columns two, three and four is three more
+    // `WM_THEMECHANGED` and three more header repaints for nothing.
+    if at == 0 {
+        lv_dress_header(list);
+    }
+}
+
+/// Dresses a report-view list's header to the theme, **after the columns exist**.
+///
+/// **This is the owner's defect of 2026-10-16**, reported of the Filters dialog as *"the header
+/// columns are not visible, the text is black and the background is black in dark mode"*. Every
+/// dialog here with a list view had it.
+///
+/// **Two things were wrong, and the first fix only looked like the whole of it.** The theme class
+/// was never reaching the header at all: `theme_dialog` walks the window tree at `WM_INITDIALOG`
+/// and `apply_theme_tree` already has a `SysHeader32` arm, but a list view creates its header
+/// **lazily**, on the first `LVM_INSERTCOLUMN` — which happens after that walk. So the one control
+/// that needed dressing was the one the walk could not see.
+///
+/// **And dressing it is not enough**, which `header.rs` already knew and this did not: the dark
+/// class gives the band its dark ground and leaves the title text at the light theme's near-black.
+/// The owner said so of the grid's header a month ago in the same words, and again of this one:
+/// *"the headers are still hard to read in dark mode as the headers are dark and the text is
+/// also"*. The ink of a custom-drawn control's text is the device context's, so it has to be set
+/// at `CDDS_ITEMPREPAINT` — and the header sends that notification to **its own parent, the list
+/// view**, never to the dialog. Hence [`header_proc`]: the list is subclassed so that one message
+/// can be answered.
+///
+/// Called from [`lv_column`] rather than from each dialog, because every one of them was wrong in
+/// the same way and a fix each caller has to remember is a fix four callers will eventually not.
+pub(crate) fn lv_dress_header(list: HWND) {
+    use windows::core::w;
+    let header = lv_header(list);
+    if header.is_invalid() {
+        return;
+    }
+    crate::controls::apply_theme_class(
+        header,
+        tailhawk_core::theme::theme().dark,
+        w!("DarkMode_ItemsView"),
+        w!("ItemsView"),
+    );
+    // Idempotent: `SetWindowSubclass` with the same proc and id replaces rather than stacks, so a
+    // list refilled a hundred times carries one subclass.
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            list,
+            Some(header_proc),
+            HEADER_SUBCLASS,
+            0,
+        );
+    }
+}
+
+/// The id this file's list-view subclass is registered under.
+const HEADER_SUBCLASS: usize = 0x7A11;
+
+/// A report-view list's header window, or an invalid handle before one exists.
+fn lv_header(list: HWND) -> HWND {
+    const LVM_GETHEADER: u32 = LVM_FIRST + 31;
+    let header = unsafe { SendMessageW(list, LVM_GETHEADER, WPARAM(0), LPARAM(0)) };
+    HWND(header.0 as *mut core::ffi::c_void)
+}
+
+/// Answers the header's `NM_CUSTOMDRAW` on the list view's behalf, so its titles are drawn in the
+/// theme's ink. See [`lv_dress_header`] for why this cannot live in the dialog procedure.
+///
+/// Everything else goes straight on to the list view, including the list's *own* custom draw —
+/// that one is sent **by** this window to the dialog and never arrives here.
+unsafe extern "system" fn header_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    if msg == WM_NOTIFY && lparam.0 != 0 {
+        let header = unsafe { &*(lparam.0 as *const NMHDR) };
+        if header.code == crate::header::NM_CUSTOMDRAW && header.hwndFrom == lv_header(hwnd) {
+            if let Some(answer) =
+                unsafe { crate::header::custom_draw(lparam, crate::header::header_ink()) }
+            {
+                return LRESULT(answer);
+            }
+        }
+    }
+    unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 /// Fills a two-column list view with `(name, value)` pairs — the detail window's *Fields* page.
@@ -4621,6 +5065,34 @@ pub(crate) fn lv_row(list: HWND, at: i32, cells: &[String]) {
             mask: LVIF_TEXT,
             iItem: at,
             iSubItem: i as i32 + 1,
+            pszText: PWSTR(text.as_mut_ptr()),
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_SETITEMTEXTW,
+                WPARAM(at as usize),
+                LPARAM(&mut sub as *mut LVITEMW as isize),
+            );
+        }
+    }
+}
+
+/// Rewrites one row's cells in place, leaving the list's columns, scroll and check boxes alone.
+///
+/// **For a list that is rebuilt as somebody types.** A full refill resets the scroll position and
+/// re-selects, and the filters dialog does it on every keystroke so the row keeps up with the
+/// phrase box; doing that by tearing the list down and building it again also meant re-inserting
+/// four columns and re-dressing the header each time. Only the cells change, so only the cells are
+/// written.
+pub(crate) fn lv_set_row(list: HWND, at: i32, cells: &[String]) {
+    for (i, cell) in cells.iter().enumerate() {
+        let mut text = wsz(cell);
+        let mut sub = LVITEMW {
+            mask: LVIF_TEXT,
+            iItem: at,
+            iSubItem: i as i32,
             pszText: PWSTR(text.as_mut_ptr()),
             ..Default::default()
         };
@@ -5026,7 +5498,7 @@ unsafe extern "system" fn import_proc(
                             list,
                             LVM_SETEXTENDEDLISTVIEWSTYLE,
                             WPARAM(0),
-                            LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                            LPARAM(LVS_EX_FULLROWSELECT as isize),
                         );
                     }
                 }
@@ -5220,7 +5692,7 @@ unsafe extern "system" fn format_proc(
                             list,
                             LVM_SETEXTENDEDLISTVIEWSTYLE,
                             WPARAM(0),
-                            LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+                            LPARAM(LVS_EX_FULLROWSELECT as isize),
                         );
                     }
                 }
@@ -5810,33 +6282,130 @@ mod tests {
         );
         assert!(
             at(ID_V_LIST).style & LVS_REPORT != 0,
-            "in report mode, because On and Polarity are columns beside the text"
+            "in report mode, because what a filter is reads in columns beside its text"
         );
         for (id, what) in [
             (ID_V_REMOVE, "delete"),
             (ID_V_EDIT, "edit"),
             (ID_V_ENABLED, "activate/deactivate"),
+            (ID_V_REMOVE_ALL, "clear the list"),
+            (ID_V_UP, "move up"),
+            (ID_V_DOWN, "move down"),
+            (ID_V_CASE, "say case matters"),
+            (ID_V_REGEX, "say it is a regular expression"),
+            (ID_V_ON_INCLUDE, "turn every include filter on"),
+            (ID_V_ON_EXCLUDE, "turn every exclude filter on"),
+            (ID_V_OFF_INCLUDE, "turn every include filter off"),
+            (ID_V_OFF_EXCLUDE, "turn every exclude filter off"),
         ] {
-            assert!(
-                matches!(at(id).class, Class::Button),
-                "no way to {what} a filter"
-            );
+            assert!(matches!(at(id).class, Class::Button), "no way to {what}");
         }
 
         // §7.1 keeps a disabled filter's place *and* its text rather than dropping it, so "off"
-        // has to be something a row can read — which is why it is a column and not an absence.
+        // has to be something a row can read — which is the check box in the first column.
         use tailhawk_core::filter::{Chip, Chips, Polarity};
         let chip = |text: &str, polarity| Chip::parse(text, polarity).expect("a word parses");
         let editor = tailhawk_core::filter::Editor::open(&Chips {
             chips: vec![
                 chip("keep", Polarity::Include),
-                chip("drop", Polarity::Exclude),
+                chip("/drop/", Polarity::Exclude),
+                chip("level >= Warning", Polarity::Include),
             ],
         });
         let rows = filter_row_cells(&editor);
-        assert_eq!(rows.len(), 2, "one row per filter");
-        assert_eq!(rows[0], ["on", "include", "keep"]);
-        assert_eq!(rows[1], ["on", "exclude", "drop"]);
+        assert_eq!(rows.len(), 3, "one row per filter");
+        assert_eq!(rows[0], ["keep", "No", "No", "Include"]);
+        assert_eq!(
+            rows[1],
+            ["/drop/", "Yes", "Yes", "Exclude"],
+            "a regex with no i flag is case-sensitive, and the row says both"
+        );
+        assert_eq!(
+            rows[2],
+            ["level >= Warning", "—", "—", "Include"],
+            "a comparison is neither, and says so rather than answering No twice"
+        );
+    }
+
+    /// **A filter that is off is drawn dim, and one that is on is left alone.**
+    ///
+    /// The conversation's shape is the part worth pinning: answer the first stage with "tell me
+    /// about items" or no item stage ever arrives, and answer a row that is on with *nothing*
+    /// rather than with the list's own colour — which would be a colour claimed rather than
+    /// inherited, and wrong the moment the theme changes under it.
+    #[test]
+    fn a_filter_that_is_off_is_drawn_dim() {
+        const DIM: u32 = 0x0080_8080;
+        let enabled = [true, false];
+        assert!(
+            matches!(
+                filters_dim_for(CDDS_PREPAINT, 0, &enabled, DIM),
+                Swatch::Items
+            ),
+            "without this the item stage never arrives"
+        );
+        assert!(matches!(
+            filters_dim_for(CDDS_ITEMPREPAINT, 0, &enabled, DIM),
+            Swatch::Leave
+        ));
+        assert!(matches!(
+            filters_dim_for(CDDS_ITEMPREPAINT, 1, &enabled, DIM),
+            Swatch::Tint(Some(DIM), None)
+        ));
+        // A row the model does not have is the list and the editor disagreeing for one message,
+        // which happens on every removal. It is not a disabled filter.
+        assert!(matches!(
+            filters_dim_for(CDDS_ITEMPREPAINT, 9, &enabled, DIM),
+            Swatch::Leave
+        ));
+    }
+
+    /// **Every control of the Filters dialog is inside it, and no two are on top of each other.**
+    ///
+    /// Hand-placed dialog units are checked by nothing else here, and the two ways to get them
+    /// wrong are both silent: a control past the template's own width or height is simply not
+    /// drawn, and two that overlap paint over each other in creation order, so the one underneath
+    /// is unreachable by the mouse while still being there for the keyboard. This dialog is laid
+    /// out in a single row of numbers and is the one worth pinning — the option row had to be
+    /// moved to the left edge because `Regular expression` and a radio pair did not fit beside a
+    /// label, and nothing but arithmetic said so.
+    #[test]
+    fn the_filters_dialog_fits_inside_itself() {
+        let items = filters_dialog_items();
+        for item in &items {
+            assert!(
+                item.x >= 0 && item.y >= 0,
+                "{:?} starts outside the dialog at ({}, {})",
+                item.text,
+                item.x,
+                item.y
+            );
+            assert!(
+                item.x + item.w <= V_DIALOG_W,
+                "{:?} runs past the right edge: {} + {} > {V_DIALOG_W}",
+                item.text,
+                item.x,
+                item.w
+            );
+            assert!(
+                item.y + item.h <= V_DIALOG_H,
+                "{:?} runs past the bottom: {} + {} > {V_DIALOG_H}",
+                item.text,
+                item.y,
+                item.h
+            );
+        }
+        for (i, a) in items.iter().enumerate() {
+            for b in items.iter().skip(i + 1) {
+                let apart =
+                    a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+                assert!(
+                    apart,
+                    "{:?} and {:?} overlap: ({}, {}, {}, {}) and ({}, {}, {}, {})",
+                    a.text, b.text, a.x, a.y, a.w, a.h, b.x, b.y, b.w, b.h
+                );
+            }
+        }
     }
 
     /// The Filter dialog reads down one left edge. Every labelled field starts in the same column

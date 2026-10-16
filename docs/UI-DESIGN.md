@@ -267,6 +267,16 @@ filter and format are reached the way the standard Windows applications reach th
   remove, and **OK / Cancel / Apply**, Apply being the owner's: it is what lets a reader see the
   effect of a change without closing. The dialog is movable, so it can be dragged clear of the rows
   it is filtering.
+  **Its arrangement is Hoo WinTail's, from 2026-10-16** — *("I dont really like the ui. I would
+  prefer something like the hoo wintail filter dialog", with a screenshot of its* Set Include &
+  Exclude Filters *window)*. The selected filter reads across the top: phrase, enabled, match case,
+  regular expression, include/exclude. The list below carries every filter with a check box, its
+  text, those two answers and its type, a disabled one drawn dim. The verbs are buttons down the
+  right — New, Remove, Remove all, Up, Down, Edit… — and under the list are Enable and Disable all
+  include and exclude. **Match case and Regular expression are readings of the filter's own text**,
+  not state stored beside it, because §7.2 allows no hidden second representation; over an
+  expression that is not a phrase both are greyed and the list says `—`. **Import and Export are
+  not taken**: there is no filter file to import, and inventing one was not what he asked for.
   **A non-modal, dockable editor is the eventual shape and is deliberately deferred**, because it
   needs docking infrastructure this program does not have — the owner's call, 2026-10-06: "we can
   consider that later, together with implementing a proper docking infrastructure, which we dont
@@ -287,6 +297,8 @@ filter and format are reached the way the standard Windows applications reach th
   one independent predicate, includes before excludes, unknown fields warn rather than silently
   matching nothing. While filters are active the **status bar** carries a live
   `2 filters · 1,204 of 5,000 rows` chip; clicking it shows the panel.
+  **The code went with the design on 2026-10-16**, on the owner's say-so: `filterpanel.rs` had been
+  unreachable since the dialog replaced it, and 670 lines of it were still compiled.
 - **The format picker is a submenu of the Format menu** — Format ▸ Log format lists the detected
   candidates with a radio mark on the one in force, where the old right-edge chip opened a bespoke
   dropdown. Parse health stays visible in the status bar's format chip, which also opens the menu.

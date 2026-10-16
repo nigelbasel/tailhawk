@@ -705,6 +705,64 @@ impl Editor {
         }
     }
 
+    /// Moves the selected filter one place, and keeps the selection on the row that moved.
+    ///
+    /// **Because dragging must not be the only way to reorder** — the accessibility rule that put
+    /// `Move up` and `Move down` on the old panel's row menu, now the dialog's two buttons. Order
+    /// is display order under §7.2, so nothing is filtered again by this; what has to be right is
+    /// that the selection follows, or a second press acts on a different filter.
+    ///
+    /// The offer travels with its own row for the reason [`Self::remove`] shifts it: `offered`
+    /// names an index, and a swap that steps over it would otherwise leave it naming a filter
+    /// somebody typed.
+    pub fn move_selected(&mut self, down: bool) -> bool {
+        let Some(at) = self.selected else {
+            return false;
+        };
+        let to = if down { at + 1 } else { at.wrapping_sub(1) };
+        if to >= self.rows.len() {
+            return false;
+        }
+        self.rows.swap(at, to);
+        self.selected = Some(to);
+        self.offered = match self.offered {
+            Some(o) if o == at => Some(to),
+            Some(o) if o == to => Some(at),
+            keep => keep,
+        };
+        self.dirty = true;
+        true
+    }
+
+    /// Enables or disables every filter of one polarity, leaving the other polarity alone.
+    ///
+    /// **A reader turns off every excluding filter to see what they were hiding**, and wants them
+    /// back afterwards — which is §7.1's disabled filter, keeping its place and its text, done to
+    /// a whole polarity at once.
+    ///
+    /// **An offered row takes no part**, because it is not a filter yet. Without that, `Disable
+    /// all include` over a freshly offered row would count as changing it by hand and OK would put
+    /// a filter reading [`OFFERED`] in force.
+    pub fn set_all(&mut self, polarity: Polarity, enabled: bool) {
+        for at in 0..self.rows.len() {
+            if self.offered == Some(at) || self.rows[at].polarity != polarity {
+                continue;
+            }
+            if self.rows[at].enabled != enabled {
+                self.rows[at].enabled = enabled;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Drops every row, the offered one included: there is nothing left to select.
+    pub fn remove_all(&mut self) {
+        self.rows.clear();
+        self.selected = None;
+        self.offered = None;
+        self.dirty = true;
+    }
+
     /// Removes the selected filter and selects its neighbour.
     ///
     /// **The row after it, or the last one** — the same rule a list control follows, so removing
@@ -745,6 +803,166 @@ impl Editor {
                 .collect(),
         }
     }
+}
+
+/// What a filter's own text says about itself — the phrase, and the two things the boxes beside it
+/// describe.
+///
+/// **The text is the filter, and these are readings of it.** §7.2 allows no hidden second
+/// representation: what the dialog shows is what runs, so `Regular expression` and `Match case` are
+/// not flags stored alongside the expression but answers *about* it. Toggling one rewrites the
+/// expression, and the next reading agrees with what was typed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Phrase {
+    /// The words themselves, with the regex delimiters or the quotes taken off.
+    pub text: String,
+    pub regex: bool,
+    pub match_case: bool,
+    /// The expression is more than a phrase — a comparison, a call, an `and` — so neither box
+    /// describes it and neither may be offered. Wrapping `level >= Warning` in slashes because a
+    /// box was ticked would turn a comparison into a search for its own spelling.
+    pub structured: bool,
+}
+
+/// `/` inside a regex, written so the grammar's delimiter does not end the pattern early.
+///
+/// **The lexer has taken `\/` since it was written** — *"otherwise a path pattern cannot be written
+/// at all, which for a log tool is most of them"* — and the composer did not, so every phrase with
+/// a slash in it composed to something that would not parse. `GET /api` became `/GET /api/`: an
+/// empty regex, then `a`, `p` and `i` read as flags, then a stray delimiter.
+fn escaped_delimiters(text: &str) -> String {
+    text.replace('/', "\\/")
+}
+
+/// And back: the lexer unescapes `\/` into a literal slash, so a reading of the written text has
+/// to do the same or the next write would escape the escape.
+fn unescaped_delimiters(text: &str) -> String {
+    text.replace("\\/", "/")
+}
+
+/// Reads a filter's text. See [`Phrase`].
+pub fn phrase_of(source: &str) -> Phrase {
+    let trimmed = source.trim();
+    // `/…/` and `/…/i` are the grammar's regex forms, and the `i` is its only way of saying that
+    // case does not matter.
+    //
+    // **The grammar decides, not the first and last characters.** `/a/ and /b/i` begins with a
+    // delimiter and ends with one and is not a regex at all — it is an `and` of two — and reading
+    // it as one claimed its text was `a/ and /b`, offered both boxes over it, and would have
+    // rewritten the pair with only the second half's case changed. So the shape is taken from the
+    // ends and then *checked* against what the expression actually parses to.
+    let single_regex = matches!(
+        Chip::parse(trimmed, Polarity::Include),
+        Ok(Chip {
+            predicate: Predicate::Regex { .. },
+            ..
+        })
+    );
+    if single_regex {
+        if let Some(body) = trimmed.strip_prefix('/') {
+            if let Some(inner) = body.strip_suffix("/i") {
+                return Phrase {
+                    text: unescaped_delimiters(inner),
+                    regex: true,
+                    ..Phrase::default()
+                };
+            }
+            if let Some(inner) = body.strip_suffix('/') {
+                return Phrase {
+                    text: unescaped_delimiters(inner),
+                    regex: true,
+                    match_case: true,
+                    ..Phrase::default()
+                };
+            }
+        }
+    }
+    // **The grammar answers, not a second parser.** `Predicate::Text` carries the words with the
+    // quotes already off, which is exactly the phrase — and anything that parses as more than text
+    // is not a phrase at all. Text that does not parse is shown as typed: it is being written.
+    match Chip::parse(trimmed, Polarity::Include) {
+        Ok(Chip {
+            predicate: Predicate::Text { source, .. },
+            ..
+        }) => Phrase {
+            text: source,
+            ..Phrase::default()
+        },
+        Ok(_) => Phrase {
+            text: trimmed.to_owned(),
+            structured: true,
+            ..Phrase::default()
+        },
+        Err(_) => Phrase {
+            text: trimmed.to_owned(),
+            ..Phrase::default()
+        },
+    }
+}
+
+/// Writes a phrase and its two answers back as a filter.
+///
+/// **Ticking `Match case` over plain text changes the kind of filter**, because the grammar's only
+/// case-sensitive form is a regex without the `i` flag. The text becomes one, the escaping keeps it
+/// meaning its own letters, and reading it back says `Regular expression` — which is the truth and
+/// is visible in the phrase box, rather than a box that quietly does nothing.
+///
+/// **The phrase itself is never edited to make it fit.** Three things used to be quietly changed
+/// on the way through, each of which alters what the filter matches: a `/` ended the pattern early
+/// and left something that would not parse, the words were trimmed, and a `"` was **deleted**.
+/// A slash is escaped, the spacing is kept, and a phrase carrying a quotation mark — which the
+/// grammar's quoted token has no escape for — is written as a case-insensitive regex over its own
+/// letters, which is the same filter.
+pub fn phrase_source(text: &str, regex: bool, match_case: bool) -> String {
+    let literal = || escaped_delimiters(&crate::search::Pattern::escape(text));
+    if regex {
+        let body = escaped_delimiters(text);
+        return if match_case {
+            format!("/{body}/")
+        } else {
+            format!("/{body}/i")
+        };
+    }
+    if match_case {
+        return format!("/{}/", literal());
+    }
+    // Verbatim when the parser reads it back as exactly these words — `timeout`. Quoted when it
+    // would otherwise read as an expression, or when the spacing would not survive, because
+    // `level >= Warning` and `ERROR ` must both mean their own letters.
+    if let Ok(Chip {
+        predicate: Predicate::Text { source, .. },
+        ..
+    }) = Chip::parse(text, Polarity::Include)
+    {
+        if source == text {
+            return text.to_owned();
+        }
+    }
+    if text.contains('"') {
+        return format!("/{}/i", literal());
+    }
+    format!("\"{text}\"")
+}
+
+/// Widths for the filters list's four columns — the filter, match case, regular expression, type —
+/// apportioned to the width the list actually has.
+///
+/// The sources editor's `column_widths` is the same decision and carries the argument: fixed widths
+/// overflowed a list nobody had measured, and a first draft of the arithmetic produced a column of
+/// width -4 from the zero the shell reports when it cannot measure at all. Each column is floored
+/// at something a word fits in and the rest is shared out.
+pub fn column_widths(total: i32) -> [i32; 4] {
+    const SHARE: [i32; 4] = [55, 12, 18, 15];
+    const FLOOR: i32 = 36;
+    let total = total.max(FLOOR * SHARE.len() as i32);
+    let spare = i64::from(total - FLOOR * SHARE.len() as i32);
+    let mut out = [FLOOR; 4];
+    for (slot, share) in out.iter_mut().zip(SHARE) {
+        *slot += (spare * i64::from(share) / 100) as i32;
+    }
+    // The remainder goes on the filter's own text, which is the column that wants it.
+    out[0] += total - out.iter().sum::<i32>();
+    out
 }
 
 /// Where a chip's text stopped making sense, and what was expected there.
@@ -2028,5 +2246,289 @@ mod tests {
             "what is left is `b` alone: the offer is still an offer, not a filter"
         );
         assert_eq!(editor.commit().chips[0].source, "b");
+    }
+
+    /// **What a filter's own text says about itself**, which is what the two boxes beside the
+    /// phrase are reading. The grammar has exactly three shapes to tell apart, and the fourth
+    /// case — an expression that is not a phrase at all — must say so rather than answer `No`
+    /// twice and invite a click that would wrap `level >= Warning` in slashes.
+    #[test]
+    fn a_filter_says_whether_it_is_a_regular_expression_and_whether_case_matters() {
+        let read = |source: &str| {
+            let p = phrase_of(source);
+            (p.text, p.regex, p.match_case, p.structured)
+        };
+        assert_eq!(
+            read("timeout"),
+            ("timeout".to_owned(), false, false, false),
+            "plain text is §7.2's case-insensitive substring"
+        );
+        assert_eq!(
+            read("/err.*/i"),
+            ("err.*".to_owned(), true, false, false),
+            "the i flag is the grammar's only way to say case does not matter in a regex"
+        );
+        assert_eq!(
+            read("/err.*/"),
+            ("err.*".to_owned(), true, true, false),
+            "and without it, case matters"
+        );
+        assert!(
+            read("level >= Warning").3,
+            "a comparison is not a phrase, and neither box describes it"
+        );
+        assert!(read("contains(message, \"timeout\")").3, "nor is a call");
+        // A lone slash is not a regex, and must not be read as one — `strip_prefix` alone would.
+        assert_eq!(read("/"), ("/".to_owned(), false, false, false));
+    }
+
+    /// **The two boxes write back through the same reading**, so a filter the dialog composed is
+    /// one the dialog can read again. Ticking `Match case` over plain text is the one case that
+    /// changes the *kind* of filter — the grammar's only case-sensitive form is a regex, so the
+    /// text becomes one and the `Regular expression` box ticks itself. That is surfaced rather
+    /// than hidden: the phrase box shows the slashes.
+    #[test]
+    fn what_the_boxes_write_is_what_the_boxes_read() {
+        for (text, regex, case) in [
+            ("timeout", false, false),
+            ("err.*", true, false),
+            ("err.*", true, true),
+        ] {
+            let source = phrase_source(text, regex, case);
+            let back = phrase_of(&source);
+            assert_eq!(
+                (back.text.as_str(), back.regex, back.match_case),
+                (text, regex, case),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            phrase_source("timeout", false, true),
+            "/timeout/",
+            "case-sensitive plain text has to become a regex: the grammar has no other form"
+        );
+        assert!(
+            phrase_of(&phrase_source("timeout", false, true)).regex,
+            "and it says so when read back, rather than claiming to be plain text"
+        );
+        // Text that would parse as something else is quoted, or `level >= Warning` typed into the
+        // phrase box would silently become a comparison rather than the words themselves.
+        assert_eq!(
+            phrase_source("level >= Warning", false, false),
+            "\"level >= Warning\""
+        );
+    }
+
+    /// **Up and Down, because dragging must not be the only way** — the rule that put `Move up`
+    /// on the panel's row menu before the panel went. Order is display order under §7.2, so
+    /// nothing is filtered again; what matters is that the selection follows the row it moved,
+    /// or the second press acts on a different filter.
+    #[test]
+    fn a_filter_moves_up_and_down_and_the_selection_goes_with_it() {
+        let live = chips_of(&[
+            ("a", Polarity::Include),
+            ("b", Polarity::Include),
+            ("c", Polarity::Include),
+        ]);
+        let mut editor = Editor::open(&live);
+        editor.select(Some(2));
+        assert!(editor.move_selected(false), "c moves up");
+        assert_eq!(editor.selected(), Some(1));
+        let order: Vec<&str> = editor.rows().iter().map(|c| c.source.as_str()).collect();
+        assert_eq!(order, ["a", "c", "b"]);
+
+        assert!(editor.move_selected(true), "and back down");
+        assert_eq!(editor.selected(), Some(2));
+
+        assert!(!editor.move_selected(true), "nothing below the last");
+        editor.select(Some(0));
+        assert!(!editor.move_selected(false), "nor above the first");
+    }
+
+    /// An offered row is not a filter, so a move that steps over it carries the offer with it —
+    /// the same bookkeeping `remove` does, for the same reason: `offered` names an index.
+    #[test]
+    fn moving_a_row_past_the_offer_keeps_the_offer_on_its_own_row() {
+        let live = chips_of(&[("a", Polarity::Include), ("b", Polarity::Include)]);
+        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        assert_eq!(editor.offered(), Some(2));
+        editor.select(Some(1));
+        assert!(editor.move_selected(true), "b swaps with the offered row");
+        assert_eq!(editor.offered(), Some(1), "the offer moved with its row");
+        assert_eq!(
+            editor.commit().chips.len(),
+            2,
+            "and is still not a filter: a and b"
+        );
+    }
+
+    /// **The four bulk verbs act on a polarity**, which is what makes them worth having: a reader
+    /// turns off every excluding filter to see what they were hiding, without losing them.
+    ///
+    /// **A row nobody typed into is left out of all four**, because it is not a filter yet — and
+    /// `Disable all include` over a freshly offered row would otherwise mark it changed by hand
+    /// and put a filter reading `new` in force.
+    #[test]
+    fn enabling_or_disabling_every_filter_of_one_polarity_leaves_the_others_alone() {
+        let live = chips_of(&[
+            ("a", Polarity::Include),
+            ("b", Polarity::Exclude),
+            ("c", Polarity::Include),
+        ]);
+        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        assert_eq!(editor.offered(), Some(3));
+
+        editor.set_all(Polarity::Include, false);
+        let state: Vec<bool> = editor.rows().iter().map(|c| c.enabled).collect();
+        assert_eq!(
+            state,
+            [false, true, false, true],
+            "both includes off, the exclude untouched, and the offered row untouched"
+        );
+        assert_eq!(editor.offered(), Some(3), "still only an offer");
+        assert_eq!(
+            editor.commit().chips.len(),
+            3,
+            "so OK adds no fourth filter"
+        );
+
+        editor.set_all(Polarity::Include, true);
+        assert!(editor.rows().iter().all(|c| c.enabled));
+    }
+
+    /// Remove all empties the list and leaves nothing selected — including the offered row, which
+    /// is on the list even though it is not a filter.
+    #[test]
+    fn remove_all_empties_the_list() {
+        let live = chips_of(&[("a", Polarity::Include), ("b", Polarity::Exclude)]);
+        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        editor.remove_all();
+        assert!(editor.rows().is_empty());
+        assert_eq!(editor.selected(), None);
+        assert_eq!(editor.offered(), None);
+        assert!(editor.dirty(), "there is something to apply");
+        assert!(editor.commit().chips.is_empty());
+    }
+
+    /// The four columns fit the list they are in, and the narrowest case the shell can hand over
+    /// — zero, which is what `GetClientRect` reports when it cannot measure — still produces four
+    /// columns a word fits in. `sourceset::column_widths` was caught giving one a width of -4.
+    #[test]
+    fn the_filter_lists_columns_fit_the_width_they_are_given() {
+        for total in [0, 1, 120, 520, 1400] {
+            let widths = column_widths(total);
+            assert!(
+                widths.iter().all(|w| *w >= 36),
+                "{total}: {widths:?} has a column too narrow to read"
+            );
+            if total >= 36 * 4 {
+                assert_eq!(
+                    widths.iter().sum::<i32>(),
+                    total,
+                    "{total}: the row fills the list exactly"
+                );
+            }
+        }
+        assert!(
+            column_widths(520)[0] > column_widths(520)[3],
+            "the filter's own text gets the room"
+        );
+    }
+
+    /// **A phrase with a slash in it is the commonest phrase a log tool has**, and both option
+    /// boxes used to make one unparsable: `/api` composed as `//api/`, which the lexer reads as an
+    /// empty regex followed by the flags `a`, `p`, `i` and then a stray delimiter. The grammar has
+    /// had `\/` since it was written — its own comment says *"otherwise a path pattern cannot be
+    /// written at all, which for a log tool is most of them"* — and this is the composer finally
+    /// using it.
+    #[test]
+    fn a_phrase_with_a_slash_in_it_survives_both_boxes() {
+        for (text, regex, case) in [
+            ("GET /api/v2", false, false),
+            ("GET /api/v2", false, true),
+            ("GET /api/v2", true, true),
+            ("GET /api/v2", true, false),
+        ] {
+            let source = phrase_source(text, regex, case);
+            assert!(
+                Chip::parse(&source, Polarity::Include).is_ok(),
+                "{source:?} does not parse"
+            );
+            let back = phrase_of(&source);
+            assert_eq!(back.text, text, "{source:?} reads back as something else");
+            // Case matters either way round; whether it is *called* a regular expression
+            // afterwards is `what_the_boxes_write_is_what_the_boxes_read`'s subject, because
+            // ticking `Match case` over plain text is how the grammar says case-sensitive.
+            assert_eq!(back.match_case, case, "{source:?}");
+            if regex {
+                assert!(back.regex, "{source:?} stopped being a regular expression");
+            }
+        }
+    }
+
+    /// **Whitespace inside a phrase is part of the phrase.** `/ERROR /i` and `/^\s+at /i` are both
+    /// filters somebody wrote on purpose — the trailing space is what keeps `ERROR ` off
+    /// `ERRORS`, and a stack-trace filter is nothing without it. Composing used to trim, so
+    /// clicking either box widened the filter with nothing on screen saying so.
+    #[test]
+    fn whitespace_inside_a_phrase_is_part_of_it() {
+        for (text, regex, case) in [
+            ("ERROR ", true, false),
+            ("ERROR ", false, false),
+            (" at ", false, false),
+        ] {
+            let source = phrase_source(text, regex, case);
+            assert!(
+                Chip::parse(&source, Polarity::Include).is_ok(),
+                "{source:?} does not parse"
+            );
+            assert_eq!(
+                phrase_of(&source).text,
+                text,
+                "{source:?} lost the space it was written with"
+            );
+        }
+    }
+
+    /// **A quotation mark cannot be written inside a quoted value**, because the lexer's quoted
+    /// token has no escape — so the composer used to *delete* it, and `say "hi"` quietly became
+    /// `say hi`, which matches different lines. The grammar's regex token takes a `"` happily, and
+    /// a case-insensitive regex over the escaped letters is the same filter, so that is what it
+    /// composes instead of mangling the words.
+    #[test]
+    fn a_phrase_with_a_quotation_mark_keeps_it() {
+        let source = phrase_source("say \"hi\"", false, false);
+        let chip = Chip::parse(&source, Polarity::Include).expect("composes to something legal");
+        let said = record("he did say \"hi\" again");
+        assert!(
+            chip.predicate.eval(&said).acts(),
+            "{source:?} no longer matches the line it was written for"
+        );
+        let other = record("he did say hi again");
+        assert!(
+            !chip.predicate.eval(&other).acts(),
+            "{source:?} matches a line without the quotes, so the quotes were dropped"
+        );
+    }
+
+    /// **Two regexes joined by `and` are not one regex**, however the whole expression begins and
+    /// ends. Reading the delimiters alone said `/a/ and /b/i` was a case-insensitive regex whose
+    /// text is `a/ and /b` — so the list claimed Yes and No about it, both boxes were offered, and
+    /// ticking one would have rewritten the pair with only the second half's case changed. The
+    /// grammar decides instead.
+    #[test]
+    fn an_expression_that_merely_starts_and_ends_with_a_slash_is_not_a_regex() {
+        let joined = phrase_of("/a/ and /b/i");
+        assert!(
+            joined.structured,
+            "an and of two regexes is an expression, not a phrase: {joined:?}"
+        );
+        assert!(!joined.regex, "{joined:?}");
+        assert_eq!(joined.text, "/a/ and /b/i", "shown as written");
+
+        // And one that really is a single regex still reads as one.
+        let single = phrase_of("/a and b/i");
+        assert!(!single.structured && single.regex);
+        assert_eq!(single.text, "a and b");
     }
 }

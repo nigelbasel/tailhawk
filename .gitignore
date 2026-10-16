@@ -11,3 +11,8 @@ logs/
 # `docs/HANDOFF.md` is the committed record; these are tooling state and do not belong in a
 # public repository's root.
 SESSION-STATUS-*.md
+
+# Reference screenshots the owner drops here while describing what he wants. CLEANROOM.md §3
+# admits other products as *observable behaviour*; a picture of their window is not ours to
+# redistribute, so it is read and left out of the repository.
+Screenshot*.png

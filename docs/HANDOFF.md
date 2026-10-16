@@ -1,6 +1,123 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-15: there were two filter dialogs, and the one you could find had no list
+## ▶ Resume point — 2026-10-16: the panel is gone, and the filters dialog is WinTail's shape
+
+**285 shell + 1023 core, 0 failed; fmt and clippy clean; `portable-core` checked on the Linux
+target** (its one warning, `Cancel::flag` in `search.rs`, is older than this work).
+
+**Two commits.** `202eae8` removes the filter panel; the dialog rebuild follows it. CI by SHA on the
+first: run 38872275728, success on all five jobs —
+https://github.com/nigelbasel/tailhawk/actions/runs/38872275728
+
+**He asked for the cleanup and, while it was running, reported the dialog.** Three things in one
+message: the list's column titles were *"black and the background is black in dark mode"*, he did
+not like the grid lines, and he did not like the UI — *"I would prefer something like the hoo
+wintail filter dialog"*, with a screenshot of its **Set Include & Exclude Filters** window saved in
+the repo root. Asked how far to follow it, he chose **layout and verbs, our grammar**.
+
+### The header defect was two defects, and the second one had been solved here before
+
+**First:** a list view creates its `SysHeader32` **lazily, on the first `LVM_INSERTCOLUMN`**.
+`theme_dialog` walks the window tree at `WM_INITDIALOG`, and `apply_theme_tree` has had a
+`SysHeader32` arm since a review found five dialogs reproducing the grid header's defect — but the
+columns go in *after* that walk, so the one control that needed `DarkMode_ItemsView` was the one
+control the walk could not see. **It cannot be found by reading the theming code**, which is
+correct and documents this very case; the only tell is that the columns are inserted later.
+
+**Second, and this is the one to remember:** the dark class gives the band its dark ground and
+**leaves the title text at the light theme's near-black**. He said so after the first fix shipped —
+*"the headers are still hard to read in dark mode as the headers are dark and the text is also"* —
+and `header.rs` already knew it. `header::custom_draw`'s own doc comment quotes him saying the same
+thing about the **grid's** header a month earlier, and the answer there was `NM_CUSTOMDRAW` plus
+`SetTextColor` at `CDDS_ITEMPREPAINT`, because the ink of a custom-drawn control's text is the
+device context's. The precedent was open on screen and read past.
+
+**Why it needed a subclass.** A list view's header sends `NM_CUSTOMDRAW` to **its own parent — the
+list view** — and never to the dialog, so no dialog procedure can answer it. `lv_dress_header`
+therefore subclasses the list (`header_proc`, idempotent, the `tabstrip.rs` idiom) and answers that
+one notification through `header::custom_draw(lparam, header::header_ink())`, which takes both
+themes' ink from the theme the way the grid header does. Everything else goes to `DefSubclassProc`,
+including the list's *own* custom draw, which is sent by that window and never arrives there.
+
+**The lesson is the general one:** when a defect has been met in this codebase before, read the fix
+that was written for it before inventing another.
+
+### What the dialog is now
+
+The selected filter reads across the top — phrase, **Enable**, **Match case**, **Regular
+expression**, **Include** / **Exclude**. The list below carries every filter: a check box for §7.1's
+enabled mark, its text, those two answers, and its type; a filter that is off is drawn in the hint
+ink. The verbs are buttons down the right — OK, Cancel, Apply, then New, Remove, Remove all, Up,
+Down, Edit… — and the four bulk acts sit under the list: Enable and Disable, all include and all
+exclude.
+
+**`Match case` and `Regular expression` are readings of the filter's own text, not state beside
+it.** §7.2 allows no hidden second representation, so `phrase_of` reads what the text already says
+and `phrase_source` writes it back; the two are inverses and live in the model, and
+`compose_filter`'s any-column branch now calls the same function. Ticking a box rewrites the phrase
+*visibly*. Ticking `Match case` over plain text produces a **regular expression**, because that is
+the grammar's only case-sensitive form — the slashes appear in the box and the other tick follows,
+which is the truth rather than a box that quietly does nothing. Over an expression that is not a
+phrase at all both boxes are greyed and the list says `—` rather than `No`.
+
+**`Up` and `Down` are the capability the panel's removal took**, rebuilt in the model where it can
+be tested: `Editor::move_selected`, against `Document::move_chip`, which was reachable only from a
+context menu on a panel that was never created.
+
+**`set_all` leaves an offered row alone**, and that is mutation-verified: without it `Disable all
+include` over a freshly offered row counts as a change by hand, and OK puts a filter reading `new`
+in force. That is the defect the offer mechanism exists to prevent, reached through a new button —
+the same shape as the one found by re-reading the diff on 2026-10-15.
+
+**Grid lines are gone from every list dialog**, not just this one. He dislikes them; say so if you
+are tempted to put them back.
+
+### The review found four defects in the model, and all four changed what a filter matches
+
+Worth reading, because each one is the same shape: a composer quietly editing the words it was
+given, where the right answer was to use a form of the grammar that already existed.
+
+- **A `/` in a phrase composed to something that does not parse.** `GET /api` → `/GET /api/`: an
+  empty regex, then `a`, `p` and `i` read as flags, then a stray delimiter. The lexer has taken
+  `\/` since it was written and **its own comment says path patterns need it** — the composer just
+  never emitted it. For a log viewer this is the commonest phrase there is.
+- **The write trimmed and the read did not**, so `/ERROR /i` became `/ERROR/` and a stack-trace
+  filter `/^\s+at /i` lost the space it was written for. The filter then matched more lines, with
+  nothing on screen saying so. The plain form now quotes whenever the spacing would not survive.
+- **A `"` was deleted outright**, so `say "hi"` became `say hi`. The quoted token has no escape —
+  so a phrase with a quotation mark is now a case-insensitive regex over its own letters, which is
+  the same filter instead of a shorter one.
+- **`/a/ and /b/i` was read as one regex** whose text is `a/ and /b`, because the test was the
+  first and last characters rather than the grammar. Now gated on `Chip::parse` returning a single
+  `Predicate::Regex`.
+
+In the shell: one `LVN_ITEMCHANGED` can be both a selection change and a check change, so handling
+them as alternatives dropped the tick — and the next refill wrote it back from the model, so it
+looked like it took and then reverted. Read the boxes first and unconditionally, bounded by the
+list's own item count. Also: an option click no longer discards half-typed text that does not
+parse, a button that disables itself no longer takes the keyboard with it, and the per-keystroke
+refresh writes one row's cells instead of rebuilding the list.
+
+### What wants his eyes
+
+- The header titles, in **dark mode** — confirmed wrong once already after the first attempt, so
+  worth looking at in the other four list dialogs too (Remote sources, Highlight rules, Define
+  Format, Select Columns), which all take the same route through `lv_column`.
+- `Ctrl+L` still landing in the phrase box with the placeholder selected, now that the box has moved
+  to the top of a taller dialog.
+- The four bulk buttons, the dimmed row, and whether `Edit…` still round-trips through the composer.
+- **The one worth testing deliberately**, carried over from 2026-10-15 and still unverified: open
+  the list over an existing *include* filter and press OK without touching anything. It used to
+  invert the filter.
+
+### Not done, deliberately
+
+- **Import and Export of filters.** He was offered them and chose the layout without. There is no
+  filter file in this program and inventing a format was not what he asked for.
+- The WinTail screenshot stays **untracked**. `CLEANROOM.md` §3 allows that product as *observable
+  behaviour only*; looking at their window is not the same as committing it.
+
+## ▶ Earlier — 2026-10-15: there were two filter dialogs, and the one you could find had no list
 
 **288 shell + 1012 core, fmt and clippy clean, `portable-core` checked on the Linux target.**
 
@@ -289,7 +406,7 @@ Manager.
 
 ---
 
-## ▶ Resume point — 2026-10-08/09: he used it all day and reported fourteen things
+## ▶ Earlier — 2026-10-08/09: he used it all day and reported fourteen things
 
 **Master `b010731`, green on all five CI jobs by SHA
 (https://github.com/nigelbasel/tailhawk/actions/runs/37799143905). 286 shell + 998 core. Tree clean.**
@@ -455,7 +572,7 @@ had two — so the layout he set *after* the verification also survived.
 ---
 
 
-## ▶ Resume point — 2026-10-05: the welcome list reads correctly, and there is one resize grip
+## ▶ Earlier — 2026-10-05: the welcome list reads correctly, and there is one resize grip
 
 **Master `83cda63`, green on all five CI jobs by SHA. 269 shell + 972 core.**
 
