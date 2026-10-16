@@ -20,7 +20,6 @@ mod controls;
 mod darkmode;
 mod detailwin;
 mod dialog;
-mod filterpanel;
 mod gridtext;
 mod header;
 mod icon;
@@ -299,9 +298,6 @@ struct Document {
     /// §2.5's header as the real control, one per pane, created by the shell the first time this
     /// pane is laid out with a layout. `None` until then, and the painter draws the band instead.
     header_ctl: Option<header::Header>,
-    /// Section 2.1's filter panel as Windows controls, one per document like the header control, placed
-    /// over the band this document reserves. Created the first frame the panel is shown.
-    filter_ctl: Option<filterpanel::FilterPanel>,
     /// The control's band in pixels — `HDM_LAYOUT`'s answer — which the view reserves in place of
     /// the drawn band's row height once the control exists.
     header_band: f32,
@@ -333,13 +329,8 @@ struct Document {
     detail: DetailPane,
     /// E21's export or live tee, while one is in progress.
     tee: Option<Tee>,
-    /// The filter panel's selected row, for Edit… and Remove to act on.
-    filter_selected: Option<usize>,
     /// Whether this pane draws the status bar — the bottom pane of a split does, the top does not.
     show_footer: bool,
-    /// §2.1's docked filter panel: shown by `Ctrl+L`, adding a chip, or View ▸ Filter panel, and
-    /// hideable — the VS tool-window posture, fixed rather than floating.
-    show_filters: bool,
     /// Where this pane's top edge is in the client, so a click can be made pane-relative.
     pane_top: f32,
     /// The pane's left edge in client pixels — zero unless the tab is split side by side.
@@ -791,7 +782,6 @@ impl Document {
             header: layout.as_ref().map(Layout::header),
             id: next_document_id(),
             header_ctl: None,
-            filter_ctl: None,
             header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             fitted_for: None,
@@ -808,8 +798,6 @@ impl Document {
             detail: DetailPane::default(),
             tee: None,
             show_footer: true,
-            show_filters: false,
-            filter_selected: None,
             pane_top: 0.0,
             pane_left: 0.0,
             pump: None,
@@ -870,7 +858,6 @@ impl Document {
             header: layout.as_ref().map(Layout::header),
             id: next_document_id(),
             header_ctl: None,
-            filter_ctl: None,
             header_band: 0.0,
             column_defaults: layout.as_ref().map(|l| l.widths.clone()),
             fitted_for: None,
@@ -887,8 +874,6 @@ impl Document {
             detail: DetailPane::default(),
             tee: None,
             show_footer: true,
-            show_filters: false,
-            filter_selected: None,
             pane_top: 0.0,
             pane_left: 0.0,
             pump: Some(pump),
@@ -946,8 +931,7 @@ impl Document {
         } else {
             0.0
         };
-        let panel = self.filter_band_px(row_h);
-        self.view.set_footer_px(footer + panel);
+        self.view.set_footer_px(footer);
         // The band is the control's height once the control exists, and the drawn band's row
         // height until then — never a constant, for the reason every native surface here gives.
         self.view
@@ -1258,14 +1242,6 @@ impl Document {
         self.filtering.filtered()
     }
 
-    /// The filter the panel's list has selected, if it still exists — what Edit filter… and Remove
-    /// filter act on. A selection past the end is no selection: a chip removed by another path must
-    /// not leave the menu pointing at nothing.
-    fn selected_filter(&self) -> Option<usize> {
-        self.filter_selected
-            .filter(|at| *at < self.filtering.chips.chips.len())
-    }
-
     /// Whether there is a save to stop — a live one from "Keep saving…", or a one-shot export
     /// still in flight.
     ///
@@ -1349,7 +1325,6 @@ impl Document {
                 }
                 _ => Vec::new(),
             },
-            filters_hidden: !self.show_filters,
         })
     }
 
@@ -1366,11 +1341,6 @@ impl Document {
                 self.filtering.chips.chips.push(chip);
             }
         }
-        // Chips that arrive without a keystroke — `--filter=`, a file's remembered state — bring
-        // their panel with them unless this file was closed with it hidden. §1.1 forbids filters
-        // in force with nothing saying so, and until the status line counted them the panel was
-        // the only thing that could: hence `filters_hidden` is the newer half of a pair, and
-        // honouring it is only safe because `▼ n filters · k of m` now says it too.
         self.filtering.records_only = state.collapse && self.detection.accepted.is_some();
         self.filtering.error = None;
         self.bookmarks.extend(state.bookmarks.iter().copied());
@@ -1875,95 +1845,6 @@ impl Document {
     }
 
     /// Drops every chip and the survivors with them: the unfiltered view.
-    /// Removes chip `i` and keeps the panel's selection honest: the removed row deselects, and a
-    /// selection past it slides up — every removal path comes through here, because the one that
-    /// did not once left the panel's Remove acting on the wrong chip.
-    fn remove_chip(&mut self, i: usize) {
-        if i >= self.filtering.chips.chips.len() {
-            return;
-        }
-        self.remember();
-        self.filtering.chips.chips.remove(i);
-        self.filter_selected = match self.filter_selected {
-            Some(s) if s == i => None,
-            Some(s) if s > i => Some(s - 1),
-            keep => keep,
-        };
-        self.filtering.clear_results();
-        self.refilter();
-        {
-            let rows = self.view_rows();
-            self.view.grid_mut().set_total_rows(rows);
-        }
-    }
-
-    /// Flips chip `i`'s enabled mark and reruns the sieve — the panel's `[x]` and the row menu's
-    /// Enabled item, one decision.
-    fn flip_chip_enabled(&mut self, i: usize) {
-        if i >= self.filtering.chips.chips.len() {
-            return;
-        }
-        self.remember();
-        let chip = &mut self.filtering.chips.chips[i];
-        chip.enabled = !chip.enabled;
-        self.filtering.clear_results();
-        self.refilter();
-        let rows = self.view_rows();
-        self.view.grid_mut().set_total_rows(rows);
-    }
-
-    /// The filter panel's band in pixels: one answer, asked by the reserver in `lay_out` and by the
-    /// shell placing the panel over it, from the list's own row and frame once the panel exists and
-    /// from the chrome row's until then.
-    fn filter_band_px(&self, row_h: f32) -> f32 {
-        let band = self.band_h(row_h);
-        let (row, frame) = self
-            .filter_ctl
-            .as_ref()
-            .map(|p| p.metrics())
-            .unwrap_or((band + 2.0, 4.0));
-        filterpanel::band_height(
-            self.filtering.chips.chips.len(),
-            self.show_filters,
-            row,
-            frame,
-        )
-    }
-
-    /// Moves chip `from` to position `to`, reporting a change. Order is display-only (section 7.2), so
-    /// nothing is filtered again; the selection follows the chip that moved. The panel's `Move up`
-    /// and `Move down` use this, because a reorder that could only be dragged is one the keyboard
-    /// cannot do.
-    fn move_chip(&mut self, from: usize, to: usize) -> bool {
-        let chips = &mut self.filtering.chips.chips;
-        if from >= chips.len() || to >= chips.len() || from == to {
-            return false;
-        }
-        let chip = chips.remove(from);
-        chips.insert(to, chip);
-        if self.filter_selected == Some(from) {
-            self.filter_selected = Some(to);
-        }
-        true
-    }
-
-    /// Flips chip `i`'s polarity the same way — the panel's sign and the row menu's item.
-    fn flip_chip_polarity(&mut self, i: usize) {
-        if i >= self.filtering.chips.chips.len() {
-            return;
-        }
-        self.remember();
-        let chip = &mut self.filtering.chips.chips[i];
-        chip.polarity = match chip.polarity {
-            Polarity::Include => Polarity::Exclude,
-            Polarity::Exclude => Polarity::Include,
-        };
-        self.filtering.clear_results();
-        self.refilter();
-        let rows = self.view_rows();
-        self.view.grid_mut().set_total_rows(rows);
-    }
-
     fn clear_filter(&mut self) {
         if !self.filtering.filtered() {
             return;
@@ -1975,7 +1856,6 @@ impl Document {
         // — so Esc on a traced view cleared nothing, left the trace on, and emptied the survivors
         // into a blank grid that no pass would refill. "Clear filters" means all of them.
         self.filtering.trace = None;
-        self.filter_selected = None;
         self.filtering.error = None;
         self.filtering.clear_results();
         // And a pass, for the same reason `follow_trace` needs one: the survivors are gone until
@@ -3604,11 +3484,6 @@ enum Command {
     /// kind of drift that left two of the items below permanently greyed.
     OpenFilters,
     ClearFilter,
-    /// The filter the panel's list has selected, in the Filter dialog. The owner, 2026-09-15:
-    /// commands are on the menu bar, not on buttons inside a pane.
-    EditFilter,
-    /// And removed — the panel's `Delete`, on the menu bar where it can be found.
-    RemoveFilter,
     ToggleCollapse,
     RevealInvisibles,
     ToggleBookmark,
@@ -5041,7 +4916,6 @@ impl Shell {
                             labels: Vec::new(),
                             columns: Vec::new(),
                             column_order: Vec::new(),
-                            filters_hidden: false,
                         });
                     }
                     // **`state_key`, not the path** — for a remote source those differ, and that
@@ -5760,9 +5634,6 @@ impl Shell {
                         if let Some(ctl) = doc.header_ctl.as_mut() {
                             ctl.place(0, 0, 0, 0, false);
                         }
-                        if let Some(panel) = doc.filter_ctl.as_mut() {
-                            panel.place(0, 0, 0, 0, false);
-                        }
                     }
                 }
                 let panes = self.document.panes_mut();
@@ -5775,9 +5646,6 @@ impl Shell {
                         // own rows, answering to its own gestures.
                         if let Some(ctl) = doc.header_ctl.as_mut() {
                             ctl.place(0, 0, 0, 0, false);
-                        }
-                        if let Some(panel) = doc.filter_ctl.as_mut() {
-                            panel.place(0, 0, 0, 0, false);
                         }
                         continue;
                     };
@@ -5822,19 +5690,6 @@ impl Shell {
                         .as_ref()
                         .map(|h| h.band_height(width as i32) as f32)
                         .unwrap_or(0.0);
-                    // The filter panel is made before the layout, not after it: `lay_out` reserves
-                    // its band from the panel's own measured heights, and a panel made afterwards
-                    // would be placed from those while its first band was reserved from a guess.
-                    if doc.show_filters && doc.filter_ctl.is_none() {
-                        doc.filter_ctl = filterpanel::FilterPanel::create(hwnd);
-                    }
-                    // Filled before the layout too: a row can only be measured once the list holds
-                    // one, and a band reserved from a guessed row height clips the rows it shows.
-                    let rows = filterpanel::list_rows_of(&doc.filtering.chips.chips);
-                    let selected = doc.filter_selected;
-                    if let Some(panel) = doc.filter_ctl.as_mut() {
-                        panel.set(&rows, selected);
-                    }
                     doc.lay_out(cell, (width as u32, height as u32));
                     header::trace("shell: pane laid out");
                     // Filled and placed after the layout, from the same boxes the drawn band used,
@@ -5872,18 +5727,6 @@ impl Shell {
                                 shown,
                             );
                         }
-                    }
-                    // Section 2.1's filter panel as Windows controls: filled from the chips, and
-                    // placed over the band `lay_out` just reserved from the same `filter_band_px`.
-                    let panel_px = doc.filter_band_px(cell.1).round() as i32;
-                    if let Some(panel) = doc.filter_ctl.as_mut() {
-                        panel.place(
-                            x.round() as i32,
-                            (top + height).round() as i32 - panel_px,
-                            width.round() as i32,
-                            panel_px,
-                            panel_px > 0,
-                        );
                     }
                     // The highlighter's frame budget starts here, alongside the painter's own
                     // `begin_frame` inside `paint_panes` — one frame, one budget, §11.3.
@@ -6606,12 +6449,6 @@ impl Shell {
                     windows::core::w!("DarkMode_ItemsView"),
                     windows::core::w!("ItemsView"),
                 );
-            }
-        }
-        // And every document's filter panel, whose brush and control classes follow the theme too.
-        for (_, doc) in self.document.all_mut() {
-            if let Some(panel) = doc.filter_ctl.as_mut() {
-                panel.adopt_theme();
             }
         }
         // The *name*, not the resolved palette: "system" is an instruction, and storing what it
@@ -7396,21 +7233,10 @@ impl Shell {
                 self.reload_rules(hwnd);
                 return true;
             }
-            // F6 moves between panes, and the filter panel is one: from the log into the panel when
-            // it is shown, and otherwise to the other pane of a split. Inside the panel, F6 and Esc
-            // bring the keyboard back — see `filter_panel_escape`.
+            // F6 moves between the panes of a split.
             Command::FocusOtherPane => {
-                let panel = self
-                    .document
-                    .as_ref()
-                    .and_then(|d| d.filter_ctl.as_ref())
-                    .filter(|p| p.is_visible() && !p.has_focus());
-                if let Some(panel) = panel {
-                    panel.focus();
-                } else {
-                    let other = 1 - self.document.focused_pane().min(1);
-                    self.document.focus_pane(other);
-                }
+                let other = 1 - self.document.focused_pane().min(1);
+                self.document.focus_pane(other);
             }
             Command::CloseTab => {
                 self.document.close_active();
@@ -7444,16 +7270,6 @@ impl Shell {
                 self.pending_filters = filters_intent_of(command);
             }
             Command::ClearFilter => doc.clear_filter(),
-            Command::EditFilter => {
-                if let Some(at) = doc.selected_filter() {
-                    self.pending_filter_edit = Some(at);
-                }
-            }
-            Command::RemoveFilter => {
-                if let Some(at) = doc.selected_filter() {
-                    doc.remove_chip(at);
-                }
-            }
             Command::ResetColumns => {
                 doc.reset_columns();
             }
@@ -11514,207 +11330,6 @@ pub fn detail_window_closed(hdlg: HWND, owner: HWND) {
     }
 }
 
-/// The document whose native filter panel is `panel`, **made the focused pane**.
-///
-/// Found by the panel's window and never by a position — the rule the header control's
-/// notifications follow, for the same reason: a document changes tab and pane on every split and
-/// close, and its window is the one thing that stays its own. Only the shown tab's panes have a
-/// panel on screen, so only they are searched. Focused, because every gesture in a panel is about
-/// that pane's filters while the menu's commands and the pending Filter dialog act on the focused
-/// document: a double-click in the other pane's panel must not edit this one's.
-fn doc_with_panel(shell: &mut Shell, panel: HWND) -> Option<&mut Document> {
-    let pane = shell
-        .document
-        .panes()
-        .iter()
-        .position(|doc| doc.filter_ctl.as_ref().is_some_and(|p| p.hwnd() == panel))?;
-    shell.document.focus_pane(pane);
-    shell.document.panes_mut().get_mut(pane)
-}
-
-/// A gesture in the filter panel's list that is a menu command: `Enter` or a double-click is
-/// Edit ▸ Edit filter…, and `Delete` is Edit ▸ Remove filter.
-///
-/// **One command, one path.** The panel's document becomes the focused pane, and the command's own
-/// id is posted to the owner exactly as the menu bar sends it — so the Filter dialog opens from the
-/// owner's `WM_COMMAND`, outside this procedure and outside the `STATE` borrow, and a panel gesture
-/// cannot do anything its menu item does not.
-pub(crate) fn filter_panel_command(panel: HWND, command: Command) {
-    let owner =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
-    let found = STATE.with(|s| {
-        let Ok(mut state) = s.try_borrow_mut() else {
-            return false;
-        };
-        state
-            .as_mut()
-            .is_some_and(|shell| doc_with_panel(shell, panel).is_some())
-    });
-    if found && !owner.is_invalid() {
-        unsafe {
-            let _ = PostMessageW(
-                owner,
-                WM_COMMAND,
-                WPARAM(menubar::command_id(command) as usize),
-                LPARAM(0),
-            );
-        }
-    }
-}
-
-/// The panel's list changed: a check box was clicked, or `Space` pressed on a row, or the selection
-/// moved.
-///
-/// **A check box that disagrees with its chip is a flip** — `filterpanel::flipped` — which is the one
-/// reading that cannot come out the wrong way round, because the list view reports that a state
-/// changed and not which way.
-pub fn filter_panel_changed(panel: HWND) {
-    let owner =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
-    let changed = STATE.with(|s| {
-        let Ok(mut state) = s.try_borrow_mut() else {
-            return false;
-        };
-        let Some(shell) = state.as_mut() else {
-            return false;
-        };
-        {
-            let Some(doc) = doc_with_panel(shell, panel) else {
-                return false;
-            };
-            let Some(ctl) = doc.filter_ctl.as_ref() else {
-                return false;
-            };
-            let checks = ctl.checks();
-            let selected = ctl.selected();
-            let rows = filterpanel::list_rows_of(&doc.filtering.chips.chips);
-            let flips = filterpanel::flipped(&rows, &checks);
-            doc.filter_selected = selected.filter(|at| *at < rows.len());
-            for at in &flips {
-                doc.flip_chip_enabled(*at);
-            }
-            let now = filterpanel::list_rows_of(&doc.filtering.chips.chips);
-            if let Some(ctl) = doc.filter_ctl.as_mut() {
-                ctl.accept_checks(&now);
-            }
-        }
-        // Retitled whether or not a box flipped: a selection in the other pane's list has just
-        // made that pane the focused one, and the title names the focused document.
-        shell.sync_scrollbar();
-        shell.retitle(owner);
-        true
-    });
-    if changed && !owner.is_invalid() {
-        unsafe {
-            let _ = InvalidateRect(owner, None, false);
-        }
-    }
-}
-
-/// `Esc` in the panel: the keyboard goes back to the log, which is where it came from.
-pub fn filter_panel_escape(panel: HWND) {
-    let owner =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
-    if !owner.is_invalid() {
-        unsafe {
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(owner);
-        }
-    }
-}
-
-/// A right-click on the panel's list, or `Shift+F10` / the menu key inside it: the selected row's
-/// menu — Edit, polarity, enabled, move, remove.
-///
-/// **The row is the list's selection**, which a right-click has already set, so the pointer's
-/// position decides nothing here but where the menu hangs. A keyboard summons carries `(-1, -1)`
-/// and the menu hangs off the panel instead of the screen's corner.
-pub fn filter_panel_context(panel: HWND, x: i32, y: i32) {
-    let owner =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(panel) }.unwrap_or_default();
-    let subject = STATE.with(|s| {
-        let Ok(mut state) = s.try_borrow_mut() else {
-            return None;
-        };
-        let shell = state.as_mut()?;
-        let doc = doc_with_panel(shell, panel)?;
-        let at = doc.filter_ctl.as_ref()?.selected()?;
-        let chip = doc.filtering.chips.chips.get(at)?;
-        doc.filter_selected = Some(at);
-        Some((
-            at,
-            chip.enabled,
-            chip.polarity == Polarity::Include,
-            doc.filtering.chips.chips.len(),
-        ))
-    });
-    let Some((at, enabled, include, count)) = subject else {
-        return;
-    };
-    let (sx, sy) = if x == -1 && y == -1 {
-        let mut r = RECT::default();
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(panel, &mut r);
-        }
-        (r.left + 8, r.top + 8)
-    } else {
-        (x, y)
-    };
-    let items = menubar::panel_row_context(enabled, include, at > 0, at + 1 < count);
-    let Some(id) = menubar::track_context(owner, &items, sx, sy) else {
-        return;
-    };
-    let acted = STATE.with(|s| {
-        let Ok(mut state) = s.try_borrow_mut() else {
-            return false;
-        };
-        let Some(shell) = state.as_mut() else {
-            return false;
-        };
-        let edit = {
-            let Some(doc) = doc_with_panel(shell, panel) else {
-                return false;
-            };
-            match id {
-                menubar::ID_CTX_CHIP_EDIT => true,
-                menubar::ID_CTX_CHIP_POLARITY => {
-                    doc.flip_chip_polarity(at);
-                    false
-                }
-                menubar::ID_CTX_CHIP_TOGGLE => {
-                    doc.flip_chip_enabled(at);
-                    false
-                }
-                menubar::ID_CTX_CHIP_UP | menubar::ID_CTX_CHIP_DOWN => {
-                    let to = if id == menubar::ID_CTX_CHIP_UP {
-                        at.saturating_sub(1)
-                    } else {
-                        at + 1
-                    };
-                    doc.move_chip(at, to);
-                    false
-                }
-                menubar::ID_CTX_CHIP_REMOVE => {
-                    doc.remove_chip(at);
-                    false
-                }
-                _ => return false,
-            }
-        };
-        if edit {
-            shell.pending_filter_edit = Some(at);
-        }
-        shell.sync_scrollbar();
-        shell.retitle(owner);
-        true
-    });
-    if acted && !owner.is_invalid() {
-        unsafe {
-            let _ = PostMessageW(owner, WM_DRAIN_DIALOGS, WPARAM(0), LPARAM(0));
-            let _ = InvalidateRect(owner, None, false);
-        }
-    }
-}
-
 pub fn rules_dialog_closed(hdlg: HWND, owner: HWND) {
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
@@ -14220,39 +13835,6 @@ fn main() -> Result<()> {
         if !detail.is_invalid() && unsafe { IsDialogMessageW(detail, &msg) }.as_bool() {
             continue;
         }
-        // The filter panels' keyboard — Tab between the list and the buttons, access keys, Esc back
-        // to the log — is the dialog manager's, and it only runs when the loop offers it the message.
-        let panels: Vec<HWND> = STATE.with(|s| {
-            s.borrow()
-                .as_ref()
-                .map(|shell| {
-                    shell
-                        .document
-                        .all()
-                        .filter_map(|d| d.filter_ctl.as_ref())
-                        .filter(|p| p.is_visible())
-                        .map(|p| p.hwnd())
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
-        // F6 out of the panel is the loop's to answer, before the dialog manager sees it: from a
-        // push button the dialog manager hands the key to the button, which ignores it, and the
-        // keyboard would be trapped in the panel it was moved into.
-        let in_panel = panels.iter().copied().find(|panel| {
-            *panel == msg.hwnd
-                || unsafe { windows::Win32::UI::WindowsAndMessaging::IsChild(*panel, msg.hwnd) }
-                    .as_bool()
-        });
-        if let Some(panel) = in_panel {
-            if msg.message == WM_KEYDOWN && msg.wParam.0 == usize::from(VK_F6.0) {
-                filter_panel_escape(panel);
-                continue;
-            }
-            if unsafe { IsDialogMessageW(panel, &msg) }.as_bool() {
-                continue;
-            }
-        }
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -16110,8 +15692,8 @@ mod tests {
         for other in [
             Command::Find,
             Command::ClearFilter,
-            Command::EditFilter,
-            Command::RemoveFilter,
+            Command::EditLastChip,
+            Command::ClearSearch,
         ] {
             assert_eq!(filters_intent_of(other), None, "{other:?} opens no dialog");
         }

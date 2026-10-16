@@ -97,10 +97,9 @@ on the first keystroke. Tracking interaction instead would break the save-on-lea
 
 ### What to know before touching this again
 
-- **`filterpanel.rs` is still there and still inert** — 670 lines, `FilterPanel::create` never
-  called, because `show_filters` is `false` and nothing assigns it. Its removal is his call and has
-  been recorded as such since 2026-10-09. `pending_filter_edit` and `Command::EditFilter` /
-  `Command::RemoveFilter` stay dead with it; they are dispatched only from that file.
+- **`filterpanel.rs` is gone** (2026-10-16, on his say-so) and so is everything that existed only to
+  serve it. One correction to what this section said before: **`pending_filter_edit` was not dead** —
+  `Command::EditLastChip` sets it and the composer's write-back drains it. It stays.
 - **The Filters dialog was not in `no_two_controls_of_a_dialog_share_a_mnemonic_or_an_id`** and every
   other dialog was. Adding it failed immediately on the `Edi&t…` verb — `&Edit…` as first written
   collided with `&Enabled`. The gap was real and is closed.
@@ -431,20 +430,6 @@ had two — so the layout he set *after* the verification also survived.
 
 ### Open, and his call
 
-- **`filterpanel.rs` is dead in fact but still compiled** — ~670 lines and 3 tests. `show_filters` is
-  `false` at both construction sites and **nothing in the codebase sets it true**, so the panel is
-  never created; `band_height` returns `0.0` whenever it is hidden, which makes removing the band
-  reservation provably inert. ~15 call sites, two `Document` fields, and `FileState::filters_hidden`
-  (which is now always written `true` and means nothing).
-  **This was promised on 2026-10-08 and deliberately not done, and he was told so rather than finding
-  out later.** The reason is worth keeping: it is ~700 lines across 15 call sites for **no
-  user-visible change**, and starting it while he was mid-test on a live build would have put a large
-  inert diff between him and the next fix he asked for. The arithmetic says it is safe; the timing
-  said wait. He is away using the build now, which is exactly the quiet window it wants.
-  **`filter_selected` must survive the removal** — it is *not* panel-only; `selected_filter()` reads
-  it for the menu's filter commands. `FileState::filters_hidden` has its own round-trip test.
-- The stale comment in `Document::apply_state` about chips bringing "their panel with them" describes
-  a panel that can no longer arrive. It goes with the removal above.
 - Welcome-row link **styling**, and binding the hand cursor to the text extent — `row_at_y` ignores
   x, so it spans the full row width.
 - Real MDI with floating children stays parked with docking infrastructure, **by his decision**.

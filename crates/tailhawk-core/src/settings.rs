@@ -22,8 +22,8 @@
 //!   overrides with any duration, not only one the menu offers.
 //! - `[window]` — `x`, `y`, `width`, `height`, `maximized`: where the window was.
 //! - `[[file]]` — `path`, `chips` (each `+text` or `-text`), `collapse`, `bookmarks` (file rows),
-//!   `labels` (each `n:text`), `columns` (widths in cells, zero meaning hidden), `column_order`
-//!   (display order before the message), `filters_hidden`: what a file was being
+//!   `labels` (each `n:text`), `columns` (widths in cells, zero meaning hidden) and `column_order`
+//!   (display order before the message): what a file was being
 //!   looked at through, so opening it again shows the same view. Keyed by **path**; §12.4 says
 //!   file identity, which survives a rename where a path does not, and that upgrade is recorded
 //!   rather than done.
@@ -76,14 +76,6 @@ pub struct FileState {
     /// carried order inside `columns` would have thrown the move away — which is exactly what
     /// happened to every header drag before this field existed.
     pub column_order: Vec<u64>,
-    /// §2.1's filter panel, when the user closed it on a file that has filters.
-    ///
-    /// **Stored the negative way round on purpose.** A settings file written before this field
-    /// existed says nothing about the panel, and so does every file whose panel was left open —
-    /// both read back as `false`, and `false` has to mean *shown*, because a remembered file
-    /// opens with its filters already in force. The other way round, every such file would come
-    /// back filtered with nothing on screen saying so.
-    pub filters_hidden: bool,
 }
 
 /// A remote log source — `LOKI.md`, and the owner's requirement of 2026-09-02 that dev, QA and live
@@ -739,9 +731,6 @@ impl Settings {
             if f.collapse {
                 out.push_str("collapse = true\n");
             }
-            if f.filters_hidden {
-                out.push_str("filters_hidden = true\n");
-            }
             if !f.bookmarks.is_empty() {
                 let rows: Vec<String> = f.bookmarks.iter().map(u64::to_string).collect();
                 out.push_str(&format!("bookmarks = [{}]\n", rows.join(", ")));
@@ -901,7 +890,6 @@ impl Settings {
                             "path" => f.path = unquote(value),
                             "chips" => f.chips = array(value),
                             "collapse" => f.collapse = value == "true",
-                            "filters_hidden" => f.filters_hidden = value == "true",
                             "bookmarks" => {
                                 f.bookmarks =
                                     array(value).iter().filter_map(|v| v.parse().ok()).collect()
@@ -1529,7 +1517,6 @@ mod tests {
             labels: vec!["1:Exception".to_owned(), "9:a \"quoted\" one".to_owned()],
             columns: vec![19, 5, 0],
             column_order: Vec::new(),
-            filters_hidden: false,
         });
         s.set_file(FileState {
             path: r"C:\logs\other.log".to_owned(),
@@ -1539,51 +1526,36 @@ mod tests {
             labels: Vec::new(),
             columns: Vec::new(),
             column_order: Vec::new(),
-            filters_hidden: false,
         });
         s
     }
 
-    /// A closed filter panel is remembered; an open one writes nothing.
+    /// **A key this version no longer knows costs the file nothing.**
     ///
-    /// The asymmetry is the point. Absence of the key has to read as *shown*, because that is
-    /// what every settings file written before the key existed means, and what every file whose
-    /// panel was left open means. Only the deliberate choice to close it is worth a line.
+    /// `filters_hidden` was written for every file until 2026-10-16 and is in every settings file
+    /// on disk today, three times over in the owner's own. The panel it described is gone, so the
+    /// key went with it — and a retired key must read as *nothing was said*, leaving the rest of
+    /// the entry intact, rather than taking the file down with it. The next write drops the line.
     #[test]
-    fn a_closed_filter_panel_is_remembered_and_an_open_one_says_nothing() {
-        let mut s = Settings::default();
-        s.set_file(FileState {
-            path: r"C:\logs\hidden.log".to_owned(),
-            chips: vec!["+error".to_owned()],
-            filters_hidden: true,
-            ..FileState::default()
-        });
-        s.set_file(FileState {
-            path: r"C:\logs\shown.log".to_owned(),
-            chips: vec!["+error".to_owned()],
-            ..FileState::default()
-        });
-
-        let text = s.to_toml();
-        assert_eq!(
-            text.matches("filters_hidden").count(),
-            1,
-            "only the closed one is written: {text}"
+    fn a_key_this_version_has_retired_leaves_the_rest_of_the_entry_alone() {
+        let text = concat!(
+            "[[file]]\n",
+            "path = \"C:\\\\logs\\\\app.log\"\n",
+            "chips = [\"+error\"]\n",
+            "filters_hidden = true\n",
+            "collapse = true\n",
         );
-
-        let back = Settings::from_toml(&text);
+        let back = Settings::from_toml(text);
+        let file = back.file(r"C:\logs\app.log").expect("the entry survives");
+        assert_eq!(file.chips, vec!["+error".to_owned()], "{text}");
         assert!(
-            back.file(r"C:\logs\hidden.log")
-                .expect("the hidden one")
-                .filters_hidden,
-            "{text}"
+            file.collapse,
+            "the key after the retired one is read: {text}"
         );
         assert!(
-            !back
-                .file(r"C:\logs\shown.log")
-                .expect("the shown one")
-                .filters_hidden,
-            "an absent key reads as shown: {text}"
+            !back.to_toml().contains("filters_hidden"),
+            "and writing it back drops the line: {}",
+            back.to_toml()
         );
     }
 
@@ -1634,7 +1606,6 @@ mod tests {
             labels: Vec::new(),
             columns: Vec::new(),
             column_order: Vec::new(),
-            filters_hidden: false,
         });
         assert!(s.file(r"C:\logs\app.log").is_none());
         s.set_file(FileState {
@@ -1645,7 +1616,6 @@ mod tests {
             labels: Vec::new(),
             columns: Vec::new(),
             column_order: Vec::new(),
-            filters_hidden: false,
         });
         assert_eq!(s.files.len(), 1, "case-insensitive path replaces");
         assert_eq!(s.file(r"C:\logs\other.log").unwrap().chips, ["+x"]);
@@ -2064,7 +2034,6 @@ mod tests {
             labels: Vec::new(),
             columns: Vec::new(),
             column_order: Vec::new(),
-            filters_hidden: false,
         });
         std::fs::create_dir_all(tiers[1].parent().unwrap()).unwrap();
         std::fs::write(&tiers[1], personal.to_toml()).unwrap();
@@ -2080,7 +2049,6 @@ mod tests {
             labels: Vec::new(),
             columns: Vec::new(),
             column_order: Vec::new(),
-            filters_hidden: false,
         });
         curated.set_file(FileState {
             path: "b.log".into(),
@@ -2090,7 +2058,6 @@ mod tests {
             labels: Vec::new(),
             columns: Vec::new(),
             column_order: Vec::new(),
-            filters_hidden: false,
         });
         std::fs::write(&tiers[0], curated.to_toml()).unwrap();
         let merged = load(&tiers);

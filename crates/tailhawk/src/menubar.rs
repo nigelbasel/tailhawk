@@ -214,12 +214,6 @@ pub const ID_CTX_TOP_N: u32 = 10_302;
 pub const ID_CTX_FILTER_COLUMN: u32 = 10_303;
 pub const ID_CTX_FILTER_TO: u32 = 10_304;
 pub const ID_CTX_FILTER_OUT: u32 = 10_305;
-pub const ID_CTX_CHIP_EDIT: u32 = 10_306;
-pub const ID_CTX_CHIP_POLARITY: u32 = 10_307;
-pub const ID_CTX_CHIP_TOGGLE: u32 = 10_308;
-pub const ID_CTX_CHIP_REMOVE: u32 = 10_309;
-pub const ID_CTX_CHIP_UP: u32 = 10_310;
-pub const ID_CTX_CHIP_DOWN: u32 = 10_311;
 
 /// The header's right-click menu for one column: sorting, the top-N cut, and the §7.2 route —
 /// "Filter on this column…" opens the Filter dialog already scoped. `sort_here` is this column's
@@ -310,38 +304,6 @@ pub fn grid_context(has_selection: bool, detail: bool) -> Vec<tailhawk_core::men
             "",
             command_id(Command::DefineFormat),
         ),
-    ]
-}
-
-/// A filter row's right-click menu in the panel — §2.4's per-chip acts, gathered where the pointer
-/// already is: edit, polarity, enabled, move and remove.
-/// `can_up` and `can_down` grey the moves at the ends of the list rather than hiding them, so the
-/// menu keeps its shape from row to row: a menu whose shape changes is one that cannot be learned.
-pub fn panel_row_context(
-    enabled: bool,
-    include: bool,
-    can_up: bool,
-    can_down: bool,
-) -> Vec<tailhawk_core::menu::Item> {
-    use tailhawk_core::menu::Item;
-    let on = |item: Item, yes: bool| if yes { item } else { item.disabled() };
-    vec![
-        Item::command("&Edit…", "", ID_CTX_CHIP_EDIT),
-        Item::command(
-            if include {
-                "Make e&xcluding"
-            } else {
-                "Make &including"
-            },
-            "",
-            ID_CTX_CHIP_POLARITY,
-        ),
-        Item::check("Ena&bled", "", ID_CTX_CHIP_TOGGLE, enabled),
-        Item::separator(),
-        on(Item::command("Move &up", "", ID_CTX_CHIP_UP), can_up),
-        on(Item::command("Move &down", "", ID_CTX_CHIP_DOWN), can_down),
-        Item::separator(),
-        Item::command("&Remove", "", ID_CTX_CHIP_REMOVE),
     ]
 }
 
@@ -1185,18 +1147,6 @@ mod tests {
         );
     }
 
-    /// The chip menu mirrors its chip: the tick is the enabled state, and the polarity item
-    /// offers the *other* polarity, which is the only one worth offering.
-    #[test]
-    fn the_panel_row_context_mirrors_its_chip() {
-        let include = panel_row_context(true, true, true, true);
-        assert!(include.iter().any(|i| i.label == "Ena&bled" && i.checked));
-        assert!(include.iter().any(|i| i.label == "Make e&xcluding"));
-        let exclude = panel_row_context(false, false, true, true);
-        assert!(exclude.iter().any(|i| i.label == "Ena&bled" && !i.checked));
-        assert!(exclude.iter().any(|i| i.label == "Make &including"));
-    }
-
     /// No two items of one context menu share a mnemonic — the same rule the bar's menus keep,
     /// for the same reason: the second claimant is unreachable by the key drawn under it.
     #[test]
@@ -1204,7 +1154,6 @@ mod tests {
         for (name, items) in [
             ("header", header_context("level", None, true)),
             ("grid", grid_context(true, true)),
-            ("panel row", panel_row_context(true, true, true, true)),
         ] {
             let mut seen = Vec::new();
             for m in items.iter().filter_map(|i| i.mnemonic()) {
@@ -1490,43 +1439,6 @@ mod tests {
         assert_eq!(
             separating.id, joining.id,
             "one command, so one id and one dispatch"
-        );
-    }
-
-    /// **Reordering filters without dragging.** *Accessibility*: "Don't make dragging the only way
-    /// to perform an action" — and the panel's rows could only be reordered by a drag until the panel
-    /// became a list view. The moves are greyed at the ends of the list, never hidden, so the menu
-    /// keeps one shape from row to row.
-    #[test]
-    fn a_filter_row_moves_up_and_down_and_greys_at_the_ends() {
-        let find = |items: &[tailhawk_core::menu::Item], id: u32| {
-            items
-                .iter()
-                .find(|i| i.id == Some(id))
-                .cloned()
-                .expect("the item is there")
-        };
-        let middle = panel_row_context(true, true, true, true);
-        assert!(find(&middle, ID_CTX_CHIP_UP).enabled);
-        assert!(find(&middle, ID_CTX_CHIP_DOWN).enabled);
-        assert_eq!(find(&middle, ID_CTX_CHIP_UP).text(), "Move up");
-
-        let first = panel_row_context(true, true, false, true);
-        assert!(
-            !find(&first, ID_CTX_CHIP_UP).enabled,
-            "nothing above the first"
-        );
-        assert!(find(&first, ID_CTX_CHIP_DOWN).enabled);
-
-        let last = panel_row_context(true, true, true, false);
-        assert!(
-            !find(&last, ID_CTX_CHIP_DOWN).enabled,
-            "nothing below the last"
-        );
-        assert_eq!(
-            first.len(),
-            last.len(),
-            "greyed, not removed: the menu keeps its shape"
         );
     }
 
@@ -2103,7 +2015,6 @@ mod tests {
             ("grid", grid_context(true, false)),
             ("grid, no selection", grid_context(false, true)),
             ("header", header_context("timestamp", Some(true), true)),
-            ("filter row", panel_row_context(true, true, true, true)),
         ];
         for (name, items) in menus {
             for item in &items {

@@ -251,25 +251,6 @@ pub fn template_with(title: &str, w: i16, h: i16, items: &[Item], extra: u32) ->
     )
 }
 
-/// A template for a dialog that lives **inside** another window rather than over it — the filter
-/// panel's host. `DS_CONTROL` makes it behave as a control of its parent, and `WS_EX_CONTROLPARENT`
-/// lets the dialog manager walk into it, so Tab reaches its buttons and its list like any dialog's.
-/// No caption, no frame, no centring: its parent places it.
-pub fn template_child(w: i16, h: i16, items: &[Item]) -> Vec<u16> {
-    const WS_CHILD: u32 = 0x4000_0000;
-    const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
-    const DS_CONTROL: u32 = 0x0400;
-    const WS_EX_CONTROLPARENT: u32 = 0x0001_0000;
-    template_styled(
-        "",
-        w,
-        h,
-        items,
-        WS_CHILD | WS_CLIPSIBLINGS | DS_CONTROL,
-        WS_EX_CONTROLPARENT,
-    )
-}
-
 /// The one encoder both templates share: `style` beyond `DS_SETFONT`, which every template here
 /// sets, and the extended style.
 fn template_styled(title: &str, w: i16, h: i16, items: &[Item], style: u32, ex: u32) -> Vec<u16> {
@@ -2711,11 +2692,11 @@ fn rules_pick_colour(hdlg: HWND, state: &mut RulesState, which: tailhawk_core::r
 /// `WM_CTLCOLOR*` answers need. Call from `WM_INITDIALOG`; the return value is untouched.
 ///
 /// **`chrome_bg`, not `pane_bg`.** A dialog is chrome — the same family as the toolbar and the
-/// status bar — where the filter panel sits *inside* the log pane and takes the pane's ground.
+/// status bar — rather than part of the log pane, which has its own ground.
 ///
-/// **One brush per dialog, freed by [`drop_dialog_brush`] on `WM_DESTROY`.** `filterpanel.rs`
-/// carries the note explaining why: a brush shared between surfaces was deleted by whichever one
-/// closed first, and the rest went on painting with a freed GDI object.
+/// **One brush per dialog, freed by [`drop_dialog_brush`] on `WM_DESTROY`**, because a brush
+/// shared between surfaces was deleted by whichever one closed first and the rest went on
+/// painting with a freed GDI object.
 fn theme_dialog(hdlg: HWND) {
     use windows::Win32::Graphics::Gdi::CreateSolidBrush;
     let theme = tailhawk_core::theme::theme();
