@@ -5,6 +5,18 @@
 **289 shell + 1023 core, 0 failed; fmt and clippy clean; `portable-core` checked on the Linux
 target** (its one warning, `Cancel::flag` in `search.rs`, is older than this work).
 
+**`gh` is not used on this machine, as of 2026-10-20.** The owner flagged it as a security violation
+and its token is revoked — *"we are not using gh, as that was flagged as a security violation"* — so
+every `gh` call falls back to unauthenticated, hits GitHub's 60-per-hour per-IP limit and returns
+`HTTP 403`, which reads exactly like a failing build and is not one. **Do not suggest
+`gh auth login`; the revoked token is the intended state.** `CLAUDE.md` now carries the `curl`
+recipe against the public API, which needs no credential at all — that being the reason it is the
+permitted route. CI for `1a80749` was read that way: **run 39431525083, success on all five jobs** —
+https://github.com/nigelbasel/tailhawk/actions/runs/39431525083
+
+The older resume points below still describe `gh` commands. They are a record of what happened at
+the time and have been left as written; **this paragraph overrides them**, as does `CLAUDE.md`.
+
 **A fourth known flake was found and recorded in `CLAUDE.md`.**
 `stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone` failed once under the full
 suite and passed alone. It is in `tailhawk-core`, which does not depend on the crate this change

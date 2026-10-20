@@ -68,6 +68,26 @@ so a swept-in file and a wrong `CLEANROOM.md` row publish in the same step.
 **Commit straight to master, and often.** No branches, no PRs on this project. Push, then check CI
 and *wait for the result* — do not push and walk away. Sessions have ended leaving master red.
 
+**Do not use `gh`.** The owner flagged it as a security violation and his token is revoked, so every
+`gh` call now falls back to unauthenticated, hits GitHub's 60-per-hour per-IP limit and returns
+`HTTP 403` — which reads exactly like a failing build and is not one. Read CI from the **public API
+with `curl`** instead: the repository is public, so this needs no credential at all, which is the
+whole reason it is the permitted route.
+
+```bash
+RUN=$(curl -s "https://api.github.com/repos/nigelbasel/tailhawk/actions/runs?per_page=5" \
+  | grep -B 40 "\"head_sha\": \"$(git rev-parse HEAD)\"" | grep -m1 '^      "id"' | sed 's/.*: //; s/,//')
+curl -s "https://api.github.com/repos/nigelbasel/tailhawk/actions/runs/$RUN" \
+  | grep -E '^  "(head_sha|status|conclusion)"'
+curl -s "https://api.github.com/repos/nigelbasel/tailhawk/actions/runs/$RUN/jobs" \
+  | grep -E '^      "(name|conclusion)"'
+```
+
+**Read the conclusion by SHA and per job, never a background task's exit code** — the rule below
+about a success signal that is not the thing you care about, and the one this project has been
+caught by most often. Sixty unauthenticated calls an hour is plenty for a poll every 45 seconds, and
+`https://api.github.com/rate_limit` says what is left without spending any of it.
+
 **The decision goes in a pure function; the shell only acts on the answer.** Anything that needs an
 `HWND`, a `Shell` or a live device to exercise will not be tested, and this project has the scars to
 prove it. Three defects in one session all lived in logic tangled into `Shell` or the painter: the
