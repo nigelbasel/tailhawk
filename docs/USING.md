@@ -92,6 +92,11 @@ Across the top is the selected filter: its **phrase**, whether it is **enabled**
 list below holds every filter — its text, those two answers, and its type — with a check box that
 turns it on and off. A filter that is off keeps its place and its text and is drawn dim.
 
+**If a filter is hiding everything, the status bar says so** — `⚠ every row is hidden by a filter —
+Ctrl+L to change it`, at the left of the bar. Filters are remembered per file and per remote source,
+so a filter that made sense when you wrote it can come back over a file it now excludes completely,
+and an empty window is otherwise indistinguishable from one with nothing in it.
+
 Down the right: **New**, **Remove**, **Remove all**, **Up** and **Down** (order is display order —
 it does not change which lines survive), and **Edit…**, which opens the composer described below on
 the selected row. Under the list, **Enable all include**, **Enable all exclude**, **Disable all

@@ -76,6 +76,19 @@ filter, view, format, encoding, tail** — and each is silent when it has nothin
 resting bar is quiet and the eye learns where each fact lives. `statusbar::status_panes_of` is the
 pure mapping and is where what they say is settled; the GPU driver name is no longer among them.
 
+**One fact is allowed out of its pane, and only one: a filter keeping none of the rows there are.**
+It goes in the message pane and leads it. The quietness above is what makes this necessary — the
+eye learning where each fact lives also learns to stop reading the panes that say the same thing all
+day, and `filter` is one of them, fourth and narrow between the find count and the column count.
+The owner met it twice (2026-10-16 and 2026-10-20): a remote source opened with a filter remembered
+from a session where it meant something, the tab came up blank, and `Filtered 0 of at least 1,424`
+sat unread beside the format and the encoding. **"You are being shown nothing" is not a
+steady-state fact**; it is the answer to *why is this screen empty*, which is asked at the left of
+the bar. It leads the pane rather than joining the end of it because that pane absorbs the remaining
+width and clips on the right — and the notice ahead of it may belong to another tab entirely, since
+`Shell::notice` is one field for the whole window. The count stays in the filter pane; the message
+is the sentence that names the remedy.
+
 The trap this walked into, recorded because it is not obvious: **a pane is a decision about what is
 worth showing, and a view-model with no field for a fact has taken that decision by accident.** The
 first cut had nowhere to put the Loki lag, the export progress, the sort or the revealed invisibles,

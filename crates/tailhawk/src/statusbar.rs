@@ -535,6 +535,19 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
     // separate slots and showed both; a first cut of this took `notice.or(rules)`, which made a
     // transient notice hide a standing warning for as long as it showed.
     let mut said: Vec<&str> = Vec::new();
+    // **Except for this, which goes in front of everything.** A filter keeping none of the rows
+    // there are is the only fact here that explains an empty window, and the filter pane — fourth,
+    // narrow, among the steady-state facts a reader learns to stop reading — is not where anyone
+    // looks for that. The owner met it twice: a remote source opened with a filter remembered from
+    // a session where it meant something, and the tab came up blank with `Filtered 0 of at least
+    // 1,424` sitting unread. It leads the pane because this pane absorbs the remaining width and
+    // clips on the right, and in his window the notice ahead of it belonged to a *different*
+    // source, left over from the tab opened before. The count stays in the filter pane; this is
+    // the sentence that sends him to the remedy.
+    let hiding_everything = matches!(facts.filter, Some((0, total)) if total > 0);
+    if hiding_everything {
+        said.push("⚠ every row is hidden by a filter — Ctrl+L to change it");
+    }
     said.extend(facts.notice);
     said.extend(facts.waiting);
     said.extend(facts.tee);
@@ -851,6 +864,85 @@ mod tests {
             ..open()
         });
         assert_eq!(panes.filter, "Filtered 12 of 1,192");
+    }
+
+    /// **A view showing nothing says why, in the pane a reader actually reads.**
+    ///
+    /// The owner met this twice. A remote source opened with a filter remembered from a session
+    /// where it meant something — `contains(environment, "local")`, written when that source
+    /// pointed somewhere local — and the tab came up empty. The bar *did* know: `Filtered 0 of at
+    /// least 1,424`. But the filter pane is fourth, narrow, and sits among format, encoding and
+    /// column counts, which say the same thing all day and which a reader correctly learns to stop
+    /// reading. "Every row is being hidden" is not a steady-state fact; it is the answer to *why
+    /// is this screen empty*, and it belongs where the answer is looked for.
+    ///
+    /// **And it leads the pane.** The message pane absorbs the remaining width and clips on the
+    /// right, so the first fact in it is the one guaranteed to be read — which is why this is the
+    /// one thing allowed in front of a notice. In the owner's own window the notice was a
+    /// *different source's*, left over from the tab he had opened before, and it would have pushed
+    /// this off the end.
+    #[test]
+    fn a_view_whose_filter_keeps_nothing_says_so_in_the_message_pane() {
+        let panes = status_panes_of(StatusFacts {
+            filter: Some((0, 1_424)),
+            ..open()
+        });
+        assert!(
+            panes
+                .message
+                .starts_with("⚠ every row is hidden by a filter — Ctrl+L to change it"),
+            "it leads the pane, so a long notice cannot clip it: {}",
+            panes.message
+        );
+        assert_eq!(
+            panes.filter, "Filtered 0 of 1,424",
+            "and the count stays where counts live"
+        );
+
+        // The case that made it necessary: the leftover notice names another source entirely.
+        let over_a_stale_notice = status_panes_of(StatusFacts {
+            filter: Some((0, 1_424)),
+            notice: Some("nurtur-loki-identityserver: 4 label value(s) were cut to fit"),
+            ..open()
+        });
+        assert!(
+            over_a_stale_notice
+                .message
+                .starts_with("⚠ every row is hidden"),
+            "in front of the notice, not behind it: {}",
+            over_a_stale_notice.message
+        );
+        assert!(
+            over_a_stale_notice.message.contains("4 label value(s)"),
+            "and the notice is still said, not replaced: {}",
+            over_a_stale_notice.message
+        );
+    }
+
+    /// **Only zero.** A filter that keeps some rows needs no warning — the count says it — and a
+    /// document with no rows at all is empty for a reason that has nothing to do with filtering.
+    #[test]
+    fn a_filter_that_keeps_something_or_had_nothing_to_keep_raises_nothing() {
+        let kept = status_panes_of(StatusFacts {
+            filter: Some((1, 1_424)),
+            ..open()
+        });
+        assert_eq!(
+            kept.message, "Ready",
+            "one surviving row is not a blank view"
+        );
+
+        let nothing_there = status_panes_of(StatusFacts {
+            filter: Some((0, 0)),
+            ..open()
+        });
+        assert_eq!(
+            nothing_there.message, "Ready",
+            "an empty document is not a filter's doing"
+        );
+
+        let no_filter = status_panes_of(open());
+        assert_eq!(no_filter.message, "Ready", "and no filter, nothing to say");
     }
 
     #[test]
