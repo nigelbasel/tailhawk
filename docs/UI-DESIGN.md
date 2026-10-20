@@ -76,7 +76,7 @@ filter, view, format, encoding, tail** — and each is silent when it has nothin
 resting bar is quiet and the eye learns where each fact lives. `statusbar::status_panes_of` is the
 pure mapping and is where what they say is settled; the GPU driver name is no longer among them.
 
-**One fact is allowed out of its pane, and only one: a filter keeping none of the rows there are.**
+**A filter keeping none of the rows there are is said in the message pane, at the front of it.**
 It goes in the message pane and leads it. The quietness above is what makes this necessary — the
 eye learning where each fact lives also learns to stop reading the panes that say the same thing all
 day, and `filter` is one of them, fourth and narrow between the find count and the column count.
@@ -84,10 +84,26 @@ The owner met it twice (2026-10-16 and 2026-10-20): a remote source opened with 
 from a session where it meant something, the tab came up blank, and `Filtered 0 of at least 1,424`
 sat unread beside the format and the encoding. **"You are being shown nothing" is not a
 steady-state fact**; it is the answer to *why is this screen empty*, which is asked at the left of
-the bar. It leads the pane rather than joining the end of it because that pane absorbs the remaining
-width and clips on the right — and the notice ahead of it may belong to another tab entirely, since
-`Shell::notice` is one field for the whole window. The count stays in the filter pane; the message
-is the sentence that names the remedy.
+the bar. It leads the pane rather than joining the end of it because the notice ahead of it may
+belong to another tab entirely — `Shell::notice` is one field for the whole window, and nothing
+ever clears it, so it stands until something overwrites it. The count stays in the filter pane; the
+message is the sentence that names the remedy.
+
+**The message pane is not a safe home, and that is worth stating rather than discovering.** It is
+the one pane `edges_of` can allot **zero** width: every trailing pane is measured and served first
+and the message takes what is left, which its own test drives to nothing. So on a narrow window the
+remedy clips before the `⚠` does. That is a reason to keep this sentence short, not a reason to put
+it back in the filter pane, where the owner twice did not see it. And it is not the only document
+fact here — the cut-answer advisory, the rules warning and the High Contrast flag share this pane
+already; what is new is one going *in front of the notice*.
+
+**Four facts have to agree before it is said**, because the first version asked only the last and
+was wrong in three states. `Filtering::filtered` is true for the collapse and a followed trace as
+well as for chips, and `Ctrl+L` reaches only chips. A pass is run on a worker and its survivors
+arrive in chunks, so a kept count of zero is equally a pass that **has not looked yet** — without
+that fact the warning fired on every filter application and on every spill roll of a filtered
+remote tail. A filter whose pass could not start kept nothing because it never ran, which
+`filter_error` already says. And zero of nothing is an empty document, not a filter's doing.
 
 The trap this walked into, recorded because it is not obvious: **a pane is a decision about what is
 worth showing, and a view-model with no field for a fact has taken that decision by accident.** The

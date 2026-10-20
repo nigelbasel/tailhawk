@@ -1,8 +1,45 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-20: a transport failure names the host, and two reports that were not defects
+## ▶ Resume point — 2026-10-20: a transport failure names the host, a blank view says why, and a review caught the warning crying wolf
 
-**289 shell + 1023 core, 0 failed; fmt and clippy clean; `portable-core` checked on the Linux
+### The one to read first: the warning was wrong, and the fix it recommended did not work
+
+`fef9dc2` added `⚠ every row is hidden by a filter — Ctrl+L to change it` to the message pane, and
+the component review — which the owner had told me not to wait for — found it **false in three
+states and attached to a remedy that was broken**. All verified in the code, all fixed in the
+commit after it.
+
+**`StatusFacts.filter` is `(kept.len(), total_rows)`, and `kept` is emptied by
+`Filtering::clear_results` and refilled by the sieve worker chunk by chunk.** So `(0, total)` is
+equally the state of a pass **in flight**, the bar recomposes every frame, and the warning fired on
+every filter application for as long as the pass took — and on every spill roll of a filtered
+remote tail, which `main.rs` puts at every few minutes. A false alarm with a remedy attached, over
+a window that was about to fill, in the exact workflow it was written for.
+
+Two more in the same predicate: `Filtering::filtered` is true for the **collapse** and a followed
+**trace** as well as chips, and `Ctrl+L` opens a dialog seeded from chips alone; and with
+`filter_error` set, `kept` is empty because the pass **never ran**.
+
+`StatusFacts` now carries `chips: usize` and `filter_running: bool`, and the predicate is the named
+pure `hiding_everything`, requiring all four. **The lesson is the one `UI-DESIGN.md` already
+stated two paragraphs below the prose this added to it** — a view-model with no field for a fact has
+decided about that fact by accident — and it was walked into while quoting it.
+
+**And the remedy was a lie, from a defect older than any of this.** `filters_apply` called
+`doc.refilter()` **without `clear_results()`**, alone among the paths that change a chip
+(`add_chip`, `clear_filter`, `follow_trace`, `apply_view_state`, the collapse). `refilter` starts a
+pass only over rows no pass has covered and `covered` is set to the total the moment a pass
+*begins*, so it returned at once and left the previous filter's survivors standing: **editing a
+filter and pressing Apply or OK changed the text and not the view**, and from an emptied view only
+removing every filter recovered it. True of every Apply since the dialog was built.
+
+**Still open from that review, not yet done:** a filter saved as *disabled* comes back **enabled** —
+`file_state` writes `+phrase` / `-phrase` and `apply_state` restores through `Chip::parse`, which
+yields an enabled chip. Likely part of why the owner's job-dispatcher filter was in force at all.
+
+
+
+**293 shell + 1023 core, 0 failed; fmt and clippy clean; `portable-core` checked on the Linux
 target** (its one warning, `Cancel::flag` in `search.rs`, is older than this work).
 
 **`gh` is not used on this machine, as of 2026-10-20.** The owner flagged it as a security violation

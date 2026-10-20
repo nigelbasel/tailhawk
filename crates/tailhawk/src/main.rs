@@ -5227,6 +5227,11 @@ impl Shell {
             .filtering
             .filtered()
             .then(|| (doc.filtering.kept.len() as u64, doc.set.total_rows()));
+        // **Both of these exist so the bar can tell "kept nothing" from "has not looked yet".**
+        // `kept` is emptied by `clear_results` and refilled by the sieve worker, so a count of zero
+        // is the state of every pass in flight as well as of a filter that threw everything away.
+        let filter_running = doc.filtering.running.is_some();
+        let chips = doc.filtering.chips.chips.len();
         let columns = doc.layout.as_ref().map(|layout| {
             let last = layout.widths.len().saturating_sub(1);
             // The message is always shown and is not in the tally of what could be hidden.
@@ -5244,6 +5249,8 @@ impl Shell {
             total_rows: doc.set.total_rows(),
             find,
             filter,
+            chips,
+            filter_running,
             filter_error: doc.filtering.error.as_deref(),
             columns,
             sorted: sorted.as_deref(),
@@ -11226,6 +11233,15 @@ pub fn filters_apply(owner: HWND) {
             if let Some(doc) = shell.document.as_mut() {
                 doc.filtering.chips = chips;
                 doc.filtering.error = None;
+                // **`clear_results` before `refilter`, as every other path that changes a chip
+                // does** — `add_chip`, `clear_filter`, `follow_trace`, `apply_view_state` and the
+                // collapse all do, and this one did not. `refilter` starts a pass only over rows
+                // no pass has covered, and `covered` is set to the total the moment a pass begins,
+                // so without the clear it returned at once and left the previous filter's
+                // survivors standing: editing a filter and pressing Apply or OK changed the text
+                // and not the view. From a view a filter had emptied, the window stayed empty and
+                // the only thing that recovered it was removing every filter.
+                doc.filtering.clear_results();
                 doc.refilter();
                 let rows = doc.view_rows();
                 doc.view.grid_mut().set_total_rows(rows);

@@ -406,7 +406,25 @@ pub struct StatusFacts<'a> {
     /// Rows a filter kept, of the rows there are. **Set only when a filter is in play** — a sort
     /// re-orders the same rows and keeps all of them, and reporting `Filtered 0 of N` for one is
     /// a lie about the document.
+    ///
+    /// **"In play" is `Filtering::filtered`, which is wider than chips**: the collapse and a
+    /// followed trace each make it true with no chip in force. And **a kept count of zero does not
+    /// mean a filter threw everything away** — `clear_results` empties the survivors and a worker
+    /// refills them, so `(0, total)` is equally the state of a pass that has not looked yet. Both
+    /// facts are needed to tell those apart, which is why [`StatusFacts::chips`] and
+    /// [`StatusFacts::filter_running`] exist beside this.
     pub filter: Option<(u64, u64)>,
+    /// How many chips are in force. **Zero with [`StatusFacts::filter`] set means the narrowing is
+    /// the collapse or a trace**, neither of which `Ctrl+L` can reach — it opens a dialog seeded
+    /// from chips alone.
+    pub chips: usize,
+    /// Whether a filter pass is outstanding, so the survivors are still arriving.
+    ///
+    /// **Without this the bar cannot tell "kept nothing" from "has not looked yet"**, and the two
+    /// are the same `(0, total)`. Every filter application passes through that state for as long
+    /// as the pass takes, and a filtered remote tail re-enters it each time the spill retires a
+    /// part.
+    pub filter_running: bool,
     /// A filter the reader typed that does not parse, in their own words.
     ///
     /// **It reached nothing until 2026-10-06.** `Filtering::error` was composed into
@@ -529,23 +547,38 @@ pub struct ShellFacts<'a> {
 /// with no control anywhere while the selector at least had a submenu. Both are items under
 /// `File ▸ Open remote` now, so the sentence can point at them; a warning that names an action the
 /// reader cannot find is worse than one that names none.
+/// Whether the window in front of the reader is empty **because a filter threw every row away**.
+///
+/// Four facts have to agree, and the first version of this asked only the last one — which made it
+/// fire on every filter application, because the survivors arrive from a worker and `(0, total)` is
+/// equally the state of a pass that has not looked yet.
+///
+/// - **Chips, not merely "filtered".** `Filtering::filtered` is also true for the collapse and for
+///   a followed trace, and the remedy this names — `Ctrl+L` — opens a dialog seeded from chips
+///   alone, so over a trace it would point at an empty list. A trace is named on the view pane.
+/// - **No pass outstanding.** Otherwise the sentence appears over a window that is about to fill,
+///   on every filter of a large file and every few minutes on a filtered remote tail, whose spill
+///   retires a part and restarts the pass.
+/// - **No filter error.** A pass that could not start kept nothing because it never ran; the filter
+///   pane already says so, and it displaces the count to do it.
+/// - **Zero of something.** A document with no rows at all is not a filter's doing.
+fn hiding_everything(facts: &StatusFacts<'_>) -> bool {
+    facts.chips > 0
+        && !facts.filter_running
+        && facts.filter_error.is_none()
+        && matches!(facts.filter, Some((0, total)) if total > 0)
+}
+
 pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
     // **What just happened, then what is happening, then what is wrong — and all of them, not
     // whichever was checked first.** The composed sentence gave the notice and the rules warning
     // separate slots and showed both; a first cut of this took `notice.or(rules)`, which made a
     // transient notice hide a standing warning for as long as it showed.
     let mut said: Vec<&str> = Vec::new();
-    // **Except for this, which goes in front of everything.** A filter keeping none of the rows
-    // there are is the only fact here that explains an empty window, and the filter pane — fourth,
-    // narrow, among the steady-state facts a reader learns to stop reading — is not where anyone
-    // looks for that. The owner met it twice: a remote source opened with a filter remembered from
-    // a session where it meant something, and the tab came up blank with `Filtered 0 of at least
-    // 1,424` sitting unread. It leads the pane because this pane absorbs the remaining width and
-    // clips on the right, and in his window the notice ahead of it belonged to a *different*
-    // source, left over from the tab opened before. The count stays in the filter pane; this is
-    // the sentence that sends him to the remedy.
-    let hiding_everything = matches!(facts.filter, Some((0, total)) if total > 0);
-    if hiding_everything {
+    // **In front of the notice, which is the only thing allowed there.** The notice is one field
+    // for the whole window and may belong to another tab; this explains the window in front of you.
+    // `UI-DESIGN.md` §1.1 carries the rest of the argument.
+    if hiding_everything(&facts) {
         said.push("⚠ every row is hidden by a filter — Ctrl+L to change it");
     }
     said.extend(facts.notice);
@@ -885,6 +918,7 @@ mod tests {
     fn a_view_whose_filter_keeps_nothing_says_so_in_the_message_pane() {
         let panes = status_panes_of(StatusFacts {
             filter: Some((0, 1_424)),
+            chips: 1,
             ..open()
         });
         assert!(
@@ -902,6 +936,7 @@ mod tests {
         // The case that made it necessary: the leftover notice names another source entirely.
         let over_a_stale_notice = status_panes_of(StatusFacts {
             filter: Some((0, 1_424)),
+            chips: 1,
             notice: Some("nurtur-loki-identityserver: 4 label value(s) were cut to fit"),
             ..open()
         });
@@ -919,12 +954,92 @@ mod tests {
         );
     }
 
+    /// **A pass that has not finished has not kept nothing — it has not looked yet.**
+    ///
+    /// `kept` is emptied by `Filtering::clear_results` and refilled by a worker chunk by chunk, so
+    /// `(0, total)` is the state of *every* filter application for as long as the pass takes, and
+    /// the bar is recomposed every frame. Without this the warning and its remedy appear over a
+    /// window that is about to fill, on every filter of a large file — and a filtered remote tail
+    /// restarts its pass whenever the spill retires a part, so it would flash every few minutes.
+    ///
+    /// Found by review after the first version of this shipped. It is the trap `UI-DESIGN.md`
+    /// states two paragraphs below the prose this change added to it: a view-model with no field
+    /// for a fact has decided about that fact by accident.
+    #[test]
+    fn a_filter_pass_still_running_has_not_kept_nothing() {
+        let mid_pass = status_panes_of(StatusFacts {
+            filter: Some((0, 1_424)),
+            chips: 1,
+            filter_running: true,
+            ..open()
+        });
+        assert_eq!(
+            mid_pass.message, "Ready",
+            "a pass in flight must not be reported as a view with nothing in it"
+        );
+
+        let finished = status_panes_of(StatusFacts {
+            filter: Some((0, 1_424)),
+            chips: 1,
+            filter_running: false,
+            ..open()
+        });
+        assert!(
+            finished.message.starts_with("⚠ every row is hidden"),
+            "and once it has finished, it is: {}",
+            finished.message
+        );
+    }
+
+    /// **Only a filter, and only one that ran.**
+    ///
+    /// `Filtering::filtered` is true for the collapse and for a followed trace as well as for
+    /// chips, and `Ctrl+L` reaches none of those — it opens a dialog seeded from chips alone, so
+    /// over a trace that kept nothing the sentence would name a remedy showing an empty list. And
+    /// a filter whose pass could not start has `kept` empty because it never ran, not because it
+    /// threw every row away; `filter_error` already takes the filter pane to say so.
+    #[test]
+    fn a_warning_about_a_filter_is_not_raised_for_a_trace_or_for_one_that_never_ran() {
+        let trace_only = status_panes_of(StatusFacts {
+            filter: Some((0, 1_424)),
+            chips: 0,
+            trace: Some("4bf92f3577b34da6"),
+            ..open()
+        });
+        assert_eq!(
+            trace_only.message, "Ready",
+            "a trace is not a filter and Ctrl+L would not show it"
+        );
+        assert!(
+            trace_only.view.contains("trace"),
+            "the view pane is where a trace is named: {}",
+            trace_only.view
+        );
+
+        let never_ran = status_panes_of(StatusFacts {
+            filter: Some((0, 1_424)),
+            chips: 1,
+            filter_error: Some("could not start the pass"),
+            ..open()
+        });
+        assert_eq!(
+            never_ran.message, "Ready",
+            "nothing was thrown away; the filter did not run"
+        );
+        assert!(
+            never_ran.filter.contains("could not start"),
+            "and the filter pane says why: {}",
+            never_ran.filter
+        );
+    }
+
     /// **Only zero.** A filter that keeps some rows needs no warning — the count says it — and a
     /// document with no rows at all is empty for a reason that has nothing to do with filtering.
     #[test]
     fn a_filter_that_keeps_something_or_had_nothing_to_keep_raises_nothing() {
         let kept = status_panes_of(StatusFacts {
             filter: Some((1, 1_424)),
+            chips: 1,
             ..open()
         });
         assert_eq!(
@@ -934,6 +1049,7 @@ mod tests {
 
         let nothing_there = status_panes_of(StatusFacts {
             filter: Some((0, 0)),
+            chips: 1,
             ..open()
         });
         assert_eq!(
