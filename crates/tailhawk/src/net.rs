@@ -211,6 +211,14 @@ pub enum NetFault {
         during: &'static str,
         /// The Windows error code.
         code: u32,
+        /// The host the call was about, when there was one.
+        ///
+        /// **Stamped once, in [`send`], rather than threaded through every handle wrapper.** The
+        /// wrappers raise these faults from inside `Session`, `Owned` and `Call`, none of which has
+        /// any business knowing a hostname; `send` is the single entry point and the only place
+        /// that has parsed the URL. `None` means the fault happened before a host was known — a
+        /// URL that would not parse — and nothing is invented to fill the gap.
+        host: Option<String>,
     },
     /// The server answered with a redirect. §7 forbids following one, because the next hop may be
     /// a different origin and the credential is bound to this one.
@@ -234,7 +242,9 @@ impl std::fmt::Display for NetFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NetFault::NoTransport => f.write_str("this Windows has no usable WinHTTP"),
-            NetFault::Failed { during, code } => write!(f, "{during} failed (error {code})"),
+            NetFault::Failed { during, code, host } => {
+                f.write_str(&transport_said(during, *code, host.as_deref()))
+            }
             NetFault::Redirected { status } => {
                 write!(
                     f,
@@ -249,9 +259,130 @@ impl std::fmt::Display for NetFault {
     }
 }
 
+impl NetFault {
+    /// Stamps the host the **request** was for onto a failure that has room for one.
+    ///
+    /// **`Failed` only, and only an unstamped one.** `NoTransport` is about this Windows rather
+    /// than any host; `Refused` already names the address it refused, and the host beside it would
+    /// say the same thing twice; `Redirected` and `TooLarge` are answers rather than failures to
+    /// reach anything. A fault already carrying a host does not get a second.
+    ///
+    /// **It is the request's host, not necessarily the host that failed**, and the sentences in
+    /// [`about_the_host`] are worded for that. Three of the stages that can fail — opening the
+    /// session, installing the watcher, refusing redirects — are local handle calls with no host in
+    /// them at all, and a configured proxy makes the name resolved and the address connected to the
+    /// *proxy's* rather than the target's. Naming the request's host is still the most useful thing
+    /// available, because it is the one fact that says which of several sources this was about; it
+    /// is only a licence to assert *why* it failed that this cannot give.
+    fn about(self, host: &str) -> NetFault {
+        match self {
+            // **An empty host is no host.** `Target::parse` accepts `https:///path` — the authority
+            // is simply blank — and every caller here reaches `send` through `Origin::parse`, which
+            // refuses that with `EmptyHost`. Nothing reaches this with a blank host today; the
+            // guard is here so that a future caller which does gets the host-free sentence rather
+            // than one with a hole and a dangling preposition in it.
+            NetFault::Failed {
+                during,
+                code,
+                host: None,
+            } if !host.is_empty() => NetFault::Failed {
+                during,
+                code,
+                host: Some(host.to_owned()),
+            },
+            other => other,
+        }
+    }
+}
+
+/// The sentence a transport failure deserves — the host it was about, and the code in words.
+///
+/// **A number on its own is not a reason.** The owner opened a Loki source on 2026-10-16 and was
+/// told `sending the request failed (error 12007)`. Both facts were true and neither was usable:
+/// the cause was three disconnected VPN adapters still holding DNS registrations, so his token
+/// endpoint's name resolved only sometimes — and the sentence named neither the host nor DNS.
+///
+/// Each named code points at a **different thing to check**: a name that will not resolve is
+/// resolution, a connection nothing accepted is a port or a firewall, a reset connection may be the
+/// TLS floor this module sets, and three distinct certificate faults are none of those. Collapsing
+/// them into one number makes the reader do that sorting with a search engine.
+///
+/// **What these sentences deliberately do not do is assert a cause.** `about`'s note says why: the
+/// host named is the one the *request* was for, and with a proxy configured it is not the host
+/// whose name failed to resolve. An earlier draft of this said `this machine's DNS does not answer
+/// for that name`, which is a confident sentence that a proxied machine makes false — and a
+/// confident wrong cause is worse than the bare number it replaced, because the number at least
+/// left the reader to find out. Each one now says what happened and what to check.
+///
+/// **`during` is kept wherever the code alone cannot say which failure this is.** `ERROR_WINHTTP_
+/// TIMEOUT` is the case that forces it: `Session::open` installs four separate deadlines —
+/// resolving, connecting, sending, and each read of the response — and all four arrive here as
+/// 12002. The stage is the only thing that tells a stalled read of a slow Loki query, whose remedy
+/// is a shorter fetch window, from a name that never resolved, whose remedy is DNS.
+///
+/// A code this has no words for keeps everything it has rather than guessing — the stage, the
+/// number and the host — because an unrecognised code is exactly the case where the number is all
+/// there is.
+fn transport_said(during: &str, code: u32, host: Option<&str>) -> String {
+    if let Some(said) = host.and_then(|host| about_the_host(during, code, host)) {
+        return said;
+    }
+    // `code: 0` is this module's own "we never asked Windows" — a URL that would not parse. Printing
+    // `(error 0)` for it would invite a search for a code that does not exist.
+    match (host, code) {
+        (Some(host), 0) => format!("{during} failed at {host}"),
+        (Some(host), code) => format!("{during} failed at {host} (error {code})"),
+        (None, 0) => format!("{during} failed"),
+        (None, code) => format!("{during} failed (error {code})"),
+    }
+}
+
+/// The codes worth saying in words, or `None` for one this has none for.
+///
+/// **The host leads wherever it can**, because the message pane clips on the right and the host is
+/// the fact that says which source this was about.
+fn about_the_host(during: &str, code: u32, host: &str) -> Option<String> {
+    let said = match code {
+        ERROR_WINHTTP_NAME_NOT_RESOLVED => {
+            format!("{host} could not be resolved — check this machine's DNS, VPN or proxy")
+        }
+        ERROR_WINHTTP_CANNOT_CONNECT => {
+            format!(
+                "nothing accepted a connection to {host} — check the port, a firewall, or a proxy"
+            )
+        }
+        // **Both halves of what Microsoft documents for 12030**, and the second is one this module
+        // manufactures: `TLS12_AND_13` is set unconditionally and its own note says there is no
+        // configuration that can put the older protocols back, so a server still on TLS 1.0 or 1.1
+        // is a case this code creates by design. "The connection was lost" would send that reader
+        // hunting for a flaky link.
+        ERROR_WINHTTP_CONNECTION_ERROR => format!(
+            "the connection to {host} was reset — the server, a firewall, or a TLS version it \
+             will not accept"
+        ),
+        ERROR_WINHTTP_TIMEOUT => {
+            format!("{during} timed out — {host} did not answer within the time allowed")
+        }
+        // Not "refused": that verb means `NetFault::Refused` in this module — §7's address check
+        // rejecting a resolved IP — which is a different event with a different remedy.
+        ERROR_WINHTTP_SECURE_FAILURE => format!("{host}'s certificate was not accepted"),
+        ERROR_WINHTTP_SECURE_CERT_DATE_INVALID => {
+            format!("{host}'s certificate has expired or is not yet valid")
+        }
+        ERROR_WINHTTP_SECURE_CERT_CN_INVALID => {
+            format!("{host}'s certificate is for a different name")
+        }
+        ERROR_WINHTTP_SECURE_INVALID_CA => {
+            format!("{host}'s certificate is from an authority this machine does not trust")
+        }
+        _ => return None,
+    };
+    Some(said)
+}
+
 /// What the connection watcher saw, for the request being made on this thread.
 ///
-/// **Thread-local because a request is synchronous here**: [`send`] installs the watcher, makes one
+/// **Thread-local because a request is synchronous here**: [`sending`] installs the watcher, makes one
 /// call and reads the answer before returning, so there is exactly one request in flight per thread
 /// and no ambiguity about which one a notification belongs to. If this ever becomes concurrent, the
 /// context pointer `WinHttpSetStatusCallback` carries is the place to put this instead.
@@ -287,8 +418,9 @@ fn verdict_of_text(text: &str, provenance: Provenance) -> Result<(), AddressFaul
 ///
 /// **Records; does not decide.** Aborting from inside a callback is documented but delicate, and a
 /// refusal that raced the send would be worse than useless — so the verdict is remembered here and
-/// enforced by [`send`], which refuses to read or return anything when a refusal was recorded. The
-/// residual exposure is stated plainly in [`send`]'s own note rather than papered over.
+/// enforced by [`sending`], which refuses to read or return anything when a refusal was recorded —
+/// the two checks either side of the send, and the note on [`send`] itself says what remains
+/// exposed rather than papering over it.
 unsafe extern "system" fn watch_connection(
     _handle: Handle,
     _context: usize,
@@ -355,11 +487,20 @@ const TLS12_AND_13: u32 = 0x0000_0800 | 0x0000_2000;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
-/// Send one request and read the answer.
+/// The `ERROR_WINHTTP_*` codes [`transport_said`] has words for.
 ///
-/// `token` is attached as a bearer credential for this call only. The caller is responsible for
-/// having checked, through `loki::Origin::may_connect_to`, that the address this resolves to is one
-/// §7 permits — this function performs the request it is given and does not re-litigate it.
+/// **Hand-declared like every other number in this module**, and checked against the official
+/// bindings by `the_hand_declared_constants_match_the_official_bindings` for the reason that test
+/// gives: these are not bound, so a wrong one compiles and quietly means something else.
+const ERROR_WINHTTP_TIMEOUT: u32 = 12002;
+const ERROR_WINHTTP_NAME_NOT_RESOLVED: u32 = 12007;
+const ERROR_WINHTTP_CANNOT_CONNECT: u32 = 12029;
+const ERROR_WINHTTP_CONNECTION_ERROR: u32 = 12030;
+const ERROR_WINHTTP_SECURE_CERT_DATE_INVALID: u32 = 12037;
+const ERROR_WINHTTP_SECURE_CERT_CN_INVALID: u32 = 12038;
+const ERROR_WINHTTP_SECURE_INVALID_CA: u32 = 12045;
+const ERROR_WINHTTP_SECURE_FAILURE: u32 = 12175;
+
 /// How one request proves who is asking.
 ///
 /// **A credential is an argument to the send, never a field on the request.** `loki::Request`'s
@@ -379,18 +520,52 @@ pub enum Auth<'a> {
     ClientSecret(&'a str),
 }
 
+/// Send one request and read the answer.
+///
+/// `auth` is composed into this call and nowhere else — a bearer header or a client secret in the
+/// body, for the duration of the send. The caller is responsible for having checked, through
+/// `loki::Origin::may_connect_to`, that the URL is one §7 permits; this performs the request it is
+/// given and does not re-litigate it.
+///
+/// **The residual exposure, stated rather than papered over.** `watch_connection` records the
+/// address WinHTTP connected to and [`sending`] refuses to read or return anything once a refusal
+/// is recorded — but the connection has by then been made, and with a bearer credential on the
+/// request the first bytes have been sent. That is the gap the callback cannot close from where it
+/// stands, and §7's answer is that nothing is *read back*, so a rebound address learns nothing it
+/// could return. The two `Watching::refusal()` checks either side of the send are that refusal.
+///
+/// **Two frames, because only this one knows the host.** Everything that can fail inside
+/// [`sending`] raises its fault from a handle wrapper with no hostname in reach; this frame has the
+/// parsed URL, so it stamps the host on the way out through [`NetFault::about`]. Splitting it also
+/// keeps `Target` alive in this frame for the whole call, which the `PCWSTR` pointers handed to
+/// `WinHttpConnect` and `WinHttpOpenRequest` require.
 pub fn send(request: &Request, provenance: Provenance, auth: Auth<'_>) -> Result<Answer, NetFault> {
     let api = winhttp().ok_or(NetFault::NoTransport)?;
     let target = Target::parse(&request.url).ok_or(NetFault::Failed {
         during: "reading the URL",
         code: 0,
+        host: None,
     })?;
+    // **The host is stamped on the way out, in one place.** Every `NetFault::Failed` below is
+    // raised inside a handle wrapper that has no reason to know a hostname, and threading one
+    // through all ten of them to reach the sentence would put the same string in ten places. This
+    // is the only frame that has the parsed URL and sees every fault on its way to the caller.
+    let host = target.host_text();
+    sending(api, &target, request, provenance, auth).map_err(|fault| fault.about(&host))
+}
 
+fn sending(
+    api: &'static WinHttp,
+    target: &Target,
+    request: &Request,
+    provenance: Provenance,
+    auth: Auth<'_>,
+) -> Result<Answer, NetFault> {
     let _watching = Watching::begin(provenance);
     let session = Session::open(api)?;
     session.watch()?;
-    let connection = session.connect(&target)?;
-    let call = connection.request(&target, request.method)?;
+    let connection = session.connect(target)?;
+    let call = connection.request(target, request.method)?;
     call.disable_redirects()?;
 
     // The send is where the address is resolved and connected to, so the refusal check comes
@@ -479,6 +654,16 @@ impl Target {
             secure,
         })
     }
+
+    /// The host as text, for the sentence a failure gets rather than for WinHTTP.
+    ///
+    /// **A named function because of the subtraction.** `wide` always appends a terminator, so
+    /// `host` is never empty and `len() - 1` cannot underflow — but that is a fact about `wide`
+    /// held together by this one expression, and it was written out by hand everywhere it was
+    /// needed. One place to be right, and one place to look if `wide` ever changes.
+    fn host_text(&self) -> String {
+        String::from_utf16_lossy(&self.host[..self.host.len() - 1])
+    }
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -489,6 +674,7 @@ fn failure(during: &'static str) -> NetFault {
     NetFault::Failed {
         during,
         code: unsafe { windows::Win32::Foundation::GetLastError() }.0,
+        host: None,
     }
 }
 
@@ -623,7 +809,7 @@ impl Session {
 
 /// A connection to one host and port.
 ///
-/// The handles are closed in reverse declaration order in [`send`] — call, then connection, then
+/// The handles are closed in reverse declaration order in [`sending`] — call, then connection, then
 /// session — which is the order WinHTTP documents. That ordering is Rust's own drop order rather
 /// than anything this has to arrange.
 struct Connection(Owned);
@@ -796,10 +982,7 @@ mod tests {
     #[test]
     fn a_url_splits_into_the_pieces_winhttp_asks_for_separately() {
         let t = Target::parse("https://loki.example.com/loki/api/v1/query_range").expect("parsed");
-        assert_eq!(
-            String::from_utf16_lossy(&t.host[..t.host.len() - 1]),
-            "loki.example.com"
-        );
+        assert_eq!(t.host_text(), "loki.example.com");
         assert_eq!(t.port, 443);
         assert!(t.secure);
         assert_eq!(
@@ -837,6 +1020,213 @@ mod tests {
         assert!(!Target::parse("ws://h/x").expect("ws").secure);
         assert!(Target::parse("ftp://h/x").is_none(), "and nothing else is");
         assert!(Target::parse("not a url").is_none());
+    }
+
+    /// **The host it could not reach, and the code in words.**
+    ///
+    /// The owner opened a Loki source on 2026-10-16 and the bar said `sending the request failed
+    /// (error 12007)`. The code was right and the fault was real — three disconnected ExpressVPN
+    /// adapters were still holding DNS registrations, so `identity.nurtur.tech` resolved only
+    /// sometimes — but neither the name that would not resolve nor the word "resolve" was anywhere
+    /// in the sentence, so the one thing it was about had to be looked up elsewhere. The fault held
+    /// the number all along; what it did not hold was the host.
+    #[test]
+    fn a_transport_fault_names_the_host_and_says_the_code_in_words() {
+        let unresolved = NetFault::Failed {
+            during: "sending the request",
+            code: 12007,
+            host: Some("identity.nurtur.tech".to_owned()),
+        };
+        assert_eq!(
+            unresolved.to_string(),
+            "identity.nurtur.tech could not be resolved — check this machine's DNS, VPN or proxy",
+            "the report that asked for this"
+        );
+
+        // Each of these points at a different thing to check, which is the whole argument for
+        // telling them apart — and none of them asserts a cause, because the host named is the
+        // one the request was for and a proxy makes it not the host that failed.
+        for (code, expect) in [
+            (
+                12029u32,
+                "nothing accepted a connection to telemetry.example.com — check the port, a \
+                 firewall, or a proxy",
+            ),
+            (
+                12030,
+                "the connection to telemetry.example.com was reset — the server, a firewall, or \
+                 a TLS version it will not accept",
+            ),
+            (
+                12175,
+                "telemetry.example.com's certificate was not accepted",
+            ),
+            (
+                12037,
+                "telemetry.example.com's certificate has expired or is not yet valid",
+            ),
+            (
+                12038,
+                "telemetry.example.com's certificate is for a different name",
+            ),
+            (
+                12045,
+                "telemetry.example.com's certificate is from an authority this machine does not \
+                 trust",
+            ),
+        ] {
+            let fault = NetFault::Failed {
+                during: "sending the request",
+                code,
+                host: Some("telemetry.example.com".to_owned()),
+            };
+            assert_eq!(fault.to_string(), expect, "error {code}");
+        }
+    }
+
+    /// **One code, four deadlines, and only the stage tells them apart.** `Session::open` sets a
+    /// limit on resolving, on connecting, on sending and on each read of the response, and all
+    /// four arrive as `ERROR_WINHTTP_TIMEOUT`. A sentence that dropped the stage would say the
+    /// same thing about a name that never resolved — remedy: DNS — and a stalled read of an hour
+    /// of a busy stream, whose remedy is the shorter fetch window the status bar already knows how
+    /// to recommend. The code is identical in both; the stage is the whole of the difference.
+    #[test]
+    fn a_timeout_says_which_of_the_four_deadlines_ran_out() {
+        let reading = NetFault::Failed {
+            during: "reading the body",
+            code: ERROR_WINHTTP_TIMEOUT,
+            host: Some("telemetry.example.com".to_owned()),
+        };
+        assert_eq!(
+            reading.to_string(),
+            "reading the body timed out — telemetry.example.com did not answer within the time \
+             allowed"
+        );
+
+        let connecting = NetFault::Failed {
+            during: "connecting",
+            code: ERROR_WINHTTP_TIMEOUT,
+            host: Some("telemetry.example.com".to_owned()),
+        };
+        assert_eq!(
+            connecting.to_string(),
+            "connecting timed out — telemetry.example.com did not answer within the time allowed"
+        );
+        assert_ne!(
+            reading.to_string(),
+            connecting.to_string(),
+            "two different failures with two different remedies must not read alike"
+        );
+    }
+
+    /// **A code with no words keeps the stage, the number and the host.** Naming some codes is not
+    /// a licence to lose the rest: an unrecognised one is exactly the case where a reader has
+    /// nothing but the number to go on, and the host is still what it was about.
+    ///
+    /// The host leads the named sentences and sits mid-sentence here, both before the number,
+    /// because the message pane clips on the right — a host at the end is the first fact lost.
+    #[test]
+    fn a_code_this_has_no_words_for_still_says_everything_it_knows() {
+        let odd = NetFault::Failed {
+            during: "waiting for the response",
+            code: 12152,
+            host: Some("telemetry.example.com".to_owned()),
+        };
+        assert_eq!(
+            odd.to_string(),
+            "waiting for the response failed at telemetry.example.com (error 12152)"
+        );
+
+        // Before a URL has been parsed there is no host to name, and `GetLastError` was never
+        // consulted — so neither is invented. **This is the only `host: None` the shipped product
+        // reaches**, because `send` stamps the host on every other `Failed`; the host-free forms
+        // below are exercised through the pure function rather than through a fault that cannot
+        // occur, so the test documents behaviour the program actually has.
+        let early = NetFault::Failed {
+            during: "reading the URL",
+            code: 0,
+            host: None,
+        };
+        assert_eq!(early.to_string(), "reading the URL failed");
+
+        assert_eq!(
+            transport_said("opening a session", 12019, None),
+            "opening a session failed (error 12019)"
+        );
+        assert_eq!(
+            transport_said("connecting", 0, Some("h.example.com")),
+            "connecting failed at h.example.com",
+            "no code to quote, but still a host"
+        );
+    }
+
+    /// **The stamping itself, which nothing else pins.** Every sentence above is reached only if
+    /// `send` puts the host on the fault, and `about` is the whole of that mechanism: delete the
+    /// `map_err` in `send` and the product is back to the bare numbers this change exists to
+    /// remove, with every other test in this file still passing.
+    #[test]
+    fn only_a_failure_with_room_for_a_host_is_given_one() {
+        let bare = NetFault::Failed {
+            during: "connecting",
+            code: ERROR_WINHTTP_NAME_NOT_RESOLVED,
+            host: None,
+        };
+        assert_eq!(
+            bare.clone().about("telemetry.example.com"),
+            NetFault::Failed {
+                during: "connecting",
+                code: ERROR_WINHTTP_NAME_NOT_RESOLVED,
+                host: Some("telemetry.example.com".to_owned()),
+            },
+            "the one case that takes a host"
+        );
+
+        // A host already named is not replaced: `send` stamps once, and a second stamp would mean
+        // a fault had travelled through two requests.
+        let stamped = NetFault::Failed {
+            during: "connecting",
+            code: ERROR_WINHTTP_NAME_NOT_RESOLVED,
+            host: Some("first.example.com".to_owned()),
+        };
+        assert_eq!(
+            stamped.clone().about("second.example.com"),
+            stamped,
+            "the first host stands"
+        );
+
+        // **These three carry no host, each for its own reason**, and `about`'s doc comment is the
+        // only other place that says so.
+        assert_eq!(
+            NetFault::NoTransport.about("telemetry.example.com"),
+            NetFault::NoTransport,
+            "about this Windows, not about any host"
+        );
+        let refused = NetFault::Refused {
+            address: "169.254.169.254".to_owned(),
+            fault: AddressFault::Metadata,
+        };
+        assert_eq!(
+            refused.clone().about("telemetry.example.com"),
+            refused,
+            "already names the address it refused"
+        );
+        assert_eq!(
+            NetFault::Redirected { status: 302 }.about("telemetry.example.com"),
+            NetFault::Redirected { status: 302 },
+            "an answer, not a failure to reach anything"
+        );
+        assert_eq!(
+            NetFault::TooLarge.about("telemetry.example.com"),
+            NetFault::TooLarge,
+            "likewise"
+        );
+
+        // A blank host would otherwise produce "connecting failed at  (error 12005)".
+        assert_eq!(
+            bare.clone().about(""),
+            bare,
+            "an empty host is no host, and leaves no hole in the sentence"
+        );
     }
 
     /// **Every hand-declared Win32 number in this module, against the official bindings.**
@@ -885,6 +1275,39 @@ mod tests {
         );
         assert_eq!(WINHTTP_QUERY_STATUS_CODE, w::WINHTTP_QUERY_STATUS_CODE);
         assert_eq!(WINHTTP_QUERY_FLAG_NUMBER, w::WINHTTP_QUERY_FLAG_NUMBER);
+
+        // The codes `transport_said` turns into words. A wrong one here would put a confident
+        // sentence about DNS on a certificate failure, which is worse than the number was.
+        assert_eq!(ERROR_WINHTTP_TIMEOUT, w::ERROR_WINHTTP_TIMEOUT);
+        assert_eq!(
+            ERROR_WINHTTP_NAME_NOT_RESOLVED,
+            w::ERROR_WINHTTP_NAME_NOT_RESOLVED,
+            "the one the owner was handed as a bare number"
+        );
+        assert_eq!(
+            ERROR_WINHTTP_CANNOT_CONNECT,
+            w::ERROR_WINHTTP_CANNOT_CONNECT
+        );
+        assert_eq!(
+            ERROR_WINHTTP_CONNECTION_ERROR,
+            w::ERROR_WINHTTP_CONNECTION_ERROR
+        );
+        assert_eq!(
+            ERROR_WINHTTP_SECURE_CERT_DATE_INVALID,
+            w::ERROR_WINHTTP_SECURE_CERT_DATE_INVALID
+        );
+        assert_eq!(
+            ERROR_WINHTTP_SECURE_CERT_CN_INVALID,
+            w::ERROR_WINHTTP_SECURE_CERT_CN_INVALID
+        );
+        assert_eq!(
+            ERROR_WINHTTP_SECURE_INVALID_CA,
+            w::ERROR_WINHTTP_SECURE_INVALID_CA
+        );
+        assert_eq!(
+            ERROR_WINHTTP_SECURE_FAILURE,
+            w::ERROR_WINHTTP_SECURE_FAILURE
+        );
     }
 
     /// **§7's rebinding check, over the text WinHTTP hands its callback.**

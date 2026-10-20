@@ -116,7 +116,20 @@ redistributable dependency. `cargo fmt --check` has broken the build on its own 
 The `tools/verify-*.ps1` harnesses drive the real binary. They need **`powershell`, not `pwsh`**,
 and a desktop session. `tools/verify-uia.ps1` is the exception — it needs no foreground.
 
-**Three known flakes. Two are timing criteria; the third polls a file for growth:**
+**Four known flakes. Two are timing criteria, one polls a file for growth, and one loses a race for
+an exclusive handle:**
+
+`stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone` failed on 2026-10-20 under
+the full release suite with *"the orphan should have been reaped"*, and passed alone straight
+afterwards. **The mechanism is worth knowing, because it is not a duration and not a growth poll.**
+`reap_orphans` decides a spill is orphaned by `open_exclusive` — a `CreateFileW` with no sharing at
+all — so *anything* holding that file for an instant makes the reap skip it and the assertion fail:
+an antivirus scanner, the search indexer, or a live Tailhawk writing spill parts into the same
+`%TEMP%`. The full suite creates and deletes many spills at once in that one directory, which is
+exactly when something else is most likely to be mid-scan on one of them. Its sibling
+`reaping_removes_an_orphan_spill_directory_and_leaves_a_live_one_alone` can go the same way.
+**So the general rule below widens again: a failing assertion about a file being gone, or about
+anyone holding it, is a candidate too.**
 `stdin::tests::a_spill_is_an_ordinary_file_to_the_rest_of_the_product` asserts
 `polled.lines_added == 1` immediately after appending to a spill, so it depends on the write being
 visible to the next `settle()`. Seen failing once under the full release suite on 2026-10-08 and

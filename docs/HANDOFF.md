@@ -1,5 +1,143 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-20: a transport failure names the host, and two reports that were not defects
+
+**289 shell + 1023 core, 0 failed; fmt and clippy clean; `portable-core` checked on the Linux
+target** (its one warning, `Cancel::flag` in `search.rs`, is older than this work).
+
+**A fourth known flake was found and recorded in `CLAUDE.md`.**
+`stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone` failed once under the full
+suite and passed alone. It is in `tailhawk-core`, which does not depend on the crate this change
+touches, so it cannot be this work — but the mechanism was worth chasing rather than shrugging at:
+`reap_orphans` proves a spill is orphaned with `open_exclusive`, a `CreateFileW` with **no sharing
+at all**, so anything holding that file for an instant — a scanner, the indexer, or a live Tailhawk
+writing spill parts into the same `%TEMP%` — makes the reap skip it and the assertion fail.
+
+### What was wrong, and in neither case was it Tailhawk
+
+He reported a remote source that *"went away with a wait cursor and then did nothing"*, and
+mentioned he had been cleaning up security on the machine. **Read the running window through UI
+Automation rather than guessing** — the status bar was still holding the answer:
+
+```
+nurtur-loki-identityserver · nurtur-identity-server: Could not reach the token endpoint:
+sending the request failed (error 12007).
+```
+
+WinHTTP 12007 is `ERROR_WINHTTP_NAME_NOT_RESOLVED`, against
+`https://identity.nurtur.tech/connect/token`. **Three disconnected ExpressVPN adapters were still
+carrying DNS server registrations** — `Ethernet` (ExpressVPN TAP) 10.19.0.1, `Local Area Connection`
+(ExpressVPN TUN) 100.64.100.1, Bluetooth 172.20.10.1 — and only Wi-Fi's 192.168.0.1 resolves these
+names. Queried each server directly to prove it. A multi-homed Windows sometimes takes the stale
+resolver's failure as the answer, which is why his retry worked.
+
+**Ruled out, each verified rather than assumed:** the `tailhawk` client is still registered at the
+identity server (a probe with a deliberately bogus refresh token answers `invalid_grant`, not
+`invalid_client`), `telemetry:read` and `offline_access` are still in the discovery document,
+`telemetry.nurtur.tech` answers 401 on 443 as it should, and `secrets.rs`'s real-store tests use
+dedicated `tailhawk-selftest` names so the suite cannot have eaten his credentials.
+
+**The second report — the job-dispatcher tab "totally blank" while the others tail — is a
+remembered filter**, and the status bar proves it: `Filtered 0 of at least 1,424`. His settings hold
+
+```
+[[file]]
+path = "loki://nurtur-loki-jobdispatcher?apps=job-dispatcher"
+chips = ["+contains(environment, \"local\")"]
+```
+
+That source is the only one of the three with **no `query` line**, so it is not scoped to
+`live|production` like the others — the filter was written when it pointed somewhere local, and an
+including filter on a field the records do not carry excludes every row. `Ctrl+L` ▸ Remove all
+clears it.
+
+**The defect worth fixing, and it is ours:** a view where a filter keeps nothing says so only in a
+status-bar pane, and in that very window the *message* pane was carrying a notice about a different
+source. Nothing on screen connected an empty grid to a filter. He has not asked for this yet.
+
+### The change that was made
+
+**A transport failure now names the host and says its code in words**, which he asked for in those
+words. `crates/tailhawk/src/net.rs`: `NetFault::Failed` carries a `host`, stamped once by
+`NetFault::about` in `send`; `send` is split into `send` (has the parsed URL, so it is the only
+frame that knows the host) and `sending` (the handle dance, unchanged line for line). The pure
+`transport_said` / `about_the_host` turn eight `ERROR_WINHTTP_*` codes into sentences.
+
+**The component review found four things worth having, and the first two are the ones to remember.**
+
+1. **The first draft discarded `during` for every named code**, and `ERROR_WINHTTP_TIMEOUT` makes
+   that fatal: `Session::open` installs **four** deadlines — resolving, connecting, sending, and
+   each read of the response — and all four arrive as 12002. The stage is the whole of the
+   difference between a name that never resolved (remedy: DNS) and a stalled read of a slow query
+   (remedy: the shorter fetch window the status bar already recommends). The sentence now keeps it.
+2. **It asserted a cause it could not know.** `this machine's DNS does not answer for that name` is
+   false on a machine with a configured proxy: `Session::open` uses
+   `WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`, so the name that failed to resolve is the *proxy's* and
+   the host named is merely the one the request was for. **A confident wrong cause is worse than the
+   bare number it replaces**, because the number at least left the reader to find out. Every
+   sentence now says what happened and what to check, never why.
+3. `ERROR_WINHTTP_CONNECTION_ERROR` is documented as a reset connection **or an incompatible SSL
+   protocol** — and the second is a case this module manufactures, since `TLS12_AND_13` is set
+   unconditionally and nothing can put the older protocols back. Its sentence names the TLS floor.
+4. **`about` had no test at all**, so the whole stamping mechanism could have been deleted with
+   every test still passing. It has one now. **What remains untested, honestly:** that `send`
+   actually calls it — that is shell wiring over a live socket, which `CLAUDE.md` says will not be
+   tested, rather than something overlooked.
+
+Both new behaviours were mutation-verified: dropping `during` from the timeout arm fails
+`a_timeout_says_which_of_the_four_deadlines_ran_out`, and letting `about` overwrite an existing host
+fails `only_a_failure_with_room_for_a_host_is_given_one`.
+
+### Open, and all of it his call
+
+**He has asked for the Remote sources dialog to be made usable** — *"possibly with some sort of
+discovery, and helpers for creating filters"*, cloning a source to edit one field, and a place to
+*"edit or view the list of apps being tailed"*, since there is none. He named the Windows email
+autoconfiguration pattern: one field, magic behind it, and a manual fallback for what the magic
+cannot reach. **Nothing has been built.**
+
+**Discovery is viable from one field, and this was verified against his own estate rather than
+assumed.** `https://telemetry.nurtur.tech/.well-known/openid-configuration` answers **200** and
+carries `issuer: https://identity.nurtur.tech`, `token_endpoint: /connect/token`,
+`authorization_endpoint: /connect/authorize` and `S256` among its code-challenge methods — so
+**`token_url` and `auth_url` derive from the Loki URL alone**, with no guessing.
+
+What does **not** work, also verified, so no design leans on it:
+
+- Loki's 401 carries `WWW-Authenticate: Bearer` five times with **no realm, scope or issuer**, and
+  RFC 9728's `/.well-known/oauth-protected-resource` is 404 there. The issuer cannot be read off
+  the challenge; the well-known on the resource host is what saves it.
+- Sibling-host guessing would also have worked here (`identity.nurtur.tech` answers; `auth`,
+  `login`, `sso`, `idp` all time out) — so it is a usable **fallback**, but it must be time-boxed.
+- The mount prefix cannot be settled before sign-in: `/api/v1/labels` is 404 while
+  `/loki/api/v1/labels` and `/loki/loki/api/v1/labels` are **both** 401, because the auth middleware
+  runs before routing. A **Test** button that reports what it actually reached is part of this.
+- `client_id` is the one field nothing can derive — it is assigned at registration — so it should
+  default to the last one used.
+
+`/loki/api/v1/labels` and `/loki/api/v1/label/{name}/values` are what would fill the apps list and
+turn the LogQL query into a picker. **Keep the two languages apart:** the sources dialog composes
+**LogQL** (which lines Loki sends at all), the filters dialog composes Tailhawk's own grammar (which
+lines survive on screen).
+
+**An adjacent defect found while reading the store: renaming a source silently orphans its
+sign-in.** Tokens are keyed on the source name, which is why Credential Manager holds
+`Tailhawk/loki-tokens/nurtur-loki-live` while no source is called that any more — his is
+`nurtur-loki-live 77 apps`. A Clone verb has to inherit no sign-in for the same reason.
+
+**Suggested order**, his to overrule: the Apps field and Clone first (small, self-contained, and
+they close the gap he actually hit), then discovery, then the LogQL picker.
+
+### Still unverified on screen, from earlier work
+
+The dark-mode header titles in the other four list dialogs (Remote sources, Highlight rules, Define
+Format, Select Columns) — the fix is in `lv_column`, so they should all have it. The filters
+dialog's four bulk buttons, the dimmed disabled row, and `Edit…` round-tripping through the
+composer. From 2026-10-13, in the sources dialog: the offered `(unnamed)` row, the Problem column's
+readability, and columns not jumping with eight or more sources.
+
+---
+
 ## ▶ Resume point — 2026-10-16: the panel is gone, and the filters dialog is WinTail's shape
 
 **285 shell + 1023 core, 0 failed; fmt and clippy clean; `portable-core` checked on the Linux
