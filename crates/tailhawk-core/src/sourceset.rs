@@ -44,7 +44,12 @@ pub const MAX_SOURCES: usize = 64;
 /// to read or, as a first draft of this did, one of negative width. Zero is the width the shell
 /// reports when it cannot measure the list at all, so it is the one value that has to be safe.
 pub fn column_widths(total: i32) -> [i32; 6] {
-    const SHARE: [i32; 6] = [14, 24, 18, 18, 8, 18];
+    // **Name takes the largest share after the URL, and it did not at first.** Seen on screen with
+    // the owner's own three sources: `nurtur-loki-jobdispatcher`, `nurtur-loki-live` and
+    // `nurtur-loki-identityserver` drew as `nurtur-loki-j…`, `nurtur-loki-li…` and
+    // `nurtur-loki-i…` — one letter apart, in the column a reader identifies a row by. A sixth
+    // column had to come out of the other five and it came out of the wrong one.
+    const SHARE: [i32; 6] = [20, 22, 15, 15, 8, 20];
     const FLOOR: i32 = 36;
     let total = total.max(FLOOR * SHARE.len() as i32);
     let spare = i64::from(total - FLOOR * SHARE.len() as i32);
@@ -786,6 +791,12 @@ mod tests {
             assert!(
                 widths[1] > widths[0],
                 "{widths:?}: a URL is longer than a name"
+            );
+            // **And a name is wider than anything but the URL**, because it is what a reader
+            // identifies a row by — three of the owner's sources differ in their twelfth character.
+            assert!(
+                widths[0] >= widths[2] && widths[0] >= widths[3] && widths[0] >= widths[5],
+                "{widths:?}: the name column is not the second widest"
             );
         }
 

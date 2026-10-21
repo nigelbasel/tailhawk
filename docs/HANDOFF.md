@@ -19,10 +19,27 @@ clippy to `--all-targets`**, because the eight lints were only ever "pre-existin
 nothing enforced them: CI covered the product crates' lib and bin targets and not their tests, which
 is exactly how eight accumulated and how the project's own gate script came to be unable to go green.
 
-**Nothing of today's dialog work has been seen on a screen.** The Applications field, the Clone
-verb, Discover, Test, the moved Secret row and the new fault-line sentences are all unverified
-visually — memory `tailhawk-ask-before-driving-the-desktop` says a harness run that takes focus
-blocks his machine, so it needs asking for first. That is the single most useful next thing.
+**Seen on screen on 2026-10-21, with his approval before the run took his focus**, and it was worth
+doing: six columns with the applications in one of them, Clone under Add and Remove, Discover and
+Test beside the URL rows, the Secret row moved down with nothing off the bottom edge, and the
+dark-mode header titles readable — which had been unverified in this dialog since 2026-10-16.
+
+**It also found the one defect no test could have.** His three sources are `nurtur-loki-jobdispatcher`,
+`nurtur-loki-live 77 apps` and `nurtur-loki-identityserver`, and they drew as `nurtur-loki-j…`,
+`nurtur-loki-li…` and `nurtur-loki-i…`: one letter apart, in the column a reader identifies a row by.
+The sixth column had come out of the wrong one of the other five. `SHARE` is `[20, 22, 15, 15, 8, 20]`
+now and a new assertion pins the name as second only to the URL.
+
+**The harness is `scratchpad/shot-sources.ps1`, not `tools/verify-dialogs.ps1`**, and that matters:
+`verify-dialogs.ps1`'s first act is `Get-Process tailhawk | Stop-Process -Force`, which kills the
+owner's own install, and `tools/shot-window.ps1` captures the first tailhawk window it finds. Anything
+that drives the app from here starts one instance, finds the window owned by *its own* pid, and kills
+only that.
+
+**Still unverified on screen:** the other three list dialogs' dark-mode headers (Highlight rules,
+Define Format, Select Columns), and nothing of Discover or Test has been exercised against a live
+server — both were written against what was read off his estate on 2026-10-20 and neither has been
+pressed.
 
 ### What (1) and (2) changed, and the three things found while doing them
 
