@@ -744,6 +744,23 @@ pub fn reached_said(outcome: &Reached) -> String {
     }
 }
 
+/// What one press of **Set up** amounts to, in one sentence.
+///
+/// **Both halves, because they answer different questions and either can be the one that is
+/// wrong.** Discovery says where the reader will sign in; the test says whether the URL they typed
+/// reaches a Loki at all. A configuration can have a perfect sign-in server and a missing `/loki`,
+/// and a sentence carrying only the first would send them looking in the wrong place.
+///
+/// The reachability comes first when it failed, because a URL that reaches nothing is the more
+/// urgent of the two and the one the reader can fix in the box above.
+pub fn setup_said(discovery: &Discovery, reach: &Reached) -> String {
+    let found = discovery_said(discovery);
+    match reach {
+        Reached::WantsToken(_) | Reached::Answered => format!("{found} {}", reached_said(reach)),
+        _ => format!("{} {found}", reached_said(reach)),
+    }
+}
+
 /// The host out of an absolute URL, for a sentence. The whole URL would say
 /// `https://identity.nurtur.tech/.well-known/openid-configuration`, which is a path a reader has
 /// no use for and the one thing in the sentence they did not choose.
@@ -862,6 +879,39 @@ mod tests {
             let said = discovery_said(&Discovery::Refused(PullFault::Address(address)));
             assert!(!said.is_empty(), "a refusal always says something");
         }
+    }
+
+    /// **One press says both things, and the urgent one leads.** A source can have a perfect
+    /// sign-in server and a URL that reaches no Loki at all; a sentence carrying only the first
+    /// sends the reader to look in the wrong place.
+    #[test]
+    fn setting_up_says_where_it_signs_in_and_whether_the_url_reaches_anything() {
+        let found = Discovery::Found {
+            at: "https://identity.nurtur.tech/.well-known/openid-configuration".to_owned(),
+            found: loki::Discovered {
+                issuer: "https://identity.nurtur.tech".to_owned(),
+                token_url: "https://identity.nurtur.tech/connect/token".to_owned(),
+                auth_url: "https://identity.nurtur.tech/connect/authorize".to_owned(),
+                scopes: vec!["openid".to_owned()],
+                pkce_s256: true,
+            },
+        };
+        let said = setup_said(&found, &Reached::WantsToken(401));
+        assert!(
+            said.starts_with("Found https://identity.nurtur.tech"),
+            "{said}"
+        );
+        assert!(said.contains("wants a token"), "{said}");
+
+        // The Loki URL is wrong and the sign-in server is fine: the wrong one leads, because it is
+        // the one the reader can fix in the box above.
+        let said = setup_said(&found, &Reached::NothingMounted);
+        assert!(said.starts_with("Reached the server, but"), "{said}");
+        assert!(said.contains("/loki"), "{said}");
+        assert!(
+            said.contains("Found https://identity.nurtur.tech"),
+            "{said}"
+        );
     }
 
     #[test]

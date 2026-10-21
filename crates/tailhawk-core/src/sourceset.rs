@@ -322,6 +322,31 @@ impl Editor {
         true
     }
 
+    /// Whether the selected row's secret is in the store — the shell's answer, carried.
+    pub fn current_has_secret(&self) -> bool {
+        self.stored.get(self.selected).copied().unwrap_or(false)
+    }
+
+    /// Puts `source` on the selected row, which is what an editor dialog hands back.
+    ///
+    /// **The stored flag follows the name.** A source renamed in the editor has no secret under its
+    /// new key until one is written, so saying it has one would show `stored` against a credential
+    /// that is about to be deleted along with the old name.
+    pub fn replace(&mut self, source: Source) {
+        let Some(slot) = self.sources.get_mut(self.selected) else {
+            return;
+        };
+        if slot.name != source.name {
+            if let Some(stored) = self.stored.get_mut(self.selected) {
+                *stored = false;
+            }
+        }
+        if *slot != source {
+            *slot = source;
+            self.dirty = true;
+        }
+    }
+
     /// Edits a field of the selected source.
     pub fn edit(&mut self, field: Field, value: &str) {
         let Some(source) = self.sources.get_mut(self.selected) else {

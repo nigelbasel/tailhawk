@@ -17,7 +17,7 @@
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::COLORREF;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
 };
@@ -28,11 +28,16 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetClientRect,
-    GetDlgItem, GetDlgItemInt, GetDlgItemTextW, GetSystemMetrics, GetWindowLongPtrW, PostMessageW,
-    SendDlgItemMessageW, SendMessageW, SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW,
-    ShowWindow, DLGTEMPLATE, SM_CXVSCROLL, SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY,
+    GetDlgItem, GetDlgItemInt, GetDlgItemTextW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, MapDialogRect, PostMessageW, SendDlgItemMessageW, SendMessageW, SetDlgItemInt,
+    SetDlgItemTextW, SetWindowLongPtrW, SetWindowPos, ShowWindow, DLGTEMPLATE, GW_CHILD,
+    GW_HWNDNEXT, SM_CXVSCROLL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY,
+    WM_NOTIFY,
 };
+
+use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 
@@ -118,49 +123,60 @@ const ID_R_SAVE: u16 = 196;
 /// §12.4's remote sources dialog. A range of its own so a stray id cannot land on the rules
 /// editor's controls, which sit immediately below.
 const ID_S_LIST: u16 = 210;
-const ID_S_ADD: u16 = 211;
 const ID_S_REMOVE: u16 = 212;
-const ID_S_NAME: u16 = 213;
-const ID_S_URL: u16 = 214;
-const ID_S_TOKEN: u16 = 215;
-const ID_S_CLIENT: u16 = 216;
-const ID_S_SCOPE: u16 = 217;
-const ID_S_SECRET: u16 = 218;
-const ID_S_QUERY: u16 = 219;
-const ID_S_AUTH: u16 = 221;
 const ID_S_FAULT: u16 = 220;
-const ID_S_APPS: u16 = 222;
 const ID_S_CLONE: u16 = 223;
-const ID_S_DISCOVER: u16 = 224;
-const ID_S_TEST: u16 = 225;
+const ID_S_NEW: u16 = 226;
+const ID_S_EDIT: u16 = 227;
+
+/// The one-source editor's controls. **Its own range well clear of everything else**, because it
+/// is a dialog that opens *on top of* the list and a stray id landing on the list's own controls
+/// would be answered by whichever procedure happened to see it first.
+const ID_E_NAME: u16 = 300;
+const ID_E_URL: u16 = 301;
+const ID_E_SHOWS: u16 = 302;
+const ID_E_CHOOSE: u16 = 303;
+const ID_E_SETUP: u16 = 304;
+const ID_E_ADVANCED: u16 = 305;
+const ID_E_MODE: u16 = 306;
+const ID_E_TOKEN: u16 = 307;
+const ID_E_AUTH: u16 = 308;
+const ID_E_CLIENT: u16 = 309;
+const ID_E_SCOPE: u16 = 310;
+const ID_E_SECRET: u16 = 311;
+const ID_E_FAULT: u16 = 312;
 
 /// What a worker posts back to the sources dialog when a **Discover** or a **Test** has finished.
 ///
-/// **Posted, not returned.** Either one is an HTTP round trip — several, for a Discover that has to
-/// guess — and `net::send`'s deadlines are measured in seconds, so doing it inside the dialog
-/// procedure would freeze the dialog while a reader watched. The worker owns the request and hands
+/// **Posted, not returned.** One press of **Set up** is several HTTP round trips — six, when
+/// discovery has to guess — and `net::send`'s deadlines are measured in seconds, so doing it inside
+/// the dialog procedure would freeze the dialog while a reader watched. The worker owns the request and hands
 /// back a boxed answer; `lparam` is `Box::into_raw` and the handler takes it back with
 /// `Box::from_raw` — once per *delivery*, which is not quite once per allocation: a message still
-/// queued when `EndDialog` destroys the window is discarded with the queue, so a reader who
-/// presses Test and then Cancel leaks one box. A few hundred bytes, once, at the end of a
-/// dialog's life.
+/// queued when `EndDialog` destroys the window is discarded with the queue, so a reader who presses
+/// **Set up** and then Cancel leaks one box. A few hundred bytes — and unlike the version of this
+/// that lived on the list dialog, the editor opens and closes repeatedly, so it is once per
+/// abandoned press rather than once per run.
 const WM_S_PROBED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x50;
+
+/// What a worker posts back when **Choose…** has asked the server which applications it holds.
+const WM_E_LABELS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x51;
 
 /// What one of those workers found, and **the URL it was asked about**.
 ///
-/// **The URL travels with the answer because the answer is only true of that URL.** Nothing stops a
-/// reader clicking another source in the list while six candidate probes run, each with WinHTTP's
-/// multi-second deadline — and without this the endpoints discovered for `live` were written into
-/// whichever row was selected when they landed, then committed to it by `sources_read`. One OK
-/// later and `dev` points at `live`'s token endpoint, with nothing on screen having said so.
+/// **The URL travels with the answer because the answer is only true of that URL.** The probe runs
+/// inside a modal dialog now, so the list behind it cannot be clicked — but the reader can retype
+/// the URL while six candidate probes run, each with WinHTTP's multi-second deadline, and an answer
+/// about the server they have just stopped describing must not be written into the boxes describing
+/// the new one. On the list dialog this field guarded something worse: the endpoints discovered for
+/// `live` being committed to whichever *row* was selected when they landed.
 struct Probed {
     asked: String,
-    found: Found,
-}
-
-enum Found {
-    Discovered(crate::pull::Discovery),
-    Tested(crate::pull::Reached),
+    /// Where the server says it signs people in.
+    discovery: crate::pull::Discovery,
+    /// What the Loki URL itself answered, with no credential — the half that says whether the
+    /// mount prefix is right, which no amount of discovery can tell you.
+    reach: crate::pull::Reached,
 }
 
 /// §7's filters dialog. Its own range, clear of the sources editor above and the Define Format
@@ -672,34 +688,30 @@ const R_VERB_W: i16 = 100;
 const R_FIELD_X: i16 = 55;
 
 /// The sources dialog's own size, in dialog units, named so the template and the test that walks it
-/// cannot disagree. **It grew by one field's worth on 2026-10-21** — the Applications box — and a
-/// height left behind would have put the fault line and the buttons off the bottom edge, where
-/// Windows simply does not draw them.
+/// cannot disagree.
+///
+/// **It is a third of what it was, because the fields have gone.** The owner, 2026-10-21, on the
+/// form that carried them: *"I dont really understand the screen you have created, the discover
+/// button is just sitting there, and all the fields next to it."* This dialog is the list and its
+/// verbs; everything a source *is* now belongs to the one that edits it.
 const S_DIALOG_W: i16 = 420;
 /// The height, for the reason [`S_DIALOG_W`] gives.
-const S_DIALOG_H: i16 = 284;
+const S_DIALOG_H: i16 = 165;
 
-/// The remote-sources dialog's controls, in dialog units — pure, so the template walk checks it
-/// without a window, and held to the rules editor's rule of one left edge and one right edge.
+/// The remote-sources list, in dialog units — pure, so the template walk checks it without a window.
+///
+/// **The list, its verbs, and nothing else.** The owner, 2026-10-21, having rejected a form with
+/// eleven fields on it: *"I think the user interface should really be either a first dialig that
+/// simply has the list, with new, edit delete buttons, and a close. and then new brings up a dialog
+/// that guides the user through the setup, and edit allows editing"*. He chose that over a
+/// list-and-details split *"as it allows diferent paths and guides the user better"* — which is the
+/// whole argument: **New** can guide and **Edit** can be a form, and they do not have to be the
+/// same screen.
 ///
 /// **Modal, where the rules editor is modeless, and the reason is the same one read the other way.**
 /// §5 wants the rules editor non-modal because the grid underneath *is* its preview. A source has no
-/// preview: nothing in the window changes as you type a URL, and the box carries a credential, so
-/// the shorter it is on screen the better.
+/// preview: nothing in the window changes as you pick one from a list.
 fn sources_dialog_items() -> Vec<Item> {
-    // **54 rather than 48, because "Sign-in URL:" is the longest label here.** The field moves
-    // right by the same amount and loses the same width, so the right edge still lines up with the
-    // list above it.
-    let label = |text: &str, y: i16| Item::new(Class::Static, text, 0xFFFF, (7, y + 2, 54, 8), 0);
-    let field = |id: u16, y: i16, style: u32| {
-        Item::new(
-            Class::Edit,
-            "",
-            id,
-            (63, y, 284, 12),
-            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | style,
-        )
-    };
     let verb = |text: &str, id: u16, row: i16| {
         Item::new(
             Class::Button,
@@ -711,81 +723,38 @@ fn sources_dialog_items() -> Vec<Item> {
     };
     vec![
         Item::new(
+            Class::Static,
+            "Which log servers can Tailhawk tail?",
+            0xFFFF,
+            (7, 7, 340, 9),
+            0,
+        ),
+        Item::new(
             Class::Named("SysListView32"),
             "",
             ID_S_LIST,
-            (7, 7, 340, 92),
+            (7, 20, 340, 120),
             WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         ),
-        verb("&Add", ID_S_ADD, 0),
-        verb("&Remove", ID_S_REMOVE, 1),
-        // **Third, under the two it is a shorthand for.** Cloning is adding with every field
-        // already filled in, which is the gesture the owner asked for: the estate runs one Loki, so
-        // its sources differ in a selector or a list of applications and agree about everything
-        // else. It sits with Add and Remove rather than beside the fields because it acts on the
-        // *list*, which is what the right-hand column is for.
-        verb("C&lone", ID_S_CLONE, 2),
-        label("&Name:", 106),
-        field(ID_S_NAME, 106, 0),
-        label("&URL:", 122),
-        field(ID_S_URL, 122, 0),
-        // **`k`, because `Test` needs `t` and has nowhere else to go.** Every other letter in
-        // "Test" is claimed — `e` by Secret and `s` by Scope — while "Token URL" has a spare. The
-        // test that walks these templates is what caught it; the second claimant of a mnemonic is
-        // simply unreachable by the key drawn under it, with nothing on screen to say so.
-        label("To&ken URL:", 138),
-        field(ID_S_TOKEN, 138, 0),
-        // **Directly under the token URL, because that is where it comes from.** The two are one
-        // server's pair, this one is filled in from the other when it is left empty, and a reader
-        // who has never heard of an authorize endpoint needs to see them as a set rather than find
-        // this one three rows down among the client's own settings.
-        label("Si&gn-in URL:", 154),
-        field(ID_S_AUTH, 154, 0),
-        label("&Client id:", 170),
-        field(ID_S_CLIENT, 170, 0),
-        label("&Scope:", 186),
-        field(ID_S_SCOPE, 186, 0),
-        label("&Query:", 202),
-        field(ID_S_QUERY, 202, 0),
-        // **Directly under the query, because the two together are what this source shows.** The
-        // query says which lines Loki sends at all; this says which applications among them, and
-        // until now it could only be set by ticking boxes in the picker — the owner, 2026-10-20:
-        // *"there is no place where we can edit or view the list of apps being tailed"*. Empty
-        // means the picker opens, which is what the list's `(ask)` says.
-        label("A&pplications:", 218),
-        field(ID_S_APPS, 218, 0),
-        label("S&ecret:", 234),
-        field(ID_S_SECRET, 234, ES_PASSWORD),
-        // The fault line, where the rules editor puts its own: what is wrong with the set, in the
-        // words `sourceset::Editor::fault` chose, while it is being typed rather than when a query
-        // fails.
-        Item::new(Class::Static, "", ID_S_FAULT, (7, 252, 340, 9), 0),
+        // **The verbs, and nothing else on this dialog.** The owner, 2026-10-21: *"a first dialig
+        // that simply has the list, with new, edit delete buttons, and a close."* `New…` and
+        // `Edit…` carry the ellipsis Windows uses for a command that asks for more before it acts;
+        // `Clone` and `Delete` do not, because they act at once.
+        verb("&New…", ID_S_NEW, 1),
+        verb("&Edit…", ID_S_EDIT, 2),
+        verb("C&lone", ID_S_CLONE, 3),
+        verb("&Delete", ID_S_REMOVE, 4),
+        // The fault line keeps the position it had: what is wrong with the **set**, which is the
+        // only fault this dialog can still see now that the fields have gone — two sources sharing
+        // a name, which no row can detect on its own.
+        Item::new(Class::Static, "", ID_S_FAULT, (7, 146, 340, 9), 0),
         Item::new(
             Class::Button,
-            "OK",
-            1,
-            (293, 264, 54, 14),
+            "&Close",
+            IDCANCEL,
+            (353, 144, 60, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
-        // **Discover and Test sit under the URL they act on**, not with the list verbs: Add, Remove
-        // and Clone act on the *set*, and these two act on the one source being edited. They are
-        // the two halves of the owner's email-autoconfiguration analogy — one fills the fields in
-        // from the server, the other says whether what is in them reaches anything.
-        Item::new(
-            Class::Button,
-            "&Discover",
-            ID_S_DISCOVER,
-            (353, 122, 60, 14),
-            WS_TABSTOP,
-        ),
-        Item::new(
-            Class::Button,
-            "&Test",
-            ID_S_TEST,
-            (353, 139, 60, 14),
-            WS_TABSTOP,
-        ),
-        Item::new(Class::Button, "Cancel", 2, (353, 264, 60, 14), WS_TABSTOP),
     ]
 }
 
@@ -798,8 +767,10 @@ fn sources_dialog_items() -> Vec<Item> {
 pub struct SourcesEdit {
     pub editor: tailhawk_core::sourceset::Editor,
     pub accepted: bool,
-    /// `(name, secret)` to write, when a secret was typed.
-    pub store: Option<(String, String)>,
+    /// `(name, secret)` to write, one for each source whose secret was typed. **A list, because
+    /// the list dialog outlives each editor that opens over it** — three sources can be given
+    /// secrets before Close is pressed, and a single slot kept only the last of them.
+    pub store: Vec<(String, String)>,
     /// Names whose stored secret should be deleted.
     pub forget: Vec<String>,
 }
@@ -832,11 +803,13 @@ fn set_dlg_text(hdlg: HWND, id: u16, text: &str) {
 }
 
 thread_local! {
-    /// Suppresses the `EN_CHANGE` that [`sources_show`]'s own writes fire, for the reason
+    /// Suppresses the `EN_CHANGE` that this dialog's own writes fire, for the reason
     /// `RULES_QUIET`, `FORMAT_QUIET` and `APPS_QUIET` exist — and this dialog was the one that
     /// never got one.
     ///
-    /// **What it cost was a client secret.** `sources_show` clears the secret box, the only handler
+    /// **What it cost was a client secret**, in the version of this dialog that carried the fields
+    /// itself — the one the owner rejected on 2026-10-21. `sources_show` cleared the secret box, the
+    /// only handler
     /// for that box is unconditional, and `set_secret("")` is the editor's deliberate encoding of
     /// *this source has no secret* — so OK reached `secrets::forget` and `CredDeleteW` for a
     /// credential nobody had touched. Select `dev`, type its secret, click `live`, press OK, and
@@ -909,51 +882,6 @@ fn sources_fill(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
     }
 }
 
-/// Points the fields at the selected source, and shows the set's fault.
-///
-/// **The secret box is always cleared**, never filled from the store: this dialog cannot show a
-/// secret, only replace one. An empty box therefore means "unchanged", which is exactly the
-/// distinction `Editor`'s pending `Option` keeps.
-fn sources_show(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
-    let current = edit.current().cloned().unwrap_or_default();
-    // The box shows the list as a reader would type it, which is not the list's `(ask)`: an empty
-    // box is what "ask me" looks like in a field, and a word in it would be a word to delete.
-    let apps = tailhawk_core::sourceset::apps_said(&current.apps);
-    for (id, text) in [
-        (ID_S_NAME, current.name.as_str()),
-        (ID_S_URL, current.url.as_str()),
-        (ID_S_TOKEN, current.token_url.as_str()),
-        (ID_S_AUTH, current.auth_url.as_str()),
-        (ID_S_CLIENT, current.client_id.as_str()),
-        (ID_S_SCOPE, current.scope.as_str()),
-        (ID_S_QUERY, current.query.as_str()),
-        (ID_S_APPS, apps.as_str()),
-    ] {
-        set_dlg_text(hdlg, id, text);
-    }
-    if !edit.has_pending_secret() {
-        set_dlg_text(hdlg, ID_S_SECRET, "");
-    }
-    set_dlg_text(hdlg, ID_S_FAULT, edit.fault().unwrap_or_default());
-}
-
-/// Copies every field back into the selected source.
-fn sources_read(hdlg: HWND, edit: &mut tailhawk_core::sourceset::Editor) {
-    use tailhawk_core::sourceset::Field;
-    for (id, field) in [
-        (ID_S_NAME, Field::Name),
-        (ID_S_URL, Field::Url),
-        (ID_S_TOKEN, Field::TokenUrl),
-        (ID_S_AUTH, Field::AuthUrl),
-        (ID_S_CLIENT, Field::ClientId),
-        (ID_S_SCOPE, Field::Scope),
-        (ID_S_QUERY, Field::Query),
-        (ID_S_APPS, Field::Apps),
-    ] {
-        edit.edit(field, &dlg_text(hdlg, id));
-    }
-}
-
 unsafe extern "system" fn sources_proc(
     hdlg: HWND,
     msg: u32,
@@ -979,6 +907,10 @@ unsafe extern "system" fn sources_proc(
             }
             let data = unsafe { &mut *(lparam.0 as *mut SourcesEdit) };
             data.editor.open();
+            // **The offered blank row is not offered any more.** It existed because the fields and
+            // the list were one dialog and a form with no row behind it discarded every keystroke;
+            // `New…` is that row now, and it arrives with a screen of its own.
+            data.editor.discard_blank();
             if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) } {
                 unsafe {
                     SendMessageW(
@@ -989,34 +921,43 @@ unsafe extern "system" fn sources_proc(
                     );
                 }
             }
-            sources_quietly(|| {
-                sources_fill(hdlg, &data.editor);
-                sources_show(hdlg, &data.editor);
-            });
+            sources_quietly(|| sources_fill(hdlg, &data.editor));
+            sources_verbs(hdlg, &data.editor);
             1
         }
         WM_NOTIFY => {
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
-            // `sources_fill` reselects the editor's own row, and `LVM_SETITEMSTATE` raises
-            // `LVN_ITEMCHANGED` synchronously — the re-entry `APPS_QUIET` documents.
             if SOURCES_QUIET.with(|q| q.get()) {
                 return 0;
             }
-            if header.idFrom == usize::from(ID_S_LIST) && header.code == LVN_ITEMCHANGED {
-                let Some(data) = sources_state(hdlg) else {
-                    return 0;
-                };
-                let data = unsafe { &mut *data };
-                if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) } {
-                    if let Some(at) = lv_selected(list) {
-                        if at != data.editor.selected() {
-                            // Read the fields back *before* moving, or the edits made to the row
-                            // being left are lost the moment the selection changes.
-                            sources_read(hdlg, &mut data.editor);
-                            data.editor.select(at);
-                            sources_quietly(|| sources_show(hdlg, &data.editor));
+            if header.idFrom == usize::from(ID_S_LIST) {
+                match header.code {
+                    // **The borrow lives in this arm and nowhere else.** Taken before the match, it
+                    // was still alive while `NM_DBLCLK` pumped a nested modal loop — and the list
+                    // sends focus notifications through here while that loop runs, so the procedure
+                    // re-entered and took a second `&mut` to the same object. That is the aliasing
+                    // `SOURCES_QUIET`'s doc comment calls the undefined behaviour, in the one path
+                    // `sources_new`'s comment claims is impossible.
+                    LVN_ITEMCHANGED => {
+                        let Some(data) = sources_state(hdlg) else {
+                            return 0;
+                        };
+                        let data = unsafe { &mut *data };
+                        if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) } {
+                            if let Some(at) = lv_selected(list) {
+                                data.editor.select(at);
+                            }
                         }
+                        sources_verbs(hdlg, &data.editor);
+                        return 1;
                     }
+                    // **A double-click on a row is Edit.** The list is the only thing on this
+                    // dialog, so the gesture every list in Windows has must do the obvious thing.
+                    NM_DBLCLK => {
+                        sources_edit_selected(hdlg);
+                        return 1;
+                    }
+                    _ => {}
                 }
             }
             0
@@ -1024,174 +965,40 @@ unsafe extern "system" fn sources_proc(
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u16;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
-            // **Before `sources_state`, not after.** This is the notification the dialog's own
-            // writes provoke, and taking the editor out of `DWLP_USER` here would be the second
-            // `&mut` to it while the write that caused this is still holding the first.
-            if code == EN_CHANGE && SOURCES_QUIET.with(|q| q.get()) {
-                return 1;
-            }
-            let Some(data) = sources_state(hdlg) else {
-                return 0;
-            };
-            let data = unsafe { &mut *data };
             match (id, code) {
-                (ID_S_SECRET, EN_CHANGE) => {
-                    data.editor.set_secret(&dlg_text(hdlg, ID_S_SECRET));
-                    return 1;
+                (ID_S_NEW, BN_CLICKED) => {
+                    sources_new(hdlg);
+                    1
                 }
-                (
-                    ID_S_NAME | ID_S_URL | ID_S_TOKEN | ID_S_AUTH | ID_S_CLIENT | ID_S_SCOPE
-                    | ID_S_QUERY | ID_S_APPS,
-                    EN_CHANGE,
-                ) => {
-                    sources_read(hdlg, &mut data.editor);
-                    sources_quietly(|| {
-                        sources_fill(hdlg, &data.editor);
-                        set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
-                    });
-                    return 1;
+                (ID_S_EDIT, BN_CLICKED) => {
+                    sources_edit_selected(hdlg);
+                    1
                 }
-                // **Offers the sign-in URL once the token URL is finished with**, and only into an
-                // empty box — never over something the reader typed. See `authorize_beside`: the
-                // field being unanswerable is what kept the whole authorization-code path out of
-                // reach for anyone whose settings file was not written by hand.
-                (ID_S_TOKEN, EN_KILLFOCUS) => {
-                    if dlg_text(hdlg, ID_S_AUTH).trim().is_empty() {
-                        if let Some(beside) =
-                            tailhawk_core::settings::authorize_beside(&dlg_text(hdlg, ID_S_TOKEN))
-                        {
-                            sources_quietly(|| set_dlg_text(hdlg, ID_S_AUTH, &beside));
-                            sources_read(hdlg, &mut data.editor);
-                            sources_quietly(|| {
-                                sources_fill(hdlg, &data.editor);
-                                set_dlg_text(
-                                    hdlg,
-                                    ID_S_FAULT,
-                                    data.editor.fault().unwrap_or_default(),
-                                );
-                            });
-                        }
-                    }
-                    return 1;
-                }
-                (ID_S_ADD, BN_CLICKED) => {
-                    sources_read(hdlg, &mut data.editor);
-                    data.editor.add();
-                    sources_quietly(|| {
-                        sources_fill(hdlg, &data.editor);
-                        sources_show(hdlg, &data.editor);
-                    });
-                    unsafe {
-                        if let Ok(field) = GetDlgItem(hdlg, i32::from(ID_S_NAME)) {
-                            let _ = SetFocus(field);
-                        }
-                    }
-                    return 1;
-                }
-                // **Both read the fields first and then leave the dialog alone.** The URL being
-                // asked about is whatever is in the box, which may have been typed a moment ago and
-                // never committed — asking about the stored source instead would answer a question
-                // the reader did not put. The fault line says what is happening, because a button
-                // that starts something invisible is a button that looks broken.
-                (ID_S_DISCOVER | ID_S_TEST, BN_CLICKED) => {
-                    sources_read(hdlg, &mut data.editor);
-                    sources_quietly(|| sources_fill(hdlg, &data.editor));
-                    let url = dlg_text(hdlg, ID_S_URL);
-                    if url.trim().is_empty() {
-                        set_dlg_text(hdlg, ID_S_FAULT, "Type the Loki URL first.");
-                        return 1;
-                    }
-                    let discovering = id == ID_S_DISCOVER;
-                    set_dlg_text(
-                        hdlg,
-                        ID_S_FAULT,
-                        // **Says where it is about to look, before it looks.** A Discover that
-                        // finds nothing on the host the reader named goes on to try `identity`,
-                        // `auth`, `login`, `sso` and `idp` beside it — hostnames nobody typed — and
-                        // §13.2's promise is that an outbound connection is never a surprise.
-                        if discovering {
-                            "Looking for the sign-in server at this host, then beside it…"
-                        } else {
-                            "Asking the server…"
-                        },
-                    );
-                    // **Both buttons go grey until an answer lands.** Holding Enter on a focused
-                    // Discover would otherwise spawn a thread per keypress, each walking up to six
-                    // candidates, and the last answer to arrive would win whatever order they were
-                    // asked in. They are re-enabled by the handler.
-                    for id in [ID_S_DISCOVER, ID_S_TEST] {
-                        if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
-                            let _ = unsafe { EnableWindow(button, false) };
-                        }
-                    }
-                    // The window handle is all the thread is given. It touches no editor, no
-                    // settings and no credential: the answer is posted and the UI thread applies it.
-                    let target = hdlg.0 as isize;
-                    std::thread::spawn(move || {
-                        let found = if discovering {
-                            Found::Discovered(crate::pull::discover(&url))
-                        } else {
-                            Found::Tested(crate::pull::reachable(&url))
-                        };
-                        let probed = Probed { asked: url, found };
-                        let hdlg = HWND(target as *mut std::ffi::c_void);
-                        let boxed = Box::into_raw(Box::new(probed));
-                        // **A window that has closed takes the box with it.** The dialog may be
-                        // gone by the time an answer arrives — a reader who pressed Cancel while a
-                        // timeout ran out — and a failed post means nobody will ever free it.
-                        //
-                        // **The residual, stated rather than discovered:** a handle freed and
-                        // reused between the check and the post would be sent a message it does not
-                        // expect. `WM_S_PROBED` is `WM_APP + 0x50` and only this procedure answers
-                        // it, so a window of another class ignores it and the box leaks — while a
-                        // *second sources dialog* on the reissued handle would answer it, free the
-                        // box and be handed a stale verdict. `Probed::asked` is what keeps that from
-                        // writing anything: the URL will not match the new dialog's box unless it
-                        // genuinely holds the same URL, in which case the answer is true of it. The
-                        // race needs a dialog to close and its handle to be reissued inside one
-                        // round trip; a generation counter would close it and is not worth the
-                        // machinery here.
-                        if unsafe {
-                            PostMessageW(hdlg, WM_S_PROBED, WPARAM(0), LPARAM(boxed as isize))
-                        }
-                        .is_err()
-                        {
-                            drop(unsafe { Box::from_raw(boxed) });
-                        }
-                    });
-                    return 1;
-                }
-                // **Reads the fields before copying**, exactly as Add does: the row being cloned is
-                // whatever is in the boxes, which may be half-typed, and copying the stored source
-                // instead would silently drop the edit the reader is in the middle of making.
-                // Focus goes to the name, which is the one field a copy must change.
                 (ID_S_CLONE, BN_CLICKED) => {
-                    sources_read(hdlg, &mut data.editor);
-                    // **A refusal says so.** It happens for two reasons — the set is full, or the
-                    // row is the blank one the dialog offers — and a button that does nothing and
-                    // says nothing is the complaint this project has made of every silent failure
-                    // it has found.
+                    let Some(data) = sources_state(hdlg) else {
+                        return 0;
+                    };
+                    let data = unsafe { &mut *data };
+                    // **A refusal says so.** A button that does nothing and says nothing is the
+                    // complaint this project has made of every silent failure it has found.
                     if !data.editor.clone_selected() {
                         set_dlg_text(
                             hdlg,
                             ID_S_FAULT,
-                            "Nothing to copy — type something into this row first, or the list is \
-                             full.",
+                            "Nothing to copy — choose a source first, or the list is full.",
                         );
                         return 1;
                     }
-                    sources_quietly(|| {
-                        sources_fill(hdlg, &data.editor);
-                        sources_show(hdlg, &data.editor);
-                    });
-                    unsafe {
-                        if let Ok(field) = GetDlgItem(hdlg, i32::from(ID_S_NAME)) {
-                            let _ = SetFocus(field);
-                        }
-                    }
-                    return 1;
+                    sources_quietly(|| sources_fill(hdlg, &data.editor));
+                    sources_verbs(hdlg, &data.editor);
+                    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    1
                 }
                 (ID_S_REMOVE, BN_CLICKED) => {
+                    let Some(data) = sources_state(hdlg) else {
+                        return 0;
+                    };
+                    let data = unsafe { &mut *data };
                     // **The name is remembered so its credential can be deleted too.** A source
                     // removed from the list while its secret stayed in Credential Manager would
                     // leave a credential nobody can see and nobody will revoke.
@@ -1200,121 +1007,143 @@ unsafe extern "system" fn sources_proc(
                             data.forget.push(gone);
                         }
                     }
-                    sources_quietly(|| {
-                        sources_fill(hdlg, &data.editor);
-                        sources_show(hdlg, &data.editor);
-                    });
-                    return 1;
+                    sources_quietly(|| sources_fill(hdlg, &data.editor));
+                    sources_verbs(hdlg, &data.editor);
+                    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    1
                 }
-                (1, BN_CLICKED) => {
-                    sources_read(hdlg, &mut data.editor);
-                    // A set that cannot be saved says so and stays open, rather than being written
-                    // in a state the next query would fail on.
+                // **Close saves, and it has to.** Every change on this dialog is made through a
+                // screen of its own that was accepted or cancelled on the spot, so by the time the
+                // reader reaches Close the decisions are all behind them — a Close that threw the
+                // set away would discard work they had already agreed to twice, and there is no
+                // other button to press.
+                (IDCANCEL, BN_CLICKED) | (IDOK, BN_CLICKED) => {
+                    let Some(data) = sources_state(hdlg) else {
+                        return 0;
+                    };
+                    let data = unsafe { &mut *data };
                     if let Some(fault) = data.editor.fault() {
                         set_dlg_text(hdlg, ID_S_FAULT, fault);
                         return 1;
                     }
-                    data.store = data.editor.take_secret();
-                    // The row the dialog offers to type into is not a source until something is
-                    // typed into it. The secret is taken first, because that is the one thing a
-                    // row with no name can still be carrying.
                     data.editor.discard_blank();
                     data.editor.saved();
                     data.accepted = true;
                     unsafe {
                         let _ = EndDialog(hdlg, 1);
                     }
-                    return 1;
+                    1
                 }
-                (2, BN_CLICKED) => {
-                    data.editor.close();
-                    data.forget.clear();
-                    unsafe {
-                        let _ = EndDialog(hdlg, 0);
-                    }
-                    return 1;
-                }
-                _ => {}
+                _ => 0,
             }
-            0
         }
-        // **What a worker found, applied on the thread that owns the controls.**
-        //
-        // The box is taken back here and nowhere else. `Discover` writes the two URLs it found,
-        // because filling them in is what the button is for and a reader who presses it is asking
-        // for whatever the server says — but the **scope** only into an empty box, because that one
-        // is a suggestion read out of `scopes_supported` rather than an endpoint the server named,
-        // and `authorize_beside` set the precedent for offering rather than overwriting.
-        WM_S_PROBED => {
-            let probed = unsafe { Box::from_raw(lparam.0 as *mut Probed) };
+        // **The X is Close, gate and all.** It saved without the fault check — so the one way out
+        // of a set the dialog refuses to close was also the one way to write it to the settings
+        // file, including two sources sharing a name, which is the single fault this dialog exists
+        // to catch.
+        WM_CLOSE => {
             let Some(data) = sources_state(hdlg) else {
                 return 1;
             };
             let data = unsafe { &mut *data };
-            for id in [ID_S_DISCOVER, ID_S_TEST] {
-                if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
-                    let _ = unsafe { EnableWindow(button, true) };
-                }
+            if let Some(fault) = data.editor.fault() {
+                set_dlg_text(hdlg, ID_S_FAULT, fault);
+                return 1;
             }
-            // **An answer about a URL that is no longer in the box is not applied to what is.**
-            // See `Probed::asked`. It is still *said*, because a reader who asked a question is
-            // owed the answer — with the URL named, since it is not the one in front of them.
-            let still_asking = dlg_text(hdlg, ID_S_URL) == probed.asked;
-            match probed.found {
-                Found::Discovered(outcome) => {
-                    if let (true, crate::pull::Discovery::Found { found, .. }) =
-                        (still_asking, &outcome)
-                    {
-                        sources_quietly(|| {
-                            set_dlg_text(hdlg, ID_S_TOKEN, &found.token_url);
-                            // **Only when the server named one.** `Source::signs_in` is
-                            // `!auth_url.is_empty()`, so writing an empty one here would turn a
-                            // working browser sign-in into a client-secret source and take the URL
-                            // the reader typed with it. A server that advertises no authorization
-                            // endpoint is reported in words instead.
-                            if !found.auth_url.is_empty() {
-                                set_dlg_text(hdlg, ID_S_AUTH, &found.auth_url);
-                            }
-                            if dlg_text(hdlg, ID_S_SCOPE).trim().is_empty() {
-                                set_dlg_text(
-                                    hdlg,
-                                    ID_S_SCOPE,
-                                    &tailhawk_core::loki::scope_from(found),
-                                );
-                            }
-                        });
-                        sources_read(hdlg, &mut data.editor);
-                        sources_quietly(|| sources_fill(hdlg, &data.editor));
-                    }
-                    let said = crate::pull::discovery_said(&outcome);
-                    set_dlg_text(
-                        hdlg,
-                        ID_S_FAULT,
-                        &said_about(&said, &probed.asked, still_asking),
-                    );
-                }
-                Found::Tested(outcome) => {
-                    let said = crate::pull::reached_said(&outcome);
-                    set_dlg_text(
-                        hdlg,
-                        ID_S_FAULT,
-                        &said_about(&said, &probed.asked, still_asking),
-                    );
-                }
-            }
-            1
-        }
-        WM_CLOSE => {
-            if let Some(data) = sources_state(hdlg) {
-                unsafe { &mut *data }.editor.close();
-            }
+            data.editor.discard_blank();
+            data.editor.saved();
+            data.accepted = true;
             unsafe {
-                let _ = EndDialog(hdlg, 0);
+                let _ = EndDialog(hdlg, 1);
             }
             1
         }
         _ => 0,
     }
+}
+
+/// Greys the verbs that need a row when there is none.
+fn sources_verbs(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
+    let any = !edit.sources().is_empty();
+    for id in [ID_S_EDIT, ID_S_CLONE, ID_S_REMOVE] {
+        if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
+            let _ = unsafe { EnableWindow(button, any) };
+        }
+    }
+}
+
+/// **New…** — one source's screen over an empty draft.
+///
+/// **Nothing of the list is borrowed while the nested dialog runs.** It pumps a modal loop of its
+/// own, during which this procedure can be re-entered by a paint or a notification; a `&mut
+/// SourcesEdit` held across it would be a second one taken from underneath the first.
+fn sources_new(hdlg: HWND) {
+    let mut edit = SourceEdit::new(tailhawk_core::sourcesetup::Draft::default(), false);
+    if !show_source_editor(hdlg, &mut edit) {
+        return;
+    }
+    let Some(data) = sources_state(hdlg) else {
+        return;
+    };
+    let data = unsafe { &mut *data };
+    if !data.editor.add() {
+        set_dlg_text(hdlg, ID_S_FAULT, "The list is full.");
+        return;
+    }
+    sources_took(hdlg, data, edit);
+}
+
+/// **Edit…** — the same screen over the selected source.
+fn sources_edit_selected(hdlg: HWND) {
+    let (draft, has_secret) = {
+        let Some(data) = sources_state(hdlg) else {
+            return;
+        };
+        let data = unsafe { &*data };
+        let Some(source) = data.editor.current() else {
+            return;
+        };
+        (
+            tailhawk_core::sourcesetup::Draft::of(source),
+            data.editor.current_has_secret(),
+        )
+    };
+    let mut edit = SourceEdit::new(draft, has_secret);
+    if !show_source_editor(hdlg, &mut edit) {
+        return;
+    }
+    let Some(data) = sources_state(hdlg) else {
+        return;
+    };
+    let data = unsafe { &mut *data };
+    sources_took(hdlg, data, edit);
+}
+
+/// What an accepted editor leaves behind: the source on the selected row, and the secret to store.
+///
+/// **A renamed source takes its credential with it.** The store is keyed on the name, so a rename
+/// would otherwise leave the old key behind holding a secret nobody can see and nobody will revoke
+/// — which is exactly what `Tailhawk/loki-tokens/nurtur-loki-live` is, in his own store, from a
+/// rename that happened before anything watched for it.
+fn sources_took(hdlg: HWND, data: &mut SourcesEdit, edit: SourceEdit) {
+    let was = data.editor.current().map(|s| s.name.clone());
+    let source = edit.draft.into_source();
+    if let Some(old) = was.filter(|old| !old.trim().is_empty() && *old != source.name) {
+        data.forget.push(old);
+    }
+    // **A mode with no use for a secret gives the stored one up.** Switching a source from a client
+    // secret to a browser sign-in otherwise left the credential in the store for ever, for a flow
+    // that will never send it.
+    if let Some(gone) = edit.draft.secret_to_forget(edit.has_secret) {
+        data.forget.push(gone);
+    }
+    data.editor.replace(source);
+    if let Some((name, secret)) = edit.draft.secret_to_store() {
+        data.store.push((name, secret));
+    }
+    sources_quietly(|| sources_fill(hdlg, &data.editor));
+    sources_verbs(hdlg, &data.editor);
+    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
 }
 
 fn sources_state(hdlg: HWND) -> Option<*mut SourcesEdit> {
@@ -1342,6 +1171,732 @@ pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
             hwnd,
             Some(sources_proc),
             LPARAM(data as *mut SourcesEdit as isize),
+        )
+    };
+    data.accepted
+}
+
+/// The one-source editor, collapsed. **Advanced unfolds it to [`E_DIALOG_H_OPEN`]** rather than
+/// scrolling or a second dialog, which is the oldest Windows idiom there is for "most people never
+/// need this".
+const E_DIALOG_W: i16 = 420;
+const E_DIALOG_H: i16 = 118;
+/// Where the advanced block starts, which is also the line the fold hides everything below.
+const E_ADVANCED_Y: i16 = 100;
+/// The same dialog with the credential half shown.
+///
+/// **It has to clear the last field, not merely reach it.** The buttons sit at `height - 36`, the
+/// secret box ends at `E_ADVANCED_Y + 96`, and an open height of 222 put the two in the same place
+/// — Advanced, OK and Cancel were drawn over the secret row and clipped by the bottom edge. The
+/// 22 units of slack below the buttons are the collapsed layout's, kept so both states have the
+/// same margin.
+const E_DIALOG_H_OPEN: i16 = E_ADVANCED_Y + 96 + 8 + 14 + 22;
+
+/// One source's own screen — what **Edit…** opens, and what **New…** opens once the guided flow
+/// has finished with it.
+///
+/// **Four things on the front of it, and the rest behind Advanced.** The owner, 2026-10-21, on the
+/// form this replaces: *"I dont really understand the screen you have created, the discover button
+/// is just sitting there, and all the fields next to it. that is not like the analogy I gave you of
+/// setting up email where the user simply adds an email, or has an advanced option."* A name, where
+/// the server is, what it shows, and one button that goes and works the rest out — with every OAuth
+/// value still reachable for the configuration the magic cannot manage, which is the other half of
+/// what he asked for.
+fn source_edit_items() -> Vec<Item> {
+    let label = |text: &str, y: i16| Item::new(Class::Static, text, 0xFFFF, (7, y + 2, 58, 8), 0);
+    let field = |id: u16, y: i16, w: i16, style: u32| {
+        Item::new(
+            Class::Edit,
+            "",
+            id,
+            (69, y, w, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | style,
+        )
+    };
+    let button = |text: &str, id: u16, x: i16, y: i16| {
+        Item::new(Class::Button, text, id, (x, y, 60, 14), WS_TABSTOP)
+    };
+    vec![
+        label("&Name:", 7),
+        field(ID_E_NAME, 7, 344, 0),
+        label("&Server URL:", 23),
+        field(ID_E_URL, 23, 275, 0),
+        // **One button on the front, and it is the whole analogy.** Press it and Tailhawk asks the
+        // server where it signs in, asks the Loki itself whether it answers, fills the five boxes
+        // behind Advanced from what came back, and says what it found in one sentence.
+        //
+        // **One button rather than two** — Discover and Test were separate on the form he rejected,
+        // which made the reader responsible for knowing that configuring and checking are different
+        // verbs. Setting up email asks you to press Next, not Next and then Check.
+        button("Set u&p", ID_E_SETUP, 353, 22),
+        label("S&hows:", 39),
+        field(ID_E_SHOWS, 39, 275, 0),
+        // The labels the server itself holds, and their values — not an Applications box, which
+        // made one estate's label a feature of the product.
+        button("&Choose…", ID_E_CHOOSE, 353, 38),
+        Item::new(Class::Static, "", ID_E_FAULT, (7, 60, 406, 18), 0),
+        Item::new(
+            Class::Button,
+            "&Advanced",
+            ID_E_ADVANCED,
+            (7, 82, 70, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "OK",
+            IDOK,
+            (293, 82, 54, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (353, 82, 60, 14),
+            WS_TABSTOP,
+        ),
+        // **The advanced half.** Every one of these is hidden until Advanced is pressed, and the
+        // dialog is short enough that they are off its bottom edge until then — so a reader who
+        // never presses it never sees an OAuth term.
+        label("Sign in &with:", E_ADVANCED_Y),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_E_MODE,
+            (69, E_ADVANCED_Y, 200, 80),
+            WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        ),
+        label("To&ken URL:", E_ADVANCED_Y + 20),
+        field(ID_E_TOKEN, E_ADVANCED_Y + 20, 344, 0),
+        label("Si&gn-in URL:", E_ADVANCED_Y + 36),
+        field(ID_E_AUTH, E_ADVANCED_Y + 36, 344, 0),
+        label("C&lient id:", E_ADVANCED_Y + 52),
+        field(ID_E_CLIENT, E_ADVANCED_Y + 52, 344, 0),
+        label("Sc&ope:", E_ADVANCED_Y + 68),
+        field(ID_E_SCOPE, E_ADVANCED_Y + 68, 344, 0),
+        label("Secre&t:", E_ADVANCED_Y + 84),
+        field(ID_E_SECRET, E_ADVANCED_Y + 84, 344, ES_PASSWORD),
+    ]
+}
+
+/// What the one-source editor is handed and hands back.
+pub struct SourceEdit {
+    pub draft: tailhawk_core::sourcesetup::Draft,
+    pub accepted: bool,
+    /// Whether this source already has a secret in the store, so the box can say so without the
+    /// dialog ever being told what it is — `sourceset`'s rule, one source along.
+    pub has_secret: bool,
+    /// The name this source had when the editor opened. **The stored secret belongs to that name**,
+    /// not to whatever is in the box now.
+    opened_as: String,
+    advanced: bool,
+}
+
+impl SourceEdit {
+    pub fn new(draft: tailhawk_core::sourcesetup::Draft, has_secret: bool) -> Self {
+        Self {
+            opened_as: draft.name.trim().to_owned(),
+            draft,
+            accepted: false,
+            has_secret,
+            advanced: false,
+        }
+    }
+}
+
+/// The three modes, in the order the combo offers them.
+const E_MODES: [tailhawk_core::sourcesetup::Mode; 3] = [
+    tailhawk_core::sourcesetup::Mode::SignIn,
+    tailhawk_core::sourcesetup::Mode::ClientSecret,
+    tailhawk_core::sourcesetup::Mode::Open,
+];
+
+fn source_edit_state(hdlg: HWND) -> Option<*mut SourceEdit> {
+    let ptr =
+        unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) } as *mut SourceEdit;
+    (!ptr.is_null()).then_some(ptr)
+}
+
+/// Shows or hides the advanced half and resizes the dialog around it.
+fn source_edit_fold(hdlg: HWND, open: bool) {
+    const ADVANCED: [u16; 6] = [
+        ID_E_MODE,
+        ID_E_TOKEN,
+        ID_E_AUTH,
+        ID_E_CLIENT,
+        ID_E_SCOPE,
+        ID_E_SECRET,
+    ];
+    // **The labels go with their fields.** They carry no id of their own — every one is `0xFFFF` —
+    // so they are found by where they are rather than by what they are called: anything below the
+    // fold belongs to it.
+    let mut hiding: Vec<HWND> = Vec::new();
+    let mut child = unsafe { GetWindow(hdlg, GW_CHILD) }.unwrap_or_default();
+    while !child.is_invalid() {
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(child, &mut r) }.is_ok() {
+            let mut corner = POINT {
+                x: r.left,
+                y: r.top,
+            };
+            let _ = unsafe { ScreenToClient(hdlg, &mut corner) };
+            // **The buttons are never swept.** They are moved to the bottom edge rather than
+            // belonging to either half, so position alone would hide them the moment they crossed
+            // the fold line.
+            let id = unsafe { GetDlgCtrlID(child) } as u16;
+            if corner.y >= fold_px(hdlg) && !matches!(id, ID_E_ADVANCED | IDOK | IDCANCEL) {
+                hiding.push(child);
+            }
+        }
+        child = unsafe { GetWindow(child, GW_HWNDNEXT) }.unwrap_or_default();
+    }
+    for h in hiding {
+        let _ = unsafe { ShowWindow(h, if open { SW_SHOW } else { SW_HIDE }) };
+    }
+    let _ = ADVANCED;
+    let height = if open { E_DIALOG_H_OPEN } else { E_DIALOG_H };
+    // **The buttons go to the new bottom.** Growing the dialog underneath them left OK and Cancel
+    // stranded in the middle of it, above the very fields the reader had just asked to see — which
+    // reads as the dialog having two halves rather than one that unfolded.
+    source_edit_buttons_to(hdlg, editor_buttons_y(open));
+    resize_dialog(hdlg, height);
+}
+
+/// Where the three bottom-edge buttons sit, in dialog units, in each of the dialog's two heights.
+///
+/// **Named so a test can hold it.** It was `height - 36` inline, and an open height that did not
+/// clear the last field drew Advanced, OK and Cancel over the secret box and clipped them on the
+/// bottom edge — arithmetic that no template walk could see, because the buttons move at runtime
+/// and the template only knows where they start.
+fn editor_buttons_y(open: bool) -> i16 {
+    (if open { E_DIALOG_H_OPEN } else { E_DIALOG_H }) - 36
+}
+
+/// Moves the three buttons that live on the dialog's bottom edge to `y`, in dialog units.
+fn source_edit_buttons_to(hdlg: HWND, y: i16) {
+    let mut r = RECT {
+        left: 0,
+        top: y as i32,
+        right: 4,
+        bottom: y as i32 + 8,
+    };
+    let _ = unsafe { MapDialogRect(hdlg, &mut r) };
+    for id in [ID_E_ADVANCED, IDOK, IDCANCEL] {
+        let Ok(button) = (unsafe { GetDlgItem(hdlg, i32::from(id)) }) else {
+            continue;
+        };
+        let mut at = RECT::default();
+        if unsafe { GetWindowRect(button, &mut at) }.is_err() {
+            continue;
+        }
+        let mut corner = POINT {
+            x: at.left,
+            y: at.top,
+        };
+        let _ = unsafe { ScreenToClient(hdlg, &mut corner) };
+        let _ = unsafe {
+            SetWindowPos(
+                button,
+                None,
+                corner.x,
+                r.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
+}
+
+/// The client-area y, in pixels, that the advanced block starts at — the same dialog units the
+/// template used, mapped through the font the dialog actually got.
+fn fold_px(hdlg: HWND) -> i32 {
+    let mut r = RECT {
+        left: 0,
+        top: E_ADVANCED_Y as i32,
+        right: 4,
+        bottom: E_ADVANCED_Y as i32 + 8,
+    };
+    let _ = unsafe { MapDialogRect(hdlg, &mut r) };
+    r.top
+}
+
+/// Grows or shrinks the dialog to `height` dialog units, keeping its top-left where it is.
+fn resize_dialog(hdlg: HWND, height: i16) {
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: 4,
+        bottom: height as i32,
+    };
+    let _ = unsafe { MapDialogRect(hdlg, &mut r) };
+    let mut outer = RECT::default();
+    if unsafe { GetWindowRect(hdlg, &mut outer) }.is_err() {
+        return;
+    }
+    let mut client = RECT::default();
+    if unsafe { GetClientRect(hdlg, &mut client) }.is_err() {
+        return;
+    }
+    let chrome = (outer.bottom - outer.top) - (client.bottom - client.top);
+    let _ = unsafe {
+        SetWindowPos(
+            hdlg,
+            None,
+            0,
+            0,
+            outer.right - outer.left,
+            r.bottom + chrome,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
+}
+/// Points every box at the draft. **The secret box is never filled from the store** — this dialog
+/// cannot show a secret, only replace one, which is `sourceset`'s rule in its second home.
+///
+/// **Owned copies, and written quietly — and the first draft of this was undefined behaviour.**
+/// `set_dlg_text` raises `EN_CHANGE` synchronously, the handler for it reads every box back into
+/// the draft, and the boxes below the one being written are still empty at that moment. So filling
+/// the name wiped the client id, the scope and both URLs. Worse, the list of what to write held
+/// `&str` **into the draft's own Strings** while the re-entry replaced them: the screen came back
+/// with `A` in the sign-in URL and half the server's URL in the scope, which is what reading a
+/// slice into a buffer that has been freed underneath you looks like. `sourceset`'s own
+/// `SOURCES_QUIET` exists for exactly this and its doc comment says what it cost; this dialog is
+/// new and had to learn it again.
+fn source_edit_fill(hdlg: HWND, data: &SourceEdit) {
+    let boxes: Vec<(u16, String)> = vec![
+        (ID_E_NAME, data.draft.name.clone()),
+        (ID_E_URL, data.draft.url.clone()),
+        (ID_E_SHOWS, data.draft.query.clone()),
+        (ID_E_TOKEN, data.draft.token_url.clone()),
+        (ID_E_AUTH, data.draft.auth_url.clone()),
+        (ID_E_CLIENT, data.draft.client_id.clone()),
+        (ID_E_SCOPE, data.draft.scope.clone()),
+    ];
+    editor_quietly(|| {
+        for (id, text) in &boxes {
+            set_dlg_text(hdlg, *id, text);
+        }
+    });
+    source_edit_say(hdlg, data);
+}
+
+thread_local! {
+    /// Whether the `EN_CHANGE` now arriving is one this dialog's own writes provoked.
+    ///
+    /// **Checked before the state pointer is taken, not after** — the reason `SOURCES_QUIET` gives:
+    /// a `&mut SourceEdit` and the pointer the re-entry reads out of `DWLP_USER` alias, and taking
+    /// the second one is the undefined behaviour, not writing through it.
+    static EDITOR_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `write`, with every `EN_CHANGE` it provokes marked as the dialog's own.
+fn editor_quietly<R>(write: impl FnOnce() -> R) -> R {
+    EDITOR_QUIET.with(|q| q.set(true));
+    let out = write();
+    EDITOR_QUIET.with(|q| q.set(false));
+    out
+}
+
+/// The fault line, and the one piece of state the secret box can honestly show.
+fn source_edit_say(hdlg: HWND, data: &SourceEdit) {
+    // **A renamed source has no secret yet, whatever the store held when this opened.** The
+    // credential is filed under the name, so the moment the name in the box differs the stored one
+    // belongs to a source that is about to stop existing — and saying "a secret is stored" right up
+    // to OK, after which it is deleted, tells the reader the opposite of what happens.
+    let stored = data.has_secret && data.draft.name.trim() == data.opened_as;
+    let said = match data.draft.fault() {
+        Some(why) => why.to_owned(),
+        None => match (data.draft.mode_now().needs_secret(), stored) {
+            // **"Stored" is as much as it may say.** Nothing here has ever seen the value.
+            (true, true) => "A secret is stored for this source. Type to replace it.".to_owned(),
+            (true, false) => "This source needs a secret before it can be used.".to_owned(),
+            (false, _) => String::new(),
+        },
+    };
+    set_dlg_text(hdlg, ID_E_FAULT, &said);
+    // The secret is not merely hidden on the paths that do not use one — it is disabled, so the
+    // reader is told rather than left to wonder why typing into it changes nothing.
+    if let Ok(box_) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_SECRET)) } {
+        let _ = unsafe { EnableWindow(box_, data.draft.mode_now().needs_secret()) };
+    }
+}
+
+/// Copies every box back into the draft.
+fn source_edit_read(hdlg: HWND, data: &mut SourceEdit) {
+    data.draft.name = dlg_text(hdlg, ID_E_NAME);
+    data.draft.url = dlg_text(hdlg, ID_E_URL);
+    data.draft.query = dlg_text(hdlg, ID_E_SHOWS);
+    data.draft.token_url = dlg_text(hdlg, ID_E_TOKEN);
+    data.draft.auth_url = dlg_text(hdlg, ID_E_AUTH);
+    data.draft.client_id = dlg_text(hdlg, ID_E_CLIENT);
+    data.draft.scope = dlg_text(hdlg, ID_E_SCOPE);
+    if let Some(at) = combo_selected(hdlg, ID_E_MODE, E_MODES.len()) {
+        data.draft.mode = Some(E_MODES[at]);
+    }
+    // **Reading the boxes is not choosing.** This runs on every keystroke in every field, so
+    // treating it as a choice would mean the reader had "chosen" the mode before they had seen it.
+    // Only `CBN_SELCHANGE` is a choice — see its arm.
+}
+
+unsafe extern "system" fn source_edit_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
+        WM_INITDIALOG => {
+            // **Themed, like every other dialog in this file.** Without it this one opened with
+            // light system chrome on top of a dark parent — white boxes beside the list's dark
+            // ones, which two screenshots showed before anybody noticed.
+            theme_dialog(hdlg);
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            let data = unsafe { &mut *(lparam.0 as *mut SourceEdit) };
+            let names: Vec<String> = E_MODES.iter().map(|m| m.said().to_owned()).collect();
+            let at = E_MODES
+                .iter()
+                .position(|m| *m == data.draft.mode_now())
+                .unwrap_or(0);
+            editor_quietly(|| combo_fill(hdlg, ID_E_MODE, &names, at));
+            source_edit_fill(hdlg, data);
+            source_edit_fold(hdlg, data.advanced);
+            1
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            // **Before `source_edit_state`, not after.** This is the notification this dialog's own
+            // writes provoke, and taking the editor out of `DWLP_USER` here would be the second
+            // `&mut` to it while the write that caused this still holds the first.
+            if code == EN_CHANGE && EDITOR_QUIET.with(|q| q.get()) {
+                return 1;
+            }
+            let Some(data) = source_edit_state(hdlg) else {
+                return 0;
+            };
+            let data = unsafe { &mut *data };
+            match (id, code) {
+                // **Typed means typed.** Until this fires, the secret is `None` and the store keeps
+                // whatever it holds; afterwards it is what is in the box, empty included, which is
+                // a reader saying this source has none.
+                (ID_E_SECRET, EN_CHANGE) => {
+                    data.draft.secret = Some(dlg_text(hdlg, ID_E_SECRET));
+                    source_edit_say(hdlg, data);
+                    return 1;
+                }
+                (
+                    ID_E_NAME | ID_E_URL | ID_E_SHOWS | ID_E_TOKEN | ID_E_AUTH | ID_E_CLIENT
+                    | ID_E_SCOPE,
+                    EN_CHANGE,
+                ) => {
+                    source_edit_read(hdlg, data);
+                    source_edit_say(hdlg, data);
+                    return 1;
+                }
+                // **Offers the sign-in URL once the token URL is finished with**, and only into an
+                // empty box — never over something the reader typed. `Set up` fills both when the
+                // server answers; this is for the reader filling Advanced in by hand, which is the
+                // case the whole advanced half exists for.
+                (ID_E_TOKEN, EN_KILLFOCUS) => {
+                    if data.draft.auth_url.trim().is_empty() {
+                        if let Some(beside) =
+                            tailhawk_core::settings::authorize_beside(&data.draft.token_url)
+                        {
+                            data.draft.auth_url = beside;
+                            source_edit_fill(hdlg, data);
+                        }
+                    }
+                    return 1;
+                }
+                (ID_E_MODE, CBN_SELCHANGE) => {
+                    source_edit_read(hdlg, data);
+                    // **This, and only this, is the reader choosing.** From here on `Set up` may
+                    // still fill in the endpoints, but it may not overrule the choice.
+                    data.draft.mode_chosen = true;
+                    source_edit_say(hdlg, data);
+                    return 1;
+                }
+                // **Reads the boxes, then leaves the dialog alone.** The URL being asked about is
+                // whatever is in front of the reader, which may have been typed a moment ago.
+                (ID_E_SETUP, BN_CLICKED) => {
+                    source_edit_read(hdlg, data);
+                    let url = data.draft.url.trim().to_owned();
+                    if url.is_empty() {
+                        set_dlg_text(hdlg, ID_E_FAULT, "Type the server's URL first.");
+                        return 1;
+                    }
+                    if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_SETUP)) } {
+                        let _ = unsafe { EnableWindow(button, false) };
+                    }
+                    // **Says where it is about to look, before it looks.** A Set up that finds
+                    // nothing on the host named goes on to try `identity`, `auth`, `login`, `sso`
+                    // and `idp` beside it — hostnames nobody typed — and SPEC.md §13.2's promise is
+                    // that an outbound connection is never a surprise.
+                    set_dlg_text(
+                        hdlg,
+                        ID_E_FAULT,
+                        "Asking this server where it signs people in, then the ones beside it…",
+                    );
+                    let target = hdlg.0 as isize;
+                    std::thread::spawn(move || {
+                        let probed = Probed {
+                            discovery: crate::pull::discover(&url),
+                            reach: crate::pull::reachable(&url),
+                            asked: url,
+                        };
+                        let hdlg = HWND(target as *mut std::ffi::c_void);
+                        let boxed = Box::into_raw(Box::new(probed));
+                        if unsafe {
+                            PostMessageW(hdlg, WM_S_PROBED, WPARAM(0), LPARAM(boxed as isize))
+                        }
+                        .is_err()
+                        {
+                            drop(unsafe { Box::from_raw(boxed) });
+                        }
+                    });
+                    return 1;
+                }
+                // **The button that did nothing.** It sat on the front of the dialog inert — which
+                // is the owner's own complaint about the screen this one replaced, word for word:
+                // *"the discover button is just sitting there"*.
+                //
+                // It asks the server which applications it holds, which is a credentialed round
+                // trip, so it needs a source complete enough to authenticate. That is the question
+                // the guided flow would reach *after* settling the credential; on a form it has to
+                // be checked here.
+                (ID_E_CHOOSE, BN_CLICKED) => {
+                    source_edit_read(hdlg, data);
+                    if let Some(why) = data.draft.fault() {
+                        set_dlg_text(hdlg, ID_E_FAULT, why);
+                        return 1;
+                    }
+                    let source = data.draft.into_source();
+                    if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_CHOOSE)) } {
+                        let _ = unsafe { EnableWindow(button, false) };
+                    }
+                    set_dlg_text(
+                        hdlg,
+                        ID_E_FAULT,
+                        "Asking this server which applications it holds…",
+                    );
+                    let target = hdlg.0 as isize;
+                    std::thread::spawn(move || {
+                        let found =
+                            crate::pull::label_values(&source, tailhawk_core::apps::APP_LABEL);
+                        let hdlg = HWND(target as *mut std::ffi::c_void);
+                        let boxed = Box::into_raw(Box::new(found));
+                        if unsafe {
+                            PostMessageW(hdlg, WM_E_LABELS, WPARAM(0), LPARAM(boxed as isize))
+                        }
+                        .is_err()
+                        {
+                            drop(unsafe { Box::from_raw(boxed) });
+                        }
+                    });
+                    return 1;
+                }
+                (ID_E_ADVANCED, BN_CLICKED) => {
+                    data.advanced = !data.advanced;
+                    source_edit_fold(hdlg, data.advanced);
+                    return 1;
+                }
+                (IDOK, BN_CLICKED) => {
+                    source_edit_read(hdlg, data);
+                    // A source that cannot be used says why and stays open, rather than being
+                    // written in a state the first query would fail on.
+                    if data.draft.fault().is_some() {
+                        source_edit_say(hdlg, data);
+                        // Unfold, because the reason may be behind the fold and a complaint about
+                        // a box the reader cannot see is worse than none.
+                        if !data.advanced
+                            && data
+                                .draft
+                                .blocking(tailhawk_core::sourcesetup::Step::Server)
+                                .is_none()
+                        {
+                            data.advanced = true;
+                            source_edit_fold(hdlg, true);
+                        }
+                        return 1;
+                    }
+                    data.accepted = true;
+                    unsafe {
+                        let _ = EndDialog(hdlg, 1);
+                    }
+                    return 1;
+                }
+                (IDCANCEL, BN_CLICKED) => {
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    return 1;
+                }
+                _ => {}
+            }
+            0
+        }
+        // **What the worker found, applied on the thread that owns the controls.**
+        //
+        // The box is taken back here and nowhere else, before anything else can return. An answer
+        // about a URL the reader has since changed is still *said* — they asked for it — but it is
+        // not written into boxes describing a different server.
+        WM_S_PROBED => {
+            let probed = unsafe { Box::from_raw(lparam.0 as *mut Probed) };
+            let Some(data) = source_edit_state(hdlg) else {
+                return 1;
+            };
+            let data = unsafe { &mut *data };
+            if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_SETUP)) } {
+                let _ = unsafe { EnableWindow(button, true) };
+            }
+            let still_asking = dlg_text(hdlg, ID_E_URL).trim() == probed.asked;
+            if still_asking {
+                if let crate::pull::Discovery::Found { found, .. } = &probed.discovery {
+                    // `Draft::discovered` is what decides: it writes the endpoints, offers a scope
+                    // only into an empty box, and *proposes* the login mode rather than imposing it.
+                    data.draft.discovered(found.clone());
+                }
+                data.draft.tested(reach_of(&probed.reach));
+                let at = E_MODES
+                    .iter()
+                    .position(|m| *m == data.draft.mode_now())
+                    .unwrap_or(0);
+                editor_quietly(|| unsafe {
+                    SendDlgItemMessageW(
+                        hdlg,
+                        i32::from(ID_E_MODE),
+                        CB_SETCURSEL,
+                        WPARAM(at),
+                        LPARAM(0),
+                    );
+                });
+                source_edit_fill(hdlg, data);
+            }
+            let said = crate::pull::setup_said(&probed.discovery, &probed.reach);
+            set_dlg_text(
+                hdlg,
+                ID_E_FAULT,
+                &said_about(&said, &probed.asked, still_asking),
+            );
+            1
+        }
+        // **The applications the server holds, offered through the picker that already exists.**
+        //
+        // The nested modal is opened with **nothing of this dialog borrowed** — it pumps a message
+        // loop of its own, during which this procedure is re-entered, and a `&mut SourceEdit` held
+        // across it would be a second one taken from under the first.
+        WM_E_LABELS => {
+            let found = *unsafe {
+                Box::from_raw(lparam.0 as *mut Result<Vec<String>, crate::pull::PullFault>)
+            };
+            if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_CHOOSE)) } {
+                let _ = unsafe { EnableWindow(button, true) };
+            }
+            let values = match found {
+                Ok(values) => values,
+                Err(why) => {
+                    set_dlg_text(hdlg, ID_E_FAULT, &format!("{why}"));
+                    return 1;
+                }
+            };
+            let query = {
+                let Some(data) = source_edit_state(hdlg) else {
+                    return 1;
+                };
+                unsafe { &*data }.draft.query.clone()
+            };
+            let mut pick = AppsPick {
+                list: tailhawk_core::apps::AppList::new(
+                    &values,
+                    &tailhawk_core::apps::values_in(&query, tailhawk_core::apps::APP_LABEL),
+                ),
+                choice: None,
+            };
+            let took = show_apps_dialog(hdlg, &mut pick);
+            let Some(data) = source_edit_state(hdlg) else {
+                return 1;
+            };
+            let data = unsafe { &mut *data };
+            if took || pick.choice.is_some() {
+                let chosen = pick.list.chosen();
+                // **Written into the selector, not into a field of its own.** `app` is one of the
+                // server's labels; `values_in` reads it straight back out, so the tab still titles
+                // itself `live · job-dispatcher` and Interleave still works, without a second place
+                // that says the same thing.
+                match tailhawk_core::apps::with_label(
+                    &data.draft.query,
+                    tailhawk_core::apps::APP_LABEL,
+                    &chosen,
+                ) {
+                    Ok(query) => {
+                        data.draft.query = query;
+                        data.draft.apps = chosen.iter().map(|app| (*app).to_owned()).collect();
+                    }
+                    Err(_) => {
+                        set_dlg_text(
+                            hdlg,
+                            ID_E_FAULT,
+                            "This source's filter is not a selector Tailhawk can add to.",
+                        );
+                        return 1;
+                    }
+                }
+            }
+            source_edit_fill(hdlg, data);
+            1
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = EndDialog(hdlg, 0);
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// The core's reading of what a test reached — the shell's verdict with its Windows-transport and
+/// shell-fault payloads left behind, which is all a decision can be made from.
+fn reach_of(reached: &crate::pull::Reached) -> tailhawk_core::sourcesetup::Reach {
+    use tailhawk_core::sourcesetup::Reach;
+    match reached {
+        crate::pull::Reached::WantsToken(_) => Reach::WantsToken,
+        crate::pull::Reached::Answered => Reach::Answered,
+        crate::pull::Reached::NothingMounted => Reach::NothingMounted,
+        _ => Reach::Failed,
+    }
+}
+
+/// One source's own screen. Reports whether it was accepted.
+pub fn show_source_editor(parent: HWND, data: &mut SourceEdit) -> bool {
+    let t = template(
+        "Remote source",
+        E_DIALOG_W,
+        E_DIALOG_H,
+        &source_edit_items(),
+    );
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            parent,
+            Some(source_edit_proc),
+            LPARAM(data as *mut SourceEdit as isize),
         )
     };
     data.accepted
@@ -4163,6 +4718,10 @@ const LVIS_FOCUSED: u32 = 0x0001;
 const LVIS_SELECTED: u32 = 0x0002;
 /// `LVN_FIRST - 1`, and `LVN_FIRST` is `-100` — so this is the wrapped `u32` Windows sends.
 const LVN_ITEMCHANGED: u32 = (-101_i32) as u32;
+/// `NM_FIRST - 3`. **Declared, not matched as a binding** — an undeclared name in a match arm is a
+/// pattern that captures, so `NM_DBLCLK => …` without this would have answered *every*
+/// notification the list sends and sent the reader into the editor on a single click.
+const NM_DBLCLK: u32 = (-3_i32) as u32;
 
 /// §2.2's Preferences as a modal dialog: theme and font in drop-down lists, the size in a numeric
 /// field, OK and Cancel. Returns whether OK was chosen; `data` then carries the selections.
@@ -6469,6 +7028,7 @@ mod tests {
             ("Filters", filters_dialog_items()),
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
+            ("Remote source", source_edit_items()),
             ("Applications", apps_dialog_items()),
             ("Select Columns", columns_dialog_items()),
         ] {
@@ -6741,6 +7301,79 @@ mod tests {
         );
     }
 
+    /// What a control actually occupies on screen.
+    ///
+    /// **A combo box is measured closed.** Its template height is the *dropped* extent — the filter
+    /// dialog declares its own as 90 units for a control that draws 14 — so taking it at face value
+    /// would call every combo in this product an overlap with whatever is under it.
+    fn height_of(item: &Item) -> i16 {
+        match item.class {
+            Class::ComboBox => 14,
+            _ => item.h,
+        }
+    }
+
+    /// **The one-source editor fits in both of its heights, and the buttons clear every field in
+    /// each.** They move at runtime, so no walk of the template alone can see where they end up —
+    /// which is how Advanced, OK and Cancel came to be drawn over the secret box and clipped by the
+    /// bottom edge, in a dialog whose template was perfectly well formed.
+    #[test]
+    fn the_source_editor_fits_both_of_its_heights() {
+        let items = source_edit_items();
+        let movable = [ID_E_ADVANCED, IDOK, IDCANCEL];
+        for item in &items {
+            assert!(item.x >= 0 && item.y >= 0, "{:?} starts outside", item.text);
+            assert!(
+                item.x + item.w <= E_DIALOG_W,
+                "{:?} runs past the right edge",
+                item.text
+            );
+            assert!(
+                item.y + height_of(item) <= E_DIALOG_H_OPEN,
+                "{:?} runs past the bottom of the unfolded dialog",
+                item.text
+            );
+        }
+        for (i, a) in items.iter().enumerate() {
+            for b in items.iter().skip(i + 1) {
+                let apart = a.x + a.w <= b.x
+                    || b.x + b.w <= a.x
+                    || a.y + height_of(a) <= b.y
+                    || b.y + height_of(b) <= a.y;
+                assert!(apart, "{:?} and {:?} overlap", a.text, b.text);
+            }
+        }
+
+        // **Unfolded, the buttons clear everything.**
+        let open_y = editor_buttons_y(true);
+        for item in items.iter().filter(|i| !movable.contains(&i.id)) {
+            assert!(
+                item.y + height_of(item) <= open_y,
+                "{:?} ends at {} and the buttons move to {open_y}",
+                item.text,
+                item.y + item.h
+            );
+        }
+        // **Folded, they clear everything that is still showing** — which is everything above the
+        // fold line, since the rest is hidden.
+        let shut_y = editor_buttons_y(false);
+        for item in items
+            .iter()
+            .filter(|i| !movable.contains(&i.id) && i.y < E_ADVANCED_Y)
+        {
+            assert!(
+                item.y + height_of(item) <= shut_y,
+                "{:?} ends at {} and the folded buttons sit at {shut_y}",
+                item.text,
+                item.y + item.h
+            );
+        }
+        assert!(
+            E_DIALOG_H_OPEN > E_DIALOG_H,
+            "unfolding has to make it taller"
+        );
+    }
+
     /// The Filter dialog reads down one left edge. Every labelled field starts in the same column
     /// and every full-width one ends at the same right edge — the owner saw the Expression box
     /// step sideways from the Value box above it, which is what a shared column is for.
@@ -6810,6 +7443,7 @@ mod tests {
             ("Highlight rules", rules_dialog_items()),
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
+            ("Remote source", source_edit_items()),
             ("Applications", apps_dialog_items()),
             ("Select Columns", columns_dialog_items()),
         ] {

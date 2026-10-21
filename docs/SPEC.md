@@ -1468,8 +1468,8 @@ Tailhawk's entire working set is customer log files containing PII, connection s
 and session IDs.
 
 - **No telemetry. No update ping. No font or CDN fetch. No outbound connection of any kind** unless
-  the user explicitly opens a remote source, or presses **Discover** or **Test** in the sources
-  dialog. This is a **testable assertion** in CI and a competitive claim worth making. The two
+  the user explicitly opens a remote source, or presses **Set up** or **Choose…** on a source's own
+  screen. This is a **testable assertion** in CI and a competitive claim worth making. The two
   buttons are the 2026-10-21 entry at the end of this section, and the sentence is amended here as
   well as there, because this bullet is the one that gets quoted.
 
@@ -1518,8 +1518,10 @@ and session IDs.
   > sources dialog has a **Discover** button and a **Test** button. Both make outbound connections,
   > and neither of them is "opening a source":
   >
-  > - **Test** asks the URL in the box for its label names, with no credential, and reports what it
-  >   reached. One request, to the host the reader typed.
+  > - **Set up** does both halves in one press. It asks the URL in the box for its label names with
+  >   no credential and reports what it reached — one request, to the host the reader typed — and it
+  >   asks that host where it signs people in. **Choose…** is a third: one *credentialed* request for
+  >   the values of one label, which is the only one of the three that sends a token.
   > - **Discover** asks that host for `/.well-known/openid-configuration` and, *if nothing there
   >   serves one*, asks `identity`, `auth`, `login`, `sso` and `idp` **beside** it — hostnames the
   >   reader did not type. That is the part that needs saying out loud. It is
@@ -1536,7 +1538,9 @@ and session IDs.
   >   the rule and states the residual it still has.
   >
   > So the claim is now: **no outbound connection unless the user opens a remote source, or presses
-  > Discover or Test in the sources dialog.** The conditional assertion CI makes is untouched — both
+  > Set up or Choose… on a source's own screen.** (Those were two buttons named Discover and Test on
+  > the sources dialog itself until 2026-10-21, when that dialog became a list and the fields moved
+  > to a screen of their own.) The conditional assertion CI makes is untouched — both
   > buttons reach WinHTTP through the same `LoadLibraryW` on first use, so a run that opens no
   > remote source and presses neither button still loads no transport, and
   > `tests::a_local_file_session_never_loads_the_transport` still proves it.

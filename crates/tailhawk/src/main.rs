@@ -10888,18 +10888,35 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         let mut edit = dialog::SourcesEdit {
             editor: tailhawk_core::sourceset::Editor::new(known, stored),
             accepted: false,
-            store: None,
+            store: Vec::new(),
             forget: Vec::new(),
         };
         // No `STATE` borrow is held across this: the dialog pumps its own modal loop.
         if dialog::show_sources_dialog(hwnd, &mut edit) {
+            // **Reconciled against the set that is actually being saved, first.** Both lists are
+            // collected as the reader works, and a sitting can contradict itself: give `live` a
+            // secret and then delete `live`, and the naive order writes a credential for a source
+            // that no longer exists; rename `live` to `tmp` and back, and `forget` still holds
+            // `live` — the name the surviving source has — so a working source loses its secret
+            // with nothing on screen having said so. A name that survived is never forgotten, and
+            // a name that did not survive is never written.
+            let kept: Vec<&str> = edit
+                .editor
+                .sources()
+                .iter()
+                .map(|source| source.name.as_str())
+                .collect();
+            edit.forget.retain(|gone| !kept.contains(&gone.as_str()));
+            edit.store.retain(|(name, _)| kept.contains(&name.as_str()));
             // **Credential Manager first, settings second.** If the write fails, the source is not
             // yet recorded as configured — the other order would leave a source that looks ready
             // and has no secret behind it.
             for gone in &edit.forget {
                 secrets::forget(gone);
             }
-            if let Some((name, secret)) = edit.store.take() {
+            // **Every secret typed in this sitting, not just the last.** The list dialog outlives
+            // each editor that opens over it, so three sources can be given one before Close.
+            for (name, secret) in edit.store.drain(..) {
                 if secret.is_empty() {
                     secrets::forget(&name);
                 } else {

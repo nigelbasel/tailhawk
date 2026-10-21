@@ -74,6 +74,10 @@ pub enum SelectorFault {
     NoSelector,
     /// A `{` with no matching `}`, or a quote that never closes.
     Unbalanced,
+    /// The label is not a name LogQL would accept — empty, a leading digit, or a character that
+    /// could close the brace it sits inside. Label names come from the server exactly as values do,
+    /// so this is a server answering strangely rather than a reader typing, and it is refused.
+    NotALabelName,
     /// A chosen name has a character that cannot appear inside a quoted LogQL label value without
     /// escaping — a quote or a backslash. Values come from the server, so this is a server that
     /// answered with something strange rather than a user who typed it, and it is refused rather
@@ -81,24 +85,39 @@ pub enum SelectorFault {
     UnquotableName,
 }
 
-/// The selector `query` becomes when it is asked for exactly `apps`.
+/// The label this estate's services are named by, and the only label the rest of the product treats
+/// specially: a remote tab is keyed and titled by its applications, and Interleave and Separate
+/// regroup by them.
 ///
-/// An empty `apps` leaves the query alone — "no app chosen" means the source's own selector, not an
-/// empty one. One app becomes `app="that"`, several become `app=~"a|b"`, because an exact matcher is
-/// what a reader expects to see for a single choice and Loki indexes it better.
+/// **It is one label among the server's, and the product had started to forget that.** The owner,
+/// 2026-10-21: *"the applications field is specifically a nurtur feature so I would think we need to
+/// offer the user a set of fields and possible values that could be used to constrain the output
+/// based on an initial fetch from the source once connected."* Another Loki keys on `service_name`
+/// or `namespace`; a dialog with an **Applications** box on the front of it had quietly made this a
+/// tool for one estate.
+pub const APP_LABEL: &str = "app";
+
+/// The selector `query` becomes when `label` is asked for exactly `values`.
+///
+/// An empty `values` leaves the query alone — "nothing chosen" means the source's own selector, not
+/// an empty one. One value becomes `label="that"`, several become `label=~"a|b"`, because an exact
+/// matcher is what a reader expects for a single choice and Loki indexes it better.
 ///
 /// A query with no selector at all is refused unless it is *empty*, which is a legitimate source
 /// meaning "everything this credential can see" — that gets a selector written for it.
-pub fn with_apps(query: &str, apps: &[&str]) -> Result<String, SelectorFault> {
-    if apps.is_empty() {
+pub fn with_label(query: &str, label: &str, values: &[&str]) -> Result<String, SelectorFault> {
+    if values.is_empty() {
         return Ok(query.to_owned());
     }
-    for app in apps {
+    if !is_label_name(label) {
+        return Err(SelectorFault::NotALabelName);
+    }
+    for app in values {
         if app.contains('"') || app.contains('\\') {
             return Err(SelectorFault::UnquotableName);
         }
     }
-    let matcher = app_matcher(apps);
+    let matcher = label_matcher(label, values);
 
     if query.trim().is_empty() {
         return Ok(format!("{{{matcher}}}"));
@@ -108,7 +127,7 @@ pub fn with_apps(query: &str, apps: &[&str]) -> Result<String, SelectorFault> {
     let mut kept: Vec<&str> = Vec::new();
     for part in split_matchers(inside)? {
         let part = part.trim();
-        if part.is_empty() || names_app(part) {
+        if part.is_empty() || names_label(part, label) {
             continue;
         }
         kept.push(part);
@@ -122,22 +141,40 @@ pub fn with_apps(query: &str, apps: &[&str]) -> Result<String, SelectorFault> {
     ))
 }
 
+/// The selector `query` becomes when it is asked for exactly `apps` — [`with_label`] with
+/// [`APP_LABEL`] passed in, which is all that was ever special about it.
+pub fn with_apps(query: &str, apps: &[&str]) -> Result<String, SelectorFault> {
+    with_label(query, APP_LABEL, apps)
+}
+
+/// Whether `name` is a label name LogQL will accept, so a name from anywhere cannot become a
+/// matcher that changes what a selector means.
+///
+/// The same rule [`crate::loki::label_values`] holds a label to before it reaches a URL path, read
+/// one layer along: there, a name that could choose a path segment; here, one that could close the
+/// brace it sits inside.
+fn is_label_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// `app="one"` for a single choice, `app=~"one|two"` for several.
-fn app_matcher(apps: &[&str]) -> String {
-    if let [only] = apps {
-        return format!("app=\"{only}\"");
+fn label_matcher(label: &str, values: &[&str]) -> String {
+    if let [only] = values {
+        return format!("{label}=\"{only}\"");
     }
     // **The names are joined, not escaped into a regex.** A Loki label value is matched by RE2 and
     // a name carrying `.` or `+` would match more than itself — but these names come from the
     // server's own label values, and anchoring each alternative is what keeps `api` from matching
     // `api-v2`. Loki anchors the whole match, so alternation of literals is exact as long as no
     // alternative carries a metacharacter; the ones that could are quoted here.
-    let joined = apps
+    let joined = values
         .iter()
-        .map(|app| quote_meta(app))
+        .map(|value| quote_meta(value))
         .collect::<Vec<_>>()
         .join("|");
-    format!("app=~\"{joined}\"")
+    format!("{label}=~\"{joined}\"")
 }
 
 /// The characters that mean something to RE2 and must be escaped to match themselves.
@@ -224,12 +261,12 @@ pub fn sync(list: &mut AppList, ticks: &[bool]) -> bool {
 }
 
 /// Whether one matcher is about the `app` label — `app="x"`, `app =~ "y"`, `app!="z"`.
-fn names_app(matcher: &str) -> bool {
+fn names_label(matcher: &str, label: &str) -> bool {
     let name: String = matcher
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect();
-    name == "app"
+    name == label
 }
 
 /// The byte positions of the outermost `{` and its matching `}`.
@@ -360,13 +397,14 @@ impl AppList {
     }
 }
 
-/// The apps a query already names, so reopening a picker shows what was chosen last time.
+/// The values a query already constrains `label` to, so reopening a picker shows what was chosen
+/// last time.
 ///
-/// Only an exact `app="x"` or an alternation `app=~"a|b"` is read back; anything else — a negation,
-/// a pattern with real regex in it — is left alone and reported as nothing chosen, because showing
-/// a tick beside `api` for a query that says `app!="api"` would be a lie about the user's own
-/// selector.
-pub fn apps_in(query: &str) -> Vec<String> {
+/// Only an exact `label="x"` or an alternation `label=~"a|b"` is read back; anything else — a
+/// negation, a pattern with real regex in it — is left alone and reported as nothing chosen,
+/// because showing a tick beside `api` for a query that says `app!="api"` would be a lie about the
+/// user's own selector.
+pub fn values_in(query: &str, label: &str) -> Vec<String> {
     let Ok((open, close)) = selector_span(query) else {
         return Vec::new();
     };
@@ -375,10 +413,12 @@ pub fn apps_in(query: &str) -> Vec<String> {
     };
     for part in parts {
         let part = part.trim();
-        if !names_app(part) {
+        if !names_label(part, label) {
             continue;
         }
-        let rest = part[3..].trim_start();
+        // **`label.len()`, not three.** It was `part[3..]` while `app` was the only label this
+        // could be asked about, and a longer name would have left the tail of it in the operator.
+        let rest = part[label.len()..].trim_start();
         let (exact, value) = if let Some(rest) = rest.strip_prefix("=~") {
             (false, rest.trim())
         } else if let Some(rest) = rest.strip_prefix('=') {
@@ -401,6 +441,15 @@ pub fn apps_in(query: &str) -> Vec<String> {
         return alternatives(value).unwrap_or_default();
     }
     Vec::new()
+}
+
+/// The applications a query already names — [`values_in`] with [`APP_LABEL`] passed in.
+///
+/// **Kept as its own name because it is what the rest of the product means.** A tab is keyed by
+/// its applications, titled by them and regrouped by them; those callers are asking about `app`
+/// specifically, not about a label they chose.
+pub fn apps_in(query: &str) -> Vec<String> {
+    values_in(query, APP_LABEL)
 }
 
 /// One open tab, as the regroup decision needs to see it.
@@ -1111,6 +1160,78 @@ mod tests {
         };
         let asked = regroup_question(&plan).expect("closing four windows is worth a question");
         assert!(asked.contains('4'), "the count is the point: {asked}");
+    }
+
+    /// **Any label, not just `app`.** The owner, 2026-10-21: *"the applications field is
+    /// specifically a nurtur feature so I would think we need to offer the user a set of fields and
+    /// possible values that could be used to constrain the output"*. `app` was the only label this
+    /// could narrow a selector by, and the product had made that look like a feature rather than
+    /// one estate's label.
+    #[test]
+    fn any_of_the_servers_labels_can_narrow_a_selector() {
+        assert_eq!(
+            with_label("{environment=\"live\"}", "service_name", &["gateway"]).expect("a selector"),
+            "{environment=\"live\", service_name=\"gateway\"}"
+        );
+        assert_eq!(
+            with_label("", "namespace", &["a", "b"]).expect("a selector"),
+            "{namespace=~\"a|b\"}",
+            "an empty query gets a selector written for it, as it always did"
+        );
+        // Asking again for the same label replaces its matcher and leaves every other alone.
+        assert_eq!(
+            with_label(
+                "{environment=\"live\", service_name=\"gateway\"}",
+                "service_name",
+                &["worker"]
+            )
+            .expect("a selector"),
+            "{environment=\"live\", service_name=\"worker\"}"
+        );
+
+        // **The label name is checked before it is pasted into a selector.** It comes from the
+        // server exactly as the values do.
+        assert_eq!(
+            with_label("{a=\"b\"}", "svc\"}, x=\"", &["gateway"]),
+            Err(SelectorFault::NotALabelName)
+        );
+        assert_eq!(
+            with_label("{a=\"b\"}", "", &["gateway"]),
+            Err(SelectorFault::NotALabelName)
+        );
+        assert_eq!(
+            with_label("{a=\"b\"}", "9lives", &["gateway"]),
+            Err(SelectorFault::NotALabelName)
+        );
+        assert_eq!(
+            with_label("{a=\"b\"}", "service_name", &[]).expect("unchanged"),
+            "{a=\"b\"}",
+            "nothing chosen is the source's own selector, not an empty one"
+        );
+    }
+
+    /// **Reading a selector back works for a label of any length**, which is the half that was
+    /// quietly wrong: the matcher was sliced at `part[3..]` because `app` is three letters, so a
+    /// longer name would have left its own tail in front of the operator and matched nothing.
+    #[test]
+    fn the_values_of_any_label_read_back_out_of_a_selector() {
+        let query = "{environment=\"live\", service_name=~\"gateway|worker\"}";
+        assert_eq!(values_in(query, "service_name"), ["gateway", "worker"]);
+        assert_eq!(values_in(query, "environment"), ["live"]);
+        assert_eq!(values_in(query, "app"), Vec::<String>::new());
+        assert_eq!(
+            values_in("{app=\"job-dispatcher\"}", "app"),
+            ["job-dispatcher"],
+            "and the Nurtur-shaped wrapper still reads what it always did"
+        );
+        assert_eq!(apps_in("{app=\"job-dispatcher\"}"), ["job-dispatcher"]);
+
+        // A name that is a prefix of another must not be answered by it.
+        assert_eq!(
+            values_in("{service_name_short=\"x\"}", "service_name"),
+            Vec::<String>::new(),
+            "service_name is not service_name_short"
+        );
     }
 
     /// The cases that are not a question: nothing is lost, so nothing is asked.

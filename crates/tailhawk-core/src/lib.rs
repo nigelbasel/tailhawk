@@ -44,6 +44,7 @@ pub mod semantic;
 pub mod settings;
 pub mod sha256;
 pub mod sourceset;
+pub mod sourcesetup;
 pub mod template;
 pub mod textunit;
 pub mod theme;
