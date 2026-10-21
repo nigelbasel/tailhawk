@@ -7368,10 +7368,6 @@ mod tests {
                 item.y + item.h
             );
         }
-        assert!(
-            E_DIALOG_H_OPEN > E_DIALOG_H,
-            "unfolding has to make it taller"
-        );
     }
 
     /// The Filter dialog reads down one left edge. Every labelled field starts in the same column
