@@ -667,7 +667,7 @@ mod tests {
 
         // Suffixing must not push it past the limit, so the stem gives way to the number.
         let full = "x".repeat(ENTRY_NAME_MAX);
-        let next = saved_entry_name(&full, &[], &[full.clone()]);
+        let next = saved_entry_name(&full, &[], std::slice::from_ref(&full));
         assert!(next.len() <= ENTRY_NAME_MAX, "{} chars", next.len());
         assert_ne!(next, full);
     }

@@ -346,11 +346,7 @@ mod tests {
         assert_eq!(target_for(" dev"), None, "leading space");
         assert_eq!(target_for("dev "), None, "trailing space");
         assert_eq!(target_for(&"x".repeat(NAME_MAX + 1)), None, "too long");
-        assert_eq!(
-            target_for(&"x".repeat(NAME_MAX)).is_some(),
-            true,
-            "at the limit"
-        );
+        assert!(target_for(&"x".repeat(NAME_MAX)).is_some(), "at the limit");
 
         assert_eq!(target_for("a/b"), None, "the scheme's own separator");
         assert_eq!(target_for("a\\b"), None, "and the other one");

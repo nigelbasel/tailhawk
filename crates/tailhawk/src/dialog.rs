@@ -6779,7 +6779,7 @@ mod tests {
         assert_eq!(&t[11..11 + words.len()], &words[..], "the caption");
         let face: Vec<u16> = "MS Shell Dlg".encode_utf16().collect();
         let at = (0..t.len() - face.len())
-            .find(|&i| &t[i..i + face.len()] == &face[..])
+            .find(|&i| t[i..i + face.len()] == face[..])
             .expect("the DS_SETFONT face is present");
         assert_eq!(t[at - 1], 8, "eight point, the word before the face");
     }
@@ -7236,7 +7236,7 @@ mod tests {
         assert_eq!(CDRF_NOTIFYSUBITEMDRAW, c::CDRF_NOTIFYSUBITEMDRAW as isize);
         assert_eq!(CDIS_SELECTED, c::CDIS_SELECTED.0);
         assert_eq!(CDIS_FOCUS, c::CDIS_FOCUS.0);
-        assert_eq!(NM_CUSTOMDRAW, c::NM_CUSTOMDRAW as u32);
+        assert_eq!(NM_CUSTOMDRAW, c::NM_CUSTOMDRAW);
         assert_eq!(RULES_COLOUR_COLUMN, 3, "the Colour column's position");
     }
 }

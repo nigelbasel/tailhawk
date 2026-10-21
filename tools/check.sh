@@ -37,29 +37,58 @@ step() {
 step "fmt" cargo fmt -p tailhawk -p tailhawk-core -- --check
 step "clippy" cargo clippy --release -p tailhawk -p tailhawk-core --all-targets -- -D warnings
 
-# The suite, kept in a file so the known timing flake can be told apart from a real failure.
+# **The flakes `CLAUDE.md` documents, by name.** Each fails under the full parallel suite on a loaded
+# machine and passes when run alone: two are timing criteria, one depends on when a write became
+# visible, and two lose a race for an exclusive handle on a spill nothing should be holding.
+# `CLAUDE.md`'s rule is to rerun the named test alone before blaming a change for it, so the script
+# does that rather than leaving it to whoever reads the log.
+#
+# **Only these names, and only when every failure is one of them.** Anything else alongside them is
+# a real failure and the gate stays red. Until 2026-10-21 this handled the screenful timing
+# criterion alone and only as the sole failure, so the other four — all documented in `CLAUDE.md`,
+# one of them met twice in one day — took the gate red and had to be argued about by hand.
+FLAKES=(
+  'semantic::tests::a_screenful_costs_a_fraction_of_a_frame'
+  'paint::tests::the_layout_cost_does_not_scale_with_the_number_of_visible_columns'
+  'stdin::tests::a_spill_is_an_ordinary_file_to_the_rest_of_the_product'
+  'stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone'
+  'stdin::tests::reaping_removes_an_orphan_spill_directory_and_leaves_a_live_one_alone'
+)
+
+# The suite, kept in a file so the known flakes can be told apart from a real failure.
 echo
 echo "=== test ==="
 if cargo test --release --workspace > "$root/target/check-test.log" 2>&1; then
   echo "ok"
 else
-  # `semantic::tests::a_screenful_costs_a_fraction_of_a_frame` is a timing criterion documented in
-  # `CLAUDE.md`: it fails under the full parallel suite on a loaded machine and passes alone. The
-  # rule there is to rerun it alone before blaming a change, so that is done here rather than left
-  # to whoever reads the log — but **only** when it is the sole failure. Anything alongside it is a
-  # real failure and the gate stays red.
-  failed=$(grep -cE '^test .* FAILED' "$root/target/check-test.log" || true)
-  flake=$(grep -cE '^test semantic::tests::a_screenful_costs_a_fraction_of_a_frame \.\.\. FAILED' \
-    "$root/target/check-test.log" || true)
-  if [ "$failed" = "1" ] && [ "$flake" = "1" ]; then
-    echo "the known timing flake failed under the parallel suite; rerunning it alone"
-    if cargo test --release -p tailhawk-core a_screenful_costs_a_fraction_of_a_frame >/dev/null 2>&1
-    then
-      echo "ok (the flake passes alone, as CLAUDE.md says it does)"
+  failures=$(grep -E '^test .* FAILED' "$root/target/check-test.log" \
+    | sed 's/^test //; s/ \.\.\. FAILED.*//' | sort -u)
+  unknown=0
+  for name in $failures; do
+    known=0
+    for flake in "${FLAKES[@]}"; do
+      [ "$name" = "$flake" ] && known=1
+    done
+    [ "$known" = "0" ] && unknown=1
+  done
+  if [ -n "$failures" ] && [ "$unknown" = "0" ]; then
+    echo "every failure is a documented flake; rerunning each alone"
+    alone_ok=1
+    for name in $failures; do
+      # The bare test name, because `cargo test` filters on a substring and the module path is not
+      # one the filter matches across both crates.
+      if cargo test --release --workspace "${name##*::}" >/dev/null 2>&1; then
+        echo "  $name passes alone, as CLAUDE.md says it does"
+      else
+        echo "  $name fails alone too, so this is real"
+        alone_ok=0
+      fi
+    done
+    if [ "$alone_ok" = "1" ]; then
+      echo "ok (every failure was a documented flake and passed alone)"
       "$root/tools/agentlog.sh" INFO test \
-        "the screenful timing flake failed under the parallel suite and passed alone — not a regression"
+        "documented flakes failed under the parallel suite and passed alone: $(echo $failures)"
     else
-      echo "FAILED — it fails alone too, so this is real"
       fail=1
     fi
   else

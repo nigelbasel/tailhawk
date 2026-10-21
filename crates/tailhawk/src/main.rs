@@ -14661,7 +14661,7 @@ mod tests {
             "both tabs are open, so neither tail goes"
         );
         assert_eq!(
-            spills_to_retire(&held, &[one.clone()]),
+            spills_to_retire(&held, std::slice::from_ref(&one)),
             vec![two.clone()],
             "the closed tab's tail goes and the open one's stays"
         );
@@ -16727,9 +16727,7 @@ mod tests {
             "verbatim, because Tailhawk did not name it"
         );
         assert!(
-            doc.layout
-                .as_ref()
-                .is_some_and(|l| l.widths.iter().any(|w| *w == 0)),
+            doc.layout.as_ref().is_some_and(|l| l.widths.contains(&0)),
             "the fixture must actually have a hidden column, or this proves nothing"
         );
         assert_eq!(

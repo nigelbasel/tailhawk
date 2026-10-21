@@ -1138,8 +1138,10 @@ mod tests {
         );
         assert_eq!(remote_minutes_of(Some(240)), 240);
 
-        let mut s = Settings::default();
-        s.remote_minutes = Some(240);
+        let s = Settings {
+            remote_minutes: Some(240),
+            ..Settings::default()
+        };
         assert_eq!(Settings::from_toml(&s.to_toml()).remote_minutes, Some(240));
 
         let odd = Settings::from_toml("[appearance]\nremote_minutes = 7\n");
@@ -1175,7 +1177,7 @@ mod tests {
         let piped = r"C:\Users\x\AppData\Local\Temp\tailhawk-spill-52140-00.log";
         let shouted = r"C:\USERS\X\APPDATA\LOCAL\TEMP\TAILHAWK-SPILL-52140-01\PART-000001.LOG";
         let mut s = Settings::default();
-        s.recent = vec![
+        s.recent.extend([
             Recent::File(spill.to_owned()),
             Recent::File(piped.to_owned()),
             Recent::File(real.to_owned()),
@@ -1185,7 +1187,7 @@ mod tests {
                 source: "live".to_owned(),
                 apps: Vec::new(),
             },
-        ];
+        ]);
         let read = Settings::from_toml(&s.to_toml());
         assert_eq!(
             read.recent,

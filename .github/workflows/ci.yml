@@ -110,9 +110,14 @@ jobs:
       # Product crates only, for the same reason as the format check. The experiments are still
       # compiled by the workspace build above, so they cannot rot into not building — they just do
       # not have to satisfy lints written after they were finished.
+      #
+      # --all-targets since 2026-10-21, so this matches `tools/check.sh` and the **test** code is
+      # held to the same lints as the product. It had not been, and eight lints had accumulated
+      # there — enough that the project's own gate script could not go green, which is a gate
+      # nobody can use. They are cleaned up in the same commit as this line.
       - name: Clippy
         if: matrix.arch == 'x64'
-        run: cargo clippy --release -p tailhawk -p tailhawk-core --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --release -p tailhawk -p tailhawk-core --all-targets --target ${{ matrix.target }} -- -D warnings
 
       # Product crates only. The experiment crates under experiments/ are throwaway measurement
       # code whose hand-formatting is part of what they record; reformatting them would churn

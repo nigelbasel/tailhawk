@@ -133,11 +133,23 @@ CI runs `deny`, `provenance`, then build + clippy + fmt + test on **x64 and arm6
 size gate and assertions that the binary carries no runtime shader compiler and no CRT
 redistributable dependency. `cargo fmt --check` has broken the build on its own more than once.
 
+**CI's clippy is `--all-targets` since 2026-10-21, so it matches `tools/check.sh` and holds the test
+code to the same lints as the product.** It did not, and eight lints had accumulated there — enough
+that the project's own gate script could not go green, which is a gate nobody can use. The narrower
+form is what let that happen, so the two are the same command now.
+
 The `tools/verify-*.ps1` harnesses drive the real binary. They need **`powershell`, not `pwsh`**,
 and a desktop session. `tools/verify-uia.ps1` is the exception — it needs no foreground.
 
 **Four known flakes. Two are timing criteria, one polls a file for growth, and one loses a race for
 an exclusive handle:**
+
+**`tools/check.sh` knows all five names** (the race has two siblings) and reruns each failure alone
+before calling the gate red, which is this section's rule applied by the script rather than by hand.
+It handled only the screenful criterion, and only as the *sole* failure, until 2026-10-21 — so the
+others took the gate red twice in one day and had to be argued about from the log. **A flake that has
+to be added to that list is a decision about what this project believes, so it goes in this section
+first and into `FLAKES=(…)` second.**
 
 `stdin::tests::reaping_removes_an_orphan_and_leaves_a_live_spill_alone` failed on 2026-10-20 under
 the full release suite with *"the orphan should have been reaped"*, and passed alone straight
