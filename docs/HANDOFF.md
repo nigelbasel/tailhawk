@@ -7,9 +7,17 @@ authorises, in order: **(1)** the disabled filter coming back enabled, **(2)** t
 tab, **(3)** the Remote sources dialog — apps field, clone, discovery, LogQL picker — and **(4)** the
 pre-existing `--all-targets` clippy lints that keep `tools/check.sh` from going green.
 
-**(1) and (2) are `c3c3ebc`. (3) is three parts of four — the Applications field and column, Clone,
-Discover and Test — and the LogQL picker is the one piece deliberately left, for the reasons below.
-(4) widened `tools/check.sh`'s flake handling from one named test to all five and cleaned the lints.**
+| Commit | What | CI |
+|---|---|---|
+| `c3c3ebc` | A filter switched off comes back off, and a notice knows its tab | https://github.com/nigelbasel/tailhawk/actions/runs/39561938108 |
+| `ef3a448` | The sources dialog shows the applications, clones a source, and finds the sign-in server itself | https://github.com/nigelbasel/tailhawk/actions/runs/39571478883 |
+| `3f564b3` | The project's own gate can go green, and it knows every flake it has | https://github.com/nigelbasel/tailhawk/actions/runs/39572595666 |
+
+**(3) is three parts of four** — the Applications field and column, Clone, Discover and Test — and the
+LogQL picker is the one piece deliberately left, for the reasons below. **(4) also widened CI's
+clippy to `--all-targets`**, because the eight lints were only ever "pre-existing" in the sense that
+nothing enforced them: CI covered the product crates' lib and bin targets and not their tests, which
+is exactly how eight accumulated and how the project's own gate script came to be unable to go green.
 
 **Nothing of today's dialog work has been seen on a screen.** The Applications field, the Clone
 verb, Discover, Test, the moved Secret row and the new fault-line sentences are all unverified
@@ -74,6 +82,20 @@ his estate rather than assumed, and what does not work. Two things found since, 
   `token_from_json`, so **no new core module and no new `CLEANROOM.md` §5 row is needed** for it.
 - The sources dialog's id range is 210–221 and the filters dialog starts at 230, so **222–229 are
   free** for Apps, Clone, Discover, Test and Pick.
+
+### What the two reviews found, because it is a pattern rather than two accidents
+
+Both pre-commit reviews earned their keep, and **the same mistake appeared twice in one session**:
+inserting a new item immediately above an existing one takes that item's doc comment with it. It
+happened to `notice_once_open_finished` in the morning and to `sources_dialog_items` in the
+afternoon. When you add a function or a constant above an existing one, read the doc block above the
+insertion point and ask which item it belongs to.
+
+The two that would have cost him something real, for the pattern rather than the detail: a **posted
+answer applied to whatever row was selected when it landed** (worker results need to carry what they
+were asked about, not just what they found), and **a field written unconditionally from a server's
+answer where empty is meaningful** (`Source::signs_in` is `!auth_url.is_empty()`, so an empty write
+is a behaviour change, not a blank).
 
 ### A trap in the gate script, so the next session does not lose an hour to it
 
