@@ -1,5 +1,89 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-21: the title bar carries the size, and the review stopped it being a lie
+
+**296 shell + 1023 core, 0 failed; fmt and clippy clean as CI runs them; `portable-core` checked on
+the Linux target** (its one warning, `Cancel::flag` in `search.rs`, is older than this work).
+
+### What he asked for
+
+*"in hoo wintail, when a filter is applied, it keeps showing what the size of the file in the title
+bar so one can immediately see that everything is filtered out"* — 2026-10-20, with a screenshot:
+
+```
+Hoo WinTail - [C:\Users\nigel\.claude\logs\trigger-migration.log - 6.86 MB <7197054 Bytes>]
+```
+
+The caption is now `<document> — <size> — Tailhawk`, the size being the **only** document fact in
+it. `size_text` gives both figures as WinTail does — binary units truncated to hundredths, and a
+bare count below a kilobyte — because the scaled one is what a glance reads and the exact one is
+what *moves* while a file is being tailed.
+
+### The part to read: `LogSet::bytes` is not a file length, and the first draft said it was
+
+The component review found this and it is the whole reason the commit waited. **`bytes()` sums what
+has been indexed across the members the set is *holding*.** Four things make a source larger:
+
+- an eager bound that left older members unindexed (`set.rs:909`, `eager_window` drops **whole
+  members** and records `omitted`) — a 400-file directory would caption the newest ten;
+- an answer Loki cut at its limit (`Document::answers_cut`);
+- the two **spill-backed** sources, a pipe and a remote tail: the spill is capped at
+  `stdin::SPILL_BYTES` = 512 MB and `excess()` **deletes its oldest part** to stay there.
+
+The third would have been visibly wrong. An overnight tail climbs to half a gigabyte, drops by
+sixty-four megabytes, climbs again — **the exact misreading `set.rs`'s own doc-comment says
+`bytes()` was changed to prevent**: *"reporting the live member's alone made the byte count in the
+title fall at every roll, which reads as data lost when nothing was."* Promoted into the caption,
+which is the one place he had just been told to trust.
+
+So the caption says `at least 6.86 MB (7,197,054 bytes)` when the source holds more than its index.
+**`at least` is `statusbar::floor`'s own word**, from `LOKI.md` §6 — a count of bytes over a partial
+source is a floor exactly as a count of rows is, and the bar and the caption now hedge the same way
+for the same reason. Zero is not hedged: a floor of nothing carries no information, and `0 bytes` is
+the reading he asked for.
+
+**The decision is `indexed_of(document)`, a named pure function**, not four conditions inside
+`Shell::refresh_title`, which needs an `HWND` and could never have a test. `Indexed { bytes, whole }`
+is the view-model. That is `CLAUDE.md`'s rule, and the second time in two days the trap two
+paragraphs below it in `UI-DESIGN.md` was nearly walked into: *a view-model with no field for a fact
+has decided about that fact by accident.*
+
+### Three more from the same review, all fixed
+
+1. **"Keeps showing" was broken in the case he named.** `Document::poll_follow` returns early when
+   `Polled::is_quiet` — no line *completed* — while `Follow::poll` advances `scanned_to` either way.
+   So appending to an **unterminated** line moved the bytes with nothing to rebuild the caption, and
+   §5's follow deliberately *continues* such a line rather than pushing a row. The follow tick now
+   compares `set.bytes()` across the poll. §8.1's unseen dot was left a row event on purpose: a
+   half-written line is not content arrived in a tab nobody is looking at.
+2. **The caption changed ten times a second.** It is rebuilt on every follow tick; the string used
+   to be identical every time, so `SetWindowTextW` re-set the same text and nothing noticed. An
+   exact byte count makes each call a real caption change — a taskbar button relabelled and a
+   `UIA_NamePropertyId` property change a screen reader may read out. `set_title` now reads the
+   caption back and returns if it would not change.
+3. **`UX-REVIEW.md:236` — finding 12's *Fix*, the normative paragraph — still listed `size` among
+   the facts to move to the status bar.** Only the "What has been done since" entry had been
+   amended, so a session reading the finding would have read the Fix and taken the size back out.
+   Both are amended now, and the argument is stated honestly: that finding's remedy was to move the
+   size *to the bar*, it never happened, no pane carries a size to this day, and the real reason it
+   is in the caption is that he asked for it there.
+
+Also recorded rather than glossed: the figure **does not** match Explorer to the byte, and the
+doc-comment says why instead of leaving it to be found — `Member::start` is the first byte after a
+byte-order mark, and `follow.rs`'s `FOLLOW_BUDGET_BYTES` caps a tick at 4 MB, so a hot writer is
+ahead of what has been read.
+
+### One thing found and not touched, his call
+
+**`tools/check.sh` runs `cargo clippy … --all-targets`, and that is already red on clean master** —
+ten lints in the two crates' **test** code (`field_reassign_with_default`, `needless_borrow`,
+`unnecessary_cast`, `assert_eq` on a literal bool, two `clone`-to-slice, `contains` over
+`iter().any()`). Verified by stashing: the same ten on `fe8b73f` with nothing of this work applied.
+CI uses the narrower `-p tailhawk -p tailhawk-core -- -D warnings`, which is clean, so **nothing is
+failing** — but the project's own gate script cannot go green until those are cleaned up.
+
+---
+
 ## ▶ Resume point — 2026-10-20: a transport failure names the host, a blank view says why, and a review caught the warning crying wolf
 
 ### The one to read first: the warning was wrong, and the fix it recommended did not work

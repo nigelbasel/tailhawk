@@ -97,6 +97,18 @@ Ctrl+L to change it`, at the left of the bar. Filters are remembered per file an
 so a filter that made sense when you wrote it can come back over a file it now excludes completely,
 and an empty window is otherwise indistinguishable from one with nothing in it.
 
+**And the title bar says how much of the source is indexed**, whatever the filters do to the view:
+`trigger-migration.log — 6.86 MB (7,197,054 bytes) — Tailhawk`. Scaled for a glance and exact for
+the record, because the exact number is the one that moves while a file is being tailed. It is the
+one fact a filter cannot change, so a blank view over a title reading `6.86 MB` is a filter to go
+and look at, and one over `0 bytes` is a source with nothing in it yet.
+
+It reads `at least 6.86 MB (7,197,054 bytes)` when the source holds more than has been indexed —
+a rolled set too large to index eagerly, an answer Loki cut at its limit, or a pipe or remote tail,
+whose spill keeps the most recent 512 MB and deletes older parts. For a single ordinary file it is
+that file's length, less a byte-order mark if it has one, and up to 4 MB behind a writer the follow
+pass is still catching up with.
+
 Down the right: **New**, **Remove**, **Remove all**, **Up** and **Down** (order is display order —
 it does not change which lines survive), and **Edit…**, which opens the composer described below on
 the selected row. Under the list, **Enable all include**, **Enable all exclude**, **Disable all
@@ -206,9 +218,9 @@ nothing.
 
 ## Formats
 
-The format is detected on open and named in the status bar and the window title, with the
-confidence: `· Serilog (file) 92%`. **Format ▸ Log format** lists what was considered, with the
-chosen one ticked, so a wrong guess can be overruled.
+The format is detected on open and named in the status bar, with the confidence:
+`· Serilog (file) 92%`. **Format ▸ Log format** lists what was considered, with the chosen one
+ticked, so a wrong guess can be overruled.
 
 Detected without configuration: syslog (RFC 5424 and RFC 3164), NLog, MEL Simple, Serilog (file and
 console), Apache/nginx access, log4net (full and compact), Python logging (both shapes), JSON

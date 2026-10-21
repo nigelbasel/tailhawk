@@ -234,9 +234,17 @@ measure itself. It is genuinely useful — several defects this month were found
 a window title.
 
 **Fix.** Title: `<file> — Tailhawk`, the Windows convention. The document's own facts (encoding,
-line count, size, following, lag) belong in the status bar, which already exists and is nearly
-empty. The frame and atlas instrumentation goes behind the existing `TAILHAWK_ATLAS_LOG`-style
-switch — on when a harness asks for it, absent otherwise.
+line count, following, lag) belong in the status bar, which already exists and is nearly empty. The
+frame and atlas instrumentation goes behind the existing `TAILHAWK_ATLAS_LOG`-style switch — on when
+a harness asks for it, absent otherwise.
+
+**Amended 2026-10-21: the size stays in the title.** This paragraph named it among the facts to
+move to the status bar. It never moved — no pane carries a size — and on 2026-10-20 the owner asked
+for it in the title, which is where his reference product puts it: *"when a filter is applied, it
+keeps showing what the size of the file in the title bar so one can immediately see that everything
+is filtered out."* So the title is `<document> — <size> — Tailhawk`, and the size is the **only**
+document fact in it. The reasoning is under "What has been done since" below; a session reading this
+paragraph alone should not take it back out.
 
 ## 13. The detail pane — **Fails**
 
@@ -527,12 +535,36 @@ itself, mapping the point through `HDM_HITTEST`.
 
 ## What has been done since — 2026-09-15
 
-- **12 — the title bar.** It reads `<document> — Tailhawk` now, and `Tailhawk` with nothing open.
-  Everything else it carried was already in the status bar word for word, so nothing moved: the
-  duplicate went. The build number is in Help ▸ About. The frame and atlas instrument is shown only
-  when `TAILHAWK_FRAME_STATS` is set, at the end of the status bar. The `tools/verify-*.ps1`
-  harnesses that waited on the title for a line count, a match count or a notice read the status bar
-  instead, through `WM_GETTEXT`, which Windows marshals between processes.
+- **12 — the title bar.** It reads `<document> — <size> — Tailhawk` now, and `Tailhawk` with
+  nothing open. Everything else it carried was already in the status bar word for word, so nothing
+  moved: the duplicate went. The build number is in Help ▸ About. The frame and atlas instrument is
+  shown only when `TAILHAWK_FRAME_STATS` is set, at the end of the status bar. The
+  `tools/verify-*.ps1` harnesses that waited on the title for a line count, a match count or a
+  notice read the status bar instead, through `WM_GETTEXT`, which Windows marshals between
+  processes.
+
+  **The size is in the title deliberately, and is not a regression of this finding.** The owner
+  asked for it on 2026-10-20, with a screenshot of WinTail doing the same: "when a filter is
+  applied, it keeps showing what the size of the file in the title bar so one can immediately see
+  that everything is filtered out." It is the one fact a filter cannot change, which is what makes
+  it the answer to the question a blank view asks: `Filtered 0 of 1,424` says the sieve kept
+  nothing, and only the size says whether the remedy is to fix the filter or to wait for the source.
+
+  **Said plainly, because the argument is easy to dress up:** this finding's own remedy was to move
+  the size **to the status bar**, and that never happened — no pane carries a size to this day. So
+  "the bar does not say it, therefore the title may" is true, but it is true because the remedy was
+  left undone, and the honest version is simply that the owner wants it in the caption and the
+  **Fix** paragraph above has been amended to say so. A future session reading either paragraph
+  alone should not take the size back out.
+
+  **What it says is "how much is indexed", and it hedges when that is not the whole source** —
+  `at least 6.86 MB (7,197,054 bytes)`, the status bar's own word for a floor from `LOKI.md` §6.
+  Four things make a source bigger than its index: a rolled set whose eager bound left older
+  members out, a Loki answer the server cut, and the two spill-backed sources, whose spill is
+  bounded at 512 MB and deletes its oldest part to stay there. Without the hedge an overnight tail
+  would climb to half a gigabyte, fall by sixty-four megabytes and climb again, asserting all the
+  while that it was the size of the source — which is the "reads as data lost when nothing was"
+  that `set.rs` warns about, in the one place the owner had been told to trust.
 - **14 — column headings.** The owner chose the hybrid the finding recommended. A heading from a
   format Tailhawk recognises — the catalogue, a template, a format defined from a line — is shown in
   sentence case: `Timestamp`, `Level`, `Message`. A heading that is the file's own spelling — a JSON

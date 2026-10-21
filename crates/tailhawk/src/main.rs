@@ -121,12 +121,12 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMenu,
-    GetMessageW, GetScrollInfo, GetSubMenu, GetWindow, GetWindowPlacement, IsDialogMessageW,
-    IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_APPSTARTING, IDC_ARROW, MSG,
-    NONCLIENTMETRICSW, SB_BOTTOM, SB_CTL, SB_ENDSCROLL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+    GetMessageW, GetScrollInfo, GetSubMenu, GetWindow, GetWindowPlacement, GetWindowTextW,
+    IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetClassLongPtrW, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GCLP_HBRBACKGROUND, GW_OWNER, HMENU, IDC_APPSTARTING, IDC_ARROW,
+    MSG, NONCLIENTMETRICSW, SB_BOTTOM, SB_CTL, SB_ENDSCROLL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
     SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE,
     SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
     SPI_GETWHEELSCROLLLINES, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -2928,17 +2928,118 @@ fn natural_order(columns: usize) -> Vec<usize> {
     (0..columns.saturating_sub(1)).collect()
 }
 
-/// The window's title: the document, then the program — or the program alone.
+/// The window's title: the document, how big it is, then the program — or the program alone.
 ///
 /// **UX-REVIEW finding 12.** The title carried the build, the renderer, the follow state, the
 /// encoding, the set description and the frame instrument, and the status bar said all of it again
 /// word for word. The document's facts are the status bar's; the title's job is to tell one window
 /// from another in the taskbar and in `Alt+Tab`, which is why the name comes first. The build is in
 /// Help ▸ About, which is where a person looks for it.
-fn window_title(document: Option<&str>) -> String {
+///
+/// **The size is the exception, and it is here at the owner's request** (2026-10-20, with a
+/// screenshot of WinTail, which does the same): "when a filter is applied, it keeps showing what
+/// the size of the file in the title bar so one can immediately see that everything is filtered
+/// out." It is not redundant with the bar — **no pane carries it** — and it is the one fact a
+/// filter cannot change, so it is what tells a view hiding everything apart from a source that
+/// holds nothing. Finding 12's rule was *remove what the bar already says*, not *say nothing*.
+fn window_title(document: Option<&str>, indexed: Option<Indexed>) -> String {
     match document.filter(|name| !name.is_empty()) {
-        Some(name) => format!("{name} — Tailhawk"),
+        Some(name) => match indexed {
+            Some(indexed) => format!("{name} — {} — Tailhawk", size_said(indexed)),
+            None => format!("{name} — Tailhawk"),
+        },
         None => "Tailhawk".to_owned(),
+    }
+}
+
+/// How much of a source is indexed, and whether that is the whole of it — the caption's size
+/// clause as one frame should say it.
+///
+/// **The second field exists because `LogSet::bytes` is not a file length.** It is what has been
+/// indexed, summed over the members the set is *holding*, and there are four ways for a source to
+/// be larger than that: a rolled set whose eager bound left older members unindexed
+/// (`LogSet::omitted`), a Loki answer the server cut (`Document::answers_cut`), and the two
+/// spill-backed sources — a pipe and a remote tail — whose spill is **bounded** at
+/// `stdin::SPILL_BYTES` and deletes its oldest part to stay there. Without this field the caption
+/// would climb to half a gigabyte on an overnight tail, fall by sixty-four megabytes, and climb
+/// again, asserting the whole time that it was the size of the source. `set.rs` already explains
+/// why a falling byte count in the title "reads as data lost when nothing was".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Indexed {
+    bytes: u64,
+    /// Whether the bytes are the whole source. False when anything is knowingly left out.
+    whole: bool,
+}
+
+/// What a document's caption says about its size.
+///
+/// **A function rather than four conditions inside [`Shell::refresh_title`]**, which needs an
+/// `HWND` and so can never be tested: this is the decision the caption turns on, and the four ways
+/// a source can be larger than its index are exactly the thing that would be got wrong silently.
+/// `CLAUDE.md`'s rule, and the shape all three of the defects it lists arrived in.
+fn indexed_of(document: &Document) -> Indexed {
+    Indexed {
+        bytes: document.set.bytes(),
+        whole: document.set.omitted() == 0
+            && !document.answers_cut
+            && document.remote_spill.is_none()
+            && document.pump.is_none(),
+    }
+}
+
+/// The caption's size clause: `6.86 MB (7,197,054 bytes)`, or `at least …` of a source that holds
+/// more than has been indexed.
+///
+/// **`at least` is the status bar's own word for this**, from `LOKI.md` §6 — `statusbar::floor`
+/// puts it in front of every count over a cut answer, and a count of bytes is no different from a
+/// count of rows. The caption and the bar now hedge the same way for the same reason, rather than
+/// the bar admitting a floor while the caption asserts a total.
+///
+/// Zero is the one case that is not hedged: a floor of nothing carries no information, and
+/// `0 bytes` is the reading the owner asked for — the thing to tell apart from a filter keeping
+/// nothing.
+fn size_said(indexed: Indexed) -> String {
+    match indexed {
+        Indexed { bytes: 0, .. } => size_text(0),
+        Indexed { bytes, whole: true } => size_text(bytes),
+        Indexed {
+            bytes,
+            whole: false,
+        } => format!("at least {}", size_text(bytes)),
+    }
+}
+
+/// A count of bytes, scaled for a glance and exact for the record: `6.86 MB (7,197,054 bytes)`.
+///
+/// **Both halves, because they answer different questions.** The scaled number is what the eye
+/// reads; the exact one is what *moves* while a file is being tailed, and a file growing by a few
+/// hundred bytes a second would otherwise sit at `6.86 MB` for a quarter of an hour. WinTail shows
+/// the pair for the same reason.
+///
+/// Below a kilobyte the pair would say one thing twice, so the count stands alone. The units are
+/// binary and truncated, which is what Explorer, the properties dialog and WinTail all do; a
+/// decimal megabyte would put this 5% away from what Windows says about the same file. **It is not
+/// claimed to agree with that dialog to the byte**, and for two reasons it will not: the index
+/// starts after a byte-order mark, so a file with one reads two to four bytes short, and the
+/// follow pass has a per-tick byte budget, so a hot writer is ahead of what has been read.
+fn size_text(bytes: u64) -> String {
+    const SCALES: [(u64, &str); 4] = [
+        (1 << 40, "TB"),
+        (1 << 30, "GB"),
+        (1 << 20, "MB"),
+        (1 << 10, "KB"),
+    ];
+    let exact = statusbar::with_separators(bytes);
+    for (scale, unit) in SCALES {
+        if bytes >= scale {
+            let whole = bytes / scale;
+            let hundredths = bytes % scale * 100 / scale;
+            return format!("{whole}.{hundredths:02} {unit} ({exact} bytes)");
+        }
+    }
+    match bytes {
+        1 => "1 byte".to_owned(),
+        _ => format!("{exact} bytes"),
     }
 }
 
@@ -5341,7 +5442,8 @@ impl Shell {
 
     fn refresh_title(&self, hwnd: HWND) {
         let name = self.document.as_ref().map(|doc| doc.summary.as_str());
-        set_title(hwnd, &window_title(name));
+        let indexed = self.document.as_ref().map(indexed_of);
+        set_title(hwnd, &window_title(name, indexed));
         if !still_polling(
             self.pending.is_some(),
             self.reading.len(),
@@ -7574,7 +7676,24 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Sets the caption, and **only when it would change**.
+///
+/// The caption is rebuilt on every follow tick, ten times a second, and until the size went into
+/// it the string was identical every time — so `SetWindowTextW` re-set the same text and nothing
+/// downstream noticed. An exact byte count moves on every tick of a live tail, which turns each of
+/// those calls into a real caption change: a taskbar button relabelled, an `Alt+Tab` entry
+/// relabelled, and a `UIA_NamePropertyId` property change a screen reader may read out. Ten times
+/// a second, that is the window talking over whatever the reader was listening to.
+///
+/// Compared against the window's own text rather than a remembered copy, because a remembered one
+/// can be wrong — anything else that sets the caption would leave it stale — and because reading
+/// back a caption we set ourselves is a buffer copy inside this process.
 fn set_title(hwnd: HWND, title: &str) {
+    let mut held = [0u16; 512];
+    let n = unsafe { GetWindowTextW(hwnd, &mut held) } as usize;
+    if String::from_utf16_lossy(&held[..n.min(held.len())]) == title {
+        return;
+    }
     let t = wide(title);
     unsafe {
         let _ = SetWindowTextW(hwnd, PCWSTR(t.as_ptr()));
@@ -12084,12 +12203,21 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let active = shell.document.active;
                 let mut shown_grew = false;
                 for (i, doc) in shell.document.all_mut() {
+                    // **Bytes before rows, because the caption carries a byte count now.**
+                    // `poll_follow` is quiet when no line *completed*, and `Follow::poll` advances
+                    // the scan either way — so appending to an unterminated line, which §5's
+                    // follow deliberately continues rather than pushing a new row, moves the
+                    // caption's number while leaving the view alone. §8.1's dot stays a row event:
+                    // a half-written line is not content arrived in a tab nobody is looking at.
+                    let before = doc.set.bytes();
                     if doc.poll_follow() {
                         if i == active {
                             shown_grew = true;
                         } else {
                             doc.unseen = true;
                         }
+                    } else if i == active && doc.set.bytes() != before {
+                        shown_grew = true;
                     }
                 }
                 shell.ticks += 1;
@@ -14252,6 +14380,19 @@ mod tests {
             bar(&doc)
         );
 
+        let plain = indexed_of(&doc);
+        assert!(
+            plain.whole && plain.bytes > 0,
+            "a lone file with nothing omitted and nothing cut is the whole of its source, so its \
+             caption claims to be: {plain:?}"
+        );
+        doc.answers_cut = true;
+        assert!(
+            !indexed_of(&doc).whole,
+            "and an answer the source cut makes every count over it a floor, bytes included"
+        );
+        doc.answers_cut = false;
+
         doc.remote(
             "live-identity-and-campaigns",
             "live",
@@ -14261,10 +14402,20 @@ mod tests {
             false,
         );
         assert_eq!(doc.summary, "live-identity-and-campaigns");
-        let shown = window_title(Some(&doc.summary));
+        let indexed = indexed_of(&doc);
         assert!(
-            shown.contains("live-identity-and-campaigns"),
-            "the source names the window: {shown}"
+            !indexed.whole,
+            "a remote source's bytes are what is on its spill, and the spill is bounded and \
+             deletes its oldest part — so they are a floor, never the whole of what was fetched"
+        );
+        let shown = window_title(Some(&doc.summary), Some(indexed));
+        assert_eq!(
+            shown,
+            format!(
+                "live-identity-and-campaigns — at least {} — Tailhawk",
+                size_text(doc.set.bytes())
+            ),
+            "the source names the window and the caption says the floor as the status bar says it"
         );
         assert_eq!(
             doc.remote_spill.as_deref(),
@@ -16341,17 +16492,136 @@ mod tests {
     /// part that tells one window from another.
     #[test]
     fn the_title_is_the_document_then_the_program() {
-        assert_eq!(window_title(Some("app.log")), "app.log — Tailhawk");
+        assert_eq!(window_title(Some("app.log"), None), "app.log — Tailhawk");
         assert_eq!(
-            window_title(Some("live · api, worker")),
+            window_title(Some("live · api, worker"), None),
             "live · api, worker — Tailhawk",
             "a remote source is named as its tab names it"
         );
-        assert_eq!(window_title(None), "Tailhawk", "nothing open");
+        assert_eq!(window_title(None, None), "Tailhawk", "nothing open");
         assert_eq!(
-            window_title(Some("")),
+            window_title(
+                None,
+                Some(Indexed {
+                    bytes: 7_197_054,
+                    whole: true
+                })
+            ),
+            "Tailhawk",
+            "and a size with nothing to be the size of is not a title either"
+        );
+        assert_eq!(
+            window_title(Some(""), None),
             "Tailhawk",
             "a document still opening has no name yet, and a dash before nothing is not a title"
+        );
+    }
+
+    /// **The owner, 2026-10-20, with a screenshot of WinTail beside it:** "in hoo wintail, when a
+    /// filter is applied, it keeps showing what the size of the file in the title bar so one can
+    /// immediately see that everything is filtered out."
+    ///
+    /// The size is the one fact that cannot be filtered, which is what makes it the answer to the
+    /// question a blank view asks. `Filtered 0 of 1,424` in the status bar tells you the sieve kept
+    /// nothing; it does not tell you whether that is because the filter is wrong or because the
+    /// source is empty — and those have different remedies. A title reading `0 bytes` says the
+    /// second outright.
+    #[test]
+    fn the_title_says_how_big_the_source_is() {
+        assert_eq!(
+            window_title(
+                Some("trigger-migration.log"),
+                Some(Indexed {
+                    bytes: 7_197_054,
+                    whole: true
+                })
+            ),
+            "trigger-migration.log — 6.86 MB (7,197,054 bytes) — Tailhawk",
+            "WinTail's own reading of that file, to the hundredth"
+        );
+        assert_eq!(
+            window_title(
+                Some("job-dispatcher"),
+                Some(Indexed {
+                    bytes: 0,
+                    whole: true
+                })
+            ),
+            "job-dispatcher — 0 bytes — Tailhawk",
+            "the case worth telling apart from a filter that keeps nothing"
+        );
+    }
+
+    /// **`LogSet::bytes` is not a file length, and the caption must not claim it is.** It is what
+    /// has been indexed over the members the set holds, and four things make a source bigger than
+    /// that: a rolled set whose eager bound left older members out, a Loki answer the server cut,
+    /// and the two spill-backed sources — a pipe and a remote tail — whose spill is bounded and
+    /// deletes its oldest part to stay there.
+    ///
+    /// The last of those is the one that would have been visibly wrong: a tail left running
+    /// overnight climbs to half a gigabyte, drops by sixty-four megabytes, and climbs again, which
+    /// is the "reads as data lost when nothing was" that `set.rs` already warns about — asserted
+    /// in the caption, which is the place the owner was told to look to know whether anything is
+    /// there at all.
+    #[test]
+    fn a_source_bigger_than_its_index_says_at_least() {
+        let floor = Indexed {
+            bytes: 7_197_054,
+            whole: false,
+        };
+        assert_eq!(
+            window_title(Some("nurtur-loki-live"), Some(floor)),
+            "nurtur-loki-live — at least 6.86 MB (7,197,054 bytes) — Tailhawk",
+            "the status bar's own word for a count over a cut answer — `LOKI.md` §6 — and a count \
+             of bytes is no different from a count of rows"
+        );
+        assert_eq!(
+            size_said(Indexed {
+                bytes: 0,
+                whole: false
+            }),
+            "0 bytes",
+            "a floor of nothing carries no information, and `0 bytes` is the reading that was \
+             asked for: the thing to tell apart from a filter keeping everything out"
+        );
+        assert_eq!(
+            size_said(Indexed {
+                bytes: 1_024,
+                whole: true
+            }),
+            "1.00 KB (1,024 bytes)",
+            "and a source that is all there says so by saying nothing extra"
+        );
+    }
+
+    /// Both halves, because they answer different questions: the scaled number is what a glance
+    /// reads, and the exact one is what moves while a file is being tailed — a file growing by a
+    /// few hundred bytes a second sits at `6.86 MB` for a quarter of an hour.
+    #[test]
+    fn a_size_is_scaled_for_the_eye_and_exact_for_the_record() {
+        assert_eq!(size_text(0), "0 bytes");
+        assert_eq!(size_text(1), "1 byte", "and not \"1 bytes\"");
+        assert_eq!(
+            size_text(1_023),
+            "1,023 bytes",
+            "below a kilobyte there is nothing to scale, so the bare count stands alone"
+        );
+        assert_eq!(size_text(1_024), "1.00 KB (1,024 bytes)");
+        assert_eq!(
+            size_text(1_048_575),
+            "1023.99 KB (1,048,575 bytes)",
+            "the scale steps at the boundary, not near it — this is still kilobytes"
+        );
+        assert_eq!(size_text(1_048_576), "1.00 MB (1,048,576 bytes)");
+        assert_eq!(size_text(1_073_741_824), "1.00 GB (1,073,741,824 bytes)");
+        assert_eq!(
+            size_text(1_099_511_627_776),
+            "1.00 TB (1,099,511,627,776 bytes)"
+        );
+        assert_eq!(
+            size_text(u64::MAX),
+            "16777215.99 TB (18,446,744,073,709,551,615 bytes)",
+            "a number no file will reach, said rather than overflowed"
         );
     }
 

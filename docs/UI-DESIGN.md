@@ -263,6 +263,25 @@ filter action.
 unfocused. Middle-click closes; drag reorders; drag out of the strip creates a split pane; drag onto
 another window merges. `+` opens a file, a file set, or a watched folder.
 
+**The caption is the document, its size, then the program** — `trigger-migration.log — 6.86 MB
+(7,197,054 bytes) — Tailhawk`. The size is the only document fact the caption carries, and it is
+there because it is the only one **no status bar pane carries and no filter can change**: a view
+hiding every row reads very differently over `6.86 MB` than over `0 bytes`, and the caption is
+where that number survives the view being emptied. Scaled for the glance and exact for the record,
+because the exact figure is the one that visibly moves while a file is being tailed. Everything else
+the caption once held — the build, the renderer, the follow state, the encoding, the frame
+instrument — was in the bar word for word and went; see `UX-REVIEW.md` finding 12.
+
+**It is how much is *indexed*, and the view-model has a field for whether that is the whole
+source** — `Indexed { bytes, whole }`, with `at least` in front of it when it is not, which is the
+word §6 of `LOKI.md` already uses for a count over an answer Loki cut. Four things make a source
+bigger than its index: a rolled set whose eager bound left older members out, a cut answer, and the
+two spill-backed sources, whose spill is bounded and deletes its oldest part. The field exists
+because of the trap stated below — a view-model with no field for a fact has decided about that
+fact by accident — and this is the second time in two days it was nearly walked into: without it an
+overnight tail climbs to half a gigabyte, drops by sixty-four megabytes and climbs again, while the
+caption insists it is the size of the source.
+
 **The drop guide answers "where will this go", and since 2026-09-02 it can answer in all four
 directions.** Dragging a tab over the grid highlights the half the document would take: the top or
 bottom half stacks the panes, the left or right half sets them side by side, and the middle is no
