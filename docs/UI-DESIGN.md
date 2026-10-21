@@ -84,10 +84,36 @@ The owner met it twice (2026-10-16 and 2026-10-20): a remote source opened with 
 from a session where it meant something, the tab came up blank, and `Filtered 0 of at least 1,424`
 sat unread beside the format and the encoding. **"You are being shown nothing" is not a
 steady-state fact**; it is the answer to *why is this screen empty*, which is asked at the left of
-the bar. It leads the pane rather than joining the end of it because the notice ahead of it may
-belong to another tab entirely — `Shell::notice` is one field for the whole window, and nothing
-ever clears it, so it stands until something overwrites it. The count stays in the filter pane; the
-message is the sentence that names the remedy.
+the bar. It leads the pane rather than joining the end of it because the notice ahead of it may say
+nothing about the window in front of you — `Shell::notice` is one field for the whole window, and
+nothing ever clears it, so it stands until something overwrites it. The count stays in the filter
+pane; the message is the sentence that names the remedy.
+
+**A notice now says which tab it is about, when it is about one** — 2026-10-21, and it is the other
+half of the paragraph above. `Shell::notice_about` carries a `Document::notice_key` and the pure
+`notice_shown(notice, about, active)` holds the sentence back over any other document. Three kinds
+of notice were tangled in that one field: one about a *source* before any tab exists, one about a
+tab's rows, and one genuinely about the window — a format saved, a file that would not open, a tail
+that stopped. Only the middle kind is tagged. The last kind is deliberately **not**, and the tail
+workers' faults are the case that settles it: each is said exactly once (`Backoff::should_say` is
+true on the first failure of a run; the cut and dropped notices are one-shot latches), so one held
+back by a tag would be a dead tail that looked like a quiet one.
+
+**The key is not the settings key, and the difference is the fetch window.** `Document::state_key`
+leaves it out on purpose, so a source reopened over a wider window brings back the columns and chips
+it had — which means two such tabs share it, and those are exactly the pair the bar has to tell
+apart, because widening the window and opening the source again is what the bar itself advises when
+an answer comes back cut at the limit. `Document::notice_key` is the finer identity, the same three
+facts `loki::Question` compares.
+
+**What a remote tail arrived with is a document fact, and it was being said too early to be seen.**
+`landed_records` composed "the newest 1,000 records in the last hour — spilled to `%TEMP%\…`" and
+put it in the bar, then opened the document — whose first act is to say `opening …`, in the same
+message, before any paint. So the one sentence `SPEC.md` §13.2 asks for, about writing a copy of
+somebody's logs to their disk, was formatted and discarded every time. It travels with the landing
+now (`Landing::said` → `Document::landed_said`) and is said, tagged, when the records reach the
+screen. `landing_may_say` decides the precedence: a free bar, or one holding a sentence about a
+different tab, which the new tab's arrival has already made invisible.
 
 **The message pane is not a safe home, and that is worth stating rather than discovering.** It is
 the one pane `edges_of` can allot **zero** width: every trailing pane is measured and served first

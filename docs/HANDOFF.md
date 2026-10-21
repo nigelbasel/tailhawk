@@ -1,5 +1,57 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-21, later: a filter switched off stays off, and a notice knows its tab
+
+He said *"ok, carry on with those 3 items and then take a look at the other item you found"*, which
+authorises, in order: **(1)** the disabled filter coming back enabled, **(2)** the notice knowing its
+tab, **(3)** the Remote sources dialog — apps field, clone, discovery, LogQL picker — and **(4)** the
+pre-existing `--all-targets` clippy lints that keep `tools/check.sh` from going green. **(1) and (2)
+are done and pushed; (3) and (4) are the work in hand.**
+
+### What (1) and (2) changed, and the three things found while doing them
+
+See the `CLEANROOM.md` row of 2026-10-21 for the whole argument. The short version:
+
+- A chip is written `#+text` when it is switched off, the `#` **in front of** the sign so a chip
+  whose own text starts with `#` stays unambiguous.
+- `Shell::notice_about` tags a notice with a `Document::notice_key`, and the pure
+  `notice_shown(notice, about, active)` holds it back over any other document. Only sentences about a
+  tab's rows are tagged; the tail workers' faults are deliberately **not**, because each is said once
+  and one held back by a stale tag is a dead tail that looks like a quiet one.
+- `notice_key` is finer than `state_key` **on purpose**: the fetch window is in the first and not the
+  second, so two windows of one source are two tabs to the bar and one key to the settings.
+- **The sentence a remote tail arrives with had never been seen** — `landed_records` said it and
+  `open_named` overwrote it in the same message, before any paint. It travels on `Landing::said` now.
+- **And it was wrong as well as invisible**: `pull_notice` said "in the last hour" for every fetch
+  window there is, while `settings::fetch_window_said` existed and said in its own doc-comment that
+  it was "for the status bar and the notice".
+
+### Where (3) stands before a line is written
+
+Nothing is started. The design is in the 2026-10-20 resume point below, under **"He has asked for the
+Remote sources dialog to be made usable"** — read that first; it records what was *verified* against
+his estate rather than assumed, and what does not work. Two things found since, both reusable:
+
+- `apps::saved_entry_name(base, apps, taken)` already generates a unique source name out of
+  characters the credential store accepts, with a numeric suffix on a collision. **Clone should use
+  it** rather than growing a second naming rule.
+- `loki::json_string`, `loki::json_number` and the array scan inside `loki::label_values_from_json`
+  are the pattern discovery's parsing should follow — hand-written, bounded, in `loki.rs` beside
+  `token_from_json`, so **no new core module and no new `CLEANROOM.md` §5 row is needed** for it.
+- The sources dialog's id range is 210–221 and the filters dialog starts at 230, so **222–229 are
+  free** for Apps, Clone, Discover, Test and Pick.
+
+### A trap in the gate script, so the next session does not lose an hour to it
+
+Piping `cargo test`'s output straight into a `while read` loop in Git Bash made **1,023 core tests
+abort** with `fatal runtime error: I/O error: operation failed to complete synchronously`. Nothing
+was wrong with the suite. Write cargo's output to a real file and stamp it with
+`tail -n +1 -f --pid=$!`.
+
+And read the workstream log **forward from your own banner**:
+`C:\Users\nigel\.claude\logs\tailhawk.log` holds every run ever made, and an `awk` anchored on a
+phrase as ordinary as "after the review fixes" matched a banner from the day before.
+
 ## ▶ Resume point — 2026-10-21: the title bar carries the size, and the review stopped it being a lie
 
 **296 shell + 1023 core, 0 failed; fmt and clippy clean as CI runs them; `portable-core` checked on

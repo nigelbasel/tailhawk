@@ -90,7 +90,8 @@ already in force. A row nobody types into is not a filter and is not added.
 Across the top is the selected filter: its **phrase**, whether it is **enabled**, whether it is a
 **regular expression**, whether **case** matters, and whether it **includes** or **excludes**. The
 list below holds every filter — its text, those two answers, and its type — with a check box that
-turns it on and off. A filter that is off keeps its place and its text and is drawn dim.
+turns it on and off. A filter that is off keeps its place and its text and is drawn dim, and it is
+still off when the file is opened again.
 
 **If a filter is hiding everything, the status bar says so** — `⚠ every row is hidden by a filter —
 Ctrl+L to change it`, at the left of the bar. Filters are remembered per file and per remote source,
@@ -215,6 +216,10 @@ both exist the values are merged, the exe-adjacent one winning key by key. It ho
 place, the theme, the font and its size, the recent files, the search history, and per file its
 filters, collapse, bookmarks, labels and column widths. `--stateless` reads them and writes
 nothing.
+
+A filter is written as its sign and its text — `+error`, `-retry` — with a leading `#` when it is
+switched off, so `"#+error"` is an include filter that is not in force. Hand-editing a `#` in front
+of the whole entry, `"#error"`, makes it a filter *for the text* `#error`, which matches nothing.
 
 ## Formats
 

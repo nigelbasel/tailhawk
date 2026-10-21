@@ -220,6 +220,9 @@ struct Document {
     answers_cut: bool,
     /// Where a remote source's records landed, when this document is one — see [`Document::remote`].
     remote_spill: Option<std::path::PathBuf>,
+    /// What the bar should say the moment this document reaches the screen, taken from
+    /// [`Landing::said`] and taken *out* of here when it is said. `None` once it has been.
+    landed_said: Option<String>,
     /// The question this document is the answer to: the source's **name** — the settings key,
     /// which is what says two windows watch the same place — the query it was opened with,
     /// narrowed to the applications the user picked, and how far back it asked. What `Interleave`
@@ -761,6 +764,7 @@ impl Document {
             set,
             summary,
             remote_spill: None,
+            landed_said: None,
             remote_source: None,
             lag: None,
             answers_cut: false,
@@ -837,6 +841,7 @@ impl Document {
             // are, in the only place there is to tell them.
             summary: format!("<stdin> → {}", pump.path().display()),
             remote_spill: None,
+            landed_said: None,
             remote_source: None,
             lag: None,
             answers_cut: false,
@@ -1285,21 +1290,28 @@ impl Document {
         }
     }
 
+    /// Which **tab** this is, for a notice that is about one — see [`notice_shown`].
+    ///
+    /// **Not [`Self::state_key`], and the difference is the fetch window.** That one is the
+    /// settings key and deliberately leaves the window out, so a source reopened over a wider
+    /// window brings back the columns and chips it had. Two such tabs therefore *share* a state
+    /// key — and they are exactly the pair the bar has to tell apart, because the product's own
+    /// advice when an answer comes back cut at the limit is to widen the window and open the source
+    /// again. [`tailhawk_core::loki::Question`] is the identity that distinguishes them, which is
+    /// why it is the one that decides whether an open is a duplicate.
+    fn notice_key(&self) -> Option<String> {
+        match self.remote_source.as_ref() {
+            Some(asked) => Some(format!(
+                "loki://{}?query={}&minutes={}",
+                asked.source, asked.query, asked.minutes
+            )),
+            None => Some(self.path.as_ref()?.to_string_lossy().into_owned()),
+        }
+    }
+
     fn file_state(&self) -> Option<settings::FileState> {
         let path = self.state_key()?;
-        let chips = self
-            .filtering
-            .chips
-            .chips
-            .iter()
-            .map(|c| {
-                let sign = match c.polarity {
-                    Polarity::Include => '+',
-                    Polarity::Exclude => '-',
-                };
-                format!("{sign}{}", c.source)
-            })
-            .collect();
+        let chips = self.filtering.chips.chips.iter().map(chip_text).collect();
         Some(settings::FileState {
             path,
             chips,
@@ -1331,13 +1343,10 @@ impl Document {
     /// Restores a remembered view: the chips and the collapse, then one pass. A chip that no
     /// longer parses is dropped quietly — the file is being opened, not edited.
     fn apply_state(&mut self, state: &settings::FileState) {
-        for chip in &state.chips {
-            let (polarity, text) = match chip.chars().next() {
-                Some('-') => (Polarity::Exclude, &chip[1..]),
-                Some('+') => (Polarity::Include, &chip[1..]),
-                _ => (Polarity::Include, chip.as_str()),
-            };
-            if let Ok(chip) = Chip::parse(text, polarity) {
+        for text in &state.chips {
+            let (polarity, enabled, body) = chip_read(text);
+            if let Ok(mut chip) = Chip::parse(body, polarity) {
+                chip.enabled = enabled;
                 self.filtering.chips.chips.push(chip);
             }
         }
@@ -2928,6 +2937,44 @@ fn natural_order(columns: usize) -> Vec<usize> {
     (0..columns.saturating_sub(1)).collect()
 }
 
+/// One filter chip as the settings file holds it: a `#` when it is switched off, then its sign,
+/// then the text the user typed.
+///
+/// **A chip has three facts and only two of them used to survive a restart.** The text and the
+/// polarity were written; §7.1's enabled mark was not, so a chip the owner had unticked in the
+/// Filters dialog came back ticked — narrowing, at the moment the file opened, a view he had
+/// deliberately widened, and leaving the checkbox disagreeing with what he last set it to.
+///
+/// `#` is the mark because a switched-off chip is a commented-out one, and it goes in *front* of
+/// the sign rather than behind it so the encoding stays unambiguous: the sign is always written,
+/// so a chip whose own text begins with `#` is `+#…` and never `#+…`.
+fn chip_text(chip: &Chip) -> String {
+    let off = if chip.enabled { "" } else { "#" };
+    let sign = match chip.polarity {
+        Polarity::Include => '+',
+        Polarity::Exclude => '-',
+    };
+    format!("{off}{sign}{}", chip.source)
+}
+
+/// The inverse: polarity, whether it is on, and the text. A settings file written before the mark
+/// existed carries no `#`, so everything in it reads back on — which is what it meant.
+///
+/// **A lone `#` is text, not a mark**, because nothing ever writes a mark without a sign after it.
+/// So `"#error"` hand-typed into the settings file is an include chip on the literal text `#error`,
+/// which matches nothing and hides every row; switching a filter off by hand is `"#+error"`.
+fn chip_read(text: &str) -> (Polarity, bool, &str) {
+    let (enabled, signed) = match text.strip_prefix('#') {
+        Some(rest) if rest.starts_with('+') || rest.starts_with('-') => (false, rest),
+        _ => (true, text),
+    };
+    match signed.chars().next() {
+        Some('-') => (Polarity::Exclude, enabled, &signed[1..]),
+        Some('+') => (Polarity::Include, enabled, &signed[1..]),
+        _ => (Polarity::Include, enabled, signed),
+    }
+}
+
 /// The window's title: the document, how big it is, then the program — or the program alone.
 ///
 /// **UX-REVIEW finding 12.** The title carried the build, the renderer, the follow state, the
@@ -3114,12 +3161,12 @@ fn frame_stats_enabled() -> bool {
 /// and recorded the reversal as though it were the discovery. This is the plural rule applied for
 /// its own sake: one place instead of two, and a count that cannot disagree with its noun if a
 /// future caller does pass one.
-fn regroup_notice(name: &str, count: usize, separate: bool) -> String {
+fn regroup_notice(name: &str, count: usize, separate: bool, window: &str) -> String {
     let moved = counted(count as u64, "application");
     if separate {
-        format!("{name}: {moved}, one window each — each fetches the last hour again")
+        format!("{name}: {moved}, one window each — each fetches {window} again")
     } else {
-        format!("{name}: {moved} in one window — it fetches the last hour again")
+        format!("{name}: {moved} in one window — it fetches {window} again")
     }
 }
 
@@ -3138,7 +3185,19 @@ fn spilled_to(notice: String, spill: Option<&std::path::Path>) -> String {
     }
 }
 
-fn pull_notice(name: &str, records: usize, dropped: usize, cut: bool) -> String {
+/// What the opening window of records amounts to: how many arrived, what was left out, and over
+/// what span.
+///
+/// **`window` is named rather than assumed.** Both of the sentences below said "in the last hour"
+/// whatever had been asked for, while `File ▸ Open remote ▸ Fetch window` offers fifteen minutes to
+/// a day and a hand-edited value may be anything at all — so a reader who had chosen a day was told
+/// the records were an hour's worth, and the cut branch then advised widening a window it had just
+/// misreported. [`tailhawk_core::settings::fetch_window_said`] is what phrases it, and its own
+/// doc-comment already said it was "for the status bar **and the notice**".
+///
+/// It went unnoticed because the sentence went unseen: `landed_records` said it and `open_named`
+/// overwrote it in the same message. See [`Landing::said`].
+fn pull_notice(name: &str, records: usize, dropped: usize, cut: bool, window: &str) -> String {
     let held = counted(records as u64, "record");
     if dropped > 0 {
         // **Both, when both are true.** This used to return here and never reach `cut`, so a
@@ -3155,9 +3214,9 @@ fn pull_notice(name: &str, records: usize, dropped: usize, cut: bool) -> String 
         return format!("{name}: {held}; {dropped} more {verb} returned than Tailhawk keeps{also}");
     }
     if cut {
-        return format!("{name}: the newest {held} in the last hour — there are probably more");
+        return format!("{name}: the newest {held} in {window} — there are probably more");
     }
-    format!("{name}: {held} in the last hour")
+    format!("{name}: {held} in {window}")
 }
 
 fn counted(n: u64, noun: &str) -> String {
@@ -4733,7 +4792,22 @@ struct Shell {
     rules_dialog: HWND,
     /// What just happened, as against what the document *is* — see [`status_line`]. Shown beside
     /// the description rather than instead of it, and replaced by the next notice.
+    ///
+    /// **Written through [`Shell::say`] and [`Shell::say_about`]**, so that it and `notice_about`
+    /// cannot disagree about which document a sentence belongs to. Four sites write the two fields
+    /// directly instead, each with a comment saying why: a borrow of another field of `self` is
+    /// outstanding there, and while a disjoint field may be written through it a `&mut self` method
+    /// may not. They set **both** fields, which is the invariant; what the methods add is that it
+    /// cannot be forgotten.
     notice: Option<String>,
+    /// Which document the notice is about, when it is about one rather than about the window.
+    ///
+    /// A [`Document::state_key`] — the `loki://source?apps=…` string for a remote tail, the path for
+    /// a file. **One notice field serves every tab**, so a sentence about the records that just
+    /// arrived in one tab stayed in the bar when the reader moved to another, where it described
+    /// rows that were not on screen. Tagged, it is shown where it is true and nowhere else:
+    /// [`notice_shown`] decides.
+    notice_about: Option<String>,
     /// What the title last said about following, so [`Shell::retitle_if_follow_turned_over`] can
     /// tell a state that has changed from one that merely keeps being true.
     titled_following: Option<bool>,
@@ -4989,7 +5063,7 @@ impl Shell {
                     self.fetching.remove(at);
                     // A worker that died without answering is a bug, not a fault of the source, and
                     // the window must not sit there saying "asking…" for ever.
-                    self.notice = Some("The request to Loki did not finish.".to_owned());
+                    self.say("The request to Loki did not finish.".to_owned());
                     self.refresh_title(hwnd);
                 }
                 Err(TryRecvError::Empty) => at += 1,
@@ -5048,7 +5122,11 @@ impl Shell {
                             // that no longer compiles — the DSL changed, the file was hand-edited —
                             // must not leave the user with detection's answer and no idea their
                             // memory was ignored.
+                            // The two fields rather than [`Shell::say_about`], because the match
+                            // above is still holding a borrow of `self.remembered`: disjoint fields
+                            // may be written through it, a `&mut self` method may not.
                             Some(Err(why)) => {
+                                self.notice_about = document.notice_key();
                                 self.notice = Some(format!(
                                     "⚠ remembered format {name:?} for {glob} did not compile: {why}"
                                 ));
@@ -5058,6 +5136,24 @@ impl Shell {
                     }
                     self.notice =
                         notice_once_open_finished(self.notice.as_deref(), self.opening.as_deref());
+                    if self.notice.is_none() {
+                        self.notice_about = None;
+                    }
+                    // **What the records had to say, said now that they are on screen** — and tagged
+                    // with the document, because it is a sentence about this tab's rows while the bar
+                    // is one bar for all of them. After the line above, so that it is the `opening …`
+                    // notice being replaced and never the remembered-format warning;
+                    // [`landing_may_say`] decides the rest.
+                    if let Some(said) = document.landed_said.take() {
+                        let key = document.notice_key();
+                        if landing_may_say(
+                            self.notice.as_deref(),
+                            self.notice_about.as_deref(),
+                            key.as_deref(),
+                        ) {
+                            self.say_about(key, said);
+                        }
+                    }
                     self.opening = None;
                     self.opening_question = None;
                     self.rebuild_highlighter(&mut document);
@@ -5085,14 +5181,14 @@ impl Shell {
                 }
                 Ok(Err(e)) => {
                     self.reading.remove(i);
-                    self.notice = Some(e);
+                    self.say(e);
                     self.opening = None;
                     self.opening_question = None;
                     landed = true;
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.reading.remove(i);
-                    self.notice = Some("read failed".to_owned());
+                    self.say("read failed".to_owned());
                     self.opening = None;
                     self.opening_question = None;
                     landed = true;
@@ -5203,7 +5299,15 @@ impl Shell {
                     }
                     text
                 });
-        let said = match (self.notice.as_deref(), &frames) {
+        // **The notice is only shown where it is true.** A sentence tagged with a document's key is
+        // a sentence about that document's rows, and the bar is one bar for every tab.
+        let active = self.document.as_ref().and_then(Document::notice_key);
+        let mine = notice_shown(
+            self.notice.as_deref(),
+            self.notice_about.as_deref(),
+            active.as_deref(),
+        );
+        let said = match (mine, &frames) {
             (Some(text), Some(frames)) => Some(format!("{text} — {frames}")),
             (Some(text), None) => Some(text.to_owned()),
             (None, Some(frames)) => Some(frames.clone()),
@@ -5384,7 +5488,7 @@ impl Shell {
         };
         self.settings.remote_minutes = Some(*mins);
         self.save_settings(hwnd);
-        self.notice = Some(format!(
+        self.say(format!(
             "a remote source will fetch {} — File ▸ Open remote ▸ Fetch window",
             tailhawk_core::settings::fetch_window_said(*mins)
         ));
@@ -5438,6 +5542,21 @@ impl Shell {
     /// 2026-10-05 report was about.
     fn busy_opening(&self) -> bool {
         !self.fetching.is_empty() || !self.reading.is_empty() || self.opening.is_some()
+    }
+
+    /// Says something about the window, and forgets whichever document the notice before it was
+    /// about. Every window-wide notice goes through here, which is what keeps a stale tag from
+    /// hiding a sentence that applies wherever you are standing.
+    fn say(&mut self, text: String) {
+        self.notice = Some(text);
+        self.notice_about = None;
+    }
+
+    /// Says something about one document, by its [`Document::state_key`]. Shown while that document
+    /// is the one in front and not over any other.
+    fn say_about(&mut self, key: Option<String>, text: String) {
+        self.notice = Some(text);
+        self.notice_about = key;
     }
 
     fn refresh_title(&self, hwnd: HWND) {
@@ -5521,7 +5640,7 @@ impl Shell {
             if self.detail_window.is_none() {
                 // Windows refused the template. Say so once and put the flag back, rather than
                 // trying again every frame for the life of the window.
-                self.notice = Some("the detail window could not be opened".to_owned());
+                self.say("the detail window could not be opened".to_owned());
                 if let Some(doc) = self.document.as_mut() {
                     doc.detail.open = false;
                 }
@@ -5898,6 +6017,8 @@ impl Shell {
             // renderer below is terminal for the run — the window stays up painting stage one,
             // which §3.2 requires, but it will not draw a frame again. A reassuring sentence about
             // a recovery that cannot happen is worse than the function name it replaced.
+            // The two fields rather than `say`: the renderer is borrowed for the frame.
+            self.notice_about = None;
             self.notice = Some(format!(
                 "Tailhawk could not draw this frame — {e}. Rendering has stopped; restart Tailhawk to draw again."
             ));
@@ -6222,6 +6343,10 @@ impl Shell {
         if key == VK_T.0 {
             // §7: follow the caret line's trace. The notice says which, or says there is none.
             if let Some(said) = doc.follow_trace() {
+                // Tagged with the document: it is a sentence about this tab's caret line. The two
+                // fields rather than [`Shell::say_about`], because `doc` is borrowed out of
+                // `self.document` here and a `&mut self` method may not be called through it.
+                self.notice_about = doc.notice_key();
                 self.notice = Some(said);
             }
             self.retitle(hwnd);
@@ -6314,7 +6439,7 @@ impl Shell {
     /// source, the same applications and the same window is one question asked twice.
     fn open_path(&mut self, hwnd: HWND, path: std::path::PathBuf) {
         if self.document.show_already_open(&path) {
-            self.notice = Some(format!(
+            self.say(format!(
                 "{} is already open",
                 path.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -6349,7 +6474,7 @@ impl Shell {
         // in flight nor the tabs on screen — and a second ask in that gap would start the whole
         // fetch again. See [`Shell::questions_in_flight`].
         self.opening_question = remote.as_ref().map(|landing| landing.question.clone());
-        self.notice = Some(opening);
+        self.say(opening);
         show_busy_pointer();
         self.reading.push(spawn_open(move || {
             let mut doc = Document::open(&path)?;
@@ -6362,6 +6487,7 @@ impl Shell {
                     landing.question.minutes,
                     landing.cut,
                 );
+                doc.landed_said = Some(landing.said);
             }
             Ok(doc)
         }));
@@ -6439,9 +6565,7 @@ impl Shell {
                     self.rebuild_highlighter(&mut doc);
                     self.document.split(doc);
                 }
-                Err(e) => {
-                    self.notice = Some(format!("This tab could not be opened a second time — {e}."))
-                }
+                Err(e) => self.say(format!("This tab could not be opened a second time — {e}.")),
             }
         }
         self.retitle(hwnd);
@@ -6683,7 +6807,7 @@ impl Shell {
         const HELP: &str = include_str!("../../../docs/help.html");
         let path = std::env::temp_dir().join("tailhawk-help.html");
         if let Err(why) = std::fs::write(&path, HELP) {
-            self.notice = Some(format!("could not open the help: {why}"));
+            self.say(format!("could not open the help: {why}"));
             return;
         }
         let wide: Vec<u16> = path
@@ -6884,7 +7008,7 @@ impl Shell {
     /// costs the user their work, so the status bar says it happened.
     fn close_rules_editor(&mut self) {
         if self.rules_editor.is_dirty() {
-            self.notice = Some("rules closed unsaved — Ctrl+K, Ctrl+S to save".to_owned());
+            self.say("rules closed unsaved — Ctrl+K, Ctrl+S to save".to_owned());
         }
         self.rules_editor.close();
         let specs = self.rule_specs.clone();
@@ -6911,7 +7035,7 @@ impl Shell {
             // is denied. (os error 5)", which says nothing about *which* file or what to do; §10
             // treats a read-only profile as a state rather than an impossibility, and a state is
             // something a person can change once they know where it lives.
-            self.notice = Some(format!(
+            self.say(format!(
                 "The highlight rules could not be saved to \"{}\" — {e}. Check that the file is not read-only.",
                 target.display()
             ));
@@ -6957,7 +7081,7 @@ impl Shell {
         let lines = doc.wizard_sample();
         // §10: a command that appears to do nothing is worse than one that says why it did not.
         let Some((example, rest)) = lines.split_first() else {
-            self.notice = Some("no line to define a format from".to_owned());
+            self.say("no line to define a format from".to_owned());
             return;
         };
         let mut wizard = tailhawk_core::wizard::Wizard::from_example(example);
@@ -7007,7 +7131,7 @@ impl Shell {
     fn close_wizard(&mut self, saved: bool) {
         if self.wizard.take().is_some() {
             if let Some(note) = wizard_closed_note(saved) {
-                self.notice = Some(note.to_owned());
+                self.say(note.to_owned());
             }
         }
         self.wizard_found.clear();
@@ -7026,7 +7150,7 @@ impl Shell {
         // again — so the next save appends another rather than replacing it. §6.2 calls the
         // control "Save as…"; asking for the name is what that means.
         if wizard.name.trim().is_empty() {
-            self.notice = Some("name the format first — Tab, then type".to_owned());
+            self.say("name the format first — Tab, then type".to_owned());
             return;
         }
         let format = match wizard.compile() {
@@ -7034,7 +7158,7 @@ impl Shell {
             Err(why) => {
                 // **Nothing was saved because nothing compiled** — this fires before a file is
                 // opened or a path is even chosen, so "format not saved" named the wrong event.
-                self.notice = Some(format!(
+                self.say(format!(
                     "That format definition could not be compiled — {why}."
                 ));
                 return;
@@ -7059,7 +7183,7 @@ impl Shell {
             // The real save failure, and the same remedy the highlight rules give: §10 treats a
             // read-only profile as a state, and a state is something a person can change once they
             // know where it lives.
-            self.notice = Some(format!(
+            self.say(format!(
                 "The format could not be saved to \"{}\" — {e}. Check that the file is not read-only.",
                 target.display()
             ));
@@ -7069,7 +7193,7 @@ impl Shell {
             doc.adopt_format(format);
         }
         self.wizard = None;
-        self.notice = Some(format!("format saved to {}", target.display()));
+        self.say(format!("format saved to {}", target.display()));
         self.retitle(hwnd);
     }
 
@@ -7429,6 +7553,9 @@ impl Shell {
             // §7, rung one, and the only rung the owner wanted: the trace becomes a filter.
             Command::FollowTrace => {
                 if let Some(said) = doc.follow_trace() {
+                    // Tagged with the document, and written as the two fields for the same reason
+                    // the keystroke path above gives: `doc` is borrowed out of `self.document`.
+                    self.notice_about = doc.notice_key();
                     self.notice = Some(said);
                 }
             }
@@ -9427,7 +9554,24 @@ fn regroup_now(hwnd: HWND) {
         open_remote(hwnd, source, label);
     }
     let moved = if separate { opened } else { apps.len() };
-    set_notice(hwnd, regroup_notice(&source.name, moved, separate));
+    // The window the reopens will actually ask for, read out of the settings rather than assumed —
+    // see [`pull_notice`], which said "the last hour" for every window there is.
+    let minutes = STATE.with(|s| {
+        tailhawk_core::settings::remote_minutes_of(
+            s.borrow()
+                .as_ref()
+                .and_then(|shell| shell.settings.remote_minutes),
+        )
+    });
+    set_notice(
+        hwnd,
+        regroup_notice(
+            &source.name,
+            moved,
+            separate,
+            &tailhawk_core::settings::fetch_window_said(minutes),
+        ),
+    );
 }
 
 /// Drops the `Open remote` button's menu under the button, and runs what was chosen.
@@ -9746,7 +9890,7 @@ fn from_menu_or_toolbar(lparam: LPARAM) -> bool {
 fn set_notice(hwnd: HWND, text: String) {
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
-            shell.notice = Some(text);
+            shell.say(text);
             shell.refresh_title(hwnd);
         }
     });
@@ -9783,6 +9927,17 @@ struct Landing {
     spill: std::path::PathBuf,
     /// Whether the opening window came back at the limit — `LOKI.md` §6.
     cut: bool,
+    /// What the bar should say once this document is on screen: how many records arrived, what was
+    /// left out, and where the spill is.
+    ///
+    /// **It travels with the landing because it used to be said too early to be seen.**
+    /// `landed_records` put it in the bar and then called [`Shell::open_named`], whose first act is
+    /// to say `opening …` — in the same message, before any paint — so the sentence `spilled_to`'s
+    /// own doc-comment calls *"true for as long as the document lives"* was overwritten
+    /// unseen, and [`notice_once_open_finished`] then took the `opening …` line down and left
+    /// nothing. Carried here, it arrives *with* the records and is tagged with the document it is
+    /// about, which is the only tab it is true of.
+    said: String,
 }
 
 /// One Loki request on its way, and everything the window needs while it is.
@@ -10228,6 +10383,47 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
 /// screenful and not an export.
 const REMOTE_LIMIT: u32 = 1_000;
 
+/// Whether the notice belongs on the screen as it now stands.
+///
+/// **One status bar serves every tab, and some notices are sentences about one of them.** "live ·
+/// 1,000 records in the last hour — spilled to …" is true of the tab it arrived in and of no other,
+/// so with four tabs open it followed the reader around and described rows that were not on screen.
+/// A notice tagged with a [`Document::notice_key`] is shown while that document is the one in front;
+/// an untagged one is about the window — a format saved, a file that would not open, a tail that
+/// stopped — and is shown whatever is in front, including nothing.
+///
+/// **A tiled tab is the one case where this hides a sentence about rows that are on screen.**
+/// `Tabs::split_from` and `Tabs::tile_with_next` put two *different* documents in one tab's two
+/// panes and paint both, while the bar describes the focused one — so a notice about the other is
+/// held back until it is focused. Tagging by pane rather than by document would mean the bar
+/// describing one pane and the notice another, which is the thing being fixed.
+fn notice_shown<'a>(
+    notice: Option<&'a str>,
+    about: Option<&str>,
+    active: Option<&str>,
+) -> Option<&'a str> {
+    match about {
+        Some(key) if active != Some(key) => None,
+        _ => notice,
+    }
+}
+
+/// Whether a document's landing sentence may take the bar from whatever is on it.
+///
+/// **Free, or holding a sentence about a different document.** A tab lands active —
+/// `Tabs::push` makes it so — which means a notice tagged with another document is invisible from
+/// this moment on, and keeping it would be two opens landing in one pass and *neither* of them
+/// saying anything. A sentence about the window (a tail that failed, a format that would not save)
+/// and one about this same document (the remembered-format warning) both outrank the landing: they
+/// are what the reader is looking at the bar for.
+fn landing_may_say(notice: Option<&str>, about: Option<&str>, landing: Option<&str>) -> bool {
+    match (notice, about) {
+        (None, _) => true,
+        (Some(_), Some(key)) => Some(key) != landing,
+        (Some(_), None) => false,
+    }
+}
+
 /// What the bar should say once an open has finished, one way or the other.
 ///
 /// **Only the line this open put there is taken down.** Anything the open itself had to say — a
@@ -10498,12 +10694,17 @@ fn landed_records(
     // **One rule for both paths.** The opening window and every poll after it are cut the same way
     // and by the same limit, so they ask the same question — `tail::was_cut`.
     let cut = tail::was_cut(pulled.records, REMOTE_LIMIT);
-    set_notice(
-        hwnd,
-        spilled_to(
-            pull_notice(&name, pulled.records, pulled.dropped, cut),
-            path.parent(),
+    // **Said with the landing rather than here** — see `Landing::said`. Composed here because this
+    // is where the facts are: `path` is the first spill part and does not survive the move below.
+    let said = spilled_to(
+        pull_notice(
+            &name,
+            pulled.records,
+            pulled.dropped,
+            cut,
+            &tailhawk_core::settings::fetch_window_said(minutes),
         ),
+        path.parent(),
     );
     // The query this window is a view of, kept before the source moves into the tail: `Interleave`
     // and `Separate` regroup the windows from it without asking the server anything.
@@ -10544,6 +10745,7 @@ fn landed_records(
                     question: tailhawk_core::loki::Question::new(&key, &query, minutes),
                     spill: spill_dir,
                     cut,
+                    said,
                 }),
             );
         }
@@ -10990,7 +11192,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                     }
                     shell.close_wizard(saved);
                     if let Err(why) = &outcome {
-                        shell.notice = Some(why.clone());
+                        shell.say(why.clone());
                     }
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
@@ -11092,7 +11294,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                     }
                     shell.close_wizard(saved);
                     if let Err(why) = &outcome {
-                        shell.notice = Some(why.clone());
+                        shell.say(why.clone());
                     }
                     unsafe {
                         let _ = InvalidateRect(hwnd, None, false);
@@ -12173,8 +12375,13 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     .iter()
                     .flat_map(|from| from.try_iter().collect::<Vec<_>>())
                     .last();
+                // Window-wide, and they are written to say so: every one of them leads with the
+                // source's name (`tail.rs`). A tag here would be read against whichever tab is in
+                // front, and a fault is said **once** - `Backoff::should_say` is true on the first
+                // failure of a run and `said_cut`/`said_dropped` are one-shot - so one hidden by a
+                // stale tag would be a dead tail that looked like a quiet one.
                 if let Some(said) = said {
-                    shell.notice = Some(said);
+                    shell.say(said);
                 }
                 // **How far behind each remote document is**, read from the worker that fills it.
                 // Matched by the spill directory rather than by position, because tabs open and
@@ -13816,6 +14023,7 @@ fn main() -> Result<()> {
             detail_window: None,
             rules_dialog: HWND::default(),
             notice: None,
+            notice_about: None,
             titled_following: None,
             last_find: dialog::FindSeed::default(),
             wheel_remaining: 0.0,
@@ -15297,6 +15505,144 @@ mod tests {
         );
     }
 
+    /// **A filter switched off comes back off.** §7.1's enabled mark is part of the view, and a
+    /// remembered view that turns a chip back on narrows a view the owner deliberately widened —
+    /// silently, at the moment the file opens, with the dialog's checkbox then disagreeing with
+    /// what the user last left it at.
+    #[test]
+    fn a_filter_saved_switched_off_comes_back_switched_off() {
+        let path = scratch_log("tailhawk_disabled_chip_test.log", 300);
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        filter_for(&mut doc, "nothing-matches-this", Polarity::Include);
+        assert_eq!(doc.view_rows(), 0, "on, it hides everything");
+        doc.filtering.chips.chips[0].enabled = false;
+
+        let saved = doc.file_state().expect("a path to key by");
+
+        let mut again = Document::open(&path).expect("reopen");
+        again.lay_out((8.0, 10.0), (800, 200));
+        again.apply_state(&saved);
+        let chips = &again.filtering.chips.chips;
+        assert_eq!(chips.len(), 1, "the filter came back with the file");
+        assert_eq!(chips[0].source, "nothing-matches-this");
+        assert!(!chips[0].enabled, "and it came back switched off");
+        while again.filtering.running.is_some() {
+            again.poll_filter();
+        }
+        again.poll_filter();
+        assert_eq!(
+            again.view_rows(),
+            300,
+            "so the rows are all there, which is the point of switching it off"
+        );
+    }
+
+    /// **A notice about one tab is not shown over another's rows.** One status bar serves every
+    /// tab, so the sentence that arrives with a remote tail's records — how many came, what was
+    /// left out, where the spill is — followed the reader to whatever tab they moved to next and
+    /// described rows that were not on screen.
+    ///
+    /// The keys here are two **real** documents' own [`Document::notice_key`]s rather than string
+    /// literals, because the tagging is only right if those are the strings the shell compares: a
+    /// remote tail is keyed by its source, its query and its fetch window, a file by its path, and
+    /// none of them may collide.
+    ///
+    /// **The fetch window is in the key, and [`Document::state_key`] leaves it out**, which is why
+    /// these are two functions. Widening the window and reopening the source is what the product
+    /// itself advises when an answer comes back cut at the limit, so two tabs differing only there
+    /// are the pair the bar is most likely to have to tell apart.
+    #[test]
+    fn a_notice_about_one_document_is_shown_over_that_one_only() {
+        let path = scratch_log("tailhawk_notice_about_test.log", 20);
+        let file = Document::open(&path).expect("open");
+        let mut remote = Document::open(&path).expect("open");
+        let query = "{environment=\"local\", app=\"job-dispatcher\"}";
+        remote.remote(
+            "live · job-dispatcher",
+            "nurtur-loki-jobdispatcher",
+            std::path::Path::new("spill"),
+            query,
+            60,
+            false,
+        );
+        let mut wider = Document::open(&path).expect("open");
+        wider.remote(
+            "live · job-dispatcher",
+            "nurtur-loki-jobdispatcher",
+            std::path::Path::new("spill"),
+            query,
+            1440,
+            false,
+        );
+        let tail = remote.notice_key();
+        let log = file.notice_key();
+        assert_ne!(tail, log, "a source is not one of its spill parts");
+        assert_ne!(
+            tail,
+            wider.notice_key(),
+            "an hour of that source and a day of it are two tabs"
+        );
+        assert_eq!(
+            remote.state_key(),
+            wider.state_key(),
+            "while they are one settings key, so the wider one brings back its columns"
+        );
+
+        let said = "live · job-dispatcher — 1,000 records in the last hour";
+        assert_eq!(
+            notice_shown(Some(said), tail.as_deref(), tail.as_deref()),
+            Some(said),
+            "over the tab it is about"
+        );
+        assert_eq!(
+            notice_shown(Some(said), tail.as_deref(), log.as_deref()),
+            None,
+            "and over no other"
+        );
+        assert_eq!(
+            notice_shown(Some(said), tail.as_deref(), None),
+            None,
+            "not even with every tab closed"
+        );
+        assert_eq!(
+            notice_shown(Some("format saved to C:\\x.toml"), None, log.as_deref()),
+            Some("format saved to C:\\x.toml"),
+            "a notice about the window is about the window"
+        );
+        assert_eq!(notice_shown(None, tail.as_deref(), tail.as_deref()), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The persisted form of a chip carries all three of its facts, and an older file still reads.
+    #[test]
+    fn a_chip_is_written_with_its_sign_and_its_mark() {
+        let mut chip = Chip::parse("boom", Polarity::Exclude).expect("parse");
+        assert_eq!(chip_text(&chip), "-boom");
+        chip.enabled = false;
+        assert_eq!(chip_text(&chip), "#-boom");
+
+        assert_eq!(chip_read("+error"), (Polarity::Include, true, "error"));
+        assert_eq!(chip_read("-retry"), (Polarity::Exclude, true, "retry"));
+        assert_eq!(chip_read("#+error"), (Polarity::Include, false, "error"));
+        assert_eq!(chip_read("#-retry"), (Polarity::Exclude, false, "retry"));
+        assert_eq!(
+            chip_read("bare"),
+            (Polarity::Include, true, "bare"),
+            "a file old enough to have no sign at all is an include, as it always was"
+        );
+        assert_eq!(
+            chip_read("+#hash"),
+            (Polarity::Include, true, "#hash"),
+            "the sign comes first, so a chip whose own text starts with # is unambiguous"
+        );
+        assert_eq!(
+            chip_read("#hash"),
+            (Polarity::Include, true, "#hash"),
+            "and a lone # is text, not a mark, because nothing writes a mark without a sign"
+        );
+    }
+
     /// A notice is shown beside what the document *is*, not instead of it.
     ///
     /// **This is the bug the rules harness found.** `Shell::file` carried two different things —
@@ -15705,19 +16051,19 @@ mod tests {
     #[test]
     fn regrouping_counts_the_applications_it_moved() {
         assert_eq!(
-            regroup_notice("live", 1, true),
+            regroup_notice("live", 1, true, "the last hour"),
             "live: 1 application, one window each — each fetches the last hour again"
         );
         assert_eq!(
-            regroup_notice("live", 4, true),
+            regroup_notice("live", 4, true, "the last hour"),
             "live: 4 applications, one window each — each fetches the last hour again"
         );
         assert_eq!(
-            regroup_notice("live", 1, false),
+            regroup_notice("live", 1, false, "the last hour"),
             "live: 1 application in one window — it fetches the last hour again"
         );
         assert_eq!(
-            regroup_notice("live", 9, false),
+            regroup_notice("live", 9, false, "the last hour"),
             "live: 9 applications in one window — it fetches the last hour again"
         );
     }
@@ -15729,36 +16075,36 @@ mod tests {
     #[test]
     fn a_pull_says_what_it_fetched_and_what_is_missing() {
         assert_eq!(
-            pull_notice("live", 41, 0, false),
+            pull_notice("live", 41, 0, false, "the last hour"),
             "live: 41 records in the last hour"
         );
         assert_eq!(
-            pull_notice("live", 1, 0, false),
+            pull_notice("live", 1, 0, false, "the last hour"),
             "live: 1 record in the last hour"
         );
 
         // Cut at the limit: the noun went missing here entirely.
         assert_eq!(
-            pull_notice("live", 1000, 0, true),
+            pull_notice("live", 1000, 0, true, "the last hour"),
             "live: the newest 1000 records in the last hour — there are probably more"
         );
         assert_eq!(
-            pull_notice("live", 1, 0, true),
+            pull_notice("live", 1, 0, true, "the last hour"),
             "live: the newest 1 record in the last hour — there are probably more"
         );
 
         // Tailhawk's own cap, where the verb has to agree as well as the noun.
         assert_eq!(
-            pull_notice("live", 2000, 3, false),
+            pull_notice("live", 2000, 3, false, "the last hour"),
             "live: 2000 records; 3 more were returned than Tailhawk keeps"
         );
         assert_eq!(
-            pull_notice("live", 2000, 1, false),
+            pull_notice("live", 2000, 1, false, "the last hour"),
             "live: 2000 records; 1 more was returned than Tailhawk keeps"
         );
 
         assert_eq!(
-            pull_notice("live", 1, 1, false),
+            pull_notice("live", 1, 1, false, "the last hour"),
             "live: 1 record; 1 more was returned than Tailhawk keeps",
             "the count in this branch agrees too — it was only ever tested at 2000"
         );
@@ -15770,9 +16116,51 @@ mod tests {
         // more than was ever fetched, and being told about a second, nearer shortfall is not a
         // substitute for it.
         assert_eq!(
-            pull_notice("live", 1000, 5, true),
+            pull_notice("live", 1000, 5, true, "the last hour"),
             "live: 1000 records; 5 more were returned than Tailhawk keeps — and there are probably \
              more that Loki did not return"
+        );
+
+        // **The window is the one that was asked for.** Both sentences said "in the last hour"
+        // whatever `File ▸ Open remote ▸ Fetch window` had been set to, and the cut branch's advice
+        // is to widen that window — so it advised widening a window it had just misreported. The
+        // phrasing is `settings::fetch_window_said`'s, whose own doc-comment said it was for this.
+        let day = tailhawk_core::settings::fetch_window_said(1440);
+        assert_eq!(day, "the last 24 hours");
+        assert_eq!(
+            pull_notice("live", 41, 0, false, &day),
+            "live: 41 records in the last 24 hours"
+        );
+        assert_eq!(
+            pull_notice("live", 1000, 0, true, &day),
+            "live: the newest 1000 records in the last 24 hours — there are probably more"
+        );
+        assert_eq!(
+            regroup_notice("live", 4, true, &day),
+            "live: 4 applications, one window each — each fetches the last 24 hours again"
+        );
+    }
+
+    /// **Two opens landing in one pass must not leave the bar saying nothing.** The landing
+    /// sentence yields to what is already on the bar — but only when that is still going to be
+    /// *visible*, which a sentence about a different tab is not: `Tabs::push` has just made the
+    /// landing tab the one in front.
+    #[test]
+    fn a_landing_sentence_yields_only_to_what_can_still_be_seen() {
+        let mine = Some("loki://live?query=x&minutes=60");
+        let other = Some("loki://dev?query=x&minutes=60");
+        assert!(landing_may_say(None, None, mine), "a free bar");
+        assert!(
+            landing_may_say(Some("dev: 12 records"), other, mine),
+            "a sentence about a tab that is no longer in front is already invisible"
+        );
+        assert!(
+            !landing_may_say(Some("⚠ remembered format did not compile"), mine, mine),
+            "but one about this same document outranks the count of its records"
+        );
+        assert!(
+            !landing_may_say(Some("live: could not write new records"), None, mine),
+            "and so does one about the window — a tail that failed is said once and never again"
         );
     }
 

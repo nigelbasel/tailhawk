@@ -21,7 +21,8 @@
 //!   source fetches, which `File ▸ Open remote ▸ Fetch window` sets and a hand-edited value
 //!   overrides with any duration, not only one the menu offers.
 //! - `[window]` — `x`, `y`, `width`, `height`, `maximized`: where the window was.
-//! - `[[file]]` — `path`, `chips` (each `+text` or `-text`), `collapse`, `bookmarks` (file rows),
+//! - `[[file]]` — `path`, `chips` (each `+text` or `-text`, with a leading `#` when the chip is
+//!   switched off), `collapse`, `bookmarks` (file rows),
 //!   `labels` (each `n:text`), `columns` (widths in cells, zero meaning hidden) and `column_order`
 //!   (display order before the message): what a file was being
 //!   looked at through, so opening it again shows the same view. Keyed by **path**; §12.4 says
