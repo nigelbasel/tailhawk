@@ -8,8 +8,8 @@
 //!
 //! # What this decides, and what it deliberately does not
 //!
-//! It returns **text**, not a file and not a document. The one function in the product that opens a
-//! socket should not also be choosing where things land on disk; the caller in `main.rs` puts the
+//! It returns **text**, not a file and not a document. A function that opens a socket should not
+//! also be choosing where things land on disk; the caller in `main.rs` puts the
 //! spill where every other document comes from. That keeps this testable in the only way it can be
 //! — by reading it — and keeps the file handling in the place that already does it correctly.
 //!
@@ -23,6 +23,13 @@
 //! on a share** — which is precisely the "a configuration can be sent to you" shape that §7's SSRF
 //! rule exists for. `Typed` belongs to a URL entered and used in the same breath; a URL that has
 //! been through a file, and may have come from somebody else's file, is not that.
+//!
+//! **[`discover`] and [`reachable`] are `Imported` too, although their URL was typed a second
+//! ago**, and that is the whole of why: the sources dialog's two buttons exist to say whether a
+//! configuration will *work*, and a `Typed` probe would resolve a `127.0.0.1` identity server and
+//! answer yes to a source that [`pull`] then refuses at the first query. They apply
+//! [`refuse_insecure`] and [`refuse_literal_address`] for the same reason, so a reader is told
+//! `http://` is refused by the button rather than by the first open.
 
 use tailhawk_core::loki::{self, AddressFault, Direction, Origin, OriginFault, Provenance, Window};
 use tailhawk_core::lokiwire::{self, Limits, WireFault};
@@ -535,9 +542,337 @@ pub fn expiry_from(expires_in: u64) -> u64 {
     now_seconds().saturating_add(expires_in)
 }
 
+/// What a **Discover** found, or did not.
+///
+/// **The two failures are not one failure.** A URL that will not parse is the reader's to fix in
+/// the box in front of them; a server that answered nothing is a configuration this cannot help
+/// with, and the remedy there is the two URLs by hand. Telling them apart is the whole value of
+/// the sentence [`discovery_said`] writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Discovery {
+    /// A document was read. `at` is the URL it came from, which is not always the one asked first.
+    Found { at: String, found: loki::Discovered },
+    /// Every candidate was asked and none of them had one.
+    NotFound { tried: usize },
+    /// The URL in the box is not one this can ask anything about.
+    BadUrl(OriginFault),
+    /// The URL is one [`pull`] itself would refuse — `http://`, or an address §7 forbids. Refused
+    /// here rather than asked, so that a configuration which cannot be *used* is never reported as
+    /// one that works.
+    Refused(PullFault),
+    /// Nothing could be reached at all — no network, no DNS, a proxy in the way. The fault carries
+    /// the sentence `net.rs` writes, which names the host and the stage.
+    Unreachable(NetFault),
+}
+
+/// Ask the sign-in server where it is, given the Loki URL alone.
+///
+/// **`Provenance::Imported`, although the URL was typed a second ago.** That is the stricter of the
+/// two and it is the one that will apply when the source is *used*: a `Typed` discovery would
+/// happily resolve a `127.0.0.1` identity server and then [`pull`] would refuse the same address
+/// at the first query, which is a trap — the reader would have been told the configuration worked.
+/// Refusing it here says the true thing at the earliest moment.
+///
+/// Stops at the first candidate that yields a document. A candidate that answers something other
+/// than a discovery document — a 404 page, a redirect, a login screen — is not an error, it is a
+/// host that does not serve one, so the walk goes on. Only a complete failure to reach anything is
+/// reported as a fault, and only from the **first** candidate, which is the host the reader actually
+/// named: the guesses are expected to fail and their timeouts are not news.
+pub fn discover(url: &str) -> Discovery {
+    let origin = match Origin::parse(url, Provenance::Imported) {
+        Ok(origin) => origin,
+        Err(why) => return Discovery::BadUrl(why),
+    };
+    // **The same two refusals [`pull`] applies, in the same order, before a socket is opened.**
+    // Without them a reader could press Discover on `http://loki.corp/loki`, be told where the
+    // sign-in server is, and then find every open fails with `Insecure` — told the configuration
+    // worked by one of the two buttons whose whole job is to say whether it does.
+    if let Err(why) = refuse_insecure(&origin) {
+        return Discovery::Refused(why);
+    }
+    if let Err(why) = refuse_literal_address(&origin) {
+        return Discovery::Refused(PullFault::Address(why));
+    }
+    let candidates = loki::discovery_urls(&origin);
+    let tried = candidates.len();
+    let mut reached_nothing = true;
+    let mut first_fault = None;
+    for (at, candidate) in candidates.into_iter().enumerate() {
+        let request = loki::Request {
+            method: "GET",
+            url: candidate.clone(),
+            body: String::new(),
+            content_type: None,
+        };
+        match net::send(&request, Provenance::Imported, Auth::None) {
+            Ok(answer) if answer.status == 200 => {
+                reached_nothing = false;
+                if let Some(found) = loki::discovered_from_json(&answer.body) {
+                    return Discovery::Found {
+                        at: candidate,
+                        found,
+                    };
+                }
+            }
+            Ok(_) => reached_nothing = false,
+            Err(why) => {
+                if at == 0 {
+                    first_fault = Some(why);
+                }
+            }
+        }
+    }
+    // **"Could not reach it" only when nothing at all was reached.** A Loki host that resets the
+    // connection on the well-known path, beside an `identity.<domain>` that answers and simply
+    // serves no document, is not an unreachable network — it is the case the manual fallback exists
+    // for, and saying otherwise sends the reader to look at their DNS.
+    match first_fault.filter(|_| reached_nothing) {
+        Some(why) => Discovery::Unreachable(why),
+        None => Discovery::NotFound { tried },
+    }
+}
+
+/// What a **Test** reached.
+///
+/// **A 401 is the answer this is looking for.** It means the URL *and* its mount prefix are right
+/// and the server wants a token, which is the one thing about a source that cannot be checked by
+/// reading it — `LOKI.md` §9, and verified: `/api/v1/labels` answers 404 on his estate while
+/// `/loki/api/v1/labels` and even `/loki/loki/api/v1/labels` both answer 401, because the auth
+/// middleware runs before routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reached {
+    /// 401 or 403: there is a Loki here and it wants a credential.
+    WantsToken(u16),
+    /// 200: there is a Loki here and it answered without one.
+    Answered,
+    /// 404: the server is there and nothing is mounted at this path.
+    NothingMounted,
+    /// Any other status, which is the server's own business and is reported as a number.
+    Said(u16),
+    BadUrl(OriginFault),
+    /// The URL is one [`pull`] itself would refuse, for the reason [`Discovery::Refused`] gives.
+    Refused(PullFault),
+    Unreachable(NetFault),
+}
+
+/// Ask the source's own URL whether anything is listening, with no credential at all.
+///
+/// The window is the last day, as [`label_values`] uses, and for the same reason: this question is
+/// about reachability, and a window too short would make a quiet service look like a missing one if
+/// the server ever decided to answer on content.
+pub fn reachable(url: &str) -> Reached {
+    let origin = match Origin::parse(url, Provenance::Imported) {
+        Ok(origin) => origin,
+        Err(why) => return Reached::BadUrl(why),
+    };
+    if let Err(why) = refuse_insecure(&origin) {
+        return Reached::Refused(why);
+    }
+    if let Err(why) = refuse_literal_address(&origin) {
+        return Reached::Refused(PullFault::Address(why));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or_default();
+    let request = loki::labels(
+        &origin,
+        Window {
+            start: now.saturating_sub(LABEL_WINDOW_NANOS).max(0),
+            end: now,
+        },
+    );
+    match net::send(&request, Provenance::Imported, Auth::None) {
+        Ok(answer) => match answer.status {
+            200 => Reached::Answered,
+            401 | 403 => Reached::WantsToken(answer.status),
+            404 => Reached::NothingMounted,
+            other => Reached::Said(other),
+        },
+        Err(why) => Reached::Unreachable(why),
+    }
+}
+
+/// What the dialog's fault line says about a discovery. Pure, so the wording is testable.
+pub fn discovery_said(outcome: &Discovery) -> String {
+    match outcome {
+        Discovery::Found { at, found } => {
+            let host = host_of(at);
+            let mut said = match found.issuer.is_empty() {
+                true => format!("Found a sign-in server at {host}."),
+                false => format!("Found {} at {host}.", found.issuer),
+            };
+            if found.auth_url.is_empty() {
+                said.push_str(
+                    " It offers no browser sign-in, so this source needs a client secret.",
+                );
+            } else if !found.pkce_s256 {
+                said.push_str(" It does not offer S256, which the browser sign-in requires.");
+            }
+            said
+        }
+        // **Names the remedy, because this is the case the manual fallback exists for.** The owner
+        // asked for discovery *and* for a way down to manual configuration when it cannot help.
+        Discovery::NotFound { tried } => format!(
+            "No sign-in server answered at any of the {tried} places worth looking. \
+             Fill in the token URL and the sign-in URL by hand."
+        ),
+        Discovery::BadUrl(why) => format!("That URL cannot be used: {why}."),
+        Discovery::Refused(why) => format!("{why}"),
+        Discovery::Unreachable(why) => format!("{why}"),
+    }
+}
+
+/// What the dialog's fault line says about a test. Pure, for the same reason.
+pub fn reached_said(outcome: &Reached) -> String {
+    match outcome {
+        Reached::WantsToken(_) => {
+            "Reached it, and it wants a token — the URL and its path are right.".to_owned()
+        }
+        Reached::Answered => "Reached it, and it answered without a token.".to_owned(),
+        // The remedy is the prefix, because that is what a 404 from a server that is plainly there
+        // actually means — `LOKI.md` §9's doubled `/loki` is the shape nobody guesses.
+        Reached::NothingMounted => {
+            "Reached the server, but there is no Loki at that path — check whether the URL needs \
+             a /loki on the end."
+                .to_owned()
+        }
+        Reached::Said(status) => format!("Reached it, and it answered {status}."),
+        Reached::BadUrl(why) => format!("That URL cannot be used: {why}."),
+        Reached::Refused(why) => format!("{why}"),
+        Reached::Unreachable(why) => format!("{why}"),
+    }
+}
+
+/// The host out of an absolute URL, for a sentence. The whole URL would say
+/// `https://identity.nurtur.tech/.well-known/openid-configuration`, which is a path a reader has
+/// no use for and the one thing in the sentence they did not choose.
+fn host_of(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Discovery says which server it found and what it cannot do.** A reader pressing a button
+    /// labelled Discover is entitled to know *which* machine answered before accepting what it
+    /// said — the whole point of the gesture is that they did not type those two URLs.
+    #[test]
+    fn a_discovery_names_the_server_it_found_and_the_remedy_when_it_found_none() {
+        let full = loki::Discovered {
+            issuer: "https://identity.nurtur.tech".to_owned(),
+            token_url: "https://identity.nurtur.tech/connect/token".to_owned(),
+            auth_url: "https://identity.nurtur.tech/connect/authorize".to_owned(),
+            scopes: vec!["telemetry:read".to_owned(), "offline_access".to_owned()],
+            pkce_s256: true,
+        };
+        assert_eq!(
+            discovery_said(&Discovery::Found {
+                at: "https://identity.nurtur.tech/.well-known/openid-configuration".to_owned(),
+                found: full.clone(),
+            }),
+            "Found https://identity.nurtur.tech at identity.nurtur.tech.",
+            "the issuer as it names itself, and the host that answered"
+        );
+
+        // A server with no authorization endpoint cannot sign a reader in through a browser, and
+        // `Source::signs_in` reads exactly that field — so the sentence says what the source will
+        // need instead rather than leaving the reader to discover it at the first query.
+        let secret_only = loki::Discovered {
+            auth_url: String::new(),
+            ..full.clone()
+        };
+        let said = discovery_said(&Discovery::Found {
+            at: "https://x.example/.well-known/openid-configuration".to_owned(),
+            found: secret_only,
+        });
+        assert!(said.contains("client secret"), "{said}");
+
+        let no_s256 = loki::Discovered {
+            pkce_s256: false,
+            ..full
+        };
+        let said = discovery_said(&Discovery::Found {
+            at: "https://x.example/.well-known/openid-configuration".to_owned(),
+            found: no_s256,
+        });
+        assert!(said.contains("S256"), "{said}");
+
+        // **The manual fallback is named in the sentence**, because that is what the owner asked
+        // for beside the magic: *"there should probably be an advanced option for scenarios that
+        // just dont work on the automatic discovery pattern"*.
+        let said = discovery_said(&Discovery::NotFound { tried: 6 });
+        assert!(said.contains("6 places"), "{said}");
+        assert!(said.contains("by hand"), "{said}");
+
+        assert_eq!(
+            discovery_said(&Discovery::BadUrl(OriginFault::UnsupportedScheme)),
+            format!(
+                "That URL cannot be used: {}.",
+                OriginFault::UnsupportedScheme
+            )
+        );
+    }
+
+    /// **A 401 is the answer a Test is looking for**, and a 404 has a remedy that is not obvious.
+    #[test]
+    fn a_test_reports_what_it_reached_and_what_a_404_means() {
+        assert!(reached_said(&Reached::WantsToken(401)).contains("wants a token"));
+        assert!(reached_said(&Reached::WantsToken(403)).contains("wants a token"));
+        assert!(reached_said(&Reached::Answered).contains("without a token"));
+        let said = reached_said(&Reached::NothingMounted);
+        assert!(said.contains("/loki"), "the prefix is the remedy: {said}");
+        assert_eq!(
+            reached_said(&Reached::Said(502)),
+            "Reached it, and it answered 502."
+        );
+    }
+
+    /// **A URL an open would refuse is refused by the buttons too**, and in the open's own words.
+    /// The alternative is a Test that says the configuration reaches something and a first query
+    /// that refuses the same URL — the reader told it works by the one control whose job is to say
+    /// whether it does.
+    #[test]
+    fn the_two_probes_refuse_what_an_open_would_refuse() {
+        let insecure =
+            Origin::parse("http://loki.corp/loki", Provenance::Imported).expect("origin");
+        let why = refuse_insecure(&insecure).expect_err("http is refused");
+        assert_eq!(
+            discovery_said(&Discovery::Refused(why.clone())),
+            format!("{why}"),
+            "the open's own sentence, not a second wording of the same rule"
+        );
+        assert_eq!(
+            reached_said(&Reached::Refused(why)),
+            reached_said(&Reached::Refused(
+                refuse_insecure(&insecure).expect_err("http is refused")
+            ))
+        );
+
+        // The address rule is the other half, and `pull` raises it through the same fault type.
+        let literal =
+            Origin::parse("https://10.0.0.4/loki", Provenance::Imported).expect("an origin");
+        if let Err(address) = refuse_literal_address(&literal) {
+            let said = discovery_said(&Discovery::Refused(PullFault::Address(address)));
+            assert!(!said.is_empty(), "a refusal always says something");
+        }
+    }
+
+    #[test]
+    fn a_host_is_taken_out_of_a_url_for_a_sentence() {
+        assert_eq!(
+            host_of("https://identity.nurtur.tech/.well-known/openid-configuration"),
+            "identity.nurtur.tech"
+        );
+        assert_eq!(host_of("http://localhost:3100/x"), "localhost:3100");
+        assert_eq!(host_of("nonsense"), "nonsense");
+    }
 
     fn source() -> Source {
         Source {

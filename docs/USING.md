@@ -209,6 +209,48 @@ or everything) as UTF-8 text with `\r\n`. **Keep saving…** does the same and t
 line that passes the filter as it arrives; **Stop saving** stops it. The status bar carries the
 count, and says so if a write fails.
 
+## Remote sources
+
+**Tools ▸ Remote sources…** holds the Loki servers Tailhawk can tail. The list shows each entry's
+name, URL, query, applications, whether a secret is stored for it, and what is wrong with it if
+anything is. **Add** makes a new one, **Remove** deletes it and its stored credential, and **Clone**
+copies the selected one under a name of its own — every field but the name and the credential, which
+is the quick way to a second environment that differs in one selector. A clone starts with no secret
+on purpose: a credential is filed under the source's *name*, so an inherited one would belong to the
+original.
+
+**Applications** is a comma-separated list, and an empty box means *ask me* — the picker opens when
+the source is opened. The list column says `(ask)` for those.
+
+**Discover fills in the sign-in server from the Loki URL alone.** Type the URL, press **Discover**,
+and Tailhawk asks that host for its OpenID Connect configuration and fills in the **Token URL** and
+the **Sign-in URL** from what it says. It also suggests a **Scope** if that box is empty, out of the
+scopes the server advertises — never over one you typed. If the host serves no configuration,
+Tailhawk looks for one at `identity`, `auth`, `login`, `sso` and `idp` beside it, in your own domain;
+the fault line says so before it starts. **The client id cannot be discovered** — it is assigned when
+the client is registered — and neither can the secret.
+
+Tailhawk only guesses beside a host that is **inside** a domain — `telemetry.nurtur.tech` looks in
+`nurtur.tech`, while a URL at a domain itself, like `acme.com`, gets no guesses at all, because
+`identity.com` would be somebody else's machine.
+
+If discovery finds nothing, the fields are all still there to fill in by hand, which is the only way
+some configurations can be set up.
+
+**Both buttons refuse what an open would refuse**, rather than letting you find out later: a URL
+that is not `https://`, and the private and loopback addresses §7 forbids for a source read from a
+settings file. So a `Test` that says it reached something is a source that will open.
+
+**Test says whether what is in the boxes reaches anything**, with no credential at all. It asks the
+URL for its label names and reports what came back:
+
+| It says | What it means |
+|---|---|
+| Reached it, and it wants a token | The URL and its path are right. This is the answer you want. |
+| Reached the server, but there is no Loki at that path | Usually a missing `/loki` on the end of the URL. |
+| Reached it, and it answered without a token | A Loki with authentication off, or a proxy in front. |
+| Anything else | The server's own answer, or what went wrong reaching it, naming the host. |
+
 ## What is remembered
 
 `tailhawk.settings.toml`, next to the exe if that is writable, else `%APPDATA%\Tailhawk\` — and if

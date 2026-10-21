@@ -44,6 +44,10 @@ pub enum Endpoint {
     Tail,
     /// The values one label has taken. The picker asks this once when it opens.
     LabelValues,
+    /// The label names the source holds. **The cheapest question Loki answers**, and the one a
+    /// `Test` asks: a `404` here means nothing is mounted at this prefix while a `401` means
+    /// something is and wants a token, and that distinction needs no credential to read.
+    Labels,
 }
 
 impl Endpoint {
@@ -53,6 +57,7 @@ impl Endpoint {
             Endpoint::QueryRange => "/loki/api/v1/query_range",
             Endpoint::Tail => "/loki/api/v1/tail",
             Endpoint::LabelValues => "/loki/api/v1/label",
+            Endpoint::Labels => "/loki/api/v1/labels",
         }
     }
 
@@ -1121,6 +1126,231 @@ pub fn label_values(origin: &Origin, label: &str, window: Window) -> Result<Requ
     })
 }
 
+/// What an OpenID Connect discovery document said, reduced to what a source needs.
+///
+/// **This is the "one field and the rest is resolved" half of the sources dialog.** The owner asked
+/// for it by analogy, 2026-10-20: setting up email in Windows used to mean seven fields and now
+/// means an address, *"but allows a user to still drop down to manual configuration"*. Every field
+/// here is filled from the server's own answer; `client_id` is deliberately absent, because it is
+/// assigned at registration and no amount of asking will produce it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovered {
+    /// `issuer` — the identity server's own name for itself, shown so the reader can see *which*
+    /// server was found before accepting what it said.
+    pub issuer: String,
+    /// `token_endpoint`. Empty is not a discovery document — see [`discovered_from_json`].
+    pub token_url: String,
+    /// `authorization_endpoint`, or empty when the server advertises none. A server with no
+    /// authorization endpoint cannot sign a reader in through a browser, and
+    /// [`crate::settings::Source::signs_in`] reads exactly this, so an empty one is a source that
+    /// uses a client secret.
+    pub auth_url: String,
+    /// `scopes_supported`, in the order the server listed them.
+    pub scopes: Vec<String>,
+    /// Whether `S256` is among `code_challenge_methods_supported`. §7 sends no other, so a server
+    /// without it cannot be used for the browser flow however well configured the rest is.
+    pub pkce_s256: bool,
+}
+
+/// How many characters of a discovery document will be looked at. A real one is a few kilobytes;
+/// this is generous and exists so the scan is bounded before it begins, as `token_from_json`'s is.
+pub const MAX_DISCOVERY_RESPONSE: usize = 256 * 1024;
+
+/// The well-known path RFC 8414 puts a discovery document at.
+pub const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
+
+/// The sibling host names worth trying when the resource host answers nothing, in order.
+///
+/// **Verified against his estate rather than guessed at**: `identity.nurtur.tech` answers and
+/// `auth`, `login`, `sso` and `idp` all time out, so the list is ordered by what was found and kept
+/// short because every miss costs a connection timeout in front of a reader who is waiting.
+pub const SIBLING_HOSTS: [&str; 5] = ["identity", "auth", "login", "sso", "idp"];
+
+/// Where to look for the sign-in server, given the Loki URL alone — most likely first.
+///
+/// **The resource host first.** Loki itself gives nothing away: its 401 carries
+/// `WWW-Authenticate: Bearer` with no realm, no scope and no issuer, and RFC 9728's
+/// `/.well-known/oauth-protected-resource` is a 404 there — all three checked against his estate
+/// rather than assumed. What *does* answer is the well-known on the host that serves the logs,
+/// because one gateway fronts both.
+///
+/// **The mount prefix is left off.** A well-known URL is rooted at the authority by definition, and
+/// `https://host/loki/.well-known/…` would be asking Loki, which is the thing that cannot answer.
+///
+/// **A sibling is only guessed in a domain the host is itself a subdomain of**, which is what
+/// [`sibling_domain`] decides and is the difference between asking a machine in the reader's own
+/// estate and asking a stranger. A host with nothing to put a sibling beside — an address literal,
+/// a single-label container name, or a registrable apex like `acme.com` — gets the one candidate.
+///
+/// The siblings keep the origin's **scheme** and take the **default port**. A sibling is a different
+/// machine, so the port Loki happens to listen on says nothing about it; the scheme is kept because
+/// a reader whose lab runs on plain HTTP is not helped by an HTTPS-only guess. Candidates are
+/// deduplicated, so a Loki already served from `identity.<domain>` does not ask itself twice.
+pub fn discovery_urls(origin: &Origin) -> Vec<String> {
+    let mut urls = vec![format!("{}{DISCOVERY_PATH}", origin.base())];
+    if let Some(domain) = sibling_domain(origin.host()) {
+        for sibling in SIBLING_HOSTS {
+            let candidate = format!("{}://{sibling}.{domain}{DISCOVERY_PATH}", origin.scheme());
+            if !urls.contains(&candidate) {
+                urls.push(candidate);
+            }
+        }
+    }
+    urls
+}
+
+/// The domain a sibling may be guessed in, or `None` when there is none worth guessing in.
+///
+/// **There is no public-suffix list in this tree, and this is the heuristic that stands in for one.**
+/// Taking everything after the first dot is wrong at a registrable apex: `acme.com` would make
+/// `identity.com`, and `example.co.uk` would make `identity.co.uk` — real domains belonging to
+/// strangers, asked for a well-known document from the reader's own address. Two rules keep it
+/// inside the reader's estate:
+///
+/// - **the host must have a label to spare**, so it is a subdomain of the domain derived rather than
+///   the domain itself;
+/// - **a two-letter top level needs one more**, because every country-code suffix is two letters and
+///   the two-part forms under them (`co.uk`, `com.au`, `co.jp`) are what the first rule alone walks
+///   into.
+///
+/// **The residual, stated rather than hidden:** a three-label host under a *generic* two-part
+/// suffix — `thing.herokuapp.com`, `thing.github.io` — still derives a domain that is a public
+/// suffix, and `identity.herokuapp.com` could be anybody's. A real public-suffix list is the only
+/// complete answer and is not worth a megabyte of data in this binary for a fallback that exists
+/// because one estate's `identity.<domain>` happened to answer.
+fn sibling_domain(host: &str) -> Option<&str> {
+    if host.starts_with('[') {
+        return None;
+    }
+    let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
+    if labels.iter().any(|label| label.is_empty()) {
+        return None;
+    }
+    if labels.iter().all(|label| label.parse::<u8>().is_ok()) {
+        return None;
+    }
+    let short_tld = labels.last().is_some_and(|tld| tld.len() <= 2);
+    let wanted = if short_tld { 4 } else { 3 };
+    if labels.len() < wanted {
+        return None;
+    }
+    host.split_once('.').map(|(_, domain)| domain)
+}
+
+/// Reads a discovery document. `None` when it is not one.
+///
+/// **No `token_endpoint`, no document.** That is the field the whole exercise exists to fill, and a
+/// 404 page, an empty body or a JSON object about something else all arrive here looking much the
+/// same — so the test is for the one thing that would make the answer useful rather than for
+/// anything that merely parses.
+///
+/// A hand-written scan for the reason [`token_from_json`] gives: there is no JSON crate in the tree,
+/// and this is four flat fields of a small document.
+pub fn discovered_from_json(body: &str) -> Option<Discovered> {
+    if body.len() > MAX_DISCOVERY_RESPONSE {
+        return None;
+    }
+    let token_url = json_string(body, "token_endpoint").filter(|url| !url.is_empty())?;
+    Some(Discovered {
+        issuer: json_string(body, "issuer").unwrap_or_default(),
+        token_url,
+        auth_url: json_string(body, "authorization_endpoint").unwrap_or_default(),
+        scopes: json_strings(body, "scopes_supported").unwrap_or_default(),
+        pkce_s256: json_strings(body, "code_challenge_methods_supported")
+            .unwrap_or_default()
+            .iter()
+            .any(|method| method == "S256"),
+    })
+}
+
+/// The scope to ask for, out of what the server says it supports.
+///
+/// **Only what was advertised, and nothing invented.** A scope the server does not know is a
+/// sign-in that fails with an error about a scope the reader never typed, so this offers the
+/// read-shaped scopes it listed and `offline_access` if it listed that — the refresh token being
+/// what keeps a reader signed in between sessions. Anything else is theirs to type; this is a
+/// starting point for an empty box, in the same spirit as
+/// [`crate::settings::authorize_beside`], and never an overwrite.
+///
+/// **`openid` leads it, but only for a server that can sign a reader in.** `offline_access` is
+/// defined by OIDC for an OIDC request, and identity servers differ about whether they will issue a
+/// refresh token for one that did not ask for `openid` — so a suggestion that asks for the refresh
+/// token and not the thing it belongs to is a sign-in that works and then has to be done again
+/// every session. For a server with no authorization endpoint the exchange is client credentials,
+/// where `openid` means nothing and some servers refuse it, so it is left out.
+pub fn scope_from(found: &Discovered) -> String {
+    let advertised = |name: &str| found.scopes.iter().any(|s| s == name);
+    let mut out: Vec<&str> = Vec::new();
+    if !found.auth_url.is_empty() && advertised("openid") {
+        out.push("openid");
+    }
+    out.extend(
+        found
+            .scopes
+            .iter()
+            .filter(|s| s.ends_with(":read") || s.ends_with(".read"))
+            .map(String::as_str),
+    );
+    if advertised("offline_access") {
+        out.push("offline_access");
+    }
+    out.join(" ")
+}
+
+/// Reads an array of strings at `key` — `"scopes_supported": ["a", "b"]`.
+///
+/// **Lifted out of [`label_values_from_json`], which was the only reader of an array here.** Its
+/// own scan was keyed on `"data"` and bounded by [`MAX_LABEL_VALUES`], and **the bound came with
+/// it** — so a discovery document's `scopes_supported` is held to the same ceiling. That is a list
+/// of ten against a bound meant for a list of thousands, so it is a formality there and a real
+/// guard for the label values it was written for.
+fn json_strings(body: &str, key: &str) -> Option<Vec<String>> {
+    let at = body.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = body.get(at..)?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let mut rest = rest.strip_prefix('[')?;
+    let mut values = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.strip_prefix(']').is_some() {
+            return Some(values);
+        }
+        let (value, after) = json_string_at(rest)?;
+        if values.len() == MAX_LABEL_VALUES {
+            return Some(values);
+        }
+        values.push(value);
+        rest = after.trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next,
+            None => return rest.strip_prefix(']').map(|_| values),
+        }
+    }
+}
+
+/// The label names this source holds, over `window`.
+///
+/// **What a `Test` asks, and it asks it with no credential.** `LOKI.md` §9 records that the mount
+/// prefix cannot be settled by reasoning — this estate serves Loki under `/loki`, so the doubled
+/// `/loki/loki/api/v1/labels` is a real URL and `/api/v1/labels` is not — and the auth middleware
+/// runs *before* routing, so the status alone separates them: a prefix that exists answers **401**
+/// and one that does not answers **404**. Checked against his estate rather than reasoned about.
+pub fn labels(origin: &Origin, window: Window) -> Request {
+    Request {
+        method: "GET",
+        url: format!(
+            "{}{}{}?start={}&end={}",
+            origin.base(),
+            origin.mount(),
+            Endpoint::Labels.path(),
+            window.start,
+            window.end
+        ),
+        body: String::new(),
+        content_type: None,
+    }
+}
+
 /// The values in a label response — `{"status":"success","data":["one","two"]}`.
 ///
 /// A hand-written scan for the reason `token_from_json` gives: there is no JSON crate in the tree
@@ -1135,31 +1365,7 @@ pub fn label_values_from_json(body: &str) -> Option<Vec<String>> {
     if body.len() > MAX_LABEL_RESPONSE {
         return None;
     }
-    let at = body.find("\"data\"")? + "\"data\"".len();
-    let rest = body.get(at..)?.trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let mut rest = rest.strip_prefix('[')?;
-
-    let mut values = Vec::new();
-    loop {
-        rest = rest.trim_start();
-        if let Some(after) = rest.strip_prefix(']') {
-            let _ = after;
-            return Some(values);
-        }
-        let (value, after) = json_string_at(rest)?;
-        if values.len() == MAX_LABEL_VALUES {
-            return Some(values);
-        }
-        values.push(value);
-        rest = after.trim_start();
-        match rest.strip_prefix(',') {
-            Some(next) => rest = next,
-            None => {
-                return rest.strip_prefix(']').map(|_| values);
-            }
-        }
-    }
+    json_strings(body, "data")
 }
 
 /// Reads one quoted JSON string from the front of `text`, returning it and what follows.
@@ -2565,6 +2771,180 @@ mod tests {
             Err(LabelFault::NotALabelName),
             "a name that could choose a path segment never reaches a URL"
         );
+    }
+
+    /// **Where to look for the sign-in server, given only the Loki URL.** The owner, 2026-10-20:
+    /// editing seven fields by hand *"is onerous and likely to be error prone"*, and he named
+    /// Windows' email autoconfiguration as the pattern — one field, and the rest resolved.
+    ///
+    /// The order is the verified one: the resource host's own well-known **first**, because that is
+    /// what answers on his estate (`telemetry.nurtur.tech` carries
+    /// `issuer: https://identity.nurtur.tech`), then the siblings, because guessing
+    /// `identity.<domain>` would also have worked there and is the only thing left when the first
+    /// does not answer.
+    #[test]
+    fn discovery_looks_at_the_resource_host_before_it_guesses() {
+        let origin = Origin::parse("https://telemetry.nurtur.tech/loki", Provenance::Typed)
+            .expect("an origin");
+        let urls = discovery_urls(&origin);
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://telemetry.nurtur.tech/.well-known/openid-configuration"),
+            "the host that holds the logs is asked first, and on his estate it answers"
+        );
+        assert!(
+            urls.contains(
+                &"https://identity.nurtur.tech/.well-known/openid-configuration".to_owned()
+            ),
+            "and the sibling that did answer is among the guesses: {urls:?}"
+        );
+        assert!(
+            !urls.iter().any(|u| u.contains("/loki/")),
+            "the mount prefix is not part of a well-known URL: {urls:?}"
+        );
+
+        // **A host with no domain to take a sibling from gets no guesses**, which is every
+        // single-label name — a container name, a machine on a flat network. Its own scheme and
+        // port are kept, because that is the server it is. (`localhost` would do as well, but
+        // `pull::discover` parses as `Imported`, under which §7 refuses loopback — so a test written
+        // on `localhost` would describe a URL the product never reaches.)
+        let flat = Origin::parse("http://loki-box:3100", Provenance::Typed).expect("an origin");
+        assert_eq!(
+            discovery_urls(&flat),
+            ["http://loki-box:3100/.well-known/openid-configuration"]
+        );
+
+        // A literal address has no siblings either, and `identity.10.0.0.4` is not a name.
+        let numeric =
+            Origin::parse("https://10.0.0.4:3100/loki", Provenance::Typed).expect("origin");
+        assert_eq!(
+            discovery_urls(&numeric).len(),
+            1,
+            "no sibling of an address"
+        );
+
+        // **A registrable apex gets no guesses at all**, which is what the rule exists for:
+        // everything after the first dot of `acme.com` is `com`, and `identity.com` belongs to
+        // somebody else entirely — asking it would tell a stranger that this reader is configuring
+        // a log source, from their own address.
+        for apex in ["https://acme.com/loki", "https://example.co.uk/loki"] {
+            let origin = Origin::parse(apex, Provenance::Typed).expect("an origin");
+            assert_eq!(
+                discovery_urls(&origin).len(),
+                1,
+                "{apex} is a domain, not a host inside one: {:?}",
+                discovery_urls(&origin)
+            );
+        }
+
+        // One label deeper and the domain is demonstrably the reader's own, so the guesses go
+        // inside it. A two-letter top level needs that extra label, which is what tells `co.uk`
+        // apart from `nurtur.tech`.
+        let deep =
+            Origin::parse("https://loki.example.co.uk/loki", Provenance::Typed).expect("an origin");
+        assert!(
+            discovery_urls(&deep).contains(
+                &"https://identity.example.co.uk/.well-known/openid-configuration".to_owned()
+            ),
+            "{:?}",
+            discovery_urls(&deep)
+        );
+
+        // **The scheme follows the origin and a sibling takes the default port.** A lab on plain
+        // HTTP is not helped by an HTTPS-only guess, and the port Loki listens on says nothing
+        // about a different machine.
+        let plain =
+            Origin::parse("http://loki.dev.corp:3100/loki", Provenance::Typed).expect("an origin");
+        let urls = discovery_urls(&plain);
+        assert_eq!(
+            urls[0],
+            "http://loki.dev.corp:3100/.well-known/openid-configuration"
+        );
+        assert_eq!(
+            urls[1],
+            "http://identity.dev.corp/.well-known/openid-configuration"
+        );
+
+        // A host that *is* one of the sibling names is not asked twice.
+        let itself =
+            Origin::parse("https://identity.nurtur.tech/loki", Provenance::Typed).expect("origin");
+        let urls = discovery_urls(&itself);
+        let mut unique = urls.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(urls.len(), unique.len(), "{urls:?}");
+
+        // A trailing root dot is a legal host and must not produce `https://identity./…`.
+        let rooted = Origin::parse("http://loki-box./x", Provenance::Typed).expect("an origin");
+        assert_eq!(discovery_urls(&rooted).len(), 1);
+    }
+
+    /// **The document, read for the four things that save the reader typing.** Verified against his
+    /// own identity server rather than against the specification alone.
+    #[test]
+    fn a_discovery_document_gives_up_both_endpoints_and_its_scopes() {
+        let body = r#"{
+            "issuer": "https://identity.nurtur.tech",
+            "authorization_endpoint": "https://identity.nurtur.tech/connect/authorize",
+            "token_endpoint": "https://identity.nurtur.tech/connect/token",
+            "scopes_supported": ["openid", "profile", "telemetry:read", "offline_access"],
+            "code_challenge_methods_supported": ["plain", "S256"]
+        }"#;
+        let found = discovered_from_json(body).expect("a document");
+        assert_eq!(found.issuer, "https://identity.nurtur.tech");
+        assert_eq!(
+            found.token_url,
+            "https://identity.nurtur.tech/connect/token"
+        );
+        assert_eq!(
+            found.auth_url,
+            "https://identity.nurtur.tech/connect/authorize"
+        );
+        assert!(
+            found.pkce_s256,
+            "S256 is advertised, so the browser flow works"
+        );
+        assert_eq!(
+            scope_from(&found),
+            "openid telemetry:read offline_access",
+            "the thing a refresh token belongs to, a read scope, and the refresh token"
+        );
+
+        // **No token endpoint is not a discovery document**, whatever else it holds: the one field
+        // the whole exercise exists to fill is that one.
+        assert_eq!(
+            discovered_from_json(r#"{"issuer":"https://x.example"}"#),
+            None
+        );
+        assert_eq!(discovered_from_json("<html>404</html>"), None);
+        assert_eq!(discovered_from_json(""), None);
+
+        // A server that advertises no S256 is reported as such rather than refused — the client
+        // credentials path does not need PKCE, and saying so is the dialog's business.
+        let plain = r#"{"issuer":"https://x.example","token_endpoint":"https://x.example/t",
+            "code_challenge_methods_supported":["plain"]}"#;
+        let found = discovered_from_json(plain).expect("a document");
+        assert!(!found.pkce_s256);
+        assert!(
+            found.auth_url.is_empty(),
+            "and it named no sign-in endpoint"
+        );
+        assert_eq!(
+            scope_from(&found),
+            "",
+            "nothing is invented when nothing is advertised"
+        );
+
+        // **No authorization endpoint means a client-credentials exchange**, where `openid` means
+        // nothing and some servers refuse it — so it is left out even when advertised.
+        let secret_only = Discovered {
+            issuer: "https://x.example".to_owned(),
+            token_url: "https://x.example/t".to_owned(),
+            auth_url: String::new(),
+            scopes: vec!["openid".to_owned(), "telemetry:read".to_owned()],
+            pkce_s256: false,
+        };
+        assert_eq!(scope_from(&secret_only), "telemetry:read");
     }
 
     #[test]

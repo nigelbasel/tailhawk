@@ -31,8 +31,8 @@ use crate::settings::Source;
 /// than none at all so a hand-edited settings file cannot make the list unusable.
 pub const MAX_SOURCES: usize = 64;
 
-/// Widths for the list's five columns — name, URL, query, secret, problem — apportioned to the
-/// width the list actually has.
+/// Widths for the list's six columns — name, URL, query, applications, secret, problem —
+/// apportioned to the width the list actually has.
 ///
 /// **The widths were fixed, and did not fit.** 90 + 250 + 140 + 60 + 180 is 720px inside a list
 /// 340 dialog units wide, which is somewhere around 510 to 595px depending on the shell font — so
@@ -40,15 +40,15 @@ pub const MAX_SOURCES: usize = 64;
 /// that has just been added, which is why adding one looked like adding nothing.
 ///
 /// Each column is floored at something a word fits in, and the rest is shared out — so a list
-/// narrower than five such columns overflows and scrolls rather than producing a column too narrow
+/// narrower than six such columns overflows and scrolls rather than producing a column too narrow
 /// to read or, as a first draft of this did, one of negative width. Zero is the width the shell
 /// reports when it cannot measure the list at all, so it is the one value that has to be safe.
-pub fn column_widths(total: i32) -> [i32; 5] {
-    const SHARE: [i32; 5] = [16, 30, 22, 10, 22];
+pub fn column_widths(total: i32) -> [i32; 6] {
+    const SHARE: [i32; 6] = [14, 24, 18, 18, 8, 18];
     const FLOOR: i32 = 36;
     let total = total.max(FLOOR * SHARE.len() as i32);
     let spare = i64::from(total - FLOOR * SHARE.len() as i32);
-    let mut out = [FLOOR; 5];
+    let mut out = [FLOOR; 6];
     for (slot, share) in out.iter_mut().zip(SHARE) {
         *slot += (spare * i64::from(share) / 100) as i32;
     }
@@ -69,6 +69,14 @@ pub struct Row<'a> {
     /// actually wants — dev, QA, live — share a URL, a client and a credential and differ *only*
     /// here. A list without this column is three rows that look identical.
     pub query: &'a str,
+    /// The applications this entry opens straight into, or that it asks.
+    ///
+    /// **Shown for the same reason the query is.** Two entries over one Loki may differ only in
+    /// which applications they carry — that is what makes several entries over one server worth
+    /// having — and a list that does not show them is two rows a reader cannot tell apart. Held as
+    /// a `String` rather than a slice because the list needs the composed text and the row is where
+    /// the composing belongs.
+    pub apps: String,
     /// Whether a secret is stored for this source — the shell answers this, the editor only carries
     /// it. Shown so a source that is configured but has never been given its secret is visible as
     /// such rather than failing at the first query.
@@ -186,6 +194,14 @@ impl Editor {
                 } else {
                     &s.query
                 },
+                // **`(ask)`, not blank.** An empty `apps` means the picker opens — `Source::apps`
+                // says so — which is a behaviour rather than an absence, and the commonest entry
+                // there is. Blank would read as "no applications", which is the one thing it is not.
+                apps: if s.apps.is_empty() {
+                    "(ask)".to_owned()
+                } else {
+                    apps_said(&s.apps)
+                },
                 has_secret: self.stored.get(i).copied().unwrap_or(false),
                 // **A row's own fault, including a blank row's — and deliberately not the same
                 // question [`Self::fault`] answers.** That one decides whether the set can be
@@ -263,11 +279,61 @@ impl Editor {
         Some(gone.name)
     }
 
+    /// Copies the selected source under a name of its own and selects the copy.
+    ///
+    /// **Everything but the name and the credential.** The owner asked for this to edit one field
+    /// of a configuration that is otherwise identical — the estate runs one Loki, so dev, QA and
+    /// live share a URL, a client and a scope and differ in a selector or a list of applications.
+    ///
+    /// **The copy inherits no secret, and that is correctness rather than caution.** A credential
+    /// is filed under the source's *name*, so a copy reported as having one would be pointing at
+    /// the original's — and renaming it later would orphan that one, which is a thing that has
+    /// already happened in this product's store. A pending secret is left with the row it was typed
+    /// for, exactly as [`Self::select`] leaves it.
+    ///
+    /// The name comes from [`crate::apps::saved_entry_name`], which is where the "characters a
+    /// credential key may hold, numeric suffix on a collision" rule already lives.
+    /// **A row nobody has typed into is not worth copying**, and copying it would be worse than
+    /// nothing: the copy has a generated *name*, so [`Self::is_blank_row`] no longer recognises it,
+    /// [`Self::discard_blank`] leaves it behind, and the reader is held at OK by a complaint about
+    /// a source they never meant to make.
+    pub fn clone_selected(&mut self) -> bool {
+        if self.sources.len() >= MAX_SOURCES || self.is_blank_row(self.selected) {
+            return false;
+        }
+        let Some(source) = self.sources.get(self.selected) else {
+            return false;
+        };
+        let taken: Vec<String> = self.sources.iter().map(|s| s.name.clone()).collect();
+        let copy = Source {
+            name: crate::apps::saved_entry_name(&format!("{} copy", source.name), &[], &taken),
+            ..source.clone()
+        };
+        self.sources.push(copy);
+        self.stored.push(false);
+        self.selected = self.sources.len() - 1;
+        self.pending = None;
+        self.dirty = true;
+        true
+    }
+
     /// Edits a field of the selected source.
     pub fn edit(&mut self, field: Field, value: &str) {
         let Some(source) = self.sources.get_mut(self.selected) else {
             return;
         };
+        // **The applications are a list, so they are not one of the string slots below.** Compared
+        // *after* parsing rather than as text, because the dialog reads every field on every
+        // keystroke and `gateway` and ` gateway ` are the same choice — a field that reported a
+        // change whenever the spacing differed would hold the set dirty for ever.
+        if field == Field::Apps {
+            let apps = apps_typed(value);
+            if source.apps != apps {
+                source.apps = apps;
+                self.dirty = true;
+            }
+            return;
+        }
         let slot = match field {
             Field::Name => &mut source.name,
             Field::Url => &mut source.url,
@@ -276,6 +342,7 @@ impl Editor {
             Field::ClientId => &mut source.client_id,
             Field::Scope => &mut source.scope,
             Field::Query => &mut source.query,
+            Field::Apps => unreachable!("answered above, where the list is parsed"),
         };
         if slot != value {
             slot.clear();
@@ -355,6 +422,28 @@ pub enum Field {
     ClientId,
     Scope,
     Query,
+    /// The applications the entry opens into. A list rather than a string, so [`Editor::edit`]
+    /// answers it before the others.
+    Apps,
+}
+
+/// The applications as a reader types them: a comma-separated list, trimmed, empties dropped.
+///
+/// **A comma, because that is what the list shows and what `apps=a,b` already means** in the
+/// `loki://source?apps=…` key a remote tab is remembered under. An application name cannot hold a
+/// comma — `LOKI.md` §2 has them as label values, and the picker only ever offers what the server
+/// returned — so nothing is lost by splitting on one.
+pub fn apps_typed(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The inverse, for the box and for the list.
+pub fn apps_said(apps: &[String]) -> String {
+    apps.join(", ")
 }
 
 #[cfg(test)]
@@ -703,7 +792,7 @@ mod tests {
         // **Zero is what the shell reports when it cannot measure the list**, and a width shared
         // out from nothing used to come back negative — the remainder was pushed onto the URL
         // column after the floor had already overspent the total, so `LVM_INSERTCOLUMNW` was handed
-        // a `cx` of -4. A list too narrow for five readable columns overflows and scrolls instead.
+        // a `cx` of -4. A list too narrow for six readable columns overflows and scrolls instead.
         for total in [i32::MIN, -20, 0, 1, 4, 5, 179] {
             let widths = column_widths(total);
             assert!(
@@ -711,7 +800,7 @@ mod tests {
                 "{widths:?} from a total of {total} is not a width a column can have"
             );
         }
-        assert_eq!(column_widths(0), [36; 5]);
+        assert_eq!(column_widths(0), [36; 6]);
     }
 
     /// **A source created in the app can sign the reader in**, which it could not do before
@@ -807,5 +896,142 @@ mod tests {
         let rows = editor.rows();
         assert!(rows[0].has_secret);
         assert!(!rows[1].has_secret);
+    }
+
+    /// **The applications are editable and visible, which they had never been.** The owner,
+    /// 2026-10-20: *"there is no place where we can edit or view the list of apps being tailed"* —
+    /// `Source::apps` was written only by the picker, so an entry that opened straight into seven
+    /// applications could not be told from one that asks, and the list showed neither.
+    #[test]
+    fn the_applications_are_a_field_and_a_column() {
+        let mut editor = Editor::new(vec![source("live")], vec![false]);
+        editor.open();
+        assert_eq!(
+            apps_said(&[]),
+            "",
+            "no applications is an empty box, not a word"
+        );
+        assert_eq!(editor.rows()[0].apps, "(ask)", "and the list says it asks");
+
+        editor.edit(Field::Apps, "gateway, job-dispatcher ,, identity ");
+        assert_eq!(
+            editor.current().expect("a row").apps,
+            ["gateway", "job-dispatcher", "identity"],
+            "split on commas, trimmed, and an empty one is not an application"
+        );
+        assert_eq!(
+            apps_said(&editor.current().expect("a row").apps),
+            "gateway, job-dispatcher, identity",
+            "and it reads back as what a reader would type"
+        );
+        assert_eq!(editor.rows()[0].apps, "gateway, job-dispatcher, identity");
+        assert!(editor.is_dirty());
+
+        // Typing the same thing again is not an edit — the dialog reads every field on every
+        // keystroke, so a field that always reports a change would mark the set dirty for ever.
+        let mut again = Editor::new(vec![source("live")], vec![false]);
+        again.open();
+        again.edit(Field::Apps, "gateway");
+        again.saved();
+        again.edit(Field::Apps, " gateway ");
+        assert!(!again.is_dirty(), "the same list, differently spaced");
+    }
+
+    /// **A clone carries everything but the name and the sign-in.** The owner, 2026-10-20: *"it
+    /// would also be nice to be able to clone a setup and then edit one field"*.
+    ///
+    /// **It must inherit no credential**, and that is not caution — a secret is filed under the
+    /// source's *name*, so a clone that reported one as stored would be pointing at the original's
+    /// credential, and renaming it afterwards would orphan that one. The `Secret` column saying
+    /// `—` on a fresh clone is the truth, and it is also the prompt to sign in.
+    #[test]
+    fn a_clone_is_the_same_source_under_a_new_name_with_no_secret() {
+        let mut editor = Editor::new(vec![source("live"), source("dev")], vec![true, true]);
+        editor.open();
+        editor.edit(Field::Apps, "gateway, identity");
+        editor.saved();
+
+        assert!(editor.clone_selected(), "there was room");
+        assert_eq!(editor.sources().len(), 3);
+        assert_eq!(editor.selected(), 2, "and the copy is the row being edited");
+        let copy = editor.current().expect("the copy");
+        assert_eq!(copy.name, "live copy", "a name of its own");
+        assert_eq!(copy.url, "https://live.example/loki");
+        assert_eq!(copy.query, "{environment=\"live\"}");
+        assert_eq!(copy.apps, ["gateway", "identity"], "including the apps");
+        assert!(!editor.rows()[2].has_secret, "and no credential");
+        assert!(editor.rows()[0].has_secret, "the original keeps its own");
+        assert!(editor.is_dirty());
+        assert!(
+            editor.fault().is_none(),
+            "a clone is savable at once, which a duplicate name would not be: {:?}",
+            editor.fault()
+        );
+
+        // A second copy does not collide with the first — two sources sharing a name share a
+        // credential silently, which `fault` refuses and this must not create.
+        editor.select(0);
+        assert!(editor.clone_selected());
+        assert_eq!(editor.current().expect("the copy").name, "live copy 2");
+        assert!(editor.fault().is_none(), "{:?}", editor.fault());
+
+        // A secret typed for the row being left does not follow the clone, for the same reason
+        // moving the selection discards it.
+        editor.select(0);
+        editor.set_secret("live-secret");
+        assert!(editor.clone_selected());
+        assert_eq!(
+            editor.take_secret(),
+            None,
+            "the secret stayed with the row it was typed for"
+        );
+    }
+
+    /// The bound holds for cloning as it does for adding, and a refusal changes nothing.
+    #[test]
+    fn a_clone_is_refused_when_the_set_is_full() {
+        let sources: Vec<Source> = (0..MAX_SOURCES).map(|n| source(&format!("s{n}"))).collect();
+        let mut editor = Editor::new(sources, Vec::new());
+        editor.open();
+        assert!(!editor.clone_selected());
+        assert_eq!(editor.sources().len(), MAX_SOURCES);
+    }
+
+    /// **The row the dialog offers to type into is not copied.** A copy of it would carry a
+    /// generated name, which is enough to stop `discard_blank` recognising it — so pressing Clone
+    /// on a fresh install would leave a source called `copy` with no URL, and hold the reader at OK
+    /// with a complaint about a row they never meant to create.
+    #[test]
+    fn a_blank_row_is_not_worth_cloning() {
+        let mut editor = Editor::default();
+        editor.open();
+        assert_eq!(editor.sources().len(), 1, "the offered row");
+        assert!(!editor.clone_selected());
+        assert_eq!(editor.sources().len(), 1, "and nothing was added");
+
+        // One field is enough to make it a row somebody is working on, and then it copies.
+        editor.edit(Field::Name, "live");
+        assert!(editor.clone_selected());
+        assert_eq!(editor.current().expect("the copy").name, "live copy");
+    }
+
+    /// Six columns now, and the widths still fit the list rather than hanging off its edge —
+    /// the defect `column_widths` exists for, with one more column to share out.
+    #[test]
+    fn six_columns_fit_the_width_they_are_given() {
+        for total in [0, 100, 300, 510, 595, 1200] {
+            let widths = column_widths(total);
+            assert!(
+                widths.iter().all(|w| *w >= 36),
+                "no column is too narrow to read at {total}: {widths:?}"
+            );
+            if total >= 36 * 6 {
+                assert_eq!(
+                    widths.iter().sum::<i32>(),
+                    total,
+                    "and the row fills the list exactly at {total}"
+                );
+            }
+        }
     }
 }

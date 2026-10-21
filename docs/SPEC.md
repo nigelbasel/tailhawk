@@ -1467,9 +1467,11 @@ consent; a command line is intent and is never accepted from a file.
 Tailhawk's entire working set is customer log files containing PII, connection strings, bearer tokens
 and session IDs.
 
-- **No telemetry. No update ping. No font or CDN fetch. No outbound connection of any kind** unless the
-  user explicitly opens a remote source. This is a **testable assertion** in CI and a competitive
-  claim worth making.
+- **No telemetry. No update ping. No font or CDN fetch. No outbound connection of any kind** unless
+  the user explicitly opens a remote source, or presses **Discover** or **Test** in the sources
+  dialog. This is a **testable assertion** in CI and a competitive claim worth making. The two
+  buttons are the 2026-10-21 entry at the end of this section, and the sentence is amended here as
+  well as there, because this bullet is the one that gets quoted.
 
   > **The assertion did not exist for the first month this line claimed it did.** Checked
   > 2026-08-27: CI asserted no runtime shader compiler and no CRT redistributable, and nothing
@@ -1509,6 +1511,35 @@ and session IDs.
   >
   > Nothing else changed: there is still no telemetry, no update ping, no font or CDN fetch, and the
   > only outbound connection any build can make is to a source the user configured and named.
+  >
+  > ### 2026-10-21: the sources dialog may now reach out too, and that is a second weakening
+  >
+  > **Reworded in the same commit as the code, which is what the rule above asks for.** The Remote
+  > sources dialog has a **Discover** button and a **Test** button. Both make outbound connections,
+  > and neither of them is "opening a source":
+  >
+  > - **Test** asks the URL in the box for its label names, with no credential, and reports what it
+  >   reached. One request, to the host the reader typed.
+  > - **Discover** asks that host for `/.well-known/openid-configuration` and, *if nothing there
+  >   serves one*, asks `identity`, `auth`, `login`, `sso` and `idp` **beside** it — hostnames the
+  >   reader did not type. That is the part that needs saying out loud. It is
+  >   bounded to those five, it only happens on an explicit click, it carries no credential and
+  >   sends nothing but a GET, and the dialog says *"Looking for the sign-in server at this host,
+  >   then beside it…"* **before** the first connection rather than after the last.
+  >
+  >   **"Beside it" is a heuristic, because there is no public-suffix list in this tree.** The
+  >   guesses are only made in a domain the host is demonstrably *inside*: it must have a label to
+  >   spare, and a two-letter top level needs one more — so `telemetry.nurtur.tech` guesses in
+  >   `nurtur.tech`, while `acme.com` and `example.co.uk` guess nothing at all. Without that rule
+  >   the first dot of `acme.com` would have produced `identity.com`: a stranger's domain, told from
+  >   the reader's own address that they are configuring a log source. `loki::sibling_domain` carries
+  >   the rule and states the residual it still has.
+  >
+  > So the claim is now: **no outbound connection unless the user opens a remote source, or presses
+  > Discover or Test in the sources dialog.** The conditional assertion CI makes is untouched — both
+  > buttons reach WinHTTP through the same `LoadLibraryW` on first use, so a run that opens no
+  > remote source and presses neither button still loads no transport, and
+  > `tests::a_local_file_session_never_loads_the_transport` still proves it.
 - **No conventional crash reporter.** A minidump would exfiltrate customer log content. If crash
   reporting exists, it is **local-file only**, user-initiated, with a **visible preview of exactly what
   will be sent**, and never contains buffered log content or full file paths without redaction.
