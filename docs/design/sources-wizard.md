@@ -98,9 +98,30 @@ the box has to be free text and the reader has to already know the answer. By pa
 settled and the credential is in hand, so there is something to ask.
 `Draft::can_ask_server()` is the predicate, and when it is false the page says so and takes text.
 
+## The way out, on every page
+
+**`Set it up myself…` is on every page of the wizard**, chosen by the owner on 2026-10-22 over a
+fourth state on page 2: *“go with the explicit set it up myself”*. It exists because discovery can
+fail — an identity server that is neither at the Loki's own base nor at a sibling host — and page 2
+then refuses **Next** for want of a token URL that the wizard has no box for. Cancel and *No sign-in
+needed* were the only exits, and the second builds an unauthenticated source against a server that
+has just answered 401.
+
+It is **chrome rather than a page's control**, which is the whole of its test: an escape owned by a
+page is hidden by every page that does not claim it, beginning with the one that needs it most.
+Finishing in the form finishes the wizard, because by then every answer it would have asked for has
+been given.
+
 ## What stays a form
 
-**Edit…** keeps the flat screen. Changing one field of a working source should not be four pages of
+**Edit…** keeps the form, and the form is no longer the wall of fields this wizard was written to
+replace. `Advanced` is gone: [`signing_fields`] shows the boxes the chosen mode uses and no others,
+so a Loki that needs no sign-in shows none and says so, and nothing is hidden that the mode needs.
+Every box carries its own sentence from `Field::help`, as a tooltip and on a line that follows the
+focus — the owner, 2026-10-22: *“the flat form can be designed better than the original and should
+have help/tooltips explaining what each field means”*.
+
+**Edit…** keeps it rather than guiding: Changing one field of a working source should not be four pages of
 ceremony, and by then every answer the wizard gathers has already been given.
 
 **And `Add tail…` is one page, not a wizard.** A tail is three facts — which source, a name, a

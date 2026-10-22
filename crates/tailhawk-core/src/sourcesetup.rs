@@ -425,6 +425,124 @@ impl Draft {
     }
 }
 
+/// One box on a source's form, and what it is for.
+///
+/// **The explanation is a fact about the field, not about the dialog**, which is why it lives here.
+/// The owner, 2026-10-22: *"the flat form can be designed better than the original and should have
+/// help/tooltips explaining what each field means"* — and two surfaces show it, the tooltip on hover
+/// and the line that follows the focus, so writing it twice would be writing two things that drift.
+///
+/// Every sentence here is about *this* estate rather than about OAuth in the abstract: what the box
+/// does, what fills it in, and what goes wrong if it is wrong. A reader who wanted the specification
+/// would not be on this screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Name,
+    Url,
+    Mode,
+    TokenUrl,
+    AuthUrl,
+    ClientId,
+    Secret,
+    Scope,
+}
+
+impl Field {
+    /// Every field, for the tests and for anything that walks them all.
+    pub const ALL: [Field; 8] = [
+        Field::Name,
+        Field::Url,
+        Field::Mode,
+        Field::TokenUrl,
+        Field::AuthUrl,
+        Field::ClientId,
+        Field::Secret,
+        Field::Scope,
+    ];
+
+    /// The label beside the box, mnemonic and colon included.
+    pub fn label(self) -> &'static str {
+        match self {
+            Field::Name => "Na&me:",
+            Field::Url => "&Server URL:",
+            Field::Mode => "Sign in &with:",
+            Field::TokenUrl => "To&ken URL:",
+            Field::AuthUrl => "Si&gn-in URL:",
+            Field::ClientId => "C&lient id:",
+            Field::Secret => "Secre&t:",
+            Field::Scope => "Sc&ope:",
+        }
+    }
+
+    /// What this box is for, in one or two sentences.
+    pub fn help(self) -> &'static str {
+        match self {
+            Field::Name => {
+                "What this server is called in Tailhawk's own lists. It is also the name its \
+                 sign-in is filed under in Windows Credential Manager, so renaming it moves the \
+                 credential with it."
+            }
+            Field::Url => {
+                "Where Loki answers — the base address, not a query; Tailhawk adds the rest. It \
+                 must begin with https:// and name a host, because a token on a cleartext \
+                 connection is a token given away."
+            }
+            Field::Mode => {
+                "How Tailhawk proves who is asking. Press Set up and the server is asked; this is \
+                 where you overrule the answer, and the boxes below follow what you choose."
+            }
+            Field::TokenUrl => {
+                "Where a token is collected from. On an identity server it is usually the \
+                 /connect/token path, and Set up fills it in from what the server advertises about \
+                 itself."
+            }
+            Field::AuthUrl => {
+                "Where you are sent to sign in, in a browser. Only the browser flow uses it, and \
+                 filling it in is what makes this source sign in that way rather than with a secret."
+            }
+            Field::ClientId => {
+                "The name this server knows Tailhawk by. It is assigned when the client is \
+                 registered, and it is the one thing asking the server cannot tell us."
+            }
+            Field::Secret => {
+                "The client secret, for a source that presents one instead of signing a reader in. \
+                 It is kept in Windows Credential Manager and never written to the settings file."
+            }
+            Field::Scope => {
+                "What to ask the token for. Leave it as Set up filled it in unless the server \
+                 refuses the request — a scope it does not grant is the usual reason a sign-in \
+                 that looks right still fails."
+            }
+        }
+    }
+}
+
+/// Which sign-in boxes a mode actually uses, in the order a reader is asked for them.
+///
+/// **This replaces the `Advanced` fold, and it is a better answer to the same problem.** The fold
+/// existed so that a reader who never pressed it never saw an OAuth term — but it hid *every*
+/// endpoint box behind one button, including the ones the reader had come to fill in, which is how
+/// the wizard's dead end stayed invisible for two days. A mode that needs nothing shows nothing,
+/// automatically and for every surface; a mode that needs four boxes shows exactly those four.
+pub fn signing_fields(mode: Mode) -> &'static [Field] {
+    match mode {
+        // Nothing to prove, so there is nothing to ask. The form says so in words instead.
+        Mode::Open => &[],
+        Mode::SignIn => &[
+            Field::TokenUrl,
+            Field::AuthUrl,
+            Field::ClientId,
+            Field::Scope,
+        ],
+        Mode::ClientSecret => &[
+            Field::TokenUrl,
+            Field::ClientId,
+            Field::Secret,
+            Field::Scope,
+        ],
+    }
+}
+
 /// Which of the three shapes a source already in the settings file is in.
 pub fn mode_of(source: &Source) -> Mode {
     if !source.auth_url.trim().is_empty() {
@@ -519,6 +637,112 @@ mod tests {
             3,
             "and the wizard says 'of 3', not 'of 4'"
         );
+    }
+
+    /// **Every field explains itself, and `Field::ALL` really is all of them.**
+    ///
+    /// The exhaustive match is the point of this test rather than decoration: `label` and `help` are
+    /// matches the compiler already checks, so a new variant cannot be left without either — but
+    /// nothing would make a new variant appear in `ALL`, and `ALL` is what the form walks. So a
+    /// missing variant would be a box with no tooltip and no help line, silently.
+    #[test]
+    fn every_field_of_a_source_says_what_it_is_for() {
+        let mut seen: Vec<Field> = Vec::new();
+        for field in Field::ALL {
+            // This match exists to fail compilation when a variant is added, which is how the
+            // assertion below comes to be true of a list somebody has to maintain by hand.
+            match field {
+                Field::Name
+                | Field::Url
+                | Field::Mode
+                | Field::TokenUrl
+                | Field::AuthUrl
+                | Field::ClientId
+                | Field::Secret
+                | Field::Scope => seen.push(field),
+            }
+            assert!(
+                field.help().len() > 40,
+                "{field:?} has no real explanation: {:?}",
+                field.help()
+            );
+            assert!(
+                field.help().ends_with('.'),
+                "{field:?}'s help is a sentence, so it ends like one"
+            );
+            assert_eq!(
+                field.label().matches('&').count(),
+                1,
+                "{field:?} needs exactly one keyboard mnemonic"
+            );
+            assert!(
+                field.label().ends_with(':'),
+                "{field:?} labels a box, so it ends in a colon"
+            );
+        }
+        assert_eq!(seen.len(), Field::ALL.len());
+        // **No two fields share a mnemonic**, because they are all on one form at once. The letter
+        // after the `&` is what Windows matches on Alt.
+        let mut keys: Vec<char> = Vec::new();
+        for field in Field::ALL {
+            let key = field
+                .label()
+                .split('&')
+                .nth(1)
+                .and_then(|rest| rest.chars().next())
+                .expect("a label with a mnemonic has a letter after it")
+                .to_ascii_lowercase();
+            assert!(
+                !keys.contains(&key),
+                "{field:?} takes Alt+{key}, which another field already has"
+            );
+            keys.push(key);
+        }
+    }
+
+    /// **A mode shows the boxes it uses and no others**, which is what replaced the `Advanced` fold.
+    #[test]
+    fn the_mode_decides_which_sign_in_boxes_the_form_shows() {
+        assert!(
+            signing_fields(Mode::Open).is_empty(),
+            "a Loki that wants nothing is asked for nothing"
+        );
+
+        let browser = signing_fields(Mode::SignIn);
+        assert!(
+            browser.contains(&Field::AuthUrl),
+            "a browser sign-in is sent somewhere"
+        );
+        assert!(
+            !browser.contains(&Field::Secret),
+            "and never asked for a secret \u{2014} Mode::SignIn's own doc comment says so"
+        );
+
+        let secret = signing_fields(Mode::ClientSecret);
+        assert!(
+            secret.contains(&Field::Secret),
+            "the one path with a secret"
+        );
+        assert!(
+            !secret.contains(&Field::AuthUrl),
+            "and no sign-in URL, since Source::signs_in is literally that field being non-empty"
+        );
+
+        // **What each mode shows is what `Source::fault` demands of it**, so a reader who fills in
+        // every box the form offers has a source the authority accepts. Scope is the exception: it
+        // is optional everywhere, which is why it is last.
+        for mode in [Mode::SignIn, Mode::ClientSecret] {
+            let shown = signing_fields(mode);
+            assert!(
+                shown.contains(&Field::TokenUrl) && shown.contains(&Field::ClientId),
+                "{mode:?} cannot authenticate without both of these"
+            );
+            assert_eq!(
+                shown.last(),
+                Some(&Field::Scope),
+                "{mode:?} asks the optional one last"
+            );
+        }
     }
 
     /// **Page one catches every rule about its own two boxes that the authority has.**

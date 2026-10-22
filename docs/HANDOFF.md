@@ -1,5 +1,101 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-22, later: the wizard has a way out, and the form is worth landing in
+
+`c059368` shipped the wizard. This closes the dead end it shipped with — and the owner's answer to it
+turned into a redesign of the form, which is the larger half of this.
+
+### What he decided
+
+> go with the explicit set it up myself
+
+Chosen over a fourth state on the decision page, and **against my recommendation** — his call is the
+better one for the same reason the dead end existed: the endpoint boxes live in the form, and a
+wizard page growing its own copies of them would be two places to keep in step. Then, unprompted:
+
+> the flat form can be designed better than the original and should have help/tooltips explaining
+> what each field means
+
+— which is the thing that makes the escape worth having. Landing a reader in the old wall of fields
+would have moved the dead end rather than closed it.
+
+### The escape
+
+`Set it up myself…` is **chrome on every page**, not a page's control, and that is what its test
+asserts: in the dialog once, absent from `G_PAGE_ANY`, claimed by no page in any mode. An escape
+owned by a page would be hidden by `setup_draw` on every page that did not claim it, starting with
+the one that needs it most. Pressing it reads the page, **takes a fresh async token** so a probe in
+flight cannot land on top of the form's work, and clones the draft out before the nested modal —
+which runs a loop that can dispatch back into `setup_proc` and take a second `&mut`. An accepted
+form **finishes the wizard**; a cancelled one returns to the page it left.
+
+### The form, and why the fold had to go
+
+**`Advanced` is gone.** It hid every endpoint box behind one button so that a reader who never
+pressed it never saw an OAuth term — a good instinct attached to the wrong mechanism, because the
+boxes it hid are exactly the ones a reader on the manual path has come to fill in. **That is how the
+dead end stayed invisible for two days.**
+
+`sourcesetup::signing_fields(mode)` decides instead:
+
+| Mode | Boxes |
+|---|---|
+| No sign-in needed | none — the group says so in a sentence rather than sitting empty |
+| Sign in with a browser | token URL, sign-in URL, client id, scope |
+| Client id and secret | token URL, client id, secret, scope |
+
+Same kindness, no trapdoor: a reader whose Loki needs nothing still never sees an OAuth term, and
+nothing is hidden that their mode needs. Gone with the fold: `source_edit_fold`, `fold_px`,
+`editor_buttons_y`, `source_edit_buttons_to`, `resize_dialog`, `SourceEdit::advanced`,
+`ID_E_ADVANCED` and the two-height test.
+
+**Every box explains itself**, from `Field::help` in the **core** — because what a box means is a
+fact about the field, not about the dialog. One sentence, two surfaces: the tooltip on hover and a
+line above the buttons that follows the focus, so they cannot drift. Handled before the state
+pointer is taken, so it cannot alias anything.
+
+**Two group boxes** (*The server*, *Signing in*), and **five template rows for four visible slots**:
+neither mode's set is a prefix of the other's, so rows on fixed lines would leave a hole where the
+other mode's box had been. The template gives each row its own line — which is what makes the
+geometry test mean anything — and runtime only ever compacts *upwards*.
+
+### Two Win32 facts that fail silently, so they are written down
+
+- **`tooltips_class32` is registered by `ICC_BAR_CLASSES`**, which this product had never asked for.
+  Without it `CreateWindowExW` fails, `source_edit_tips` returns early, and the form has no tooltips
+  — which looks exactly like tooltips nobody has hovered.
+- **A tooltip keeps the pointer it is given; it does not copy the string.** The eight texts are built
+  as UTF-16 once per process in a `OnceLock`. A per-dialog buffer would leak on every open, or be
+  read after it was dropped.
+
+### NOT SEEN ON SCREEN — and this is a layout change
+
+**Nothing of this has been on screen.** The gate is green on 1,401 tests, and the suite cannot see
+any of: whether the group-box captions read correctly in dark mode (a themed group box draws its own
+caption and ignores `WM_CTLCOLORBTN`), whether the tooltips actually appear, whether the help line is
+legible at its width, or whether a row lands where `source_edit_layout` means it to. Every screen run
+of this dialog so far has found something the suite could not — three defects on 2026-10-21 and one
+on 2026-10-22 — so this is the next thing to do, and it needs his desktop.
+
+### Still undone
+
+- **A credential can still be lost on a rename.** `main.rs:11062` reconciles queued secrets against
+  the names that *survived*, by name alone. Create a source with a secret, rename it in the same
+  sitting of the dialog, and the entry is dropped before anything is written. The same line orphans
+  a secret when the mode moves away from needing one. Found by review, pre-existing, wants a pure
+  function and a failing test of its own. **This is the one real defect left outstanding.**
+- The `Box<Probed>` leaks if a dialog is dismissed mid-probe. `tail_edit_proc` has the same hole.
+- A delete of a source asks and names its tail count; a delete of a tail does not ask. Not seen.
+- The other three list dialogs' dark-mode headers (Highlight rules, Define Format, Select Columns).
+- Under the Explorer theme a tree view draws its connector lines but `TVM_SETLINECOLOR` is inert.
+- `can_ask_server` still has no caller; the last page offers a tail without asking whether the
+  server can be asked anything. Said where it is defined.
+
+### The open question he has not answered
+
+**Is `telemetry.nurtur.tech` the right name for the migrated source?** It is what `host_name`
+produces, and `secrets::follow_rename` makes it safe either way — so this is taste, not risk.
+
 ## ▶ Resume point — 2026-10-22: the guided setup is built, and the review found seven defects in it
 
 `New source…` is a four-page wizard now, not the flat form. It has been walked on screen, its probe

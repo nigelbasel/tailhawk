@@ -22,7 +22,7 @@ use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
 };
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, HTREEITEM, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES,
+    InitCommonControlsEx, HTREEITEM, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES,
     INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
     LVITEMW, NMCUSTOMDRAW_DRAW_STATE_FLAGS, NMHDR, NMLVCUSTOMDRAW, NMTREEVIEWW,
     TREE_VIEW_ITEM_STATE_FLAGS, TVE_EXPAND, TVGN_CARET, TVGN_CHILD, TVGN_NEXT, TVGN_ROOT,
@@ -33,16 +33,14 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetClientRect,
-    GetDlgItem, GetDlgItemInt, GetDlgItemTextW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, IsWindowVisible, MapDialogRect, PostMessageW, SendDlgItemMessageW, SendMessageW,
-    SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW, SetWindowPos, ShowWindow, DLGTEMPLATE,
-    GW_CHILD, GW_HWNDNEXT, SM_CXVSCROLL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG,
-    WM_NCDESTROY, WM_NOTIFY,
+    GetDlgItem, GetDlgItemInt, GetDlgItemTextW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+    IsWindowVisible, MapDialogRect, PostMessageW, SendDlgItemMessageW, SendMessageW, SetDlgItemInt,
+    SetDlgItemTextW, SetWindowLongPtrW, SetWindowPos, ShowWindow, DLGTEMPLATE, SM_CXVSCROLL,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY,
 };
 
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, SetFocus,
@@ -152,7 +150,7 @@ const ID_T_FAULT: u16 = 334;
 const ID_E_NAME: u16 = 300;
 const ID_E_URL: u16 = 301;
 const ID_E_SETUP: u16 = 304;
-const ID_E_ADVANCED: u16 = 305;
+const ID_E_MODE_GROUP: u16 = 305;
 const ID_E_MODE: u16 = 306;
 const ID_E_TOKEN: u16 = 307;
 const ID_E_AUTH: u16 = 308;
@@ -160,6 +158,18 @@ const ID_E_CLIENT: u16 = 309;
 const ID_E_SCOPE: u16 = 310;
 const ID_E_SECRET: u16 = 311;
 const ID_E_FAULT: u16 = 312;
+const ID_E_SERVER_GROUP: u16 = 313;
+/// The line that explains whichever box has the focus. See [`Field::help`].
+const ID_E_HELP: u16 = 314;
+/// What the sign-in half says when the mode needs no boxes at all.
+const ID_E_NO_SIGNIN: u16 = 315;
+/// The labels of the mode-dependent rows. They have ids because they **move**: the row a box sits
+/// on depends on how many boxes the mode before it needed.
+const ID_E_L_TOKEN: u16 = 316;
+const ID_E_L_AUTH: u16 = 317;
+const ID_E_L_CLIENT: u16 = 318;
+const ID_E_L_SECRET: u16 = 319;
+const ID_E_L_SCOPE: u16 = 320;
 
 /// What a worker posts back to the sources dialog when a **Discover** or a **Test** has finished.
 ///
@@ -1970,6 +1980,9 @@ const ID_G_L_MODE: u16 = 366;
 const ID_G_L_CLIENT: u16 = 367;
 const ID_G_L_SECRET: u16 = 368;
 const ID_G_L_SCOPE: u16 = 369;
+/// The way out of the wizard and into the form, on every page. See
+/// [`no_page_of_the_guided_setup_is_a_dead_end`].
+const ID_G_MANUAL: u16 = 370;
 
 const G_DIALOG_W: i16 = 420;
 const G_DIALOG_H: i16 = 176;
@@ -2053,6 +2066,16 @@ fn setup_items() -> Vec<Item> {
         ),
         // The fault line and the row that walks the pages.
         Item::new(Class::Static, "", ID_G_FAULT, (7, 120, 406, 18), 0),
+        // **The way out, on every page.** Chrome rather than a page's control, for the reason
+        // [`no_page_of_the_guided_setup_is_a_dead_end`] gives: a page would hide it. It sits apart
+        // from the three buttons that walk the wizard because it does not walk it — it leaves.
+        Item::new(
+            Class::Button,
+            "Set it &up myself…",
+            ID_G_MANUAL,
+            (7, 148, 100, 14),
+            WS_TABSTOP,
+        ),
         Item::new(
             Class::Button,
             "< &Back",
@@ -2502,6 +2525,43 @@ unsafe extern "system" fn setup_proc(
                     setup_draw(hdlg, data);
                     1
                 }
+                // **"Set it up myself" hands the whole job to the form and leaves.**
+                //
+                // The owner chose this over a fourth state on page two, 2026-10-22: *"go with the
+                // explicit set it up myself"*. It is the right call for the reason the dead end
+                // existed at all — the endpoint boxes live in the form, and a wizard page that grew
+                // its own copies of them would be two places to keep in step.
+                //
+                // **Finishing in the form finishes the wizard.** Walking the reader back through
+                // pages they have just answered in full would be ceremony; so an accepted form
+                // closes this dialog as *Finish* would, with the draft the form produced. A
+                // cancelled form returns to the page they left, unchanged.
+                (ID_G_MANUAL, BN_CLICKED) => {
+                    setup_read(hdlg, data);
+                    // **Any probe in flight is now irrelevant and must not land on top of the
+                    // form's work.** Taking a fresh token is how this dialog says so: the answer
+                    // arrives, fails the comparison in `WM_G_PROBED`, and is dropped.
+                    data.asking = next_async_token();
+                    let mut edit = SourceEdit::new(data.draft.clone(), false);
+                    // **Nothing of ours is borrowed across the nested modal.** `show_source_editor`
+                    // runs a message loop that can dispatch to *this* procedure, which would take a
+                    // second `&mut` to the same state — so the draft is cloned out above, `data` is
+                    // not touched again on this path, and the state is fetched afresh below.
+                    let took = show_source_editor(hdlg, &mut edit);
+                    let Some(again) = setup_state(hdlg) else {
+                        return 1;
+                    };
+                    let again = unsafe { &mut *again };
+                    if took {
+                        again.draft = edit.draft;
+                        unsafe {
+                            let _ = EndDialog(hdlg, 1);
+                        }
+                    } else {
+                        setup_draw(hdlg, again);
+                    }
+                    1
+                }
                 (ID_G_MODE, CBN_SELCHANGE) => {
                     setup_read(hdlg, data);
                     // The mode decides which pages remain, so the counter can change under the
@@ -2572,21 +2632,52 @@ pub fn show_source_setup(owner: HWND, data: &mut SourceSetup) -> bool {
     data.accepted
 }
 
-/// The one-source editor, collapsed. **Advanced unfolds it to [`E_DIALOG_H_OPEN`]** rather than
-/// scrolling or a second dialog, which is the oldest Windows idiom there is for "most people never
-/// need this".
-const E_DIALOG_W: i16 = 420;
-const E_DIALOG_H: i16 = 118;
-/// Where the advanced block starts, which is also the line the fold hides everything below.
-const E_ADVANCED_Y: i16 = 100;
-/// The same dialog with the credential half shown.
+/// The one-source editor.
 ///
-/// **It has to clear the last field, not merely reach it.** The buttons sit at `height - 36`, the
-/// secret box ends at `E_ADVANCED_Y + 96`, and an open height of 222 put the two in the same place
-/// — Advanced, OK and Cancel were drawn over the secret row and clipped by the bottom edge. The
-/// 22 units of slack below the buttons are the collapsed layout's, kept so both states have the
-/// same margin.
-const E_DIALOG_H_OPEN: i16 = E_ADVANCED_Y + 96 + 8 + 14 + 22;
+/// **Two groups and no fold.** `Advanced` used to hide every endpoint box behind one button so that
+/// *"a reader who never presses it never sees an OAuth term"* — a good instinct about the wrong
+/// mechanism, because the boxes it hid were the ones a reader on the manual path had come to fill
+/// in. That is how the wizard's dead end stayed invisible for two days. The mode decides now
+/// ([`signing_fields`]): a Loki that needs no sign-in shows no sign-in boxes, which is the same
+/// kindness without the trapdoor.
+///
+/// **And every box explains itself**, which the owner asked for on 2026-10-22: *"the flat form can
+/// be designed better than the original and should have help/tooltips explaining what each field
+/// means"*. One sentence per field, from [`Field::help`], shown two ways — as a tooltip on hover and
+/// on the line above the buttons as the focus moves.
+const E_DIALOG_W: i16 = 420;
+const E_DIALOG_H: i16 = 282;
+
+/// *The server* — the two boxes every source has, whatever it does about signing in.
+const E_G1_Y: i16 = 7;
+const E_G1_H: i16 = 78;
+/// *Signing in* — the mode, and then whichever boxes the mode uses.
+const E_G2_Y: i16 = 89;
+const E_G2_H: i16 = 129;
+/// The first mode-dependent row, and the gap between rows.
+///
+/// **The rows are slots, not fixed positions.** `Mode::SignIn` wants a sign-in URL and no secret;
+/// `Mode::ClientSecret` wants a secret and no sign-in URL. Neither set is a prefix of the other, so
+/// boxes pinned to their own row would leave a hole wherever the other mode's box had been.
+/// [`signing_fields`] returns them in order and the shell drops them into slots.
+const E_SLOT_Y: i16 = 126;
+const E_SLOT_H: i16 = 18;
+/// **Five rows in the template, four ever on screen at once.**
+///
+/// The template is itself a valid layout — every row on its own line, nothing overlapping — because
+/// a template whose controls sit on top of each other cannot be checked by reading it, and the
+/// geometry test for this dialog would have to be told to ignore the very rows most likely to be
+/// wrong. Runtime only ever moves a row *up* into a lower-numbered slot, so what the test proves of
+/// the template holds of every mode.
+const E_SLOTS: usize = 5;
+/// The help line, and the row the two buttons sit on.
+const E_HELP_Y: i16 = 222;
+const E_BUTTONS_Y: i16 = E_DIALOG_H - 36;
+/// **Checked at compile time, because both sides are constants.** The help line sat where the
+/// buttons go for as long as it took to notice, and a runtime assertion about two `const`s is a
+/// test that can never fail at a time when it would help.
+const _: () = assert!(E_HELP_Y + 20 <= E_BUTTONS_Y);
+const _: () = assert!(E_SLOT_Y + E_SLOT_H * (E_SLOTS as i16 - 1) + 12 <= E_G2_Y + E_G2_H);
 
 /// One source's own screen — what **Edit…** opens, and what **New…** opens once the guided flow
 /// has finished with it.
@@ -2599,78 +2690,102 @@ const E_DIALOG_H_OPEN: i16 = E_ADVANCED_Y + 96 + 8 + 14 + 22;
 /// value still reachable for the configuration the magic cannot manage, which is the other half of
 /// what he asked for.
 fn source_edit_items() -> Vec<Item> {
-    let label = |text: &str, y: i16| Item::new(Class::Static, text, 0xFFFF, (7, y + 2, 58, 8), 0);
+    const BS_GROUPBOX: u32 = 0x0007;
+    let group = |text: &str, id: u16, y: i16, h: i16| {
+        Item::new(Class::Button, text, id, (7, y, 406, h), BS_GROUPBOX)
+    };
+    // Labels sit inside a group box, so they start one notch further in than they used to.
+    let label =
+        |text: &str, id: u16, y: i16| Item::new(Class::Static, text, id, (14, y + 2, 62, 8), 0);
     let field = |id: u16, y: i16, w: i16, style: u32| {
         Item::new(
             Class::Edit,
             "",
             id,
-            (69, y, w, 12),
+            (80, y, w, 12),
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | style,
         )
     };
-    let button = |text: &str, id: u16, x: i16, y: i16| {
-        Item::new(Class::Button, text, id, (x, y, 60, 14), WS_TABSTOP)
-    };
+    use tailhawk_core::sourcesetup::Field;
     vec![
-        label("&Name:", 7),
-        field(ID_E_NAME, 7, 344, 0),
-        label("&Server URL:", 23),
-        field(ID_E_URL, 23, 275, 0),
+        group("The server", ID_E_SERVER_GROUP, E_G1_Y, E_G1_H),
+        label(Field::Name.label(), 0xFFFF, 22),
+        field(ID_E_NAME, 22, 319, 0),
+        label(Field::Url.label(), 0xFFFF, 40),
+        // Narrower than the rest, because Set up sits on its row: pressing it is about the URL.
+        field(ID_E_URL, 40, 253, 0),
         // **One button on the front, and it is the whole analogy.** Press it and Tailhawk asks the
-        // server where it signs in, asks the Loki itself whether it answers, fills the five boxes
-        // behind Advanced from what came back, and says what it found in one sentence.
+        // server where it signs in, asks the Loki itself whether it answers, fills in what came
+        // back and says what it found in one sentence.
         //
         // **One button rather than two** — Discover and Test were separate on the form he rejected,
         // which made the reader responsible for knowing that configuring and checking are different
         // verbs. Setting up email asks you to press Next, not Next and then Check.
-        button("Set u&p", ID_E_SETUP, 353, 22),
-        // **No `Shows:` and no `Choose…`.** Both were here while one entry was a connection and a
-        // view at once; a selector and a list of applications are what a *tail* is, and they are on
-        // its screen now. What is left is the connection, which is all a source ever was.
-        Item::new(Class::Static, "", ID_E_FAULT, (7, 44, 406, 18), 0),
         Item::new(
             Class::Button,
-            "&Advanced",
-            ID_E_ADVANCED,
-            (7, 82, 70, 14),
+            "Set u&p",
+            ID_E_SETUP,
+            (339, 39, 60, 14),
             WS_TABSTOP,
         ),
+        // What Set up found, or what is still wrong. Inside the group it belongs to.
+        Item::new(Class::Static, "", ID_E_FAULT, (14, 58, 385, 22), 0),
+        group("Signing in", ID_E_MODE_GROUP, E_G2_Y, E_G2_H),
+        label(Field::Mode.label(), 0xFFFF, 106),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_E_MODE,
+            (80, 106, 200, 80),
+            WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        ),
+        // **What the sign-in half says when there is nothing to ask.** A group box with nothing in
+        // it reads as a dialog that failed to draw; a sentence reads as an answer.
+        Item::new(
+            Class::Static,
+            "This server answers without a sign-in, so there is nothing more to set up here.",
+            ID_E_NO_SIGNIN,
+            (14, E_SLOT_Y, 385, 18),
+            0,
+        ),
+        // **The mode-dependent rows, in template order rather than screen order.** Every one of
+        // these is moved to its slot by `source_edit_layout` before it is shown, so where they are
+        // written here matters only in that they must not be on top of anything that stays put.
+        label(Field::TokenUrl.label(), ID_E_L_TOKEN, E_SLOT_Y),
+        field(ID_E_TOKEN, E_SLOT_Y, 319, 0),
+        label(Field::AuthUrl.label(), ID_E_L_AUTH, E_SLOT_Y + E_SLOT_H),
+        field(ID_E_AUTH, E_SLOT_Y + E_SLOT_H, 319, 0),
+        label(
+            Field::ClientId.label(),
+            ID_E_L_CLIENT,
+            E_SLOT_Y + E_SLOT_H * 2,
+        ),
+        field(ID_E_CLIENT, E_SLOT_Y + E_SLOT_H * 2, 319, 0),
+        label(
+            Field::Secret.label(),
+            ID_E_L_SECRET,
+            E_SLOT_Y + E_SLOT_H * 3,
+        ),
+        field(ID_E_SECRET, E_SLOT_Y + E_SLOT_H * 3, 319, ES_PASSWORD),
+        label(Field::Scope.label(), ID_E_L_SCOPE, E_SLOT_Y + E_SLOT_H * 4),
+        field(ID_E_SCOPE, E_SLOT_Y + E_SLOT_H * 4, 319, 0),
+        // **The help line, which is why the fields no longer have to explain themselves in their
+        // labels.** It follows the focus; the same sentence is the box's tooltip.
+        Item::new(Class::Static, "", ID_E_HELP, (7, E_HELP_Y, 406, 20), 0),
         Item::new(
             Class::Button,
             "OK",
             IDOK,
-            (293, 82, 54, 14),
+            (293, E_BUTTONS_Y, 54, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
         Item::new(
             Class::Button,
             "Cancel",
             IDCANCEL,
-            (353, 82, 60, 14),
+            (353, E_BUTTONS_Y, 60, 14),
             WS_TABSTOP,
         ),
-        // **The advanced half.** Every one of these is hidden until Advanced is pressed, and the
-        // dialog is short enough that they are off its bottom edge until then — so a reader who
-        // never presses it never sees an OAuth term.
-        label("Sign in &with:", E_ADVANCED_Y),
-        Item::new(
-            Class::ComboBox,
-            "",
-            ID_E_MODE,
-            (69, E_ADVANCED_Y, 200, 80),
-            WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-        ),
-        label("To&ken URL:", E_ADVANCED_Y + 20),
-        field(ID_E_TOKEN, E_ADVANCED_Y + 20, 344, 0),
-        label("Si&gn-in URL:", E_ADVANCED_Y + 36),
-        field(ID_E_AUTH, E_ADVANCED_Y + 36, 344, 0),
-        label("C&lient id:", E_ADVANCED_Y + 52),
-        field(ID_E_CLIENT, E_ADVANCED_Y + 52, 344, 0),
-        label("Sc&ope:", E_ADVANCED_Y + 68),
-        field(ID_E_SCOPE, E_ADVANCED_Y + 68, 344, 0),
-        label("Secre&t:", E_ADVANCED_Y + 84),
-        field(ID_E_SECRET, E_ADVANCED_Y + 84, 344, ES_PASSWORD),
     ]
 }
 
@@ -2684,7 +2799,6 @@ pub struct SourceEdit {
     /// The name this source had when the editor opened. **The stored secret belongs to that name**,
     /// not to whatever is in the box now.
     opened_as: String,
-    advanced: bool,
 }
 
 impl SourceEdit {
@@ -2694,7 +2808,6 @@ impl SourceEdit {
             draft,
             accepted: false,
             has_secret,
-            advanced: false,
         }
     }
 }
@@ -2706,146 +2819,177 @@ const E_MODES: [tailhawk_core::sourcesetup::Mode; 3] = [
     tailhawk_core::sourcesetup::Mode::Open,
 ];
 
+/// The label and the box that stand for one field on the source editor.
+fn e_controls_of(field: tailhawk_core::sourcesetup::Field) -> (u16, u16) {
+    use tailhawk_core::sourcesetup::Field;
+    match field {
+        Field::Name => (0xFFFF, ID_E_NAME),
+        Field::Url => (0xFFFF, ID_E_URL),
+        Field::Mode => (0xFFFF, ID_E_MODE),
+        Field::TokenUrl => (ID_E_L_TOKEN, ID_E_TOKEN),
+        Field::AuthUrl => (ID_E_L_AUTH, ID_E_AUTH),
+        Field::ClientId => (ID_E_L_CLIENT, ID_E_CLIENT),
+        Field::Secret => (ID_E_L_SECRET, ID_E_SECRET),
+        Field::Scope => (ID_E_L_SCOPE, ID_E_SCOPE),
+    }
+}
+
+/// Which field a control belongs to, for the help line that follows the focus.
+fn e_field_of(id: u16) -> Option<tailhawk_core::sourcesetup::Field> {
+    tailhawk_core::sourcesetup::Field::ALL
+        .into_iter()
+        .find(|field| e_controls_of(*field).1 == id)
+}
+
+/// Each field's help as UTF-16, built once per process.
+///
+/// **A tooltip keeps the pointer it is given; it does not copy the string.** So the buffer has to
+/// outlive the tooltip, and a buffer built per dialog would either leak on every open or be read
+/// after it was dropped. Eight strings, once, for the life of the process.
+fn e_help_wide(field: tailhawk_core::sourcesetup::Field) -> *mut u16 {
+    use std::sync::OnceLock;
+    use tailhawk_core::sourcesetup::Field;
+    static TEXTS: OnceLock<Vec<Vec<u16>>> = OnceLock::new();
+    let texts = TEXTS.get_or_init(|| Field::ALL.iter().map(|f| wsz(f.help())).collect());
+    let at = Field::ALL.iter().position(|f| *f == field).unwrap_or(0);
+    texts[at].as_ptr().cast_mut()
+}
+
+/// Hangs a tooltip off every box, carrying the same sentence the help line shows.
+///
+/// **`TTF_SUBCLASS` is what makes this one call rather than a message pump.** The tooltip control
+/// subclasses each box and picks the hover up itself; without it the dialog would have to relay
+/// every mouse message, which is the bespoke half of a job the control already does. Asked for by
+/// the owner on 2026-10-22, alongside the help line: *"should have help/tooltips explaining what
+/// each field means"*.
+fn source_edit_tips(hdlg: HWND) {
+    use tailhawk_core::sourcesetup::Field;
+    use windows::Win32::UI::Controls::{
+        TOOLTIPS_CLASS, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTTOOLINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, WINDOW_STYLE, WS_EX_TOPMOST, WS_POPUP,
+    };
+    const TTS_ALWAYSTIP: u32 = 0x01;
+    const TTS_NOPREFIX: u32 = 0x02;
+    let tip = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASS,
+            windows_core::PCWSTR::null(),
+            WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+            0,
+            0,
+            0,
+            0,
+            hdlg,
+            None,
+            None,
+            None,
+        )
+    };
+    let Ok(tip) = tip else { return };
+    // **Without a maximum width a tooltip is one line**, however long the sentence, and runs off
+    // the side of the screen. With one it wraps at that width and honours `\n` as well.
+    unsafe {
+        SendMessageW(tip, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(300));
+    }
+    for field in Field::ALL {
+        let (_, id) = e_controls_of(field);
+        let Ok(control) = (unsafe { GetDlgItem(hdlg, i32::from(id)) }) else {
+            continue;
+        };
+        let mut info = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            hwnd: hdlg,
+            uId: control.0 as usize,
+            lpszText: windows::core::PWSTR(e_help_wide(field)),
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                tip,
+                TTM_ADDTOOLW,
+                WPARAM(0),
+                LPARAM(&mut info as *mut TTTOOLINFOW as isize),
+            );
+        }
+    }
+}
+
+/// Puts the mode's sign-in boxes in the slots, in order, and hides the ones it does not use.
+///
+/// **This is the `Advanced` fold's replacement**, and the decision half of it is
+/// [`signing_fields`]: a pure list of which boxes this mode uses. All that is left here is
+/// `SetWindowPos`, which is the only kind of thing the view is supposed to be doing.
+fn source_edit_layout(hdlg: HWND, mode: tailhawk_core::sourcesetup::Mode) {
+    use tailhawk_core::sourcesetup::{signing_fields, Field};
+    let wanted = signing_fields(mode);
+    editor_quietly(|| {
+        for field in Field::ALL {
+            let (label, box_) = e_controls_of(field);
+            // Name, URL and the mode combo are on every mode's screen and never move.
+            if label == 0xFFFF {
+                continue;
+            }
+            let at = wanted.iter().position(|f| *f == field);
+            for (n, id) in [label, box_].into_iter().enumerate() {
+                let Ok(control) = (unsafe { GetDlgItem(hdlg, i32::from(id)) }) else {
+                    continue;
+                };
+                let Some(slot) = at else {
+                    let _ = unsafe { ShowWindow(control, SW_HIDE) };
+                    continue;
+                };
+                // There are only so many slots, and a row placed past the last one would be drawn
+                // outside the group box that is supposed to contain it.
+                let slot = slot.min(E_SLOTS - 1);
+                // The label sits two units below the box's top, as the template has it.
+                let y = E_SLOT_Y + E_SLOT_H * slot as i16 + if n == 0 { 2 } else { 0 };
+                let mut r = RECT {
+                    left: 0,
+                    top: i32::from(y),
+                    right: 4,
+                    bottom: i32::from(y) + 8,
+                };
+                let _ = unsafe { MapDialogRect(hdlg, &mut r) };
+                let mut now = RECT::default();
+                if unsafe { GetWindowRect(control, &mut now) }.is_err() {
+                    continue;
+                }
+                let mut corner = POINT {
+                    x: now.left,
+                    y: now.top,
+                };
+                let _ = unsafe { ScreenToClient(hdlg, &mut corner) };
+                let _ = unsafe {
+                    SetWindowPos(
+                        control,
+                        None,
+                        corner.x,
+                        r.top,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                };
+                let _ = unsafe { ShowWindow(control, SW_SHOW) };
+            }
+        }
+        // The sentence that stands in for the boxes when there are none.
+        if let Ok(says) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_NO_SIGNIN)) } {
+            let _ = unsafe { ShowWindow(says, if wanted.is_empty() { SW_SHOW } else { SW_HIDE }) };
+        }
+    });
+}
+
 fn source_edit_state(hdlg: HWND) -> Option<*mut SourceEdit> {
     let ptr =
         unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) } as *mut SourceEdit;
     (!ptr.is_null()).then_some(ptr)
 }
 
-/// Shows or hides the advanced half and resizes the dialog around it.
-fn source_edit_fold(hdlg: HWND, open: bool) {
-    const ADVANCED: [u16; 6] = [
-        ID_E_MODE,
-        ID_E_TOKEN,
-        ID_E_AUTH,
-        ID_E_CLIENT,
-        ID_E_SCOPE,
-        ID_E_SECRET,
-    ];
-    // **The labels go with their fields.** They carry no id of their own — every one is `0xFFFF` —
-    // so they are found by where they are rather than by what they are called: anything below the
-    // fold belongs to it.
-    let mut hiding: Vec<HWND> = Vec::new();
-    let mut child = unsafe { GetWindow(hdlg, GW_CHILD) }.unwrap_or_default();
-    while !child.is_invalid() {
-        let mut r = RECT::default();
-        if unsafe { GetWindowRect(child, &mut r) }.is_ok() {
-            let mut corner = POINT {
-                x: r.left,
-                y: r.top,
-            };
-            let _ = unsafe { ScreenToClient(hdlg, &mut corner) };
-            // **The buttons are never swept.** They are moved to the bottom edge rather than
-            // belonging to either half, so position alone would hide them the moment they crossed
-            // the fold line.
-            let id = unsafe { GetDlgCtrlID(child) } as u16;
-            if corner.y >= fold_px(hdlg) && !matches!(id, ID_E_ADVANCED | IDOK | IDCANCEL) {
-                hiding.push(child);
-            }
-        }
-        child = unsafe { GetWindow(child, GW_HWNDNEXT) }.unwrap_or_default();
-    }
-    for h in hiding {
-        let _ = unsafe { ShowWindow(h, if open { SW_SHOW } else { SW_HIDE }) };
-    }
-    let _ = ADVANCED;
-    let height = if open { E_DIALOG_H_OPEN } else { E_DIALOG_H };
-    // **The buttons go to the new bottom.** Growing the dialog underneath them left OK and Cancel
-    // stranded in the middle of it, above the very fields the reader had just asked to see — which
-    // reads as the dialog having two halves rather than one that unfolded.
-    source_edit_buttons_to(hdlg, editor_buttons_y(open));
-    resize_dialog(hdlg, height);
-}
-
-/// Where the three bottom-edge buttons sit, in dialog units, in each of the dialog's two heights.
-///
-/// **Named so a test can hold it.** It was `height - 36` inline, and an open height that did not
-/// clear the last field drew Advanced, OK and Cancel over the secret box and clipped them on the
-/// bottom edge — arithmetic that no template walk could see, because the buttons move at runtime
-/// and the template only knows where they start.
-fn editor_buttons_y(open: bool) -> i16 {
-    (if open { E_DIALOG_H_OPEN } else { E_DIALOG_H }) - 36
-}
-
-/// Moves the three buttons that live on the dialog's bottom edge to `y`, in dialog units.
-fn source_edit_buttons_to(hdlg: HWND, y: i16) {
-    let mut r = RECT {
-        left: 0,
-        top: y as i32,
-        right: 4,
-        bottom: y as i32 + 8,
-    };
-    let _ = unsafe { MapDialogRect(hdlg, &mut r) };
-    for id in [ID_E_ADVANCED, IDOK, IDCANCEL] {
-        let Ok(button) = (unsafe { GetDlgItem(hdlg, i32::from(id)) }) else {
-            continue;
-        };
-        let mut at = RECT::default();
-        if unsafe { GetWindowRect(button, &mut at) }.is_err() {
-            continue;
-        }
-        let mut corner = POINT {
-            x: at.left,
-            y: at.top,
-        };
-        let _ = unsafe { ScreenToClient(hdlg, &mut corner) };
-        let _ = unsafe {
-            SetWindowPos(
-                button,
-                None,
-                corner.x,
-                r.top,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        };
-    }
-}
-
-/// The client-area y, in pixels, that the advanced block starts at — the same dialog units the
-/// template used, mapped through the font the dialog actually got.
-fn fold_px(hdlg: HWND) -> i32 {
-    let mut r = RECT {
-        left: 0,
-        top: E_ADVANCED_Y as i32,
-        right: 4,
-        bottom: E_ADVANCED_Y as i32 + 8,
-    };
-    let _ = unsafe { MapDialogRect(hdlg, &mut r) };
-    r.top
-}
-
-/// Grows or shrinks the dialog to `height` dialog units, keeping its top-left where it is.
-fn resize_dialog(hdlg: HWND, height: i16) {
-    let mut r = RECT {
-        left: 0,
-        top: 0,
-        right: 4,
-        bottom: height as i32,
-    };
-    let _ = unsafe { MapDialogRect(hdlg, &mut r) };
-    let mut outer = RECT::default();
-    if unsafe { GetWindowRect(hdlg, &mut outer) }.is_err() {
-        return;
-    }
-    let mut client = RECT::default();
-    if unsafe { GetClientRect(hdlg, &mut client) }.is_err() {
-        return;
-    }
-    let chrome = (outer.bottom - outer.top) - (client.bottom - client.top);
-    let _ = unsafe {
-        SetWindowPos(
-            hdlg,
-            None,
-            0,
-            0,
-            outer.right - outer.left,
-            r.bottom + chrome,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-        )
-    };
-}
 /// Points every box at the draft. **The secret box is never filled from the store** — this dialog
 /// cannot show a secret, only replace one, which is `sourceset`'s rule in its second home.
 ///
@@ -2877,6 +3021,9 @@ fn source_edit_fill(hdlg: HWND, data: &SourceEdit) {
         }
         source_edit_say(hdlg, data);
     });
+    // **Which boxes are on screen is part of filling it in.** The mode decides, so a draft read
+    // back from the settings file opens showing exactly the boxes its mode uses.
+    source_edit_layout(hdlg, data.draft.mode_now());
 }
 
 thread_local! {
@@ -2972,7 +3119,7 @@ unsafe extern "system" fn source_edit_proc(
                 .unwrap_or(0);
             editor_quietly(|| combo_fill(hdlg, ID_E_MODE, &names, at));
             source_edit_fill(hdlg, data);
-            source_edit_fold(hdlg, data.advanced);
+            source_edit_tips(hdlg);
             1
         }
         WM_COMMAND => {
@@ -2993,6 +3140,16 @@ unsafe extern "system" fn source_edit_proc(
             // inside a synchronous write, so every notification arriving while the flag is set was
             // provoked by this dialog and has nothing to tell it.
             if EDITOR_QUIET.with(|q| q.get()) {
+                return 1;
+            }
+            // **The help line follows the focus, and it needs no state to do it.** What a box is
+            // for is a fact about the field — `Field::help` — not about this draft, so this is
+            // handled before the state pointer is taken and cannot alias anything. It is the same
+            // sentence the box's tooltip carries, from the same place, so the two cannot drift.
+            if code == EN_SETFOCUS || code == CBN_SETFOCUS {
+                if let Some(field) = e_field_of(id) {
+                    editor_quietly(|| set_dlg_text(hdlg, ID_E_HELP, field.help()));
+                }
                 return 1;
             }
             let Some(data) = source_edit_state(hdlg) else {
@@ -3037,6 +3194,9 @@ unsafe extern "system" fn source_edit_proc(
                     // still fill in the endpoints, but it may not overrule the choice.
                     data.draft.mode_chosen = true;
                     source_edit_say(hdlg, data);
+                    // The boxes below follow the choice — which is what the mode being a fork
+                    // means, and what `Advanced` could not do.
+                    source_edit_layout(hdlg, data.draft.mode_now());
                     return 1;
                 }
                 // **Reads the boxes, then leaves the dialog alone.** The URL being asked about is
@@ -3085,28 +3245,16 @@ unsafe extern "system" fn source_edit_proc(
                     });
                     return 1;
                 }
-                (ID_E_ADVANCED, BN_CLICKED) => {
-                    data.advanced = !data.advanced;
-                    source_edit_fold(hdlg, data.advanced);
-                    return 1;
-                }
                 (IDOK, BN_CLICKED) => {
                     source_edit_read(hdlg, data);
                     // A source that cannot be used says why and stays open, rather than being
                     // written in a state the first query would fail on.
                     if data.draft.fault().is_some() {
                         source_edit_say(hdlg, data);
-                        // Unfold, because the reason may be behind the fold and a complaint about
-                        // a box the reader cannot see is worse than none.
-                        if !data.advanced
-                            && data
-                                .draft
-                                .blocking(tailhawk_core::sourcesetup::Step::Server)
-                                .is_none()
-                        {
-                            data.advanced = true;
-                            source_edit_fold(hdlg, true);
-                        }
+                        // **No unfolding to do any more.** This used to open the advanced half on
+                        // the way out, because the box being complained about could be behind it;
+                        // every box the mode uses is on screen from the start now, which is the
+                        // same guarantee without the special case.
                         return 1;
                     }
                     data.accepted = true;
@@ -3194,6 +3342,18 @@ fn reach_of(reached: &crate::pull::Reached) -> tailhawk_core::sourcesetup::Reach
 
 /// One source's own screen. Reports whether it was accepted.
 pub fn show_source_editor(parent: HWND, data: &mut SourceEdit) -> bool {
+    // **`tooltips_class32` has to be asked for, and this product never had.** The tooltip is
+    // created rather than declared in the template, so an unregistered class does not fail
+    // visibly — `CreateWindowExW` returns an error, `source_edit_tips` returns early, and the
+    // form simply has no tooltips, which is indistinguishable from not having written them.
+    // Tooltips live in `ICC_BAR_CLASSES`, with the toolbars and the status bars.
+    let icc = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_BAR_CLASSES,
+    };
+    unsafe {
+        let _ = InitCommonControlsEx(&icc);
+    }
     let t = template(
         "Remote source",
         E_DIALOG_W,
@@ -5982,6 +6142,9 @@ const EN_KILLFOCUS: u32 = 0x0200;
 /// easy warning to read past.
 const BN_CLICKED: u32 = 0;
 const CBN_SELCHANGE: u32 = 1;
+/// A box taking the focus, which is what moves the source editor's help line.
+const EN_SETFOCUS: u32 = 0x0100;
+const CBN_SETFOCUS: u32 = 3;
 const EM_GETSEL: u32 = 0x00B0;
 const EM_SETSEL: u32 = 0x00B1;
 
@@ -8740,6 +8903,7 @@ mod tests {
             ID_G_FAULT,
             ID_G_BACK,
             ID_G_NEXT,
+            ID_G_MANUAL,
             IDCANCEL,
         ];
         // **Every page in every mode**, because the mode decides what the credential page holds:
@@ -8845,6 +9009,7 @@ mod tests {
             ID_G_FAULT,
             ID_G_BACK,
             ID_G_NEXT,
+            ID_G_MANUAL,
             IDCANCEL,
         ];
         for item in setup_items() {
@@ -8855,6 +9020,53 @@ mod tests {
                 item.id
             );
         }
+    }
+
+    /// **No page is a dead end.**
+    ///
+    /// `blocking(Step::HowToSignIn)` refuses **Next** when a sign-in has no token URL, and the
+    /// wizard has no token-URL box — so a Loki whose identity server is not discoverable had no
+    /// honest way through at all: Cancel, or *No sign-in needed*, which builds an unauthenticated
+    /// source against a server that has just answered 401. The owner asked for this case when he
+    /// asked for discovery — *"there should probably be an avanced option for scnarios that just
+    /// dont work on the automatic discovery pattern"* — and chose its shape on 2026-10-22: *"go with
+    /// the explicit set it up myself"*.
+    ///
+    /// **So the escape is chrome**, and that is the thing worth a test. It is in the dialog once, it
+    /// is on every page, and it is therefore *absent* from `G_PAGE_ANY` — the list `setup_draw`
+    /// hides. An escape owned by a page would be hidden by every page that did not claim it,
+    /// starting with the one that needs it most.
+    #[test]
+    fn no_page_of_the_guided_setup_is_a_dead_end() {
+        use tailhawk_core::sourcesetup::{Mode, Step};
+        let items = setup_items();
+        let escape: Vec<&Item> = items.iter().filter(|i| i.id == ID_G_MANUAL).collect();
+        assert_eq!(
+            escape.len(),
+            1,
+            "the way out to the form is in the dialog exactly once"
+        );
+        assert!(
+            !G_PAGE_ANY.contains(&ID_G_MANUAL),
+            "the escape is chrome: in G_PAGE_ANY it would be hidden by every page not claiming it"
+        );
+        for mode in [Mode::SignIn, Mode::ClientSecret, Mode::Open] {
+            for step in [
+                Step::Server,
+                Step::HowToSignIn,
+                Step::Credential,
+                Step::Ready,
+            ] {
+                assert!(
+                    !setup_page_controls(step, mode).contains(&ID_G_MANUAL),
+                    "{step:?} in {mode:?} claims the escape, so it is a page control after all"
+                );
+            }
+        }
+        assert!(
+            escape[0].text.contains('&'),
+            "and it is reachable from the keyboard like every other button"
+        );
     }
 
     /// **A browser sign-in is never shown the secret box**, which is the owner's own question about
@@ -9119,14 +9331,88 @@ mod tests {
         }
     }
 
-    /// **The one-source editor fits in both of its heights, and the buttons clear every field in
-    /// each.** They move at runtime, so no walk of the template alone can see where they end up —
-    /// which is how Advanced, OK and Cancel came to be drawn over the secret box and clipped by the
-    /// bottom edge, in a dialog whose template was perfectly well formed.
+    /// **Every field has a box on the form, every box leads back to its field, and every row that
+    /// moves has a label it can move.**
+    ///
+    /// The help line and the tooltips both go through `e_controls_of`, and a field whose id is not
+    /// in the template fails *silently*: no tooltip appears, which looks exactly like a tooltip
+    /// that has not been hovered, and the help line stays on whatever it last said. Nothing on
+    /// screen would show it.
+    ///
+    /// The last assertion is the one with teeth. A mode-dependent row is moved into its slot by
+    /// `source_edit_layout`, and `GetDlgItem` cannot find a control whose id is `0xFFFF` — so a
+    /// label left as the shared `IDC_STATIC` would stay where the template put it while its box
+    /// moved out from under it.
     #[test]
-    fn the_source_editor_fits_both_of_its_heights() {
+    fn every_field_of_the_source_editor_has_a_box_and_an_explanation() {
+        use tailhawk_core::sourcesetup::{signing_fields, Field, Mode};
         let items = source_edit_items();
-        let movable = [ID_E_ADVANCED, IDOK, IDCANCEL];
+        for field in Field::ALL {
+            let (label, box_) = e_controls_of(field);
+            assert!(
+                items.iter().any(|i| i.id == box_),
+                "{field:?} has no box on the form, so its help is unreachable"
+            );
+            assert_eq!(
+                e_field_of(box_),
+                Some(field),
+                "{field:?}'s box does not lead back to it, so the help line cannot name it"
+            );
+            if label != 0xFFFF {
+                assert!(
+                    items.iter().any(|i| i.id == label),
+                    "{field:?}'s label id is not in the template"
+                );
+                assert!(
+                    items
+                        .iter()
+                        .any(|i| i.id == label && i.text == field.label()),
+                    "{field:?}'s label on screen is not the one the field declares"
+                );
+            }
+        }
+        for mode in [Mode::SignIn, Mode::ClientSecret, Mode::Open] {
+            for field in signing_fields(mode) {
+                assert_ne!(
+                    e_controls_of(*field).0,
+                    0xFFFF,
+                    "{field:?} is moved into a slot, so its label needs an id of its own"
+                );
+            }
+        }
+    }
+
+    /// **The one-source editor fits, each group holds its own rows, and nothing collides with
+    /// anything it can be on screen beside.**
+    ///
+    /// Three kinds of thing make a plain pairwise check wrong here, and naming them is most of the
+    /// value of this test:
+    ///
+    /// * **A group box contains its rows**, so it overlaps every one of them by design. It is a
+    ///   container, and what is worth asserting of it is containment rather than separation.
+    /// * **`ID_E_NO_SIGNIN` sits on the first slot**, because it is what that slot says when the
+    ///   mode has no boxes at all. It and the rows are never both up.
+    /// * **The mode-dependent rows move.** The template gives each one its own line so that this
+    ///   walk means something; at runtime they are compacted upwards into [`E_SLOTS`] slots, which
+    ///   only ever moves a row onto a line this test has already cleared.
+    ///
+    /// It replaces a test of the `Advanced` fold's two heights, which went when the fold did.
+    #[test]
+    fn the_source_editor_fits_and_each_group_holds_its_rows() {
+        let items = source_edit_items();
+        let groups = [ID_E_SERVER_GROUP, ID_E_MODE_GROUP];
+        let rows = [
+            ID_E_L_TOKEN,
+            ID_E_TOKEN,
+            ID_E_L_AUTH,
+            ID_E_AUTH,
+            ID_E_L_CLIENT,
+            ID_E_CLIENT,
+            ID_E_L_SECRET,
+            ID_E_SECRET,
+            ID_E_L_SCOPE,
+            ID_E_SCOPE,
+        ];
         for item in &items {
             assert!(item.x >= 0 && item.y >= 0, "{:?} starts outside", item.text);
             assert!(
@@ -9135,13 +9421,21 @@ mod tests {
                 item.text
             );
             assert!(
-                item.y + height_of(item) <= E_DIALOG_H_OPEN,
-                "{:?} runs past the bottom of the unfolded dialog",
-                item.text
+                item.y + height_of(item) <= E_DIALOG_H,
+                "{:?} runs past the bottom: {} + {} > {E_DIALOG_H}",
+                item.text,
+                item.y,
+                height_of(item)
             );
         }
-        for (i, a) in items.iter().enumerate() {
-            for b in items.iter().skip(i + 1) {
+
+        // Everything that is not a container, with the mutually exclusive sentence held back.
+        let laid_out: Vec<&Item> = items
+            .iter()
+            .filter(|i| !groups.contains(&i.id) && i.id != ID_E_NO_SIGNIN)
+            .collect();
+        for (n, a) in laid_out.iter().enumerate() {
+            for b in laid_out.iter().skip(n + 1) {
                 let apart = a.x + a.w <= b.x
                     || b.x + b.w <= a.x
                     || a.y + height_of(a) <= b.y
@@ -9149,29 +9443,54 @@ mod tests {
                 assert!(apart, "{:?} and {:?} overlap", a.text, b.text);
             }
         }
-
-        // **Unfolded, the buttons clear everything.**
-        let open_y = editor_buttons_y(true);
-        for item in items.iter().filter(|i| !movable.contains(&i.id)) {
+        // The stand-in sentence may share a slot with a row, and with nothing else.
+        let says = items
+            .iter()
+            .find(|i| i.id == ID_E_NO_SIGNIN)
+            .expect("the sign-in group says something when it has no boxes");
+        for other in laid_out.iter().filter(|i| !rows.contains(&i.id)) {
+            let apart = says.x + says.w <= other.x
+                || other.x + other.w <= says.x
+                || says.y + says.h <= other.y
+                || other.y + height_of(other) <= says.y;
             assert!(
-                item.y + height_of(item) <= open_y,
-                "{:?} ends at {} and the buttons move to {open_y}",
-                item.text,
-                item.y + item.h
+                apart,
+                "the no-sign-in sentence overlaps {:?}, which is not a row it stands in for",
+                other.text
             );
         }
-        // **Folded, they clear everything that is still showing** — which is everything above the
-        // fold line, since the rest is hidden.
-        let shut_y = editor_buttons_y(false);
-        for item in items
-            .iter()
-            .filter(|i| !movable.contains(&i.id) && i.y < E_ADVANCED_Y)
-        {
+
+        // **Each group contains every row that belongs to it.** A row drawn outside its group box
+        // is exactly what the groups exist to stop the reader having to puzzle out.
+        for group in groups {
+            let at = items
+                .iter()
+                .find(|i| i.id == group)
+                .expect("the group box is in the template");
+            let mine: Vec<&&Item> = laid_out
+                .iter()
+                .filter(|i| i.y >= at.y && i.y < at.y + at.h)
+                .collect();
+            assert!(!mine.is_empty(), "{:?} holds nothing", at.text);
+            for row in mine {
+                assert!(
+                    row.y + height_of(row) <= at.y + at.h && row.x >= at.x,
+                    "{:?} is not inside {:?}",
+                    row.text,
+                    at.text
+                );
+            }
+        }
+
+        // **The help line clears both groups.** The slots fitting inside the sign-in group, and
+        // the help line clearing the buttons, are both comparisons of constants and are asserted
+        // at compile time beside the constants themselves.
+        for group in groups {
+            let at = items.iter().find(|i| i.id == group).unwrap();
             assert!(
-                item.y + height_of(item) <= shut_y,
-                "{:?} ends at {} and the folded buttons sit at {shut_y}",
-                item.text,
-                item.y + item.h
+                at.y + at.h <= E_HELP_Y,
+                "{:?} runs into the help line",
+                at.text
             );
         }
     }
