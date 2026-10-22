@@ -1,6 +1,75 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-21, late: a source is a connection, a tail is a view
+## ▶ Resume point — 2026-10-22: the tree has verbs, the tails have checkboxes, the menu has two levels
+
+The source/tail split shipped yesterday as `77ad922` (CI green, all five jobs). This is what came of
+putting it on screen.
+
+### What he asked for, having seen it
+
+> If nothing is selected then the add tail button should be disabled, same thing if a tail is
+> enabled, there should be a clone button. there should also be an open option when a tail is
+> selected. probably the tails should have checkboxes to select multiple tails to start. also, the
+> remote sources menu should reflect the tree by having a multiple level menu
+
+and then, unprompted: *"the checkboxes sshould be on the tails, not the sources"*. All five are
+built, seen working on screen, and he has approved them: *"ok, that looks good"*.
+
+| | |
+|---|---|
+| **Open** | A verb, first in the column. Closes the dialog (opening is leaving), saves as Close does, and the shell starts the windows *after* the settings are written. |
+| **Checkboxes** | `TVS_CHECKBOXES` in the template — it must be set before any item is inserted — with `tv_no_checkbox` clearing the state image on every **source** row. |
+| **Multi-open** | `sourceset::tails_to_open(ticked, chosen)`: ticks beat the selection, duplicates collapse, a source opens nothing. |
+| **Two-level menu** | `sourceset::menu_tree` + `MenuSource`; `remote_menu_of` nests a submenu per server. A server with no tails is listed and greyed; a tail with no source sits at the top level. |
+| **The greying** | Already correct, and now proven: with a source selected `Open` is disabled, and clicking a tail enables it. |
+
+### Three things the screen settled that nothing else could
+
+**The selection does reach the model.** The worry was that `TVN_SELCHANGEDW` never arrived, which
+would have left `Edit…` opening the source's screen for a chosen tail. It arrives.
+
+**He has exercised `Add tail…` and `Choose…` against the live server, and they work.** A fourth tail
+`ndc` appeared in his settings at 07:45, carrying a `with_label`-built `{app=~…}` query over nineteen
+real NDC service names. That is the applications picker reaching his Loki, getting the real list back
+and writing the tail correctly — the first end-to-end run of either, and the handoff has carried
+*"never pressed against a live server"* since 2026-10-20. **`Set up` / `Discover` / `Test` still have
+not been.**
+
+**And one defect was never real.** The verb column went from 60 units to 80 because a screenshot
+looked as though the ellipsis in `New source…` was clipped. At four times zoom there is whitespace to
+spare on both sides: `…` is one character (U+2026) whose three dots merge into a dash at that size.
+Worse, the test written for it was calibrated to 5 units/character *specifically so it would fail* on
+the old layout — tuning a test until a non-defect trips it. It is back to the textbook 4 and its doc
+comment now says it has never caught anything. The width is kept for the derivation
+(`S_VERB_W`/`S_VERB_X`/`S_BODY_W` from the dialog's own width) rather than the number.
+
+### Knowingly undone
+
+- **The wizard.** `New source…` opens the source *form*. `sourcesetup::Draft::steps`, `Step` and
+  `can_ask_server` still have no consumer. `docs/design/sources-wizard.md` records that its page 4 is
+  superseded by the tail editor.
+- **`Set up` / `Discover` / `Test` have never been pressed against a live server.**
+- A delete of a source asks and names its tail count; a delete of a tail does not ask. Not seen.
+- The other three list dialogs' dark-mode headers (Highlight rules, Define Format, Select Columns).
+- Under the Explorer theme a tree view draws its connector lines but `TVM_SETLINECOLOR` is inert.
+
+### The open question he has not answered
+
+**Is `telemetry.nurtur.tech` the right name for the migrated source?** It is what `host_name`
+produces, and `secrets::follow_rename` makes it safe either way — so this is taste, not risk. It is
+the name at the root of his tree from now on.
+
+### Two things about driving this app from a harness, learned the hard way
+
+**Post the command; do not type it.** `SetForegroundWindow` is refused while the desktop is in use,
+so three attempts at `Alt+T, R` missed entirely. `PostMessageW(hwnd, WM_COMMAND, 35, 0)` opens the
+Remote sources dialog every time — 35 is `Command::EditSources`'s index in `Command::LISTED`.
+
+**Every `W` import needs `CharSet.Unicode`.** Without it `GetClassNameW` and `GetWindowTextW` write
+UTF-16 that is read back as ANSI, so every caption truncates to its first character and
+`FindWindowExW` can never match. That one cost three failed runs and looked like an application fault
+each time.
+## 2026-10-21, late: a source is a connection, a tail is a view
 
 **His model, in his words**, and it is the fix for a cluster of defects rather than a refactor:
 

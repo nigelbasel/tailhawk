@@ -5224,12 +5224,21 @@ impl Shell {
         }
     }
 
-    /// What `File ▸ Open remote` lists: **the tails, not the sources.** A source is a server and a
-    /// sign-in; what a reader opens is a view of one, and since 2026-10-21 those are separate
-    /// things. The owner's words: *"They can add a source, and then can create new tail with a name
-    /// and choose how the source gets filtered to be displayed."*
-    fn tail_names(&self) -> Vec<String> {
-        self.settings.tails.iter().map(|t| t.name.clone()).collect()
+    /// What `File ▸ Open remote` lists: **the tails, nested under the sources they read.**
+    ///
+    /// A source is a server and a sign-in; what a reader opens is a view of one, and since
+    /// 2026-10-21 those are separate things — the owner's words: *"They can add a source, and then
+    /// can create new tail with a name and choose how the source gets filtered to be displayed."*
+    /// The menu shows that shape since 2026-10-22, on his ask that it *"reflect the tree by having
+    /// a multiple level menu"*; a flat list of tail names threw away which server each one reads,
+    /// which is the one thing the split is for.
+    fn remote_tree(
+        &self,
+    ) -> (
+        Vec<tailhawk_core::sourceset::MenuSource>,
+        Vec<(usize, String)>,
+    ) {
+        tailhawk_core::sourceset::menu_tree(&self.settings.sources, &self.settings.tails)
     }
 
     /// Writes §12.4's state: where the window is, how each open file is being looked at, the
@@ -9607,13 +9616,13 @@ fn open_remote_menu(hwnd: HWND) -> bool {
         let state = s.borrow();
         let Some(shell) = state.as_ref() else {
             return (
-                Vec::new(),
+                (Vec::new(), Vec::new()),
                 None,
                 tailhawk_core::settings::remote_minutes_of(None),
             );
         };
         (
-            shell.tail_names(),
+            shell.remote_tree(),
             shell.toolbar.as_ref().map(|bar| bar.hwnd()),
             tailhawk_core::settings::remote_minutes_of(shell.settings.remote_minutes),
         )
@@ -9622,7 +9631,8 @@ fn open_remote_menu(hwnd: HWND) -> bool {
     else {
         return false;
     };
-    let items = menubar::remote_menu_of(&sources, minutes);
+    let (nested, loose) = sources;
+    let items = menubar::remote_menu_of(&nested, &loose, minutes);
     if let Some(id) = menubar::track_context(hwnd, &items, x, y) {
         // **Posted, not run.** This is called from inside comctl32's `TBN_DROPDOWN` handling, and
         // `Remote sources…` opens a modal dialog: running it here would put a second modal loop
@@ -11031,6 +11041,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             store: Vec::new(),
             forget: Vec::new(),
             rename: Vec::new(),
+            open: Vec::new(),
         };
         // No `STATE` borrow is held across this: the dialog pumps its own modal loop.
         if dialog::show_sources_dialog(hwnd, &mut edit) {
@@ -11100,6 +11111,26 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                     shell.save_settings(hwnd);
                 }
             });
+            // **Opened after the settings are written, and outside every borrow.** `Open` is the
+            // reader leaving the dialog *for* these windows, so the configuration that names them
+            // must be on disk before the first fetch goes out — and `open_remembered_or_pick`
+            // takes borrows of its own and pumps a picker, which is why nothing of the shell is
+            // held here.
+            for name in &edit.open {
+                let found = STATE.with(|s| {
+                    s.borrow().as_ref().and_then(|shell| {
+                        let at = shell.settings.tails.iter().position(|t| &t.name == name)?;
+                        tail_and_source(shell, at)
+                    })
+                });
+                match found {
+                    Some((source, tail)) => open_remembered_or_pick(hwnd, source, tail),
+                    None => set_notice(
+                        hwnd,
+                        format!("{name}: that tail reads a source that is no longer configured."),
+                    ),
+                }
+            }
         }
         return true;
     }
@@ -13286,6 +13317,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if let Some(top) = top {
                 let tree = STATE.with(|s| {
                     s.borrow().as_ref().map(|shell| {
+                        // Built here and passed in, because `menu_bar` takes them by reference and
+                        // a temporary built inside the argument list would not outlive the call.
+                        let (remote_sources, remote_loose) = shell.remote_tree();
                         menubar::menu_bar(
                             shell.document.as_ref(),
                             menubar::BarState {
@@ -13300,7 +13334,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 can_tile: shell.document.can_tile(),
                             },
                             &shell.settings.recent,
-                            &shell.tail_names(),
+                            &remote_sources,
+                            &remote_loose,
                             &shell
                                 .document
                                 .as_ref()
@@ -14328,6 +14363,9 @@ fn main() -> Result<()> {
                 ..Default::default()
             },
             &recent,
+            // No sources, no loose tails and no columns: this is the bar built before any
+            // settings are read, so it can name nothing the reader configured.
+            &[],
             &[],
             &[],
         )) {
@@ -16558,6 +16596,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             );
             for top in 0..menu.items().len() {
                 let Some(items) = menu.at(&[top]) else {
@@ -16577,6 +16616,7 @@ mod tests {
                     toolbar: true,
                     ..Default::default()
                 },
+                &[],
                 &[],
                 &[],
                 &[],
@@ -16635,6 +16675,7 @@ mod tests {
                     toolbar: true,
                     ..Default::default()
                 },
+                &[],
                 &[],
                 &[],
                 &[],

@@ -506,10 +506,20 @@ fn tail_row_fault(tail: &Tail, sources: &[Source]) -> Option<&'static str> {
     if let Some(fault) = tail_fault(tail, sources) {
         return Some(fault);
     }
-    if tail.query.trim().is_empty() {
+    if nothing_to_ask_for(tail) {
         return Some("Say what this tail shows — a selector such as {application=\"ndc\"}.");
     }
     None
+}
+
+/// Whether this tail names nothing for the server to answer.
+///
+/// **Applications with no selector are a selector.** [`crate::apps::with_label`] writes
+/// `{app="job-dispatcher"}` for an empty query rather than refusing it, so a tail carrying only
+/// applications opens perfectly well — the owner's own `nurtur-loki-jobdispatcher` is that shape.
+/// An empty query alone is therefore not the question; having neither is.
+fn nothing_to_ask_for(tail: &Tail) -> bool {
+    tail.query.trim().is_empty() && tail.apps.iter().all(|app| app.trim().is_empty())
 }
 
 /// Why a tail cannot be used, or `None`.
@@ -556,10 +566,80 @@ pub fn tail_being_edited(tail: &Tail, taken: &[String]) -> Option<&'static str> 
     if tail.source.trim().is_empty() {
         return Some("Say which source this tail reads.");
     }
-    if tail.query.trim().is_empty() {
+    if nothing_to_ask_for(tail) {
         return Some("Say what this tail shows — a selector such as {application=\"ndc\"}.");
     }
     None
+}
+
+/// One server as `File ▸ Open remote` lists it: its name, and the tails under it with the index
+/// each one is opened by.
+///
+/// **The menu mirrors the tree, which is the owner's ask of 2026-10-22**: *"the remote sources menu
+/// should reflect the tree by having a multiple level menu"*. A flat list of tails was what the
+/// menu had the moment the model gained two levels, and it threw away the one thing the split is
+/// for — which server a view reads.
+///
+/// **It owns its strings** rather than borrowing the settings, because both callers read the shell
+/// under a `STATE` borrow and then *drop it* before building the menu — a menu is tracked in a
+/// modal loop and holding that borrow across one is the re-entrancy panic this file's deferred
+/// dialogs exist to avoid. A menu is built on demand, so the copies cost nothing that matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuSource {
+    pub name: String,
+    /// `(index into `tails()`, the tail's name)`, in list order.
+    pub tails: Vec<(usize, String)>,
+}
+
+/// The sources and their tails, as a menu should nest them.
+///
+/// **A tail whose source is not in the set comes back under `None`**, the way the tree hangs it at
+/// the root: a hand-edited file can produce one, and a menu that silently omitted it would be the
+/// configuration quietly disagreeing with the dialog that lists it.
+pub fn menu_tree(sources: &[Source], tails: &[Tail]) -> (Vec<MenuSource>, Vec<(usize, String)>) {
+    let mut out: Vec<MenuSource> = Vec::with_capacity(sources.len());
+    for source in sources {
+        out.push(MenuSource {
+            name: source.name.clone(),
+            tails: tails
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.source == source.name)
+                .map(|(n, t)| (n, t.name.clone()))
+                .collect(),
+        });
+    }
+    let loose: Vec<(usize, String)> = tails
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !sources.iter().any(|s| s.name == t.source))
+        .map(|(n, t)| (n, t.name.clone()))
+        .collect();
+    (out, loose)
+}
+
+/// Which tails `Open` should start, given what is ticked and what is selected.
+///
+/// **Ticking is the deliberate gesture and it wins.** The owner, 2026-10-22: *"probably the tails
+/// should have checkboxes to select multiple tails to start"* — so when any box is ticked, those
+/// are the tails, and the highlighted row is only where the caret happens to be. With nothing
+/// ticked the selection is the obvious intent, and `Open` on a *source* opens nothing, because a
+/// source is a server and has no window of its own.
+///
+/// **Ordered and deduplicated**, because each one becomes a window: two routes to the same tail
+/// must not open it twice, and the order a reader ticked them in is not an order worth preserving
+/// over the order they are listed in.
+pub fn tails_to_open(ticked: &[usize], chosen: Chosen) -> Vec<usize> {
+    if !ticked.is_empty() {
+        let mut out = ticked.to_vec();
+        out.sort_unstable();
+        out.dedup();
+        return out;
+    }
+    match chosen {
+        Chosen::Tail(at) => vec![at],
+        _ => Vec::new(),
+    }
 }
 
 /// How many tails the set will **add** — and the bound the two `File ▸ Open remote` id ranges are
@@ -1457,5 +1537,130 @@ mod tests {
             ],
             "the first tail *drawn* is tails[1]; a counter would have called it Tail(0)"
         );
+    }
+
+    /// **A tail with applications and no selector is complete, because the applications *are* the
+    /// selector.** `apps::with_label` writes `{app="job-dispatcher"}` for an empty query rather than
+    /// refusing it, so such a tail opens.
+    ///
+    /// **Found on the owner's own configuration, before the tree had even been looked at.** His
+    /// `nurtur-loki-jobdispatcher` is exactly this shape — `apps = ["job-dispatcher"]`, no query —
+    /// and the empty-query rule written the day before would have drawn a fault on it in the tree
+    /// and refused to let its editor be accepted unchanged. A warning on a working row is how a
+    /// warning stops being read, which this project has a scar about already.
+    #[test]
+    fn applications_with_no_selector_are_the_selector() {
+        let his = Tail {
+            name: "nurtur-loki-jobdispatcher".to_owned(),
+            source: "telemetry.nurtur.tech".to_owned(),
+            query: String::new(),
+            apps: vec!["job-dispatcher".to_owned()],
+        };
+        assert_eq!(
+            tail_row_fault(&his, &[source("telemetry.nurtur.tech")]),
+            None,
+            "the row must not warn about a tail that opens"
+        );
+        assert_eq!(
+            tail_being_edited(&his, &[]),
+            None,
+            "and the editor must accept it unchanged"
+        );
+
+        // With neither, there is nothing to ask the server for and both say so.
+        let neither = Tail {
+            apps: Vec::new(),
+            ..his
+        };
+        assert_eq!(
+            tail_row_fault(&neither, &[source("telemetry.nurtur.tech")]),
+            Some("Say what this tail shows — a selector such as {application=\"ndc\"}.")
+        );
+        assert_eq!(
+            tail_being_edited(&neither, &[]),
+            Some("Say what this tail shows — a selector such as {application=\"ndc\"}.")
+        );
+    }
+
+    /// **Ticking several tails and pressing Open starts all of them**, which is the owner's ask of
+    /// 2026-10-22. The highlighted row is where the caret is, not what was asked for.
+    #[test]
+    fn ticked_tails_are_what_open_starts() {
+        assert_eq!(
+            tails_to_open(&[2, 0], Chosen::Tail(1)),
+            [0, 2],
+            "the ticks win over the selection, in list order"
+        );
+        assert_eq!(
+            tails_to_open(&[1, 1, 1], Chosen::Nothing),
+            [1],
+            "and a tail reached twice is still one window"
+        );
+    }
+
+    /// With nothing ticked the selection is the intent — and a **source** is not a window.
+    #[test]
+    fn with_nothing_ticked_open_takes_the_selected_tail_and_only_a_tail() {
+        assert_eq!(tails_to_open(&[], Chosen::Tail(3)), [3]);
+        assert!(
+            tails_to_open(&[], Chosen::Source(0)).is_empty(),
+            "a source is a server; it has no window of its own"
+        );
+        assert!(tails_to_open(&[], Chosen::Nothing).is_empty());
+    }
+
+    /// **The menu nests the way the tree does**, and each tail keeps the index it is opened by —
+    /// which is its position in `tails()`, not its position in the menu. Those differ as soon as
+    /// two sources' tails interleave, and handing the menu a position would open the wrong one.
+    #[test]
+    fn the_menu_nests_tails_under_their_source_and_keeps_their_real_index() {
+        let editor = opened();
+        let (nested, loose) = menu_tree(editor.sources(), editor.tails());
+        let shape: Vec<(&str, Vec<(usize, &str)>)> = nested
+            .iter()
+            .map(|m| {
+                (
+                    m.name.as_str(),
+                    m.tails.iter().map(|(n, t)| (*n, t.as_str())).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("loki", vec![(0, "ndc"), (1, "identity")]),
+                ("spare", vec![(2, "spare-view")]),
+            ]
+        );
+        assert!(loose.is_empty());
+    }
+
+    /// A tail whose source is missing is listed, not dropped — as the tree hangs it at the root.
+    #[test]
+    fn a_tail_with_no_source_is_still_on_the_menu() {
+        let mut editor = Editor::new(
+            vec![source("loki")],
+            vec![tail("ndc", "loki"), tail("orphan", "gone")],
+            vec![false],
+        );
+        editor.open();
+        let (nested, loose) = menu_tree(editor.sources(), editor.tails());
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].tails, [(0, "ndc".to_owned())]);
+        assert_eq!(
+            loose,
+            [(1, "orphan".to_owned())],
+            "under no server, carrying the index that opens it"
+        );
+    }
+
+    /// A source with no tails is still a row, because it is still a server the reader configured.
+    #[test]
+    fn a_source_with_no_tails_is_on_the_menu_with_nothing_under_it() {
+        let mut editor = Editor::new(vec![source("empty")], Vec::new(), vec![false]);
+        editor.open();
+        let (nested, _) = menu_tree(editor.sources(), editor.tails());
+        assert_eq!(nested.len(), 1);
+        assert!(nested[0].tails.is_empty());
     }
 }

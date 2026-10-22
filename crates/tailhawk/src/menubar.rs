@@ -449,26 +449,66 @@ fn column_number(n: usize) -> String {
 /// the bar says to narrow the time range or the selector: `Choose applications` is the selector and
 /// `Fetch window` is the time range, which until 2026-10-05 was a constant with no menu item
 /// anywhere — so the advice named two remedies and only one of them could be followed.
-pub fn remote_menu_of(tails: &[String], minutes: u32) -> Vec<tailhawk_core::menu::Item> {
+pub fn remote_menu_of(
+    sources: &[tailhawk_core::sourceset::MenuSource],
+    loose: &[(usize, String)],
+    minutes: u32,
+) -> Vec<tailhawk_core::menu::Item> {
     use tailhawk_core::menu::Item;
     // **Bounded, and it says when it bounded.** Each id range holds
-    // [`tailhawk_core::sourceset::MAX_TAILS`] entries, so a longer list — which only a hand-edited
-    // settings file produces — would run the n-th item's id into the next range. The ones left out
-    // are *named as left out* rather than silently dropped, because a list that quietly ends is how
-    // a reader concludes a tail they configured has gone.
-    let shown = tails.len().min(tailhawk_core::sourceset::MAX_TAILS);
-    let mut items: Vec<Item> = tails[..shown]
+    // [`tailhawk_core::sourceset::MAX_TAILS`] entries, so a tail whose index reached past that
+    // would run into the next range. The ones left out are *named as left out* rather than
+    // silently dropped, because a list that quietly ends is how a reader concludes a tail they
+    // configured has gone.
+    let fits = |at: usize| at < tailhawk_core::sourceset::MAX_TAILS;
+    let leaf = |base: u32, at: usize, name: &str| {
+        Item::command(&name.replace('&', "&&"), "", base + at as u32)
+    };
+    let dropped = sources
         .iter()
-        .enumerate()
-        .map(|(n, name)| Item::command(&name.replace('&', "&&"), "", ID_SOURCE_BASE + n as u32))
-        .collect();
-    if shown < tails.len() {
+        .flat_map(|s| s.tails.iter())
+        .chain(loose.iter())
+        .filter(|(at, _)| !fits(*at))
+        .count();
+
+    // **A submenu per server, which is the tree drawn as a menu.** A flat list of tails threw away
+    // the one thing the source/tail split is for — which server a view reads — and the owner asked
+    // for it back on 2026-10-22: *"the remote sources menu should reflect the tree by having a
+    // multiple level menu"*.
+    let nest = |base: u32| -> Vec<Item> {
+        let mut rows: Vec<Item> = Vec::new();
+        for source in sources {
+            let under: Vec<Item> = source
+                .tails
+                .iter()
+                .filter(|(at, _)| fits(*at))
+                .map(|(at, name)| leaf(base, *at, name))
+                .collect::<Vec<Item>>();
+            // **A server with nothing under it is still listed, and disabled.** It is a thing the
+            // reader configured; a menu that hid it would disagree with the dialog that lists it,
+            // and an empty submenu you can open onto nothing is worse than a greyed row.
+            let row = Item::submenu(&source.name.replace('&', "&&"), under);
+            rows.push(match source.tails.iter().any(|(at, _)| fits(*at)) {
+                true => row,
+                false => row.disabled(),
+            });
+        }
+        // A tail whose source is not configured hangs at the top level, as it hangs at the tree's
+        // root, rather than vanishing from the one surface that would have explained it.
+        rows.extend(
+            loose
+                .iter()
+                .filter(|(at, _)| fits(*at))
+                .map(|(at, name)| leaf(base, *at, name)),
+        );
+        rows
+    };
+
+    let mut items: Vec<Item> = nest(ID_SOURCE_BASE);
+    if dropped > 0 {
         items.push(
             Item::command(
-                &format!(
-                    "and {} more — open them from Remote sources…",
-                    tails.len() - shown
-                ),
+                &format!("and {dropped} more — open them from Remote sources…"),
                 "",
                 ID_UNLISTED,
             )
@@ -479,13 +519,7 @@ pub fn remote_menu_of(tails: &[String], minutes: u32) -> Vec<tailhawk_core::menu
         items.push(Item::separator());
         items.push(Item::submenu(
             "Choose &applications",
-            tails[..shown]
-                .iter()
-                .enumerate()
-                .map(|(n, name)| {
-                    Item::command(&name.replace('&', "&&"), "", ID_SOURCE_PICK_BASE + n as u32)
-                })
-                .collect(),
+            nest(ID_SOURCE_PICK_BASE),
         ));
         items.push(Item::submenu(
             "Fetch &window",
@@ -543,7 +577,11 @@ pub fn menu_bar(
     doc: Option<&Document>,
     state: BarState,
     recent: &[tailhawk_core::settings::Recent],
-    sources: &[String],
+    // The sources with their tails nested, and the tails whose source is not configured — see
+    // [`tailhawk_core::sourceset::menu_tree`]. Two parameters rather than one tuple because the
+    // second is the odd case and naming it keeps it from being forgotten.
+    sources: &[tailhawk_core::sourceset::MenuSource],
+    loose_tails: &[(usize, String)],
     // **Not `columns`**: this function already binds that name to a bool — whether the document has
     // any columns at all — and a parameter of the same name is silently shadowed by it. The slice
     // was unreachable here for three compiles, saying so only as an `unused variable` warning.
@@ -591,6 +629,7 @@ pub fn menu_bar(
             "Open re&mote source",
             remote_menu_of(
                 sources,
+                loose_tails,
                 tailhawk_core::settings::remote_minutes_of(Some(state.remote_minutes)),
             ),
         ),
@@ -985,6 +1024,22 @@ fn compact_path(path: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// One server with the named tails under it, as `menu_tree` would hand them over.
+    ///
+    /// **The menu nests since 2026-10-22** — the owner: *"the remote sources menu should reflect
+    /// the tree by having a multiple level menu"* — so a test that wants two openable tails needs a
+    /// server to hang them from, and the index each carries is what opens it.
+    fn under(server: &str, tails: &[&str]) -> Vec<tailhawk_core::sourceset::MenuSource> {
+        vec![tailhawk_core::sourceset::MenuSource {
+            name: server.to_owned(),
+            tails: tails
+                .iter()
+                .enumerate()
+                .map(|(n, t)| (n, (*t).to_owned()))
+                .collect(),
+        }]
+    }
+
     /// A fixture column. `HeaderColumn` has no `Default`, and the cell geometry is nothing a menu
     /// reads — `title` and `label` are kept deliberately different because they are different in
     /// life: the title is what a filter is written against, the label is what is drawn.
@@ -1026,6 +1081,7 @@ mod tests {
                 toolbar: true,
                 ..BarState::default()
             },
+            &[],
             &[],
             &[],
             &columns,
@@ -1204,18 +1260,17 @@ mod tests {
     /// item nor the toolbar button is ever a dead end, and neither is ever greyed.
     #[test]
     fn the_remote_menu_always_ends_with_the_way_to_configure_one() {
-        let none = remote_menu_of(&[], 60);
+        let none = remote_menu_of(&[], &[], 60);
         assert_eq!(none.len(), 1, "no sources, no separator, no blank menu");
         assert_eq!(none[0].text(), "Remote sources…");
         assert_eq!(none[0].id, Some(command_id(Command::EditSources)));
 
-        let two = remote_menu_of(&["live".to_owned(), "qa".to_owned()], 60);
+        let two = remote_menu_of(&under("telemetry", &["live", "qa"]), &[], 60);
         let text: Vec<String> = two.iter().map(|i| i.text()).collect();
         assert_eq!(
             text,
             [
-                "live",
-                "qa",
+                "telemetry",
                 "",
                 "Choose applications",
                 "Fetch window",
@@ -1224,8 +1279,17 @@ mod tests {
             ],
             "the two remedies a cut answer names sit together, above the separator"
         );
-        assert_eq!(two[0].id, Some(ID_SOURCE_BASE));
-        assert_eq!(two[1].id, Some(ID_SOURCE_BASE + 1));
+        // **And the tails are under their server, not beside it** — the owner's ask of 2026-10-22.
+        // A flat list threw away the one thing the source/tail split is for.
+        let under_it: Vec<(String, Option<u32>)> =
+            two[0].items.iter().map(|i| (i.text(), i.id)).collect();
+        assert_eq!(
+            under_it,
+            [
+                ("live".to_owned(), Some(ID_SOURCE_BASE)),
+                ("qa".to_owned(), Some(ID_SOURCE_BASE + 1)),
+            ]
+        );
     }
 
     /// **The way back to the picker lists the same sources under its own ids.** An entry that
@@ -1234,13 +1298,20 @@ mod tests {
     /// because a source with nothing remembered is also one whose picker a reader may want twice.
     #[test]
     fn choosing_applications_again_offers_every_source() {
-        let items = remote_menu_of(&["live".to_owned(), "qa".to_owned()], 60);
+        let items = remote_menu_of(&under("telemetry", &["live", "qa"]), &[], 60);
         let choose = items
             .iter()
             .find(|i| i.text() == "Choose applications")
             .expect("the submenu is there whenever any source is");
-        let inner: Vec<(String, Option<u32>)> =
-            choose.items.iter().map(|i| (i.text(), i.id)).collect();
+        // **It nests the same way the open list does**, because it is the same tree asked a
+        // different question — one submenu per server, the tails inside it.
+        let servers: Vec<String> = choose.items.iter().map(|i| i.text()).collect();
+        assert_eq!(servers, ["telemetry"]);
+        let inner: Vec<(String, Option<u32>)> = choose.items[0]
+            .items
+            .iter()
+            .map(|i| (i.text(), i.id))
+            .collect();
         assert_eq!(
             inner,
             [
@@ -1249,15 +1320,16 @@ mod tests {
             ]
         );
 
-        // **The two ranges must not overlap**, or choosing the picker would open the source and
-        // the reader would never see the list they asked for.
+        // **The two ranges must not overlap**, or choosing the picker would open the tail and the
+        // reader would never see the list they asked for. `MAX_TAILS`, not `MAX_SOURCES`: the menu
+        // has listed tails since 2026-10-21 and this assertion was still sized for the old one.
         assert!(
-            ID_SOURCE_PICK_BASE >= ID_SOURCE_BASE + tailhawk_core::sourceset::MAX_SOURCES as u32,
+            ID_SOURCE_PICK_BASE >= ID_SOURCE_BASE + tailhawk_core::sourceset::MAX_TAILS as u32,
             "the pick range starts inside the open range"
         );
 
         // Nothing configured, nothing to choose from: no empty submenu.
-        assert!(remote_menu_of(&[], 60)
+        assert!(remote_menu_of(&[], &[], 60)
             .iter()
             .all(|i| i.text() != "Choose applications"));
     }
@@ -1286,6 +1358,7 @@ mod tests {
                     can_tile,
                     ..BarState::default()
                 },
+                &[],
                 &[],
                 &[],
                 &[],
@@ -1334,7 +1407,7 @@ mod tests {
     /// looking for it had no reason to come.
     #[test]
     fn the_fetch_window_is_on_the_menu_and_checks_the_chosen_one() {
-        let items = remote_menu_of(&["live".to_owned()], 240);
+        let items = remote_menu_of(&under("telemetry", &["live"]), &[], 240);
         let window = items
             .iter()
             .find(|i| i.text() == "Fetch window")
@@ -1363,7 +1436,7 @@ mod tests {
             assert_eq!(*id, Some(ID_WINDOW_BASE + n as u32));
         }
 
-        assert!(remote_menu_of(&[], 60)
+        assert!(remote_menu_of(&[], &[], 60)
             .iter()
             .all(|i| i.text() != "Fetch window"));
     }
@@ -1373,9 +1446,13 @@ mod tests {
     /// and a name that is all one word could take a mnemonic another item already owns.
     #[test]
     fn an_ampersand_in_a_source_name_survives_the_menu() {
-        let items = remote_menu_of(&["R&D".to_owned()], 60);
-        assert_eq!(items[0].label, "R&&D", "doubled for Windows");
-        assert_eq!(items[0].text(), "R&D", "drawn as the user typed it");
+        // **Both levels draw a name the reader chose**, so both have to escape it. The server's
+        // name only started being drawn on 2026-10-22, when the menu grew its second level.
+        let items = remote_menu_of(&under("S&P", &["R&D"]), &[], 60);
+        assert_eq!(items[0].label, "S&&P", "the server, doubled for Windows");
+        assert_eq!(items[0].text(), "S&P", "drawn as the user typed it");
+        assert_eq!(items[0].items[0].label, "R&&D", "and the tail under it");
+        assert_eq!(items[0].items[0].text(), "R&D");
     }
 
     /// The File menu and the toolbar drop the same list — one function, so they cannot answer the
@@ -1391,6 +1468,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         let file = menu.at(&[0]).expect("File opens").to_vec();
         let remote = file
@@ -1400,7 +1478,7 @@ mod tests {
         assert!(remote.enabled, "never greyed: it is the way in");
         assert_eq!(
             remote.items.iter().map(|i| i.text()).collect::<Vec<_>>(),
-            remote_menu_of(&[], 60)
+            remote_menu_of(&[], &[], 60)
                 .iter()
                 .map(|i| i.text())
                 .collect::<Vec<_>>()
@@ -1421,6 +1499,7 @@ mod tests {
                     regroup_separates: separates,
                     ..BarState::default()
                 },
+                &[],
                 &[],
                 &[],
                 &[],
@@ -1519,6 +1598,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         let mut keys = Vec::new();
         advertised(menu.items(), &mut keys);
@@ -1549,6 +1629,7 @@ mod tests {
                 toolbar: true,
                 ..BarState::default()
             },
+            &[],
             &[],
             &[],
             &[],
@@ -1598,6 +1679,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .ids();
         let missing: Vec<&str> = Command::LISTED
@@ -1644,6 +1726,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                 ),
             ),
             (
@@ -1655,6 +1738,7 @@ mod tests {
                         ..BarState::default()
                     },
                     &recent,
+                    &[],
                     &[],
                     &[],
                 ),
@@ -1671,6 +1755,7 @@ mod tests {
                         toolbar: true,
                         ..BarState::default()
                     },
+                    &[],
                     &[],
                     &[],
                     &[
@@ -1727,6 +1812,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         let mut bare: Vec<String> = Vec::new();
         for top in 0..menu.items().len() {
@@ -1756,6 +1842,7 @@ mod tests {
                 toolbar: true,
                 ..BarState::default()
             },
+            &[],
             &[],
             &[],
             &[],
@@ -1842,6 +1929,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         let file = menu.at(&[0]).expect("File opens").to_vec();
         assert!(
@@ -1864,6 +1952,7 @@ mod tests {
                 ..Default::default()
             },
             &paths,
+            &[],
             &[],
             &[],
         );
@@ -1974,6 +2063,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         let file = menu.at(&[0]).expect("File").to_vec();
         assert!(
@@ -2000,6 +2090,7 @@ mod tests {
                     toolbar: true,
                     ..Default::default()
                 },
+                &[],
                 &[],
                 &[],
                 &[],

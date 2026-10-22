@@ -24,10 +24,12 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, HTREEITEM, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES,
     INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
-    LVITEMW, NMCUSTOMDRAW_DRAW_STATE_FLAGS, NMHDR, NMLVCUSTOMDRAW, NMTREEVIEWW, TVE_EXPAND,
-    TVGN_CARET, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMEXW, TVI_LAST,
-    TVI_ROOT, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM, TVN_SELCHANGEDW,
-    TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    LVITEMW, NMCUSTOMDRAW_DRAW_STATE_FLAGS, NMHDR, NMLVCUSTOMDRAW, NMTREEVIEWW,
+    TREE_VIEW_ITEM_STATE_FLAGS, TVE_EXPAND, TVGN_CARET, TVGN_CHILD, TVGN_NEXT, TVGN_ROOT,
+    TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_STATEIMAGEMASK,
+    TVITEMEXW, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EXPAND, TVM_GETITEMW,
+    TVM_GETNEXTITEM, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETITEMW, TVN_SELCHANGEDW,
+    TVS_CHECKBOXES, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetClientRect,
@@ -132,6 +134,7 @@ const ID_S_CLONE: u16 = 223;
 const ID_S_NEW: u16 = 226;
 const ID_S_EDIT: u16 = 227;
 const ID_S_ADD_TAIL: u16 = 228;
+const ID_S_OPEN: u16 = 229;
 
 /// The one-tail editor's controls — its own range beside the source editor's, and for the same
 /// reason: it opens on top of the tree and a stray id must not reach the tree's own verbs.
@@ -704,6 +707,23 @@ const R_FIELD_X: i16 = 55;
 const S_DIALOG_W: i16 = 420;
 /// The height, for the reason [`S_DIALOG_W`] gives.
 const S_DIALOG_H: i16 = 165;
+/// How wide the verb column is, and how far from the left edge it starts.
+///
+/// **It is eighty because sixty was misread, not because sixty was wrong.** On 2026-10-22 a
+/// screenshot looked as though `New source…`, `Add tail…` and `Edit…` were drawing with the
+/// ellipsis clipped off — `New source.` — and the column was widened for it. At four times zoom
+/// every one of those buttons has whitespace to spare on both sides: the trailing mark is `…`
+/// itself, which is **one** character (U+2026) whose three dots merge into a dash at that size.
+/// Nothing was ever cut.
+///
+/// What is kept is the derivation rather than the number: a column sized from the dialog's own
+/// width, with the tree taking what is left, is better than the three loose literals it replaced —
+/// and six verbs deserve a deliberate width. The twenty units come off the tree; the right margin
+/// is unchanged at 7.
+const S_VERB_W: i16 = 80;
+const S_VERB_X: i16 = S_DIALOG_W - S_VERB_W - 7;
+/// What is left for the tree and the two lines of prose, once the verbs have their column.
+const S_BODY_W: i16 = S_VERB_X - 7 - 6;
 
 /// The remote-sources tree, in dialog units — pure, so the template walk checks it without a
 /// window.
@@ -734,7 +754,7 @@ fn sources_dialog_items() -> Vec<Item> {
             Class::Button,
             text,
             id,
-            (353, 7 + row * 17, 60, 14),
+            (S_VERB_X, 7 + row * 17, S_VERB_W, 14),
             WS_TABSTOP,
         )
     };
@@ -743,16 +763,23 @@ fn sources_dialog_items() -> Vec<Item> {
             Class::Static,
             "Which log servers can Tailhawk tail, and what does each one show?",
             0xFFFF,
-            (7, 7, 340, 9),
+            (7, 7, S_BODY_W, 9),
             0,
         ),
         Item::new(
             Class::Named("SysTreeView32"),
             "",
             ID_S_TREE,
-            (7, 20, 340, 120),
+            (7, 20, S_BODY_W, 120),
+            // **`TVS_CHECKBOXES` must be set before any item is inserted**, which is why it is in
+            // the template rather than applied afterwards — the control builds its state image
+            // list when the style first appears, and items added before that never get one. The
+            // boxes go on the **tails only**; `sources_fill` clears the state image on every source
+            // row, because the owner was explicit on 2026-10-22: *"the checkboxes sshould be on
+            // the tails, not the sources"*. A server is not a thing you start.
             WS_BORDER
                 | WS_TABSTOP
+                | TVS_CHECKBOXES
                 | TVS_HASBUTTONS
                 | TVS_HASLINES
                 | TVS_LINESATROOT
@@ -760,20 +787,24 @@ fn sources_dialog_items() -> Vec<Item> {
         ),
         // `New source…`, `Add tail…` and `Edit…` carry the ellipsis Windows uses for a command that
         // asks for more before it acts; `Clone` and `Delete` do not, because they act at once.
-        verb("&New source…", ID_S_NEW, 1),
-        verb("&Add tail…", ID_S_ADD_TAIL, 2),
-        verb("&Edit…", ID_S_EDIT, 3),
-        verb("C&lone", ID_S_CLONE, 4),
-        verb("&Delete", ID_S_REMOVE, 5),
+        // **`Open` is first because it is what the dialog is usually for.** The owner, 2026-10-22:
+        // *"there should also be an open option when a tail is selected"*. The rest read as the
+        // two doors in, then the three things you do to a row that exists.
+        verb("&Open", ID_S_OPEN, 1),
+        verb("&New source…", ID_S_NEW, 2),
+        verb("&Add tail…", ID_S_ADD_TAIL, 3),
+        verb("&Edit…", ID_S_EDIT, 4),
+        verb("C&lone", ID_S_CLONE, 5),
+        verb("&Delete", ID_S_REMOVE, 6),
         // The fault line keeps the position it had: what is wrong with the **set**, which is what
         // no single row can see — two sources sharing a name, two tails sharing one, or a tail
         // reading a server that is not there.
-        Item::new(Class::Static, "", ID_S_FAULT, (7, 146, 340, 9), 0),
+        Item::new(Class::Static, "", ID_S_FAULT, (7, 146, S_BODY_W, 9), 0),
         Item::new(
             Class::Button,
             "&Close",
             IDCANCEL,
-            (353, 144, 60, 14),
+            (S_VERB_X, 144, S_VERB_W, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
     ]
@@ -794,6 +825,9 @@ pub struct SourcesEdit {
     pub store: Vec<(String, String)>,
     /// Names whose stored secret should be deleted.
     pub forget: Vec<String>,
+    /// The names of the tails `Open` was pressed on, for the shell to start once the dialog has
+    /// gone and the settings are written.
+    pub open: Vec<String>,
     /// `(was, now)` for each source the reader renamed, so its credential can be **moved** rather
     /// than deleted.
     ///
@@ -908,6 +942,10 @@ fn sources_fill(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
             if parents.len() == at {
                 parents.push(item);
             }
+            // **The box comes off the servers.** `TVS_CHECKBOXES` puts one on every row, and a
+            // server is not a thing you start — ticking one would mean nothing and inviting it
+            // would be a question with no answer.
+            tv_no_checkbox(tree, item);
         }
         if node.at == chosen {
             land = Some(item);
@@ -933,10 +971,40 @@ fn sources_verbs(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
             let _ = unsafe { EnableWindow(button, on) };
         }
     };
+    // Edit, Clone and Delete all need a row, of either kind.
     for id in [ID_S_EDIT, ID_S_CLONE, ID_S_REMOVE] {
         enable(id, anything);
     }
+    // **`Add tail…` needs a source chosen or a tail chosen**, because "add a tail to this" means
+    // the same thing either way — see `Editor::chosen_source`.
     enable(ID_S_ADD_TAIL, edit.chosen_source().is_some());
+    // **`Open` needs something to open**, which is a ticked box or a selected tail and never a
+    // source: `tails_to_open` is the decision and this only greys on its answer.
+    let ticked = sources_ticked(hdlg);
+    enable(
+        ID_S_OPEN,
+        !tailhawk_core::sourceset::tails_to_open(&ticked, edit.chosen()).is_empty(),
+    );
+}
+
+/// Which tails are ticked, read off the control rather than mirrored into the model.
+///
+/// **The tree already holds this and holds it correctly**, so a second copy in the editor would be
+/// a second thing to keep in step — and the one notification that reports a check change
+/// (`TVN_ITEMCHANGED`) is answered by the same procedure that would be writing the copy. Reading it
+/// when it is wanted is both simpler and the version that cannot drift.
+fn sources_ticked(hdlg: HWND) -> Vec<usize> {
+    use tailhawk_core::sourceset::Chosen;
+    let Ok(tree) = (unsafe { GetDlgItem(hdlg, i32::from(ID_S_TREE)) }) else {
+        return Vec::new();
+    };
+    tv_checked(tree)
+        .into_iter()
+        .filter_map(|data| match Chosen::unpack(data) {
+            Chosen::Tail(at) => Some(at),
+            _ => None,
+        })
+        .collect()
 }
 
 /// **New source…** — one source's screen over an empty draft.
@@ -1233,6 +1301,10 @@ unsafe extern "system" fn sources_proc(
                     sources_new(hdlg);
                     1
                 }
+                (ID_S_OPEN, BN_CLICKED) => {
+                    sources_open(hdlg);
+                    1
+                }
                 (ID_S_ADD_TAIL, BN_CLICKED) => {
                     sources_add_tail(hdlg);
                     1
@@ -1308,6 +1380,37 @@ unsafe extern "system" fn sources_proc(
             1
         }
         _ => 0,
+    }
+}
+
+/// **Open** — every ticked tail, or the selected one.
+///
+/// **It closes the dialog, because opening is leaving.** The windows appear behind it and a dialog
+/// still sitting over them would have to be dismissed before they could be read; `Close` already
+/// saves, so this takes the same path and names what it opened on the way out.
+fn sources_open(hdlg: HWND) {
+    let ticked = sources_ticked(hdlg);
+    let Some(data) = sources_state(hdlg) else {
+        return;
+    };
+    let data = unsafe { &mut *data };
+    let wanted = tailhawk_core::sourceset::tails_to_open(&ticked, data.editor.chosen());
+    if wanted.is_empty() {
+        return;
+    }
+    data.open = wanted
+        .iter()
+        .filter_map(|at| data.editor.tail(*at).map(|t| t.name.clone()))
+        .collect();
+    if let Some(fault) = data.editor.fault() {
+        set_dlg_text(hdlg, ID_S_FAULT, fault);
+        data.open.clear();
+        return;
+    }
+    data.editor.saved();
+    data.accepted = true;
+    unsafe {
+        let _ = EndDialog(hdlg, 1);
     }
 }
 
@@ -6721,6 +6824,87 @@ pub(crate) fn tv_select(tree: HWND, item: HTREEITEM) {
     }
 }
 
+/// Takes the checkbox off one item.
+///
+/// **`TVS_CHECKBOXES` is all-or-nothing, so the exception is drawn here.** A tree view with that
+/// style gives every item a state image, and the state image *is* the checkbox \u2014 index 1 unticked,
+/// 2 ticked. Setting it to **0** means "no state image", which is how Windows itself hides the box
+/// on a row that is not a choice. The owner, 2026-10-22: *"the checkboxes sshould be on the tails,
+/// not the sources"*.
+pub(crate) fn tv_no_checkbox(tree: HWND, item: HTREEITEM) {
+    let mut it = TVITEMW {
+        mask: TVIF_STATE,
+        hItem: item,
+        state: TREE_VIEW_ITEM_STATE_FLAGS(0),
+        stateMask: TVIS_STATEIMAGEMASK,
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            tree,
+            TVM_SETITEMW,
+            WPARAM(0),
+            LPARAM(&mut it as *mut TVITEMW as isize),
+        );
+    }
+}
+
+/// The `lParam` of every ticked item, walked depth-first.
+///
+/// **Ticked is state image 2**, which is the second of the two the control draws; anything else \u2014
+/// unticked, or the 0 that [`tv_no_checkbox`] leaves on a source \u2014 is not a choice the reader made.
+pub(crate) fn tv_checked(tree: HWND) -> Vec<isize> {
+    fn walk(tree: HWND, from: HTREEITEM, out: &mut Vec<isize>) {
+        let mut item = from;
+        while item.0 != 0 {
+            let mut it = TVITEMW {
+                mask: TVIF_STATE | TVIF_PARAM,
+                hItem: item,
+                stateMask: TVIS_STATEIMAGEMASK,
+                ..Default::default()
+            };
+            let got = unsafe {
+                SendMessageW(
+                    tree,
+                    TVM_GETITEMW,
+                    WPARAM(0),
+                    LPARAM(&mut it as *mut TVITEMW as isize),
+                )
+            };
+            if got.0 != 0 && (it.state.0 >> 12) == 2 {
+                out.push(it.lParam.0);
+            }
+            let child = unsafe {
+                SendMessageW(
+                    tree,
+                    TVM_GETNEXTITEM,
+                    WPARAM(TVGN_CHILD as usize),
+                    LPARAM(item.0),
+                )
+            };
+            if child.0 != 0 {
+                walk(tree, HTREEITEM(child.0), out);
+            }
+            let next = unsafe {
+                SendMessageW(
+                    tree,
+                    TVM_GETNEXTITEM,
+                    WPARAM(TVGN_NEXT as usize),
+                    LPARAM(item.0),
+                )
+            };
+            item = HTREEITEM(next.0);
+        }
+    }
+    let root =
+        unsafe { SendMessageW(tree, TVM_GETNEXTITEM, WPARAM(TVGN_ROOT as usize), LPARAM(0)) };
+    let mut out = Vec::new();
+    if root.0 != 0 {
+        walk(tree, HTREEITEM(root.0), &mut out);
+    }
+    out
+}
+
 /// Opens `item` so its children are visible.
 pub(crate) fn tv_expand(tree: HWND, item: HTREEITEM) {
     unsafe {
@@ -7981,6 +8165,37 @@ mod tests {
             !items.iter().any(|i| matches!(i.class, Class::Edit)),
             "this dialog is the tree and its verbs; everything a row *is* belongs to its own screen"
         );
+    }
+
+    /// **Each verb's label fits inside its button**, which is a thing no geometry test can see:
+    /// `the_sources_dialog_fits_inside_itself` checks that control *rectangles* stay inside the
+    /// dialog and clear of each other, and knows nothing about the text drawn in them.
+    ///
+    /// **This guards a future label, and it has never caught a real one.** It was written on
+    /// 2026-10-22 for an ellipsis that looked clipped in a screenshot and was not — see
+    /// [`S_VERB_W`] — and the per-character constant was first set to five *specifically so the
+    /// test would fail on the layout being replaced*. That is tuning a test until a non-defect
+    /// trips it, which is the inverse of a mutation check and leaves coverage claimed for
+    /// something that was never there. The constant is back to four, which is what a dialog unit
+    /// means: a quarter of the font's average character width, by definition.
+    ///
+    /// So what it is for is the honest, smaller thing — a seventh verb, longer than these six,
+    /// added without the column being widened for it.
+    #[test]
+    fn every_verb_label_fits_in_its_button() {
+        for item in sources_dialog_items() {
+            if !matches!(item.class, Class::Button) {
+                continue;
+            }
+            let drawn = item.text.replace("&&", "\u{1}").replace('&', "");
+            let needed = drawn.chars().count() as i16 * 4 + 14;
+            assert!(
+                needed <= item.w,
+                "{:?} needs about {needed} units and its button is {}",
+                item.text,
+                item.w
+            );
+        }
     }
 
     /// **Every control of the Remote sources dialog is inside it and none overlaps another.** The
