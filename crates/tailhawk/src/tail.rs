@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tailhawk_core::loki::{Direction, Nanos, Window};
-use tailhawk_core::settings::Source;
+use tailhawk_core::settings::{Source, Tail as View};
 use tailhawk_core::stdin::SpillWriter;
 
 /// How long between polls when everything is working.
@@ -278,7 +278,12 @@ impl Tail {
         self.cut.load(Ordering::Relaxed)
     }
 
-    /// Starts tailing `source` into `spill`, resuming after `since`.
+    /// Starts tailing `view` of `source` into `spill`, resuming after `since`.
+    ///
+    /// **Both halves, because the worker needs both.** The source says where to ask and how to sign
+    /// in; the view says what to ask for and what to call it in a notice. Before 2026-10-21 the
+    /// query was a field of the source and this took one argument — which is exactly why three
+    /// tails of one Loki could not be told apart.
     ///
     /// The writer rather than a path, because the spill is bounded: a part fills, the next one
     /// starts, and the oldest are deleted behind it. `stdin.rs` owns all three and the worker only
@@ -289,6 +294,7 @@ impl Tail {
     /// wrong side of a `RefCell` borrow.
     pub fn start(
         source: Source,
+        view: View,
         mut spill: SpillWriter,
         since: Nanos,
         seed: &str,
@@ -300,7 +306,7 @@ impl Tail {
         let mark = Arc::clone(&newest);
         let cut = Arc::new(AtomicBool::new(false));
         let cut_mark = Arc::clone(&cut);
-        let name = source.name.clone();
+        let name = view.name.clone();
         // The opening pull's lines are what the first overlap would fetch again; seeded here so the
         // first poll after opening writes nothing twice.
         let mut recent = Recent::new(RECENT_LINES);
@@ -339,7 +345,13 @@ impl Tail {
                     "tail: ask start={} end={} since={since} floor={floor}",
                     window.start, window.end
                 ));
-                match crate::pull::pull(&source, window, TAIL_LIMIT, Direction::Forward) {
+                match crate::pull::pull(
+                    &source,
+                    &view.query,
+                    window,
+                    TAIL_LIMIT,
+                    Direction::Forward,
+                ) {
                     Ok(pulled) => {
                         backoff.succeeded();
                         // Said once, per LOKI.md §6: a value the parser had to cut is not silently

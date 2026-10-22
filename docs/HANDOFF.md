@@ -1,6 +1,97 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-21, later: a filter switched off stays off, and a notice knows its tab
+## ▶ Resume point — 2026-10-21, late: a source is a connection, a tail is a view
+
+**His model, in his words**, and it is the fix for a cluster of defects rather than a refactor:
+
+> Im thinking that we poossibly need to separate the actual remote source with what is being tailed.
+> So we might have a single source, the nurtur loki server, but three separate tails, say one looking
+> at ndc, one at identity server and one at job dispatcher
+
+then the terminology — *"They can add a source, and then can create new tail with a name and choose
+how the source gets filtered to be displayed"* — then the surface:
+
+> so instead of a simple list, we would have a list of sources, each of which might be a node on a
+> tree with the tails unerneath them. Then the user can either add a new source, or can add a tail to
+> the source.
+
+He approved it the same day: *"yes, that looks good"*. It is built, it is gate-green, and
+**it has not been seen on screen** — see *What to do first*.
+
+### What to do first
+
+1. **Run it and look at the tree.** Nothing of the Remote sources dialog has been on screen since it
+   became one, and this project's record is unambiguous about what that costs: the screenshot on
+   2026-10-21 found aliasing UB and two layout errors the whole suite could not. **Ask him before
+   the run** — memory `tailhawk-ask-before-driving-the-desktop` — and batch it: the tree, a source's
+   screen, a tail's screen, dark mode on all three. The harness is
+   `scratchpad/shot-sources.ps1`, **not** `tools/verify-dialogs.ps1`, whose first act kills his own
+   install.
+2. **Watch the first launch move his credential.** This is the one risky part. `settings::split_sources`
+   renames each migrated source after its **host**, and Credential Manager is keyed on the name — so
+   `secrets::follow_rename` copies his client secret and refresh token onto the new name and forgets
+   the old key, once, at load. If it is wrong he is signed out of every Loki he has. It is suppressed
+   under `--stateless`, so a harness run will not exercise it; a real launch will. His store has
+   `Tailhawk/loki-tokens/nurtur-loki-live` in it, which is exactly the case.
+3. **Then the wizard**, which is still not built — see below.
+
+### What the split changed
+
+| | |
+|---|---|
+| `settings::Source` | The **connection**: name, url, auth_url, token_url, client_id, scope. Lost `query` and `apps`. |
+| `settings::Tail` | The **view**: name, source (by name), query, apps. New. |
+| `Settings::tails` | Written as `[[tail]]`. `merged_under` merges them by name, which it had never done for tails at all. |
+| `File ▸ Open remote` | Lists **tails**. `Shell::tail_names`, and `pending_pull`/`pending_repick` index the tails. |
+| The credential | Follows the **source**. A tail owns none: `Editor::remove` reports a name for a source and nothing for a tail. |
+| `sourceset` | The tree. `Node` (carrying the `Chosen` it is), `Chosen::packed`/`unpack`, `Editor` over both lists, `clone_chosen`, `node_label`, `tail_being_edited`, `MAX_TAILS = 512`. |
+| `Recent::Remote.source` | Renamed to `.tail`, and `loki::Question.source` to `.tail`. Both had held a tail's name since the split; the wire format `loki://name?apps=…` is unchanged. |
+
+**A migrated file keeps working.** Entries agreeing about everything but the view become one source
+named after its host, with a tail each; the tails keep the entries' names, so `Open Recent` and every
+remembered application set resolve. `docs/USING.md` says this to the reader.
+
+### Three things found on the way, all real
+
+**A live regression I was one commit from shipping.** `split_sources`' own doc comment claimed
+*"nothing is moved in Credential Manager — the shell looks there as well as under its own, see the
+`secrets_for` fallback"*. **There was no `secrets_for` and nothing looked anywhere but the source's
+own name.** So every migrated source would have been silently unauthenticated — which is the symptom
+he reported at the start of this session. Fixed with `Renamed`, the pure `secret_to_move`, and
+`secrets::follow_rename`.
+
+**A second doc comment naming a test that was not there.** `ID_WINDOW_BASE` said *"Clear of every
+other range, which `the_id_ranges_cannot_collide` asserts rather than trusts"*. I reported that the
+check did not exist; **that was wrong and the log carries the correction** — the check was alive
+inside `the_fetch_window_is_on_the_menu_and_checks_the_chosen_one`, just not under that name, and
+hard-coding `MAX_SOURCES` for both source ranges. Lifted out, given the name, pointed at `MAX_TAILS`,
+and extended to the loose ids. **I had grepped for a name and reported on a behaviour**, which is the
+same mistake as reading a success signal that is not the thing you care about.
+
+**`tools/check.sh` was still two steps short of CI.** It gained `portable-core` (the Linux check of
+`tailhawk-core`) and `provenance`. This is the rest of the lesson from `68ea87e` this morning: a gate
+that tells you less than the one downstream of it is not a gate. It found the only real defect of the
+run — an elidable lifetime my own `cargo clippy` invocation reported clean.
+
+### Knowingly undone
+
+- **The wizard.** `New source…` opens the source *form*. `sourcesetup::Draft::steps`, `Step` and
+  `can_ask_server` still have no consumer. `docs/design/sources-wizard.md` now says so at the top and
+  records that its page 4 is superseded: a selector and a list of applications are what a tail is, so
+  that page is the tail editor, which is one page and needs no wizard.
+- **Nothing of the tree, either editor, or the credential move has been on screen.**
+- **`Discover`/`Set up` and `Test` have still never been pressed against a live server.**
+- A delete of a source asks and names its tail count; a delete of a tail does not ask. Not seen.
+- The other three list dialogs' dark-mode headers (Highlight rules, Define Format, Select Columns)
+  remain unverified on screen.
+- `docs/design/*.aps` and `RCa*` are gitignored — Visual Studio artefacts from him opening the `.rc`.
+
+### The open question he has not answered
+
+**Is `telemetry.nurtur.tech` the right name for the migrated source?** It is what `host_name` produces
+and the credential move makes it safe, but it is his estate and his name to choose. The alternative is
+to keep one of the view names, which keeps that view's credential in place and orphans the others.
+## 2026-10-21, earlier: a filter switched off stays off, and a notice knows its tab
 
 He said *"ok, carry on with those 3 items and then take a look at the other item you found"*, which
 authorises, in order: **(1)** the disabled filter coming back enabled, **(2)** the notice knowing its

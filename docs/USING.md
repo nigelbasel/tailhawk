@@ -211,30 +211,47 @@ count, and says so if a write fails.
 
 ## Remote sources
 
-**Tools ▸ Remote sources…** holds the Loki servers Tailhawk can tail, and it is a list and nothing
-else: the sources, with **New…**, **Edit…**, **Clone** and **Delete** beside them, and **Close**.
-Double-clicking a row edits it. Clone copies a source under a name of its own — every field but the
-name and the credential, which is the quick way to a second environment that differs in one
-selector. A clone starts with no secret on purpose: a credential is filed under the source's *name*,
+**Tools ▸ Remote sources…** holds the Loki servers Tailhawk can tail and what it shows of each, as
+a tree: a **source** is a server, and the **tails** underneath it are the named views you open.
+
+```
+telemetry.nurtur.tech
+    ndc
+    identity server
+    job dispatcher
+```
+
+**A source is a connection; a tail is a view.** One Loki, one sign-in, one stored credential — and
+as many tails of it as you have things to watch. `File ▸ Open remote` lists the **tails**, because a
+tail is what a window shows and what a tab is called.
+
+The tree has five verbs beside it and **Close**:
+
+| | |
+|---|---|
+| **New source…** | A server. Asks where it is, and works the rest out. |
+| **Add tail…** | A view of whichever source you are pointing at — or of the source above the tail you are pointing at, which is the same thing. |
+| **Edit…** | Whichever row you are on: a source's screen for a source, a tail's for a tail. Double-clicking a row does the same. |
+| **Clone** | A copy under a name of its own. A **source** brings its tails with it, which is the quick way to a second environment that differs in one URL. A **tail** is a second view of the same server — no second sign-in. |
+| **Delete** | A **tail** goes at once. A **source** asks first, and says how many tails go with it, because they all read that server. |
+
+A cloned source starts with no secret on purpose: a credential is filed under the source's *name*,
 so an inherited one would belong to the original.
 
 **Close saves.** Every change is made on a screen of its own that you accepted or cancelled there
 and then, so by the time you reach Close you have agreed to each one already.
 
-### One source's screen
+### A source's screen
 
-**New…** and **Edit…** open the same screen, and it has four things on it:
+**New source…** and **Edit…** on a source open the same screen, and it has three things on it:
 
 | | |
 |---|---|
-| **Name** | What you call it. It is also the key its credential is filed under. |
+| **Name** | What you call the server. It is also the key its credential is filed under. |
 | **Server URL** | Where Loki is. The only thing you have to know. |
-| **Shows** | The LogQL selector this source starts from, or empty for everything the credential can see. |
 | **Set up** | One press: it asks that server where it signs people in, asks the Loki itself whether it answers, fills in what it learns, and says what it found in one sentence. |
 
-**Choose…** asks the server which applications it holds and offers them as a list to tick. What you
-tick is written into **Shows** as part of the selector — `app="job-dispatcher"` — rather than into a
-field of its own, because `app` is one of your server's labels and not a concept the product owns.
+There is no selector here, and no applications: those are what a *tail* is.
 
 **Advanced** unfolds the rest: how Tailhawk signs in, the token and sign-in URLs, the client id, the
 scope and the secret. You should not need any of it when **Set up** can reach the server, and it is
@@ -249,7 +266,22 @@ The **sign-in** choice is the one that changes what the rest means:
 | **No sign-in needed** | A Loki with authentication off. Needs nothing at all. |
 
 The secret box is greyed out on the two that do not use one, and a source that stops using a secret
-has its stored one deleted rather than left behind for a sign-in that will never send it.
+has its stored one deleted rather than left behind for a sign-in that will never send it. A source
+that wants a secret and has none says so on its row in the tree.
+
+### A tail's screen
+
+**Add tail…** and **Edit…** on a tail open the same screen, and it has three things on it:
+
+| | |
+|---|---|
+| **Reads** | Which source it reads. Stated, not asked — it is the row you came from. To point a view at another server, add a tail there; the two servers have different credentials and may hold different labels. |
+| **Name** | What you call the view. This is what `File ▸ Open remote` lists and what the tab is called. |
+| **Shows** | The LogQL selector, such as `{application="ndc"}`. |
+
+**Choose…** asks that server which applications it holds and offers them as a list to tick. What you
+tick is written into **Shows** as part of the selector — `app="job-dispatcher"` — rather than into a
+field of its own, because `app` is one of your server's labels and not a concept the product owns.
 
 **What Set up tells you**, and what to do about it:
 
@@ -281,6 +313,18 @@ nothing.
 A filter is written as its sign and its text — `+error`, `-retry` — with a leading `#` when it is
 switched off, so `"#+error"` is an include filter that is not in force. Hand-editing a `#` in front
 of the whole entry, `"#error"`, makes it a filter *for the text* `#error`, which matches nothing.
+
+### A settings file written before this
+
+**It is read and migrated, and nothing of yours is lost.** A file from before 2026-10-21 has one
+`[[source]]` per view, carrying both the connection and the selector. Reading it splits them:
+entries that agree about everything but the view become **one** source named after its host, with a
+**tail** for each — and the tails keep the names those entries had, so `File ▸ Open Recent` and
+every remembered application set go on working.
+
+**Your sign-in follows the rename.** The credential store is keyed on the source's name, so the
+first launch after the upgrade moves each migrated server's stored secret and sign-in onto its new
+name. You stay signed in.
 
 ## Formats
 

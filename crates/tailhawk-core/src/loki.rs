@@ -1605,8 +1605,13 @@ impl Follow {
 /// that an answer was cut at the limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
-    /// The configured source's name, which is its settings key.
-    pub source: String,
+    /// The configured tail's name — what the tab is called, and the settings key a reopen looks
+    /// the view up by.
+    ///
+    /// **It was called `source` until 2026-10-21 and held a source's name**, which is what made
+    /// three views of one Loki indistinguishable: `already_asked` keys on this, so three tails
+    /// sharing a server looked to it like one window already open.
+    pub tail: String,
     /// The selector the window is a view of, applications and all.
     pub query: String,
     /// How far back it asked, in minutes.
@@ -1615,9 +1620,9 @@ pub struct Question {
 
 impl Question {
     /// For the call sites that have the three parts loose.
-    pub fn new(source: &str, query: &str, minutes: u32) -> Question {
+    pub fn new(tail: &str, query: &str, minutes: u32) -> Question {
         Question {
-            source: source.to_owned(),
+            tail: tail.to_owned(),
             query: query.to_owned(),
             minutes,
         }

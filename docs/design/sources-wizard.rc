@@ -1,0 +1,300 @@
+// The Remote sources wizard, as five dialog templates the Visual Studio designer can open.
+//
+// **Open this file, not the project.** File ▸ Open ▸ File… on `sources-wizard.rc` puts the five
+// pages in the Resource View; double-click one to lay it out by eye. Nothing in the Tailhawk build
+// reads this — the shipped dialogs are `Item` lists in `crates/tailhawk/src/dialog.rs`, because a
+// `.res` would put a resource compiler in the build. The flow these pages belong to is
+// `sources-wizard.md` beside this file, and the decisions behind it are
+// `crates/tailhawk-core/src/sourcesetup.rs`, which is already written and tested.
+//
+// **Every page is the same size and the same frame**: a heading, a step counter, the page's own
+// controls, one sentence that explains rather than labels, and Back / Next / Cancel on the bottom
+// edge. 420 x 180 dialog units, the width the other Tailhawk dialogs use.
+//
+// Dialog units, for moving things about: the right edge is 413, the field column starts at 69, and
+// the three buttons sit at y 158.
+
+// **Includes `resource.h` and nothing else.** A loose `.rc` opened in the designer has no SDK
+// include path, so `#include <windows.h>` fails with RC1015 before a page can be drawn;
+// `resource.h` carries the dozen style constants these pages use instead.
+#include "resource.h"
+
+/////////////////////////////////////////////////////////////////////////////
+// The Remote sources dialog itself — a tree, not a list.
+//
+// **A tail only exists under a source, and a tree says so without a word of explanation.** The
+// owner, 2026-10-21: *"instead of a simple list, we would have a list of sources, each of which
+// might be a node on a tree with the tails underneath them. Then the user can either add a new
+// source, or can add a tail to the source."*
+//
+// **The verbs follow the selection.** With a source chosen: `Add tail…`, `Edit…` the source,
+// `Clone` it with its tails, `Delete` it *and* its tails. With a tail chosen: `Edit…` the tail,
+// `Clone` the tail, `Delete` just the tail. `New source…` is always live. What is greyed at any
+// moment is the whole of the explanation a reader needs for what a node is.
+//
+// **No columns.** The six-column list said name, URL, query, applications, secret and problem —
+// which was the old model drawn out: a row had to carry both halves because a row *was* both
+// halves. A source is named by its host and a tail by what it shows; anything wrong with the
+// selected node goes on the fault line, where the set's own fault already goes.
+
+IDD_SOURCES DIALOGEX 0, 0, 420, 196
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Remote sources"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Which log servers can Tailhawk tail?",IDC_STATIC,7,7,340,9
+    CONTROL         "",IDC_SRC_TREE,"SysTreeView32",TVS_HASBUTTONS | TVS_HASLINES |
+                    TVS_LINESATROOT | TVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,
+                    7,20,340,150
+    PUSHBUTTON      "&New source...",IDC_SRC_NEW_SOURCE,353,20,60,14
+    PUSHBUTTON      "&Add tail...",IDC_SRC_ADD_TAIL,353,38,60,14
+    PUSHBUTTON      "&Edit...",IDC_SRC_EDIT,353,56,60,14
+    PUSHBUTTON      "C&lone",IDC_SRC_CLONE,353,74,60,14
+    PUSHBUTTON      "&Delete",IDC_SRC_DELETE,353,92,60,14
+    LTEXT           "",IDC_SRC_FAULT,7,176,340,9
+    DEFPUSHBUTTON   "&Close",IDC_SRC_CLOSE,353,174,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Page 1 — the only thing a reader has to know.
+//
+// **Next is the work.** It asks the server where it signs people in and whether the Loki answers,
+// then moves on carrying what it learned. That press is the whole of the email-setup analogy:
+// one field, and the rest resolved.
+
+IDD_WIZ_SERVER DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Which log server?",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 1 of 5",IDC_WIZ_STEP,300,7,113,9
+    LTEXT           "&Name:",IDC_STATIC,7,28,58,8
+    EDITTEXT        IDC_WIZ_NAME,69,26,344,12,ES_AUTOHSCROLL
+    LTEXT           "&Server URL:",IDC_STATIC,7,46,58,8
+    EDITTEXT        IDC_WIZ_URL,69,44,344,12,ES_AUTOHSCROLL
+    LTEXT           "A name you will recognise, and where Loki is. Next asks that server how it wants you to sign in.",
+                    IDC_WIZ_SAYS,7,70,406,18
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14,WS_DISABLED
+    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Page 1, when a server you already use is on the list.
+//
+// **A second source on a known server needs one thing: a name.** The owner, 2026-10-21: *"if I
+// already have another tail running that I have signed in to, can this one simply pick up the
+// details if it is the same server?"* Everything pages 2 and 3 ask for — the login mode, both URLs,
+// the client id, the scope — belongs to the **server**, not to the source, so three sources on one
+// Loki necessarily agree about all of it. Choosing a known server skips both pages: **Step 1 of 3**.
+//
+// The list offers each *server* once, not each source, and says how many sources use it.
+
+IDD_WIZ_SERVER_KNOWN DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Which log server?",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 1 of 3",IDC_WIZ_STEP,300,7,113,9
+    CONTROL         "One you &already use:",IDC_WIZ_KNOWN,"Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,7,26,200,10
+    COMBOBOX        IDC_WIZ_SERVERS,21,40,392,80,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "A&nother server:",IDC_WIZ_OTHER,"Button",
+                    BS_AUTORADIOBUTTON,7,60,200,10
+    LTEXT           "Server &URL:",IDC_STATIC,21,76,58,8,WS_DISABLED
+    EDITTEXT        IDC_WIZ_URL,83,74,330,12,ES_AUTOHSCROLL | WS_DISABLED
+    LTEXT           "N&ame:",IDC_STATIC,7,100,58,8
+    EDITTEXT        IDC_WIZ_NAME,69,98,344,12,ES_AUTOHSCROLL
+    LTEXT           "Everything but the name is already known for a server you use. Next goes straight to what this source should show.",
+                    IDC_WIZ_SAYS,7,122,406,18
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14,WS_DISABLED
+    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Page 2 — the decision, not a result screen.
+//
+// **Radio buttons rather than a dropdown**, because the choice is the fork that decides whether
+// page 3 exists at all, and a combo hides two thirds of it behind a click.
+//
+// **The three boxes are the manual fallback, in the path.** They shrink to fit: "No sign-in
+// needed" hides all three, "client id and secret" hides the sign-in URL. When discovery found
+// nothing they are empty and waiting, which is the configuration the magic cannot reach.
+
+IDD_WIZ_SIGNIN DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "How should Tailhawk sign in?",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 2 of 5",IDC_WIZ_STEP,300,7,113,9
+    LTEXT           "Found https://identity.nurtur.tech at identity.nurtur.tech. Reached it, and it wants a token - the URL and its path are right.",
+                    IDC_WIZ_FOUND,7,24,406,18
+    CONTROL         "Sign in with a &browser",IDC_WIZ_BROWSER,"Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,7,46,200,10
+    CONTROL         "Use a client id and &secret",IDC_WIZ_SECRET_MODE,"Button",
+                    BS_AUTORADIOBUTTON,7,59,200,10
+    CONTROL         "N&o sign-in needed",IDC_WIZ_OPEN,"Button",
+                    BS_AUTORADIOBUTTON,7,72,200,10
+    LTEXT           "To&ken URL:",IDC_STATIC,7,92,58,8
+    EDITTEXT        IDC_WIZ_TOKEN,69,90,344,12,ES_AUTOHSCROLL
+    LTEXT           "Si&gn-in URL:",IDC_STATIC,7,108,58,8
+    EDITTEXT        IDC_WIZ_AUTH,69,106,344,12,ES_AUTOHSCROLL
+    LTEXT           "Sco&pe:",IDC_STATIC,7,124,58,8
+    EDITTEXT        IDC_WIZ_SCOPE,69,122,344,12,ES_AUTOHSCROLL
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14
+    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Page 2, the same page in its other two states — drawn separately because a template can only
+// show one, and the live page is one dialog whose controls follow the mode.
+//
+// **Greyed, not hidden, and the reason is evidence.** A reader who picks "No sign-in needed" on a
+// server that does advertise a token endpoint can see that endpoint sitting there dimmed, which is
+// what tells them they have chosen wrong; hiding it removes the evidence exactly when it would
+// correct them. Nothing moves either way — the page is a fixed size and the buttons are pinned — so
+// hiding would only leave a hole.
+//
+// 2a: the server wants nothing. Everything the three boxes hold is still shown, and unusable.
+
+IDD_WIZ_SIGNIN_OPEN DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "How should Tailhawk sign in?",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 2 of 4",IDC_WIZ_STEP,300,7,113,9
+    LTEXT           "Reached it, and it answered without a token. Found https://identity.nurtur.tech at identity.nurtur.tech.",
+                    IDC_WIZ_FOUND,7,24,406,18
+    CONTROL         "Sign in with a &browser",IDC_WIZ_BROWSER,"Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,7,46,200,10
+    CONTROL         "Use a client id and &secret",IDC_WIZ_SECRET_MODE,"Button",
+                    BS_AUTORADIOBUTTON,7,59,200,10
+    CONTROL         "N&o sign-in needed",IDC_WIZ_OPEN,"Button",
+                    BS_AUTORADIOBUTTON,7,72,200,10
+    LTEXT           "To&ken URL:",IDC_STATIC,7,92,58,8,WS_DISABLED
+    EDITTEXT        IDC_WIZ_TOKEN,69,90,344,12,ES_AUTOHSCROLL | WS_DISABLED
+    LTEXT           "Si&gn-in URL:",IDC_STATIC,7,108,58,8,WS_DISABLED
+    EDITTEXT        IDC_WIZ_AUTH,69,106,344,12,ES_AUTOHSCROLL | WS_DISABLED
+    LTEXT           "Sco&pe:",IDC_STATIC,7,124,58,8,WS_DISABLED
+    EDITTEXT        IDC_WIZ_SCOPE,69,122,344,12,ES_AUTOHSCROLL | WS_DISABLED
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14
+    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// 2b: nothing answered. The boxes are empty, enabled and waiting — **this is the manual
+// configuration, in the path rather than behind a disclosure triangle**, which is the half of the
+// email analogy the owner asked for alongside the magic: "there should probably be an avanced
+// option for scnarios that just dont work on the automatic discovery pattern".
+
+IDD_WIZ_SIGNIN_MANUAL DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "How should Tailhawk sign in?",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 2 of 5",IDC_WIZ_STEP,300,7,113,9
+    LTEXT           "No sign-in server answered at any of the 6 places worth looking. Reached it, and it wants a token. Choose how it signs in and fill in the two URLs.",
+                    IDC_WIZ_FOUND,7,24,406,18
+    CONTROL         "Sign in with a &browser",IDC_WIZ_BROWSER,"Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,7,46,200,10
+    CONTROL         "Use a client id and &secret",IDC_WIZ_SECRET_MODE,"Button",
+                    BS_AUTORADIOBUTTON,7,59,200,10
+    CONTROL         "N&o sign-in needed",IDC_WIZ_OPEN,"Button",
+                    BS_AUTORADIOBUTTON,7,72,200,10
+    LTEXT           "To&ken URL:",IDC_STATIC,7,92,58,8
+    EDITTEXT        IDC_WIZ_TOKEN,69,90,344,12,ES_AUTOHSCROLL
+    LTEXT           "Si&gn-in URL:",IDC_STATIC,7,108,58,8
+    EDITTEXT        IDC_WIZ_AUTH,69,106,344,12,ES_AUTOHSCROLL
+    LTEXT           "Sco&pe:",IDC_STATIC,7,124,58,8
+    EDITTEXT        IDC_WIZ_SCOPE,69,122,344,12,ES_AUTOHSCROLL
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14
+    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Page 3 — absent entirely when the server wants nothing.
+//
+// **The secret row is not merely greyed on the browser path, it is not there.** And on that path
+// Next signs the reader in, which is what makes page 4 able to ask the server anything at all.
+
+IDD_WIZ_CLIENT DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "What is this client called?",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 3 of 5",IDC_WIZ_STEP,300,7,113,9
+    LTEXT           "&Client id:",IDC_STATIC,7,34,58,8
+    EDITTEXT        IDC_WIZ_CLIENT,69,32,344,12,ES_AUTOHSCROLL
+    LTEXT           "Se&cret:",IDC_STATIC,7,52,58,8
+    EDITTEXT        IDC_WIZ_SECRET,69,50,344,12,ES_AUTOHSCROLL | ES_PASSWORD
+    LTEXT           "The client id is the one thing the server cannot tell us - it is assigned when the client is registered.",
+                    IDC_WIZ_SAYS,7,76,406,18
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14
+    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Page 4 — the server's own labels, which is the page a flat form can never have.
+//
+// By here the credential is settled, so there is something to ask. `app` sits in the left-hand
+// list as one label among others with no special status - the owner's correction, 2026-10-21:
+// "the applications field is specifically a nurtur feature".
+//
+// Ticking writes into Shows; Shows stays typeable, because the ticks are a helper and not a cage.
+// The values list carries check boxes, which are a run-time style rather than a template one.
+
+IDD_WIZ_SHOWS DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "What should this source show?",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 4 of 5",IDC_WIZ_STEP,300,7,113,9
+    LTEXT           "&Label:",IDC_STATIC,7,24,120,8
+    LISTBOX         IDC_WIZ_LABELS,7,36,120,78,LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "&Values:",IDC_STATIC,133,24,280,8
+    CONTROL         "",IDC_WIZ_VALUES,"SysListView32",LVS_REPORT | LVS_NOCOLUMNHEADER |
+                    LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,133,36,280,78
+    LTEXT           "S&hows:",IDC_STATIC,7,122,58,8
+    EDITTEXT        IDC_WIZ_SHOWS,69,120,344,12,ES_AUTOHSCROLL
+    LTEXT           "Tick what you want to see. Leave it empty for everything this credential can see.",
+                    IDC_WIZ_SAYS,7,138,406,9
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14
+    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Page 5 — a source proven to work rather than one merely typed.
+//
+// **Try it does one real fetch.** It is the difference between a wizard that collected answers and
+// one that finished.
+
+IDD_WIZ_READY DIALOGEX 0, 0, 420, 180
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add a remote source"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Ready to use",IDC_WIZ_HEADING,7,7,260,9
+    RTEXT           "Step 5 of 5",IDC_WIZ_STEP,300,7,113,9
+    LTEXT           "live\nhttps://telemetry.nurtur.tech/loki\nSigns you in with a browser, as the client ""tailhawk""\nShows {app=""job-dispatcher""}",
+                    IDC_WIZ_SUMMARY,7,26,406,45
+    PUSHBUTTON      "&Try it",IDC_WIZ_TRY,7,78,60,14
+    LTEXT           "Fetched 1,000 records in the last hour.",IDC_WIZ_TRIED,73,81,340,9
+    LTEXT           "Finish adds this to your sources. Edit... changes any of it later.",
+                    IDC_WIZ_SAYS,7,104,406,18
+    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14
+    DEFPUSHBUTTON   "&Finish",IDC_WIZ_NEXT,289,158,60,14
+    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
+END

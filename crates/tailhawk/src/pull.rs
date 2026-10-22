@@ -236,12 +236,18 @@ pub fn label_values(source: &Source, label: &str) -> Result<Vec<String>, PullFau
 /// How far back the picker asks for label values. A day, for the reason [`label_values`] gives.
 const LABEL_WINDOW_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
-/// Fetch a window of records from `source`.
+/// Fetch a window of records from `source`, asking `query`.
+///
+/// **The query is an argument because it is not the source's.** It belongs to the *tail* — the
+/// named view — and one source answers as many of them as the reader has made. Until 2026-10-21 a
+/// source carried a query, which is how one Loki came to be three entries with three credentials;
+/// see `settings::Tail`.
 ///
 /// The secret is read immediately before the exchange and dropped immediately after — it is never
 /// held across the query, which carries the shorter-lived bearer token instead.
 pub fn pull(
     source: &Source,
+    query: &str,
     window: Window,
     limit: u32,
     direction: Direction,
@@ -256,7 +262,7 @@ pub fn pull(
         Some(fetch_token(source)?)
     };
 
-    let request = loki::query_range(&origin, &source.query, window, limit, direction);
+    let request = loki::query_range(&origin, query, window, limit, direction);
     let auth = match token.as_deref() {
         Some(bearer) => Auth::Bearer(bearer),
         None => Auth::None,
@@ -930,12 +936,15 @@ mod tests {
             url: "https://telemetry.example/loki".to_owned(),
             token_url: "https://identity.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
-            apps: Vec::new(),
             scope: "telemetry:read".to_owned(),
-            query: "{environment=\"dev\"}".to_owned(),
             auth_url: String::new(),
         }
     }
+
+    /// The selector these tests pull with. **A `&str` argument since 2026-10-21**, because the
+    /// query belongs to a tail and a tail is not what `pull` needs — it needs a server, a question
+    /// and a window.
+    const QUERY: &str = "{environment=\"dev\"}";
 
     /// **A bad URL is refused before anything is opened**, and says which URL — the two are
     /// configured in different boxes of the same dialog, so "the URL is wrong" is not an answer.
@@ -949,6 +958,7 @@ mod tests {
             matches!(
                 pull(
                     &loopback,
+                    QUERY,
                     Window { start: 0, end: 1 },
                     10,
                     Direction::Backward
@@ -965,6 +975,7 @@ mod tests {
         assert!(matches!(
             pull(
                 &bad_token_url,
+                QUERY,
                 Window { start: 0, end: 1 },
                 10,
                 Direction::Backward
@@ -988,6 +999,7 @@ mod tests {
         assert_eq!(
             pull(
                 &source(),
+                QUERY,
                 Window { start: 0, end: 1 },
                 10,
                 Direction::Backward
@@ -1022,6 +1034,7 @@ mod tests {
             assert_eq!(
                 pull(
                     &insecure,
+                    QUERY,
                     Window { start: 0, end: 1 },
                     10,
                     Direction::Backward

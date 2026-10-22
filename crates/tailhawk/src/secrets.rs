@@ -32,10 +32,11 @@ use windows::Win32::Security::Credentials::{
 /// it there, and which of their sources it belongs to.
 const PREFIX: &str = "Tailhawk/loki/";
 
-/// The longest a source name may be. `CREDENTIALW::TargetName` is documented as at most 32,767
-/// characters, so this is not the platform's limit — it is a limit on how silly a name can get
-/// before it stops being a name.
-const NAME_MAX: usize = 64;
+/// The longest a source name may be — **the core's constant, not a second copy of it.**
+///
+/// It was a copy, and `Source::fault` did not check the length while claiming the store "enforces
+/// the same shape": a 65-character name saved and then failed silently here, at every call.
+use tailhawk_core::settings::NAME_MAX;
 
 /// The prefix the tokens from a sign-in are filed under.
 ///
@@ -263,6 +264,108 @@ fn delete_at(target: &str) -> bool {
         Ok(()) => true,
         Err(e) => e.code() == ERROR_NOT_FOUND.to_hresult(),
     }
+}
+
+/// Moves a renamed source's credentials onto its new name.
+///
+/// **The settings moved, so the credential moves with them.** The store is keyed on the source's
+/// name, so a rename — whether the settings migration's, which names each source after its host,
+/// or the reader's own in the editor — leaves the secret and the sign-in under a name nothing will
+/// ever look up again: the reader is silently signed out of a server they signed into, and a
+/// credential nobody can see is left behind for nobody to revoke.
+/// `Tailhawk/loki-tokens/nurtur-loki-live` is one of those in this machine's own store, from a
+/// rename that happened before anything watched for it.
+///
+/// **Both kinds, asked separately.** A source can hold a client secret under one old name and a
+/// sign-in under another — three entries over one Loki is how the old shape expressed three views,
+/// and nothing stopped them being configured differently.
+///
+/// **Every value is read before any is written, and the plan is made before either.**
+/// [`credential_plan`] is the whole decision and it says why: an entry named after another entry's
+/// host makes "is the new name already occupied?" and "what is under this name?" both change
+/// underneath a loop that moves as it goes. Deciding first, reading second and writing third is
+/// what makes the file order stop mattering.
+///
+/// [`credential_plan`]: tailhawk_core::settings::credential_plan
+///
+/// **Copy, then clear.** A credential left under a name nothing references is the orphan this
+/// exists to remove, so finishing the move is the point rather than a tidy-up — and an old key is
+/// cleared only after the new one reads back, so a failed write cannot lose a credential.
+///
+/// Reports how many credentials it moved, for the log line: this is the sort of thing that must be
+/// visible once and never silent.
+pub fn follow_rename(renamed: &[tailhawk_core::settings::Renamed]) -> usize {
+    // Every name the store has anything under, read once. A name counts as held if *either* kind
+    // is there, and the two are planned separately against that same snapshot.
+    let names: Vec<String> = renamed
+        .iter()
+        .flat_map(|r| std::iter::once(r.now.clone()).chain(r.was.iter().cloned()))
+        .collect();
+    let with_secret: Vec<String> = names
+        .iter()
+        .filter(|name| load(name).is_some())
+        .cloned()
+        .collect();
+    let with_sign_in: Vec<String> = names
+        .iter()
+        .filter(|name| load_refresh(name).is_some())
+        .cloned()
+        .collect();
+
+    let secrets = tailhawk_core::settings::credential_plan(renamed, &with_secret);
+    let sign_ins = tailhawk_core::settings::credential_plan(renamed, &with_sign_in);
+
+    // Read everything the plans call for, from the store as it stands.
+    let held: Vec<(String, Option<String>)> = secrets
+        .moves
+        .iter()
+        .map(|mv| (mv.to.clone(), load(&mv.from)))
+        .collect();
+    let tokens: Vec<(String, Option<String>)> = sign_ins
+        .moves
+        .iter()
+        .map(|mv| (mv.to.clone(), load_refresh(&mv.from)))
+        .collect();
+
+    let mut moved = 0;
+    let mut landed: Vec<&str> = Vec::new();
+    for (to, secret) in &held {
+        if let Some(secret) = secret {
+            if store(to, secret) && load(to).is_some() {
+                moved += 1;
+                landed.push(to);
+            }
+        }
+    }
+    let mut landed_tokens: Vec<&str> = Vec::new();
+    for (to, refresh) in &tokens {
+        if let Some(refresh) = refresh {
+            if store_refresh(to, refresh) && load_refresh(to).is_some() {
+                moved += 1;
+                landed_tokens.push(to);
+            }
+        }
+    }
+    // Cleared last, and only where the move it belongs to landed.
+    for name in &secrets.clear {
+        if secrets
+            .moves
+            .iter()
+            .any(|mv| &mv.from == name && landed.contains(&mv.to.as_str()))
+        {
+            forget(name);
+        }
+    }
+    for name in &sign_ins.clear {
+        if sign_ins
+            .moves
+            .iter()
+            .any(|mv| &mv.from == name && landed_tokens.contains(&mv.to.as_str()))
+        {
+            forget_refresh(name);
+        }
+    }
+    moved
 }
 
 #[cfg(test)]

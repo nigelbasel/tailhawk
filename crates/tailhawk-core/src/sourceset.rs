@@ -1,4 +1,4 @@
-//! The remote sources under edit — the decision half of the credentials dialog.
+//! The sources and their tails under edit — the decision half of the Remote sources dialog.
 //!
 //! `dialog.rs` draws this and routes clicks back into it; the shell's `secrets` module stores what
 //! it produces. Nothing here needs a window, which is the point: the rules editor's own history is
@@ -7,9 +7,18 @@
 //!
 //! **This mirrors [`crate::ruleset::Editor`] on purpose.** Rows, a selection, a fault per row, a
 //! dirty flag, open and close. §1.2's memorability rule is usually read as being about the people
-//! using the product, but it applies just as much to the people maintaining it: two list-and-fields
-//! dialogs that disagree about what "dirty" means, or about whether the selection survives a
-//! delete, are two dialogs to learn instead of one.
+//! using the product, but it applies just as much to the people maintaining it: two list dialogs
+//! that disagree about what "dirty" means, or about whether the selection survives a delete, are
+//! two dialogs to learn instead of one.
+//!
+//! # A source is a connection; a tail is a view
+//!
+//! Since 2026-10-21, and it is the owner's framing: *"we might have a single source, the nurtur
+//! loki server, but three separate tails, say one looking at ndc, one at identity server and one at
+//! job dispatcher"*. The tree draws it — a source is a node, its tails are its children — and the
+//! credential follows the **source**, which is what one entry per view had been getting wrong: one
+//! Loki with three entries meant three credentials for the same server, the same client and the
+//! same person.
 //!
 //! # The secret is handled by not being here
 //!
@@ -25,93 +34,90 @@
 //!   It never sees the value, so a credential cannot escape through a `Debug` line, a test fixture
 //!   or a panic message by way of this type.
 
-use crate::settings::Source;
+use crate::settings::{Source, Tail};
 
-/// How many sources the dialog will hold. Generous for "one per environment", and a bound rather
-/// than none at all so a hand-edited settings file cannot make the list unusable.
+/// How many sources the dialog will **add**. Generous for "one per environment".
+///
+/// **It bounds adding, not loading**, which its own comment used to get wrong: it said a bound
+/// existed "so a hand-edited settings file cannot make the list unusable", and nothing caps
+/// `[[source]]` at load. What actually protects the menu is
+/// [`crate::menubar`]-side truncation, which says how many it left out; the tree itself draws
+/// whatever the file holds, which is the honest behaviour for a configuration a person edited.
 pub const MAX_SOURCES: usize = 64;
 
-/// Widths for the list's six columns — name, URL, query, applications, secret, problem —
-/// apportioned to the width the list actually has.
+/// One row of the tree, flattened for drawing.
 ///
-/// **The widths were fixed, and did not fit.** 90 + 250 + 140 + 60 + 180 is 720px inside a list
-/// 340 dialog units wide, which is somewhere around 510 to 595px depending on the shell font — so
-/// `Problem` hung off the right-hand edge. That is the only column with anything in it for a row
-/// that has just been added, which is why adding one looked like adding nothing.
+/// **A source is a node and its tails are its children**, which is the owner's shape, 2026-10-21:
+/// *"instead of a simple list, we would have a list of sources, each of which might be a node on a
+/// tree with the tails underneath them."* Flattened here rather than handed over as a nest, because
+/// a `SysTreeView32` is filled one item at a time and the order is the drawing order.
 ///
-/// Each column is floored at something a word fits in, and the rest is shared out — so a list
-/// narrower than six such columns overflows and scrolls rather than producing a column too narrow
-/// to read or, as a first draft of this did, one of negative width. Zero is the width the shell
-/// reports when it cannot measure the list at all, so it is the one value that has to be safe.
-pub fn column_widths(total: i32) -> [i32; 6] {
-    // **Name takes the largest share after the URL, and it did not at first.** Seen on screen with
-    // the owner's own three sources: `nurtur-loki-jobdispatcher`, `nurtur-loki-live` and
-    // `nurtur-loki-identityserver` drew as `nurtur-loki-j…`, `nurtur-loki-li…` and
-    // `nurtur-loki-i…` — one letter apart, in the column a reader identifies a row by. A sixth
-    // column had to come out of the other five and it came out of the wrong one.
-    const SHARE: [i32; 6] = [20, 22, 15, 15, 8, 20];
-    const FLOOR: i32 = 36;
-    let total = total.max(FLOOR * SHARE.len() as i32);
-    let spare = i64::from(total - FLOOR * SHARE.len() as i32);
-    let mut out = [FLOOR; 6];
-    for (slot, share) in out.iter_mut().zip(SHARE) {
-        *slot += (spare * i64::from(share) / 100) as i32;
-    }
-    // The division's remainder goes on the widest column, so the row fills the list exactly rather
-    // than leaving a few pixels of dead ground beyond the last divider.
-    out[1] += total - out.iter().sum::<i32>();
-    out
-}
-
-/// One row as the list should draw it.
+/// **No columns.** The list this replaces had six — name, URL, query, applications, secret and
+/// problem — which was the old model drawn out: a row carried both halves because a row *was* both
+/// halves. A source is named by its host and a tail by what it shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row<'a> {
+pub struct Node<'a> {
     pub name: &'a str,
-    pub url: &'a str,
-    /// The selector this source starts from, or that it takes everything.
-    ///
-    /// **Shown in the list, and it has to be.** The estate runs one Loki, so the sources a person
-    /// actually wants — dev, QA, live — share a URL, a client and a credential and differ *only*
-    /// here. A list without this column is three rows that look identical.
-    pub query: &'a str,
-    /// The applications this entry opens straight into, or that it asks.
-    ///
-    /// **Shown for the same reason the query is.** Two entries over one Loki may differ only in
-    /// which applications they carry — that is what makes several entries over one server worth
-    /// having — and a list that does not show them is two rows a reader cannot tell apart. Held as
-    /// a `String` rather than a slice because the list needs the composed text and the row is where
-    /// the composing belongs.
-    pub apps: String,
-    /// Whether a secret is stored for this source — the shell answers this, the editor only carries
-    /// it. Shown so a source that is configured but has never been given its secret is visible as
-    /// such rather than failing at the first query.
-    pub has_secret: bool,
-    /// Why this row cannot be used, if it cannot.
+    /// **Which row this is, ready to go into a tree item.** Carried rather than left for the shell
+    /// to work out, because a source and an orphaned tail both have `under: None` and the only way
+    /// to tell them apart from the outside is to count the sources already drawn — which is the
+    /// view re-deriving what the model knows, and the shape of three defects this project has
+    /// already fixed.
+    pub at: Chosen,
+    /// `None` for a source, and for a tail whose source is not in the set; `Some(at)` for a tail of
+    /// the source at that index.
+    pub under: Option<usize>,
+    /// Why this node cannot be used, if it cannot.
     pub fault: Option<&'static str>,
+    /// Whether a credential is stored for this source. Meaningless on a tail, which has none —
+    /// **one credential per source, however many tails read it**, which is the whole point of the
+    /// split.
+    pub has_secret: bool,
+    /// Whether this source *needs* a client secret — true only in
+    /// [`Mode::ClientSecret`](crate::sourcesetup::Mode::ClientSecret). A source that signs the
+    /// reader in through a browser has none and never will, and a source that wants no token at all
+    /// has nothing to authenticate with; saying either was missing a secret would be a warning on a
+    /// correctly-configured server. False on a tail, which holds no credential of any kind.
+    pub wants_secret: bool,
 }
 
-/// The set of sources under edit.
+/// What the tree has selected.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Chosen {
+    /// Nothing, which is the state an empty set opens in.
+    #[default]
+    Nothing,
+    Source(usize),
+    Tail(usize),
+}
+
+/// The sources and their tails, under edit.
+///
+/// **This mirrors [`crate::ruleset::Editor`] on purpose**, as it always has: rows, a selection, a
+/// fault, a dirty flag, open and close. What changed on 2026-10-21 is that there are two kinds of
+/// row and one of them belongs to the other.
 #[derive(Debug, Default)]
 pub struct Editor {
     sources: Vec<Source>,
+    tails: Vec<Tail>,
     /// Whether the shell found a stored secret for each source, parallel to `sources`.
     stored: Vec<bool>,
-    /// The secret typed into the box for the selected row, if the user has typed one.
-    pending: Option<String>,
-    selected: usize,
+    chosen: Chosen,
     open: bool,
     dirty: bool,
 }
 
 impl Editor {
-    /// An editor over `sources`, closed. `stored` says which of them already have a secret; a short
-    /// list is padded with `false` rather than rejected, because the answer to "does this have a
-    /// secret" for a source the shell did not ask about is "not as far as we know".
-    pub fn new(sources: Vec<Source>, stored: Vec<bool>) -> Self {
+    /// An editor over `sources` and their `tails`, closed. `stored` says which sources already have
+    /// a secret; a short list is padded with `false` rather than rejected, because the answer to
+    /// "does this have a secret" for a source the shell did not ask about is "not as far as we
+    /// know".
+    pub fn new(sources: Vec<Source>, tails: Vec<Tail>, stored: Vec<bool>) -> Self {
         let mut stored = stored;
         stored.resize(sources.len(), false);
         Self {
             sources,
+            tails,
             stored,
             ..Self::default()
         }
@@ -125,219 +131,179 @@ impl Editor {
         self.dirty
     }
 
-    /// Opens on the first row, making one if the set is empty.
+    /// Opens on the first source, if there is one.
     ///
-    /// **A dialog that shows editable fields must have a row behind them.** Without the row the
-    /// fields were a form that discarded every keystroke: [`Self::edit`] writes into the selected
-    /// source and an empty set has none, so the owner filled the dialog in twice on a fresh install
-    /// and twice watched OK close it having saved nothing. Pressing **Add** afterwards only cleared
-    /// the boxes, because the shell repaints them from the new blank row.
-    ///
-    /// Offering the row is not a change to the set, so it deliberately leaves the editor clean —
-    /// and [`Self::discard_blank`] takes it back out again if nothing was ever typed into it.
+    /// **No blank row is offered any more.** The dialog that needed one showed editable fields
+    /// beside the list, and a form with no row behind it discarded every keystroke. `New source…`
+    /// is that row now, and it arrives with a screen of its own.
     pub fn open(&mut self) {
         self.open = true;
-        self.selected = 0;
-        self.pending = None;
-        if self.sources.is_empty() {
-            self.sources.push(Source::default());
-            self.stored.push(false);
-        }
+        self.chosen = match self.sources.is_empty() {
+            true => Chosen::Nothing,
+            false => Chosen::Source(0),
+        };
     }
 
-    /// Closes, forgetting any secret typed but not saved.
-    ///
-    /// **The pending secret is dropped here and this is the only place it can be.** A cancelled
-    /// dialog that left a credential in memory would be a credential in the next crash dump.
     pub fn close(&mut self) {
         self.open = false;
-        self.pending = None;
     }
 
     pub fn sources(&self) -> &[Source] {
         &self.sources
     }
 
-    pub fn selected(&self) -> usize {
-        self.selected
+    pub fn tails(&self) -> &[Tail] {
+        &self.tails
     }
 
-    /// The selected source, if there is one.
-    pub fn current(&self) -> Option<&Source> {
-        self.sources.get(self.selected)
+    pub fn chosen(&self) -> Chosen {
+        self.chosen
     }
 
-    /// Points the editor at row `at`, forgetting a secret typed against the row being left.
+    /// Selects a node. Out of range is a deselection rather than a panic, because the tree reports
+    /// what it has and this is told rather than asked.
+    pub fn choose(&mut self, chosen: Chosen) {
+        self.chosen = match chosen {
+            Chosen::Source(at) if at < self.sources.len() => chosen,
+            Chosen::Tail(at) if at < self.tails.len() => chosen,
+            _ => Chosen::Nothing,
+        };
+    }
+
+    /// The source the selection is on or under — a source node, or the source a chosen tail reads.
     ///
-    /// **Forgetting it is the whole reason this is not a plain assignment.** A secret typed for
-    /// `dev` and then carried to `live` by a click on the list would be stored against the wrong
-    /// source — a mistake nothing downstream could detect, because both are valid strings.
-    pub fn select(&mut self, at: usize) {
-        if at < self.sources.len() && at != self.selected {
-            self.pending = None;
+    /// **`Add tail…` works with either chosen**, because "add a tail to this" means the same thing
+    /// whether the reader is pointing at the source or at one of its tails.
+    pub fn chosen_source(&self) -> Option<usize> {
+        match self.chosen {
+            Chosen::Source(at) => Some(at),
+            Chosen::Tail(at) => {
+                let name = &self.tails.get(at)?.source;
+                self.sources.iter().position(|s| &s.name == name)
+            }
+            Chosen::Nothing => None,
         }
-        self.selected = at.min(self.sources.len().saturating_sub(1));
     }
 
-    /// The rows, for the list.
-    pub fn rows(&self) -> Vec<Row<'_>> {
-        self.sources
-            .iter()
-            .enumerate()
-            .map(|(i, s)| Row {
-                // **A row with no name yet still has to look like a row.** Every field of a new
-                // source is empty, so drawn as stored it is a blank line — and the owner, having
-                // pressed Add, reported that it "added nothing at all".
-                name: if s.name.is_empty() {
+    pub fn source(&self, at: usize) -> Option<&Source> {
+        self.sources.get(at)
+    }
+
+    pub fn tail(&self, at: usize) -> Option<&Tail> {
+        self.tails.get(at)
+    }
+
+    /// Whether source `at` has a secret in the store.
+    pub fn source_has_secret(&self, at: usize) -> bool {
+        self.stored.get(at).copied().unwrap_or(false)
+    }
+
+    /// The tree, flattened: each source followed by the tails that read it.
+    ///
+    /// **A tail whose source is not in the set is still shown**, under no parent and carrying its
+    /// own fault, because a hand-edited file can produce one and a row that vanishes is worse than
+    /// a row that explains itself.
+    pub fn nodes(&self) -> Vec<Node<'_>> {
+        let mut out = Vec::with_capacity(self.sources.len() + self.tails.len());
+        for (at, source) in self.sources.iter().enumerate() {
+            out.push(Node {
+                name: if source.name.is_empty() {
                     "(unnamed)"
                 } else {
-                    &s.name
+                    &source.name
                 },
-                url: &s.url,
-                query: if s.query.is_empty() {
-                    "(everything)"
+                at: Chosen::Source(at),
+                under: None,
+                fault: source.fault(),
+                has_secret: self.source_has_secret(at),
+                wants_secret: crate::sourcesetup::mode_of(source)
+                    == crate::sourcesetup::Mode::ClientSecret,
+            });
+            for (n, tail) in self
+                .tails
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.source == source.name)
+            {
+                out.push(Node {
+                    name: if tail.name.is_empty() {
+                        "(unnamed)"
+                    } else {
+                        &tail.name
+                    },
+                    at: Chosen::Tail(n),
+                    under: Some(at),
+                    fault: tail_row_fault(tail, &self.sources),
+                    has_secret: false,
+                    wants_secret: false,
+                });
+            }
+        }
+        for (n, tail) in self
+            .tails
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !self.sources.iter().any(|s| s.name == t.source))
+        {
+            out.push(Node {
+                name: if tail.name.is_empty() {
+                    "(unnamed)"
                 } else {
-                    &s.query
+                    &tail.name
                 },
-                // **`(ask)`, not blank.** An empty `apps` means the picker opens — `Source::apps`
-                // says so — which is a behaviour rather than an absence, and the commonest entry
-                // there is. Blank would read as "no applications", which is the one thing it is not.
-                apps: if s.apps.is_empty() {
-                    "(ask)".to_owned()
-                } else {
-                    apps_said(&s.apps)
-                },
-                has_secret: self.stored.get(i).copied().unwrap_or(false),
-                // **A row's own fault, including a blank row's — and deliberately not the same
-                // question [`Self::fault`] answers.** That one decides whether the set can be
-                // saved and so forgives a row nobody typed into; this one describes the row, and
-                // "Give the source a name." is the most useful thing the list can say about the
-                // blank row it just offered. The two disagreeing about the blank row is the point,
-                // not an oversight to be tidied away.
-                fault: s.fault(),
-            })
-            .collect()
+                at: Chosen::Tail(n),
+                under: None,
+                fault: tail_row_fault(tail, &self.sources),
+                has_secret: false,
+                wants_secret: false,
+            });
+        }
+        out
     }
 
-    /// Adds an empty source and selects it. Reports whether there was room.
-    pub fn add(&mut self) -> bool {
+    /// Adds a source and selects it. Reports whether there was room.
+    pub fn add_source(&mut self, source: Source) -> bool {
         if self.sources.len() >= MAX_SOURCES {
             return false;
         }
-        self.sources.push(Source::default());
+        self.sources.push(source);
         self.stored.push(false);
-        self.selected = self.sources.len() - 1;
-        self.pending = None;
+        self.chosen = Chosen::Source(self.sources.len() - 1);
         self.dirty = true;
         true
     }
 
-    /// Whether row `at` holds nothing at all — no field typed, and no secret typed against it.
-    ///
-    /// A source indistinguishable from a fresh blank one is the row [`Self::open`] offers before
-    /// anybody has used it. The secret is part of the question because a credential typed against
-    /// a nameless row has nowhere to be stored: that row must keep saying so rather than be
-    /// quietly dropped, which would be this whole defect over again in miniature.
-    fn is_blank_row(&self, at: usize) -> bool {
-        self.sources
-            .get(at)
-            .is_some_and(|s| *s == Source::default())
-            && !(at == self.selected && self.pending.as_deref().is_some_and(|s| !s.is_empty()))
-    }
-
-    /// Drops every row nobody typed anything into, so the offered row is not saved as a source.
-    ///
-    /// **The selection follows the row it was on.** A blank row removed from *below* the selection
-    /// shifts every row above it down one, and leaving the index alone would silently move the
-    /// selection to the next source along — which is how [`Self::take_secret`] would come to store
-    /// a credential against the wrong source, the mistake [`Self::select`] exists to prevent.
-    /// `self.selected` itself is left untouched until the end, because [`Self::is_blank_row`] asks
-    /// which row is selected and must get the same answer throughout.
-    pub fn discard_blank(&mut self) {
-        let mut selected = self.selected;
-        for at in (0..self.sources.len()).rev() {
-            if self.is_blank_row(at) {
-                self.sources.remove(at);
-                self.stored.remove(at);
-                if at < selected {
-                    selected -= 1;
-                }
-            }
-        }
-        self.selected = selected.min(self.sources.len().saturating_sub(1));
-    }
-
-    /// Removes the selected source. Reports the name it had, so the shell can forget its secret.
-    ///
-    /// **The name comes back rather than the shell reading it first**, because after this call the
-    /// row is gone and the only other way to know which credential to delete would be to remember
-    /// it beforehand — which is the sort of thing that gets forgotten when a second caller appears.
-    pub fn remove(&mut self) -> Option<String> {
-        if self.selected >= self.sources.len() {
-            return None;
-        }
-        let gone = self.sources.remove(self.selected);
-        self.stored.remove(self.selected);
-        self.selected = self.selected.min(self.sources.len().saturating_sub(1));
-        self.pending = None;
-        self.dirty = true;
-        Some(gone.name)
-    }
-
-    /// Copies the selected source under a name of its own and selects the copy.
-    ///
-    /// **Everything but the name and the credential.** The owner asked for this to edit one field
-    /// of a configuration that is otherwise identical — the estate runs one Loki, so dev, QA and
-    /// live share a URL, a client and a scope and differ in a selector or a list of applications.
-    ///
-    /// **The copy inherits no secret, and that is correctness rather than caution.** A credential
-    /// is filed under the source's *name*, so a copy reported as having one would be pointing at
-    /// the original's — and renaming it later would orphan that one, which is a thing that has
-    /// already happened in this product's store. A pending secret is left with the row it was typed
-    /// for, exactly as [`Self::select`] leaves it.
-    ///
-    /// The name comes from [`crate::apps::saved_entry_name`], which is where the "characters a
-    /// credential key may hold, numeric suffix on a collision" rule already lives.
-    /// **A row nobody has typed into is not worth copying**, and copying it would be worse than
-    /// nothing: the copy has a generated *name*, so [`Self::is_blank_row`] no longer recognises it,
-    /// [`Self::discard_blank`] leaves it behind, and the reader is held at OK by a complaint about
-    /// a source they never meant to make.
-    pub fn clone_selected(&mut self) -> bool {
-        if self.sources.len() >= MAX_SOURCES || self.is_blank_row(self.selected) {
+    /// Adds a tail and selects it.
+    pub fn add_tail(&mut self, tail: Tail) -> bool {
+        if self.tails.len() >= MAX_TAILS {
             return false;
         }
-        let Some(source) = self.sources.get(self.selected) else {
-            return false;
-        };
-        let taken: Vec<String> = self.sources.iter().map(|s| s.name.clone()).collect();
-        let copy = Source {
-            name: crate::apps::saved_entry_name(&format!("{} copy", source.name), &[], &taken),
-            ..source.clone()
-        };
-        self.sources.push(copy);
-        self.stored.push(false);
-        self.selected = self.sources.len() - 1;
-        self.pending = None;
+        self.tails.push(tail);
+        self.chosen = Chosen::Tail(self.tails.len() - 1);
         self.dirty = true;
         true
     }
 
-    /// Whether the selected row's secret is in the store — the shell's answer, carried.
-    pub fn current_has_secret(&self) -> bool {
-        self.stored.get(self.selected).copied().unwrap_or(false)
-    }
-
-    /// Puts `source` on the selected row, which is what an editor dialog hands back.
+    /// Puts `source` on the chosen source's row, renaming its tails with it.
     ///
-    /// **The stored flag follows the name.** A source renamed in the editor has no secret under its
-    /// new key until one is written, so saying it has one would show `stored` against a credential
-    /// that is about to be deleted along with the old name.
-    pub fn replace(&mut self, source: Source) {
-        let Some(slot) = self.sources.get_mut(self.selected) else {
+    /// **The tails follow the name.** A tail says which source it reads by *name*, so renaming a
+    /// source without carrying its children would orphan every one of them — the same mistake, one
+    /// level up, as filing a credential under a view's name.
+    pub fn replace_source(&mut self, source: Source) {
+        let Chosen::Source(at) = self.chosen else {
+            return;
+        };
+        let Some(slot) = self.sources.get_mut(at) else {
             return;
         };
         if slot.name != source.name {
-            if let Some(stored) = self.stored.get_mut(self.selected) {
+            let was = slot.name.clone();
+            for tail in self.tails.iter_mut().filter(|t| t.source == was) {
+                tail.source = source.name.clone();
+            }
+            if let Some(stored) = self.stored.get_mut(at) {
+                // The credential is filed under the name, so a renamed source has none under the
+                // new one until it is written there.
                 *stored = false;
             }
         }
@@ -347,115 +313,262 @@ impl Editor {
         }
     }
 
-    /// Edits a field of the selected source.
-    pub fn edit(&mut self, field: Field, value: &str) {
-        let Some(source) = self.sources.get_mut(self.selected) else {
+    /// Puts `tail` on the chosen tail's row.
+    pub fn replace_tail(&mut self, tail: Tail) {
+        let Chosen::Tail(at) = self.chosen else {
             return;
         };
-        // **The applications are a list, so they are not one of the string slots below.** Compared
-        // *after* parsing rather than as text, because the dialog reads every field on every
-        // keystroke and `gateway` and ` gateway ` are the same choice — a field that reported a
-        // change whenever the spacing differed would hold the set dirty for ever.
-        if field == Field::Apps {
-            let apps = apps_typed(value);
-            if source.apps != apps {
-                source.apps = apps;
-                self.dirty = true;
-            }
+        let Some(slot) = self.tails.get_mut(at) else {
             return;
-        }
-        let slot = match field {
-            Field::Name => &mut source.name,
-            Field::Url => &mut source.url,
-            Field::TokenUrl => &mut source.token_url,
-            Field::AuthUrl => &mut source.auth_url,
-            Field::ClientId => &mut source.client_id,
-            Field::Scope => &mut source.scope,
-            Field::Query => &mut source.query,
-            Field::Apps => unreachable!("answered above, where the list is parsed"),
         };
-        if slot != value {
-            slot.clear();
-            slot.push_str(value);
+        if *slot != tail {
+            *slot = tail;
             self.dirty = true;
         }
     }
 
-    /// Records the secret typed for the selected row. An empty string means *there is none*, which
-    /// is not the same as never having typed one.
-    pub fn set_secret(&mut self, secret: &str) {
-        self.pending = Some(secret.to_owned());
-        self.dirty = true;
+    /// Removes what is chosen. **A source takes its tails with it**, and reports every name whose
+    /// credential should go — which for a source is its own, and for a tail is none at all.
+    pub fn remove(&mut self) -> Vec<String> {
+        match self.chosen {
+            Chosen::Source(at) if at < self.sources.len() => {
+                let gone = self.sources.remove(at);
+                self.stored.remove(at);
+                self.tails.retain(|t| t.source != gone.name);
+                self.dirty = true;
+                self.chosen = match self.sources.is_empty() {
+                    true => Chosen::Nothing,
+                    false => Chosen::Source(at.min(self.sources.len() - 1)),
+                };
+                vec![gone.name]
+            }
+            Chosen::Tail(at) if at < self.tails.len() => {
+                self.tails.remove(at);
+                self.dirty = true;
+                // **A tail owns no credential.** One source, one credential, however many tails —
+                // so removing a tail must never reach the store.
+                self.chosen = Chosen::Nothing;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
     }
 
-    /// Whether a secret has been typed for the selected row this time round.
-    pub fn has_pending_secret(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    /// Takes the pending secret and the name to store it against, clearing it.
-    ///
-    /// `None` when nothing was typed — which the caller must read as *leave the store alone*, not
-    /// as *store nothing*.
-    pub fn take_secret(&mut self) -> Option<(String, String)> {
-        let secret = self.pending.take()?;
-        let name = self.current()?.name.clone();
-        Some((name, secret))
-    }
-
-    /// Why the set cannot be saved, or `None`. The first fault of any row, and duplicate names —
-    /// which the rows themselves cannot see, because a name is only a duplicate next to another.
-    /// A row nobody has typed into is not judged at all — see [`Self::is_blank_row`]. A reader who
-    /// opens the dialog to look, touches nothing and presses OK must not be held there by a
-    /// complaint about the blank row they were offered.
-    pub fn fault(&self) -> Option<&'static str> {
-        let used = || {
-            (0..self.sources.len())
-                .filter(|at| !self.is_blank_row(*at))
-                .map(|at| &self.sources[at])
+    /// How many tails read source `at` — what a confirmation has to say before a delete.
+    pub fn tails_of(&self, at: usize) -> usize {
+        let Some(source) = self.sources.get(at) else {
+            return 0;
         };
-        if let Some(fault) = used().find_map(|s| s.fault()) {
+        self.tails
+            .iter()
+            .filter(|t| t.source == source.name)
+            .count()
+    }
+
+    /// Why the set cannot be saved, or `None`.
+    ///
+    /// Each source's own fault first, then the two a single row cannot see: two sources sharing a
+    /// name, and two tails sharing one.
+    pub fn fault(&self) -> Option<&'static str> {
+        if let Some(fault) = self.sources.iter().find_map(|s| s.fault()) {
             return Some(fault);
         }
+        if let Some(fault) = self.tails.iter().find_map(|t| tail_fault(t, &self.sources)) {
+            return Some(fault);
+        }
+        // **Compared trimmed, as [`tail_being_edited`] compares them.** They did not match: the
+        // gate compared exactly, so `ndc` and ` ndc ` could sit in a saveable set although the
+        // editor refused to create the second — two rows the store and `already_asked` would then
+        // treat as one. Two gates that disagree about what "the same name" means are two rules.
         let mut seen: Vec<&str> = Vec::with_capacity(self.sources.len());
-        for source in used() {
-            if seen.contains(&source.name.as_str()) {
+        for source in &self.sources {
+            let name = source.name.trim();
+            if seen.contains(&name) {
                 return Some("Two sources share a name; each needs its own.");
             }
-            seen.push(&source.name);
+            seen.push(name);
+        }
+        let mut named: Vec<&str> = Vec::with_capacity(self.tails.len());
+        for tail in &self.tails {
+            let name = tail.name.trim();
+            if named.contains(&name) {
+                return Some("Two tails share a name; each needs its own.");
+            }
+            named.push(name);
         }
         None
     }
 
-    /// Marks the set saved. The pending secret is **not** cleared here: the shell takes it with
-    /// [`take_secret`](Self::take_secret) and this only records that the list itself is clean.
+    /// Copies what is chosen under a name of its own, and selects the copy.
+    ///
+    /// **A source brings its tails.** The owner, 2026-10-20: *"it would also be nice to be able to
+    /// clone a setup and then edit one field"* — and the field he means is a URL, because the
+    /// estate runs one Loki per environment with the same applications on each. A clone that copied
+    /// the server alone would hand him a connection showing nothing until he had typed all three
+    /// views again, which is not the labour he asked to be saved.
+    ///
+    /// **A tail brings nothing**: it is a second view of the *same* server, which is precisely what
+    /// the old one-entry-per-view shape could not express without a second credential.
+    ///
+    /// **The copy inherits no secret, and that is correctness rather than caution.** The store is
+    /// keyed on the source's *name*, so a copy reported as having one would be pointing at the
+    /// original's — and renaming it later would orphan that one, which has already happened in this
+    /// product's store.
+    ///
+    /// **A source whose tails will not fit is refused whole.** Half a clone is a server showing
+    /// nothing, marked dirty, which Close would then write.
+    ///
+    /// Names come from [`crate::apps::saved_entry_name`], where the "characters a credential key
+    /// may hold, numeric suffix on a collision" rule already lives.
+    pub fn clone_chosen(&mut self) -> bool {
+        match self.chosen {
+            Chosen::Source(at) => self.clone_source(at),
+            Chosen::Tail(at) => self.clone_tail(at),
+            Chosen::Nothing => false,
+        }
+    }
+
+    fn clone_source(&mut self, at: usize) -> bool {
+        let Some(source) = self.sources.get(at).cloned() else {
+            return false;
+        };
+        let moving: Vec<Tail> = self
+            .tails
+            .iter()
+            .filter(|t| t.source == source.name)
+            .cloned()
+            .collect();
+        if self.sources.len() >= MAX_SOURCES || self.tails.len() + moving.len() > MAX_TAILS {
+            return false;
+        }
+        let taken: Vec<String> = self.sources.iter().map(|s| s.name.clone()).collect();
+        let name = crate::apps::saved_entry_name(&format!("{} copy", source.name), &[], &taken);
+        // **Every copied tail is named before any is pushed**, against a list that grows as they
+        // are named: two tails called `ndc` and `ndc copy` would otherwise both want `ndc copy`.
+        let mut names: Vec<String> = self.tails.iter().map(|t| t.name.clone()).collect();
+        let copies: Vec<Tail> = moving
+            .into_iter()
+            .map(|tail| {
+                let named =
+                    crate::apps::saved_entry_name(&format!("{} copy", tail.name), &[], &names);
+                names.push(named.clone());
+                Tail {
+                    name: named,
+                    source: name.clone(),
+                    ..tail
+                }
+            })
+            .collect();
+        self.sources.push(Source { name, ..source });
+        // **No secret.** The flag is parallel to `sources`, and `false` is the only true answer:
+        // the store has nothing under a name that did not exist a moment ago.
+        self.stored.push(false);
+        self.tails.extend(copies);
+        self.chosen = Chosen::Source(self.sources.len() - 1);
+        self.dirty = true;
+        true
+    }
+
+    fn clone_tail(&mut self, at: usize) -> bool {
+        if self.tails.len() >= MAX_TAILS {
+            return false;
+        }
+        let Some(tail) = self.tails.get(at).cloned() else {
+            return false;
+        };
+        let taken: Vec<String> = self.tails.iter().map(|t| t.name.clone()).collect();
+        let name = crate::apps::saved_entry_name(&format!("{} copy", tail.name), &[], &taken);
+        self.tails.push(Tail { name, ..tail });
+        self.chosen = Chosen::Tail(self.tails.len() - 1);
+        self.dirty = true;
+        true
+    }
+
+    /// Marks the set saved.
     pub fn saved(&mut self) {
         self.dirty = false;
     }
 }
 
-/// The editable fields of a source, so the dialog names one rather than passing an index.
+/// What a tail's **row** should say is wrong with it, or `None`.
 ///
-/// **`AuthUrl` was missing until 2026-10-13, and its absence was a whole feature unreachable.**
-/// [`Source::signs_in`](crate::settings::Source::signs_in) is `!auth_url.is_empty()`, so a field
-/// that could not be set meant every source anyone created in the app answered "does not sign
-/// in" — and the authorization-code path, loopback socket, PKCE and sign-in dialog all built and
-/// all working, could never be entered. The owner's own sources had it only because his settings
-/// file was written by hand. The first person to be handed the app was told to paste a client
-/// secret instead, and had no login screen to find.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Field {
-    Name,
-    Url,
-    TokenUrl,
-    AuthUrl,
-    ClientId,
-    Scope,
-    Query,
-    /// The applications the entry opens into. A list rather than a string, so [`Editor::edit`]
-    /// answers it before the others.
-    Apps,
+/// **Everything [`tail_fault`] refuses, and the one thing it tolerates.** The gate has to let a
+/// tail with no selector through, or a file migrated from the old shape could not be closed — but
+/// a tail with no selector cannot be opened either: the query reaches Loki as an empty `query`
+/// field and comes back 400. Before this the row said nothing and the reader found out on the
+/// first open, which is the "fewer lines, no error" shape of failure this project keeps naming as
+/// the worst kind.
+///
+/// This is the third of three faults and each has one job: the **row** warns, the **gate**
+/// ([`Editor::fault`]) decides whether the set can be written, and the **editor**
+/// ([`tail_being_edited`]) decides whether a new one can be made.
+fn tail_row_fault(tail: &Tail, sources: &[Source]) -> Option<&'static str> {
+    if let Some(fault) = tail_fault(tail, sources) {
+        return Some(fault);
+    }
+    if tail.query.trim().is_empty() {
+        return Some("Say what this tail shows — a selector such as {application=\"ndc\"}.");
+    }
+    None
 }
+
+/// Why a tail cannot be used, or `None`.
+///
+/// **A tail's name is not a credential key**, so it is held to less than a source's: it must be
+/// something, and it must say which source it reads.
+fn tail_fault(tail: &Tail, sources: &[Source]) -> Option<&'static str> {
+    if tail.name.trim().is_empty() {
+        return Some("Give the tail a name.");
+    }
+    if tail.source.trim().is_empty() {
+        return Some("Say which source this tail reads.");
+    }
+    if !sources.iter().any(|s| s.name == tail.source) {
+        return Some("This tail reads a source that is not in the list.");
+    }
+    None
+}
+
+/// Why the tail being edited cannot be accepted, or `None`.
+///
+/// **Stricter than [`tail_fault`], deliberately, and the difference is which gate it guards.**
+/// `tail_fault` is the set-level gate that holds the Close button: anything it refuses makes the
+/// whole configuration unsaveable. This holds one editor's OK, where the reader is looking at the
+/// field in question and can fix it on the spot.
+///
+/// The query is the difference. A tail with no selector cannot be opened — `query_range` has
+/// nothing to ask — so an editor must not accept one. But a settings file migrated from the old
+/// shape can contain a `[[source]]` that never had a query, and holding *Close* over that would
+/// wedge the dialog on a configuration the reader did not write and may not be able to find: they
+/// would have to fix a tail they never made before they could leave a screen they only opened to
+/// look. So the set tolerates it, the row says so, and the editor refuses to produce another.
+///
+/// `taken` is every *other* tail's name. Two tails sharing one is two windows asking one question,
+/// where the second looks to `already_asked` like the first already open — so it is refused here as
+/// well as in [`Editor::fault`], because here it can be refused next to the box that caused it.
+pub fn tail_being_edited(tail: &Tail, taken: &[String]) -> Option<&'static str> {
+    if tail.name.trim().is_empty() {
+        return Some("Give the tail a name.");
+    }
+    if taken.iter().any(|name| name.trim() == tail.name.trim()) {
+        return Some("A tail of that name already exists.");
+    }
+    if tail.source.trim().is_empty() {
+        return Some("Say which source this tail reads.");
+    }
+    if tail.query.trim().is_empty() {
+        return Some("Say what this tail shows — a selector such as {application=\"ndc\"}.");
+    }
+    None
+}
+
+/// How many tails the set will **add** — and the bound the two `File ▸ Open remote` id ranges are
+/// sized for, which is the one place it is load-bearing rather than a courtesy.
+///
+/// **It bounds adding, not loading**; see [`MAX_SOURCES`], whose comment made the same wrong claim.
+/// `remote_menu_of` truncates the menu here and names what it left out, so a longer hand-edited
+/// file cannot run an item's id into the next range.
+pub const MAX_TAILS: usize = 512;
 
 /// The applications as a reader types them: a comma-separated list, trimmed, empties dropped.
 ///
@@ -476,6 +589,63 @@ pub fn apps_said(apps: &[String]) -> String {
     apps.join(", ")
 }
 
+impl Chosen {
+    /// This selection as one number, for a tree item to carry.
+    ///
+    /// **A `SysTreeView32` item holds an `LPARAM` and nothing else**, and what the dialog needs back
+    /// from a click is *which row of which list* — two numbers. Packing them is the shell's only
+    /// honest option, so the packing is decided here, beside the type, with a test: the alternative
+    /// is a parallel `Vec<Chosen>` indexed by insertion order, which is a second model of the tree
+    /// that can disagree with the first.
+    ///
+    /// `Nothing` is 0, a source is odd, a tail is even and non-zero. That keeps the kind in the low
+    /// bit, so a stray or stale `LPARAM` cannot be read as the wrong kind of row — only as a row
+    /// that is out of range, which [`Editor::choose`] already treats as a deselection.
+    pub fn packed(self) -> isize {
+        match self {
+            Chosen::Nothing => 0,
+            Chosen::Source(at) => 1 + (at as isize) * 2,
+            Chosen::Tail(at) => 2 + (at as isize) * 2,
+        }
+    }
+
+    /// The inverse. Anything that was not produced by [`Self::packed`] reads as `Nothing` rather
+    /// than as a row, because a tree item whose data this cannot account for is not a row this
+    /// dialog put there.
+    pub fn unpack(packed: isize) -> Chosen {
+        if packed <= 0 {
+            return Chosen::Nothing;
+        }
+        match packed % 2 {
+            1 => Chosen::Source(((packed - 1) / 2) as usize),
+            _ => Chosen::Tail(((packed - 2) / 2) as usize),
+        }
+    }
+}
+
+/// How one node of the tree reads, with what is wrong with it and what it is missing.
+///
+/// **The tree has no columns, so the row has to say it.** The list this replaced had a `Secret`
+/// column reading `stored` or `—` and a `Problem` column; both were how a reader found out that a
+/// source was configured but unusable, which is the commonest half-finished state there is. A tree
+/// item is one string, so they are appended to it.
+///
+/// **`(no secret stored)` is said only of a source that wants one.** A source that signs the reader
+/// in through a browser legitimately has no client secret and never will, so labelling it would be
+/// telling every correctly-configured sign-in source that something is missing — which is how a
+/// warning stops being read.
+pub fn node_label(node: &Node<'_>) -> String {
+    let mut out = node.name.to_owned();
+    if node.wants_secret && !node.has_secret {
+        out.push_str("  (no secret stored)");
+    }
+    if let Some(fault) = node.fault {
+        out.push_str("  — ");
+        out.push_str(fault);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,588 +656,806 @@ mod tests {
             url: format!("https://{name}.example/loki"),
             token_url: "https://identity.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
-            apps: Vec::new(),
             scope: "telemetry:read".to_owned(),
-            query: format!("{{environment=\"{name}\"}}"),
             auth_url: String::new(),
         }
     }
 
-    /// **A secret typed for one source must not be stored against another.** Both are valid
-    /// strings, so nothing downstream could ever detect the mistake — the credential would simply
-    /// be wrong, and the source it was meant for would go on failing to authenticate.
-    #[test]
-    fn moving_the_selection_forgets_a_secret_typed_for_the_row_being_left() {
-        let mut editor = Editor::new(vec![source("dev"), source("live")], vec![false, false]);
-        editor.open();
-        editor.set_secret("dev-secret");
-        assert!(editor.has_pending_secret());
-
-        editor.select(1);
-        assert!(
-            !editor.has_pending_secret(),
-            "the secret did not follow the click to the other source"
-        );
-        assert_eq!(editor.take_secret(), None);
-
-        // Selecting the row already selected is not a move, so it does not discard a secret being
-        // typed — a dialog that re-selects on every keystroke would otherwise lose it.
-        editor.set_secret("live-secret");
-        editor.select(1);
-        assert_eq!(
-            editor.take_secret(),
-            Some(("live".to_owned(), "live-secret".to_owned()))
-        );
-    }
-
-    /// **`None` and `Some("")` are different answers**, and conflating them wipes a credential the
-    /// user never touched the first time somebody fixes a typo in a hostname.
-    #[test]
-    fn not_typing_a_secret_is_not_the_same_as_clearing_one() {
-        let mut editor = Editor::new(vec![source("dev")], vec![true]);
-        editor.open();
-
-        editor.edit(Field::Url, "https://corrected.example/loki");
-        assert_eq!(
-            editor.take_secret(),
-            None,
-            "editing another field leaves the stored secret alone"
-        );
-        assert!(
-            editor.rows()[0].has_secret,
-            "and it is still recorded as there"
-        );
-
-        editor.set_secret("");
-        assert_eq!(
-            editor.take_secret(),
-            Some(("dev".to_owned(), String::new())),
-            "an empty box is a deliberate 'there is no secret'"
-        );
-    }
-
-    /// Closing forgets a secret that was typed but not saved — the only place it can be dropped,
-    /// and the difference between a cancelled dialog and a credential in the next crash dump.
-    #[test]
-    fn cancelling_forgets_what_was_typed() {
-        let mut editor = Editor::new(vec![source("dev")], vec![false]);
-        editor.open();
-        editor.set_secret("typed-then-cancelled");
-        editor.close();
-        assert!(!editor.is_open());
-        assert!(!editor.has_pending_secret());
-        assert_eq!(editor.take_secret(), None);
-    }
-
-    /// Removing reports the name, because after the call there is no other way to know which
-    /// credential to forget.
-    #[test]
-    fn removing_reports_the_name_whose_secret_should_go() {
-        let mut editor = Editor::new(vec![source("dev"), source("live")], vec![true, true]);
-        editor.open();
-        editor.select(1);
-        assert_eq!(editor.remove().as_deref(), Some("live"));
-        assert_eq!(editor.sources().len(), 1);
-        assert_eq!(
-            editor.selected(),
-            0,
-            "the selection lands on a row that exists"
-        );
-        assert!(editor.rows()[0].has_secret, "the survivor keeps its own");
-
-        assert_eq!(editor.remove().as_deref(), Some("dev"));
-        assert!(editor.sources().is_empty());
-        assert_eq!(
-            editor.remove(),
-            None,
-            "removing from nothing is not a panic"
-        );
-    }
-
-    /// **A duplicate name is the one fault a row cannot see**, because a name is only a duplicate
-    /// beside another one — and two sources sharing a name share a credential, silently.
-    #[test]
-    fn the_set_refuses_two_sources_with_one_name() {
-        let mut editor = Editor::new(vec![source("dev"), source("dev")], vec![false, false]);
-        assert!(editor.fault().is_some(), "two rows, one name");
-        assert!(
-            editor.rows().iter().all(|r| r.fault.is_none()),
-            "and neither row is wrong by itself, which is why the set has to check"
-        );
-
-        editor.select(1);
-        editor.edit(Field::Name, "live");
-        assert_eq!(editor.fault(), None);
-
-        // A row's own fault is reported too, and before the duplicate check.
-        editor.edit(Field::Url, "http://insecure.example");
-        assert!(editor.fault().is_some(), "http is a fault of the row");
-    }
-
-    /// The list is bounded, and adding selects what was added so typing goes to the new row.
-    ///
-    /// Adding to a set that was empty lands on row **1**, not row 0: since 2026-10-13 [`open`]
-    /// offers a row to type into, so Add on a fresh dialog is a *second* row. The extra blank one
-    /// costs nothing — [`discard_blank`] takes every untyped row back out on save.
-    ///
-    /// [`open`]: Editor::open
-    /// [`discard_blank`]: Editor::discard_blank
-    #[test]
-    fn adding_selects_the_new_row_and_the_list_is_bounded() {
-        let mut editor = Editor::new(Vec::new(), Vec::new());
-        editor.open();
-        assert!(editor.add());
-        assert_eq!(editor.selected(), 1);
-        assert_eq!(editor.sources().len(), 2);
-        editor.edit(Field::Name, "dev");
-        assert_eq!(editor.current().map(|s| s.name.as_str()), Some("dev"));
-        assert!(editor.is_dirty());
-
-        while editor.sources().len() < MAX_SOURCES {
-            assert!(editor.add());
-        }
-        assert!(!editor.add(), "the list is bounded");
-        assert_eq!(editor.sources().len(), MAX_SOURCES);
-    }
-
-    /// **An editor opened with no sources had nowhere to put what you typed.** The owner filled the
-    /// fields in twice on a fresh install and hit OK, and both times the dialog shut having added
-    /// nothing: [`Editor::edit`] writes into the *selected* source, an empty set has none, so every
-    /// keystroke was discarded — and [`Editor::fault`] then found nothing wrong with an empty set,
-    /// so OK was a perfectly valid save of it. Pressing **Add** was no escape, because the shell
-    /// repaints the fields from the new blank row and so clears what had been typed.
-    ///
-    /// A dialog that shows seven editable boxes must have a row behind them. Offering the row is
-    /// not a change to the set, though, so it does not make the editor dirty.
-    #[test]
-    fn an_editor_opened_with_no_sources_has_a_row_to_type_into() {
-        let mut editor = Editor::new(Vec::new(), Vec::new());
-        editor.open();
-        assert_eq!(
-            editor.sources().len(),
-            1,
-            "an empty set opens on a row, or there is nowhere for a keystroke to land"
-        );
-        assert!(
-            editor.current().is_some(),
-            "and that row is the selected one"
-        );
-        assert!(
-            !editor.is_dirty(),
-            "a row offered is not a change made; Cancel must still discard cleanly"
-        );
-
-        editor.edit(Field::Name, "live");
-        assert_eq!(
-            editor.current().map(|s| s.name.as_str()),
-            Some("live"),
-            "this is the keystroke that used to go nowhere"
-        );
-        assert!(editor.is_dirty());
-    }
-
-    /// **A row nobody typed into is not a source.** It is the other half of opening on a row: a
-    /// reader who opens the dialog to look, touches nothing and presses OK must not be held there
-    /// by "Give the source a name." for a row they never asked for, and must not have a nameless
-    /// source written to their settings file either.
-    ///
-    /// A secret typed against it is the exception, and it has to be: dropping that row would
-    /// discard a credential silently, which is the very fault this whole change exists to fix. So
-    /// a row with a secret and no name keeps faulting until it has one.
-    #[test]
-    fn a_row_nobody_typed_into_is_not_a_source_and_is_not_saved() {
-        let mut editor = Editor::new(vec![Source::default()], vec![false]);
-        editor.open();
-        assert_eq!(editor.sources().len(), 1, "the row is there to be judged");
-        assert_eq!(
-            editor.fault(),
-            None,
-            "an untouched row is not a half-finished one"
-        );
-        editor.discard_blank();
-        assert!(
-            editor.sources().is_empty(),
-            "and it is not written to the settings file"
-        );
-
-        let mut typed = Editor::new(vec![Source::default()], vec![false]);
-        typed.open();
-        typed.set_secret("hunter2");
-        assert_eq!(
-            typed.fault(),
-            Some("Give the source a name."),
-            "a secret has nowhere to be stored without a name, so say so rather than drop it"
-        );
-        typed.discard_blank();
-        assert_eq!(
-            typed.sources().len(),
-            1,
-            "and the row survives, because discarding it would discard the secret with it"
-        );
-
-        let mut real = Editor::new(vec![source("live"), Source::default()], vec![true, false]);
-        real.open();
-        assert_eq!(
-            real.fault(),
-            None,
-            "a blank row beside a real one faults nobody"
-        );
-        real.discard_blank();
-        assert_eq!(real.sources().len(), 1, "and only the real one is saved");
-        assert_eq!(real.sources()[0].name, "live");
-
-        // End to end from the state the owner was actually in: nothing configured, the dialog
-        // offers a row, he fills it in, and that one source is what gets saved.
-        let mut fresh = Editor::new(Vec::new(), Vec::new());
-        fresh.open();
-        fresh.edit(Field::Name, "live");
-        fresh.edit(Field::Url, "https://telemetry.example/loki");
-        assert_eq!(fresh.fault(), None);
-        fresh.discard_blank();
-        assert_eq!(
-            fresh.sources().len(),
-            1,
-            "the row he typed into is a source"
-        );
-        assert_eq!(fresh.sources()[0].name, "live");
-    }
-
-    /// **The selection follows the row it was on, rather than the index it had.** Dropping a blank
-    /// row from below the selection shifts everything above it down one, so leaving the index alone
-    /// moves the selection silently to the *next* source — and [`Editor::take_secret`] reads the
-    /// selection for the name to store a credential against. That is how a secret typed for one
-    /// source comes to be written against another, which is the mistake [`Editor::select`] was
-    /// given its own doc comment to prevent.
-    #[test]
-    fn discarding_blank_rows_leaves_the_selection_on_the_source_it_was_on() {
-        let mut editor = Editor::new(
-            vec![Source::default(), source("dev"), source("live")],
-            vec![false, true, true],
-        );
-        editor.select(2);
-        assert_eq!(editor.current().map(|s| s.name.as_str()), Some("live"));
-
-        editor.discard_blank();
-        assert_eq!(
-            editor.current().map(|s| s.name.as_str()),
-            Some("live"),
-            "the blank row below it went, so the index has to come down with it"
-        );
-
-        // The shape that costs a credential: the blank row carrying the typed secret is the one
-        // kept, and it must still be the selected one afterwards or `take_secret` names the wrong
-        // source.
-        let mut carrying = Editor::new(
-            vec![Source::default(), Source::default(), source("live")],
-            vec![false, false, true],
-        );
-        carrying.select(1);
-        carrying.set_secret("hunter2");
-        carrying.discard_blank();
-        assert_eq!(
-            carrying.take_secret(),
-            Some((String::new(), "hunter2".to_owned())),
-            "the secret belongs to the nameless row it was typed into, not to live"
-        );
-    }
-
-    /// **A new row has to look like a row.** Every field of one is empty, so with the name shown
-    /// as it is stored the list draws a blank line — and the owner, having pressed Add, reported
-    /// that it "added nothing at all". The query column already substitutes a word for empty for
-    /// exactly this reason; the name is the column that says a row is there.
-    #[test]
-    fn a_row_with_no_name_yet_still_reads_as_a_row() {
-        let mut editor = Editor::new(vec![Source::default()], vec![false]);
-        editor.open();
-        let rows = editor.rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].name, "(unnamed)",
-            "a blank line in the list reads as nothing having been added"
-        );
-        assert_eq!(rows[0].query, "(everything)");
-
-        editor.edit(Field::Name, "live");
-        assert_eq!(
-            editor.rows()[0].name,
-            "live",
-            "and a name, once given, is shown instead of standing in for one"
-        );
-    }
-
-    /// **The columns are apportioned to the width there is, not to a width that was hoped for.**
-    /// They were fixed at 90 + 250 + 140 + 60 + 180 = 720px inside a list 340 dialog units wide —
-    /// around 510 to 595px depending on the shell font — so `Problem` fell off the right-hand edge.
-    /// That is the one column with any text in a new row, which is why an added row looked like no
-    /// row at all.
-    #[test]
-    fn the_list_columns_fit_the_width_the_list_actually_has() {
-        for total in [320, 420, 510, 595, 720, 1200] {
-            let widths = column_widths(total);
-            let sum: i32 = widths.iter().sum();
-            assert_eq!(
-                sum, total,
-                "{widths:?} sums to {sum} and so does not fill {total}px exactly"
-            );
-            assert!(
-                widths.iter().all(|w| *w >= 36),
-                "{widths:?} has a column too narrow to read a word in"
-            );
-            assert!(
-                widths[1] > widths[0],
-                "{widths:?}: a URL is longer than a name"
-            );
-            // **And a name is wider than anything but the URL**, because it is what a reader
-            // identifies a row by — three of the owner's sources differ in their twelfth character.
-            assert!(
-                widths[0] >= widths[2] && widths[0] >= widths[3] && widths[0] >= widths[5],
-                "{widths:?}: the name column is not the second widest"
-            );
-        }
-
-        // **Zero is what the shell reports when it cannot measure the list**, and a width shared
-        // out from nothing used to come back negative — the remainder was pushed onto the URL
-        // column after the floor had already overspent the total, so `LVM_INSERTCOLUMNW` was handed
-        // a `cx` of -4. A list too narrow for six readable columns overflows and scrolls instead.
-        for total in [i32::MIN, -20, 0, 1, 4, 5, 179] {
-            let widths = column_widths(total);
-            assert!(
-                widths.iter().all(|w| *w >= 36),
-                "{widths:?} from a total of {total} is not a width a column can have"
-            );
-        }
-        assert_eq!(column_widths(0), [36; 6]);
-    }
-
-    /// **A source created in the app can sign the reader in**, which it could not do before
-    /// 2026-10-13: there was no [`Field`] for `auth_url`, so the editor had no way to set the one
-    /// value [`Source::signs_in`] reads, and the colleague the owner gave the app to got no login
-    /// screen — just an instruction to paste a client secret he had no reason to possess.
-    #[test]
-    fn a_source_typed_in_the_dialog_can_be_made_to_sign_in() {
-        let mut editor = Editor::new(vec![source("live")], vec![true]);
-        assert!(
-            !editor.sources()[0].signs_in(),
-            "a source with no sign-in URL presents a client secret instead"
-        );
-
-        editor.edit(Field::AuthUrl, "https://identity.example/connect/authorize");
-        assert!(
-            editor.sources()[0].signs_in(),
-            "and setting the field is what moves it onto the authorization-code path"
-        );
-        assert_eq!(
-            editor.sources()[0].auth_url,
-            "https://identity.example/connect/authorize",
-            "stored where pull::begin_sign_in reads it, not merely remembered by the dialog"
-        );
-        assert_eq!(
-            editor.fault(),
-            None,
-            "a complete sign-in source is not a half-configured one"
-        );
-    }
-
-    /// **Three sources against one Loki differ only by their selector**, which is the shape the
-    /// owner chose on 2026-09-03 once it was established that `environment` is a label and not a
-    /// host. The list has to show it, or those three rows are indistinguishable — and an empty
-    /// selector has to say something rather than nothing, or it reads as a missing value.
-    #[test]
-    fn the_selector_is_what_tells_three_sources_of_one_loki_apart() {
-        let one = |name: &str, query: &str| Source {
+    fn tail(name: &str, of: &str) -> Tail {
+        Tail {
             name: name.to_owned(),
-            url: "https://telemetry.example/loki".to_owned(),
-            token_url: "https://identity.example/connect/token".to_owned(),
-            client_id: "tailhawk".to_owned(),
+            source: of.to_owned(),
+            query: format!("{{application=\"{name}\"}}"),
             apps: Vec::new(),
-            scope: "telemetry:read".to_owned(),
-            query: query.to_owned(),
-            auth_url: String::new(),
-        };
-        let editor = Editor::new(
+        }
+    }
+
+    /// An editor over two sources, opened, where **both** have a tail.
+    ///
+    /// **`spare` has one on purpose.** It had none until a review pointed out what that cost: with
+    /// every tail reading one source, `remove`'s `retain(|t| t.source != gone.name)` and
+    /// `replace_source`'s `filter(|t| t.source == was)` could both be replaced by "do it to all of
+    /// them" and the tests named for them would still pass. A fixture where the distinction cannot
+    /// be observed is a fixture that cannot catch the bug.
+    fn opened() -> Editor {
+        let mut editor = Editor::new(
+            vec![source("loki"), source("spare")],
             vec![
-                one("dev", "{environment=\"dev\"}"),
-                one("live", "{environment=~\"live|production\"}"),
-                one("all", ""),
+                tail("ndc", "loki"),
+                tail("identity", "loki"),
+                tail("spare-view", "spare"),
             ],
-            vec![true, true, true],
+            vec![true, false],
         );
-        let rows = editor.rows();
-        assert!(
-            rows.iter()
-                .map(|r| r.url)
-                .collect::<Vec<_>>()
-                .windows(2)
-                .all(|p| p[0] == p[1]),
-            "they share a host, which is the whole point"
-        );
-        let queries: Vec<&str> = rows.iter().map(|r| r.query).collect();
+        editor.open();
+        editor
+    }
+
+    /// **The shape the owner asked for, flattened in drawing order.** 2026-10-21: *"instead of a
+    /// simple list, we would have a list of sources, each of which might be a node on a tree with
+    /// the tails unerneath them."* A tail follows the source it reads, and `under` says which.
+    #[test]
+    fn the_tree_puts_each_tail_under_the_source_it_reads() {
+        let editor = opened();
+        let nodes = editor.nodes();
+        let shape: Vec<(&str, Option<usize>)> = nodes.iter().map(|n| (n.name, n.under)).collect();
         assert_eq!(
-            queries,
+            shape,
             [
-                "{environment=\"dev\"}",
-                "{environment=~\"live|production\"}",
-                "(everything)"
+                ("loki", None),
+                ("ndc", Some(0)),
+                ("identity", Some(0)),
+                ("spare", None),
+                ("spare-view", Some(1)),
             ],
-            "and are told apart only by this"
+            "sources in order, each followed by its own tails"
+        );
+        // **And each node says which row it is**, which is what the tree item carries and what a
+        // click hands back. A source and an orphaned tail both have `under: None`, so this is the
+        // only thing that tells them apart — the shell must never have to count.
+        let rows: Vec<Chosen> = nodes.iter().map(|n| n.at).collect();
+        assert_eq!(
+            rows,
+            [
+                Chosen::Source(0),
+                Chosen::Tail(0),
+                Chosen::Tail(1),
+                Chosen::Source(1),
+                Chosen::Tail(2),
+            ]
+        );
+        for node in &nodes {
+            assert_eq!(
+                Chosen::unpack(node.at.packed()),
+                node.at,
+                "and it survives the tree item"
+            );
+        }
+    }
+
+    /// **One credential per source, however many tails read it** — the whole reason the split
+    /// exists. A tail must never report a secret of its own: it has none to report, and a tree that
+    /// showed one would be inviting the reader to give three credentials to one server, which is
+    /// the state this product's own store is in.
+    #[test]
+    fn only_a_source_carries_a_secret() {
+        let editor = opened();
+        let nodes = editor.nodes();
+        let flags: Vec<(&str, bool)> = nodes.iter().map(|n| (n.name, n.has_secret)).collect();
+        assert_eq!(
+            flags,
+            [
+                ("loki", true),
+                ("ndc", false),
+                ("identity", false),
+                ("spare", false),
+                ("spare-view", false),
+            ]
+        );
+    }
+
+    /// **A tail whose source has gone is shown, faulted, under nothing.** A hand-edited settings
+    /// file produces one, and a row that silently vanishes is how a reader concludes their
+    /// configuration was eaten.
+    #[test]
+    fn a_tail_with_no_source_is_shown_and_says_why() {
+        let mut editor = Editor::new(
+            vec![source("loki")],
+            vec![tail("ndc", "loki"), tail("orphan", "gone")],
+            vec![false],
+        );
+        editor.open();
+        let nodes = editor.nodes();
+        let orphan = nodes
+            .iter()
+            .find(|n| n.name == "orphan")
+            .expect("it is still listed");
+        assert_eq!(
+            orphan.under, None,
+            "it hangs under nothing, having no parent"
         );
         assert_eq!(
-            queries
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            3,
-            "no two rows read the same"
+            orphan.at,
+            Chosen::Tail(1),
+            "**and it is still tail 1**, although it is drawn last: a row drawn out of order that              reported its drawing position would hand Edit the wrong tail"
         );
-
-        // An empty selector is legitimate — never a fault.
-        assert!(editor.fault().is_none());
+        assert_eq!(
+            orphan.fault,
+            Some("This tail reads a source that is not in the list.")
+        );
+        assert!(
+            editor.fault().is_some(),
+            "and the set cannot be saved while it is there"
+        );
     }
 
-    /// A short `stored` list is padded rather than refused: "we did not ask" reads as "no secret",
-    /// which shows the source as needing one rather than hiding it.
+    /// **`Add tail…` works from either kind of row.** Pointing at a source and pointing at one of
+    /// its tails both mean "add a tail to this source", and a reader who has just clicked a tail is
+    /// exactly the reader who wants another one beside it.
     #[test]
-    fn a_short_stored_list_is_padded() {
-        let editor = Editor::new(vec![source("a"), source("b")], vec![true]);
-        let rows = editor.rows();
-        assert!(rows[0].has_secret);
-        assert!(!rows[1].has_secret);
+    fn the_chosen_source_is_the_one_underneath_a_chosen_tail() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(1));
+        assert_eq!(editor.chosen_source(), Some(1));
+        editor.choose(Chosen::Tail(0));
+        assert_eq!(
+            editor.chosen_source(),
+            Some(0),
+            "the tail reads `loki`, which is source 0"
+        );
+        editor.choose(Chosen::Nothing);
+        assert_eq!(editor.chosen_source(), None);
     }
 
-    /// **The applications are editable and visible, which they had never been.** The owner,
-    /// 2026-10-20: *"there is no place where we can edit or view the list of apps being tailed"* —
-    /// `Source::apps` was written only by the picker, so an entry that opened straight into seven
-    /// applications could not be told from one that asks, and the list showed neither.
+    /// Out of range is a deselection, not a panic: the tree reports what it has and this is told
+    /// rather than asked.
     #[test]
-    fn the_applications_are_a_field_and_a_column() {
-        let mut editor = Editor::new(vec![source("live")], vec![false]);
+    fn choosing_a_row_that_is_not_there_selects_nothing() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(99));
+        assert_eq!(editor.chosen(), Chosen::Nothing);
+        editor.choose(Chosen::Tail(99));
+        assert_eq!(editor.chosen(), Chosen::Nothing);
+    }
+
+    /// **A rename carries the children.** A tail names its source by *name*, so renaming the source
+    /// without moving its tails orphans every one of them — the same mistake, one level up, as
+    /// filing a credential under a view's name.
+    #[test]
+    fn renaming_a_source_takes_its_tails_with_it() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.replace_source(Source {
+            name: "nurtur-loki".to_owned(),
+            ..source("loki")
+        });
+        let reads: Vec<&str> = editor.tails().iter().map(|t| t.source.as_str()).collect();
+        assert_eq!(
+            reads,
+            ["nurtur-loki", "nurtur-loki", "spare"],
+            "**its own two tails followed it and the other source's did not.** Without a tail on \
+             `spare` this could not tell a carried rename from one that renamed every tail there is"
+        );
+        assert!(editor.fault().is_none(), "nothing was orphaned: {reads:?}");
+        assert!(
+            !editor.source_has_secret(0),
+            "the credential is filed under the name, so the new name has none yet"
+        );
+    }
+
+    /// **Deleting a source deletes its tails, and reports only its own credential.** A tail reading
+    /// a server that is gone has nowhere to ask; and a tail owns no credential, so removing one
+    /// must never reach the store.
+    #[test]
+    fn deleting_a_source_takes_its_tails_and_names_one_credential() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        let forget = editor.remove();
+        assert_eq!(forget, ["loki"], "its own name, and nothing else");
+        assert_eq!(editor.sources().len(), 1);
+        let left: Vec<&str> = editor.tails().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            left,
+            ["spare-view"],
+            "**its own two tails went and the other source's stayed.** A fixture where every tail \
+             read one source could not tell this from `tails.clear()`"
+        );
+    }
+
+    #[test]
+    fn deleting_a_tail_touches_no_credential() {
+        let mut editor = opened();
+        let before = editor.tails().len();
+        editor.choose(Chosen::Tail(1));
+        assert!(
+            editor.remove().is_empty(),
+            "a tail has no credential of its own to forget"
+        );
+        assert_eq!(editor.tails().len(), before - 1, "exactly the one chosen");
+        let left: Vec<&str> = editor.tails().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(left, ["ndc", "spare-view"], "and the others are untouched");
+        assert_eq!(editor.sources().len(), 2, "the server it read stays");
+    }
+
+    /// What a confirmation has to be able to say before a delete, because the count is the whole
+    /// reason to ask.
+    #[test]
+    fn a_source_knows_how_many_tails_would_go_with_it() {
+        let mut editor = opened();
+        assert_eq!(editor.tails_of(0), 2);
+        assert_eq!(editor.tails_of(1), 1, "its own, not everyone's");
+        assert_eq!(editor.tails_of(99), 0, "and nothing at all for no source");
+        // **A source with no tails reports none**, which the fixture used to say by accident and
+        // now says on purpose: `spare` was the no-tails case until it was given one to make
+        // `remove` and `replace_source` testable, so the case needs a source of its own.
+        assert!(editor.add_source(source("untouched")));
+        assert_eq!(editor.tails_of(2), 0);
+    }
+
+    /// **Two sources sharing a name is the fault no single row can see**, and so is two tails: the
+    /// first is a shared credential key, the second a shared question — three windows one of which
+    /// would look to `already_asked` like the others already open.
+    #[test]
+    fn two_rows_of_a_kind_may_not_share_a_name() {
+        let mut editor = Editor::new(
+            vec![source("loki"), source("loki")],
+            Vec::new(),
+            vec![false, false],
+        );
         editor.open();
         assert_eq!(
-            apps_said(&[]),
-            "",
-            "no applications is an empty box, not a word"
+            editor.fault(),
+            Some("Two sources share a name; each needs its own.")
         );
-        assert_eq!(editor.rows()[0].apps, "(ask)", "and the list says it asks");
 
-        editor.edit(Field::Apps, "gateway, job-dispatcher ,, identity ");
-        assert_eq!(
-            editor.current().expect("a row").apps,
-            ["gateway", "job-dispatcher", "identity"],
-            "split on commas, trimmed, and an empty one is not an application"
+        let mut tails = Editor::new(
+            vec![source("loki")],
+            vec![tail("ndc", "loki"), tail("ndc", "loki")],
+            vec![false],
         );
+        tails.open();
         assert_eq!(
-            apps_said(&editor.current().expect("a row").apps),
-            "gateway, job-dispatcher, identity",
-            "and it reads back as what a reader would type"
+            tails.fault(),
+            Some("Two tails share a name; each needs its own.")
         );
-        assert_eq!(editor.rows()[0].apps, "gateway, job-dispatcher, identity");
+    }
+
+    #[test]
+    fn a_tail_needs_a_name_and_a_source() {
+        let mut editor = Editor::new(
+            vec![source("loki")],
+            vec![Tail {
+                name: "  ".to_owned(),
+                ..tail("ndc", "loki")
+            }],
+            vec![false],
+        );
+        editor.open();
+        assert_eq!(editor.fault(), Some("Give the tail a name."));
+
+        let mut nameless = Editor::new(
+            vec![source("loki")],
+            vec![Tail {
+                source: String::new(),
+                ..tail("ndc", "loki")
+            }],
+            vec![false],
+        );
+        nameless.open();
+        assert_eq!(nameless.fault(), Some("Say which source this tail reads."));
+    }
+
+    /// Adding selects what was added, so the reader's next click lands on it.
+    #[test]
+    fn adding_selects_what_was_added_and_marks_the_set_dirty() {
+        let mut editor = opened();
+        assert!(!editor.is_dirty());
+        assert!(editor.add_source(source("third")));
+        assert_eq!(editor.chosen(), Chosen::Source(2));
         assert!(editor.is_dirty());
+        editor.saved();
 
-        // Typing the same thing again is not an edit — the dialog reads every field on every
-        // keystroke, so a field that always reports a change would mark the set dirty for ever.
-        let mut again = Editor::new(vec![source("live")], vec![false]);
-        again.open();
-        again.edit(Field::Apps, "gateway");
-        again.saved();
-        again.edit(Field::Apps, " gateway ");
-        assert!(!again.is_dirty(), "the same list, differently spaced");
+        assert!(editor.add_tail(tail("jobs", "third")));
+        assert_eq!(
+            editor.chosen(),
+            Chosen::Tail(editor.tails().len() - 1),
+            "the row just added, wherever the fixture put it"
+        );
+        assert!(editor.is_dirty());
+    }
+
+    /// Both bounds are refusals rather than truncations, and neither is silent — the caller says so.
+    #[test]
+    fn neither_list_grows_past_its_bound() {
+        let mut editor = Editor::new(
+            (0..MAX_SOURCES).map(|n| source(&format!("s{n}"))).collect(),
+            Vec::new(),
+            Vec::new(),
+        );
+        editor.open();
+        assert!(!editor.add_source(source("one too many")));
+        assert_eq!(editor.sources().len(), MAX_SOURCES);
+
+        let mut tails = Editor::new(
+            vec![source("loki")],
+            (0..MAX_TAILS)
+                .map(|n| tail(&format!("t{n}"), "loki"))
+                .collect(),
+            vec![false],
+        );
+        tails.open();
+        assert!(!tails.add_tail(tail("one too many", "loki")));
+        assert_eq!(tails.tails().len(), MAX_TAILS);
+    }
+
+    /// **A short `stored` is padded, not rejected.** The answer to "does this have a secret" for a
+    /// source the shell did not ask about is "not as far as we know" — and a panic here would take
+    /// the dialog down over a question nobody needed answered.
+    #[test]
+    fn a_stored_list_shorter_than_the_sources_is_padded() {
+        let editor = Editor::new(vec![source("a"), source("b")], Vec::new(), vec![true]);
+        assert!(editor.source_has_secret(0));
+        assert!(!editor.source_has_secret(1));
+        assert!(!editor.source_has_secret(99));
+    }
+
+    /// Typing the same thing again is not an edit — every accepted editor hands a whole value back,
+    /// so a replace that always marked the set dirty would mark it dirty for ever.
+    #[test]
+    fn replacing_a_row_with_itself_is_not_a_change() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.replace_source(source("loki"));
+        assert!(!editor.is_dirty(), "the same source, field for field");
+
+        editor.choose(Chosen::Tail(0));
+        editor.replace_tail(tail("ndc", "loki"));
+        assert!(!editor.is_dirty(), "and the same tail");
+
+        editor.replace_tail(Tail {
+            query: "{application=\"ndc\"} |= `error`".to_owned(),
+            ..tail("ndc", "loki")
+        });
+        assert!(editor.is_dirty(), "a different query is a change");
+    }
+
+    /// A replace with nothing chosen changes nothing, rather than writing to row zero.
+    #[test]
+    fn replacing_with_nothing_chosen_writes_nowhere() {
+        let mut editor = opened();
+        editor.choose(Chosen::Nothing);
+        editor.replace_source(source("overwritten"));
+        editor.replace_tail(tail("overwritten", "loki"));
+        assert_eq!(editor.source(0).map(|s| s.name.as_str()), Some("loki"));
+        assert_eq!(editor.tail(0).map(|t| t.name.as_str()), Some("ndc"));
+        assert!(!editor.is_dirty());
+    }
+
+    /// **`replace_source` on a chosen tail is not a cross-write**, and vice versa. Each takes only
+    /// its own kind of row, because the two lists are indexed separately and `Tail(1)` is a
+    /// perfectly valid index into `sources`.
+    #[test]
+    fn a_replace_of_one_kind_ignores_a_chosen_row_of_the_other() {
+        let mut editor = opened();
+        editor.choose(Chosen::Tail(1));
+        editor.replace_source(source("clobbered"));
+        assert_eq!(
+            editor.source(1).map(|s| s.name.as_str()),
+            Some("spare"),
+            "source 1 was not written through a chosen tail 1"
+        );
+
+        editor.choose(Chosen::Source(0));
+        editor.replace_tail(tail("clobbered", "loki"));
+        assert_eq!(editor.tail(0).map(|t| t.name.as_str()), Some("ndc"));
     }
 
     /// **A clone carries everything but the name and the sign-in.** The owner, 2026-10-20: *"it
     /// would also be nice to be able to clone a setup and then edit one field"*.
     ///
-    /// **It must inherit no credential**, and that is not caution — a secret is filed under the
-    /// source's *name*, so a clone that reported one as stored would be pointing at the original's
-    /// credential, and renaming it afterwards would orphan that one. The `Secret` column saying
-    /// `—` on a fresh clone is the truth, and it is also the prompt to sign in.
+    /// **A source's tails come with it**, which is the version of this that is worth having: the
+    /// estate runs one Loki per environment and the same three applications on each, so cloning
+    /// `live` to make `qa` and then editing one URL is the whole labour saved. Cloning the server
+    /// alone would leave a copy that shows nothing until three tails are typed again.
+    ///
+    /// **The copy inherits no secret, and that is correctness rather than caution.** A credential is
+    /// filed under the source's *name*, so a copy reported as having one would be pointing at the
+    /// original's — and renaming it later would orphan that one, which is a thing that has already
+    /// happened in this product's store.
     #[test]
-    fn a_clone_is_the_same_source_under_a_new_name_with_no_secret() {
-        let mut editor = Editor::new(vec![source("live"), source("dev")], vec![true, true]);
-        editor.open();
-        editor.edit(Field::Apps, "gateway, identity");
-        editor.saved();
-
-        assert!(editor.clone_selected(), "there was room");
-        assert_eq!(editor.sources().len(), 3);
-        assert_eq!(editor.selected(), 2, "and the copy is the row being edited");
-        let copy = editor.current().expect("the copy");
-        assert_eq!(copy.name, "live copy", "a name of its own");
-        assert_eq!(copy.url, "https://live.example/loki");
-        assert_eq!(copy.query, "{environment=\"live\"}");
-        assert_eq!(copy.apps, ["gateway", "identity"], "including the apps");
-        assert!(!editor.rows()[2].has_secret, "and no credential");
-        assert!(editor.rows()[0].has_secret, "the original keeps its own");
-        assert!(editor.is_dirty());
+    fn cloning_a_source_copies_its_tails_and_no_credential() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        assert!(editor.clone_chosen());
+        let Chosen::Source(at) = editor.chosen() else {
+            panic!("the copy is selected: {:?}", editor.chosen());
+        };
+        let copy = editor.source(at).expect("it is there").clone();
+        assert_ne!(copy.name, "loki", "a name of its own");
+        assert_eq!(copy.url, source("loki").url, "and everything else carried");
+        assert!(
+            !editor.source_has_secret(at),
+            "no secret, because the store is keyed on the name"
+        );
+        assert_eq!(
+            editor.tails_of(at),
+            2,
+            "both tails were copied onto the new server"
+        );
+        assert_eq!(editor.tails_of(0), 2, "and the original kept its own");
         assert!(
             editor.fault().is_none(),
-            "a clone is savable at once, which a duplicate name would not be: {:?}",
-            editor.fault()
+            "every copied tail got a name of its own: {:?}",
+            editor.tails().iter().map(|t| &t.name).collect::<Vec<_>>()
         );
+    }
 
-        // A second copy does not collide with the first — two sources sharing a name share a
-        // credential silently, which `fault` refuses and this must not create.
-        editor.select(0);
-        assert!(editor.clone_selected());
-        assert_eq!(editor.current().expect("the copy").name, "live copy 2");
-        assert!(editor.fault().is_none(), "{:?}", editor.fault());
+    /// **The collision the clone's own doc comment names, which nothing tested.**
+    ///
+    /// *"two tails called `ndc` and `ndc copy` would otherwise both want `ndc copy`"* — and with
+    /// that pair in the set, dropping the line that grows the taken-names list as each copy is
+    /// named produces exactly that, which `Editor::fault` then refuses. The fixture has to contain
+    /// the pair for the assertion to mean anything.
+    #[test]
+    fn cloning_a_source_names_each_copied_tail_against_the_copies_already_named() {
+        let mut editor = Editor::new(
+            vec![source("loki")],
+            vec![tail("ndc", "loki"), tail("ndc copy", "loki")],
+            vec![false],
+        );
+        editor.open();
+        editor.choose(Chosen::Source(0));
+        assert!(editor.clone_chosen());
 
-        // A secret typed for the row being left does not follow the clone, for the same reason
-        // moving the selection discards it.
-        editor.select(0);
-        editor.set_secret("live-secret");
-        assert!(editor.clone_selected());
+        let names: Vec<&str> = editor.tails().iter().map(|t| t.name.as_str()).collect();
+        let mut unique: Vec<&str> = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
         assert_eq!(
-            editor.take_secret(),
+            unique.len(),
+            names.len(),
+            "two tails ended up sharing a name: {names:?}"
+        );
+        assert_eq!(
+            editor.fault(),
             None,
-            "the secret stayed with the row it was typed for"
+            "which is what the set would have refused: {names:?}"
         );
     }
 
-    /// The bound holds for cloning as it does for adding, and a refusal changes nothing.
+    /// A cloned tail is a second view of the **same** server — no second credential, no second
+    /// connection, which is exactly what the old one-entry-per-view model could not express.
     #[test]
-    fn a_clone_is_refused_when_the_set_is_full() {
-        let sources: Vec<Source> = (0..MAX_SOURCES).map(|n| source(&format!("s{n}"))).collect();
-        let mut editor = Editor::new(sources, Vec::new());
-        editor.open();
-        assert!(!editor.clone_selected());
-        assert_eq!(editor.sources().len(), MAX_SOURCES);
+    fn cloning_a_tail_adds_a_view_of_the_same_source() {
+        let mut editor = opened();
+        editor.choose(Chosen::Tail(0));
+        assert!(editor.clone_chosen());
+        let Chosen::Tail(at) = editor.chosen() else {
+            panic!("the copy is selected: {:?}", editor.chosen());
+        };
+        let copy = editor.tail(at).expect("it is there").clone();
+        assert_eq!(copy.source, "loki", "the same server");
+        assert_eq!(copy.query, tail("ndc", "loki").query, "and the same query");
+        assert_ne!(copy.name, "ndc", "under a name of its own");
+        assert_eq!(editor.sources().len(), 2, "no source was added");
+        assert!(editor.fault().is_none());
     }
 
-    /// **The row the dialog offers to type into is not copied.** A copy of it would carry a
-    /// generated name, which is enough to stop `discard_blank` recognising it — so pressing Clone
-    /// on a fresh install would leave a source called `copy` with no URL, and hold the reader at OK
-    /// with a complaint about a row they never meant to create.
     #[test]
-    fn a_blank_row_is_not_worth_cloning() {
-        let mut editor = Editor::default();
-        editor.open();
-        assert_eq!(editor.sources().len(), 1, "the offered row");
-        assert!(!editor.clone_selected());
-        assert_eq!(editor.sources().len(), 1, "and nothing was added");
+    fn there_is_nothing_to_clone_with_nothing_chosen_and_nothing_to_clone_into_a_full_list() {
+        let mut editor = opened();
+        editor.choose(Chosen::Nothing);
+        assert!(!editor.clone_chosen());
+        assert!(!editor.is_dirty());
 
-        // One field is enough to make it a row somebody is working on, and then it copies.
-        editor.edit(Field::Name, "live");
-        assert!(editor.clone_selected());
-        assert_eq!(editor.current().expect("the copy").name, "live copy");
+        let mut full = Editor::new(
+            (0..MAX_SOURCES).map(|n| source(&format!("s{n}"))).collect(),
+            Vec::new(),
+            Vec::new(),
+        );
+        full.open();
+        full.choose(Chosen::Source(0));
+        assert!(
+            !full.clone_chosen(),
+            "and it says no rather than truncating"
+        );
+        assert_eq!(full.sources().len(), MAX_SOURCES);
     }
 
-    /// Six columns now, and the widths still fit the list rather than hanging off its edge —
-    /// the defect `column_widths` exists for, with one more column to share out.
+    /// **A source whose tails would not fit is not half-cloned.** Copying the server and then
+    /// finding there is no room for its views would leave a connection showing nothing, which is
+    /// worse than the refusal — and it would be marked dirty, so Close would write it.
     #[test]
-    fn six_columns_fit_the_width_they_are_given() {
-        for total in [0, 100, 300, 510, 595, 1200] {
-            let widths = column_widths(total);
-            assert!(
-                widths.iter().all(|w| *w >= 36),
-                "no column is too narrow to read at {total}: {widths:?}"
+    fn a_source_clone_that_cannot_carry_its_tails_is_refused_whole() {
+        let mut editor = Editor::new(
+            vec![source("loki")],
+            (0..MAX_TAILS)
+                .map(|n| tail(&format!("t{n}"), "loki"))
+                .collect(),
+            vec![false],
+        );
+        editor.open();
+        editor.choose(Chosen::Source(0));
+        assert!(!editor.clone_chosen());
+        assert_eq!(editor.sources().len(), 1, "no half-made server");
+        assert_eq!(editor.tails().len(), MAX_TAILS);
+        assert!(!editor.is_dirty());
+    }
+
+    /// Opening selects the first source, and an empty set selects nothing. **No blank row is
+    /// offered**: the dialog that needed one showed editable fields beside the list, and a form with
+    /// no row behind it discarded every keystroke. `New source…` is that row now.
+    #[test]
+    fn opening_lands_on_the_first_source_or_on_nothing() {
+        let editor = opened();
+        assert_eq!(editor.chosen(), Chosen::Source(0));
+        assert!(editor.is_open());
+
+        let mut empty = Editor::new(Vec::new(), Vec::new(), Vec::new());
+        empty.open();
+        assert_eq!(empty.chosen(), Chosen::Nothing);
+        assert!(
+            empty.sources().is_empty() && empty.tails().is_empty(),
+            "and nothing was invented to fill it"
+        );
+    }
+
+    /// An unnamed row still draws, because a blank line in a tree is unclickable and unexplainable.
+    #[test]
+    fn a_row_with_no_name_is_drawn_as_unnamed() {
+        let mut editor = Editor::new(
+            vec![Source {
+                name: String::new(),
+                ..source("loki")
+            }],
+            vec![Tail {
+                name: String::new(),
+                source: String::new(),
+                ..tail("ndc", "loki")
+            }],
+            vec![false],
+        );
+        editor.open();
+        let names: Vec<&str> = editor.nodes().iter().map(|n| n.name).collect();
+        assert_eq!(names, ["(unnamed)", "(unnamed)"]);
+    }
+
+    #[test]
+    fn the_applications_round_trip_through_the_box() {
+        assert_eq!(
+            apps_typed(" ndc , identity ,, "),
+            ["ndc".to_owned(), "identity".to_owned()]
+        );
+        assert_eq!(apps_said(&apps_typed("ndc,identity")), "ndc, identity");
+        assert!(apps_typed("  ,, ").is_empty());
+    }
+
+    /// **The packing is a round trip or it is a bug**, and it is the only thing standing between a
+    /// click on one row and the dialog acting on another.
+    #[test]
+    fn a_selection_survives_being_packed_into_a_tree_item() {
+        let every: Vec<Chosen> = std::iter::once(Chosen::Nothing)
+            .chain((0..MAX_SOURCES).map(Chosen::Source))
+            .chain((0..MAX_TAILS).map(Chosen::Tail))
+            .collect();
+        for chosen in &every {
+            assert_eq!(
+                Chosen::unpack(chosen.packed()),
+                *chosen,
+                "{chosen:?} did not come back"
             );
-            if total >= 36 * 6 {
-                assert_eq!(
-                    widths.iter().sum::<i32>(),
-                    total,
-                    "and the row fills the list exactly at {total}"
-                );
+        }
+        // **No two rows pack to the same number**, which is the failure that would hand a click on
+        // a tail to a source.
+        let mut packed: Vec<isize> = every.iter().map(|c| c.packed()).collect();
+        let count = packed.len();
+        packed.sort_unstable();
+        packed.dedup();
+        assert_eq!(packed.len(), count, "two rows share a number");
+    }
+
+    /// Anything this did not write reads as nothing, rather than as row zero of a list.
+    #[test]
+    fn a_tree_item_carrying_nothing_this_wrote_is_not_a_row() {
+        assert_eq!(Chosen::unpack(0), Chosen::Nothing);
+        assert_eq!(Chosen::unpack(-1), Chosen::Nothing);
+        assert_eq!(Chosen::unpack(isize::MIN), Chosen::Nothing);
+    }
+
+    /// **What the row says, now that there are no columns to say it in.** The list this replaced
+    /// had a `Secret` column and a `Problem` column, and both were how a reader learned that a
+    /// server was configured and unusable.
+    #[test]
+    fn a_row_says_what_is_wrong_with_it_and_what_it_is_missing() {
+        let plain = Node {
+            name: "loki",
+            at: Chosen::Source(0),
+            under: None,
+            fault: None,
+            has_secret: true,
+            wants_secret: true,
+        };
+        assert_eq!(
+            node_label(&plain),
+            "loki",
+            "a ready source says only its name"
+        );
+
+        assert_eq!(
+            node_label(&Node {
+                has_secret: false,
+                ..plain.clone()
+            }),
+            "loki  (no secret stored)"
+        );
+        // **And a source that wants no secret is never told it is missing one.** A browser sign-in
+        // has none until the first sign-in and a server wanting no token never will; labelling
+        // either is how a warning stops being read.
+        assert_eq!(
+            node_label(&Node {
+                has_secret: false,
+                wants_secret: false,
+                ..plain.clone()
+            }),
+            "loki"
+        );
+        assert_eq!(
+            node_label(&Node {
+                fault: Some("Give the source a URL."),
+                ..plain.clone()
+            }),
+            "loki  — Give the source a URL."
+        );
+        assert_eq!(
+            node_label(&Node {
+                has_secret: false,
+                fault: Some("Give the source a URL."),
+                ..plain
+            }),
+            "loki  (no secret stored)  — Give the source a URL.",
+            "both, when both are true"
+        );
+    }
+
+    /// Which sources the tree marks as wanting a secret, read off the same `mode_of` the editor
+    /// uses — so the row and the screen that edits it cannot disagree about what is missing.
+    #[test]
+    fn only_a_client_secret_source_is_marked_as_wanting_one() {
+        let signs_in = Source {
+            auth_url: "https://identity.example/connect/authorize".to_owned(),
+            ..source("live")
+        };
+        let open = Source {
+            token_url: String::new(),
+            client_id: String::new(),
+            scope: String::new(),
+            ..source("open")
+        };
+        let mut editor = Editor::new(
+            vec![source("secret"), signs_in, open],
+            Vec::new(),
+            vec![false, false, false],
+        );
+        editor.open();
+        let wants: Vec<(&str, bool)> = editor
+            .nodes()
+            .iter()
+            .map(|n| (n.name, n.wants_secret))
+            .collect();
+        assert_eq!(wants, [("secret", true), ("live", false), ("open", false)]);
+    }
+
+    /// **The editor is stricter than the set, and the query is the whole difference.** A tail with
+    /// no selector cannot be opened; but a file migrated from the old shape can hold one, and
+    /// refusing *Close* over it would wedge the dialog on a configuration the reader never wrote.
+    #[test]
+    fn the_tail_editor_insists_on_a_selector_where_the_set_tolerates_one() {
+        let blank = Tail {
+            query: String::new(),
+            ..tail("ndc", "loki")
+        };
+        assert_eq!(
+            tail_being_edited(&blank, &[]),
+            Some("Say what this tail shows — a selector such as {application=\"ndc\"}.")
+        );
+        assert_eq!(
+            tail_fault(&blank, &[source("loki")]),
+            None,
+            "**and the set still saves**, or a migrated file could not be closed"
+        );
+        assert_eq!(tail_being_edited(&tail("ndc", "loki"), &[]), None);
+    }
+
+    /// The editor refuses a duplicate name next to the box that caused it, rather than leaving the
+    /// reader to discover it from the fault line after Close.
+    #[test]
+    fn the_tail_editor_refuses_a_name_another_tail_already_has() {
+        let taken = ["identity".to_owned(), "ndc".to_owned()];
+        assert_eq!(
+            tail_being_edited(&tail("ndc", "loki"), &taken),
+            Some("A tail of that name already exists.")
+        );
+        assert_eq!(
+            tail_being_edited(&tail(" ndc ", "loki"), &taken),
+            Some("A tail of that name already exists."),
+            "spacing is not a different name"
+        );
+        assert_eq!(tail_being_edited(&tail("jobs", "loki"), &taken), None);
+        assert_eq!(
+            tail_being_edited(
+                &Tail {
+                    name: "  ".to_owned(),
+                    ..tail("ndc", "loki")
+                },
+                &taken
+            ),
+            Some("Give the tail a name."),
+            "and a blank name is reported as blank, not as taken"
+        );
+    }
+
+    /// **Sources come back in index order, every source before its own children.**
+    ///
+    /// This is what the tree's fill depends on and the reason it can be one pass: it keeps the
+    /// handle of each source it inserts, indexed by `Chosen::Source(at)`, and a tail arrives with
+    /// `under: Some(at)` naming the parent to hang it from — so the parent must already have been
+    /// inserted. Pinned here because a reordering of `nodes()` would otherwise be found only on
+    /// screen, as tails hanging at the root.
+    ///
+    /// **And a tail's `at` is its index in `tails()`, never its position in the drawing.** That is
+    /// the half that was got wrong: the shell derived the index from a counter that incremented in
+    /// drawing order, and `nodes()` groups tails under their source rather than emitting them in
+    /// index order — so with two sources whose tails interleave, a click on one row acted on
+    /// another. `Edit…` edited the wrong tail and `Delete` deleted the wrong one.
+    ///
+    /// **This test could not have caught that, and saying so matters more than the coverage it
+    /// claims.** The field was always right; the view ignored it. No pure function can stop a
+    /// window procedure re-deriving what it was handed — only a screenshot or a test that owns a
+    /// window can, and this project has neither for this dialog. What this pins is the invariant the
+    /// fill now leans on, so a change to `nodes()` breaks loudly here instead of quietly there.
+    #[test]
+    fn the_nodes_come_back_in_an_order_the_tree_can_fill_in_one_pass() {
+        // tails[0] reads the *second* source, which is what makes drawing order differ from index
+        // order — exactly the arrangement the counting fill got wrong.
+        let mut editor = Editor::new(
+            vec![source("first"), source("second")],
+            vec![tail("b", "second"), tail("a", "first")],
+            vec![false, false],
+        );
+        editor.open();
+        let nodes = editor.nodes();
+
+        let mut seen_sources = 0usize;
+        for node in &nodes {
+            match node.at {
+                Chosen::Source(at) => {
+                    assert_eq!(at, seen_sources, "sources arrive in index order: {at}");
+                    seen_sources += 1;
+                }
+                Chosen::Tail(_) => {
+                    if let Some(under) = node.under {
+                        assert!(
+                            under < seen_sources,
+                            "{:?} hangs under source {under}, which has not been drawn yet",
+                            node.name
+                        );
+                    }
+                }
+                Chosen::Nothing => panic!("no node is nothing"),
             }
         }
+
+        // And the mapping itself, which is the part a counter cannot reproduce.
+        let drawn: Vec<(&str, Chosen)> = nodes.iter().map(|n| (n.name, n.at)).collect();
+        assert_eq!(
+            drawn,
+            [
+                ("first", Chosen::Source(0)),
+                ("a", Chosen::Tail(1)),
+                ("second", Chosen::Source(1)),
+                ("b", Chosen::Tail(0)),
+            ],
+            "the first tail *drawn* is tails[1]; a counter would have called it Tail(0)"
+        );
     }
 }

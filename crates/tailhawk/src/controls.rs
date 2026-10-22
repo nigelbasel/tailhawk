@@ -56,7 +56,10 @@ unsafe extern "system" fn dress_child(
 ) -> windows::Win32::Foundation::BOOL {
     use windows::core::w;
     use windows::Win32::Foundation::{BOOL, LPARAM, WPARAM};
-    use windows::Win32::UI::Controls::{LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR};
+    use windows::Win32::UI::Controls::{
+        LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
+        TVM_SETTEXTCOLOR,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SendMessageW};
 
     let (dark, list_bg, list_ink) = unsafe { *(lparam.0 as *const (bool, u32, u32)) };
@@ -76,6 +79,24 @@ unsafe extern "system" fn dress_child(
                     LPARAM(list_bg as isize),
                 );
                 SendMessageW(hwnd, LVM_SETTEXTCOLOR, WPARAM(0), LPARAM(list_ink as isize));
+            }
+        }
+        // **A tree view needs its colours told to it, exactly as a list view does.** The class is
+        // `Explorer`'s — which is right here, because Explorer's own navigation pane *is* a tree
+        // view dressed that way — but the class alone leaves the ground white, so the catch-all
+        // below would have given the Remote sources tree black text on white inside a dark dialog.
+        // That is the defect a review found in the source editor on 2026-10-21, and this control is
+        // the first `SysTreeView32` in the product: the arm goes in with it rather than after a
+        // screenshot catches it.
+        "SysTreeView32" => {
+            apply_theme(hwnd, dark);
+            unsafe {
+                SendMessageW(hwnd, TVM_SETBKCOLOR, WPARAM(0), LPARAM(list_bg as isize));
+                SendMessageW(hwnd, TVM_SETTEXTCOLOR, WPARAM(0), LPARAM(list_ink as isize));
+                // The expand/collapse glyphs come from the theme and the lines do not, so a
+                // dark tree draws its own hairlines over the dark ground unless they take the
+                // ink colour too.
+                SendMessageW(hwnd, TVM_SETLINECOLOR, WPARAM(0), LPARAM(list_ink as isize));
             }
         }
         // **A list view's header is a descendant, and needs the list's class, not Explorer's.**

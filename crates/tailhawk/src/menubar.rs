@@ -170,9 +170,25 @@ pub const ID_RECENT_BASE: u32 = 10_100;
 /// Format ▸ Log format's rows, the same way: `ID_FORMAT_BASE + n` is the n-th row of
 /// [`crate::format_menu_of`]'s answer, resolved back through it when chosen.
 pub const ID_FORMAT_BASE: u32 = 10_200;
-/// `LOKI.md`'s remote sources: `ID_SOURCE_BASE + n` opens the n-th configured source. A range,
-/// because the sources are data the user named rather than commands the register knows.
-pub const ID_SOURCE_BASE: u32 = 10_400;
+/// How many rows that submenu will list.
+///
+/// **It exists because the range was bounded by three different numbers.** The submenu truncated at
+/// none, the dispatch arm hard-coded 64, and `the_id_ranges_cannot_collide` asserted against
+/// `MAX_MENU_COLUMNS` — which is the *column* cap and has nothing to do with formats. The 101st
+/// remembered format's id is `ID_CTX_SORT_ASC`, so a hand-edited formats file could put "sort
+/// ascending" on the Log format menu. One constant, read by the producer, the dispatch and the
+/// test.
+pub const MAX_MENU_FORMATS: usize = 64;
+/// `LOKI.md`'s remote tails: `ID_SOURCE_BASE + n` opens the n-th configured tail. A range, because
+/// the tails are data the user named rather than commands the register knows.
+///
+/// **Moved out of the 10_400 block on 2026-10-21, when the menu stopped listing sources.** It
+/// listed at most [`tailhawk_core::sourceset::MAX_SOURCES`] of them and sat 100 ids below
+/// [`ID_SORT_COL_BASE`], which was room enough for 64 and not for the
+/// [`tailhawk_core::sourceset::MAX_TAILS`] a tail list can hold. Both tail ranges are now above
+/// every other, with 600 ids each; `the_id_ranges_cannot_collide` checks it rather than trusting
+/// the arithmetic.
+pub const ID_SOURCE_BASE: u32 = 12_000;
 /// Format's column submenus — `Sort by`, `Top N by`, `Filter on` — one range each.
 ///
 /// **`BASE + n` names the n-th *shown* column, never the layout index.** `HeaderColumn`'s own
@@ -186,14 +202,14 @@ pub const ID_SOURCE_BASE: u32 = 10_400;
 /// desc)` and `Command::TopN(column)` are not in `Command::LISTED` by value, for the same reason
 /// [`ID_UNLISTED`] exists — and until now they were reachable only by right-clicking the header,
 /// which no keyboard can do.
-/// `File ▸ Open remote ▸ Choose applications`: `ID_SOURCE_PICK_BASE + n` asks the n-th source which
-/// applications it has and shows the picker, instead of opening it the way its entry remembers.
+/// `File ▸ Open remote ▸ Choose applications`: `ID_SOURCE_PICK_BASE + n` asks the n-th tail's source
+/// which applications it has and shows the picker, instead of opening it the way the tail remembers.
 ///
-/// **A second range over the same list rather than a modifier on the first.** A source that
-/// remembers its applications opens straight into them, so without an explicit way back the set
-/// could be chosen once and never changed — and a menu is where a command belongs, rather than a
-/// shift-click nobody would find.
-pub const ID_SOURCE_PICK_BASE: u32 = 10_800;
+/// **A second range over the same list rather than a modifier on the first.** A tail that remembers
+/// its applications opens straight into them, so without an explicit way back the set could be
+/// chosen once and never changed — and a menu is where a command belongs, rather than a shift-click
+/// nobody would find.
+pub const ID_SOURCE_PICK_BASE: u32 = 12_600;
 
 /// `File ▸ Open remote ▸ Fetch window`: `ID_WINDOW_BASE + n` chooses the n-th of
 /// [`tailhawk_core::settings::FETCH_WINDOWS`]. Clear of every other range, which
@@ -433,18 +449,37 @@ fn column_number(n: usize) -> String {
 /// the bar says to narrow the time range or the selector: `Choose applications` is the selector and
 /// `Fetch window` is the time range, which until 2026-10-05 was a constant with no menu item
 /// anywhere — so the advice named two remedies and only one of them could be followed.
-pub fn remote_menu_of(sources: &[String], minutes: u32) -> Vec<tailhawk_core::menu::Item> {
+pub fn remote_menu_of(tails: &[String], minutes: u32) -> Vec<tailhawk_core::menu::Item> {
     use tailhawk_core::menu::Item;
-    let mut items: Vec<Item> = sources
+    // **Bounded, and it says when it bounded.** Each id range holds
+    // [`tailhawk_core::sourceset::MAX_TAILS`] entries, so a longer list — which only a hand-edited
+    // settings file produces — would run the n-th item's id into the next range. The ones left out
+    // are *named as left out* rather than silently dropped, because a list that quietly ends is how
+    // a reader concludes a tail they configured has gone.
+    let shown = tails.len().min(tailhawk_core::sourceset::MAX_TAILS);
+    let mut items: Vec<Item> = tails[..shown]
         .iter()
         .enumerate()
         .map(|(n, name)| Item::command(&name.replace('&', "&&"), "", ID_SOURCE_BASE + n as u32))
         .collect();
+    if shown < tails.len() {
+        items.push(
+            Item::command(
+                &format!(
+                    "and {} more — open them from Remote sources…",
+                    tails.len() - shown
+                ),
+                "",
+                ID_UNLISTED,
+            )
+            .disabled(),
+        );
+    }
     if !items.is_empty() {
         items.push(Item::separator());
         items.push(Item::submenu(
             "Choose &applications",
-            sources
+            tails[..shown]
                 .iter()
                 .enumerate()
                 .map(|(n, name)| {
@@ -750,6 +785,7 @@ pub fn menu_bar(
                         .map(|d| {
                             d.format_rows()
                                 .into_iter()
+                                .take(MAX_MENU_FORMATS)
                                 .enumerate()
                                 .map(|(i, (label, current, separator))| {
                                     if separator {
@@ -899,13 +935,13 @@ fn recent_label(n: usize, entry: &tailhawk_core::settings::Recent) -> String {
     // take out the applications that say which window this was.
     let shown = match entry {
         tailhawk_core::settings::Recent::File(path) => compact_path(path, RECENT_LABEL_CHARS),
-        tailhawk_core::settings::Recent::Remote { source, apps } => {
+        tailhawk_core::settings::Recent::Remote { tail, apps } => {
             let names: Vec<&str> = apps.iter().map(String::as_str).collect();
             // **Capped, because `source_label` only counts once there are more than three.** Up to
             // three it spells them out in full, and three long service names beside a long source
             // name make a menu row twice the width of every file row beside it.
             elide(
-                &tailhawk_core::apps::source_label(source, &names),
+                &tailhawk_core::apps::source_label(tail, &names),
                 RECENT_LABEL_CHARS,
             )
         }
@@ -1292,14 +1328,10 @@ mod tests {
     /// Reported 2026-10-05: the bar said to narrow the time range or the selector and *"there is no
     /// indication of how they might do that"* — truer than it sounded, because the fetch window was
     /// a constant with no control anywhere while the selector at least had a submenu. This asserts
-    /// the item exists, that exactly the chosen duration carries the check, and that its ids cannot
-    /// reach into any neighbouring range.
-    ///
-    /// **The range check is every pair, not the one pair that had an assertion.** Each range is a
-    /// base plus an index, so an overlap means one menu item silently running another's command.
-    /// There are eight ranges and the previous assertion compared two of them; `10_300` is still
-    /// unclaimed between `ID_FORMAT_BASE` and `ID_SOURCE_BASE`, which is exactly the sort of gap
-    /// somebody fills by eye.
+    /// the item exists, that exactly the chosen duration carries the check, and that its own ids
+    /// are the ones `ID_WINDOW_BASE` promises. **Whether that range can collide with another is
+    /// [`the_id_ranges_cannot_collide`]'s** — it lived here until 2026-10-21, where a reader
+    /// looking for it had no reason to come.
     #[test]
     fn the_fetch_window_is_on_the_menu_and_checks_the_chosen_one() {
         let items = remote_menu_of(&["live".to_owned()], 240);
@@ -1329,29 +1361,6 @@ mod tests {
         );
         for (n, (_, id, _)) in inner.iter().enumerate() {
             assert_eq!(*id, Some(ID_WINDOW_BASE + n as u32));
-        }
-
-        let ranges = [
-            (ID_RECENT_BASE, 64u32),
-            (ID_FORMAT_BASE, 64),
-            (ID_SOURCE_BASE, tailhawk_core::sourceset::MAX_SOURCES as u32),
-            (ID_SORT_COL_BASE, 64),
-            (ID_TOPN_COL_BASE, 64),
-            (ID_FILTER_COL_BASE, 64),
-            (
-                ID_SOURCE_PICK_BASE,
-                tailhawk_core::sourceset::MAX_SOURCES as u32,
-            ),
-            (
-                ID_WINDOW_BASE,
-                tailhawk_core::settings::FETCH_WINDOWS.len() as u32,
-            ),
-        ];
-        for (i, (base_a, len_a)) in ranges.iter().enumerate() {
-            for (base_b, len_b) in ranges.iter().skip(i + 1) {
-                let clear = base_a + len_a <= *base_b || base_b + len_b <= *base_a;
-                assert!(clear, "{base_a}+{len_a} overlaps {base_b}+{len_b}");
-            }
         }
 
         assert!(remote_menu_of(&[], 60)
@@ -1907,7 +1916,7 @@ mod tests {
     #[test]
     fn a_remote_recent_is_labelled_as_a_source_and_keeps_its_mnemonic() {
         let one = tailhawk_core::settings::Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: vec!["nurtur-gateway".to_owned()],
         };
         let label = recent_label(0, &one);
@@ -1921,7 +1930,7 @@ mod tests {
 
         // And a wide selection counts rather than listing, exactly as the title bar does.
         let many = tailhawk_core::settings::Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: (1..=9).map(|n| format!("service-{n}")).collect(),
         };
         let label = recent_label(1, &many);
@@ -1936,7 +1945,7 @@ mod tests {
     #[test]
     fn a_wide_remote_recent_is_cut_to_the_width_a_file_row_keeps() {
         let wide = tailhawk_core::settings::Recent::Remote {
-            source: "nurtur-identity-server-production".to_owned(),
+            tail: "nurtur-identity-server-production".to_owned(),
             apps: vec![
                 "nurtur-gateway-internal".to_owned(),
                 "nurtur-identity-worker".to_owned(),
@@ -2024,6 +2033,101 @@ mod tests {
                     item.text(),
                     item.accelerator
                 );
+            }
+        }
+    }
+    /// **Every id range clear of every other, and of every loose id.**
+    ///
+    /// `ID_WINDOW_BASE`'s doc comment has named this test since it was written and this is the
+    /// first day it exists under that name: the check itself was real, buried in
+    /// [`the_fetch_window_is_on_the_menu_and_checks_the_chosen_one`], where a reader looking for it
+    /// had no reason to come. Each range is a base plus an index, so an overlap means one menu item
+    /// silently running another's command.
+    ///
+    /// **It was also hard-coding `MAX_SOURCES` for the two source ranges on the day they stopped
+    /// counting sources.** `File ▸ Open remote` lists tails from 2026-10-21, and
+    /// [`tailhawk_core::sourceset::MAX_TAILS`] is 512 against `MAX_SOURCES`'s 64 — so at the old
+    /// `ID_SOURCE_BASE` of 10_400 the 100th tail's id *was* [`ID_SORT_COL_BASE`], and whichever arm
+    /// of the dispatch `match` came first would have won. Both ranges moved above every other for
+    /// the room, which is the arithmetic this asserts rather than trusts.
+    ///
+    /// **The loose ids are checked too, because a range can swallow one without overlapping any
+    /// other range.** The `10_300` block is where `ID_CTX_*` lives, in the gap the lifted comment
+    /// itself called "exactly the sort of gap somebody fills by eye".
+    #[test]
+    fn the_id_ranges_cannot_collide() {
+        let ranges: [(&str, u32, u32); 8] = [
+            (
+                "recent",
+                ID_RECENT_BASE,
+                tailhawk_core::settings::RECENT_MAX as u32,
+            ),
+            ("log format", ID_FORMAT_BASE, MAX_MENU_FORMATS as u32),
+            ("sort column", ID_SORT_COL_BASE, MAX_MENU_COLUMNS as u32),
+            ("top-n column", ID_TOPN_COL_BASE, MAX_MENU_COLUMNS as u32),
+            ("filter column", ID_FILTER_COL_BASE, MAX_MENU_COLUMNS as u32),
+            (
+                "fetch window",
+                ID_WINDOW_BASE,
+                tailhawk_core::settings::FETCH_WINDOWS.len() as u32,
+            ),
+            (
+                "open tail",
+                ID_SOURCE_BASE,
+                tailhawk_core::sourceset::MAX_TAILS as u32,
+            ),
+            (
+                "choose applications",
+                ID_SOURCE_PICK_BASE,
+                tailhawk_core::sourceset::MAX_TAILS as u32,
+            ),
+        ];
+        for (at, (name, base, len)) in ranges.iter().enumerate() {
+            assert!(*len > 0, "{name} bounds its range at nothing");
+            for (other, other_base, other_len) in ranges.iter().skip(at + 1) {
+                let clear = base + len <= *other_base || other_base + other_len <= *base;
+                assert!(
+                    clear,
+                    "{name} ({base}+{len}) overlaps {other} ({other_base}+{other_len})"
+                );
+            }
+        }
+
+        // **Every loose id this module declares, not a sample of them.** The list held ten of
+        // nineteen while its own comment said the loose ids were checked — claiming coverage it
+        // did not have, which this project calls the worst kind of test. The nine that were missing
+        // all sit in 10_001–10_012, clear of every range, so the arithmetic was fine and the
+        // claim was not.
+        let loose: [(&str, u32); 19] = [
+            ("unlisted", ID_UNLISTED),
+            ("exit", ID_EXIT),
+            ("keyboard map", ID_KEYMAP),
+            ("about", ID_ABOUT),
+            ("cut", ID_CUT),
+            ("paste", ID_PASTE),
+            ("font", ID_FONT),
+            ("preferences", ID_PREFS),
+            ("clear recent", ID_CLEAR_RECENT),
+            ("help", ID_HELP),
+            ("go to", ID_GOTO),
+            ("the Open remote button", ID_SOURCE_MENU),
+            ("sort ascending", ID_CTX_SORT_ASC),
+            ("sort descending", ID_CTX_SORT_DESC),
+            ("top n", ID_CTX_TOP_N),
+            ("filter on column", ID_CTX_FILTER_COLUMN),
+            ("filter to", ID_CTX_FILTER_TO),
+            ("filter out", ID_CTX_FILTER_OUT),
+            ("edit sources", command_id(Command::EditSources)),
+        ];
+        for (name, id) in &loose {
+            for (range, base, len) in &ranges {
+                assert!(
+                    !(*base..base + len).contains(id),
+                    "{name} ({id}) is inside {range}'s range"
+                );
+            }
+            for (other, other_id) in loose.iter().filter(|(n, _)| n != name) {
+                assert_ne!(id, other_id, "{name} and {other} share an id");
             }
         }
     }

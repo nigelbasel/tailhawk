@@ -470,10 +470,16 @@ someone's filter text, and there is none here to log.
 - The values are the server's. Nothing caches them across sessions or infers them from what a spill
   already holds: a picker that offers an application the source cannot see produces an empty window
   and no reason for it.
-- The choice rewrites the source's **own** selector (`apps::with_apps`) rather than composing a new
+- The choice rewrites the **tail's own** selector (`apps::with_apps`) rather than composing a new
   one, so the environment the user chose and any pipeline stages after the selector survive. The
   same function does both of the owner's asks: every name at once is *interleave*, one name at a
   time is *one window each*.
+- **The selector belongs to a tail, not to a source**, since 2026-10-21 — the owner's framing: *"we
+  might have a single source, the nurtur loki server, but three separate tails, say one looking at
+  ndc, one at identity server and one at job dispatcher"*. A source is the server and the sign-in; a
+  tail is a named view of it, and the credential follows the **source**. One entry per view had been
+  giving one Loki three credentials for the same server, the same client and the same person, and
+  `settings::split_sources` migrates an old file into the shape it was describing.
 - A label response beyond a megabyte, or beyond ten thousand values, is refused rather than walked;
   the picker itself holds 512 and says when the server offered more.
 

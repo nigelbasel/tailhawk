@@ -117,33 +117,301 @@ pub struct Source {
     /// nowhere to be approved. The field was renamed rather than kept beside a second one, because
     /// a configuration file carrying an endpoint nothing can use is a trap for whoever reads it next.
     pub auth_url: String,
-    /// The applications this entry is for, remembered from the last time they were chosen.
-    ///
-    /// **Empty means "ask me".** Set, and the source opens straight into these without a picker —
-    /// the owner's ask of 2026-10-02: *"it would be good to remember which apps were selected the
-    /// previous time so that a user doesnt have to reselect a particular set of apps"*, and
-    /// *"when opening with a preselected list, go straight to that list"*.
-    ///
-    /// **It is also what makes several entries over one Loki possible**, which was the other half
-    /// of that ask. Two sources can share a URL and a selector and differ only here, each under its
-    /// own name in the cloud menu. The apps are kept *beside* the query rather than narrowed into
-    /// it, so the entry still follows the selector if that is edited later —
-    /// [`apps::with_apps`](crate::apps::with_apps) does the narrowing at the moment of opening.
-    pub apps: Vec<String>,
     /// The OAuth2 client id.
     pub client_id: String,
     /// The scope to request.
     pub scope: String,
-    /// The LogQL selector this source starts from — `{environment="dev"}` and the like.
+}
+
+/// One named view of one source's logs — a name, and how the source is filtered to make it.
+///
+/// **A source and a tail are different things, and this product spent two months conflating them.**
+/// The owner, 2026-10-21: *"we possibly need to separate the actual remote source with what is
+/// being tailed. So we might have a single source, the nurtur loki server, but three separate
+/// tails, say one looking at ndc, one at identity server and one at job dispatcher"*. And then the
+/// words the screens use: *"They can add a source, and then can create new tail with a name and
+/// choose how the source gets filtered to be displayed"*.
+///
+/// The fields that used to sit on [`Source`] said so themselves. `query`'s doc comment read *"This
+/// is what makes one Loki into several sources"* and `apps`' read *"Two sources can share a URL and
+/// a selector and differ only here"* — both describing a workaround for a model that had no word
+/// for a view.
+///
+/// **What it fixes is not cosmetic.** A credential is filed under a source's name, so one Loki with
+/// three entries meant three credential entries for the same server, the same client and the same
+/// person — which is why `Tailhawk/loki-tokens/nurtur-loki-live` sits orphaned in the owner's store
+/// after a rename, and why renaming an entry destroyed its sign-in. One source, one credential,
+/// however many tails.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tail {
+    /// What the user calls it, and what its tab is titled. Unique within the file.
+    pub name: String,
+    /// The [`Source::name`] this tail reads from.
+    pub source: String,
+    /// The LogQL selector this tail starts from — `{environment="dev"}` and the like.
     ///
-    /// **This is what makes one Loki into several sources**, and it is the whole of the owner's
-    /// choice of 2026-09-03. The estate runs a *single* Loki: `environment` is a **label**, not a
-    /// host, so dev, QA and live differ by what is asked and not by where. Three entries sharing a
-    /// URL, a client and a credential, differing only here, is what "three windows I can just open"
-    /// actually means.
+    /// **Empty is tolerated rather than legitimate**, and the distinction is the difference between
+    /// three gates. A file migrated from the old shape can carry one — the old editor let a source
+    /// have no selector and drew it as *"(everything)"* — so the set-level gate
+    /// [`crate::sourceset::Editor::fault`] has to accept it or such a file could not be closed. But
+    /// it cannot be *opened*: it reaches Loki as an empty `query` field and comes back 400. So the
+    /// row says so ([`crate::sourceset::tail_row_fault`]) and the editor refuses to make another
+    /// ([`crate::sourceset::tail_being_edited`]).
     ///
-    /// Empty is legitimate and means everything the credential can see — so it is never a fault.
+    /// This said "so it is never a fault" until a review pointed out that one of the three
+    /// disagreed with it.
     pub query: String,
+    /// The applications this tail is for, remembered from the last time they were chosen.
+    ///
+    /// **Empty means "ask me".** Set, and the tail opens straight into these without a picker — the
+    /// owner's ask of 2026-10-02: *"it would be good to remember which apps were selected the
+    /// previous time so that a user doesnt have to reselect a particular set of apps"*.
+    ///
+    /// Kept *beside* the query rather than narrowed into it, so the tail still follows the selector
+    /// if that is edited later — [`apps::with_apps`](crate::apps::with_apps) narrows at the moment
+    /// of opening.
+    pub apps: Vec<String>,
+}
+
+/// One `[[source]]` section as every settings file written before 2026-10-21 holds it: a
+/// connection and a view in the same entry.
+///
+/// **It exists only to be read and split.** Nothing writes this shape any more, and the only thing
+/// that constructs one is [`Settings::from_toml`] meeting a `[[source]]` section.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegacySource {
+    /// Everything about the connection, which is what a [`Source`] still is.
+    pub source: Source,
+    /// The selector, which is now a [`Tail`]'s.
+    pub query: String,
+    /// The applications, likewise.
+    pub apps: Vec<String>,
+}
+
+/// Splits the old one-entry-per-view shape into the sources and tails it was really describing.
+///
+/// **Entries that agree about everything but the view are one source.** The connection is the URL,
+/// the two endpoints, the client and the scope; `query` and `apps` are the view. Three entries over
+/// one Loki differing only in those two were always one source and three tails, and the file said
+/// so by repeating the other five fields three times.
+///
+/// **The source is named after its host**, because the old names belong to the views and the views
+/// keep them: `nurtur-loki-jobdispatcher` stays the name of a *tail*, and the source it reads from
+/// is `telemetry.nurtur.tech`. A host is predictable, stable, and already what a reader would call
+/// the thing. Characters a credential key may not hold are replaced, so a port or an address
+/// literal cannot produce a name the store refuses.
+///
+/// **The credential has to follow, and this says where from.** A migrated source is a *new name*,
+/// and the store is keyed on the name — so the secret and the refresh token sitting under
+/// `nurtur-loki-live` are invisible to a source now called `telemetry.nurtur.tech`, and the reader
+/// is silently signed out of a server they signed into. That is the orphaned-credential defect this
+/// product already has one of, reproduced by its own upgrade. The third return is therefore every
+/// new source's old names, for the shell to move the credential across; see [`Renamed`], and
+/// `secrets::follow_rename` in the shell, which is the half that may touch the store.
+///
+/// An earlier version of this comment claimed *"nothing is moved in Credential Manager — the shell
+/// looks there as well as under its own, see the `secrets_for` fallback"*. There was no
+/// `secrets_for`, and nothing looked anywhere but the source's own name.
+pub fn split_sources(entries: &[LegacySource]) -> (Vec<Source>, Vec<Tail>, Vec<Renamed>) {
+    let mut servers: Vec<Source> = Vec::new();
+    let mut tails: Vec<Tail> = Vec::new();
+    let mut renamed: Vec<Renamed> = Vec::new();
+    // **Compared with the URLs normalised, because a trailing slash is not a different server.**
+    // `https://telemetry.nurtur.tech/loki` and `…/loki/` are the same Loki typed two ways, and a
+    // raw string comparison made them two sources — which is two credentials for one server, the
+    // exact duplication this whole split exists to end, reintroduced by the thing meant to end it.
+    let settled = |source: &Source| Source {
+        name: String::new(),
+        url: source.url.trim().trim_end_matches('/').to_owned(),
+        token_url: source.token_url.trim().to_owned(),
+        auth_url: source.auth_url.trim().to_owned(),
+        client_id: source.client_id.trim().to_owned(),
+        scope: source.scope.trim().to_owned(),
+    };
+    for entry in entries {
+        let source = &entry.source;
+        let connection = settled(source);
+        let at = servers.iter().position(|s| settled(s) == connection);
+        let name = match at {
+            Some(at) => servers[at].name.clone(),
+            None => {
+                let wanted = host_name(&source.url);
+                let taken: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+                let name = crate::apps::saved_entry_name(&wanted, &[], &taken);
+                servers.push(Source {
+                    name: name.clone(),
+                    ..connection
+                });
+                renamed.push(Renamed {
+                    now: name.clone(),
+                    was: Vec::new(),
+                });
+                name
+            }
+        };
+        // **Every entry that folded into this source is a name its credential may be under**, in
+        // file order, because the shell has no better way to choose between them than the one the
+        // reader wrote.
+        if let Some(entry_of) = renamed.iter_mut().find(|r| r.now == name) {
+            entry_of.was.push(source.name.clone());
+        }
+        tails.push(Tail {
+            name: source.name.clone(),
+            source: name,
+            query: entry.query.clone(),
+            apps: entry.apps.clone(),
+        });
+    }
+    // A source whose new name is one of its own old ones needs nothing moved.
+    renamed.retain(|r| !r.was.contains(&r.now));
+    (servers, tails, renamed)
+}
+
+/// A source that a migration renamed, and the names it used to be known by.
+///
+/// **It is not written to the settings file and it does not survive a save.** It is the one-time
+/// instruction *"the credential for this server is filed under one of these"*, produced by
+/// [`split_sources`] when it reads an old file and consumed by the shell before the new file is
+/// written. Once the credential has moved there is nothing left to say.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Renamed {
+    /// What the source is called now.
+    pub now: String,
+    /// What the entries that folded into it were called, in file order.
+    pub was: Vec<String>,
+}
+
+/// Which old name a credential should be moved from, or `None` if nothing should move.
+///
+/// **Pure, so the decision is tested and the store is only ever touched on its answer.** `now` is
+/// whether the new name already holds one; `was` is each old name and whether it holds one, in the
+/// order [`Renamed`] gives.
+///
+/// - A credential already under the new name wins: a reader who has signed in since the upgrade
+///   must not be rolled back to a token from before it.
+/// - Otherwise the first old name that has one. Several is the three-entries-over-one-Loki case,
+///   where they are tokens for the same server, the same client and the same person.
+pub fn secret_to_move(now: bool, was: &[(String, bool)]) -> Option<&str> {
+    if now {
+        return None;
+    }
+    was.iter()
+        .find(|(_, has)| *has)
+        .map(|(name, _)| name.as_str())
+}
+
+/// One credential to carry from an old name to a new one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialMove {
+    /// The name it is filed under now.
+    pub from: String,
+    /// The name it belongs under.
+    pub to: String,
+}
+
+/// Every credential a migration should carry, and the old names to clear afterwards.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CredentialPlan {
+    pub moves: Vec<CredentialMove>,
+    /// Names to delete once every move has landed.
+    pub clear: Vec<String>,
+}
+
+/// Plans the whole credential migration **before any of it happens**, which is the only way it is
+/// correct.
+///
+/// `held` is every name the store has something under, read once, before anything moves.
+///
+/// **Deciding one entry at a time against the live store is wrong, and quietly.** Two things make
+/// it so, and both need a legacy entry *named after some other entry's host* — which is the naming
+/// convention this very version writes, so it is a shape upgraders will have.
+///
+/// - **A new name that is also another entry's old name is not "already occupied".** Asking the
+///   live store whether `telemetry.nurtur.tech` holds a credential answers yes when that is the
+///   name of a *different* legacy source whose own credential is about to move away. Treating that
+///   as occupied skips the move, and the secret that belonged there is left orphaned for ever.
+/// - **And a move must not land on a name something is still due to be taken from.** Having
+///   decided not to skip, writing immediately clobbers the credential the other entry has not read
+///   yet — so that entry then carries the *wrong* secret to its own new name. Reading every value
+///   first is what makes the order stop mattering.
+///
+/// The clear list follows from the same fact: a name that is some entry's `to` is never cleared,
+/// however many entries took from it, because clearing it would delete what was just written
+/// there.
+pub fn credential_plan(renamed: &[Renamed], held: &[String]) -> CredentialPlan {
+    let has = |name: &str| held.iter().any(|h| h == name);
+    let landing: Vec<&str> = renamed.iter().map(|r| r.now.as_str()).collect();
+    let leaving: Vec<&str> = renamed
+        .iter()
+        .flat_map(|r| r.was.iter())
+        .map(String::as_str)
+        .collect();
+
+    let mut plan = CredentialPlan::default();
+    for entry in renamed {
+        // Occupied means "holds a credential that is staying there" — so a name something is due
+        // to be taken from does not count, however full it looks.
+        let occupied = has(&entry.now) && !leaving.contains(&entry.now.as_str());
+        let flags: Vec<(String, bool)> = entry
+            .was
+            .iter()
+            .map(|was| (was.clone(), has(was)))
+            .collect();
+        // **Never onto the name it came from.** `split_sources` drops an entry whose new name is
+        // one of its own old ones, so a migration cannot ask for this — but the editor's renames
+        // come through here too, and a copy-then-clear of one name onto itself would delete the
+        // credential it had just written.
+        if let Some(from) = secret_to_move(occupied, &flags).filter(|from| *from != entry.now) {
+            plan.moves.push(CredentialMove {
+                from: from.to_owned(),
+                to: entry.now.clone(),
+            });
+        }
+    }
+    for mv in &plan.moves {
+        if !landing.contains(&mv.from.as_str()) && !plan.clear.contains(&mv.from) {
+            plan.clear.push(mv.from.clone());
+        }
+    }
+    plan
+}
+
+/// The longest a source's name may be, because it is also the key its credential is filed under.
+///
+/// **It lives here rather than in the shell's `secrets` module**, where the same number used to be
+/// the only copy. `Source::fault` claimed the store "enforces the same shape" and did not check the
+/// length at all, so a 65-character name saved cleanly and then failed silently at every store
+/// call: the pasted secret was never written, the row read `(no secret stored)` for ever, and
+/// nothing said why. A limit one half of the product enforces and the other half only mentions is
+/// not a shared rule, so this is the one definition and `secrets::nameable` reads it.
+///
+/// `CREDENTIALW::TargetName` is documented as up to 32,767 characters, so this is not the
+/// platform's limit — it is a limit on how silly a name can get before it stops being a name.
+pub const NAME_MAX: usize = 64;
+
+/// A URL's host, as a name a source may be called and a credential may be filed under.
+///
+/// Anything outside letters, digits, `-`, `_`, `.` and space becomes `-`, so a port or a bracketed
+/// address literal cannot produce a name [`Source::fault`] refuses and the store would not accept.
+fn host_name(url: &str) -> String {
+    let after = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = after.split('/').next().unwrap_or(after);
+    let cleaned: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c| c == '-' || c == ' ').to_owned();
+    if trimmed.is_empty() {
+        "loki".to_owned()
+    } else {
+        trimmed
+    }
 }
 
 impl Source {
@@ -154,14 +422,20 @@ impl Source {
     /// typed rather than when a query fails.
     pub fn fault(&self) -> Option<&'static str> {
         // The name is the credential's key as well as the label, so it is held to what can be one:
-        // no separator, no control characters, nothing that trims away to nothing. The shell's
-        // `secrets::target_for` enforces the same shape at the store; this is the half that can
-        // say so in words while the user is still typing.
+        // no separator, no control characters, nothing that trims away to nothing, and nothing
+        // longer than [`NAME_MAX`]. The shell's `secrets::nameable` holds a name to exactly this,
+        // reading the same constant; this is the half that can say so in words while the user is
+        // still typing.
         if self.name.trim().is_empty() {
             return Some("Give the source a name.");
         }
         if self.name.trim() != self.name {
             return Some("The name cannot start or end with a space.");
+        }
+        // **The length was the one rule only the store knew.** A longer name saved and then failed
+        // silently at every store call — no secret written, no sign-in kept, nothing said.
+        if self.name.len() > NAME_MAX {
+            return Some("The name is too long to file a credential under.");
         }
         let nameable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ');
         if !self.name.chars().all(nameable) {
@@ -265,6 +539,12 @@ pub struct Settings {
     pub files: Vec<FileState>,
     /// `LOKI.md`'s remote sources, in the order the user put them. Secrets are NOT here.
     pub sources: Vec<Source>,
+    /// The tails — the named views, each reading one of the sources above.
+    ///
+    /// **A source is a connection and a tail is a view**, since 2026-10-21. Before that one
+    /// `[[source]]` was both, which is why a file written by an older build migrates on read: see
+    /// [`split_sources`].
+    pub tails: Vec<Tail>,
     /// V13: `dark`, `light` or `system`, when the user chose one.
     pub theme: Option<String>,
     /// §2.2 Preferences: the grid font family, when the user chose one.
@@ -290,6 +570,14 @@ pub struct Settings {
     pub recent: Vec<Recent>,
     /// The Find dialog's query history, newest first, at most [`FIND_MAX`].
     pub find_queries: Vec<String>,
+    /// Which shape the file said it was in, or `None` for a file that predates [`MODEL`] and is
+    /// therefore migrated. Not a setting a reader would ever want to change.
+    pub model: Option<u32>,
+    /// **Not a setting: the one-time note that reading this file migrated it.** Each entry is a
+    /// source that [`split_sources`] gave a new name, and the names its credential may be filed
+    /// under. The shell acts on it once, before saving, and nothing writes it to a file — see
+    /// [`Renamed`] and [`secret_to_move`].
+    pub migrated: Vec<Renamed>,
 }
 
 /// One entry in File ▸ Open Recent: a file on disk, or a remote source and what was chosen from it.
@@ -306,11 +594,29 @@ pub struct Settings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recent {
     File(String),
-    Remote { source: String, apps: Vec<String> },
+    Remote { tail: String, apps: Vec<String> },
 }
 
 /// The prefix that marks a recent entry as a remote source rather than a path.
 const REMOTE_SCHEME: &str = "loki://";
+
+/// Which shape the settings file is in — written at the top of every file this version produces.
+///
+/// **It exists because the two shapes are byte-identical in one case**, and that case is ordinary.
+/// Before 2026-10-21 a `[[source]]` was a connection *and* a view; the splitter decides a file is
+/// old by finding a `[[source]]` that carries a `query` or an `apps`. But the old writer emitted
+/// `query` only when it was non-empty and the old editor let it be empty — it drew the empty one as
+/// *"(everything)"* — so a source configured to show everything wrote neither key, and a file full
+/// of those is indistinguishable from a new file with sources and no tails.
+///
+/// Guessing it cost the view. Read as new, the file keeps its sources and has no tails at all, and
+/// `File ▸ Open remote` — which lists tails — comes up **empty**: the server is in the
+/// configuration and unreachable from the menu. Read as old, a new file whose tails the reader had
+/// deliberately deleted would grow them back on every load.
+///
+/// So the file says. A file carrying no `model` key is from before this and is migrated; one
+/// carrying this is read as it stands.
+pub const MODEL: u32 = 2;
 
 /// How far back a remote source fetches when nothing has been chosen — one hour, which is what the
 /// fixed constant was before there was a choice.
@@ -472,10 +778,10 @@ impl Recent {
                     _ => format!("{}\\{}", parts[1], parts[0]),
                 }
             }
-            Recent::Remote { source, apps } if apps.is_empty() => format!("{source}  (Loki)"),
-            Recent::Remote { source, apps } => {
+            Recent::Remote { tail, apps } if apps.is_empty() => format!("{tail}  (Loki)"),
+            Recent::Remote { tail, apps } => {
                 let named: Vec<&str> = apps.iter().map(String::as_str).collect();
-                format!("{}  (Loki)", crate::apps::source_label(source, &named))
+                format!("{}  (Loki)", crate::apps::source_label(tail, &named))
             }
         }
     }
@@ -484,12 +790,12 @@ impl Recent {
     pub fn encode(&self) -> String {
         match self {
             Recent::File(path) => path.clone(),
-            Recent::Remote { source, apps } if apps.is_empty() => {
-                format!("{REMOTE_SCHEME}{}", escape(source))
+            Recent::Remote { tail, apps } if apps.is_empty() => {
+                format!("{REMOTE_SCHEME}{}", escape(tail))
             }
-            Recent::Remote { source, apps } => {
+            Recent::Remote { tail, apps } => {
                 let apps: Vec<String> = apps.iter().map(|a| escape(a)).collect();
-                format!("{REMOTE_SCHEME}{}?apps={}", escape(source), apps.join(","))
+                format!("{REMOTE_SCHEME}{}?apps={}", escape(tail), apps.join(","))
             }
         }
     }
@@ -500,16 +806,16 @@ impl Recent {
         let Some(rest) = text.strip_prefix(REMOTE_SCHEME) else {
             return Recent::File(text.to_owned());
         };
-        let (source, apps) = match rest.split_once("?apps=") {
+        let (name, apps) = match rest.split_once("?apps=") {
             // **Not filtered for empties.** `encode` writes `?apps=` only when there is at least
             // one, so the marker's presence already says the list is non-empty — and dropping an
             // empty name here would make `decode(encode(x))` differ from `x` for the one a
             // hand-written `{app=""}` selector produces.
-            Some((source, apps)) => (source, apps.split(',').map(unescape).collect()),
+            Some((name, apps)) => (name, apps.split(',').map(unescape).collect()),
             None => (rest, Vec::new()),
         };
         Recent::Remote {
-            source: unescape(source),
+            tail: unescape(name),
             apps,
         }
     }
@@ -625,6 +931,18 @@ impl Settings {
             self.sources.retain(|e| e.name != s.name);
             self.sources.push(s);
         }
+        // **And the tails the same way, which they were not.** A tail is a named artefact of the
+        // same kind as a source, so a curated tail beside the exe and a user's own with the same
+        // name is the overriding case `sources` has always handled; two tails sharing a name is a
+        // fault the editor refuses, and a merge that appended would have manufactured one.
+        for t in over.tails {
+            self.tails.retain(|e| e.name != t.name);
+            self.tails.push(t);
+        }
+        // **Every tier's migration note is kept**, because each tier is a file of its own and any
+        // of them can be in the old shape. They are instructions to move a credential once, not
+        // settings, so the later tier does not replace the earlier one's.
+        self.migrated.extend(over.migrated);
         if over.theme.is_some() {
             self.theme = over.theme;
         }
@@ -646,6 +964,10 @@ impl Settings {
     pub fn to_toml(&self) -> String {
         let mut out =
             String::from("# Tailhawk settings — SPEC.md §12.4. Rewritten whole; edits survive.\n");
+        // **First, and before any table.** Its absence is what tells the reader this file predates
+        // the source/tail split — see [`MODEL`], which is the whole argument. A bare key must come
+        // before the first `[table]` heading or TOML puts it inside that table.
+        out.push_str(&format!("model = {MODEL}\n"));
         // One `[appearance]` heading however many of its keys are set — a second heading for the
         // same table is legal TOML but reads as a mistake to anyone editing the file by hand, which
         // §12.4 expects them to do.
@@ -707,19 +1029,23 @@ impl Settings {
             if !s.client_id.is_empty() {
                 out.push_str(&format!("client_id = {}\n", quote(&s.client_id)));
             }
-            if !s.apps.is_empty() {
-                let listed: Vec<String> = s.apps.iter().map(|a| quote(a)).collect();
-                out.push_str(&format!("apps = [{}]\n", listed.join(", ")));
-            }
             if !s.scope.is_empty() {
                 out.push_str(&format!("scope = {}\n", quote(&s.scope)));
             }
-            if !s.query.is_empty() {
-                out.push_str(&format!(
-                    "query = {}
-",
-                    quote(&s.query)
-                ));
+        }
+        // **A tail is a section of its own**, because it is a thing of its own: a name, the
+        // source it reads, and how that source is filtered. Written after the sources, so a
+        // hand-edited file reads in the order a person would explain it.
+        for t in &self.tails {
+            out.push_str("\n[[tail]]\n");
+            out.push_str(&format!("name = {}\n", quote(&t.name)));
+            out.push_str(&format!("source = {}\n", quote(&t.source)));
+            if !t.query.is_empty() {
+                out.push_str(&format!("query = {}\n", quote(&t.query)));
+            }
+            if !t.apps.is_empty() {
+                let listed: Vec<String> = t.apps.iter().map(|a| quote(a)).collect();
+                out.push_str(&format!("apps = [{}]\n", listed.join(", ")));
             }
         }
         for f in &self.files {
@@ -768,45 +1094,77 @@ impl Settings {
         let mut window = Window::default();
         let mut have_window = false;
         let mut file: Option<FileState> = None;
-        let mut source: Option<Source> = None;
-        let flush_file =
-            |file: &mut Option<FileState>, source: &mut Option<Source>, settings: &mut Settings| {
-                if let Some(f) = file.take() {
-                    if !f.path.is_empty() {
-                        settings.set_file(f);
-                    }
+        let mut source: Option<LegacySource> = None;
+        let mut tail: Option<Tail> = None;
+        // **Every `[[source]]` is collected before any of it is believed**, because an entry that
+        // carries a `query` or an `apps` is one of the old entry-per-view kind and the whole set
+        // has to be split together — two entries are one source only if they agree, which cannot be
+        // known one section at a time.
+        let mut legacy: Vec<LegacySource> = Vec::new();
+        let flush_file = |file: &mut Option<FileState>,
+                          source: &mut Option<LegacySource>,
+                          tail: &mut Option<Tail>,
+                          legacy: &mut Vec<LegacySource>,
+                          settings: &mut Settings| {
+            if let Some(f) = file.take() {
+                if !f.path.is_empty() {
+                    settings.set_file(f);
                 }
-                // A source with no name cannot key its own credential, so it is dropped rather than
-                // kept as an entry that can never work.
-                if let Some(s) = source.take() {
-                    if !s.name.trim().is_empty() {
-                        settings.sources.retain(|e| e.name != s.name);
-                        settings.sources.push(s);
-                    }
+            }
+            // A source with no name cannot key its own credential, so it is dropped rather than
+            // kept as an entry that can never work.
+            if let Some(s) = source.take() {
+                if !s.source.name.trim().is_empty() {
+                    legacy.retain(|e| e.source.name != s.source.name);
+                    legacy.push(s);
                 }
-            };
+            }
+            // A tail with no name, or none that says which source it reads, is the same case.
+            if let Some(t) = tail.take() {
+                if !t.name.trim().is_empty() && !t.source.trim().is_empty() {
+                    settings.tails.retain(|e| e.name != t.name);
+                    settings.tails.push(t);
+                }
+            }
+        };
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             if let Some(header) = line.strip_prefix("[[").and_then(|l| l.strip_suffix("]]")) {
-                flush_file(&mut file, &mut source, &mut settings);
+                flush_file(
+                    &mut file,
+                    &mut source,
+                    &mut tail,
+                    &mut legacy,
+                    &mut settings,
+                );
                 section = match header.trim() {
                     "file" => {
                         file = Some(FileState::default());
                         Section::File
                     }
                     "source" => {
-                        source = Some(Source::default());
+                        source = Some(LegacySource::default());
                         Section::Source
+                    }
+                    "tail" => {
+                        tail = Some(Tail::default());
+                        Section::Tail
                     }
                     _ => Section::Other,
                 };
                 continue;
             }
             if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                flush_file(&mut file, &mut source, &mut settings);
+                flush_file(
+                    &mut file,
+                    &mut source,
+                    &mut tail,
+                    &mut legacy,
+                    &mut settings,
+                );
                 section = match header.trim() {
                     "window" => {
                         have_window = true;
@@ -866,16 +1224,31 @@ impl Settings {
                     "maximized" => window.maximized = value == "true",
                     _ => {}
                 },
+                Section::Tail => {
+                    if let Some(t) = tail.as_mut() {
+                        match key {
+                            "name" => t.name = unquote(value),
+                            "source" => t.source = unquote(value),
+                            "query" => t.query = unquote(value),
+                            "apps" => t.apps = array(value),
+                            _ => {}
+                        }
+                    }
+                }
+                // **A `[[source]]` may be either shape**, and which one it is cannot be known until
+                // the section ends: a `query` or an `apps` key makes it one of the old
+                // entry-per-view kind. So every one is read into a [`LegacySource`] and the
+                // decision is taken when it is flushed.
                 Section::Source => {
                     if let Some(s) = source.as_mut() {
                         match key {
-                            "name" => s.name = unquote(value),
-                            "url" => s.url = unquote(value),
-                            "token_url" => s.token_url = unquote(value),
-                            "auth_url" => s.auth_url = unquote(value),
-                            "client_id" => s.client_id = unquote(value),
+                            "name" => s.source.name = unquote(value),
+                            "url" => s.source.url = unquote(value),
+                            "token_url" => s.source.token_url = unquote(value),
+                            "auth_url" => s.source.auth_url = unquote(value),
+                            "client_id" => s.source.client_id = unquote(value),
+                            "scope" => s.source.scope = unquote(value),
                             "apps" => s.apps = array(value),
-                            "scope" => s.scope = unquote(value),
                             "query" => s.query = unquote(value),
                             // **A `secret` key is read and thrown away.** Somebody will eventually
                             // put one here by hand, and silently ignoring it is better than either
@@ -908,10 +1281,53 @@ impl Settings {
                         }
                     }
                 }
-                Section::None | Section::Other => {}
+                // **The one key that lives outside every table**, because its absence is what says
+                // the file predates the source/tail split — see [`MODEL`]. `Section::Other` is a
+                // table this version does not know, and a `model` key inside one of those is not
+                // this key.
+                Section::None => {
+                    if key == "model" {
+                        settings.model = value.parse().ok();
+                    }
+                }
+                Section::Other => {}
             }
         }
-        flush_file(&mut file, &mut source, &mut settings);
+        flush_file(
+            &mut file,
+            &mut source,
+            &mut tail,
+            &mut legacy,
+            &mut settings,
+        );
+        // **Which shape the file was in, decided once, at the end.**
+        //
+        // A `[[source]]` that carries a view — a query or a list of applications — is one of the old
+        // entry-per-view kind, and the whole set is split: entries agreeing about everything but
+        // the view become one source with a tail each. A file whose sources carry no view is
+        // already in the new shape and its `[[tail]]` sections say the rest.
+        //
+        // **A file that has both is read as already migrated**, and its `[[source]]` entries are
+        // taken as connections. That is the state a migrated file is written in, and it is also
+        // what a hand-edited one should mean.
+        // **The file says which shape it is in, and only a file that does not say is migrated.**
+        // A `[[source]]` carrying a view is still taken as the old shape whatever the key says,
+        // because a hand-edited file can be both wrong and sincere — but the key is what rescues
+        // the case the view cannot be seen in: sources with no query and no apps, which the old
+        // editor drew as *"(everything)"* and which are indistinguishable from new-shape sources
+        // with no tails. See [`MODEL`].
+        let old_shape = settings.model.is_none();
+        let views = legacy
+            .iter()
+            .any(|e| !e.query.trim().is_empty() || !e.apps.is_empty());
+        if (old_shape || views) && settings.tails.is_empty() && !legacy.is_empty() {
+            let (sources, tails, renamed) = split_sources(&legacy);
+            settings.sources = sources;
+            settings.tails = tails;
+            settings.migrated = renamed;
+        } else {
+            settings.sources = legacy.into_iter().map(|e| e.source).collect();
+        }
         if have_window && window.width > 0 && window.height > 0 {
             settings.window = Some(window);
         }
@@ -928,6 +1344,7 @@ enum Section {
     Find,
     File,
     Source,
+    Tail,
     Other,
 }
 
@@ -1184,7 +1601,7 @@ mod tests {
             Recent::File(shouted.to_owned()),
             Recent::File(temp.to_owned()),
             Recent::Remote {
-                source: "live".to_owned(),
+                tail: "live".to_owned(),
                 apps: Vec::new(),
             },
         ]);
@@ -1195,7 +1612,7 @@ mod tests {
                 Recent::File(real.to_owned()),
                 Recent::File(temp.to_owned()),
                 Recent::Remote {
-                    source: "live".to_owned(),
+                    tail: "live".to_owned(),
                     apps: Vec::new()
                 }
             ],
@@ -1213,12 +1630,12 @@ mod tests {
         let mut s = Settings::default();
         s.remember_recent(Recent::File(r"C:\logs\a.log".to_owned()));
         s.remember_recent(Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: vec!["nurtur-gateway".to_owned()],
         });
         // The same source narrowed differently is a different window, so a second entry.
         s.remember_recent(Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: vec!["nurtur-identity".to_owned()],
         });
         assert_eq!(s.recent.len(), 3, "{:?}", s.recent);
@@ -1241,7 +1658,7 @@ mod tests {
     #[test]
     fn two_sources_differing_only_in_case_are_two_entries() {
         let of = |app: &str| Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: vec![app.to_owned()],
         };
         let mut s = Settings::default();
@@ -1261,13 +1678,13 @@ mod tests {
     #[test]
     fn an_empty_application_name_is_not_quietly_dropped() {
         let there = Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: vec![String::new()],
         };
         assert_eq!(Recent::decode(&there.encode()), there);
         // And a source with no applications at all is still distinct from that.
         let none = Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: Vec::new(),
         };
         assert_eq!(Recent::decode(&none.encode()), none);
@@ -1359,7 +1776,7 @@ mod tests {
     #[test]
     fn a_recent_entry_can_be_forgotten_without_disturbing_the_rest() {
         let gone = Recent::Remote {
-            source: "nurtur-loki".to_owned(),
+            tail: "nurtur-loki".to_owned(),
             apps: Vec::new(),
         };
         let mut s = Settings::default();
@@ -1390,7 +1807,7 @@ mod tests {
     #[test]
     fn a_remote_sources_layout_is_kept_under_the_name_the_recent_list_uses() {
         let entry = Recent::Remote {
-            source: "nurtur-loki-live".to_owned(),
+            tail: "nurtur-loki-live".to_owned(),
             apps: vec!["job-dispatcher".to_owned()],
         };
         let mut s = Settings::default();
@@ -1499,10 +1916,14 @@ mod tests {
                 url: "https://telemetry-dev.example/loki".to_owned(),
                 token_url: "https://identity-dev.example/connect/token".to_owned(),
                 client_id: "tailhawk".to_owned(),
-                apps: Vec::new(),
                 scope: "telemetry:read".to_owned(),
-                query: "{environment=\"dev\"}".to_owned(),
                 auth_url: String::new(),
+            }],
+            tails: vec![Tail {
+                name: "dev".to_owned(),
+                source: "dev".to_owned(),
+                query: "{environment=\"dev\"}".to_owned(),
+                apps: Vec::new(),
             }],
             theme: Some("light".to_owned()),
             font: Some("Cascadia Mono".to_owned()),
@@ -1511,6 +1932,8 @@ mod tests {
             toolbar_large: Some(true),
             recent: vec![Recent::File(r"C:\logs\app.log".to_owned())],
             find_queries: vec!["ERROR".to_owned(), r"time\d+".to_owned()],
+            migrated: Vec::new(),
+            model: Some(MODEL),
         };
         s.set_file(FileState {
             path: r"C:\logs\app.log".to_owned(),
@@ -1635,10 +2058,14 @@ mod tests {
             url: "https://telemetry-dev.example/loki".to_owned(),
             token_url: "https://identity-dev.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
-            apps: Vec::new(),
             scope: "telemetry:read".to_owned(),
-            query: "{environment=~\"live|production\"}".to_owned(),
             auth_url: "https://identity-dev.example/connect/authorize".to_owned(),
+        });
+        s.tails.push(Tail {
+            name: "dev production".to_owned(),
+            source: "dev".to_owned(),
+            query: "{environment=~\"live|production\"}".to_owned(),
+            apps: vec!["ndc".to_owned()],
         });
         s.sources.push(Source {
             name: "open".to_owned(),
@@ -1647,7 +2074,9 @@ mod tests {
         });
 
         let text = s.to_toml();
-        assert_eq!(Settings::from_toml(&text).sources, s.sources, "round trip");
+        let back = Settings::from_toml(&text);
+        assert_eq!(back.sources, s.sources, "round trip");
+        assert_eq!(back.tails, s.tails, "and the tails with them");
         // An unauthenticated source writes three fewer keys rather than three empty ones.
         assert!(!text.contains("token_url = \"\""), "no empty keys");
 
@@ -1664,11 +2093,19 @@ mod tests {
                            secret = \"hunter2\"\n";
         let read = Settings::from_toml(hand_edited);
         assert_eq!(read.sources.len(), 1);
-        assert_eq!(read.sources[0].name, "dev");
         assert!(
             !read.to_toml().contains("hunter2"),
             "and it does not survive to be written back"
         );
+        // **This fixture carries no `model` key, so it is an old file and reading it migrates.**
+        // The source takes its host's name and the entry's name becomes the *tail's* — which is
+        // the point of [`MODEL`]: before it, this exact shape (a source with no query and no apps)
+        // was read as already-new, the tail was never minted, and `File ▸ Open remote` — which
+        // lists tails — came up empty over a server that was still in the configuration.
+        assert_eq!(read.sources[0].name, "a.example", "named after its host");
+        assert_eq!(read.tails.len(), 1, "**and the view survived**");
+        assert_eq!(read.tails[0].name, "dev", "under the name the entry had");
+        assert_eq!(read.tails[0].source, "a.example");
     }
 
     /// A source with no name cannot key its own credential, so it is dropped rather than kept as an
@@ -1723,7 +2160,7 @@ mod tests {
     #[test]
     fn a_recent_entry_reads_as_the_thing_a_reader_recognises() {
         let remote = Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: vec!["Worker".to_owned(), "Api".to_owned()],
         };
         let shown = remote.shown();
@@ -1739,7 +2176,7 @@ mod tests {
         );
 
         let whole = Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: Vec::new(),
         };
         assert_eq!(whole.shown(), "live  (Loki)");
@@ -1757,28 +2194,38 @@ mod tests {
     }
 
     /// **A remembered application set survives the round trip, and an empty one writes nothing.**
-    /// Empty means "ask me", so a source that has never had a choice made must not come back
-    /// carrying an empty list that reads as a deliberate selection of nothing.
+    /// Empty means "ask me", so a tail that has never had a choice made must not come back carrying
+    /// an empty list that reads as a deliberate selection of nothing.
+    ///
+    /// **And it is two tails of one source now, which is the whole point of the split.** This test
+    /// used to end by asserting that two *sources* over one Loki shared a URL and a selector and
+    /// differed only in name — "the other half of the ask", it said. That shape is what gave one
+    /// server three credentials under three names; the ask is still honoured and the model finally
+    /// says so.
     #[test]
     fn a_remembered_application_set_comes_back_whole() {
         let mut s = Settings::default();
         s.sources.push(Source {
-            name: "live-workers".to_owned(),
+            name: "live".to_owned(),
             url: "https://telemetry.example/loki".to_owned(),
             token_url: "https://identity.example/connect/token".to_owned(),
             auth_url: "https://identity.example/connect/authorize".to_owned(),
             client_id: "tailhawk".to_owned(),
+            scope: "telemetry:read".to_owned(),
+        });
+        s.tails.push(Tail {
+            name: "live-workers".to_owned(),
+            source: "live".to_owned(),
+            query: "{environment=\"live\"}".to_owned(),
             apps: vec![
                 "nurtur-gateway".to_owned(),
                 "campaign-editor-api".to_owned(),
             ],
-            scope: "telemetry:read".to_owned(),
-            query: "{environment=\"live\"}".to_owned(),
         });
-        s.sources.push(Source {
+        s.tails.push(Tail {
             name: "live-everything".to_owned(),
             apps: Vec::new(),
-            ..s.sources[0].clone()
+            ..s.tails[0].clone()
         });
 
         let text = s.to_toml();
@@ -1787,10 +2234,10 @@ mod tests {
             "{text}"
         );
         let back = Settings::from_toml(&text);
-        assert_eq!(back.sources[0].apps, s.sources[0].apps);
+        assert_eq!(back.tails[0].apps, s.tails[0].apps);
         assert!(
-            back.sources[1].apps.is_empty(),
-            "a source with nothing remembered must not grow an empty list"
+            back.tails[1].apps.is_empty(),
+            "a tail with nothing remembered must not grow an empty list"
         );
         assert_eq!(
             text.matches("apps = ").count(),
@@ -1798,11 +2245,11 @@ mod tests {
             "only the entry that remembers something writes the key: {text}"
         );
 
-        // **Two entries over one Loki, differing only in what they remember**, which is the other
-        // half of the ask: same URL, same selector, their own names.
-        assert_eq!(back.sources[0].url, back.sources[1].url);
-        assert_eq!(back.sources[0].query, back.sources[1].query);
-        assert_ne!(back.sources[0].name, back.sources[1].name);
+        // **Two views of one Loki: one server, one credential, two names.**
+        assert_eq!(back.sources.len(), 1, "and only one connection for both");
+        assert_eq!(back.tails[0].source, back.tails[1].source);
+        assert_eq!(back.tails[0].query, back.tails[1].query);
+        assert_ne!(back.tails[0].name, back.tails[1].name);
     }
 
     /// **A source says why it cannot be used, while it is being typed.** The alternative is a
@@ -1815,9 +2262,7 @@ mod tests {
             url: "https://telemetry-dev.example/loki".to_owned(),
             token_url: "https://identity-dev.example/connect/token".to_owned(),
             client_id: "tailhawk".to_owned(),
-            apps: Vec::new(),
             scope: "telemetry:read".to_owned(),
-            query: String::new(),
             auth_url: String::new(),
         };
         assert_eq!(good.fault(), None, "a complete source is usable");
@@ -1849,7 +2294,6 @@ mod tests {
             Source {
                 token_url: String::new(),
                 client_id: String::new(),
-                apps: Vec::new(),
                 ..signs_in.clone()
             }
             .fault()
@@ -1860,7 +2304,6 @@ mod tests {
         let unauthenticated = Source {
             token_url: String::new(),
             client_id: String::new(),
-            apps: Vec::new(),
             scope: String::new(),
             ..good.clone()
         };
@@ -1896,7 +2339,6 @@ mod tests {
         assert!(
             Source {
                 client_id: String::new(),
-                apps: Vec::new(),
                 ..good.clone()
             }
             .fault()
@@ -2094,8 +2536,15 @@ mod tests {
             1,
             "a leading BOM must not cost the file its contents"
         );
-        assert_eq!(marked.sources[0].name, "live");
         assert_eq!(marked.sources[0].url, "https://example.com/loki");
+        // **The fixture is an *old* file — its `[[source]]` carries a query — so reading it
+        // migrates it, and the name `live` is the *tail's*.** This assertion used to be
+        // `sources[0].name == "live"` and failed on the day the split landed, which is the
+        // migration working rather than the BOM failing. Said here because a test named for one
+        // thing failing over another is how an hour goes missing.
+        assert_eq!(marked.tails[0].name, "live");
+        assert_eq!(marked.sources[0].name, "example.com");
+        assert_eq!(marked.tails[0].source, "example.com");
     }
 
     /// **A path is never mistaken for a source, whatever it contains.**
@@ -2131,7 +2580,7 @@ mod tests {
     #[test]
     fn a_remote_entry_carries_its_source_and_its_applications() {
         let there = Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: vec!["nurtur-gateway".to_owned(), "nurtur-identity".to_owned()],
         };
         assert_eq!(
@@ -2147,7 +2596,7 @@ mod tests {
     #[test]
     fn a_remote_entry_with_no_applications_says_nothing_about_them() {
         let there = Recent::Remote {
-            source: "live".to_owned(),
+            tail: "live".to_owned(),
             apps: Vec::new(),
         };
         assert_eq!(there.encode(), "loki://live");
@@ -2162,9 +2611,430 @@ mod tests {
     #[test]
     fn a_name_containing_the_separators_comes_back_whole() {
         let there = Recent::Remote {
-            source: "live? 50%".to_owned(),
+            tail: "live? 50%".to_owned(),
             apps: vec!["a,b".to_owned(), "100%".to_owned()],
         };
         assert_eq!(Recent::decode(&there.encode()), there);
+    }
+
+    /// **The migration the owner's insight asked for**, 2026-10-21: *"we might have a single source,
+    /// the nurtur loki server, but three separate tails, say one looking at ndc, one at identity
+    /// server and one at job dispatcher"*. Three old entries differing only in their selector were
+    /// always one server; the file said so by repeating the other five fields three times.
+    #[test]
+    fn three_old_entries_over_one_loki_become_one_source_and_three_tails() {
+        let legacy: Vec<LegacySource> = ["ndc", "identity", "jobdispatcher"]
+            .iter()
+            .map(|app| LegacySource {
+                source: Source {
+                    name: format!("nurtur-loki-{app}"),
+                    url: "https://telemetry.nurtur.tech/loki".to_owned(),
+                    token_url: "https://identity.nurtur.tech/connect/token".to_owned(),
+                    auth_url: "https://identity.nurtur.tech/connect/authorize".to_owned(),
+                    client_id: "tailhawk".to_owned(),
+                    scope: "telemetry:read".to_owned(),
+                },
+                query: format!("{{application=\"{app}\"}}"),
+                apps: vec![(*app).to_owned()],
+            })
+            .collect();
+
+        let (sources, tails, renamed) = split_sources(&legacy);
+        assert_eq!(sources.len(), 1, "one server: {sources:?}");
+        assert_eq!(
+            sources[0].name, "telemetry.nurtur.tech",
+            "named after its host, because the old names belong to the views"
+        );
+        let names: Vec<&str> = tails.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "nurtur-loki-ndc",
+                "nurtur-loki-identity",
+                "nurtur-loki-jobdispatcher"
+            ],
+            "**and the views keep their names**, which is what `Recent::Remote` remembers and what \
+             a tab is called — a migration that renamed them would break every recent open"
+        );
+        assert!(
+            tails.iter().all(|t| t.source == sources[0].name),
+            "all three read the one server"
+        );
+        assert_eq!(tails[0].apps, ["ndc"]);
+        assert_eq!(tails[0].query, "{application=\"ndc\"}");
+
+        // **And the credential's old names, in file order**, because the shell has to move it and
+        // the store is keyed on a name that has just changed.
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].now, "telemetry.nurtur.tech");
+        assert_eq!(renamed[0].was, names, "every entry that folded in");
+    }
+
+    /// Entries that differ in the **connection** are different servers, however alike their views.
+    #[test]
+    fn entries_against_different_servers_stay_apart() {
+        let legacy: Vec<LegacySource> = ["dev", "live"]
+            .iter()
+            .map(|env| LegacySource {
+                source: Source {
+                    name: format!("loki-{env}"),
+                    url: format!("https://telemetry-{env}.example/loki"),
+                    ..Source::default()
+                },
+                query: "{application=\"ndc\"}".to_owned(),
+                apps: Vec::new(),
+            })
+            .collect();
+        let (sources, tails, _) = split_sources(&legacy);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(tails.len(), 2);
+        assert_ne!(tails[0].source, tails[1].source);
+    }
+
+    /// **Two servers on one host get names of their own.** Dev and live behind one hostname,
+    /// differing in a client id or a scope, would otherwise both want the host's name — and two
+    /// sources sharing a name is one credential for two servers, which `Editor::fault` refuses and
+    /// the store could not tell apart.
+    #[test]
+    fn two_servers_behind_one_host_do_not_share_a_name() {
+        let legacy: Vec<LegacySource> = ["one", "two"]
+            .iter()
+            .map(|client| LegacySource {
+                source: Source {
+                    name: format!("loki-{client}"),
+                    url: "https://telemetry.example/loki".to_owned(),
+                    token_url: "https://identity.example/connect/token".to_owned(),
+                    client_id: (*client).to_owned(),
+                    scope: "telemetry:read".to_owned(),
+                    ..Source::default()
+                },
+                query: "{application=\"ndc\"}".to_owned(),
+                apps: Vec::new(),
+            })
+            .collect();
+        let (sources, _, renamed) = split_sources(&legacy);
+        assert_eq!(sources.len(), 2);
+        assert_ne!(sources[0].name, sources[1].name, "{sources:?}");
+        assert_eq!(renamed.len(), 2, "each has its own credential to move");
+    }
+
+    /// A host that cannot be a credential key does not become one: a port, or an address literal.
+    #[test]
+    fn a_host_with_a_port_is_cleaned_into_a_name_the_store_accepts() {
+        let legacy = [LegacySource {
+            source: Source {
+                name: "local".to_owned(),
+                url: "https://[::1]:3100/loki".to_owned(),
+                ..Source::default()
+            },
+            query: "{application=\"ndc\"}".to_owned(),
+            apps: Vec::new(),
+        }];
+        let (sources, _, _) = split_sources(&legacy);
+        assert_eq!(sources.len(), 1);
+        assert!(
+            !sources[0].name.contains(':') && !sources[0].name.contains('/'),
+            "{:?} would be refused by Source::fault and by the store",
+            sources[0].name
+        );
+        assert_eq!(sources[0].fault(), None, "{:?}", sources[0]);
+    }
+
+    /// **A source whose new name is one it already had needs nothing moved**, and saying it does
+    /// would have the shell copy a credential onto itself and then delete it.
+    #[test]
+    fn a_source_that_kept_its_name_reports_no_rename() {
+        let legacy = [LegacySource {
+            source: Source {
+                name: "telemetry.example".to_owned(),
+                url: "https://telemetry.example/loki".to_owned(),
+                ..Source::default()
+            },
+            query: "{application=\"ndc\"}".to_owned(),
+            apps: Vec::new(),
+        }];
+        let (sources, tails, renamed) = split_sources(&legacy);
+        assert_eq!(sources[0].name, "telemetry.example");
+        assert_eq!(tails[0].name, "telemetry.example");
+        assert!(
+            renamed.is_empty(),
+            "the name did not change, so the credential is already where it belongs"
+        );
+    }
+
+    /// **Which name a credential moves from, decided without a store.** The store is only ever
+    /// touched on this function's answer, which is why it is a function.
+    #[test]
+    fn a_credential_already_under_the_new_name_is_never_overwritten() {
+        let was = [("old-one".to_owned(), true), ("old-two".to_owned(), true)];
+        assert_eq!(
+            secret_to_move(true, &was),
+            None,
+            "a reader who signed in since the upgrade is not rolled back to a token from before it"
+        );
+        assert_eq!(
+            secret_to_move(false, &was),
+            Some("old-one"),
+            "otherwise the first old name that has one, in the order the file put them"
+        );
+        assert_eq!(
+            secret_to_move(
+                false,
+                &[("old-one".to_owned(), false), ("old-two".to_owned(), true)]
+            ),
+            Some("old-two"),
+            "skipping the ones that hold nothing"
+        );
+        assert_eq!(secret_to_move(false, &[]), None);
+        assert_eq!(
+            secret_to_move(false, &[("old-one".to_owned(), false)]),
+            None,
+            "nothing anywhere is nothing to move, not an empty write"
+        );
+    }
+
+    /// **A file already in the new shape is not migrated again.** `[[source]]` entries carrying no
+    /// view are connections, and the `[[tail]]` sections say the rest — which is exactly what this
+    /// product writes from now on, so re-reading its own output must be a no-op.
+    #[test]
+    fn a_file_in_the_new_shape_is_read_as_it_stands() {
+        let text =
+            "[[source]]\nname = \"telemetry.example\"\nurl = \"https://telemetry.example/loki\"\n\
+                    \n[[tail]]\nname = \"ndc\"\nsource = \"telemetry.example\"\n\
+                    query = \"{application=\\\"ndc\\\"}\"\n";
+        let read = Settings::from_toml(text);
+        assert_eq!(read.sources.len(), 1);
+        assert_eq!(read.sources[0].name, "telemetry.example");
+        assert_eq!(read.tails.len(), 1);
+        assert_eq!(read.tails[0].name, "ndc");
+        assert_eq!(read.tails[0].source, "telemetry.example");
+        assert!(
+            read.migrated.is_empty(),
+            "nothing was renamed, so no credential should move"
+        );
+        // And round-tripping it changes nothing, which is what makes the migration one-way-once.
+        let again = Settings::from_toml(&read.to_toml());
+        assert_eq!(again.sources, read.sources);
+        assert_eq!(again.tails, read.tails);
+        assert!(again.migrated.is_empty());
+    }
+
+    /// **The migration note never reaches the file.** It is an instruction to move a credential
+    /// once, not a setting, and a `migrated` key in a settings file would be read back next launch
+    /// and acted on again.
+    #[test]
+    fn the_migration_note_is_not_written_and_does_not_survive_a_save() {
+        let old =
+            "[[source]]\nname = \"nurtur-loki-ndc\"\nurl = \"https://telemetry.example/loki\"\n\
+                   query = \"{application=\\\"ndc\\\"}\"\n";
+        let read = Settings::from_toml(old);
+        assert_eq!(read.migrated.len(), 1, "it migrated, so there is a note");
+
+        let text = read.to_toml();
+        assert!(!text.contains("migrated"), "{text}");
+        // **The old name survives as the tail's and not as the source's**, which is the thing worth
+        // asserting and which this could not say for a few hours: it read
+        // `!text.contains("nurtur-loki-ndc\n")`, and `to_toml` always writes
+        // `name = "nurtur-loki-ndc"` — closing quote, *then* newline — so the searched substring
+        // could never appear whatever the code did. An assertion that cannot fail is worse than
+        // none, because it is counted.
+        let written = Settings::from_toml(&text);
+        assert_eq!(written.sources.len(), 1);
+        assert_eq!(written.sources[0].name, "telemetry.example");
+        assert_eq!(written.tails.len(), 1);
+        assert_eq!(written.tails[0].name, "nurtur-loki-ndc");
+        assert!(
+            Settings::from_toml(&text).migrated.is_empty(),
+            "the written file is in the new shape, so reading it migrates nothing"
+        );
+    }
+
+    /// Tails merge by name across the tiers, as sources do — a curated tail beside the exe and the
+    /// user's own of the same name is one tail, not the two that `Editor::fault` refuses.
+    #[test]
+    fn tails_merge_by_name_across_the_tiers() {
+        let curated = Settings {
+            tails: vec![
+                Tail {
+                    name: "ndc".to_owned(),
+                    source: "live".to_owned(),
+                    query: "{application=\"ndc\"}".to_owned(),
+                    apps: Vec::new(),
+                },
+                Tail {
+                    name: "identity".to_owned(),
+                    source: "live".to_owned(),
+                    query: "{application=\"identity\"}".to_owned(),
+                    apps: Vec::new(),
+                },
+            ],
+            ..Settings::default()
+        };
+        let mine = Settings {
+            tails: vec![Tail {
+                name: "ndc".to_owned(),
+                source: "live".to_owned(),
+                query: "{application=\"ndc\"} |= `error`".to_owned(),
+                apps: Vec::new(),
+            }],
+            ..Settings::default()
+        };
+        let merged = curated.merged_under(mine);
+        assert_eq!(merged.tails.len(), 2, "{:?}", merged.tails);
+        let ndc = merged
+            .tails
+            .iter()
+            .find(|t| t.name == "ndc")
+            .expect("still there");
+        assert_eq!(
+            ndc.query, "{application=\"ndc\"} |= `error`",
+            "the user's own wins, as it does for a source"
+        );
+    }
+
+    fn renamed(now: &str, was: &[&str]) -> Renamed {
+        Renamed {
+            now: now.to_owned(),
+            was: was.iter().map(|w| (*w).to_owned()).collect(),
+        }
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// The ordinary case: three views of one Loki fold into one server named after its host, and
+    /// the credential comes from whichever of the three had one.
+    #[test]
+    fn the_plan_carries_one_credential_from_the_entries_that_folded_together() {
+        let plan = credential_plan(
+            &[renamed(
+                "telemetry.nurtur.tech",
+                &["nurtur-loki-ndc", "nurtur-loki-identity"],
+            )],
+            &owned(&["nurtur-loki-identity"]),
+        );
+        assert_eq!(
+            plan.moves,
+            [CredentialMove {
+                from: "nurtur-loki-identity".to_owned(),
+                to: "telemetry.nurtur.tech".to_owned(),
+            }]
+        );
+        assert_eq!(plan.clear, ["nurtur-loki-identity"]);
+    }
+
+    /// A credential already under the new name wins: a reader who signed in since the upgrade is
+    /// not rolled back to a token from before it.
+    #[test]
+    fn the_plan_leaves_a_credential_that_is_already_in_the_right_place() {
+        let plan = credential_plan(
+            &[renamed("telemetry.nurtur.tech", &["nurtur-loki-ndc"])],
+            &owned(&["telemetry.nurtur.tech", "nurtur-loki-ndc"]),
+        );
+        assert!(plan.moves.is_empty(), "{:?}", plan.moves);
+        assert!(
+            plan.clear.is_empty(),
+            "and the old one is left alone rather than deleted \u{2014} it is the only copy of \
+             something the reader may still want, and nothing has replaced it"
+        );
+    }
+
+    /// **The case that decides this has to be planned rather than looped: a legacy entry named
+    /// after another entry's host.** That is the naming convention this very version writes, so it
+    /// is a shape upgraders will have.
+    ///
+    /// Deciding one entry at a time against the live store gets it wrong twice over. Asking whether
+    /// `telemetry.nurtur.tech` is occupied answers yes — it is the name of a *different* source
+    /// whose credential is about to leave — so `X`'s secret is never moved and is orphaned for
+    /// ever; and had it not been skipped, writing immediately would have clobbered the credential
+    /// the other entry had not read yet, carrying the wrong secret to `other.example`.
+    #[test]
+    fn a_legacy_entry_named_after_another_entrys_host_still_gets_its_own_credential() {
+        let renames = [
+            renamed("telemetry.nurtur.tech", &["X"]),
+            renamed("other.example", &["telemetry.nurtur.tech"]),
+        ];
+        let plan = credential_plan(&renames, &owned(&["X", "telemetry.nurtur.tech"]));
+
+        assert_eq!(
+            plan.moves,
+            [
+                CredentialMove {
+                    from: "X".to_owned(),
+                    to: "telemetry.nurtur.tech".to_owned(),
+                },
+                CredentialMove {
+                    from: "telemetry.nurtur.tech".to_owned(),
+                    to: "other.example".to_owned(),
+                },
+            ],
+            "both move, and each from its own old name"
+        );
+        assert_eq!(
+            plan.clear,
+            ["X"],
+            "**and `telemetry.nurtur.tech` is never cleared**, because it is where the first move \
+             lands — clearing it would delete what was just written there"
+        );
+    }
+
+    /// Order in the file does not change the answer, which is the property the planning buys.
+    #[test]
+    fn the_plan_does_not_depend_on_the_order_of_the_file() {
+        let held = owned(&["X", "telemetry.nurtur.tech"]);
+        let forward = credential_plan(
+            &[
+                renamed("telemetry.nurtur.tech", &["X"]),
+                renamed("other.example", &["telemetry.nurtur.tech"]),
+            ],
+            &held,
+        );
+        let backward = credential_plan(
+            &[
+                renamed("other.example", &["telemetry.nurtur.tech"]),
+                renamed("telemetry.nurtur.tech", &["X"]),
+            ],
+            &held,
+        );
+        let mut a: Vec<(String, String)> = forward
+            .moves
+            .iter()
+            .map(|m| (m.from.clone(), m.to.clone()))
+            .collect();
+        let mut b: Vec<(String, String)> = backward
+            .moves
+            .iter()
+            .map(|m| (m.from.clone(), m.to.clone()))
+            .collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert_eq!(forward.clear, backward.clear);
+    }
+
+    /// Nothing anywhere is nothing to move, not an empty write.
+    #[test]
+    fn the_plan_is_empty_when_nothing_holds_a_credential() {
+        let plan = credential_plan(&[renamed("now", &["was"])], &[]);
+        assert!(plan.moves.is_empty());
+        assert!(plan.clear.is_empty());
+        assert_eq!(
+            credential_plan(&[], &owned(&["anything"])),
+            CredentialPlan::default()
+        );
+    }
+
+    /// A source that kept its name is not in the list at all — `split_sources` drops it — but a
+    /// hand-made plan that said so must not copy a credential onto itself and then delete it.
+    #[test]
+    fn a_move_onto_the_name_it_came_from_is_never_planned() {
+        let plan = credential_plan(&[renamed("same", &["same"])], &owned(&["same"]));
+        assert!(
+            plan.moves.is_empty(),
+            "the name is occupied by the very thing that would move: {:?}",
+            plan.moves
+        );
+        assert!(plan.clear.is_empty());
     }
 }

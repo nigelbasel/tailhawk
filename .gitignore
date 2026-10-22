@@ -16,3 +16,8 @@ SESSION-STATUS-*.md
 # admits other products as *observable behaviour*; a picture of their window is not ours to
 # redistribute, so it is read and left out of the repository.
 Screenshot*.png
+
+# Visual Studio resource-editor artefacts from opening docs/design/*.rc by hand: a binary
+# cache and an rc temp file, both regenerated on open.
+docs/design/*.aps
+docs/design/RCa*

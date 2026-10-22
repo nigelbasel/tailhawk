@@ -22,9 +22,12 @@ use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
 };
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMCUSTOMDRAW_DRAW_STATE_FLAGS, NMHDR,
-    NMLVCUSTOMDRAW,
+    InitCommonControlsEx, HTREEITEM, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES,
+    INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
+    LVITEMW, NMCUSTOMDRAW_DRAW_STATE_FLAGS, NMHDR, NMLVCUSTOMDRAW, NMTREEVIEWW, TVE_EXPAND,
+    TVGN_CARET, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMEXW, TVI_LAST,
+    TVI_ROOT, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM, TVN_SELCHANGEDW,
+    TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetClientRect,
@@ -122,20 +125,27 @@ const ID_R_SAVE: u16 = 196;
 
 /// §12.4's remote sources dialog. A range of its own so a stray id cannot land on the rules
 /// editor's controls, which sit immediately below.
-const ID_S_LIST: u16 = 210;
+const ID_S_TREE: u16 = 210;
 const ID_S_REMOVE: u16 = 212;
 const ID_S_FAULT: u16 = 220;
 const ID_S_CLONE: u16 = 223;
 const ID_S_NEW: u16 = 226;
 const ID_S_EDIT: u16 = 227;
+const ID_S_ADD_TAIL: u16 = 228;
+
+/// The one-tail editor's controls — its own range beside the source editor's, and for the same
+/// reason: it opens on top of the tree and a stray id must not reach the tree's own verbs.
+const ID_T_SOURCE: u16 = 330;
+const ID_T_NAME: u16 = 331;
+const ID_T_QUERY: u16 = 332;
+const ID_T_CHOOSE: u16 = 333;
+const ID_T_FAULT: u16 = 334;
 
 /// The one-source editor's controls. **Its own range well clear of everything else**, because it
 /// is a dialog that opens *on top of* the list and a stray id landing on the list's own controls
 /// would be answered by whichever procedure happened to see it first.
 const ID_E_NAME: u16 = 300;
 const ID_E_URL: u16 = 301;
-const ID_E_SHOWS: u16 = 302;
-const ID_E_CHOOSE: u16 = 303;
 const ID_E_SETUP: u16 = 304;
 const ID_E_ADVANCED: u16 = 305;
 const ID_E_MODE: u16 = 306;
@@ -158,9 +168,6 @@ const ID_E_FAULT: u16 = 312;
 /// that lived on the list dialog, the editor opens and closes repeatedly, so it is once per
 /// abandoned press rather than once per run.
 const WM_S_PROBED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x50;
-
-/// What a worker posts back when **Choose…** has asked the server which applications it holds.
-const WM_E_LABELS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x51;
 
 /// What one of those workers found, and **the URL it was asked about**.
 ///
@@ -698,19 +705,29 @@ const S_DIALOG_W: i16 = 420;
 /// The height, for the reason [`S_DIALOG_W`] gives.
 const S_DIALOG_H: i16 = 165;
 
-/// The remote-sources list, in dialog units — pure, so the template walk checks it without a window.
+/// The remote-sources tree, in dialog units — pure, so the template walk checks it without a
+/// window.
 ///
-/// **The list, its verbs, and nothing else.** The owner, 2026-10-21, having rejected a form with
-/// eleven fields on it: *"I think the user interface should really be either a first dialig that
-/// simply has the list, with new, edit delete buttons, and a close. and then new brings up a dialog
-/// that guides the user through the setup, and edit allows editing"*. He chose that over a
+/// **A tree of sources with their tails underneath**, which is the owner's shape, 2026-10-21:
+/// *"instead of a simple list, we would have a list of sources, each of which might be a node on a
+/// tree with the tails unerneath them. Then the user can either add a new source, or can add a tail
+/// to the source."* He approved it the same day: *"yes, that looks good"*.
+///
+/// **The verbs, and nothing else on this dialog.** The owner, having rejected a form with eleven
+/// fields on it: *"I think the user interface should really be either a first dialig that simply has
+/// the list, with new, edit delete buttons, and a close. and then new brings up a dialog that
+/// guides the user through the setup, and edit allows editing"*. He chose that over a
 /// list-and-details split *"as it allows diferent paths and guides the user better"* — which is the
-/// whole argument: **New** can guide and **Edit** can be a form, and they do not have to be the
-/// same screen.
+/// whole argument: **New** can guide and **Edit** can be a form, and they do not have to be one
+/// screen.
+///
+/// **`Edit…` and `Delete` act on either kind of row; `New source…` and `Add tail…` are the two
+/// doors in.** One verb that means "new something" and asks which would be a dialog asking a
+/// question the reader has already answered by what they clicked.
 ///
 /// **Modal, where the rules editor is modeless, and the reason is the same one read the other way.**
 /// §5 wants the rules editor non-modal because the grid underneath *is* its preview. A source has no
-/// preview: nothing in the window changes as you pick one from a list.
+/// preview: nothing in the window changes as you pick one from a tree.
 fn sources_dialog_items() -> Vec<Item> {
     let verb = |text: &str, id: u16, row: i16| {
         Item::new(
@@ -724,29 +741,33 @@ fn sources_dialog_items() -> Vec<Item> {
     vec![
         Item::new(
             Class::Static,
-            "Which log servers can Tailhawk tail?",
+            "Which log servers can Tailhawk tail, and what does each one show?",
             0xFFFF,
             (7, 7, 340, 9),
             0,
         ),
         Item::new(
-            Class::Named("SysListView32"),
+            Class::Named("SysTreeView32"),
             "",
-            ID_S_LIST,
+            ID_S_TREE,
             (7, 20, 340, 120),
-            WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            WS_BORDER
+                | WS_TABSTOP
+                | TVS_HASBUTTONS
+                | TVS_HASLINES
+                | TVS_LINESATROOT
+                | TVS_SHOWSELALWAYS,
         ),
-        // **The verbs, and nothing else on this dialog.** The owner, 2026-10-21: *"a first dialig
-        // that simply has the list, with new, edit delete buttons, and a close."* `New…` and
-        // `Edit…` carry the ellipsis Windows uses for a command that asks for more before it acts;
-        // `Clone` and `Delete` do not, because they act at once.
-        verb("&New…", ID_S_NEW, 1),
-        verb("&Edit…", ID_S_EDIT, 2),
-        verb("C&lone", ID_S_CLONE, 3),
-        verb("&Delete", ID_S_REMOVE, 4),
-        // The fault line keeps the position it had: what is wrong with the **set**, which is the
-        // only fault this dialog can still see now that the fields have gone — two sources sharing
-        // a name, which no row can detect on its own.
+        // `New source…`, `Add tail…` and `Edit…` carry the ellipsis Windows uses for a command that
+        // asks for more before it acts; `Clone` and `Delete` do not, because they act at once.
+        verb("&New source…", ID_S_NEW, 1),
+        verb("&Add tail…", ID_S_ADD_TAIL, 2),
+        verb("&Edit…", ID_S_EDIT, 3),
+        verb("C&lone", ID_S_CLONE, 4),
+        verb("&Delete", ID_S_REMOVE, 5),
+        // The fault line keeps the position it had: what is wrong with the **set**, which is what
+        // no single row can see — two sources sharing a name, two tails sharing one, or a tail
+        // reading a server that is not there.
         Item::new(Class::Static, "", ID_S_FAULT, (7, 146, 340, 9), 0),
         Item::new(
             Class::Button,
@@ -773,6 +794,20 @@ pub struct SourcesEdit {
     pub store: Vec<(String, String)>,
     /// Names whose stored secret should be deleted.
     pub forget: Vec<String>,
+    /// `(was, now)` for each source the reader renamed, so its credential can be **moved** rather
+    /// than deleted.
+    ///
+    /// **Renaming a source used to destroy its secret.** The old name went onto `forget` and
+    /// nothing went onto `store` — `Draft::secret_to_store` answers `None` unless a secret was
+    /// typed in that sitting — so a reader who corrected a typo in a name lost the credential with
+    /// nothing said, and the source then read `(no secret stored)` for ever. The doc comment here
+    /// claimed the opposite, and cited `Tailhawk/loki-tokens/nurtur-loki-live` — an orphan in this
+    /// machine's own store — as the thing it was preventing, while manufacturing more of them:
+    /// nothing has ever called `forget_refresh` on a rename, so the *sign-in* was orphaned too.
+    ///
+    /// `secrets::follow_rename` is the machinery that moves both, written for the settings
+    /// migration, and this is the second caller it should always have had.
+    pub rename: Vec<(String, String)>,
 }
 
 /// A probe's verdict, with the URL named when it is no longer the one in the box.
@@ -803,9 +838,16 @@ fn set_dlg_text(hdlg: HWND, id: u16, text: &str) {
 }
 
 thread_local! {
-    /// Suppresses the `EN_CHANGE` that this dialog's own writes fire, for the reason
+    /// Suppresses the notifications that this dialog's own writes fire, for the reason
     /// `RULES_QUIET`, `FORMAT_QUIET` and `APPS_QUIET` exist — and this dialog was the one that
     /// never got one.
+    ///
+    /// **What it suppresses here is `TVN_SELCHANGEDW`, not `EN_CHANGE`.** This dialog has had no
+    /// edit control since it became a tree: `tv_reset` and `tv_select` make the control report a
+    /// selection change, synchronously, in the middle of a fill that is reading the editor the
+    /// handler would take a second reference to. The `EN_CHANGE` story below is the history of the
+    /// flag rather than its present job, and it is kept because it is the reason the flag is
+    /// trusted.
     ///
     /// **What it cost was a client secret**, in the version of this dialog that carried the fields
     /// itself — the one the owner rejected on 2026-10-21. `sources_show` cleared the secret box, the
@@ -824,62 +866,293 @@ thread_local! {
     static SOURCES_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Runs `write`, with every `EN_CHANGE` it provokes marked as the dialog's own.
+/// Runs `write`, with every notification it provokes marked as the dialog's own.
+///
+/// **It restores rather than clears**, so one of these inside another does not un-quiet the outer
+/// region on its way out — which is what a nested fill would have done, and the whole point of the
+/// flag is that nothing between the two writes may take a reference.
 fn sources_quietly<R>(write: impl FnOnce() -> R) -> R {
-    SOURCES_QUIET.with(|q| q.set(true));
+    let was = SOURCES_QUIET.with(|q| q.replace(true));
     let out = write();
-    SOURCES_QUIET.with(|q| q.set(false));
+    SOURCES_QUIET.with(|q| q.set(was));
     out
 }
 
-/// Fills the list from the editor's rows, keeping the selection.
+/// Fills the tree from the editor's nodes, keeping the selection.
+///
+/// **Every source is expanded.** A collapsed tree hides exactly the thing the reader came to see,
+/// and with one server and three tails there is nothing to be gained by folding it; the buttons and
+/// the lines are there for a set large enough to want them.
 fn sources_fill(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
-    let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) }) else {
+    let Ok(tree) = (unsafe { GetDlgItem(hdlg, i32::from(ID_S_TREE)) }) else {
         return;
     };
-    lv_reset(list);
-    // The widths come from the width the list has rather than from five constants that did not
-    // fit in it — `sourceset::column_widths` says what went wrong and why `Problem` matters.
-    //
-    // **A vertical scrollbar's width comes off whether or not one is showing yet.** This runs on
-    // every keystroke, and the bar appears once the list outgrows its seven visible rows — so
-    // measuring the client area as it is would make the columns jump and a horizontal scrollbar
-    // flicker in and out while the reader types. Costing the bar always is steadier than being
-    // right about it sometimes.
-    let mut client = RECT::default();
-    let measured = if unsafe { GetClientRect(list, &mut client) }.is_ok() {
-        client.right - client.left
-    } else {
-        0
+    tv_reset(tree);
+    let chosen = edit.chosen();
+    // The handle of each source, by its own index, so a tail can be hung from the one it reads.
+    // `the_nodes_come_back_in_an_order_the_tree_can_fill_in_one_pass` is what lets this be one
+    // pass: every source arrives in index order, before any of its children.
+    let mut parents: Vec<HTREEITEM> = Vec::with_capacity(edit.sources().len());
+    let mut land: Option<HTREEITEM> = None;
+    for node in edit.nodes() {
+        let label = tailhawk_core::sourceset::node_label(&node);
+        // **The row comes from the node and is never counted.** It was counted, in drawing order,
+        // until it was found by re-reading the diff — and `nodes()` groups tails under their
+        // source rather than emitting them in index order, so with two sources whose tails
+        // interleave, a click on one row acted on another: `Edit…` edited the wrong tail and
+        // `Delete` deleted the wrong one. A tail whose source is absent arrives with `under: None`
+        // and hangs at the root, which is why the parent is looked up rather than assumed.
+        let parent = node.under.and_then(|under| parents.get(under).copied());
+        let item = tv_item(tree, parent, &label, node.at.packed());
+        if let tailhawk_core::sourceset::Chosen::Source(at) = node.at {
+            if parents.len() == at {
+                parents.push(item);
+            }
+        }
+        if node.at == chosen {
+            land = Some(item);
+        }
+    }
+    for parent in &parents {
+        tv_expand(tree, *parent);
+    }
+    if let Some(item) = land {
+        tv_select(tree, item);
+    }
+}
+
+/// Greys the verbs that need a row when there is none, and the two that need a particular kind.
+///
+/// **`Add tail…` needs a source chosen or a tail chosen**, because "add a tail to this" means the
+/// same thing either way — see `Editor::chosen_source`. The other three need any row at all.
+fn sources_verbs(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
+    use tailhawk_core::sourceset::Chosen;
+    let anything = edit.chosen() != Chosen::Nothing;
+    let enable = |id: u16, on: bool| {
+        if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
+            let _ = unsafe { EnableWindow(button, on) };
+        }
     };
-    let bar = unsafe { GetSystemMetrics(SM_CXVSCROLL) };
-    let widths = tailhawk_core::sourceset::column_widths(measured - bar);
-    // **Whether a secret is stored is a column, not a guess.** A source that is configured but has
-    // never been given its secret is the commonest half-finished state there is, and without this
-    // it looks identical to one that is ready.
-    for (at, title) in ["Name", "URL", "Query", "Applications", "Secret", "Problem"]
-        .iter()
-        .enumerate()
-    {
-        lv_column(list, at as i32, title, widths[at]);
+    for id in [ID_S_EDIT, ID_S_CLONE, ID_S_REMOVE] {
+        enable(id, anything);
     }
-    for (i, row) in edit.rows().iter().enumerate() {
-        lv_row(
-            list,
-            i as i32,
-            &[
-                row.name.to_owned(),
-                row.url.to_owned(),
-                row.query.to_owned(),
-                row.apps.clone(),
-                if row.has_secret { "stored" } else { "—" }.to_owned(),
-                row.fault.unwrap_or_default().to_owned(),
-            ],
+    enable(ID_S_ADD_TAIL, edit.chosen_source().is_some());
+}
+
+/// **New source…** — one source's screen over an empty draft.
+///
+/// **Nothing of the tree is borrowed while the nested dialog runs.** It pumps a modal loop of its
+/// own, during which this procedure can be re-entered by a paint or a notification; a `&mut
+/// SourcesEdit` held across it would be a second one taken from underneath the first.
+fn sources_new(hdlg: HWND) {
+    let mut edit = SourceEdit::new(tailhawk_core::sourcesetup::Draft::default(), false);
+    if !show_source_editor(hdlg, &mut edit) {
+        return;
+    }
+    let source = edit.draft.into_source();
+    let Some(data) = sources_state(hdlg) else {
+        return;
+    };
+    let data = unsafe { &mut *data };
+    let name = source.name.clone();
+    if !data.editor.add_source(source) {
+        set_dlg_text(
+            hdlg,
+            ID_S_FAULT,
+            "There is no room for another source — 64 is the limit.",
         );
+        return;
     }
-    if !edit.rows().is_empty() {
-        lv_select(list, edit.selected());
+    if let Some(secret) = edit.draft.secret_to_store().map(|(_, secret)| secret) {
+        data.store.push((name, secret));
     }
+    sources_redraw(hdlg, data);
+}
+
+/// **Add tail…** — a tail's screen over an empty draft, against the chosen source.
+fn sources_add_tail(hdlg: HWND) {
+    let (of, taken) = {
+        let Some(data) = sources_state(hdlg) else {
+            return;
+        };
+        let data = unsafe { &*data };
+        let Some(at) = data.editor.chosen_source() else {
+            return;
+        };
+        let Some(source) = data.editor.source(at) else {
+            return;
+        };
+        (
+            source.clone(),
+            data.editor
+                .tails()
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<String>>(),
+        )
+    };
+    let mut edit = TailEdit::new(
+        tailhawk_core::settings::Tail {
+            source: of.name.clone(),
+            ..Default::default()
+        },
+        taken,
+    );
+    edit.reading(of);
+    if !show_tail_editor(hdlg, &mut edit) {
+        return;
+    }
+    let Some(data) = sources_state(hdlg) else {
+        return;
+    };
+    let data = unsafe { &mut *data };
+    if !data.editor.add_tail(edit.tail) {
+        set_dlg_text(
+            hdlg,
+            ID_S_FAULT,
+            "There is no room for another tail — 512 is the limit.",
+        );
+        return;
+    }
+    sources_redraw(hdlg, data);
+}
+
+/// **Edit…** — whichever screen the chosen row calls for.
+fn sources_edit_chosen(hdlg: HWND) {
+    use tailhawk_core::sourceset::Chosen;
+    let chosen = {
+        let Some(data) = sources_state(hdlg) else {
+            return;
+        };
+        unsafe { &*data }.editor.chosen()
+    };
+    match chosen {
+        Chosen::Source(_) => sources_edit_source(hdlg),
+        Chosen::Tail(_) => sources_edit_tail(hdlg),
+        Chosen::Nothing => {}
+    }
+}
+
+fn sources_edit_source(hdlg: HWND) {
+    let (draft, has_secret) = {
+        let Some(data) = sources_state(hdlg) else {
+            return;
+        };
+        let data = unsafe { &*data };
+        let Some(at) = (match data.editor.chosen() {
+            tailhawk_core::sourceset::Chosen::Source(at) => Some(at),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(source) = data.editor.source(at) else {
+            return;
+        };
+        (
+            tailhawk_core::sourcesetup::Draft::of(source),
+            data.editor.source_has_secret(at),
+        )
+    };
+    let mut edit = SourceEdit::new(draft, has_secret);
+    if !show_source_editor(hdlg, &mut edit) {
+        return;
+    }
+    let Some(data) = sources_state(hdlg) else {
+        return;
+    };
+    let data = unsafe { &mut *data };
+    sources_took_source(hdlg, data, edit);
+}
+
+fn sources_edit_tail(hdlg: HWND) {
+    let (tail, taken, reads) = {
+        let Some(data) = sources_state(hdlg) else {
+            return;
+        };
+        let data = unsafe { &*data };
+        let Some(at) = (match data.editor.chosen() {
+            tailhawk_core::sourceset::Chosen::Tail(at) => Some(at),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(tail) = data.editor.tail(at) else {
+            return;
+        };
+        (
+            tail.clone(),
+            data.editor
+                .tails()
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| *n != at)
+                .map(|(_, t)| t.name.clone())
+                .collect::<Vec<String>>(),
+            // **The server this tail reads, so `Choose…` has somewhere to ask.** `None` for the
+            // hand-edited orphan, which is why the button can be greyed rather than fail.
+            data.editor
+                .chosen_source()
+                .and_then(|at| data.editor.source(at))
+                .cloned(),
+        )
+    };
+    let mut edit = TailEdit::new(tail, taken);
+    if let Some(source) = reads {
+        edit.reading(source);
+    }
+    if !show_tail_editor(hdlg, &mut edit) {
+        return;
+    }
+    let Some(data) = sources_state(hdlg) else {
+        return;
+    };
+    let data = unsafe { &mut *data };
+    data.editor.replace_tail(edit.tail);
+    sources_redraw(hdlg, data);
+}
+
+/// What an accepted source editor leaves behind: the source on the chosen row, and the secret to
+/// store.
+///
+/// **A renamed source takes its credential with it**, which it did not until 2026-10-21 although
+/// this comment said so. The store is keyed on the name, and the old code put the old name on
+/// `forget` while nothing put the new one on `store` — so a reader correcting a typo in a name lost
+/// the secret, with nothing said, and the row then read `(no secret stored)` for ever. The sign-in
+/// was orphaned at the same moment, because nothing has ever called `forget_refresh` on a rename.
+/// `Tailhawk/loki-tokens/nurtur-loki-live` is one of those, in this machine's own store. The rename
+/// now goes on [`SourcesEdit::rename`] and the shell moves both halves through
+/// `secrets::follow_rename`.
+fn sources_took_source(hdlg: HWND, data: &mut SourcesEdit, edit: SourceEdit) {
+    let was = match data.editor.chosen() {
+        tailhawk_core::sourceset::Chosen::Source(at) => {
+            data.editor.source(at).map(|s| s.name.clone())
+        }
+        _ => None,
+    };
+    let source = edit.draft.into_source();
+    // **A rename moves the credential; it does not delete it.** See [`SourcesEdit::rename`].
+    if let Some(old) = was.filter(|old| !old.trim().is_empty() && *old != source.name) {
+        data.rename.push((old, source.name.clone()));
+    }
+    // **A mode with no use for a secret gives the stored one up.** Switching a source from a client
+    // secret to a browser sign-in otherwise left the credential in the store for ever, for a flow
+    // that will never send it.
+    if let Some(gone) = edit.draft.secret_to_forget(edit.has_secret) {
+        data.forget.push(gone);
+    }
+    data.editor.replace_source(source);
+    if let Some((name, secret)) = edit.draft.secret_to_store() {
+        data.store.push((name, secret));
+    }
+    sources_redraw(hdlg, data);
+}
+
+/// Refills the tree, re-greys the verbs and re-reads the fault — the three things that follow every
+/// change, in one place so none of them can be forgotten at one call site.
+fn sources_redraw(hdlg: HWND, data: &mut SourcesEdit) {
+    sources_quietly(|| sources_fill(hdlg, &data.editor));
+    sources_verbs(hdlg, &data.editor);
+    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
 }
 
 unsafe extern "system" fn sources_proc(
@@ -907,22 +1180,9 @@ unsafe extern "system" fn sources_proc(
             }
             let data = unsafe { &mut *(lparam.0 as *mut SourcesEdit) };
             data.editor.open();
-            // **The offered blank row is not offered any more.** It existed because the fields and
-            // the list were one dialog and a form with no row behind it discarded every keystroke;
-            // `New…` is that row now, and it arrives with a screen of its own.
-            data.editor.discard_blank();
-            if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) } {
-                unsafe {
-                    SendMessageW(
-                        list,
-                        LVM_SETEXTENDEDLISTVIEWSTYLE,
-                        WPARAM(0),
-                        LPARAM(LVS_EX_FULLROWSELECT as isize),
-                    );
-                }
-            }
             sources_quietly(|| sources_fill(hdlg, &data.editor));
             sources_verbs(hdlg, &data.editor);
+            set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
             1
         }
         WM_NOTIFY => {
@@ -930,31 +1190,34 @@ unsafe extern "system" fn sources_proc(
             if SOURCES_QUIET.with(|q| q.get()) {
                 return 0;
             }
-            if header.idFrom == usize::from(ID_S_LIST) {
+            if header.idFrom == usize::from(ID_S_TREE) {
                 match header.code {
                     // **The borrow lives in this arm and nowhere else.** Taken before the match, it
-                    // was still alive while `NM_DBLCLK` pumped a nested modal loop — and the list
+                    // was still alive while `NM_DBLCLK` pumped a nested modal loop — and the tree
                     // sends focus notifications through here while that loop runs, so the procedure
                     // re-entered and took a second `&mut` to the same object. That is the aliasing
                     // `SOURCES_QUIET`'s doc comment calls the undefined behaviour, in the one path
                     // `sources_new`'s comment claims is impossible.
-                    LVN_ITEMCHANGED => {
+                    //
+                    // **The row comes out of the item itself**, as the `Chosen` the fill packed
+                    // into it — see `Chosen::packed`. The alternative is counting items, which is
+                    // the view re-deriving the model.
+                    TVN_SELCHANGEDW => {
                         let Some(data) = sources_state(hdlg) else {
                             return 0;
                         };
                         let data = unsafe { &mut *data };
-                        if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_S_LIST)) } {
-                            if let Some(at) = lv_selected(list) {
-                                data.editor.select(at);
-                            }
-                        }
+                        let change = unsafe { &*(lparam.0 as *const NMTREEVIEWW) };
+                        data.editor.choose(tailhawk_core::sourceset::Chosen::unpack(
+                            change.itemNew.lParam.0,
+                        ));
                         sources_verbs(hdlg, &data.editor);
                         return 1;
                     }
-                    // **A double-click on a row is Edit.** The list is the only thing on this
-                    // dialog, so the gesture every list in Windows has must do the obvious thing.
+                    // **A double-click on a row is Edit.** The tree is the only thing on this
+                    // dialog, so the gesture every tree in Windows has must do the obvious thing.
                     NM_DBLCLK => {
-                        sources_edit_selected(hdlg);
+                        sources_edit_chosen(hdlg);
                         return 1;
                     }
                     _ => {}
@@ -970,8 +1233,12 @@ unsafe extern "system" fn sources_proc(
                     sources_new(hdlg);
                     1
                 }
+                (ID_S_ADD_TAIL, BN_CLICKED) => {
+                    sources_add_tail(hdlg);
+                    1
+                }
                 (ID_S_EDIT, BN_CLICKED) => {
-                    sources_edit_selected(hdlg);
+                    sources_edit_chosen(hdlg);
                     1
                 }
                 (ID_S_CLONE, BN_CLICKED) => {
@@ -981,35 +1248,19 @@ unsafe extern "system" fn sources_proc(
                     let data = unsafe { &mut *data };
                     // **A refusal says so.** A button that does nothing and says nothing is the
                     // complaint this project has made of every silent failure it has found.
-                    if !data.editor.clone_selected() {
+                    if !data.editor.clone_chosen() {
                         set_dlg_text(
                             hdlg,
                             ID_S_FAULT,
-                            "Nothing to copy — choose a source first, or the list is full.",
+                            "Nothing to copy — choose a row first, or there is no room for it.",
                         );
                         return 1;
                     }
-                    sources_quietly(|| sources_fill(hdlg, &data.editor));
-                    sources_verbs(hdlg, &data.editor);
-                    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    sources_redraw(hdlg, data);
                     1
                 }
                 (ID_S_REMOVE, BN_CLICKED) => {
-                    let Some(data) = sources_state(hdlg) else {
-                        return 0;
-                    };
-                    let data = unsafe { &mut *data };
-                    // **The name is remembered so its credential can be deleted too.** A source
-                    // removed from the list while its secret stayed in Credential Manager would
-                    // leave a credential nobody can see and nobody will revoke.
-                    if let Some(gone) = data.editor.remove() {
-                        if !gone.trim().is_empty() {
-                            data.forget.push(gone);
-                        }
-                    }
-                    sources_quietly(|| sources_fill(hdlg, &data.editor));
-                    sources_verbs(hdlg, &data.editor);
-                    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+                    sources_remove(hdlg);
                     1
                 }
                 // **Close saves, and it has to.** Every change on this dialog is made through a
@@ -1026,7 +1277,6 @@ unsafe extern "system" fn sources_proc(
                         set_dlg_text(hdlg, ID_S_FAULT, fault);
                         return 1;
                     }
-                    data.editor.discard_blank();
                     data.editor.saved();
                     data.accepted = true;
                     unsafe {
@@ -1050,7 +1300,6 @@ unsafe extern "system" fn sources_proc(
                 set_dlg_text(hdlg, ID_S_FAULT, fault);
                 return 1;
             }
-            data.editor.discard_blank();
             data.editor.saved();
             data.accepted = true;
             unsafe {
@@ -1062,88 +1311,57 @@ unsafe extern "system" fn sources_proc(
     }
 }
 
-/// Greys the verbs that need a row when there is none.
-fn sources_verbs(hdlg: HWND, edit: &tailhawk_core::sourceset::Editor) {
-    let any = !edit.sources().is_empty();
-    for id in [ID_S_EDIT, ID_S_CLONE, ID_S_REMOVE] {
-        if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
-            let _ = unsafe { EnableWindow(button, any) };
-        }
-    }
-}
-
-/// **New…** — one source's screen over an empty draft.
+/// **Delete** — whichever row is chosen, and a source says what goes with it first.
 ///
-/// **Nothing of the list is borrowed while the nested dialog runs.** It pumps a modal loop of its
-/// own, during which this procedure can be re-entered by a paint or a notification; a `&mut
-/// SourcesEdit` held across it would be a second one taken from underneath the first.
-fn sources_new(hdlg: HWND) {
-    let mut edit = SourceEdit::new(tailhawk_core::sourcesetup::Draft::default(), false);
-    if !show_source_editor(hdlg, &mut edit) {
-        return;
-    }
-    let Some(data) = sources_state(hdlg) else {
-        return;
-    };
-    let data = unsafe { &mut *data };
-    if !data.editor.add() {
-        set_dlg_text(hdlg, ID_S_FAULT, "The list is full.");
-        return;
-    }
-    sources_took(hdlg, data, edit);
-}
-
-/// **Edit…** — the same screen over the selected source.
-fn sources_edit_selected(hdlg: HWND) {
-    let (draft, has_secret) = {
+/// **The count is the whole reason to ask.** Deleting a source deletes every tail that reads it, and
+/// a reader who clicked Delete on a server expecting to lose one row would lose four with nothing
+/// having said so. A tail is deleted without a question: it is one row, it carries no credential,
+/// and Cancel on a confirmation nobody needed is worse than the undo this dialog does not have.
+fn sources_remove(hdlg: HWND) {
+    use tailhawk_core::sourceset::Chosen;
+    let question = {
         let Some(data) = sources_state(hdlg) else {
             return;
         };
         let data = unsafe { &*data };
-        let Some(source) = data.editor.current() else {
-            return;
-        };
-        (
-            tailhawk_core::sourcesetup::Draft::of(source),
-            data.editor.current_has_secret(),
-        )
+        match data.editor.chosen() {
+            Chosen::Source(at) => {
+                let Some(name) = data.editor.source(at).map(|s| s.name.clone()) else {
+                    return;
+                };
+                Some(match data.editor.tails_of(at) {
+                    0 => format!("Delete \"{name}\" and its stored secret?"),
+                    1 => {
+                        format!("Delete \"{name}\"? Its one tail and its stored secret go with it.")
+                    }
+                    many => format!(
+                        "Delete \"{name}\"? Its {many} tails and its stored secret go with it."
+                    ),
+                })
+            }
+            _ => None,
+        }
     };
-    let mut edit = SourceEdit::new(draft, has_secret);
-    if !show_source_editor(hdlg, &mut edit) {
-        return;
+    // **Asked with no borrow held**, because a message box pumps a modal loop and this procedure is
+    // re-entered while it runs.
+    if let Some(question) = question {
+        if !crate::confirmed(hdlg, &question) {
+            return;
+        }
     }
     let Some(data) = sources_state(hdlg) else {
         return;
     };
     let data = unsafe { &mut *data };
-    sources_took(hdlg, data, edit);
-}
-
-/// What an accepted editor leaves behind: the source on the selected row, and the secret to store.
-///
-/// **A renamed source takes its credential with it.** The store is keyed on the name, so a rename
-/// would otherwise leave the old key behind holding a secret nobody can see and nobody will revoke
-/// — which is exactly what `Tailhawk/loki-tokens/nurtur-loki-live` is, in his own store, from a
-/// rename that happened before anything watched for it.
-fn sources_took(hdlg: HWND, data: &mut SourcesEdit, edit: SourceEdit) {
-    let was = data.editor.current().map(|s| s.name.clone());
-    let source = edit.draft.into_source();
-    if let Some(old) = was.filter(|old| !old.trim().is_empty() && *old != source.name) {
-        data.forget.push(old);
+    // **The names are remembered so their credentials can be deleted too.** A source removed while
+    // its secret stayed in Credential Manager leaves a credential nobody can see and nobody will
+    // revoke. A tail reports none, because it has none.
+    for gone in data.editor.remove() {
+        if !gone.trim().is_empty() {
+            data.forget.push(gone);
+        }
     }
-    // **A mode with no use for a secret gives the stored one up.** Switching a source from a client
-    // secret to a browser sign-in otherwise left the credential in the store for ever, for a flow
-    // that will never send it.
-    if let Some(gone) = edit.draft.secret_to_forget(edit.has_secret) {
-        data.forget.push(gone);
-    }
-    data.editor.replace(source);
-    if let Some((name, secret)) = edit.draft.secret_to_store() {
-        data.store.push((name, secret));
-    }
-    sources_quietly(|| sources_fill(hdlg, &data.editor));
-    sources_verbs(hdlg, &data.editor);
-    set_dlg_text(hdlg, ID_S_FAULT, data.editor.fault().unwrap_or_default());
+    sources_redraw(hdlg, data);
 }
 
 fn sources_state(hdlg: HWND) -> Option<*mut SourcesEdit> {
@@ -1158,6 +1376,17 @@ fn sources_state(hdlg: HWND) -> Option<*mut SourcesEdit> {
 /// Reports whether the set was accepted. The caller writes `editor.sources()` into its settings and
 /// takes `store` and `forget` to Credential Manager.
 pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
+    // **The tree classes are asked for explicitly.** comctl32 is already loaded by the manifest and
+    // the list views on the other dialogs work without this — but `SysTreeView32` is new to this
+    // product, and a dialog template naming a class that is not registered creates no control at
+    // all and reports nothing: an empty dialog with a working Close button.
+    let icc = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_TREEVIEW_CLASSES,
+    };
+    unsafe {
+        let _ = InitCommonControlsEx(&icc);
+    }
     let t = template(
         "Remote sources",
         S_DIALOG_W,
@@ -1171,6 +1400,420 @@ pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
             hwnd,
             Some(sources_proc),
             LPARAM(data as *mut SourcesEdit as isize),
+        )
+    };
+    data.accepted
+}
+
+/// The one-tail editor's size, named so the template and the walk that checks it cannot disagree.
+const T_DIALOG_W: i16 = 420;
+const T_DIALOG_H: i16 = 104;
+
+/// One tail's own screen — what **Add tail…** opens and what **Edit…** opens on a tail.
+///
+/// **It is one page, because a tail is three facts.** The owner's framing, 2026-10-21: *"They can
+/// add a source, and then can create new tail with a name and choose how the source gets filtered to
+/// be displayed."* Which server it reads is settled before this opens — it is whichever row the
+/// reader was on — so it is stated rather than asked, and the two live fields are the name and the
+/// selector.
+///
+/// **`Choose…` is the Nurtur half, and it is the reason the guided flow was worth building.** The
+/// owner: *"the applications field is specifically a nurtur feature so I would think we need to offer
+/// the user a set of fields and possible values that could be used to constrain the output based on
+/// an initial fetch from the source once connected."* It asks the server what it holds and offers
+/// the answer — a list of real values to tick, not a free-text box to mistype. It moved here from
+/// the source editor with the split: an application is something a *view* narrows to, and asking a
+/// server what it holds needs a source that is already configured enough to authenticate — which
+/// on this screen it is, **except** for a tail whose source is not in the set at all. A hand-edited
+/// file can produce one, and then there is no server to ask and the button is greyed.
+fn tail_edit_items() -> Vec<Item> {
+    let label = |text: &str, y: i16| Item::new(Class::Static, text, 0xFFFF, (7, y + 2, 58, 8), 0);
+    vec![
+        label("Reads:", 7),
+        // **Said, not asked.** Which source a tail reads is the row the reader came from; a combo
+        // box here would be a question they have already answered, and one they could answer
+        // wrongly. Moving a tail between servers is Delete and Add, which is honest about what it
+        // costs: the two servers have different credentials and may hold different labels.
+        Item::new(Class::Static, "", ID_T_SOURCE, (69, 9, 344, 9), 0),
+        label("&Name:", 23),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_T_NAME,
+            (69, 23, 344, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        label("S&hows:", 39),
+        Item::new(
+            Class::Edit,
+            "",
+            ID_T_QUERY,
+            (69, 39, 275, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        Item::new(
+            Class::Button,
+            "&Choose…",
+            ID_T_CHOOSE,
+            (353, 38, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(Class::Static, "", ID_T_FAULT, (7, 56, 406, 18), 0),
+        Item::new(
+            Class::Button,
+            "OK",
+            IDOK,
+            (293, 78, 54, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (353, 78, 60, 14),
+            WS_TABSTOP,
+        ),
+    ]
+}
+
+/// What the one-tail editor is handed and hands back.
+pub struct TailEdit {
+    pub tail: tailhawk_core::settings::Tail,
+    pub accepted: bool,
+    /// Every **other** tail's name, so a duplicate is refused next to the box that caused it rather
+    /// than discovered from the list's fault line after Close.
+    taken: Vec<String>,
+    /// The connection this tail reads — handed in by [`TailEdit::reading`] before the dialog opens,
+    /// because `Choose…` has to ask that server what it holds and the tree knows which it is.
+    ///
+    /// `None` only for a tail whose source is not in the set, which a hand-edited file can produce:
+    /// then `Choose…` has nowhere to send the question and is greyed rather than left to fail.
+    source: Option<tailhawk_core::settings::Source>,
+    /// The number of the `Choose…` this editor is waiting on, or 0. See [`next_labels_token`]:
+    /// an answer stamped with anything else was asked for by a dialog that has gone.
+    waiting_on: usize,
+}
+
+impl TailEdit {
+    pub fn new(tail: tailhawk_core::settings::Tail, taken: Vec<String>) -> Self {
+        Self {
+            tail,
+            accepted: false,
+            taken,
+            source: None,
+            waiting_on: 0,
+        }
+    }
+
+    /// The source this tail reads, for the editor to carry to `Choose…`.
+    pub fn reading(&mut self, source: tailhawk_core::settings::Source) {
+        self.source = Some(source);
+    }
+}
+
+/// `Choose…`'s answer, posted back from the worker that asked the server.
+const WM_T_LABELS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x0142;
+
+/// Hands out a number to each `Choose…` so a late answer cannot be given to the wrong editor.
+///
+/// **A posted message outlives the dialog that asked for it.** `Choose…` is greyed while the call
+/// runs, but OK, Cancel, Esc and the X are not — dismiss the editor mid-call and the message is
+/// either refused (and the box dropped correctly) or already in the thread queue. If it is queued
+/// and the reader opens another tail editor straight away, USER can hand the new dialog the same
+/// `HWND` value: the answer would then be reclaimed by a dialog that never asked, re-enabling its
+/// `Choose…` and popping the applications picker over the **wrong tail**, writing the result into
+/// it.
+///
+/// Not memory-unsafe — `DWLP_USER` is per-window and the new dialog set it itself, and no other
+/// procedure in the crate answers this message — but it is wrong data on screen, which is worse to
+/// diagnose. The asking editor stamps its number into the `WPARAM` and compares on arrival.
+fn next_labels_token() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Suppresses the `EN_CHANGE` this dialog's own writes fire, for the reason `EDITOR_QUIET`
+    /// exists one screen along: `set_dlg_text` raises it **synchronously**, so a fill that writes
+    /// two boxes re-enters this procedure between them, and a handler that reads every box back
+    /// into the draft would replace the very `String`s the fill is reading from.
+    static TAIL_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `write`, with every notification it provokes marked as the dialog's own. Restores rather
+/// than clears — see [`sources_quietly`].
+fn tail_quietly<R>(write: impl FnOnce() -> R) -> R {
+    let was = TAIL_QUIET.with(|q| q.replace(true));
+    let out = write();
+    TAIL_QUIET.with(|q| q.set(was));
+    out
+}
+
+fn tail_edit_state(hdlg: HWND) -> Option<*mut TailEdit> {
+    let ptr = unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) } as *mut TailEdit;
+    (!ptr.is_null()).then_some(ptr)
+}
+
+/// Writes the draft into the boxes.
+///
+/// **The strings are owned before anything is written.** Building the write list as `&str` into the
+/// draft's own `String`s and then writing them one at a time is aliasing undefined behaviour, found
+/// on screen in the source editor on 2026-10-21: each write re-enters the procedure, whose
+/// `EN_CHANGE` handler replaces those very `String`s, and the loop reads on into a freed buffer.
+fn tail_edit_fill(hdlg: HWND, data: &TailEdit) {
+    let writes: [(u16, String); 3] = [
+        (ID_T_SOURCE, data.tail.source.clone()),
+        (ID_T_NAME, data.tail.name.clone()),
+        (ID_T_QUERY, data.tail.query.clone()),
+    ];
+    // **The guard is in here rather than at the call sites**, which is the shape
+    // [`source_edit_fill`] settled on one screen along: a guard a caller has to remember is a guard
+    // the next caller forgets, and what it is protecting is undefined behaviour rather than a
+    // cosmetic flicker.
+    tail_quietly(|| {
+        for (id, text) in &writes {
+            set_dlg_text(hdlg, *id, text);
+        }
+    });
+}
+
+/// Reads the boxes back into the draft. The source is not among them: it is a static.
+fn tail_edit_read(hdlg: HWND, data: &mut TailEdit) {
+    data.tail.name = dlg_text(hdlg, ID_T_NAME);
+    data.tail.query = dlg_text(hdlg, ID_T_QUERY);
+}
+
+/// Says what is wrong with the tail as it stands, or clears the line.
+fn tail_edit_say(hdlg: HWND, data: &TailEdit) {
+    set_dlg_text(
+        hdlg,
+        ID_T_FAULT,
+        tailhawk_core::sourceset::tail_being_edited(&data.tail, &data.taken).unwrap_or_default(),
+    );
+}
+
+unsafe extern "system" fn tail_edit_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
+        WM_INITDIALOG => {
+            theme_dialog(hdlg);
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            let data = unsafe { &*(lparam.0 as *const TailEdit) };
+            tail_edit_fill(hdlg, data);
+            tail_edit_say(hdlg, data);
+            // **`Choose…` needs a server to ask.** A tail whose source was not handed over — which
+            // is the hand-edited orphan — has nowhere to send the question, and a button that
+            // cannot work is greyed rather than left to fail.
+            if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_T_CHOOSE)) } {
+                let _ = unsafe { EnableWindow(button, data.source.is_some()) };
+            }
+            1
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            // **Every notification, not just `EN_CHANGE`, and before the state pointer is taken.**
+            //
+            // `set_dlg_text` is `SetDlgItemTextW`, and an edit control answers `WM_SETTEXT` by
+            // sending the parent `EN_UPDATE` *and then* `EN_CHANGE` — both synchronously, so both
+            // re-enter this procedure while the write that caused them still holds a reference to
+            // the state. A guard that names `EN_CHANGE` alone lets `EN_UPDATE` through to take a
+            // second one, which is the aliasing the quiet flag exists to prevent and not something
+            // the second reference has to be *written* through to be undefined. `EnableWindow` on a
+            // control that has the focus is a third route, by way of `EN_KILLFOCUS`, and a combo
+            // fill is a fourth.
+            //
+            // **Nothing is lost by suppressing all of them**: no user gesture can be dispatched
+            // inside a synchronous write, so every notification arriving while the flag is set was
+            // provoked by this dialog and has nothing to tell it.
+            if TAIL_QUIET.with(|q| q.get()) {
+                return 1;
+            }
+            let Some(data) = tail_edit_state(hdlg) else {
+                return 0;
+            };
+            let data = unsafe { &mut *data };
+            match (id, code) {
+                (ID_T_NAME | ID_T_QUERY, EN_CHANGE) => {
+                    tail_edit_read(hdlg, data);
+                    tail_edit_say(hdlg, data);
+                    return 1;
+                }
+                (ID_T_CHOOSE, BN_CLICKED) => {
+                    tail_edit_read(hdlg, data);
+                    let Some(source) = data.source.clone() else {
+                        return 1;
+                    };
+                    // Quiet, because disabling the button that was just clicked takes the focus off
+                    // it and a button answers that with `BN_KILLFOCUS` — which would arrive inside
+                    // this handler, where the `&mut` is live.
+                    tail_quietly(|| {
+                        if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_T_CHOOSE)) } {
+                            let _ = unsafe { EnableWindow(button, false) };
+                        }
+                        set_dlg_text(
+                            hdlg,
+                            ID_T_FAULT,
+                            "Asking this server which applications it holds…",
+                        );
+                    });
+                    let token = next_labels_token();
+                    data.waiting_on = token;
+                    let target = hdlg.0 as isize;
+                    std::thread::spawn(move || {
+                        let found =
+                            crate::pull::label_values(&source, tailhawk_core::apps::APP_LABEL);
+                        let hdlg = HWND(target as *mut std::ffi::c_void);
+                        let boxed = Box::into_raw(Box::new(found));
+                        if unsafe {
+                            PostMessageW(hdlg, WM_T_LABELS, WPARAM(token), LPARAM(boxed as isize))
+                        }
+                        .is_err()
+                        {
+                            drop(unsafe { Box::from_raw(boxed) });
+                        }
+                    });
+                    return 1;
+                }
+                (IDOK, BN_CLICKED) => {
+                    tail_edit_read(hdlg, data);
+                    if let Some(why) =
+                        tailhawk_core::sourceset::tail_being_edited(&data.tail, &data.taken)
+                    {
+                        set_dlg_text(hdlg, ID_T_FAULT, why);
+                        return 1;
+                    }
+                    // Trimmed on the way out, so the name the credential-free half of the
+                    // model keys on is the one the reader can see.
+                    data.tail.name = data.tail.name.trim().to_owned();
+                    data.tail.query = data.tail.query.trim().to_owned();
+                    data.accepted = true;
+                    unsafe {
+                        let _ = EndDialog(hdlg, 1);
+                    }
+                    return 1;
+                }
+                (IDCANCEL, BN_CLICKED) => {
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    return 1;
+                }
+                _ => {}
+            }
+            0
+        }
+        // **The applications the server holds, offered through the picker that already exists.**
+        //
+        // The nested modal is opened with **nothing of this dialog borrowed** — it pumps a message
+        // loop of its own, during which this procedure is re-entered, and a `&mut TailEdit` held
+        // across it would be a second one taken from under the first.
+        WM_T_LABELS => {
+            // **Reclaimed first, whoever it turns out to be for**, or a message this dialog will
+            // not act on is a leak. Then checked: see [`next_labels_token`].
+            let found = *unsafe {
+                Box::from_raw(lparam.0 as *mut Result<Vec<String>, crate::pull::PullFault>)
+            };
+            let ours = tail_edit_state(hdlg)
+                .is_some_and(|data| unsafe { &*data }.waiting_on == wparam.0 && wparam.0 != 0);
+            if !ours {
+                return 1;
+            }
+            if let Some(data) = tail_edit_state(hdlg) {
+                unsafe { &mut *data }.waiting_on = 0;
+            }
+            if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_T_CHOOSE)) } {
+                let _ = unsafe { EnableWindow(button, true) };
+            }
+            let values = match found {
+                Ok(values) => values,
+                Err(why) => {
+                    set_dlg_text(hdlg, ID_T_FAULT, &format!("{why}"));
+                    return 1;
+                }
+            };
+            let query = {
+                let Some(data) = tail_edit_state(hdlg) else {
+                    return 1;
+                };
+                unsafe { &*data }.tail.query.clone()
+            };
+            let mut pick = AppsPick {
+                list: tailhawk_core::apps::AppList::new(
+                    &values,
+                    &tailhawk_core::apps::values_in(&query, tailhawk_core::apps::APP_LABEL),
+                ),
+                choice: None,
+            };
+            let took = show_apps_dialog(hdlg, &mut pick);
+            let Some(data) = tail_edit_state(hdlg) else {
+                return 1;
+            };
+            let data = unsafe { &mut *data };
+            if took || pick.choice.is_some() {
+                let chosen = pick.list.chosen();
+                // **Written into the selector, not into a field of its own.** `app` is one of the
+                // server's labels; `values_in` reads it straight back out, so the tab still titles
+                // itself `live · job-dispatcher` and Interleave still works, without a second place
+                // that says the same thing.
+                match tailhawk_core::apps::with_label(
+                    &data.tail.query,
+                    tailhawk_core::apps::APP_LABEL,
+                    &chosen,
+                ) {
+                    Ok(query) => {
+                        data.tail.query = query;
+                        data.tail.apps = chosen.iter().map(|app| (*app).to_owned()).collect();
+                        tail_edit_fill(hdlg, data);
+                        tail_edit_say(hdlg, data);
+                    }
+                    Err(why) => set_dlg_text(hdlg, ID_T_FAULT, &format!("{why:?}")),
+                }
+            }
+            1
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = EndDialog(hdlg, 0);
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// Shows one tail's editor over `owner`. Reports whether it was accepted.
+pub fn show_tail_editor(owner: HWND, data: &mut TailEdit) -> bool {
+    let title = match data.tail.name.trim().is_empty() {
+        true => "New tail",
+        false => "Tail",
+    };
+    let t = template(title, T_DIALOG_W, T_DIALOG_H, &tail_edit_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            owner,
+            Some(tail_edit_proc),
+            LPARAM(data as *mut TailEdit as isize),
         )
     };
     data.accepted
@@ -1229,12 +1872,10 @@ fn source_edit_items() -> Vec<Item> {
         // which made the reader responsible for knowing that configuring and checking are different
         // verbs. Setting up email asks you to press Next, not Next and then Check.
         button("Set u&p", ID_E_SETUP, 353, 22),
-        label("S&hows:", 39),
-        field(ID_E_SHOWS, 39, 275, 0),
-        // The labels the server itself holds, and their values — not an Applications box, which
-        // made one estate's label a feature of the product.
-        button("&Choose…", ID_E_CHOOSE, 353, 38),
-        Item::new(Class::Static, "", ID_E_FAULT, (7, 60, 406, 18), 0),
+        // **No `Shows:` and no `Choose…`.** Both were here while one entry was a connection and a
+        // view at once; a selector and a list of applications are what a *tail* is, and they are on
+        // its screen now. What is left is the connection, which is all a source ever was.
+        Item::new(Class::Static, "", ID_E_FAULT, (7, 44, 406, 18), 0),
         Item::new(
             Class::Button,
             "&Advanced",
@@ -1468,18 +2109,21 @@ fn source_edit_fill(hdlg: HWND, data: &SourceEdit) {
     let boxes: Vec<(u16, String)> = vec![
         (ID_E_NAME, data.draft.name.clone()),
         (ID_E_URL, data.draft.url.clone()),
-        (ID_E_SHOWS, data.draft.query.clone()),
         (ID_E_TOKEN, data.draft.token_url.clone()),
         (ID_E_AUTH, data.draft.auth_url.clone()),
         (ID_E_CLIENT, data.draft.client_id.clone()),
         (ID_E_SCOPE, data.draft.scope.clone()),
     ];
+    // **The fault line and the greying are inside the quiet region too.** `source_edit_say` ends
+    // with `EnableWindow` on the secret box, and disabling a control that has the keyboard focus
+    // makes Windows take the focus away — whereupon the edit sends `EN_KILLFOCUS`, which is not a
+    // write this dialog meant to hear about. Nesting is safe because `editor_quietly` restores.
     editor_quietly(|| {
         for (id, text) in &boxes {
             set_dlg_text(hdlg, *id, text);
         }
+        source_edit_say(hdlg, data);
     });
-    source_edit_say(hdlg, data);
 }
 
 thread_local! {
@@ -1492,10 +2136,12 @@ thread_local! {
 }
 
 /// Runs `write`, with every `EN_CHANGE` it provokes marked as the dialog's own.
+/// Runs `write`, with every notification it provokes marked as the dialog's own. Restores rather
+/// than clears — see [`sources_quietly`].
 fn editor_quietly<R>(write: impl FnOnce() -> R) -> R {
-    EDITOR_QUIET.with(|q| q.set(true));
+    let was = EDITOR_QUIET.with(|q| q.replace(true));
     let out = write();
-    EDITOR_QUIET.with(|q| q.set(false));
+    EDITOR_QUIET.with(|q| q.set(was));
     out
 }
 
@@ -1527,7 +2173,6 @@ fn source_edit_say(hdlg: HWND, data: &SourceEdit) {
 fn source_edit_read(hdlg: HWND, data: &mut SourceEdit) {
     data.draft.name = dlg_text(hdlg, ID_E_NAME);
     data.draft.url = dlg_text(hdlg, ID_E_URL);
-    data.draft.query = dlg_text(hdlg, ID_E_SHOWS);
     data.draft.token_url = dlg_text(hdlg, ID_E_TOKEN);
     data.draft.auth_url = dlg_text(hdlg, ID_E_AUTH);
     data.draft.client_id = dlg_text(hdlg, ID_E_CLIENT);
@@ -1580,10 +2225,21 @@ unsafe extern "system" fn source_edit_proc(
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u16;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
-            // **Before `source_edit_state`, not after.** This is the notification this dialog's own
-            // writes provoke, and taking the editor out of `DWLP_USER` here would be the second
-            // `&mut` to it while the write that caused this still holds the first.
-            if code == EN_CHANGE && EDITOR_QUIET.with(|q| q.get()) {
+            // **Every notification, not just `EN_CHANGE`, and before the state pointer is taken.**
+            //
+            // `set_dlg_text` is `SetDlgItemTextW`, and an edit control answers `WM_SETTEXT` by
+            // sending the parent `EN_UPDATE` *and then* `EN_CHANGE` — both synchronously, so both
+            // re-enter this procedure while the write that caused them still holds a reference to
+            // the state. A guard that names `EN_CHANGE` alone lets `EN_UPDATE` through to take a
+            // second one, which is the aliasing the quiet flag exists to prevent and not something
+            // the second reference has to be *written* through to be undefined. `EnableWindow` on a
+            // control that has the focus is a third route, by way of `EN_KILLFOCUS`, and a combo
+            // fill is a fourth.
+            //
+            // **Nothing is lost by suppressing all of them**: no user gesture can be dispatched
+            // inside a synchronous write, so every notification arriving while the flag is set was
+            // provoked by this dialog and has nothing to tell it.
+            if EDITOR_QUIET.with(|q| q.get()) {
                 return 1;
             }
             let Some(data) = source_edit_state(hdlg) else {
@@ -1600,8 +2256,7 @@ unsafe extern "system" fn source_edit_proc(
                     return 1;
                 }
                 (
-                    ID_E_NAME | ID_E_URL | ID_E_SHOWS | ID_E_TOKEN | ID_E_AUTH | ID_E_CLIENT
-                    | ID_E_SCOPE,
+                    ID_E_NAME | ID_E_URL | ID_E_TOKEN | ID_E_AUTH | ID_E_CLIENT | ID_E_SCOPE,
                     EN_CHANGE,
                 ) => {
                     source_edit_read(hdlg, data);
@@ -1640,18 +2295,24 @@ unsafe extern "system" fn source_edit_proc(
                         set_dlg_text(hdlg, ID_E_FAULT, "Type the server's URL first.");
                         return 1;
                     }
-                    if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_SETUP)) } {
-                        let _ = unsafe { EnableWindow(button, false) };
-                    }
-                    // **Says where it is about to look, before it looks.** A Set up that finds
-                    // nothing on the host named goes on to try `identity`, `auth`, `login`, `sso`
-                    // and `idp` beside it — hostnames nobody typed — and SPEC.md §13.2's promise is
-                    // that an outbound connection is never a surprise.
-                    set_dlg_text(
-                        hdlg,
-                        ID_E_FAULT,
-                        "Asking this server where it signs people in, then the ones beside it…",
-                    );
+                    // Quiet, for the reason the tail editor's `Choose…` is: disabling the button
+                    // that was just clicked takes the focus off it, and a button answers that with
+                    // `BN_KILLFOCUS` — arriving inside this handler, where the `&mut` is live.
+                    //
+                    // **The sentence says where it is about to look, before it looks.** A Set up
+                    // that finds nothing on the host named goes on to try `identity`, `auth`,
+                    // `login`, `sso` and `idp` beside it — hostnames nobody typed — and SPEC.md
+                    // §13.2's promise is that an outbound connection is never a surprise.
+                    editor_quietly(|| {
+                        if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_SETUP)) } {
+                            let _ = unsafe { EnableWindow(button, false) };
+                        }
+                        set_dlg_text(
+                            hdlg,
+                            ID_E_FAULT,
+                            "Asking this server where it signs people in, then the ones beside it…",
+                        );
+                    });
                     let target = hdlg.0 as isize;
                     std::thread::spawn(move || {
                         let probed = Probed {
@@ -1663,45 +2324,6 @@ unsafe extern "system" fn source_edit_proc(
                         let boxed = Box::into_raw(Box::new(probed));
                         if unsafe {
                             PostMessageW(hdlg, WM_S_PROBED, WPARAM(0), LPARAM(boxed as isize))
-                        }
-                        .is_err()
-                        {
-                            drop(unsafe { Box::from_raw(boxed) });
-                        }
-                    });
-                    return 1;
-                }
-                // **The button that did nothing.** It sat on the front of the dialog inert — which
-                // is the owner's own complaint about the screen this one replaced, word for word:
-                // *"the discover button is just sitting there"*.
-                //
-                // It asks the server which applications it holds, which is a credentialed round
-                // trip, so it needs a source complete enough to authenticate. That is the question
-                // the guided flow would reach *after* settling the credential; on a form it has to
-                // be checked here.
-                (ID_E_CHOOSE, BN_CLICKED) => {
-                    source_edit_read(hdlg, data);
-                    if let Some(why) = data.draft.fault() {
-                        set_dlg_text(hdlg, ID_E_FAULT, why);
-                        return 1;
-                    }
-                    let source = data.draft.into_source();
-                    if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_CHOOSE)) } {
-                        let _ = unsafe { EnableWindow(button, false) };
-                    }
-                    set_dlg_text(
-                        hdlg,
-                        ID_E_FAULT,
-                        "Asking this server which applications it holds…",
-                    );
-                    let target = hdlg.0 as isize;
-                    std::thread::spawn(move || {
-                        let found =
-                            crate::pull::label_values(&source, tailhawk_core::apps::APP_LABEL);
-                        let hdlg = HWND(target as *mut std::ffi::c_void);
-                        let boxed = Box::into_raw(Box::new(found));
-                        if unsafe {
-                            PostMessageW(hdlg, WM_E_LABELS, WPARAM(0), LPARAM(boxed as isize))
                         }
                         .is_err()
                         {
@@ -1793,71 +2415,6 @@ unsafe extern "system" fn source_edit_proc(
                 ID_E_FAULT,
                 &said_about(&said, &probed.asked, still_asking),
             );
-            1
-        }
-        // **The applications the server holds, offered through the picker that already exists.**
-        //
-        // The nested modal is opened with **nothing of this dialog borrowed** — it pumps a message
-        // loop of its own, during which this procedure is re-entered, and a `&mut SourceEdit` held
-        // across it would be a second one taken from under the first.
-        WM_E_LABELS => {
-            let found = *unsafe {
-                Box::from_raw(lparam.0 as *mut Result<Vec<String>, crate::pull::PullFault>)
-            };
-            if let Ok(button) = unsafe { GetDlgItem(hdlg, i32::from(ID_E_CHOOSE)) } {
-                let _ = unsafe { EnableWindow(button, true) };
-            }
-            let values = match found {
-                Ok(values) => values,
-                Err(why) => {
-                    set_dlg_text(hdlg, ID_E_FAULT, &format!("{why}"));
-                    return 1;
-                }
-            };
-            let query = {
-                let Some(data) = source_edit_state(hdlg) else {
-                    return 1;
-                };
-                unsafe { &*data }.draft.query.clone()
-            };
-            let mut pick = AppsPick {
-                list: tailhawk_core::apps::AppList::new(
-                    &values,
-                    &tailhawk_core::apps::values_in(&query, tailhawk_core::apps::APP_LABEL),
-                ),
-                choice: None,
-            };
-            let took = show_apps_dialog(hdlg, &mut pick);
-            let Some(data) = source_edit_state(hdlg) else {
-                return 1;
-            };
-            let data = unsafe { &mut *data };
-            if took || pick.choice.is_some() {
-                let chosen = pick.list.chosen();
-                // **Written into the selector, not into a field of its own.** `app` is one of the
-                // server's labels; `values_in` reads it straight back out, so the tab still titles
-                // itself `live · job-dispatcher` and Interleave still works, without a second place
-                // that says the same thing.
-                match tailhawk_core::apps::with_label(
-                    &data.draft.query,
-                    tailhawk_core::apps::APP_LABEL,
-                    &chosen,
-                ) {
-                    Ok(query) => {
-                        data.draft.query = query;
-                        data.draft.apps = chosen.iter().map(|app| (*app).to_owned()).collect();
-                    }
-                    Err(_) => {
-                        set_dlg_text(
-                            hdlg,
-                            ID_E_FAULT,
-                            "This source's filter is not a selector Tailhawk can add to.",
-                        );
-                        return 1;
-                    }
-                }
-            }
-            source_edit_fill(hdlg, data);
             1
         }
         WM_CLOSE => {
@@ -6112,6 +6669,70 @@ pub(crate) fn lv_select(list: HWND, at: usize) {
     }
 }
 
+/// Empties a tree view.
+pub(crate) fn tv_reset(tree: HWND) {
+    unsafe {
+        SendMessageW(tree, TVM_DELETEITEM, WPARAM(0), LPARAM(TVI_ROOT.0));
+    }
+}
+
+/// Appends one item under `parent` (`None` for a root), carrying `data`, and hands back its handle.
+///
+/// **The text buffer must outlive the send and no longer.** `TVITEMW::pszText` is a pointer the
+/// control copies from during `TVM_INSERTITEMW`, so the local `Vec` is exactly the right lifetime —
+/// which is the same contract [`lv_row`] works to, beside it.
+pub(crate) fn tv_item(tree: HWND, parent: Option<HTREEITEM>, text: &str, data: isize) -> HTREEITEM {
+    let mut wide = wsz(text);
+    let insert = TVINSERTSTRUCTW {
+        hParent: parent.unwrap_or(TVI_ROOT),
+        hInsertAfter: TVI_LAST,
+        // `TVINSERTSTRUCTW`'s last member is a union of `TVITEMW` and the extended `TVITEMEXW`,
+        // and comctl32 reads whichever the struct's own size says it was given. The `windows`
+        // crate names it `Anonymous`, so the field is spelled rather than inferred.
+        Anonymous: TVINSERTSTRUCTW_0 {
+            itemex: TVITEMEXW {
+                mask: TVIF_TEXT | TVIF_PARAM,
+                pszText: PWSTR(wide.as_mut_ptr()),
+                lParam: LPARAM(data),
+                ..Default::default()
+            },
+        },
+    };
+    let made = unsafe {
+        SendMessageW(
+            tree,
+            TVM_INSERTITEMW,
+            WPARAM(0),
+            LPARAM(&insert as *const TVINSERTSTRUCTW as isize),
+        )
+    };
+    HTREEITEM(made.0)
+}
+
+/// Selects `item`, so a refill leaves the pointer where the reader left it.
+pub(crate) fn tv_select(tree: HWND, item: HTREEITEM) {
+    unsafe {
+        SendMessageW(
+            tree,
+            TVM_SELECTITEM,
+            WPARAM(TVGN_CARET as usize),
+            LPARAM(item.0),
+        );
+    }
+}
+
+/// Opens `item` so its children are visible.
+pub(crate) fn tv_expand(tree: HWND, item: HTREEITEM) {
+    unsafe {
+        SendMessageW(
+            tree,
+            TVM_EXPAND,
+            WPARAM(TVE_EXPAND.0 as usize),
+            LPARAM(item.0),
+        );
+    }
+}
+
 /// The Import Layout dialog's controls — §6.3 as [`format_dialog_items`]'s sibling, and shaped
 /// like it on purpose: the same pattern box, fault line, Save as, Test and preview in the same
 /// places, so the two doors to one artefact do not have to be learned twice.
@@ -7029,6 +7650,7 @@ mod tests {
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
             ("Remote source", source_edit_items()),
+            ("Tail", tail_edit_items()),
             ("Applications", apps_dialog_items()),
             ("Select Columns", columns_dialog_items()),
         ] {
@@ -7236,6 +7858,131 @@ mod tests {
         }
     }
 
+    /// **Every control of the tail editor is inside it and none overlaps another.**
+    ///
+    /// The sibling of [`the_sources_dialog_fits_inside_itself`], and written with it rather than
+    /// after a screenshot: the source editor's buttons were drawn over its Secret row and clipped
+    /// by its bottom edge on 2026-10-21, which is what a dialog laid out in constants does when
+    /// nothing checks the arithmetic. Windows draws a control past the bottom edge as nothing at
+    /// all and says nothing about it.
+    #[test]
+    fn the_tail_editor_fits_inside_itself() {
+        let items = tail_edit_items();
+        for item in &items {
+            assert!(
+                item.x >= 0 && item.y >= 0,
+                "{:?} starts outside the dialog at ({}, {})",
+                item.text,
+                item.x,
+                item.y
+            );
+            assert!(
+                item.x + item.w <= T_DIALOG_W,
+                "{:?} runs past the right edge: {} + {} > {T_DIALOG_W}",
+                item.text,
+                item.x,
+                item.w
+            );
+            assert!(
+                item.y + item.h <= T_DIALOG_H,
+                "{:?} runs past the bottom: {} + {} > {T_DIALOG_H}",
+                item.text,
+                item.y,
+                item.h
+            );
+        }
+        for (i, a) in items.iter().enumerate() {
+            for b in items.iter().skip(i + 1) {
+                let apart =
+                    a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+                assert!(apart, "{:?} overlaps {:?}", a.text, b.text);
+            }
+        }
+    }
+
+    /// **The tail editor asks for a name and a selector, and states the server.** Which source a
+    /// tail reads is the row the reader came from — a combo box here would be a question they have
+    /// already answered — so it is a static, and this asserts it: an edit box in that slot is an
+    /// invitation to retype a name that keys a credential.
+    #[test]
+    fn the_tail_editor_states_its_source_and_edits_only_the_two_fields() {
+        let items = tail_edit_items();
+        let at = |id: u16| {
+            items
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap_or_else(|| panic!("the tail editor has no control {id}"))
+        };
+        assert!(
+            matches!(at(ID_T_SOURCE).class, Class::Static),
+            "the server is said, not asked"
+        );
+        assert!(matches!(at(ID_T_NAME).class, Class::Edit));
+        assert!(matches!(at(ID_T_QUERY).class, Class::Edit));
+        assert!(matches!(at(ID_T_CHOOSE).class, Class::Button));
+        assert!(matches!(at(ID_T_FAULT).class, Class::Static));
+        // **And nothing of the connection is on it.** A tail editor with a URL or a client id on it
+        // would be the one-entry-per-view shape coming back through the dialog.
+        for id in [ID_E_URL, ID_E_TOKEN, ID_E_AUTH, ID_E_CLIENT, ID_E_SECRET] {
+            assert!(
+                !items.iter().any(|i| i.id == id),
+                "control {id} belongs to the source, not to a view of it"
+            );
+        }
+    }
+
+    /// **The source editor is the connection and nothing else.** `Shows:` and `Choose…` were on it
+    /// while one entry was a connection and a view at once; a selector and a list of applications
+    /// are what a *tail* is, and a source editor still carrying them would let a reader configure
+    /// a view on the screen that keys the credential — which is how one Loki came to have three.
+    #[test]
+    fn the_source_editor_carries_no_view_of_the_server() {
+        let items = source_edit_items();
+        for id in [ID_T_QUERY, ID_T_CHOOSE, ID_T_SOURCE] {
+            assert!(
+                !items.iter().any(|i| i.id == id),
+                "control {id} belongs to a tail, not to the connection"
+            );
+        }
+        for id in [ID_E_NAME, ID_E_URL, ID_E_SETUP, ID_E_SECRET] {
+            assert!(
+                items.iter().any(|i| i.id == id),
+                "and the connection's own control {id} is still there"
+            );
+        }
+    }
+
+    /// **The tree, its five verbs and Close — and the tree is a tree.** A `SysListView32` here
+    /// would be the flat list the owner replaced, and it would compile: the fill would put every
+    /// source and every tail on one level with nothing saying which read what.
+    #[test]
+    fn the_sources_dialog_is_a_tree_with_a_verb_for_each_kind_of_row() {
+        let items = sources_dialog_items();
+        let tree = items
+            .iter()
+            .find(|i| i.id == ID_S_TREE)
+            .expect("the tree is there");
+        assert!(
+            matches!(tree.class, Class::Named("SysTreeView32")),
+            "{:?}",
+            tree.class
+        );
+        for id in [ID_S_NEW, ID_S_ADD_TAIL, ID_S_EDIT, ID_S_CLONE, ID_S_REMOVE] {
+            assert!(items.iter().any(|i| i.id == id), "verb {id} is missing");
+        }
+        assert!(
+            items.iter().any(|i| i.id == IDCANCEL),
+            "and the one way out"
+        );
+        // **No fields.** The owner rejected the form that had them: *"I dont really understand the
+        // screen you have created, the discover button is just sitting there, and all the fields
+        // next to it."*
+        assert!(
+            !items.iter().any(|i| matches!(i.class, Class::Edit)),
+            "this dialog is the tree and its verbs; everything a row *is* belongs to its own screen"
+        );
+    }
+
     /// **Every control of the Remote sources dialog is inside it and none overlaps another.** The
     /// dialog gained an Applications row on 2026-10-21 and everything below it moved down 16 units;
     /// a height left at its old value would have put the fault line and both buttons past the
@@ -7440,6 +8187,7 @@ mod tests {
             ("Go to line", goto_dialog_items(500)),
             ("Remote sources", sources_dialog_items()),
             ("Remote source", source_edit_items()),
+            ("Tail", tail_edit_items()),
             ("Applications", apps_dialog_items()),
             ("Select Columns", columns_dialog_items()),
         ] {

@@ -134,8 +134,6 @@ pub struct Draft {
     /// The secret as typed. `None` means *leave whatever is in the store alone* — the distinction
     /// `sourceset` keeps for the same reason, and for the same credential.
     pub secret: Option<String>,
-    pub apps: Vec<String>,
-    pub query: String,
     /// What asking the server where it signs in came back with, when it has been asked.
     pub found: Option<Discovered>,
     /// What a test reached, when one has been run.
@@ -164,8 +162,6 @@ impl Draft {
             client_id: source.client_id.clone(),
             scope: source.scope.clone(),
             secret: None,
-            apps: source.apps.clone(),
-            query: source.query.clone(),
             found: None,
             reached: None,
             // **A source that exists is in the mode it is in, not one proposed to it.** Editing
@@ -335,8 +331,6 @@ impl Draft {
                 Mode::Open => String::new(),
                 _ => self.scope.trim().to_owned(),
             },
-            apps: self.apps.clone(),
-            query: self.query.trim().to_owned(),
         }
     }
 
@@ -655,13 +649,10 @@ mod tests {
             auth_url: "https://identity.example/connect/authorize".to_owned(),
             client_id: "tailhawk".to_owned(),
             scope: "telemetry:read".to_owned(),
-            apps: vec!["gateway".to_owned()],
-            query: "{environment=\"live\"}".to_owned(),
         };
         assert_eq!(mode_of(&browser), Mode::SignIn);
         let draft = Draft::of(&browser);
         assert_eq!(draft.mode, Some(Mode::SignIn));
-        assert_eq!(draft.apps, ["gateway"]);
         assert_eq!(
             draft.secret, None,
             "editing one does not reach into the store"

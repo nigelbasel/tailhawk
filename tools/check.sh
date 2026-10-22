@@ -37,6 +37,45 @@ step() {
 step "fmt" cargo fmt -p tailhawk -p tailhawk-core -- --check
 step "clippy" cargo clippy --release -p tailhawk -p tailhawk-core --all-targets -- -D warnings
 
+# **CI's `portable-core` job, which this script did not have.** `tailhawk-core` is portable by
+# contract and CI checks it against Linux on every push; a `use windows::` or a `\\?\` path that
+# reaches it compiles here and fails there, so the gap between the two gates is a red master
+# twenty minutes after a green local run.
+#
+# That is not hypothetical: it happened on 2026-10-21 with clippy's `--all-targets`, which was
+# widened in CI and not here, and `68ea87e` exists to undo the consequence. The lesson is the
+# general one and this is the rest of it — **a gate that tells you less than the one downstream of
+# it is not a gate**. It is skipped with a line rather than silently when the target is not
+# installed, because a check that quietly did not run is the same fault again.
+if rustup target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-gnu; then
+  step "portable-core" cargo check -p tailhawk-core --target x86_64-unknown-linux-gnu
+else
+  echo
+  echo "=== portable-core ==="
+  echo "SKIPPED: the x86_64-unknown-linux-gnu target is not installed."
+  echo "  rustup target add x86_64-unknown-linux-gnu"
+  echo "  CI runs this on every push, so a skip here is a check deferred, not a check passed."
+fi
+
+# **And the provenance gate, for the same reason.** CI fails the build when a file in
+# `crates/tailhawk-core/src/` is named nowhere in `CLEANROOM.md`, which is `CLEANROOM.md` §1.5's
+# rule that the entry is written *before* the module. Running it here is what makes the rule
+# catchable before the push rather than after it.
+step "provenance" bash -c '
+  missing=()
+  for f in crates/tailhawk-core/src/*.rs; do
+    n=$(basename "$f")
+    [ "$n" = "lib.rs" ] && continue
+    grep -qF -- "$n" CLEANROOM.md || missing+=("$n")
+  done
+  if [ ${#missing[@]} -ne 0 ]; then
+    echo "CLEANROOM.md section 5 names no entry for: ${missing[*]}"
+    echo "Add the entry before the code, per section 1.5 - not after this gate fails."
+    exit 1
+  fi
+  echo "every core module is named in CLEANROOM.md"
+'
+
 # **The flakes `CLAUDE.md` documents, by name.** Each fails under the full parallel suite on a loaded
 # machine and passes when run alone: two are timing criteria, one depends on when a write became
 # visible, and two lose a race for an exclusive handle on a spill nothing should be holding.

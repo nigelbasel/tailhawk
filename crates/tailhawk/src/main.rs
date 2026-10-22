@@ -1281,7 +1281,7 @@ impl Document {
         match self.remote_source.as_ref() {
             Some(asked) => Some(
                 settings::Recent::Remote {
-                    source: asked.source.clone(),
+                    tail: asked.tail.clone(),
                     apps: tailhawk_core::apps::apps_in(&asked.query),
                 }
                 .encode(),
@@ -1303,7 +1303,7 @@ impl Document {
         match self.remote_source.as_ref() {
             Some(asked) => Some(format!(
                 "loki://{}?query={}&minutes={}",
-                asked.source, asked.query, asked.minutes
+                asked.tail, asked.query, asked.minutes
             )),
             None => Some(self.path.as_ref()?.to_string_lossy().into_owned()),
         }
@@ -4246,7 +4246,7 @@ impl Tabs {
             .iter()
             .map(
                 |tab| match tab.panes.first().and_then(|d| d.remote_source.as_ref()) {
-                    Some(asked) => tailhawk_core::apps::Tab::remote(&asked.source, &asked.query),
+                    Some(asked) => tailhawk_core::apps::Tab::remote(&asked.tail, &asked.query),
                     None => tailhawk_core::apps::Tab::local(),
                 },
             )
@@ -4727,9 +4727,9 @@ struct Shell {
     /// §12.4's remote sources dialog, deferred like every other so no `STATE` borrow is held
     /// while it pumps its own modal loop.
     pending_sources: bool,
-    /// The remote source the user picked, waiting for the pull that must not run inside a borrow.
+    /// The remote tail the user picked, waiting for the pull that must not run inside a borrow.
     pending_pull: Option<usize>,
-    /// The remote source whose applications the user wants to choose again, waiting for the same
+    /// The remote tail whose applications the user wants to choose again, waiting for the same
     /// reason: the label call is a credential read and two round trips.
     pending_repick: Option<usize>,
     /// The whole seconds the bar last reported for the longest request in flight, so a frame is
@@ -5208,11 +5208,14 @@ impl Shell {
         }
     }
 
-    /// Writes §12.4's state: where the window is, how each open file is being looked at, and
-    /// §2.2's `[appearance]` preferences.
-    /// The names of the configured remote sources, for File ▸ Open remote source.
     /// What `Interleave` / `Separate` would do to the windows as they stand — see
     /// [`menubar::BarState::regroup_separates`]. `None` means the item is greyed.
+    ///
+    /// **Two paragraphs that belonged to other functions have been removed from here.** One
+    /// described `save_settings`, which no longer has a doc comment at all, and one described the
+    /// old `source_names` — a function that does not exist any more, having become
+    /// [`Shell::tail_names`] with a comment of its own. This is the "inserting above steals doc
+    /// comments" failure the project has recorded twice, found a third time by a review.
     fn regroup_separates(&self) -> Option<bool> {
         let tabs = self.document.regroup_tabs();
         match tailhawk_core::apps::regroup_of(&tabs, self.document.active)? {
@@ -5221,14 +5224,19 @@ impl Shell {
         }
     }
 
-    fn source_names(&self) -> Vec<String> {
-        self.settings
-            .sources
-            .iter()
-            .map(|s| s.name.clone())
-            .collect()
+    /// What `File ▸ Open remote` lists: **the tails, not the sources.** A source is a server and a
+    /// sign-in; what a reader opens is a view of one, and since 2026-10-21 those are separate
+    /// things. The owner's words: *"They can add a source, and then can create new tail with a name
+    /// and choose how the source gets filtered to be displayed."*
+    fn tail_names(&self) -> Vec<String> {
+        self.settings.tails.iter().map(|t| t.name.clone()).collect()
     }
 
+    /// Writes §12.4's state: where the window is, how each open file is being looked at, the
+    /// remote sources and their tails, and §2.2's `[appearance]` preferences.
+    ///
+    /// Its own sentence again, having spent some time attached to [`Shell::regroup_separates`]
+    /// three functions below.
     fn save_settings(&mut self, hwnd: HWND) {
         // The theme is written where it is chosen — see `adopt_theme` — so it is deliberately not
         // touched here. Overwriting it from `theme_name` made a `--theme=` flag persist and made a
@@ -6481,7 +6489,7 @@ impl Shell {
             if let Some(landing) = remote {
                 doc.remote(
                     &landing.label,
-                    &landing.question.source,
+                    &landing.question.tail,
                     &landing.spill,
                     &landing.question.query,
                     landing.question.minutes,
@@ -7251,8 +7259,8 @@ impl Shell {
                     }
                     // Deferred for the same reason the source list below is: opening a remote
                     // takes a `STATE` borrow of its own, and this runs inside one.
-                    Some(tailhawk_core::settings::Recent::Remote { source, apps }) => {
-                        self.pending_reopen = Some((source, apps));
+                    Some(tailhawk_core::settings::Recent::Remote { tail, apps }) => {
+                        self.pending_reopen = Some((tail, apps));
                     }
                     None => {}
                 }
@@ -7261,14 +7269,14 @@ impl Shell {
             // `LOKI.md`'s remote sources. The pull itself is deferred, like every other thing that
             // must not run inside a `STATE` borrow — it opens sockets and can take seconds.
             id if (menubar::ID_SOURCE_BASE
-                ..menubar::ID_SOURCE_BASE + tailhawk_core::sourceset::MAX_SOURCES as u32)
+                ..menubar::ID_SOURCE_BASE + tailhawk_core::sourceset::MAX_TAILS as u32)
                 .contains(&id) =>
             {
                 self.pending_pull = Some((id - menubar::ID_SOURCE_BASE) as usize);
                 true
             }
             id if (menubar::ID_SOURCE_PICK_BASE
-                ..menubar::ID_SOURCE_PICK_BASE + tailhawk_core::sourceset::MAX_SOURCES as u32)
+                ..menubar::ID_SOURCE_PICK_BASE + tailhawk_core::sourceset::MAX_TAILS as u32)
                 .contains(&id) =>
             {
                 self.pending_repick = Some((id - menubar::ID_SOURCE_PICK_BASE) as usize);
@@ -7334,7 +7342,10 @@ impl Shell {
                 self.pending_filter = Some((Polarity::Include, Some(title)));
                 true
             }
-            id if (menubar::ID_FORMAT_BASE..menubar::ID_FORMAT_BASE + 64).contains(&id) => {
+            id if (menubar::ID_FORMAT_BASE
+                ..menubar::ID_FORMAT_BASE + menubar::MAX_MENU_FORMATS as u32)
+                .contains(&id) =>
+            {
                 let at = (id - menubar::ID_FORMAT_BASE) as usize;
                 let action = self
                     .document
@@ -9470,19 +9481,25 @@ fn regroup_now(hwnd: HWND) {
         let shell = state.as_ref()?;
         let tabs = shell.document.regroup_tabs();
         let plan = tailhawk_core::apps::regroup_of(&tabs, shell.document.active)?;
-        // The *configured* source, not the narrowed one this window holds: `with_apps` replaces the
-        // application matcher, and starting from the configuration keeps the credential's name and
-        // every other matcher the user wrote.
+        // The *configured* tail, not the narrowed one this window holds: `with_apps` replaces the
+        // application matcher, and starting from the configuration keeps every other matcher the
+        // user wrote. The source comes with it, because that is where the credential lives.
         let name = tabs.get(shell.document.active)?.source.clone()?;
+        let tail = shell
+            .settings
+            .tails
+            .iter()
+            .find(|t| t.name == name)?
+            .clone();
         let source = shell
             .settings
             .sources
             .iter()
-            .find(|s| s.name == name)
+            .find(|s| s.name == tail.source)
             .cloned()?;
-        Some((plan, source))
+        Some((plan, source, tail))
     });
-    let Some((plan, source)) = plan else {
+    let Some((plan, source, tail)) = plan else {
         return;
     };
     // **Interleaving closes windows, so it asks first.** `regroup_question` decides whether there
@@ -9514,27 +9531,30 @@ fn regroup_now(hwnd: HWND) {
     } else {
         vec![names.clone()]
     };
-    let mut opening: Vec<(tailhawk_core::settings::Source, String)> = Vec::new();
+    let mut opening: Vec<(tailhawk_core::settings::Tail, String)> = Vec::new();
     for group in &groups {
-        let Ok(query) = tailhawk_core::apps::with_apps(&source.query, group) else {
+        let Ok(query) = tailhawk_core::apps::with_apps(&tail.query, group) else {
             set_notice(
                 hwnd,
                 format!(
-                    "{}: this source's query is not a selector this can add to.",
-                    source.name
+                    "{}: this tail's query is not a selector this can add to.",
+                    tail.name
                 ),
             );
             return;
         };
+        // The same rule the first open follows: named while they fit, counted once they do not.
+        // Interleaving twenty windows into one is exactly where the joined list stopped being
+        // readable, so it is exactly where this must not be a `join` either. **The label is the
+        // window's and the name stays the tail's** — see `remote_to_reopen`, where putting the
+        // label in the name wrote a recent entry that pointed at no tail.
         opening.push((
-            tailhawk_core::settings::Source {
+            tailhawk_core::settings::Tail {
                 query,
-                ..source.clone()
+                apps: group.iter().map(|app| (*app).to_owned()).collect(),
+                ..tail.clone()
             },
-            // The same rule the first open follows: named while they fit, counted once they do
-            // not. Interleaving twenty windows into one is exactly where the joined list stopped
-            // being readable, so it is exactly where this must not be a `join` either.
-            tailhawk_core::apps::source_label(&source.name, group),
+            tailhawk_core::apps::source_label(&tail.name, group),
         ));
     }
 
@@ -9550,8 +9570,8 @@ fn regroup_now(hwnd: HWND) {
         }
     });
     let opened = opening.len();
-    for (source, label) in opening {
-        open_remote(hwnd, source, label);
+    for (each, label) in opening {
+        open_remote(hwnd, source.clone(), each, label);
     }
     let moved = if separate { opened } else { apps.len() };
     // The window the reopens will actually ask for, read out of the settings rather than assumed —
@@ -9566,7 +9586,7 @@ fn regroup_now(hwnd: HWND) {
     set_notice(
         hwnd,
         regroup_notice(
-            &source.name,
+            &tail.name,
             moved,
             separate,
             &tailhawk_core::settings::fetch_window_said(minutes),
@@ -9593,7 +9613,7 @@ fn open_remote_menu(hwnd: HWND) -> bool {
             );
         };
         (
-            shell.source_names(),
+            shell.tail_names(),
             shell.toolbar.as_ref().map(|bar| bar.hwnd()),
             tailhawk_core::settings::remote_minutes_of(shell.settings.remote_minutes),
         )
@@ -9971,17 +9991,20 @@ enum Fetched {
     /// The applications this source offers, for the picker.
     Apps {
         source: tailhawk_core::settings::Source,
+        tail: tailhawk_core::settings::Tail,
         values: Vec<String>,
     },
-    /// The label call could not answer. The source still opens — a picker is a convenience, and one
+    /// The label call could not answer. The tail still opens — a picker is a convenience, and one
     /// that can stop you reading your logs is worse than none.
     NoApps {
         source: tailhawk_core::settings::Source,
+        tail: tailhawk_core::settings::Tail,
         why: String,
     },
     /// A window of records, ready to become a document called `label`.
     Records {
         source: tailhawk_core::settings::Source,
+        tail: tailhawk_core::settings::Tail,
         label: String,
         pulled: Box<pull::Pulled>,
         window_end: tailhawk_core::loki::Nanos,
@@ -9996,6 +10019,7 @@ enum Fetched {
     /// Carries what the reader has to approve, and what to go back to once they have.
     SignInStarted {
         source: tailhawk_core::settings::Source,
+        tail: tailhawk_core::settings::Tail,
         then: Resume,
         signing_in: pull::SignIn,
     },
@@ -10014,29 +10038,37 @@ fn spawn_fetch(work: impl FnOnce() -> Fetched + Send + 'static) -> Receiver<Fetc
 }
 
 /// Ask a source which applications it has — **on a worker**.
-fn ask_for_apps(source: tailhawk_core::settings::Source) -> Receiver<Fetched> {
+fn ask_for_apps(
+    source: tailhawk_core::settings::Source,
+    tail: tailhawk_core::settings::Tail,
+) -> Receiver<Fetched> {
     spawn_fetch(move || match pull::label_values(&source, APP_LABEL) {
-        Ok(values) if !values.is_empty() => Fetched::Apps { source, values },
+        Ok(values) if !values.is_empty() => Fetched::Apps {
+            source,
+            tail,
+            values,
+        },
         // The label call is the first thing a remote open does, so it is where a reader who is not
         // signed in should be asked — not after a notice blaming Loki for refusing them.
         Err(pull::PullFault::NotSignedIn) => match pull::begin_sign_in(&source) {
             Ok(signing_in) => Fetched::SignInStarted {
                 source,
+                tail,
                 then: Resume::Pick,
                 signing_in,
             },
             Err(why) => {
                 let why = why.to_string();
-                Fetched::NoApps { source, why }
+                Fetched::NoApps { source, tail, why }
             }
         },
         Ok(_) => {
             let why = "Loki lists no applications for this source".to_owned();
-            Fetched::NoApps { source, why }
+            Fetched::NoApps { source, tail, why }
         }
         Err(why) => {
             let why = why.to_string();
-            Fetched::NoApps { source, why }
+            Fetched::NoApps { source, tail, why }
         }
     })
 }
@@ -10053,15 +10085,16 @@ enum Resume {
     Pick,
 }
 
-/// Fetch the opening window of records for `source` — **on a worker**.
+/// Fetch the opening window of records for `tail` of `source` — **on a worker**.
 ///
-/// `label` is what the document will be called: the source's name, or the application chosen for it.
+/// `label` is what the document will be called: the tail's name, or the application chosen for it.
 ///
 /// `minutes` is how far back to ask, from `File ▸ Open remote ▸ Fetch window`. **It is a parameter
 /// rather than a constant read in here** so the one place that decides it is the settings, and the
 /// worker cannot disagree with the menu's check mark or with what the notice has just said.
 fn ask_for_records(
     source: tailhawk_core::settings::Source,
+    tail: tailhawk_core::settings::Tail,
     label: String,
     minutes: u32,
 ) -> Receiver<Fetched> {
@@ -10076,12 +10109,14 @@ fn ask_for_records(
         };
         match pull::pull(
             &source,
+            &tail.query,
             window,
             REMOTE_LIMIT,
             tailhawk_core::loki::Direction::Backward,
         ) {
             Ok(pulled) => Fetched::Records {
                 source,
+                tail,
                 label,
                 pulled: Box::new(pulled),
                 window_end: window.end,
@@ -10093,6 +10128,7 @@ fn ask_for_records(
             Err(pull::PullFault::NotSignedIn) => match pull::begin_sign_in(&source) {
                 Ok(signing_in) => Fetched::SignInStarted {
                     source,
+                    tail,
                     then: Resume::Records(label),
                     signing_in,
                 },
@@ -10128,38 +10164,45 @@ fn ask_for_records(
 /// changing what the original remembers as well would be two edits for one gesture — which is why
 /// this does not go through [`remember_apps`].
 ///
-/// **The name is generated and the credential is shared.** A new entry over the same Loki is the
-/// same server and the same sign-in, so it keeps the source's `url`, `auth_url`, `token_url`,
-/// `client_id` and `scope` — but not its *name*, which is the credential key. Renaming afterwards
-/// is what `Tools ▸ Remote sources` is for.
-fn save_as_entry(hwnd: HWND, source: &tailhawk_core::settings::Source, chosen: &[String]) {
+/// **It saves a tail, which is what it was always describing.** This comment used to explain that
+/// a new entry over the same Loki *"is the same server and the same sign-in, so it keeps the
+/// source's `url`, `auth_url`, `token_url`, `client_id` and `scope` — but not its name, which is the
+/// credential key"*: five fields copied to fake a thing the model had no word for. Since
+/// 2026-10-21 it has one, so this adds a [`Tail`](tailhawk_core::settings::Tail) to the source the
+/// reader started from and copies nothing at all.
+fn save_as_entry(
+    hwnd: HWND,
+    source: tailhawk_core::settings::Source,
+    tail: &tailhawk_core::settings::Tail,
+    chosen: &[String],
+) {
     let names: Vec<&str> = chosen.iter().map(String::as_str).collect();
     let saved = STATE.with(|s| {
         let mut state = s.borrow_mut();
         let shell = state.as_mut()?;
-        if shell.settings.sources.len() >= tailhawk_core::sourceset::MAX_SOURCES {
+        if shell.settings.tails.len() >= tailhawk_core::sourceset::MAX_TAILS {
             return None;
         }
         let taken: Vec<String> = shell
             .settings
-            .sources
+            .tails
             .iter()
             .map(|existing| existing.name.clone())
             .collect();
-        let entry = tailhawk_core::settings::Source {
-            name: tailhawk_core::apps::saved_entry_name(&source.name, &names, &taken),
+        let entry = tailhawk_core::settings::Tail {
+            name: tailhawk_core::apps::saved_entry_name(&tail.name, &names, &taken),
             apps: chosen.to_vec(),
-            ..source.clone()
+            ..tail.clone()
         };
-        shell.settings.sources.push(entry.clone());
+        shell.settings.tails.push(entry.clone());
         Some(entry)
     });
     let Some(entry) = saved else {
         set_notice(
             hwnd,
             format!(
-                "There is no room for another entry — {} is the limit.",
-                tailhawk_core::sourceset::MAX_SOURCES
+                "There is no room for another tail — {} is the limit.",
+                tailhawk_core::sourceset::MAX_TAILS
             ),
         );
         return;
@@ -10173,13 +10216,13 @@ fn save_as_entry(hwnd: HWND, source: &tailhawk_core::settings::Source, chosen: &
         hwnd,
         format!("Saved as \"{}\" — it is in Open remote now.", entry.name),
     );
-    open_remembered_or_pick(hwnd, entry);
+    open_remembered_or_pick(hwnd, source, entry);
 }
 
-/// Keeps the applications just chosen against the source they were chosen for, so the next open
+/// Keeps the applications just chosen against the tail they were chosen for, so the next open
 /// goes straight into them.
 ///
-/// **Written against the source's *name*, not its position**, because the sources dialog can
+/// **Written against the tail's *name*, not its position**, because the sources dialog can
 /// reorder and delete entries between one open and the next — the same reason `Recent::Remote`
 /// stores a name. The save happens outside the borrow the decision was made in, like every other
 /// settings write here.
@@ -10189,18 +10232,18 @@ fn remember_apps(hwnd: HWND, name: &str, chosen: &[String]) {
         let Some(shell) = state.as_mut() else {
             return false;
         };
-        let Some(source) = shell
+        let Some(tail) = shell
             .settings
-            .sources
+            .tails
             .iter_mut()
-            .find(|source| source.name == name)
+            .find(|tail| tail.name == name)
         else {
             return false;
         };
-        if source.apps == chosen {
+        if tail.apps == chosen {
             return false;
         }
-        source.apps = chosen.to_vec();
+        tail.apps = chosen.to_vec();
         true
     });
     if changed {
@@ -10223,18 +10266,23 @@ fn remember_apps(hwnd: HWND, name: &str, chosen: &[String]) {
 /// **A remembered set that no longer applies offers the picker rather than nothing.** A selector
 /// edited by hand since the apps were remembered is the way here, and refusing to open would leave
 /// the reader an entry that does nothing and no way to see why.
-fn open_remembered_or_pick(hwnd: HWND, source: tailhawk_core::settings::Source) {
-    if source.apps.is_empty() {
-        open_picked(hwnd, source);
+fn open_remembered_or_pick(
+    hwnd: HWND,
+    source: tailhawk_core::settings::Source,
+    tail: tailhawk_core::settings::Tail,
+) {
+    if tail.apps.is_empty() {
+        open_picked(hwnd, source, tail);
         return;
     }
-    let chosen: Vec<&str> = source.apps.iter().map(String::as_str).collect();
-    match tailhawk_core::apps::with_apps(&source.query, &chosen) {
+    let chosen: Vec<&str> = tail.apps.iter().map(String::as_str).collect();
+    match tailhawk_core::apps::with_apps(&tail.query, &chosen) {
         Ok(query) => {
-            let label = tailhawk_core::apps::source_label(&source.name, &chosen);
+            let label = tailhawk_core::apps::source_label(&tail.name, &chosen);
             open_remote(
                 hwnd,
-                tailhawk_core::settings::Source { query, ..source },
+                source,
+                tailhawk_core::settings::Tail { query, ..tail },
                 label,
             );
         }
@@ -10242,17 +10290,21 @@ fn open_remembered_or_pick(hwnd: HWND, source: tailhawk_core::settings::Source) 
             set_notice(
                 hwnd,
                 format!(
-                    "{}: its selector no longer takes an application — choose again.",
-                    source.name
+                    "{}: its filter no longer takes an application — choose again.",
+                    tail.name
                 ),
             );
-            open_picked(hwnd, source);
+            open_picked(hwnd, source, tail);
         }
     }
 }
 
-fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
-    let name = source.name.clone();
+fn open_picked(
+    hwnd: HWND,
+    source: tailhawk_core::settings::Source,
+    tail: tailhawk_core::settings::Tail,
+) {
+    let name = tail.name.clone();
     let asking = tailhawk_core::loki::Question::new(&name, ENQUIRY, 0);
     // **The enquiry is guarded like the fetch it precedes.** It is the first round trip a source
     // the user has not opened before makes, and the slowest thing on screen while it runs; a second
@@ -10267,7 +10319,7 @@ fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
         set_notice(hwnd, format!("{name}: still asking what it holds."));
         return;
     }
-    let waiting = ask_for_apps(source);
+    let waiting = ask_for_apps(source, tail);
     // **The sentence goes on the request, not in the notice slot.** The bar counts the seconds off
     // whatever is in flight, and a copy of the same words in the notice would show it twice.
     STATE.with(|s| {
@@ -10291,11 +10343,16 @@ fn open_picked(hwnd: HWND, source: tailhawk_core::settings::Source) {
 }
 
 /// The picker, once the applications are known. Runs on the UI thread, where a modal dialog belongs.
-fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<String>) {
+fn pick_apps(
+    hwnd: HWND,
+    source: tailhawk_core::settings::Source,
+    tail: tailhawk_core::settings::Tail,
+    values: Vec<String>,
+) {
     let mut pick = dialog::AppsPick {
         list: tailhawk_core::apps::AppList::new(
             &values,
-            &tailhawk_core::apps::apps_in(&source.query),
+            &tailhawk_core::apps::apps_in(&tail.query),
         ),
         choice: None,
     };
@@ -10303,8 +10360,8 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
         // Cancelled, or accepted with nothing ticked. Nothing ticked means "no narrowing", which is
         // the source as configured — and that is what the user gets rather than an empty window.
         if pick.choice.is_some() {
-            let label = source.name.clone();
-            open_remote(hwnd, source, label);
+            let label = tail.name.clone();
+            open_remote(hwnd, source, tail, label);
         }
         return;
     }
@@ -10316,25 +10373,26 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
         .map(|s| (*s).to_string())
         .collect();
     if pick.choice != Some(dialog::Pick::SaveAs) {
-        remember_apps(hwnd, &source.name, &chosen);
+        remember_apps(hwnd, &tail.name, &chosen);
     }
     match pick.choice {
         Some(dialog::Pick::Interleaved) => {
             let names: Vec<&str> = chosen.iter().map(String::as_str).collect();
-            match tailhawk_core::apps::with_apps(&source.query, &names) {
+            match tailhawk_core::apps::with_apps(&tail.query, &names) {
                 Ok(query) => {
-                    let label = tailhawk_core::apps::source_label(&source.name, &names);
+                    let label = tailhawk_core::apps::source_label(&tail.name, &names);
                     open_remote(
                         hwnd,
-                        tailhawk_core::settings::Source { query, ..source },
+                        source,
+                        tailhawk_core::settings::Tail { query, ..tail },
                         label,
                     );
                 }
                 Err(_) => set_notice(
                     hwnd,
                     format!(
-                        "{}: this source's query is not a selector this can add to.",
-                        source.name
+                        "{}: this tail's filter is not a selector this can add to.",
+                        tail.name
                     ),
                 ),
             }
@@ -10344,7 +10402,7 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
                 set_notice(hwnd, "Tick the applications to save first.".to_owned());
                 return;
             }
-            save_as_entry(hwnd, &source, &chosen);
+            save_as_entry(hwnd, source, &tail, &chosen);
         }
         Some(dialog::Pick::Separate) => {
             // Each window is a tail of its own — a worker, a poll and a bounded spill — so a
@@ -10354,17 +10412,28 @@ fn pick_apps(hwnd: HWND, source: tailhawk_core::settings::Source, values: Vec<St
                 return;
             }
             for app in &chosen {
-                match tailhawk_core::apps::with_apps(&source.query, &[app.as_str()]) {
-                    // **The source's own name is kept**, because it is the key the credential is
-                    // stored under — only the label shown to the user changes.
-                    Ok(query) => open_remote(
-                        hwnd,
-                        tailhawk_core::settings::Source {
-                            query,
-                            ..source.clone()
-                        },
-                        tailhawk_core::apps::source_label(&source.name, &[app.as_str()]),
-                    ),
+                match tailhawk_core::apps::with_apps(&tail.query, &[app.as_str()]) {
+                    // **Each window is its own question, and the query is what makes it one.**
+                    // `loki::Question` is *(tail, query, minutes)* and each of these windows asks
+                    // for one application, so they differ in the query and `already_asked` tells
+                    // them apart — which is why the tail keeps its configured **name**. Writing the
+                    // per-window label into the name instead made `open_remote` record three
+                    // recent entries no tail is called, every one of which reports the source gone
+                    // when it is next clicked. The **source** passes through untouched: one
+                    // credential, three tails.
+                    Ok(query) => {
+                        let named = tailhawk_core::apps::source_label(&tail.name, &[app.as_str()]);
+                        open_remote(
+                            hwnd,
+                            source.clone(),
+                            tailhawk_core::settings::Tail {
+                                query,
+                                apps: vec![app.clone()],
+                                ..tail.clone()
+                            },
+                            named,
+                        )
+                    }
                     Err(_) => set_notice(
                         hwnd,
                         format!(
@@ -10519,6 +10588,28 @@ impl std::fmt::Display for CannotReopen {
     }
 }
 
+/// The n-th configured tail and the source it reads, as `File ▸ Open remote` numbers them.
+///
+/// **Both or neither.** A tail names its source by name, so a settings file edited by hand can hold
+/// one whose source is not there — and an open that proceeded with the tail alone would have
+/// nowhere to ask and no credential to ask with.
+fn tail_and_source(
+    shell: &Shell,
+    at: usize,
+) -> Option<(
+    tailhawk_core::settings::Source,
+    tailhawk_core::settings::Tail,
+)> {
+    let tail = shell.settings.tails.get(at)?.clone();
+    let source = shell
+        .settings
+        .sources
+        .iter()
+        .find(|s| s.name == tail.source)
+        .cloned()?;
+    Some((source, tail))
+}
+
 /// The source and label a recent remote entry reopens, or the reason it cannot.
 ///
 /// **A source can be renamed or deleted between one open and the next**, and the recent list is not
@@ -10529,19 +10620,34 @@ impl std::fmt::Display for CannotReopen {
 /// entry, so a source whose query changed underneath the entry reopens against the query it has now.
 fn remote_to_reopen(
     sources: &[tailhawk_core::settings::Source],
+    tails: &[tailhawk_core::settings::Tail],
     name: &str,
     apps: &[String],
-) -> std::result::Result<(tailhawk_core::settings::Source, String), CannotReopen> {
-    let Some(source) = sources.iter().find(|s| s.name == name).cloned() else {
+) -> std::result::Result<
+    (
+        tailhawk_core::settings::Source,
+        tailhawk_core::settings::Tail,
+        String,
+    ),
+    CannotReopen,
+> {
+    // **The name is a tail's.** It is what the recent list remembers and what a tab is called; the
+    // source behind it is whichever one that tail reads.
+    let Some(tail) = tails.iter().find(|t| t.name == name).cloned() else {
+        return Err(CannotReopen::Gone {
+            name: name.to_owned(),
+        });
+    };
+    let Some(source) = sources.iter().find(|s| s.name == tail.source).cloned() else {
         return Err(CannotReopen::Gone {
             name: name.to_owned(),
         });
     };
     let chosen: Vec<&str> = apps.iter().map(String::as_str).collect();
     let query = if chosen.is_empty() {
-        source.query.clone()
+        tail.query.clone()
     } else {
-        match tailhawk_core::apps::with_apps(&source.query, &chosen) {
+        match tailhawk_core::apps::with_apps(&tail.query, &chosen) {
             Ok(query) => query,
             Err(_) => {
                 return Err(CannotReopen::NoSelector {
@@ -10550,8 +10656,24 @@ fn remote_to_reopen(
             }
         }
     };
-    let label = tailhawk_core::apps::source_label(&source.name, &chosen);
-    Ok((tailhawk_core::settings::Source { query, ..source }, label))
+    let label = tailhawk_core::apps::source_label(&tail.name, &chosen);
+    // **The tail keeps its own name and the label is carried separately**, which is what
+    // `Pick::Interleaved` and `open_remembered_or_pick` already do. Writing the label into the name
+    // looked right — a narrowed window is a different window from the whole tail — but
+    // `loki::Question` is *(tail, query, minutes)* and the narrowing is in the **query**, so the two
+    // were always distinguishable. What the name is actually for is the settings key: `open_remote`
+    // records a recent entry from it, so a label there produced `loki://ndc · api, worker?apps=…`,
+    // which no tail is called — one dead row pushed onto a ten-deep list on every single reopen,
+    // and the next click on it reporting the source gone.
+    Ok((
+        source,
+        tailhawk_core::settings::Tail {
+            query,
+            apps: apps.to_vec(),
+            ..tail
+        },
+        label,
+    ))
 }
 
 /// §12.3: fetch a remote source and open what comes back as an ordinary document.
@@ -10569,7 +10691,12 @@ fn remote_to_reopen(
 /// hour…" because an hour was the only thing it could be; now that
 /// [`Shell::choose_fetch_window`] exists, a notice naming the wrong duration would be worse than
 /// one naming none — so the minutes are read here and the sentence is built from them.
-fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: String) {
+fn open_remote(
+    hwnd: HWND,
+    source: tailhawk_core::settings::Source,
+    tail: tailhawk_core::settings::Tail,
+    label: String,
+) {
     // **The same question twice is refused here**, before anything is remembered or asked for, and
     // this is also the one place every remote open passes through. A fetch against a live server
     // takes seconds, during which the only sign of life is the status bar and the busy pointer —
@@ -10582,7 +10709,10 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
                 .and_then(|shell| shell.settings.remote_minutes),
         )
     });
-    let asking = tailhawk_core::loki::Question::new(&source.name, &source.query, minutes);
+    // **The tail names the question, not the source.** A question is "what is this tab showing",
+    // and three tails of one source are three tabs; keying on the source would make the second one
+    // look like the first already open.
+    let asking = tailhawk_core::loki::Question::new(&tail.name, &tail.query, minutes);
     match STATE.with(|s| {
         s.borrow().as_ref().map(|shell| {
             tailhawk_core::loki::already_asked(
@@ -10622,14 +10752,14 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
     // it opened. The owner's ask of 2026-09-21: "I would also like the recently used files to
     // allow supporting the recent remote opens."
     let entry = tailhawk_core::settings::Recent::Remote {
-        source: source.name.clone(),
-        apps: tailhawk_core::apps::apps_in(&source.query),
+        tail: tail.name.clone(),
+        apps: tailhawk_core::apps::apps_in(&tail.query),
     };
     let said = format!(
         "{label}: fetching {}…",
         tailhawk_core::settings::fetch_window_said(minutes)
     );
-    let waiting = ask_for_records(source, label.clone(), minutes);
+    let waiting = ask_for_records(source, tail, label.clone(), minutes);
     STATE.with(|s| {
         if let Some(shell) = s.borrow_mut().as_mut() {
             shell.fetching.push(Asking {
@@ -10657,6 +10787,7 @@ fn open_remote(hwnd: HWND, source: tailhawk_core::settings::Source, label: Strin
 fn landed_records(
     hwnd: HWND,
     source: tailhawk_core::settings::Source,
+    of: tailhawk_core::settings::Tail,
     name: String,
     pulled: pull::Pulled,
     window_end: tailhawk_core::loki::Nanos,
@@ -10706,14 +10837,14 @@ fn landed_records(
         ),
         path.parent(),
     );
-    // The query this window is a view of, kept before the source moves into the tail: `Interleave`
+    // The query this window is a view of, kept before the tail moves into the worker: `Interleave`
     // and `Separate` regroup the windows from it without asking the server anything.
-    let query = source.query.clone();
+    let query = of.query.clone();
     // **And its configured name, taken here for the same reason and used for a different job.**
-    // `name` above is the *label* — the source and the applications chosen, as a reader sees it.
+    // `name` above is the *label* — the tail and the applications chosen, as a reader sees it.
     // This is the settings key, which is what `Interleave` and `Separate` look a tab back up by,
     // and handing them the label instead is what made both of them fail in silence.
-    let key = source.name.clone();
+    let key = of.name.clone();
     // **And now it tails.** Everything above is one window of history; this is what makes the
     // source live. The worker asks Loki for what is newer than the newest record just written and
     // appends it to this same spill, so the follow machinery that was already saying "● following"
@@ -10721,6 +10852,7 @@ fn landed_records(
     let (notices, from_tail) = std::sync::mpsc::channel();
     let tail = tail::Tail::start(
         source,
+        of,
         writer,
         pulled.newest.unwrap_or(window_end),
         &pulled.clef,
@@ -10804,13 +10936,17 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             .and_then(|shell| shell.pending_pull.take())
     });
     if let Some(at) = pulling {
-        let source = STATE.with(|s| {
+        let picked = STATE.with(|s| {
             s.borrow()
                 .as_ref()
-                .and_then(|shell| shell.settings.sources.get(at).cloned())
+                .and_then(|shell| tail_and_source(shell, at))
         });
-        if let Some(source) = source {
-            open_remembered_or_pick(hwnd, source);
+        match picked {
+            Some((source, tail)) => open_remembered_or_pick(hwnd, source, tail),
+            None => set_notice(
+                hwnd,
+                "That tail reads a source that is no longer configured.".to_owned(),
+            ),
         }
         return true;
     }
@@ -10820,13 +10956,17 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             .and_then(|shell| shell.pending_repick.take())
     });
     if let Some(at) = repicking {
-        let source = STATE.with(|s| {
+        let picked = STATE.with(|s| {
             s.borrow()
                 .as_ref()
-                .and_then(|shell| shell.settings.sources.get(at).cloned())
+                .and_then(|shell| tail_and_source(shell, at))
         });
-        if let Some(source) = source {
-            open_picked(hwnd, source);
+        match picked {
+            Some((source, tail)) => open_picked(hwnd, source, tail),
+            None => set_notice(
+                hwnd,
+                "That tail reads a source that is no longer configured.".to_owned(),
+            ),
         }
         return true;
     }
@@ -10836,14 +10976,14 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             .and_then(|shell| shell.pending_reopen.take())
     });
     if let Some((name, apps)) = reopening {
-        let sources = STATE.with(|s| {
+        let (sources, tails) = STATE.with(|s| {
             s.borrow()
                 .as_ref()
-                .map(|shell| shell.settings.sources.clone())
+                .map(|shell| (shell.settings.sources.clone(), shell.settings.tails.clone()))
                 .unwrap_or_default()
         });
-        match remote_to_reopen(&sources, &name, &apps) {
-            Ok((source, label)) => open_remote(hwnd, source, label),
+        match remote_to_reopen(&sources, &tails, &name, &apps) {
+            Ok((source, tail, label)) => open_remote(hwnd, source, tail, label),
             Err(why) => {
                 // A row that can never be acted on comes off the list, here, where the attempt
                 // that proved it dead was made — not on a sweep at start-up, which would silently
@@ -10852,7 +10992,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                     STATE.with(|s| {
                         if let Some(shell) = s.borrow_mut().as_mut() {
                             let entry = tailhawk_core::settings::Recent::Remote {
-                                source: name.clone(),
+                                tail: name.clone(),
                                 apps: apps.clone(),
                             };
                             if shell.settings.forget_recent(&entry) {
@@ -10875,10 +11015,10 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         // **The store is asked only whether a secret exists, never for its value.** That is what
         // lets the editor carry a `has_secret` flag without ever holding a credential — see
         // `sourceset`'s module note — and it is why this reads `is_some()` and drops the rest.
-        let known = STATE.with(|s| {
+        let (known, tails) = STATE.with(|s| {
             s.borrow()
                 .as_ref()
-                .map(|shell| shell.settings.sources.clone())
+                .map(|shell| (shell.settings.sources.clone(), shell.settings.tails.clone()))
                 .unwrap_or_default()
         });
         let stored: Vec<bool> = known
@@ -10886,10 +11026,11 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             .map(|source| secrets::load(&source.name).is_some())
             .collect();
         let mut edit = dialog::SourcesEdit {
-            editor: tailhawk_core::sourceset::Editor::new(known, stored),
+            editor: tailhawk_core::sourceset::Editor::new(known, tails, stored),
             accepted: false,
             store: Vec::new(),
             forget: Vec::new(),
+            rename: Vec::new(),
         };
         // No `STATE` borrow is held across this: the dialog pumps its own modal loop.
         if dialog::show_sources_dialog(hwnd, &mut edit) {
@@ -10908,11 +11049,36 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                 .collect();
             edit.forget.retain(|gone| !kept.contains(&gone.as_str()));
             edit.store.retain(|(name, _)| kept.contains(&name.as_str()));
+            // **A rename only moves a credential onto a source that survived the sitting.** Rename
+            // `live` to `tmp` and then delete `tmp`, and moving the credential first would put it
+            // under a name nothing references — which is the orphan this exists to clear.
+            edit.rename.retain(|(_, now)| kept.contains(&now.as_str()));
             // **Credential Manager first, settings second.** If the write fails, the source is not
             // yet recorded as configured — the other order would leave a source that looks ready
             // and has no secret behind it.
+            //
+            // **Moves before deletes**, because a rename is a move and the name it moves *from* is
+            // not on `forget` — but a delete of some other source might name it, and taking the
+            // credential away before the move would make the move find nothing. `follow_rename`
+            // carries the client secret and the refresh token together, which is the half a rename
+            // has never done.
+            if !edit.rename.is_empty() {
+                let moves: Vec<tailhawk_core::settings::Renamed> = edit
+                    .rename
+                    .iter()
+                    .map(|(was, now)| tailhawk_core::settings::Renamed {
+                        now: now.clone(),
+                        was: vec![was.clone()],
+                    })
+                    .collect();
+                secrets::follow_rename(&moves);
+            }
             for gone in &edit.forget {
                 secrets::forget(gone);
+                // A deleted source's **sign-in** goes with it. Nothing did this, so every source
+                // ever deleted left its refresh token in the store under a name no longer in the
+                // settings file — invisible and unrevokable from inside the product.
+                secrets::forget_refresh(gone);
             }
             // **Every secret typed in this sitting, not just the last.** The list dialog outlives
             // each editor that opens over it, so three sources can be given one before Close.
@@ -10926,6 +11092,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
                     shell.settings.sources = edit.editor.sources().to_vec();
+                    shell.settings.tails = edit.editor.tails().to_vec();
                 }
             });
             STATE.with(|s| {
@@ -11808,6 +11975,7 @@ unsafe extern "system" fn sign_in_callback(
 fn sign_in_dialog(
     hwnd: HWND,
     source: tailhawk_core::settings::Source,
+    tail: tailhawk_core::settings::Tail,
     then: Resume,
     signing_in: pull::SignIn,
 ) {
@@ -11871,8 +12039,8 @@ fn sign_in_dialog(
         // wanted; it is the toll on the way to it, and stopping here to make them click again
         // would make the sign-in feel like the task.
         Some(Ok(())) => match then {
-            Resume::Records(label) => open_remote(hwnd, source, label),
-            Resume::Pick => open_picked(hwnd, source),
+            Resume::Records(label) => open_remote(hwnd, source, tail, label),
+            Resume::Pick => open_picked(hwnd, source, tail),
         },
         Some(Err(why)) => set_notice(hwnd, format!("{}: {why}", source.name)),
         // Cancelled. Said, because a window that closes with nothing on the bar is the "command
@@ -12330,26 +12498,32 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // first, which is the shape every re-entrancy fault in this file has had.
             for answer in fetched {
                 match answer {
-                    Fetched::Apps { source, values } => pick_apps(hwnd, source, values),
-                    Fetched::NoApps { source, why } => {
-                        let label = source.name.clone();
+                    Fetched::Apps {
+                        source,
+                        tail,
+                        values,
+                    } => pick_apps(hwnd, source, tail, values),
+                    Fetched::NoApps { source, tail, why } => {
+                        let label = tail.name.clone();
                         set_notice(hwnd, format!("{label}: {why} — opening all of it."));
-                        open_remote(hwnd, source, label);
+                        open_remote(hwnd, source, tail, label);
                     }
                     Fetched::Records {
                         source,
+                        tail,
                         label,
                         pulled,
                         window_end,
                         minutes,
-                    } => landed_records(hwnd, source, label, *pulled, window_end, minutes),
+                    } => landed_records(hwnd, source, tail, label, *pulled, window_end, minutes),
                     // Outside the borrow, like the picker beside it and for the same reason: it
                     // pumps a modal loop of its own.
                     Fetched::SignInStarted {
                         source,
+                        tail,
                         then,
                         signing_in,
-                    } => sign_in_dialog(hwnd, source, then, signing_in),
+                    } => sign_in_dialog(hwnd, source, tail, then, signing_in),
                     Fetched::Failed { name, why } => set_notice(hwnd, format!("{name}: {why}")),
                 }
             }
@@ -12969,8 +13143,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 tailhawk_core::settings::Recent::File(path) => {
                                     shell.open_path(hwnd, PathBuf::from(path));
                                 }
-                                tailhawk_core::settings::Recent::Remote { source, apps } => {
-                                    shell.pending_reopen = Some((source, apps));
+                                tailhawk_core::settings::Recent::Remote { tail, apps } => {
+                                    shell.pending_reopen = Some((tail, apps));
                                 }
                             }
                         }
@@ -13126,7 +13300,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 can_tile: shell.document.can_tile(),
                             },
                             &shell.settings.recent,
-                            &shell.source_names(),
+                            &shell.tail_names(),
                             &shell
                                 .document
                                 .as_ref()
@@ -13916,7 +14090,24 @@ fn main() -> Result<()> {
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
     let roaming = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
     let settings_tiers = settings::tiers(exe_dir.as_deref(), roaming.as_deref());
-    let settings = settings::load(&settings_tiers);
+    let mut settings = settings::load(&settings_tiers);
+    // **A migrated settings file moves its credentials before anything reads one.** Reading an old
+    // one-entry-per-view file renames each source after its host, and the store is keyed on the
+    // name — so this is the one moment at which both names are known. It runs before the window
+    // exists, deliberately: the alternative is a reader who opens a source they signed into
+    // yesterday and is asked to sign in again, with the old token still in the store under a name
+    // nothing will ever look up again.
+    //
+    // **Suppressed by `--stateless`**, which promises to write nothing: a credential move is a
+    // write, and the harnesses run with it.
+    if !stateless && !settings.migrated.is_empty() {
+        let moved = secrets::follow_rename(&settings.migrated);
+        header::trace(&format!(
+            "settings: migrated {} source(s) to the source/tail shape, moved {moved} credential(s)",
+            settings.migrated.len()
+        ));
+    }
+    settings.migrated.clear();
     // §7.1: the user's highlight rules, from the same tiers.
     let rules_tiers = tailhawk_core::rules::tiers(exe_dir.as_deref(), roaming.as_deref());
     // §6.5.1: the remembered format definitions, from the same tiers. Read, not compiled.
@@ -14321,18 +14512,26 @@ mod tests {
         );
     }
 
-    /// A configured source, named and with a selector, and nothing else filled in — the reopen
-    /// decision reads those two fields and carries the rest through untouched.
-    fn a_source(name: &str, query: &str) -> tailhawk_core::settings::Source {
+    /// A configured connection, named and with nothing else filled in.
+    fn a_source(name: &str) -> tailhawk_core::settings::Source {
         tailhawk_core::settings::Source {
             name: name.to_owned(),
             url: "https://example.invalid/loki".to_owned(),
             token_url: String::new(),
             client_id: String::new(),
-            apps: Vec::new(),
             scope: String::new(),
-            query: query.to_owned(),
             auth_url: String::new(),
+        }
+    }
+
+    /// A tail of the source of the same name — which is how a migrated file reads, and the
+    /// arrangement `Recent::Remote` names: its field holds a **tail's** name.
+    fn a_tail(name: &str, query: &str) -> tailhawk_core::settings::Tail {
+        tailhawk_core::settings::Tail {
+            name: name.to_owned(),
+            source: name.to_owned(),
+            query: query.to_owned(),
+            apps: Vec::new(),
         }
     }
 
@@ -14340,34 +14539,91 @@ mod tests {
     /// the entry was recorded with, and labelled the way the window that made the entry was.
     #[test]
     fn a_recent_remote_reopens_its_source_narrowed_to_the_applications_it_recorded() {
-        let sources = [
-            a_source("live", "{environment=\"live\"}"),
-            a_source("dev", "{environment=\"dev\"}"),
+        let sources = [a_source("live"), a_source("dev")];
+        let tails = [
+            a_tail("live", "{environment=\"live\"}"),
+            a_tail("dev", "{environment=\"dev\"}"),
         ];
         let apps = ["Worker".to_owned(), "Api".to_owned()];
-        let (source, label) = remote_to_reopen(&sources, "dev", &apps).expect("dev is configured");
-        assert_eq!(source.name, "dev");
+        let (source, tail, label) =
+            remote_to_reopen(&sources, &tails, "dev", &apps).expect("dev is configured");
+        assert_eq!(source.name, "dev", "the connection the tail reads");
         assert_eq!(source.url, "https://example.invalid/loki");
         assert!(
-            source.query.contains("environment=\"dev\""),
-            "the source's own selector must survive the narrowing: {}",
-            source.query
+            tail.query.contains("environment=\"dev\""),
+            "the tail's own selector must survive the narrowing: {}",
+            tail.query
         );
         assert!(
-            source.query.contains("Worker") && source.query.contains("Api"),
+            tail.query.contains("Worker") && tail.query.contains("Api"),
             "both recorded applications must be asked for: {}",
-            source.query
+            tail.query
         );
         assert_eq!(label, "dev · Worker, Api");
+        assert_eq!(tail.apps, apps, "and it remembers what it was narrowed to");
+        // **The tail keeps its configured name, and the label is only the label.**
+        //
+        // This assertion said the opposite for a few hours on 2026-10-21 — it *required* the name
+        // to be the label — and the reason it gave was wrong: `loki::Question` is
+        // *(tail, query, minutes)*, and a narrowed reopen differs in the **query**, so the two
+        // windows were never going to collide. What the name is for is the settings key, so the
+        // label in it meant `open_remote` recorded `loki://dev · Worker, Api?apps=…` into Open
+        // Recent, which names no tail — a dead row pushed onto a ten-deep list on every reopen,
+        // reporting the source gone when next clicked. A test that asserts a defect is worse than
+        // no test, so this one is the invariant rather than the behaviour.
+        assert_eq!(
+            tail.name, "dev",
+            "the name is the settings key `Recent::Remote` is written from"
+        );
+        assert_ne!(
+            tail.name, label,
+            "and it is not the label, however much the label looks like a name"
+        );
+    }
+
+    /// **Reopening from Open Recent writes back the row it came from, not a new one.**
+    ///
+    /// The round trip is the thing: an entry reopened must produce the same entry, or every reopen
+    /// adds a row that names no tail and the ten-deep list fills with its own exhaust. The assertion
+    /// is on `Recent::encode`, because that string *is* the row, and `forget_recent` and
+    /// `remember_recent` both match on it.
+    #[test]
+    fn reopening_a_recent_remote_produces_the_same_recent_row() {
+        let sources = [a_source("dev")];
+        let tails = [a_tail("dev", "{environment=\"dev\"}")];
+        let apps = ["Worker".to_owned(), "Api".to_owned()];
+
+        let was = tailhawk_core::settings::Recent::Remote {
+            tail: "dev".to_owned(),
+            apps: apps.to_vec(),
+        };
+        let (_, tail, _) =
+            remote_to_reopen(&sources, &tails, "dev", &apps).expect("dev is configured");
+        // What `open_remote` records, composed the way it composes it.
+        let again = tailhawk_core::settings::Recent::Remote {
+            tail: tail.name.clone(),
+            apps: tailhawk_core::apps::apps_in(&tail.query),
+        };
+        assert_eq!(
+            again.encode(),
+            was.encode(),
+            "a reopen must write the row it was opened from"
+        );
     }
 
     /// An entry with no applications reopens the source as it stands. The distinction matters:
     /// "no application chosen" means the source's own selector, not an empty one.
     #[test]
     fn a_recent_remote_with_no_applications_reopens_the_source_as_it_stands() {
-        let sources = [a_source("live", "{environment=\"live\"}")];
-        let (source, _) = remote_to_reopen(&sources, "live", &[]).expect("live is configured");
-        assert_eq!(source.query, "{environment=\"live\"}");
+        let sources = [a_source("live")];
+        let tails = [a_tail("live", "{environment=\"live\"}")];
+        let (_, tail, label) =
+            remote_to_reopen(&sources, &tails, "live", &[]).expect("live is configured");
+        assert_eq!(tail.query, "{environment=\"live\"}");
+        assert_eq!(
+            label, "live",
+            "and it keeps its own name, having not been narrowed"
+        );
     }
 
     /// **The recent list is a record of what was done, not the configuration.** A source renamed or
@@ -14380,9 +14636,10 @@ mod tests {
     /// its own small mystery.
     #[test]
     fn a_recent_remote_whose_source_is_gone_says_so_and_the_row_is_dropped() {
-        let sources = [a_source("live", "{environment=\"live\"}")];
-        let why =
-            remote_to_reopen(&sources, "staging", &[]).expect_err("staging is not configured");
+        let sources = [a_source("live")];
+        let tails = [a_tail("live", "{environment=\"live\"}")];
+        let why = remote_to_reopen(&sources, &tails, "staging", &[])
+            .expect_err("staging is not configured");
         let said = why.to_string();
         assert!(
             said.contains("staging"),
@@ -14403,9 +14660,11 @@ mod tests {
     /// take away the only record of what the reader was looking at.
     #[test]
     fn a_recent_remote_that_could_work_later_keeps_its_row() {
-        let sources = [a_source("odd", "|= \"boom\"")];
+        let sources = [a_source("odd")];
+        let tails = [a_tail("odd", "|= \"boom\"")];
         let apps = ["Worker".to_owned()];
-        let why = remote_to_reopen(&sources, "odd", &apps).expect_err("that query has no selector");
+        let why = remote_to_reopen(&sources, &tails, "odd", &apps)
+            .expect_err("that query has no selector");
         assert!(
             !why.the_entry_is_dead(),
             "the source is there — this is fixable, not dead"
@@ -14416,9 +14675,10 @@ mod tests {
     /// said rather than opening the whole source and quietly ignoring the choice.
     #[test]
     fn a_recent_remote_whose_query_takes_no_selector_says_so() {
-        let sources = [a_source("odd", "|= \"boom\"")];
+        let sources = [a_source("odd")];
+        let tails = [a_tail("odd", "|= \"boom\"")];
         let apps = ["Worker".to_owned()];
-        let said = remote_to_reopen(&sources, "odd", &apps)
+        let said = remote_to_reopen(&sources, &tails, "odd", &apps)
             .expect_err("that query has no selector")
             .to_string();
         assert!(
@@ -15731,9 +15991,7 @@ mod tests {
         );
         assert_eq!(doc.summary, "live \u{b7} 7 applications", "the title reads");
         assert_eq!(
-            doc.remote_source
-                .as_ref()
-                .map(|asked| asked.source.as_str()),
+            doc.remote_source.as_ref().map(|asked| asked.tail.as_str()),
             Some("live"),
             "the identity is the settings key, which is what regroup looks up"
         );
@@ -15899,12 +16157,12 @@ mod tests {
     fn a_click_on_a_recent_row_lands_on_that_row() {
         let recent = vec![
             tailhawk_core::settings::Recent::Remote {
-                source: "live".to_owned(),
+                tail: "live".to_owned(),
                 apps: vec!["nurtur-gateway".to_owned()],
             },
             tailhawk_core::settings::Recent::File(r"C:\logs\app.log".to_owned()),
             tailhawk_core::settings::Recent::Remote {
-                source: "qa".to_owned(),
+                tail: "qa".to_owned(),
                 apps: Vec::new(),
             },
         ];
@@ -18163,7 +18421,7 @@ mod tests {
                 &[
                     tailhawk_core::settings::Recent::File(r"C:\logs\app.log".to_owned()),
                     tailhawk_core::settings::Recent::Remote {
-                        source: "live".to_owned(),
+                        tail: "live".to_owned(),
                         apps: vec!["nurtur-gateway".to_owned(), "nurtur-print-api".to_owned()],
                     },
                     tailhawk_core::settings::Recent::File(r"C:\logs\other.log".to_owned()),
