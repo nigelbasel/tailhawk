@@ -64,11 +64,11 @@ END
 
 IDD_WIZ_SERVER DIALOGEX 0, 0, 420, 180
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
+CAPTION "New remote source"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     LTEXT           "Which log server?",IDC_WIZ_HEADING,7,7,260,9
-    RTEXT           "Step 1 of 5",IDC_WIZ_STEP,300,7,113,9
+    RTEXT           "Step 1 of 4",IDC_WIZ_STEP,300,7,113,9
     LTEXT           "&Name:",IDC_STATIC,7,28,58,8
     EDITTEXT        IDC_WIZ_NAME,69,26,344,12,ES_AUTOHSCROLL
     LTEXT           "&Server URL:",IDC_STATIC,7,46,58,8
@@ -93,7 +93,7 @@ END
 
 IDD_WIZ_SERVER_KNOWN DIALOGEX 0, 0, 420, 180
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
+CAPTION "New remote source"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     LTEXT           "Which log server?",IDC_WIZ_HEADING,7,7,260,9
@@ -126,11 +126,11 @@ END
 
 IDD_WIZ_SIGNIN DIALOGEX 0, 0, 420, 180
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
+CAPTION "New remote source"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     LTEXT           "How should Tailhawk sign in?",IDC_WIZ_HEADING,7,7,260,9
-    RTEXT           "Step 2 of 5",IDC_WIZ_STEP,300,7,113,9
+    RTEXT           "Step 2 of 4",IDC_WIZ_STEP,300,7,113,9
     LTEXT           "Found https://identity.nurtur.tech at identity.nurtur.tech. Reached it, and it wants a token - the URL and its path are right.",
                     IDC_WIZ_FOUND,7,24,406,18
     CONTROL         "Sign in with a &browser",IDC_WIZ_BROWSER,"Button",
@@ -164,7 +164,7 @@ END
 
 IDD_WIZ_SIGNIN_OPEN DIALOGEX 0, 0, 420, 180
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
+CAPTION "New remote source"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     LTEXT           "How should Tailhawk sign in?",IDC_WIZ_HEADING,7,7,260,9
@@ -196,11 +196,11 @@ END
 
 IDD_WIZ_SIGNIN_MANUAL DIALOGEX 0, 0, 420, 180
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
+CAPTION "New remote source"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     LTEXT           "How should Tailhawk sign in?",IDC_WIZ_HEADING,7,7,260,9
-    RTEXT           "Step 2 of 5",IDC_WIZ_STEP,300,7,113,9
+    RTEXT           "Step 2 of 4",IDC_WIZ_STEP,300,7,113,9
     LTEXT           "No sign-in server answered at any of the 6 places worth looking. Reached it, and it wants a token. Choose how it signs in and fill in the two URLs.",
                     IDC_WIZ_FOUND,7,24,406,18
     CONTROL         "Sign in with a &browser",IDC_WIZ_BROWSER,"Button",
@@ -223,16 +223,23 @@ END
 /////////////////////////////////////////////////////////////////////////////
 // Page 3 — absent entirely when the server wants nothing.
 //
-// **The secret row is not merely greyed on the browser path, it is not there.** And on that path
-// Next signs the reader in, which is what makes page 4 able to ask the server anything at all.
+// **The secret row is not merely greyed on the browser path, it is not there.** This drawing said
+// so from the start and the code did not do it: `setup_page_controls` took only the step, so the
+// browser path was shown the secret box until 2026-10-22, which is the very thing the owner asked
+// about the form this wizard replaced. The template cannot show both states at once, so what is
+// drawn here is the client-secret one; on the browser path the Secret row is absent and the two
+// below it move up.
+//
+// And on that path Next signs the reader in, which is what makes the credential available by the
+// last page - so `Add tail...` has a server to ask.
 
 IDD_WIZ_CLIENT DIALOGEX 0, 0, 420, 180
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
+CAPTION "New remote source"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     LTEXT           "What is this client called?",IDC_WIZ_HEADING,7,7,260,9
-    RTEXT           "Step 3 of 5",IDC_WIZ_STEP,300,7,113,9
+    RTEXT           "Step 3 of 4",IDC_WIZ_STEP,300,7,113,9
     LTEXT           "&Client id:",IDC_STATIC,7,34,58,8
     EDITTEXT        IDC_WIZ_CLIENT,69,32,344,12,ES_AUTOHSCROLL
     LTEXT           "Se&cret:",IDC_STATIC,7,52,58,8
@@ -245,49 +252,18 @@ BEGIN
 END
 
 /////////////////////////////////////////////////////////////////////////////
-// Page 4 — the server's own labels, which is the page a flat form can never have.
-//
-// By here the credential is settled, so there is something to ask. `app` sits in the left-hand
-// list as one label among others with no special status - the owner's correction, 2026-10-21:
-// "the applications field is specifically a nurtur feature".
-//
-// Ticking writes into Shows; Shows stays typeable, because the ticks are a helper and not a cage.
-// The values list carries check boxes, which are a run-time style rather than a template one.
-
-IDD_WIZ_SHOWS DIALOGEX 0, 0, 420, 180
-STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
-FONT 8, "MS Shell Dlg", 400, 0, 0x1
-BEGIN
-    LTEXT           "What should this source show?",IDC_WIZ_HEADING,7,7,260,9
-    RTEXT           "Step 4 of 5",IDC_WIZ_STEP,300,7,113,9
-    LTEXT           "&Label:",IDC_STATIC,7,24,120,8
-    LISTBOX         IDC_WIZ_LABELS,7,36,120,78,LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "&Values:",IDC_STATIC,133,24,280,8
-    CONTROL         "",IDC_WIZ_VALUES,"SysListView32",LVS_REPORT | LVS_NOCOLUMNHEADER |
-                    LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,133,36,280,78
-    LTEXT           "S&hows:",IDC_STATIC,7,122,58,8
-    EDITTEXT        IDC_WIZ_SHOWS,69,120,344,12,ES_AUTOHSCROLL
-    LTEXT           "Tick what you want to see. Leave it empty for everything this credential can see.",
-                    IDC_WIZ_SAYS,7,138,406,9
-    PUSHBUTTON      "< &Back",IDC_WIZ_BACK,225,158,60,14
-    DEFPUSHBUTTON   "&Next >",IDC_WIZ_NEXT,289,158,60,14
-    PUSHBUTTON      "Cancel",IDCANCEL,353,158,60,14
-END
-
-/////////////////////////////////////////////////////////////////////////////
-// Page 5 — a source proven to work rather than one merely typed.
+// Page 4 — a source proven to work rather than one merely typed.
 //
 // **Try it does one real fetch.** It is the difference between a wizard that collected answers and
 // one that finished.
 
 IDD_WIZ_READY DIALOGEX 0, 0, 420, 180
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Add a remote source"
+CAPTION "New remote source"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     LTEXT           "Ready to use",IDC_WIZ_HEADING,7,7,260,9
-    RTEXT           "Step 5 of 5",IDC_WIZ_STEP,300,7,113,9
+    RTEXT           "Step 4 of 4",IDC_WIZ_STEP,300,7,113,9
     LTEXT           "live\nhttps://telemetry.nurtur.tech/loki\nSigns you in with a browser, as the client ""tailhawk""\nShows {app=""job-dispatcher""}",
                     IDC_WIZ_SUMMARY,7,26,406,45
     PUSHBUTTON      "&Try it",IDC_WIZ_TRY,7,78,60,14

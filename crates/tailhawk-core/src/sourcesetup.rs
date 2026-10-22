@@ -20,7 +20,7 @@
 //! that could not be tested.
 
 use crate::loki::Discovered;
-use crate::settings::Source;
+use crate::settings::{is_https, Source, NAME_MAX};
 
 /// How a source proves who is asking.
 ///
@@ -88,16 +88,8 @@ pub enum Step {
     HowToSignIn,
     /// The client id, and the secret when the mode needs one. Absent entirely for [`Mode::Open`].
     Credential,
-    /// Which of the server's own labels to constrain on, and what the selector comes to.
-    ///
-    /// **The labels are the server's, not the product's.** The owner, 2026-10-21: *"the
-    /// applications field is specifically a nurtur feature so I would think we need to offer the
-    /// user a set of fields and possible values that could be used to constrain the output based on
-    /// an initial fetch from the source once connected. this is why the wizard works well."* `app`
-    /// is one label in one estate; another Loki keys on `service_name` or `namespace`, and a form
-    /// with an **Applications** box on it had quietly made this a Nurtur tool.
-    WhatToShow,
-    /// What it amounts to, and the chance to try it before it is saved.
+    /// What it amounts to, and the chance to try it before it is saved — and the offer of a first
+    /// tail, because a source with none shows nothing.
     Ready,
 }
 
@@ -110,7 +102,6 @@ impl Step {
             Step::Server => "Which log server?",
             Step::HowToSignIn => "How should Tailhawk sign in?",
             Step::Credential => "What is this client called?",
-            Step::WhatToShow => "What should this source show?",
             Step::Ready => "Ready to use",
         }
     }
@@ -207,6 +198,39 @@ impl Draft {
         self.reached = Some(reach);
     }
 
+    /// Point the draft at `url`, forgetting whatever the server it used to name advertised.
+    /// Answers whether anything was thrown away.
+    ///
+    /// **An answer is only true of the URL it was asked about.** Discovery fills the token URL, the
+    /// sign-in URL and the scope, and the wizard has no boxes for any of the three — so in a wizard
+    /// draft all of them came from whichever server was in the box when the probe ran. Changing the
+    /// server and keeping them produces a source aimed at one host carrying another's endpoints,
+    /// which fails at the first query with a token the wrong issuer minted and names neither host
+    /// on screen.
+    ///
+    /// Only what discovery filled is cleared, so a caller with boxes of its own — the flat editor,
+    /// where the reader may have typed an endpoint by hand — does not lose typing it did not get
+    /// from a server. **The mode is cleared only if nobody chose it**: a proposal is about the old
+    /// server, but a reader's decision is theirs and survives.
+    pub fn point_at(&mut self, url: &str) -> bool {
+        let same = url.trim() == self.url.trim();
+        self.url = url.to_owned();
+        if same {
+            return false;
+        }
+        let forgot_reach = self.reached.take().is_some();
+        if self.found.take().is_none() {
+            return forgot_reach;
+        }
+        self.token_url.clear();
+        self.auth_url.clear();
+        self.scope.clear();
+        if !self.mode_chosen {
+            self.mode = None;
+        }
+        true
+    }
+
     /// The mode in force, or what would be proposed if the decision page were reached now.
     pub fn mode_now(&self) -> Mode {
         self.mode.unwrap_or(Mode::SignIn)
@@ -222,7 +246,6 @@ impl Draft {
         if self.mode_now() != Mode::Open {
             steps.push(Step::Credential);
         }
-        steps.push(Step::WhatToShow);
         steps.push(Step::Ready);
         steps
     }
@@ -240,18 +263,26 @@ impl Draft {
                 if self.name.trim() != self.name {
                     return Some("The name cannot start or end with a space.");
                 }
+                // **The rules page one does not know are the ones it holds the box for.** These
+                // three were the authority's alone, so a 65-character name or an `https://` with no
+                // host passed page one, passed pages two and three, and was refused by **Finish** —
+                // naming a box three Backs away. `fault()` asking the authority last decides which
+                // answer wins, not which page the reader is standing on.
+                if self.name.len() > NAME_MAX {
+                    return Some("The name is too long to file a credential under.");
+                }
                 if !nameable(&self.name) {
                     return Some("The name can hold letters, digits, spaces, - _ and . only.");
                 }
                 if self.url.trim().is_empty() {
                     return Some("Give this source the Loki server's URL.");
                 }
-                if !self
-                    .url
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("https://")
-                {
+                // **The authority's own predicate, not a second opinion about it.** This was
+                // `trim_start().to_ascii_lowercase().starts_with("https://")`, which accepted three
+                // URLs `is_https` refuses — `HTTPS://…` (the lowercasing, which the authority does
+                // not do), and `https://` and `https:///loki`, which have a scheme and no host.
+                // Two implementations of one rule is why they disagreed.
+                if !is_https(self.url.trim()) {
                     return Some("The URL must begin with https://.");
                 }
                 None
@@ -280,7 +311,7 @@ impl Draft {
                 }
                 None
             }
-            Step::WhatToShow | Step::Ready => None,
+            Step::Ready => None,
         }
     }
 
@@ -334,14 +365,21 @@ impl Draft {
         }
     }
 
-    /// Whether the server can be asked what labels it holds, which is what [`Step::WhatToShow`]
-    /// needs before it can offer anything.
+    /// Whether the server can be asked what labels it holds — what the tail editor's `Choose…`
+    /// needs before it can offer anything, and so what [`Step::Ready`]'s offer of a first tail
+    /// leads to.
     ///
     /// **This is the wizard's whole advantage over a form.** A label list costs a credential, and on
     /// a flat form the moment the reader fills in what to show is a moment when nothing knows
     /// whether the source can be reached at all — so the box has to be free text and the reader has
-    /// to already know the answer. By this page the mode is settled and the credential is in hand,
-    /// so there is something to ask. When there is not, the page says so and takes text.
+    /// to already know the answer. By the last page the mode is settled and the credential is in
+    /// hand, so there is something to ask with.
+    ///
+    /// **Nothing in the shell calls this yet**, which is the honest state of it: the last page
+    /// offers a tail and the tail editor then asks on its own behalf, so this is the question that
+    /// offer *should* be gated on and is not. Keeping it is a decision, not an oversight — it is
+    /// `pub` in a library crate, so neither `dead_code` nor clippy will say so, and a reader is
+    /// entitled to know that from here rather than from a grep.
     pub fn can_ask_server(&self) -> bool {
         if self.blocking(Step::Server).is_some() {
             return false;
@@ -462,7 +500,6 @@ mod tests {
                 Step::Server,
                 Step::HowToSignIn,
                 Step::Credential,
-                Step::WhatToShow,
                 Step::Ready
             ]
         );
@@ -470,18 +507,111 @@ mod tests {
         draft.mode = Some(Mode::Open);
         assert_eq!(
             draft.steps(),
-            [
-                Step::Server,
-                Step::HowToSignIn,
-                Step::WhatToShow,
-                Step::Ready
-            ],
+            [Step::Server, Step::HowToSignIn, Step::Ready],
             "a server that wants nothing is not asked for a client id"
         );
-        assert!(
-            !draft.steps().contains(&Step::Credential),
-            "and the page it would have been is not counted either"
+        // **The counter is what this is really about**, and asserting `!contains(Credential)` three
+        // lines under an exact-vector `assert_eq!` could only ever restate it. What the reader is
+        // owed is the number: a page that is going to be skipped was never one of the steps, so
+        // "Step 2 of 3" is the truth about how much is left.
+        assert_eq!(
+            draft.steps().len(),
+            3,
+            "and the wizard says 'of 3', not 'of 4'"
         );
+    }
+
+    /// **Page one catches every rule about its own two boxes that the authority has.**
+    ///
+    /// [`Draft::fault`] asks the pages first and `Source::fault` last, and its doc comment says
+    /// that makes a complaint about an unseen box impossible. It does not: asking the authority
+    /// last settles *which answer wins*, not *which page the reader is standing on* when they hear
+    /// it. A rule the authority knows and page one does not is a reader held on the last page by a
+    /// complaint about the first box, three Backs away from the box it names.
+    ///
+    /// Three were exactly that, found by review on 2026-10-22 and each reachable by typing: a name
+    /// past [`NAME_MAX`] (no `EM_LIMITTEXT` anywhere, so it is typeable), and two URLs the draft's
+    /// own `starts_with("https://")` accepted that the authority's `is_https` refuses. The fix was
+    /// to stop having a second opinion — page one calls `is_https` now — so this test's job is to
+    /// hold the two in step rather than to describe either.
+    #[test]
+    fn page_one_catches_every_rule_about_its_own_boxes() {
+        let too_long = "x".repeat(NAME_MAX + 1);
+        let long = named(&too_long);
+        assert!(
+            long.blocking(Step::Server).is_some(),
+            "a name too long to file a credential under is page one's business"
+        );
+        assert_eq!(
+            long.blocking(Step::Server),
+            long.into_source().fault(),
+            "and in the authority's own words, so the two cannot drift"
+        );
+
+        // **`https://` alone and `https:///loki` have a scheme and no host.** The draft's old test
+        // was `starts_with`, which both satisfy; the first is the one a reader produces by typing
+        // the scheme and tabbing away.
+        for url in [
+            "HTTPS://telemetry.example/loki",
+            "https://",
+            "https:///loki",
+        ] {
+            let mut bad = named("lab");
+            bad.url = url.to_owned();
+            assert!(
+                bad.blocking(Step::Server).is_some(),
+                "{url} is refused on the page that holds the box, not on Finish"
+            );
+            assert_eq!(
+                bad.blocking(Step::Server),
+                bad.into_source().fault(),
+                "{url}: and in the authority's own words"
+            );
+        }
+    }
+
+    /// **Pointing the draft at another server throws away what the last one advertised.**
+    ///
+    /// The wizard has no token-URL or sign-in-URL box: every endpoint in a wizard draft arrived
+    /// from discovery, about the URL that was in the box when the probe ran. Going Back, changing
+    /// the server and pressing Next produced a source aimed at the new host carrying the old host's
+    /// token and sign-in URLs — every query failing with a token the wrong issuer minted, and
+    /// nothing on screen naming either server. Found by review on 2026-10-22.
+    #[test]
+    fn pointing_the_draft_at_another_server_forgets_what_the_last_one_said() {
+        let mut draft = named("live");
+        draft.discovered(discovered("https://identity.example/connect/authorize"));
+        draft.tested(Reach::WantsToken);
+        assert!(
+            !draft.token_url.is_empty(),
+            "discovery filled the endpoints"
+        );
+
+        assert!(
+            draft.point_at("https://other.example/loki"),
+            "the server changed, so the answer about the old one is stale"
+        );
+        assert_eq!(draft.url, "https://other.example/loki");
+        assert!(draft.found.is_none(), "nothing has answered about this one");
+        assert!(
+            draft.token_url.is_empty() && draft.auth_url.is_empty() && draft.scope.is_empty(),
+            "and the old server's endpoints went with it"
+        );
+        assert!(draft.reached.is_none(), "nor has it been reached");
+
+        // **Re-reading the same text is not a change.** `setup_read` runs on every page draw, so a
+        // method that forgot on equality would throw the probe's answer away immediately after it
+        // landed.
+        draft.discovered(discovered("https://identity.example/connect/authorize"));
+        assert!(!draft.point_at("https://other.example/loki"));
+        assert!(draft.found.is_some(), "the answer about this server stands");
+
+        // A mode the reader chose is theirs, and survives the server changing under it.
+        draft.mode = Some(Mode::ClientSecret);
+        draft.mode_chosen = true;
+        draft.point_at("https://third.example/loki");
+        assert_eq!(draft.mode, Some(Mode::ClientSecret));
+        assert!(draft.mode_chosen);
     }
 
     /// **Each page complains about itself and nothing else.** Being held on page one by a
@@ -675,10 +805,15 @@ mod tests {
         assert_eq!(mode_of(&secret), Mode::ClientSecret);
     }
 
-    /// **The page that asks what to show can only offer the server's own labels once there is a
-    /// way to ask**, and the wizard is what makes that true by the time the page is reached.
+    /// **The server can only be asked for its labels once there is a way to ask**, and the wizard
+    /// is what makes that true: by the last page the mode is settled and the credential is in hand,
+    /// so `Choose…` in the tail editor has something to ask with.
+    ///
+    /// Named for [`Step::WhatToShow`] until 2026-10-22, a page that no longer exists — it asked for
+    /// a query and an application list, which is what a *tail* is, so the tail editor owns them and
+    /// the last page offers a first tail instead.
     #[test]
-    fn what_to_show_knows_whether_the_server_can_be_asked_yet() {
+    fn the_server_can_be_asked_for_labels_only_once_there_is_a_way_to_ask() {
         let mut draft = Draft::default();
         assert!(!draft.can_ask_server(), "nothing is configured at all");
 
@@ -705,6 +840,19 @@ mod tests {
         assert!(!browser.can_ask_server());
         browser.client_id = "tailhawk".to_owned();
         assert!(browser.can_ask_server(), "as far as this side can tell");
+
+        // **The sign-in URL is half that rule and nothing exercised it.** Dropping
+        // `!self.auth_url.trim().is_empty()` from the `SignIn` arm left every assertion above
+        // passing — the only draft here with a client id in that mode had an auth URL that
+        // `discovered` had filled in, so the conjunct the doc comment argues hardest for was
+        // unguarded. Found by review on 2026-10-22; this is the case that fails without it.
+        let mut nowhere = named("browser");
+        nowhere.mode = Some(Mode::SignIn);
+        nowhere.client_id = "tailhawk".to_owned();
+        assert!(
+            !nowhere.can_ask_server(),
+            "a browser sign-in with nowhere to send the reader cannot have happened"
+        );
 
         // A draft whose own first page is unfinished cannot be asked anything, whatever else is set.
         browser.url = "http://telemetry.example/loki".to_owned();
@@ -778,6 +926,26 @@ mod tests {
                 "{what}: and in the authority's own words"
             );
         }
+
+        // **Which half of `fault()` each case exercises, because it is not obvious and a reviewer
+        // read the whole test as tautological on 2026-10-22.** The two endpoint cases are caught
+        // only by the `.or_else` backstop — no page checks an endpoint's scheme — so for them the
+        // equality above holds by construction and what it guards is the backstop still being
+        // there. The server URL is the one case a *page* catches, since page one calls `is_https`,
+        // and for that one the equality is a real agreement check.
+        let mut bad_url = draft.clone();
+        bad_url.url = "HTTPS://telemetry.example/loki".to_owned();
+        assert!(
+            bad_url.blocking(Step::Server).is_some(),
+            "the Loki URL is page one's own business"
+        );
+        let mut bad_token = draft.clone();
+        bad_token.token_url = "http://identity.example/connect/token".to_owned();
+        assert_eq!(
+            bad_token.blocking(Step::HowToSignIn),
+            None,
+            "and no page checks an endpoint's scheme, so only the authority refuses this"
+        );
     }
 
     /// What the decision page offers before anybody has touched it.

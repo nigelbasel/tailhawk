@@ -527,7 +527,7 @@ pub fn authorize_beside(token_url: &str) -> Option<String> {
 /// **`http` is refused rather than warned about.** A bearer token on a cleartext connection is a
 /// bearer token given away, and `LOKI.md` §7 asks for transport that cannot be downgraded — a rule
 /// worth nothing if the URL that carries the credential can simply say `http`.
-fn is_https(url: &str) -> bool {
+pub(crate) fn is_https(url: &str) -> bool {
     url.strip_prefix("https://")
         .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
 }

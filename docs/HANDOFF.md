@@ -1,6 +1,96 @@
 # Handoff — resume here
 
-## ▶ Resume point — 2026-10-22: the tree has verbs, the tails have checkboxes, the menu has two levels
+## ▶ Resume point — 2026-10-22: the guided setup is built, and the review found seven defects in it
+
+`New source…` is a four-page wizard now, not the flat form. It has been walked on screen, its probe
+has been pressed against his live estate, and a two-agent review of it before commit found seven
+real defects — three of which would have reached him on an ordinary first run.
+
+### The wizard
+
+| | |
+|---|---|
+| **The pages** | *Which log server?* — *How should Tailhawk sign in?* — *What is this client called?* — *Ready*. One dialog, `setup_page_controls` showing and hiding a page at a time. |
+| **The counter** | Computed from `Draft::steps`, so a credential page that is going to be skipped was never counted: a Loki that needs no sign-in says **Step 2 of 3**. |
+| **`Next` asks the server** | No `Set up` button sitting inert — his complaint about the form was *“the discover button is just sitting there”*. The probe runs on a worker, `Next` greys while it is in flight, and the answer arrives as `WM_G_PROBED`. |
+| **The last page** | Offers a first tail rather than asking what to show. `Step::WhatToShow` is **gone** — a selector and an application list are what a *tail* is. |
+| **`Edit…` stays a form** | By the time one field of a working source needs correcting, every answer the wizard gathers has been given. |
+
+### The live probe worked, which closes a line this handoff has carried since 2026-10-20
+
+> Found https://identity.nurtur.tech at telemetry.nurtur.tech
+> Reached it, and it wants a token — the URL and its path are right.
+
+Discovery **and** the reachability test, both correct, both against his own estate. The mode combo
+came up pre-selected on *Sign in with a browser*, read from the `auth_url` discovery returned.
+**`Set up` / `Discover` / `Test` have now been pressed against a live server** — delete that line
+wherever it survives below.
+
+### What the screen found, and what only the review could find
+
+The screen found page two saying *“Found ‹issuer› at ‹host›”* **twice**, four lines apart, because
+the status line already carries the finding and the verdict together.
+
+The review found the rest. These are worth reading as a set, because the first three are the kind a
+suite structurally cannot see:
+
+1. **The mode list grew by three entries on every redraw.** `combo_fill` loops `CB_ADDSTRING` and
+   there was no `CB_RESETCONTENT` anywhere in the file; every caller before this one filled once at
+   `WM_INITDIALOG`, so the gap had never shown. `setup_draw` fills on every draw. And because
+   `combo_selected` clamps a position past the end, picking a duplicate row resolved to
+   `Mode::Open` — **choose a browser sign-in, get a source with no authentication.**
+2. **Changing the server kept the old one’s endpoints.** The probe only fired when nothing had been
+   found, so Back, a new URL and Next never re-asked: a source aimed at one host carrying another’s
+   token and sign-in URLs, naming neither on screen. The worker carried the URL it asked about and
+   nothing read it. Fixed in the model as `Draft::point_at`.
+3. **The secret box was on the browser-sign-in page** — the owner’s own question about the form this
+   replaced, inherited because `setup_page_controls` took only the step. `setup_page_controls` takes
+   the mode now, and `docs/design/sources-wizard.rc` had said the row *“is not merely greyed… it is
+   not there”* from the start.
+4. **The focus was left on a hidden control.** `Next` is the default button, so Enter in the URL box
+   advanced the page without moving focus, and Windows does not relocate focus on `SW_HIDE`.
+5. **The staleness token restarted at 1 per dialog**, defeating the mechanism it was copied from.
+   One process-wide `next_async_token` now, renamed from `next_labels_token`.
+6. **Page one held a second opinion about `https://`** — it accepted `HTTPS://`, `https://` and
+   `https:///loki`, which `Source::fault` refuses, so page one passed them and **Finish** refused
+   them, naming a box three Backs away. It calls `is_https` now. Same shape, same fix, for
+   `NAME_MAX`.
+7. **`setup_found_said` said nothing had answered** for a discovery whose `issuer` was blank while
+   its endpoints sat filled in the draft.
+
+Three mutation checks were run and each seen to fail before its fix: the `auth_url` conjunct of
+`can_ask_server` (a genuine survivor — no case anywhere set a client id with an empty `auth_url`),
+the mode-blind credential page, and the page-one rules.
+
+### Knowingly undone, and the first one is the next piece of work
+
+- **Discovery failing is a dead end.** `blocking(Step::HowToSignIn)` says *“A sign-in needs the token
+  URL. Set it up, or type it here”* and **the wizard has no token-URL box** — the message is
+  inherited from the flat editor, where that field exists. A Loki whose identity server is not
+  discoverable therefore has no honest path through: the only exits are Cancel, or *No sign-in
+  needed*, which builds an unauthenticated source against a server that just answered 401. This is
+  exactly the case he asked for in the first place — *“there should probably be an avanced option for
+  scnarios that just dont work on the automatic discovery pattern”* — and it is a page, not a patch.
+- **A credential can still be lost on a rename.** `main.rs:11062` reconciles the queued secrets
+  against the names that *survived*, by name alone: `store.retain(|(name, _)| kept.contains(…))`.
+  Create a source in the wizard with a secret, rename it in the same sitting of the dialog, and the
+  entry is dropped before anything is written — a client-secret source with no secret in Credential
+  Manager and nothing said. The same line orphans a secret when the mode moves away from one, since
+  `add_source` pushes `stored = false` and `secret_to_forget` therefore answers `None`. **Found by
+  the review, pre-existing, not fixed here** — it wants a pure function and a test of its own.
+- The `Box<Probed>` leaks if the dialog is dismissed mid-probe. `tail_edit_proc` has the same hole.
+- A delete of a source asks and names its tail count; a delete of a tail does not ask. Not seen.
+- The other three list dialogs’ dark-mode headers (Highlight rules, Define Format, Select Columns).
+- Under the Explorer theme a tree view draws its connector lines but `TVM_SETLINECOLOR` is inert.
+- `can_ask_server` has no caller. The last page offers a tail without asking whether the server can
+  be asked anything; that is the question the offer *should* be gated on. Said where it is defined.
+
+### The open question he has not answered
+
+**Is `telemetry.nurtur.tech` the right name for the migrated source?** It is what `host_name`
+produces, and `secrets::follow_rename` makes it safe either way — so this is taste, not risk.
+
+## 2026-10-22: the tree has verbs, the tails have checkboxes, the menu has two levels
 
 The source/tail split shipped yesterday as `77ad922` (CI green, all five jobs). This is what came of
 putting it on screen.
@@ -45,10 +135,11 @@ comment now says it has never caught anything. The width is kept for the derivat
 
 ### Knowingly undone
 
-- **The wizard.** `New source…` opens the source *form*. `sourcesetup::Draft::steps`, `Step` and
-  `can_ask_server` still have no consumer. `docs/design/sources-wizard.md` records that its page 4 is
-  superseded by the tail editor.
-- **`Set up` / `Discover` / `Test` have never been pressed against a live server.**
+- ~~**The wizard.** `New source…` opens the source *form*.~~ **Both of these were overtaken the
+  same day — see the resume point above.** The wizard is built and `New source…` opens it; the probe
+  has been pressed against the live server and both halves of it came back correct. They are struck
+  through rather than deleted because a resuming session greps for these two sentences.
+- ~~**`Set up` / `Discover` / `Test` have never been pressed against a live server.**~~
 - A delete of a source asks and names its tail count; a delete of a tail does not ask. Not seen.
 - The other three list dialogs' dark-mode headers (Highlight rules, Define Format, Select Columns).
 - Under the Explorer theme a tree view draws its connector lines but `TVM_SETLINECOLOR` is inert.

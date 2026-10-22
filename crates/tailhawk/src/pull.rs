@@ -770,7 +770,7 @@ pub fn setup_said(discovery: &Discovery, reach: &Reached) -> String {
 /// The host out of an absolute URL, for a sentence. The whole URL would say
 /// `https://identity.nurtur.tech/.well-known/openid-configuration`, which is a path a reader has
 /// no use for and the one thing in the sentence they did not choose.
-fn host_of(url: &str) -> &str {
+pub(crate) fn host_of(url: &str) -> &str {
     url.split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(url)

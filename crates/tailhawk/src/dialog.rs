@@ -34,17 +34,19 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetClientRect,
     GetDlgItem, GetDlgItemInt, GetDlgItemTextW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, MapDialogRect, PostMessageW, SendDlgItemMessageW, SendMessageW, SetDlgItemInt,
-    SetDlgItemTextW, SetWindowLongPtrW, SetWindowPos, ShowWindow, DLGTEMPLATE, GW_CHILD,
-    GW_HWNDNEXT, SM_CXVSCROLL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY,
-    WM_NOTIFY,
+    GetWindowRect, IsWindowVisible, MapDialogRect, PostMessageW, SendDlgItemMessageW, SendMessageW,
+    SetDlgItemInt, SetDlgItemTextW, SetWindowLongPtrW, SetWindowPos, ShowWindow, DLGTEMPLATE,
+    GW_CHILD, GW_HWNDNEXT, SM_CXVSCROLL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG,
+    WM_NCDESTROY, WM_NOTIFY,
 };
 
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID;
 
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus,
+};
 
 use crate::keymap::KeymapSheet;
 use crate::prefs;
@@ -239,6 +241,7 @@ const W_PREVIEW_ROWS: usize = tailhawk_core::wizard::MAX_SAMPLES;
 const DWLP_USER: i32 = 16;
 
 const CB_ADDSTRING: u32 = 0x0143;
+const CB_RESETCONTENT: u32 = 0x014B;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
 const EM_SETTABSTOPS: u32 = 0x00CB;
@@ -1013,11 +1016,16 @@ fn sources_ticked(hdlg: HWND) -> Vec<usize> {
 /// own, during which this procedure can be re-entered by a paint or a notification; a `&mut
 /// SourcesEdit` held across it would be a second one taken from underneath the first.
 fn sources_new(hdlg: HWND) {
-    let mut edit = SourceEdit::new(tailhawk_core::sourcesetup::Draft::default(), false);
-    if !show_source_editor(hdlg, &mut edit) {
+    // **`New source…` guides; `Edit…` is a form.** The owner, 2026-10-21: *"new brings up a dialog
+    // that guides the user through the setup, and edit allows editing"* — and he chose that over a
+    // list-and-details split *"as it allows diferent paths and guides the user better"*. Changing
+    // one field of a working source should not be four pages of ceremony, and by then every answer
+    // the guided setup gathers has already been given.
+    let mut setup = SourceSetup::new();
+    if !show_source_setup(hdlg, &mut setup) {
         return;
     }
-    let source = edit.draft.into_source();
+    let source = setup.draft.into_source();
     let Some(data) = sources_state(hdlg) else {
         return;
     };
@@ -1031,10 +1039,15 @@ fn sources_new(hdlg: HWND) {
         );
         return;
     }
-    if let Some(secret) = edit.draft.secret_to_store().map(|(_, secret)| secret) {
+    if let Some(secret) = setup.draft.secret_to_store().map(|(_, secret)| secret) {
         data.store.push((name, secret));
     }
     sources_redraw(hdlg, data);
+    // **A source with no tails shows nothing**, so the last page offers one and this is where the
+    // offer is honoured — after the source exists, because a tail names the source it reads.
+    if setup.then_add_tail {
+        sources_add_tail(hdlg);
+    }
 }
 
 /// **Add tail…** — a tail's screen over an empty draft, against the chosen source.
@@ -1592,7 +1605,7 @@ pub struct TailEdit {
     /// `None` only for a tail whose source is not in the set, which a hand-edited file can produce:
     /// then `Choose…` has nowhere to send the question and is greyed rather than left to fail.
     source: Option<tailhawk_core::settings::Source>,
-    /// The number of the `Choose…` this editor is waiting on, or 0. See [`next_labels_token`]:
+    /// The number of the `Choose…` this editor is waiting on, or 0. See [`next_async_token`]:
     /// an answer stamped with anything else was asked for by a dialog that has gone.
     waiting_on: usize,
 }
@@ -1617,7 +1630,8 @@ impl TailEdit {
 /// `Choose…`'s answer, posted back from the worker that asked the server.
 const WM_T_LABELS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x0142;
 
-/// Hands out a number to each `Choose…` so a late answer cannot be given to the wrong editor.
+/// Hands out a number to each question asked of a server, so a late answer cannot be given to the
+/// wrong dialog.
 ///
 /// **A posted message outlives the dialog that asked for it.** `Choose…` is greyed while the call
 /// runs, but OK, Cancel, Esc and the X are not — dismiss the editor mid-call and the message is
@@ -1630,7 +1644,13 @@ const WM_T_LABELS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x014
 /// Not memory-unsafe — `DWLP_USER` is per-window and the new dialog set it itself, and no other
 /// procedure in the crate answers this message — but it is wrong data on screen, which is worse to
 /// diagnose. The asking editor stamps its number into the `WPARAM` and compares on arrival.
-fn next_labels_token() -> usize {
+/// **One counter for the whole process, which is the entire point.** The guided setup's probe kept
+/// its own, starting at 0 in `SourceSetup::new`, so the first probe of *every* instance of that
+/// dialog was token 1 — and a token that restarts cannot tell one dialog's question from the next
+/// one's, which is the hazard described above and the reason this function exists. Abandon a probe
+/// mid-flight, reopen the wizard, ask again, and both answers matched. Found by review on
+/// 2026-10-22.
+fn next_async_token() -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -1778,7 +1798,7 @@ unsafe extern "system" fn tail_edit_proc(
                             "Asking this server which applications it holds…",
                         );
                     });
-                    let token = next_labels_token();
+                    let token = next_async_token();
                     data.waiting_on = token;
                     let target = hdlg.0 as isize;
                     std::thread::spawn(move || {
@@ -1831,7 +1851,7 @@ unsafe extern "system" fn tail_edit_proc(
         // across it would be a second one taken from under the first.
         WM_T_LABELS => {
             // **Reclaimed first, whoever it turns out to be for**, or a message this dialog will
-            // not act on is a leak. Then checked: see [`next_labels_token`].
+            // not act on is a leak. Then checked: see [`next_async_token`].
             let found = *unsafe {
                 Box::from_raw(lparam.0 as *mut Result<Vec<String>, crate::pull::PullFault>)
             };
@@ -1917,6 +1937,636 @@ pub fn show_tail_editor(owner: HWND, data: &mut TailEdit) -> bool {
             owner,
             Some(tail_edit_proc),
             LPARAM(data as *mut TailEdit as isize),
+        )
+    };
+    data.accepted
+}
+
+/// The guided setup's controls. **Its own range**, clear of the one-source editor's and the tail
+/// editor's, because it opens over the tree exactly as they do and a stray id must not reach the
+/// tree's verbs.
+const ID_G_HEADING: u16 = 350;
+const ID_G_COUNTER: u16 = 351;
+const ID_G_FAULT: u16 = 352;
+const ID_G_BACK: u16 = 353;
+const ID_G_NEXT: u16 = 354;
+/// Page one.
+const ID_G_NAME: u16 = 355;
+const ID_G_URL: u16 = 356;
+/// Page two.
+const ID_G_MODE: u16 = 357;
+const ID_G_FOUND: u16 = 358;
+/// Page three.
+const ID_G_CLIENT: u16 = 359;
+const ID_G_SECRET: u16 = 360;
+const ID_G_SCOPE: u16 = 361;
+/// Page four.
+const ID_G_SUMMARY: u16 = 362;
+const ID_G_ADD_TAIL: u16 = 363;
+/// Labels, which are shown and hidden with the fields they belong to and so cannot all be `0xFFFF`.
+const ID_G_L_NAME: u16 = 364;
+const ID_G_L_URL: u16 = 365;
+const ID_G_L_MODE: u16 = 366;
+const ID_G_L_CLIENT: u16 = 367;
+const ID_G_L_SECRET: u16 = 368;
+const ID_G_L_SCOPE: u16 = 369;
+
+const G_DIALOG_W: i16 = 420;
+const G_DIALOG_H: i16 = 176;
+/// Where a page's own controls begin, below the heading and the counter.
+const G_BODY_Y: i16 = 40;
+
+/// The guided setup — what **New source…** opens.
+///
+/// **One dialog, four pages, not four dialogs.** Every control exists from the start and the page
+/// shows the ones it owns; a wizard built as four templates has four copies of the Back/Next row to
+/// keep in step, and this program already has one dialog per *thing* rather than per *state*.
+///
+/// **Why a wizard at all**, in the owner's words on 2026-10-21, rejecting the form that preceded it:
+/// *"I dont really understand the screen you have created, the discover button is just sitting
+/// there, and all the fields next to it. that is not like the analogy I gave you of setting up email
+/// where the user simply adds an email, or has an advanced option."* And then the sentence that
+/// makes it a state machine rather than four fixed pages: *"the decisions about login modes would
+/// modify later screens in this 'Wizard' style dialog."* [`Draft::steps`] is that — computed, so a
+/// credential page that will be skipped was never one of the pages, and the counter says four when
+/// four is what the reader will see.
+///
+/// **There is no "what should this show" page.** It was the fifth, and since the source/tail split
+/// of 2026-10-21 a selector and a list of applications are what a **tail** is. The last page offers
+/// a first tail instead, which is the same question asked by the screen that owns it — and a source
+/// with no tails shows nothing, so the offer is the natural end of making one.
+fn setup_items() -> Vec<Item> {
+    let label =
+        |text: &str, id: u16, y: i16| Item::new(Class::Static, text, id, (7, y + 2, 62, 9), 0);
+    let field = |id: u16, y: i16, w: i16, style: u32| {
+        Item::new(
+            Class::Edit,
+            "",
+            id,
+            (73, y, w, 12),
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | style,
+        )
+    };
+    vec![
+        // The heading is the page's question — `UI-DESIGN.md`'s applications picker set that
+        // pattern and the review that praised it asked for it again.
+        Item::new(Class::Static, "", ID_G_HEADING, (7, 7, 340, 12), 0),
+        Item::new(Class::Static, "", ID_G_COUNTER, (353, 9, 60, 9), 0),
+        // Page one.
+        // **`Na&me`, not `&Name`** — `&Next >` owns N on every page, and `< &Back` / `&Next >` are
+        // the pair every Windows wizard uses, so it is the field that gives way.
+        label("Na&me:", ID_G_L_NAME, G_BODY_Y),
+        field(ID_G_NAME, G_BODY_Y, 340, 0),
+        label("&Server URL:", ID_G_L_URL, G_BODY_Y + 18),
+        field(ID_G_URL, G_BODY_Y + 18, 340, 0),
+        // Page two.
+        label("Sign in &with:", ID_G_L_MODE, G_BODY_Y),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_G_MODE,
+            (73, G_BODY_Y, 200, 80),
+            WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        ),
+        Item::new(
+            Class::Static,
+            "",
+            ID_G_FOUND,
+            (7, G_BODY_Y + 20, 406, 36),
+            0,
+        ),
+        // Page three.
+        label("C&lient id:", ID_G_L_CLIENT, G_BODY_Y),
+        field(ID_G_CLIENT, G_BODY_Y, 340, 0),
+        label("Secre&t:", ID_G_L_SECRET, G_BODY_Y + 18),
+        field(ID_G_SECRET, G_BODY_Y + 18, 340, ES_PASSWORD),
+        label("Sc&ope:", ID_G_L_SCOPE, G_BODY_Y + 36),
+        field(ID_G_SCOPE, G_BODY_Y + 36, 340, 0),
+        // Page four.
+        Item::new(Class::Static, "", ID_G_SUMMARY, (7, G_BODY_Y, 406, 44), 0),
+        Item::new(
+            Class::Button,
+            "&Add a tail to it now",
+            ID_G_ADD_TAIL,
+            (7, G_BODY_Y + 48, 200, 12),
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        // The fault line and the row that walks the pages.
+        Item::new(Class::Static, "", ID_G_FAULT, (7, 120, 406, 18), 0),
+        Item::new(
+            Class::Button,
+            "< &Back",
+            ID_G_BACK,
+            (213, 148, 60, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Button,
+            "&Next >",
+            ID_G_NEXT,
+            (277, 148, 60, 14),
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            IDCANCEL,
+            (353, 148, 60, 14),
+            WS_TABSTOP,
+        ),
+    ]
+}
+
+/// What the guided setup is handed and hands back.
+pub struct SourceSetup {
+    pub draft: tailhawk_core::sourcesetup::Draft,
+    pub accepted: bool,
+    /// Whether the reader asked for a tail to be added once the source is made.
+    pub then_add_tail: bool,
+    /// Which of [`Draft::steps`] is showing.
+    at: usize,
+    /// The probe in flight, so a late answer about an earlier URL is not written over a later one.
+    asking: usize,
+}
+
+impl SourceSetup {
+    pub fn new() -> Self {
+        Self {
+            draft: tailhawk_core::sourcesetup::Draft::default(),
+            accepted: false,
+            then_add_tail: true,
+            at: 0,
+            asking: 0,
+        }
+    }
+
+    /// The page showing, clamped — `steps()` shortens when the mode changes, and the reader can be
+    /// standing on a page that has just stopped existing.
+    fn step(&self) -> tailhawk_core::sourcesetup::Step {
+        let steps = self.draft.steps();
+        steps[self.at.min(steps.len() - 1)]
+    }
+}
+
+thread_local! {
+    /// Suppresses the notifications this dialog's own writes fire — see `sources_quietly`, whose
+    /// doc comment carries the whole argument and the undefined behaviour it is about.
+    static SETUP_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn setup_quietly<R>(write: impl FnOnce() -> R) -> R {
+    let was = SETUP_QUIET.with(|q| q.replace(true));
+    let out = write();
+    SETUP_QUIET.with(|q| q.set(was));
+    out
+}
+
+fn setup_state(hdlg: HWND) -> Option<*mut SourceSetup> {
+    let ptr =
+        unsafe { GetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER)) } as *mut SourceSetup;
+    (!ptr.is_null()).then_some(ptr)
+}
+
+/// Which controls each page owns, given the mode in force. Everything not named here is hidden
+/// when that page shows.
+///
+/// **The mode is an argument because the secret box is the owner's own question.** He asked it of
+/// the flat form on 2026-10-21 — *"I am also wondering why there is still a field for secret when we
+/// dont need it"* — and the wizard inherited the fault, because this function took only the step.
+/// [`Mode::SignIn`]'s own doc comment says a browser sign-in needs *"**never** a secret, which is
+/// why the secret box has no business on a page this path reaches"*, and `steps()` gives that path a
+/// credential page. So the page was showing it anyway. Found by review on 2026-10-22.
+fn setup_page_controls(
+    step: tailhawk_core::sourcesetup::Step,
+    mode: tailhawk_core::sourcesetup::Mode,
+) -> &'static [u16] {
+    use tailhawk_core::sourcesetup::{Mode, Step};
+    match step {
+        Step::Server => &[ID_G_L_NAME, ID_G_NAME, ID_G_L_URL, ID_G_URL],
+        Step::HowToSignIn => &[ID_G_L_MODE, ID_G_MODE, ID_G_FOUND],
+        Step::Credential if mode == Mode::ClientSecret => &[
+            ID_G_L_CLIENT,
+            ID_G_CLIENT,
+            ID_G_L_SECRET,
+            ID_G_SECRET,
+            ID_G_L_SCOPE,
+            ID_G_SCOPE,
+        ],
+        Step::Credential => &[ID_G_L_CLIENT, ID_G_CLIENT, ID_G_L_SCOPE, ID_G_SCOPE],
+        Step::Ready => &[ID_G_SUMMARY, ID_G_ADD_TAIL],
+    }
+}
+
+/// Every control a page can own, so the ones it does not can be hidden.
+const G_PAGE_ANY: [u16; 15] = [
+    ID_G_L_NAME,
+    ID_G_NAME,
+    ID_G_L_URL,
+    ID_G_URL,
+    ID_G_L_MODE,
+    ID_G_MODE,
+    ID_G_FOUND,
+    ID_G_L_CLIENT,
+    ID_G_CLIENT,
+    ID_G_L_SECRET,
+    ID_G_SECRET,
+    ID_G_L_SCOPE,
+    ID_G_SCOPE,
+    ID_G_SUMMARY,
+    ID_G_ADD_TAIL,
+];
+
+/// Moves the focus onto the new page if the old page was holding it.
+///
+/// **Windows does not relocate focus when the focused window is hidden.** `Next` is the default
+/// push button, so pressing Enter in the Server URL box advances the page without moving focus —
+/// and the hide loop then left the focus on an invisible edit control. Keystrokes went to a box the
+/// reader could not see, the mode combo could not be reached without a click, and pressing Back
+/// rewrote the URL from the draft, discarding whatever had been typed into the dark. Found by
+/// review on 2026-10-22.
+///
+/// The page's first control is the one to take it, which is why [`setup_page_controls`] returns
+/// them in reading order; a page whose first control is a label falls through to the next, and a
+/// page with nothing focusable leaves the focus where it is — `Next` has it by then anyway.
+fn setup_focus_a_visible_control(hdlg: HWND, mine: &[u16]) {
+    let focused = unsafe { GetFocus() };
+    if !focused.is_invalid() && unsafe { IsWindowVisible(focused) }.as_bool() {
+        return;
+    }
+    for id in mine {
+        let Ok(c) = (unsafe { GetDlgItem(hdlg, i32::from(*id)) }) else {
+            continue;
+        };
+        if !unsafe { IsWindowVisible(c) }.as_bool() || !unsafe { IsWindowEnabled(c) }.as_bool() {
+            continue;
+        }
+        // A static is not somewhere the focus can usefully sit, and every page's labels are in this
+        // list beside the boxes they name.
+        if matches!(
+            *id,
+            ID_G_L_NAME
+                | ID_G_L_URL
+                | ID_G_L_MODE
+                | ID_G_L_CLIENT
+                | ID_G_L_SECRET
+                | ID_G_L_SCOPE
+                | ID_G_FOUND
+                | ID_G_SUMMARY
+        ) {
+            continue;
+        }
+        unsafe {
+            let _ = SetFocus(c);
+        }
+        return;
+    }
+}
+
+/// Draws the page showing: its heading, its counter, its controls, and what the buttons say.
+fn setup_draw(hdlg: HWND, data: &SourceSetup) {
+    use tailhawk_core::sourcesetup::Step;
+    let steps = data.draft.steps();
+    let at = data.at.min(steps.len() - 1);
+    let step = steps[at];
+    let mine = setup_page_controls(step, data.draft.mode_now());
+
+    setup_quietly(|| {
+        set_dlg_text(hdlg, ID_G_HEADING, step.heading());
+        set_dlg_text(
+            hdlg,
+            ID_G_COUNTER,
+            &format!("Step {} of {}", at + 1, steps.len()),
+        );
+        for id in G_PAGE_ANY {
+            if let Ok(c) = unsafe { GetDlgItem(hdlg, i32::from(id)) } {
+                let _ =
+                    unsafe { ShowWindow(c, if mine.contains(&id) { SW_SHOW } else { SW_HIDE }) };
+            }
+        }
+        match step {
+            Step::Server => {
+                set_dlg_text(hdlg, ID_G_NAME, &data.draft.name);
+                set_dlg_text(hdlg, ID_G_URL, &data.draft.url);
+            }
+            Step::HowToSignIn => {
+                let names: Vec<String> = E_MODES.iter().map(|m| m.said().to_owned()).collect();
+                let pick = E_MODES
+                    .iter()
+                    .position(|m| *m == data.draft.mode_now())
+                    .unwrap_or(0);
+                combo_fill(hdlg, ID_G_MODE, &names, pick);
+                set_dlg_text(hdlg, ID_G_FOUND, &setup_found_said(data));
+            }
+            Step::Credential => {
+                set_dlg_text(hdlg, ID_G_CLIENT, &data.draft.client_id);
+                set_dlg_text(
+                    hdlg,
+                    ID_G_SECRET,
+                    data.draft.secret.as_deref().unwrap_or(""),
+                );
+                set_dlg_text(hdlg, ID_G_SCOPE, &data.draft.scope);
+            }
+            Step::Ready => set_dlg_text(hdlg, ID_G_SUMMARY, &setup_summary(data)),
+        }
+        set_dlg_text(
+            hdlg,
+            ID_G_NEXT,
+            if at + 1 == steps.len() {
+                "&Finish"
+            } else {
+                "&Next >"
+            },
+        );
+        if let Ok(c) = unsafe { GetDlgItem(hdlg, i32::from(ID_G_BACK)) } {
+            let _ = unsafe { EnableWindow(c, at > 0) };
+        }
+        set_dlg_text(hdlg, ID_G_FAULT, "");
+        setup_focus_a_visible_control(hdlg, mine);
+    });
+}
+
+/// What the decision page says about the server, above the choice it is proposing.
+fn setup_found_said(data: &SourceSetup) -> String {
+    match (&data.draft.found, data.draft.reached) {
+        // **It does not repeat what the line below already says.** `setup_said` carries the
+        // finding and the reachability verdict together — *"Found ‹issuer› at ‹host›. Reached
+        // it, and it wants a token"* — and this static said the first half again, word for
+        // word, four lines above it. Seen on screen on 2026-10-22. What is left is the part
+        // only this page can say: what was done with what was found, and whose choice it is.
+        // **A document with endpoints and no `issuer` still answered.** Guarding on the issuer
+        // alone sent that case to the arm below, which says nothing answered — while its endpoints
+        // were sitting in the draft, filled in. The issuer is not what makes a discovery useful.
+        (Some(_), _) => {
+            "The endpoints that server advertises are filled in for you. Change the choice \
+             above if you know better."
+                .to_owned()
+        }
+        (_, Some(_)) => {
+            "No sign-in server answered, so this is a guess — change it if you know better."
+                .to_owned()
+        }
+        _ => "Nothing has been asked yet.".to_owned(),
+    }
+}
+
+/// The last page's summary: what this source is, in the words the reader used.
+fn setup_summary(data: &SourceSetup) -> String {
+    let mut out = format!("{}\r\n{}", data.draft.name.trim(), data.draft.url.trim());
+    out.push_str("\r\n");
+    out.push_str(data.draft.mode_now().said());
+    out
+}
+
+/// Reads the page showing back into the draft. Only the page showing: a hidden box holds whatever
+/// it held when it was last drawn, and reading it would write a stale value over a live one.
+fn setup_read(hdlg: HWND, data: &mut SourceSetup) {
+    use tailhawk_core::sourcesetup::Step;
+    match data.step() {
+        Step::Server => {
+            data.draft.name = dlg_text(hdlg, ID_G_NAME);
+            // **Changing the server throws away what the last one advertised.** The wizard has no
+            // endpoint boxes, so everything in the draft came from discovery about the URL that was
+            // in this box when the probe ran; `point_at` is where that is decided.
+            data.draft.point_at(&dlg_text(hdlg, ID_G_URL));
+        }
+        Step::HowToSignIn => {
+            if let Some(at) = combo_selected(hdlg, ID_G_MODE, E_MODES.len()) {
+                // **Chosen, not merely current.** `mode_chosen` is what stops a later probe
+                // overruling the reader — see its own doc comment, which records the Loki with
+                // authentication off that could never reach "No sign-in needed".
+                if data.draft.mode != Some(E_MODES[at]) {
+                    data.draft.mode_chosen = true;
+                }
+                data.draft.mode = Some(E_MODES[at]);
+            }
+        }
+        Step::Credential => {
+            data.draft.client_id = dlg_text(hdlg, ID_G_CLIENT);
+            data.draft.scope = dlg_text(hdlg, ID_G_SCOPE);
+            // **Typed means typed**, as in the one-source editor: until this page is read the
+            // secret is `None` and the store keeps whatever it holds.
+            //
+            // **And a mode with no use for a secret holds none**, rather than keeping one typed
+            // under another mode in plaintext for the rest of the dialog's life. The store was
+            // never at risk — `secret_to_store` gates on `needs_secret` — but the draft was.
+            data.draft.secret = if data.draft.mode_now().needs_secret() {
+                Some(dlg_text(hdlg, ID_G_SECRET))
+            } else {
+                None
+            };
+        }
+        Step::Ready => {
+            data.then_add_tail = unsafe {
+                SendDlgItemMessageW(
+                    hdlg,
+                    i32::from(ID_G_ADD_TAIL),
+                    BM_GETCHECK,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            }
+            .0 == 1
+        }
+    }
+}
+
+/// Asks the server where it signs people in, and whether the Loki itself answers — **on a worker**.
+///
+/// **This is what `Next` does on page one, rather than a button the reader has to find.** The form
+/// this wizard replaces had a `Set up` button sitting inert beside the fields, which is the owner's
+/// own complaint about it: *"the discover button is just sitting there"*. Setting up email asks you
+/// to press Next, not Next and then Check.
+fn setup_probe(hdlg: HWND, data: &mut SourceSetup) {
+    let url = data.draft.url.trim().to_owned();
+    let token = next_async_token();
+    data.asking = token;
+    // **Disabling the focused control is a write to it**, and `Next` is what the reader just
+    // pressed, so it holds the focus — `tail_edit_proc` wraps the identical operation on `Choose…`
+    // and says why. The `&mut SourceSetup` the caller holds is live across both of these.
+    setup_quietly(|| {
+        set_dlg_text(
+            hdlg,
+            ID_G_FAULT,
+            "Asking this server where it signs people in, then the ones beside it…",
+        );
+        if let Ok(c) = unsafe { GetDlgItem(hdlg, i32::from(ID_G_NEXT)) } {
+            let _ = unsafe { EnableWindow(c, false) };
+        }
+    });
+    let target = hdlg.0 as isize;
+    std::thread::spawn(move || {
+        let probed = Probed {
+            asked: url.clone(),
+            discovery: crate::pull::discover(&url),
+            reach: crate::pull::reachable(&url),
+        };
+        let hdlg = HWND(target as *mut std::ffi::c_void);
+        let boxed = Box::into_raw(Box::new(probed));
+        if unsafe { PostMessageW(hdlg, WM_G_PROBED, WPARAM(token), LPARAM(boxed as isize)) }
+            .is_err()
+        {
+            drop(unsafe { Box::from_raw(boxed) });
+        }
+    });
+}
+
+/// The answer to `Next` on page one.
+const WM_G_PROBED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x0143;
+
+unsafe extern "system" fn setup_proc(
+    hdlg: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_DESTROY => {
+            drop_dialog_brush(hdlg);
+            0
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORDLG
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX
+        | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
+            dialog_colours(hdlg, msg, wparam)
+        }
+        WM_INITDIALOG => {
+            theme_dialog(hdlg);
+            unsafe {
+                SetWindowLongPtrW(hdlg, WINDOW_LONG_PTR_INDEX(DWLP_USER), lparam.0);
+            }
+            let data = unsafe { &*(lparam.0 as *const SourceSetup) };
+            setup_quietly(|| unsafe {
+                SendDlgItemMessageW(
+                    hdlg,
+                    i32::from(ID_G_ADD_TAIL),
+                    BM_SETCHECK,
+                    WPARAM(usize::from(data.then_add_tail)),
+                    LPARAM(0),
+                );
+            });
+            setup_draw(hdlg, data);
+            1
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            // Every notification, not just `EN_CHANGE`, and before the state pointer is taken —
+            // see `tail_edit_proc`, whose comment carries the whole argument.
+            if SETUP_QUIET.with(|q| q.get()) {
+                return 1;
+            }
+            let Some(data) = setup_state(hdlg) else {
+                return 0;
+            };
+            let data = unsafe { &mut *data };
+            match (id, code) {
+                (ID_G_BACK, BN_CLICKED) => {
+                    setup_read(hdlg, data);
+                    data.at = data.at.saturating_sub(1);
+                    setup_draw(hdlg, data);
+                    1
+                }
+                (ID_G_NEXT, BN_CLICKED) => {
+                    setup_read(hdlg, data);
+                    let step = data.step();
+                    if let Some(why) = data.draft.blocking(step) {
+                        set_dlg_text(hdlg, ID_G_FAULT, why);
+                        return 1;
+                    }
+                    let steps = data.draft.steps();
+                    let last = data.at + 1 >= steps.len();
+                    if last {
+                        // **Everything, not just this page.** `fault` is every page's complaint at
+                        // once plus `Source::fault`'s, which is what Finish owes.
+                        if let Some(why) = data.draft.fault() {
+                            set_dlg_text(hdlg, ID_G_FAULT, why);
+                            return 1;
+                        }
+                        data.accepted = true;
+                        unsafe {
+                            let _ = EndDialog(hdlg, 1);
+                        }
+                        return 1;
+                    }
+                    // Leaving page one is where the server gets asked, and the move happens when
+                    // the answer lands.
+                    if step == tailhawk_core::sourcesetup::Step::Server
+                        && data.draft.found.is_none()
+                    {
+                        setup_probe(hdlg, data);
+                        return 1;
+                    }
+                    data.at += 1;
+                    setup_draw(hdlg, data);
+                    1
+                }
+                (ID_G_MODE, CBN_SELCHANGE) => {
+                    setup_read(hdlg, data);
+                    // The mode decides which pages remain, so the counter can change under the
+                    // reader's hand — which is the point of it being computed.
+                    setup_draw(hdlg, data);
+                    1
+                }
+                (IDCANCEL, BN_CLICKED) => {
+                    unsafe {
+                        let _ = EndDialog(hdlg, 0);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_G_PROBED => {
+            let probed = unsafe { Box::from_raw(lparam.0 as *mut Probed) };
+            let Some(data) = setup_state(hdlg) else {
+                return 1;
+            };
+            let data = unsafe { &mut *data };
+            setup_quietly(|| {
+                if let Ok(c) = unsafe { GetDlgItem(hdlg, i32::from(ID_G_NEXT)) } {
+                    let _ = unsafe { EnableWindow(c, true) };
+                }
+            });
+            // A late answer about a URL the reader has moved on from is said, not applied — the
+            // token is what tells the two apart.
+            if wparam.0 != data.asking {
+                return 1;
+            }
+            if let crate::pull::Discovery::Found { found, .. } = &probed.discovery {
+                data.draft.discovered(found.clone());
+            }
+            data.draft.tested(reach_of(&probed.reach));
+            data.at += 1;
+            setup_draw(hdlg, data);
+            set_dlg_text(
+                hdlg,
+                ID_G_FAULT,
+                &crate::pull::setup_said(&probed.discovery, &probed.reach),
+            );
+            1
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = EndDialog(hdlg, 0);
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// Shows the guided setup over `owner`. Reports whether it was finished.
+pub fn show_source_setup(owner: HWND, data: &mut SourceSetup) -> bool {
+    let t = template("New remote source", G_DIALOG_W, G_DIALOG_H, &setup_items());
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            t.as_ptr() as *const DLGTEMPLATE,
+            owner,
+            Some(setup_proc),
+            LPARAM(data as *mut SourceSetup as isize),
         )
     };
     data.accepted
@@ -5127,6 +5777,15 @@ pub fn compose_filter(
 }
 
 fn combo_fill(hdlg: HWND, id: u16, entries: &[String], selected: usize) {
+    // **Filling is replacing, and this used to append.** Every caller until the guided setup filled
+    // once at `WM_INITDIALOG`, so the missing reset never showed. `setup_draw` fills on *every*
+    // draw of its sign-in page, which grew the mode list by three entries per draw — and because
+    // `combo_selected` clamps a position past the end, picking one of the duplicate rows silently
+    // became `Mode::Open`: a reader who chose a browser sign-in got a source with no
+    // authentication at all. Found by review on 2026-10-22.
+    unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(id), CB_RESETCONTENT, WPARAM(0), LPARAM(0));
+    }
     for entry in entries {
         let text = wsz(entry);
         unsafe {
@@ -7835,6 +8494,7 @@ mod tests {
             ("Remote sources", sources_dialog_items()),
             ("Remote source", source_edit_items()),
             ("Tail", tail_edit_items()),
+            ("New remote source", setup_items()),
             ("Applications", apps_dialog_items()),
             ("Select Columns", columns_dialog_items()),
         ] {
@@ -8039,6 +8699,190 @@ mod tests {
                     a.text, b.text, a.x, a.y, a.w, a.h, b.x, b.y, b.w, b.h
                 );
             }
+        }
+    }
+
+    /// **Every control of the guided setup is inside it and none overlaps another** — and the
+    /// pages may overlap *each other*, which is the whole point of one dialog with four of them.
+    ///
+    /// So this checks the two things that still hold: nothing escapes the dialog, and no two
+    /// controls **of the same page** collide. A page's controls sharing a rectangle with another
+    /// page's is how the pages stack.
+    #[test]
+    fn every_page_of_the_guided_setup_fits_inside_it() {
+        use tailhawk_core::sourcesetup::{Mode, Step};
+        let items = setup_items();
+        for item in &items {
+            assert!(
+                item.x >= 0 && item.y >= 0,
+                "{:?} starts outside the dialog",
+                item.text
+            );
+            assert!(
+                item.x + item.w <= G_DIALOG_W,
+                "{:?} runs past the right edge: {} + {} > {G_DIALOG_W}",
+                item.text,
+                item.x,
+                item.w
+            );
+            assert!(
+                item.y + item.h <= G_DIALOG_H,
+                "{:?} runs past the bottom: {} + {} > {G_DIALOG_H}",
+                item.text,
+                item.y,
+                item.h
+            );
+        }
+        // The chrome every page shares, plus each page's own controls, checked page by page.
+        let chrome = [
+            ID_G_HEADING,
+            ID_G_COUNTER,
+            ID_G_FAULT,
+            ID_G_BACK,
+            ID_G_NEXT,
+            IDCANCEL,
+        ];
+        // **Every page in every mode**, because the mode decides what the credential page holds:
+        // only a client-secret source has a Secret box, so checking one mode would leave the other
+        // layout unchecked.
+        for (step, mode) in [
+            Step::Server,
+            Step::HowToSignIn,
+            Step::Credential,
+            Step::Ready,
+        ]
+        .into_iter()
+        .flat_map(|s| [Mode::SignIn, Mode::ClientSecret, Mode::Open].map(|m| (s, m)))
+        {
+            let on_screen: Vec<&Item> = items
+                .iter()
+                .filter(|i| {
+                    chrome.contains(&i.id) || setup_page_controls(step, mode).contains(&i.id)
+                })
+                .collect();
+            // **A combo box's template height is the height of its *dropped list*, not of the
+            // control.** `DLGITEMTEMPLATE`'s `cy` for `CBS_DROPDOWNLIST` is what the thing covers
+            // when it is open, and the closed control is one line — so comparing the stated
+            // height would report every combo as sitting on whatever is beneath it, which is how
+            // this test failed the first time it ran.
+            let closed = |i: &Item| match i.class {
+                Class::ComboBox => 12,
+                _ => i.h,
+            };
+            for (n, a) in on_screen.iter().enumerate() {
+                for b in on_screen.iter().skip(n + 1) {
+                    let apart = a.x + a.w <= b.x
+                        || b.x + b.w <= a.x
+                        || a.y + closed(a) <= b.y
+                        || b.y + closed(b) <= a.y;
+                    assert!(apart, "on {step:?}, {:?} overlaps {:?}", a.text, b.text);
+                }
+            }
+        }
+    }
+
+    /// **Every page owns at least one control, no control belongs to two pages of one mode, and
+    /// every control of the dialog is accounted for.**
+    ///
+    /// A page that owns nothing is a page that draws its heading over the last one's fields, since
+    /// `setup_draw` only hides what it is told about; a control claimed by two pages is one that
+    /// never gets hidden between them. Neither is visible in a geometry check.
+    ///
+    /// The third assertion is the one a review had to find by reading, on 2026-10-22, because
+    /// nothing tied `setup_items` to the tables: a **new** control named in neither
+    /// `setup_page_controls` nor `G_PAGE_ANY` satisfied both of the other two and was simply
+    /// visible on every page. The chrome is the only thing allowed to be unclaimed, and it is
+    /// listed rather than inferred so that adding to it is a decision.
+    #[test]
+    fn each_page_of_the_guided_setup_owns_its_own_controls() {
+        use tailhawk_core::sourcesetup::{Mode, Step};
+        let pages = [
+            Step::Server,
+            Step::HowToSignIn,
+            Step::Credential,
+            Step::Ready,
+        ];
+        // Per mode, because the credential page's controls depend on it: a claim is only a double
+        // claim if one *reader* could meet both pages, and a reader is in one mode at a time.
+        let mut claimed_anywhere: Vec<u16> = Vec::new();
+        for mode in [Mode::SignIn, Mode::ClientSecret, Mode::Open] {
+            let mut claimed: Vec<u16> = Vec::new();
+            for step in pages {
+                let mine = setup_page_controls(step, mode);
+                assert!(!mine.is_empty(), "{step:?} in {mode:?} owns no controls");
+                for id in mine {
+                    assert!(
+                        !claimed.contains(id),
+                        "control {id} is claimed by {step:?} and by an earlier page, in {mode:?}"
+                    );
+                    claimed.push(*id);
+                    if !claimed_anywhere.contains(id) {
+                        claimed_anywhere.push(*id);
+                    }
+                }
+            }
+            // **And `G_PAGE_ANY` covers every one of them**, because it is what `setup_draw` hides:
+            // a control missing from it is one that is shown once and never hidden again.
+            for id in &claimed {
+                assert!(
+                    G_PAGE_ANY.contains(id),
+                    "control {id} belongs to a page but is not in G_PAGE_ANY, so it is never hidden"
+                );
+            }
+        }
+        for id in G_PAGE_ANY {
+            assert!(
+                claimed_anywhere.contains(&id),
+                "G_PAGE_ANY names control {id}, which no page owns in any mode"
+            );
+        }
+
+        // **Nothing in the dialog is unaccounted for.** The secret box is on this list through
+        // `Mode::ClientSecret` alone, which is the point of that mode being an argument.
+        let chrome = [
+            ID_G_HEADING,
+            ID_G_COUNTER,
+            ID_G_FAULT,
+            ID_G_BACK,
+            ID_G_NEXT,
+            IDCANCEL,
+        ];
+        for item in setup_items() {
+            assert!(
+                chrome.contains(&item.id) || claimed_anywhere.contains(&item.id),
+                "{:?} (id {}) belongs to no page and is not chrome, so it shows on every page",
+                item.text,
+                item.id
+            );
+        }
+    }
+
+    /// **A browser sign-in is never shown the secret box**, which is the owner's own question about
+    /// the form this wizard replaced: *"I am also wondering why there is still a field for secret
+    /// when we dont need it"*. `Mode::SignIn` reaches the credential page — it needs a client id —
+    /// so the page has to know the mode, and before 2026-10-22 it did not.
+    #[test]
+    fn only_a_client_secret_source_is_asked_for_a_secret() {
+        use tailhawk_core::sourcesetup::{Mode, Step};
+        let secret = [ID_G_L_SECRET, ID_G_SECRET];
+        let shown = |mode| {
+            setup_page_controls(Step::Credential, mode)
+                .iter()
+                .any(|id| secret.contains(id))
+        };
+        assert!(shown(Mode::ClientSecret), "the one path with a secret");
+        assert!(
+            !shown(Mode::SignIn),
+            "a browser sign-in exchanges a code, never a secret"
+        );
+        assert!(!shown(Mode::Open), "and this path has no credential at all");
+        // The client id is on that page in every mode that reaches it, which is what makes the
+        // page worth showing at all.
+        for mode in [Mode::SignIn, Mode::ClientSecret] {
+            assert!(
+                setup_page_controls(Step::Credential, mode).contains(&ID_G_CLIENT),
+                "{mode:?} needs a client id"
+            );
         }
     }
 
@@ -8403,6 +9247,7 @@ mod tests {
             ("Remote sources", sources_dialog_items()),
             ("Remote source", source_edit_items()),
             ("Tail", tail_edit_items()),
+            ("New remote source", setup_items()),
             ("Applications", apps_dialog_items()),
             ("Select Columns", columns_dialog_items()),
         ] {

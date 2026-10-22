@@ -1,6 +1,6 @@
 # The Remote sources wizard — the flow
 
-The five pages are `sources-wizard.rc` beside this file, which the Visual Studio dialog designer
+The pages are `sources-wizard.rc` beside this file, which the Visual Studio dialog designer
 opens: **File ▸ Open ▸ File…** on the `.rc`, then double-click a page in the Resource View. Nothing
 in the build reads it — Tailhawk writes its dialogs as `Item` lists in
 `crates/tailhawk/src/dialog.rs`, because a `.res` would put a resource compiler in the build — so
@@ -17,14 +17,17 @@ behind them — a source is a connection, a tail is a view — is in
 file.
 
 **Still a drawing:** the five wizard pages. `New source…` opens the source *form*, not the wizard;
-`Draft::steps`, `Step` and `can_ask_server` have no consumer yet. The commit that landed the
-two-level dialog said so plainly and this says so too, because a document that reads as though the
-wizard exists is how a session comes to believe it does.
+**Built and on screen since 2026-10-22.** It replaced this note, which said `Draft::steps`, `Step`
+and `can_ask_server` had no consumer — true when it was written, and kept here in outline because
+the reason for it stands: a document that reads as though a thing exists is how a session comes to
+believe it does. What is still true of that list is the last of it, and it is stated where the
+function is defined: nothing calls `can_ask_server` yet.
 
-**Superseded by the split:** page 4, *"What should this source show?"*. A selector and a list of
-applications are what a **tail** is, so that page is a tail's screen rather than a step of a
-source's setup — and `Add tail…` is one page, which is what the fifth row of the table below
-would have been. The argument in *What the wizard can do that the form cannot* survives intact and
+**Superseded by the split, and now deleted:** the old page 4, *"What should this source show?"*. A
+selector and a list of applications are what a **tail** is, so that page is a tail's screen rather
+than a step of a source's setup, and `Add tail…` is the one page it became. `Step::WhatToShow` was
+removed from the enum on 2026-10-22; the last page offers a first tail instead, which `sources_new`
+honours after the source exists, because a tail names the source it reads. The argument in *What the wizard can do that the form cannot* survives intact and
 in fact gets stronger: by the time a reader is adding a tail, the source is configured and signed
 in, so `Choose…` always has a server to ask.
 
@@ -52,16 +55,14 @@ flowchart TD
     B["<b>2 · How should Tailhawk sign in?</b><br/>the decision, proposed"]
     C1["<b>3 · What is this client called?</b><br/>client id · Next signs you in"]
     C2["<b>3 · What is this client called?</b><br/>client id and secret"]
-    D["<b>4 · What should this source show?</b><br/>the server's own labels"]
-    E["<b>5 · Ready to use</b><br/>Try it, then Finish"]
+    E["<b>4 · Ready to use</b><br/>Finish, and the offer of a first tail"]
 
     A -->|"Next asks the server<br/>where it signs people in,<br/>and whether Loki answers"| B
     B -->|"Sign in with a browser"| C1
     B -->|"Use a client id and secret"| C2
-    B -->|"No sign-in needed<br/><i>no credential page at all</i>"| D
-    C1 --> D
-    C2 --> D
-    D --> E
+    B -->|"No sign-in needed<br/><i>no credential page at all</i>"| E
+    C1 --> E
+    C2 --> E
 ```
 
 ## What each page does, and what stops it
@@ -71,8 +72,7 @@ flowchart TD
 | **1 Which log server?** | Asks the server for its OpenID configuration, and asks the Loki URL itself whether it answers — both on a worker, with the page greyed while they run | No name; a name that starts or ends with a space or holds anything but letters, digits, spaces, `-`, `_` and `.`; no URL; a URL that is not `https://` |
 | **2 How should Tailhawk sign in?** | Nothing but move on — the decision is the page | No token URL, on the two modes that need one; no sign-in URL, on the browser one |
 | **3 What is this client called?** | Signs you in, on the browser path | No client id; a secret box you have cleared, on the one mode that uses it |
-| **4 What should this source show?** | — | **Superseded**: this is a tail's screen now, reached by `Add tail…`. See above. |
-| **5 Ready to use** | **Finish** adds the source | Never, by this point |
+| **4 Ready to use** | **Finish** adds the source, and honours the offer of a first tail | Never on this page; **Finish** itself is refused by whatever `Draft::fault` still objects to |
 
 ## The three things that are properties of the code, not of the drawing
 
@@ -100,7 +100,7 @@ settled and the credential is in hand, so there is something to ask.
 
 ## What stays a form
 
-**Edit…** keeps the flat screen. Changing one field of a working source should not be five pages of
+**Edit…** keeps the flat screen. Changing one field of a working source should not be four pages of
 ceremony, and by then every answer the wizard gathers has already been given.
 
 **And `Add tail…` is one page, not a wizard.** A tail is three facts — which source, a name, a
