@@ -31,6 +31,11 @@
 //! also carries a byte budget: rows past it get **no spans and draw plain**, which is a visibly
 //! duller frame rather than a late one — §11.3's rule, applied to colour instead of to text.
 //!
+//! **Plain for a frame, not for ever.** A row the budget paid for is kept in a [`Memo`] by the
+//! caller and costs nothing the next frame, so a screenful larger than the budget is coloured over
+//! two or three frames rather than refused from the same point in every one of them — which is
+//! what a seventy-row window of 1.5 KB lines did until 2026-10-26. See [`Memo`].
+//!
 //! **Bytes are not the only cost, and assuming they were was a bug.** The work is per *match*, and a
 //! 32 KB line against a rule as ordinary as `\w` produces 32,000 of them — inside the byte budget
 //! and nowhere near inside a frame. [`MAX_SPANS_PER_LINE`] is the second bound, and [`claim`] keeps
@@ -226,6 +231,17 @@ pub struct Highlighter {
     budget: Cell<usize>,
     /// Rows this frame gave up on, so a caller can say so rather than leave them looking unmatched.
     skipped: Cell<u32>,
+    /// Which rule set this is, for a [`Memo`] to tell its spans from an earlier set's. See
+    /// [`generation`](Self::generation).
+    generation: u64,
+}
+
+/// The source of every [`Highlighter::generation`]: process-wide, so a highlighter built later
+/// and a set edited later can never share a number with anything that came before.
+static GENERATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn next_generation() -> u64 {
+    GENERATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl Highlighter {
@@ -234,6 +250,7 @@ impl Highlighter {
             set,
             budget: Cell::new(FRAME_BUDGET_BYTES),
             skipped: Cell::new(0),
+            generation: next_generation(),
         }
     }
 
@@ -241,8 +258,20 @@ impl Highlighter {
         &self.set
     }
 
+    /// The rules, to change. **Every call is a new generation**, whether or not the caller then
+    /// changes anything: a memo keyed on the old number recolours, which costs one frame, where a
+    /// memo that kept spans from rules the user has since edited would show the old colours for as
+    /// long as the rows stayed on screen.
     pub fn set_mut(&mut self) -> &mut RuleSet {
+        self.generation = next_generation();
         &mut self.set
+    }
+
+    /// A number that changes whenever the rules might have: on construction and on every
+    /// [`set_mut`](Self::set_mut). Two highlighters never share one, so a [`Memo`] filled under a
+    /// highlighter that has since been replaced is stale by this test alone.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Starts a frame's budget. Called once per frame, before any row.
@@ -277,8 +306,13 @@ impl Highlighter {
         if line.len() > budget {
             // **Charged before the work, so an over-budget row costs nothing.** Charging afterwards
             // would let one 32 KB line blow the budget it was supposed to be stopped by.
+            //
+            // **And the budget is kept, not zeroed.** It was zeroed until 2026-10-26, which made
+            // every row after the first refusal plain whatever its length — so a screenful that
+            // was being coloured across frames by a [`Memo`] could stall on one long row, with
+            // every short row below it never reached. The frame is bounded by the budget either
+            // way; what the row that did not fit costs is nothing.
             self.skipped.set(self.skipped.get() + 1);
-            self.budget.set(0);
             return;
         }
         self.budget.set(budget - line.len());
@@ -365,6 +399,81 @@ impl Highlighter {
                 );
             });
         }
+    }
+}
+
+/// One row's spans, kept from the frame that computed them so the next frame need not.
+///
+/// **The frame budget decided a screenful, and a screenful of long rows was bigger than it.** On
+/// 2026-10-26 the owner, tailing OpenTelemetry journal lines of 1.3–1.9 KB from a set of edge
+/// droplets in a window seventy rows tall, saw his whole-line `info` rule stop two thirds of the
+/// way down the screen and the rest draw white on black — 64 KB is forty-seven such rows, and the
+/// budget was spent again from the top of the screen every frame, so the same rows went plain
+/// every frame for as long as he looked at them. It righted itself at the tail only because the
+/// last hundred lines there happened to be shorter.
+///
+/// So a row coloured once stays coloured: a memo of the spans the budget paid for, keyed by file
+/// row, and a frame spends its budget only on rows it has not yet reached. The screenful converges
+/// over two or three frames — the same shape as the glyph atlas, which rasterises what a frame
+/// could not and asks for another — instead of refusing the same rows for ever.
+///
+/// **Validated, never trusted.** An entry answers only for the exact text it was computed from
+/// and the exact [`Highlighter::generation`]: a row whose bytes changed under it (§5.5's
+/// copy-truncate) and a rule the user has since edited both recolour, at the cost of one frame.
+/// Holding the text is the cheapest exact check there is — a screenful of it is a hundred
+/// kilobytes — and a hash would be a second thing that could be wrong.
+///
+/// **Bounded by [`retain`](Self::retain)**, which the caller gives the rows it is about to draw:
+/// anything else is dropped, so the memo is never larger than one screenful and a row that scrolls
+/// off and back on simply costs its colouring again.
+#[derive(Debug, Default)]
+pub struct Memo {
+    rows: Vec<Coloured>,
+}
+
+#[derive(Debug)]
+struct Coloured {
+    row: u64,
+    generation: u64,
+    text: String,
+    spans: Vec<Span>,
+}
+
+impl Memo {
+    /// The spans kept for `row`, if they were computed from this `text` under this `generation`.
+    pub fn recall(&self, row: u64, text: &str, generation: u64) -> Option<&[Span]> {
+        let at = self.rows.binary_search_by_key(&row, |c| c.row).ok()?;
+        let kept = &self.rows[at];
+        (kept.generation == generation && kept.text == text).then_some(kept.spans.as_slice())
+    }
+
+    /// Keeps `spans` as the answer for `row` as `text` under `generation`, replacing whatever was
+    /// kept for that row before.
+    pub fn keep(&mut self, row: u64, text: &str, generation: u64, spans: Vec<Span>) {
+        let coloured = Coloured {
+            row,
+            generation,
+            text: text.to_owned(),
+            spans,
+        };
+        match self.rows.binary_search_by_key(&row, |c| c.row) {
+            Ok(at) => self.rows[at] = coloured,
+            Err(at) => self.rows.insert(at, coloured),
+        }
+    }
+
+    /// Drops every row not in `rows`, which must be sorted ascending.
+    pub fn retain(&mut self, rows: &[u64]) {
+        self.rows.retain(|c| rows.binary_search(&c.row).is_ok());
+    }
+
+    /// How many rows are kept.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 }
 
@@ -667,6 +776,87 @@ mod tests {
         h.line(&each, &mut out);
         assert!(out.is_empty(), "the second must not be examined");
         assert_eq!(h.skipped(), 1);
+    }
+
+    /// A row that does not fit in what is left is skipped on its own: the budget it did not spend
+    /// is still there for the rows after it. Zeroing it instead left every later row plain, which
+    /// is what stalled a screenful being coloured across frames by a [`Memo`].
+    #[test]
+    fn a_row_too_long_for_what_is_left_does_not_take_the_rest_of_the_frame_with_it() {
+        let h = Highlighter::new(RuleSet::new("s").with(rule("x", "x").fg(RED)));
+        h.begin_frame();
+        let mut out = Vec::new();
+        let each = "x".repeat(FRAME_BUDGET_BYTES * 2 / 3);
+        h.line(&each, &mut out);
+        assert!(!out.is_empty(), "the first fits");
+        h.line(&each, &mut out);
+        assert!(out.is_empty(), "the second does not");
+        h.line("short x", &mut out);
+        assert!(!out.is_empty(), "the third fits in what the second left");
+        assert_eq!(h.skipped(), 1, "only the row that did not fit is counted");
+    }
+
+    /// Two highlighters never share a generation, and editing the rules moves it on — which is
+    /// what lets a memo tell spans from the rules the user has now from spans from the rules
+    /// they had.
+    #[test]
+    fn every_highlighter_and_every_edit_is_a_new_generation() {
+        let mut a = Highlighter::new(RuleSet::new("a"));
+        let b = Highlighter::new(RuleSet::new("b"));
+        assert_ne!(a.generation(), b.generation());
+        let before = a.generation();
+        let _ = a.set_mut();
+        assert_ne!(
+            a.generation(),
+            before,
+            "asking for the rules to edit is an edit"
+        );
+        assert_ne!(a.generation(), b.generation());
+    }
+
+    /// A memo answers for a row only with the exact text and generation it was filled under:
+    /// a row whose bytes changed and a rule set that was edited both recolour.
+    #[test]
+    fn a_memo_answers_only_for_the_text_and_generation_it_was_filled_with() {
+        let mut memo = Memo::default();
+        let span = Span {
+            start: 0,
+            end: 4,
+            fg: Some(RED),
+            bg: None,
+        };
+        memo.keep(7, "info line", 3, vec![span]);
+        assert_eq!(memo.recall(7, "info line", 3), Some(&[span][..]));
+        assert_eq!(memo.recall(7, "info lime", 3), None, "the text changed");
+        assert_eq!(memo.recall(7, "info line", 4), None, "the rules changed");
+        assert_eq!(memo.recall(8, "info line", 3), None, "another row");
+
+        memo.keep(7, "info line", 4, Vec::new());
+        assert_eq!(
+            memo.recall(7, "info line", 3),
+            None,
+            "replaced, not added beside"
+        );
+        assert_eq!(memo.recall(7, "info line", 4), Some(&[][..]));
+        assert_eq!(memo.len(), 1);
+    }
+
+    /// `retain` is what bounds the memo to a screenful: rows not named are dropped.
+    #[test]
+    fn a_memo_keeps_only_the_rows_it_is_told_to() {
+        let mut memo = Memo::default();
+        for row in [3, 1, 2, 9] {
+            memo.keep(row, "x", 1, Vec::new());
+        }
+        assert_eq!(memo.len(), 4);
+        memo.retain(&[2, 3, 4]);
+        assert_eq!(memo.len(), 2);
+        assert!(memo.recall(2, "x", 1).is_some());
+        assert!(memo.recall(3, "x", 1).is_some());
+        assert!(memo.recall(1, "x", 1).is_none());
+        assert!(memo.recall(9, "x", 1).is_none());
+        memo.retain(&[]);
+        assert!(memo.is_empty());
     }
 
     /// **A §10.3-sized line against a rule that matches nearly every character.** This is the shape

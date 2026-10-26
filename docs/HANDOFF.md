@@ -1,5 +1,54 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-26: a screenful bigger than the budget now settles
+
+The owner, tailing Loki for the Starberry edge droplets, reported it live: *"I have selected a
+green background and yellow font colour for the info tag, but this is only being shown for the top
+two thirds of the screen, the bottom third is white on black … only if I scroll up and down … if I
+go to the bottom, it seems to come right again … and only if I scroll fast."*
+
+### What it was
+
+`highlight::FRAME_BUDGET_BYTES` is 64 KB a frame and a row past it draws plain **by design**
+(§11.3: a duller frame rather than a late one). His spill — `tailhawk-spill-<pid>-10/part-000001.log`,
+476 OpenTelemetry journal lines — averages **1,355 bytes a line**, so the budget covers ~47 rows and
+his window shows ~70. Measured across the file: **every 70-row window in rows 1–350 is 94–121 KB**,
+over budget; the last ~120 lines average 820 bytes and a screenful there is 57–59 KB, under. So it
+was never about speed: a fast scroll carried him up into the long-line region, and the tail was
+right because those lines happened to be shorter. The budget was spent from the top of the screen in
+*every* frame, so the same rows were refused for as long as he looked at them.
+
+### What changed
+
+- **`highlight::Memo`** (core): one row's spans kept across frames, keyed by file row, answering
+  only for the exact text and the exact `Highlighter::generation` it was filled under — a row whose
+  bytes changed and a rule the user edited both recolour. `retain` bounds it to the rows about to be
+  drawn.
+- **`Highlighter::generation`**: process-wide, bumped by `new` and by every `set_mut`, so two
+  highlighters never share one and an edit always invalidates.
+- **The over-budget skip keeps what is left** instead of zeroing it — otherwise one long row would
+  stall every short row beneath it and the screenful would never finish.
+- **`Document::colour_beneath`** (shell): recalls from the memo, or highlights and keeps the row if
+  the budget paid; `lay_out` prunes the memo to the frame's rows. **`Shell::paint` asks for another
+  frame** while a visible pane coloured new rows and still had rows refused — the glyph atlas's
+  convergence shape — and stops on a frame that made no progress, so a row longer than the whole
+  budget cannot spin it.
+
+The test, `a_tall_screenful_of_long_rows_is_fully_coloured_once_the_frames_settle`, was run with
+the pre-fix body of `colour_beneath` and watched fail with *"the screenful never settled"* before
+being believed. A search's matches always carry a background, which is why laying the memo's
+finished spans beneath them one at a time is the same as `Highlighter::beneath` was.
+
+### Not seen on screen
+
+The fix is in the suite and in his data, not yet in his window: the next deploy to
+`C:\Program Files\TailHawk` is where he sees it, and the thing to watch is that the lower rows fill
+in within a frame or two of a fast scroll rather than staying plain. Everything the 2026-10-22
+resume point below says is still outstanding: the screen run of the redesigned form, and the
+credential-lost-on-rename defect — which this session found is wider than recorded (chained
+renames `a→b→c` also lose the credential, and a secret typed after a rename in one sitting is
+dropped) and had sketched as a per-source ledger in `sourceset::Editor` before his report arrived.
+
 ## ▶ Resume point — 2026-10-22, later: the wizard has a way out, and the form is worth landing in
 
 `c059368` shipped the wizard. This closes the dead end it shipped with — and the owner's answer to it

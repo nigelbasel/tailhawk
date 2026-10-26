@@ -307,6 +307,17 @@ struct Document {
     /// The visible rows' presentations under `layout`, rebuilt by `lay_out` each frame — §7.1's
     /// visible-rows rule applied to columns. Keyed by **file** row, ascending.
     presented: Vec<(u64, Presentation)>,
+    /// The catalogue's spans for rows a frame has already paid for, so a screenful larger than
+    /// the highlighter's budget converges over frames instead of drawing the same rows plain in
+    /// every one — see [`tailhawk_core::highlight::Memo`]. Pruned to the visible rows by
+    /// `lay_out`; filled by `row_spans`, which the painter reaches through `&dyn RowSource`,
+    /// hence the cell.
+    memo: RefCell<tailhawk_core::highlight::Memo>,
+    /// Whether this frame coloured a row it had not before. Cleared by `lay_out`, raised by
+    /// `row_spans`, read by the shell after the frame: progress with rows still refused is the
+    /// reason to ask for another frame, and no progress is the reason to stop — a row longer than
+    /// the whole budget would otherwise have the shell repainting for ever.
+    coloured_more: std::cell::Cell<bool>,
     /// The first frame goes to the tail. **A tail tool opens at the end** — `SPEC.md` §6.1: "for a
     /// tailing tool the tail is what the user cares about" — and `Grid::is_following` is derived from
     /// being at the bottom, so this is also what makes a freshly opened file follow. Cleared once
@@ -595,7 +606,7 @@ impl RowSource for Document {
             Some(p) => {
                 let raw = std::mem::take(out);
                 p.map(&raw, out);
-                self.highlighter.beneath(&p.text, out);
+                self.colour_beneath(file_row, &p.text, out);
                 // §6.4: a continuation is "rendered dimmed and indented". Indented by the
                 // presentation; dimmed here, beneath everything a rule or a match claimed.
                 if p.continuation {
@@ -612,7 +623,7 @@ impl RowSource for Document {
             }
             None => {
                 if let Some(line) = self.set.row_text(file_row) {
-                    self.highlighter.beneath(line, out);
+                    self.colour_beneath(file_row, line, out);
                 }
             }
         }
@@ -620,6 +631,39 @@ impl RowSource for Document {
 }
 
 impl Document {
+    /// The catalogue's spans for `text`, beneath whatever `out` already holds — from the memo
+    /// when the row was coloured in an earlier frame, and from the highlighter otherwise.
+    ///
+    /// **A row the budget refused is not kept**, so the next frame tries it again with a fresh
+    /// budget; a row it paid for is, so the next frame does not pay twice. That is the whole of
+    /// how a screenful bigger than the budget settles. The spans are laid beneath one at a time
+    /// rather than by `Highlighter::beneath` because the memo holds a finished, non-overlapping
+    /// list, and a search's matches — always carrying a background — own their characters
+    /// outright either way.
+    fn colour_beneath(&self, file_row: u64, text: &str, out: &mut Vec<Span>) {
+        let generation = self.highlighter.generation();
+        let mut memo = self.memo.borrow_mut();
+        if memo.recall(file_row, text, generation).is_none() {
+            let refused = self.highlighter.skipped();
+            let mut fresh = Vec::new();
+            self.highlighter.line(text, &mut fresh);
+            if self.highlighter.skipped() == refused {
+                memo.keep(file_row, text, generation, fresh);
+                self.coloured_more.set(true);
+            }
+        }
+        if let Some(spans) = memo.recall(file_row, text, generation) {
+            for span in spans {
+                tailhawk_core::highlight::claim_beneath(out, *span);
+            }
+        }
+    }
+
+    /// Whether this frame coloured a row it had not before; the field says what it is for.
+    fn coloured_more(&self) -> bool {
+        self.coloured_more.get()
+    }
+
     /// Names this document after the **remote source it came from**, and remembers where its
     /// records landed.
     ///
@@ -795,6 +839,8 @@ impl Document {
             chrome_h: 0.0,
             layout,
             presented: Vec::new(),
+            memo: RefCell::new(tailhawk_core::highlight::Memo::default()),
+            coloured_more: std::cell::Cell::new(false),
             open_at_tail: true,
             bookmarks: Default::default(),
             labels: Vec::new(),
@@ -872,6 +918,8 @@ impl Document {
             chrome_h: 0.0,
             layout,
             presented: Vec::new(),
+            memo: RefCell::new(tailhawk_core::highlight::Memo::default()),
+            coloured_more: std::cell::Cell::new(false),
             open_at_tail: true,
             bookmarks: Default::default(),
             labels: Vec::new(),
@@ -1047,6 +1095,10 @@ impl Document {
         } else {
             let _ = self.set.fetch(first, count, anchored);
         }
+        // The memo keeps only the rows this frame will draw, so it is never more than a screenful;
+        // and the frame has coloured nothing yet.
+        self.memo.get_mut().retain(&file_rows);
+        self.coloured_more.set(false);
         // V5: the visible rows' presentations, rebuilt every frame from the raw text just fetched.
         // Fifty parses a frame; §7.1's visible-rows rule, applied to columns.
         self.presented.clear();
@@ -5707,6 +5759,7 @@ impl Shell {
         };
         let (w, h) = Self::client_size(hwnd);
         let mut rasterised = 0;
+        let mut colouring = false;
         let mut placeholders = PlaceholderStats::default();
         let mut settled_hbar: Option<bool> = None;
         let pane_count = self.document.panes().len();
@@ -6009,6 +6062,15 @@ impl Shell {
                 rasterised = laid.rasterised;
                 placeholders = PlaceholderStats::from(&laid);
                 settled_hbar = Some(want_hbar);
+                // A pane that coloured new rows this frame and still had rows refused by the
+                // highlighter's budget will get further next frame — the same reason as the
+                // glyph atlas below. One that coloured nothing new has settled, or holds a row no
+                // budget will ever fit, and asking again would spin.
+                colouring = panes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| visible.contains(i))
+                    .any(|(_, doc)| doc.highlighter.skipped() > 0 && doc.coloured_more());
                 Ok(())
             });
         // **Rasterising is a reason to draw again, and the request cannot be made from in here.**
@@ -6021,7 +6083,11 @@ impl Shell {
         // with `ValidateRect` **after** this returns, which wipes it. So the flag is raised and the
         // handler invalidates once it has validated. It converges rather than spinning — the next
         // frame finds those glyphs resident, rasterises nothing and asks for nothing.
-        self.needs_frame = rasterised > 0;
+        //
+        // **A screenful the highlighter could not finish is the second reason**, and converges the
+        // same way: the rows this frame paid for are in the document's memo, so the next frame
+        // spends its budget on the ones it refused. See `Document::colour_beneath`.
+        self.needs_frame = rasterised > 0 || colouring;
         self.placeholders = placeholders;
         header::trace("paint exit");
         if let Err(e) = &drawn {
@@ -15497,6 +15563,145 @@ mod tests {
             doc.view.grid().scroll().row
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The owner's report of 2026-10-26: a whole-line `info` rule coloured the top two thirds of
+    /// a seventy-row window of 1.3–1.9 KB Loki lines and the rest drew plain — in every frame,
+    /// because `FRAME_BUDGET_BYTES` was spent from the top of the screen each time. A screenful
+    /// larger than the budget must still end up fully coloured once the frames have settled.
+    ///
+    /// **The first frame is asserted to fall short**, or the fixture is not exercising the budget
+    /// and the test proves nothing. Before the memo, every later frame repeated the first, which
+    /// is the failure this test was watched producing.
+    #[test]
+    fn a_tall_screenful_of_long_rows_is_fully_coloured_once_the_frames_settle() {
+        let path = std::env::temp_dir().join("tailhawk_tall_screenful_test.log");
+        let filler = "x".repeat(1_480);
+        let body: String = (0..120)
+            .map(|i| format!("line {i:03} info {filler}\n"))
+            .collect();
+        std::fs::write(&path, body).expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        let green = [0.0, 0.5, 0.0, 1.0];
+        let info = Rule::new(
+            "info",
+            Pattern::compile("info", Charset::UTF_8, false).expect("compile"),
+        )
+        .bg(green)
+        .whole_line();
+        doc.highlighter.set_mut().rules.insert(0, info);
+        doc.lay_out((8.0, 10.0), (800, 700));
+        let visible: Vec<u64> = doc.view.grid().visible().map(|p| p.row).collect();
+        assert!(
+            visible.len() >= 60,
+            "the window must show a screenful bigger than the budget, not {}",
+            visible.len()
+        );
+        let coloured = |doc: &Document| -> usize {
+            let mut spans = Vec::new();
+            visible
+                .iter()
+                .filter(|&&row| {
+                    doc.row_spans(row, &mut spans);
+                    spans.iter().any(|s| s.bg == Some(green))
+                })
+                .count()
+        };
+
+        doc.highlighter.begin_frame();
+        let first = coloured(&doc);
+        assert!(
+            first < visible.len() && doc.highlighter.skipped() > 0,
+            "the fixture must exceed the budget or this proves nothing: {first} of {}",
+            visible.len()
+        );
+        let first_frame_progressed = doc.coloured_more();
+
+        let mut last = first;
+        for frame in 2..=4 {
+            doc.lay_out((8.0, 10.0), (800, 700));
+            doc.highlighter.begin_frame();
+            let now = coloured(&doc);
+            last = now;
+            assert!(
+                now >= first,
+                "frame {frame} lost rows the memo had: {now} < {first}"
+            );
+            if now == visible.len() {
+                assert_eq!(
+                    doc.highlighter.skipped(),
+                    0,
+                    "settled, so nothing was refused"
+                );
+                // The shell asks for another frame on progress with rows still refused, and
+                // stops on a frame that coloured nothing new — so the first frame must have
+                // reported progress, and one more frame on a settled screen must not.
+                assert!(
+                    first_frame_progressed,
+                    "a frame that coloured rows is progress the shell can ask for another frame on"
+                );
+                doc.lay_out((8.0, 10.0), (800, 700));
+                doc.highlighter.begin_frame();
+                assert_eq!(
+                    coloured(&doc),
+                    visible.len(),
+                    "frame {frame}: still settled"
+                );
+                assert!(
+                    !doc.coloured_more(),
+                    "a settled frame makes no progress to report"
+                );
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
+        }
+        panic!("the screenful never settled: {last} of {}", visible.len());
+    }
+
+    /// The other half of the frame request: a row longer than the whole budget is refused in
+    /// every frame, and the shell must not keep asking for frames on its account. What stops the
+    /// asking is a frame that coloured nothing new — not the refusal count, which never reaches
+    /// zero here. Without this a screen holding one such row would repaint for ever.
+    #[test]
+    fn a_row_no_budget_will_ever_fit_does_not_keep_the_shell_asking_for_frames() {
+        let path = std::env::temp_dir().join("tailhawk_endless_row_test.log");
+        let endless = "x".repeat(tailhawk_core::highlight::FRAME_BUDGET_BYTES + 1);
+        std::fs::write(
+            &path,
+            format!("short info one\n{endless}\nshort info three\n"),
+        )
+        .expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        let visible: Vec<u64> = doc.view.grid().visible().map(|p| p.row).collect();
+        assert_eq!(visible.len(), 3);
+        let mut spans = Vec::new();
+
+        doc.highlighter.begin_frame();
+        for &row in &visible {
+            doc.row_spans(row, &mut spans);
+        }
+        assert_eq!(doc.highlighter.skipped(), 1, "the long row is refused");
+        assert!(
+            doc.coloured_more(),
+            "the short rows were coloured, which is progress"
+        );
+
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.highlighter.begin_frame();
+        for &row in &visible {
+            doc.row_spans(row, &mut spans);
+        }
+        assert_eq!(
+            doc.highlighter.skipped(),
+            1,
+            "refused again, as it will be every frame"
+        );
+        assert!(
+            !doc.coloured_more(),
+            "nothing new was coloured, so the shell stops asking"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
