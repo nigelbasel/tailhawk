@@ -34,7 +34,8 @@
 //!   It never sees the value, so a credential cannot escape through a `Debug` line, a test fixture
 //!   or a panic message by way of this type.
 
-use crate::settings::{Source, Tail};
+use crate::settings::{Renamed, Source, Tail};
+use crate::sourcesetup::mode_of;
 
 /// How many sources the dialog will **add**. Generous for "one per environment".
 ///
@@ -100,11 +101,92 @@ pub enum Chosen {
 pub struct Editor {
     sources: Vec<Source>,
     tails: Vec<Tail>,
-    /// Whether the shell found a stored secret for each source, parallel to `sources`.
-    stored: Vec<bool>,
+    /// What the store holds for each source and what the reader has typed for it, parallel to
+    /// `sources`. See [`Credential`].
+    credentials: Vec<Credential>,
+    /// The original names of the sources deleted this sitting, so their credentials can go too.
+    gone: Vec<String>,
     chosen: Chosen,
     open: bool,
     dirty: bool,
+}
+
+/// One source's credential, as this sitting knows it: where it was filed when the dialog opened,
+/// whether anything was there, and what has been typed since.
+///
+/// **Keyed to the row, not to the name — which is the whole fix.** Until 2026-10-26 the dialog
+/// kept three flat lists of *names* — to store, to forget, to move — and the shell reconciled them
+/// against the names that survived the sitting. A name is not a source: a source given a secret
+/// and renamed before Close had its entry dropped because the name it was typed under did not
+/// survive; a rename `a→b→c` moved nothing because `b` did not survive either; and a source whose
+/// mode moved away from needing a secret kept it, because the row had been added that sitting and
+/// so was not "stored". Each list was right about the event it recorded and wrong about the
+/// source it belonged to. Carried on the row, the original name and the typed value cannot come
+/// apart from it, and [`Editor::secret_plan`] reads the end state rather than replaying events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Credential {
+    /// The name the source was filed under when the dialog opened. `None` for a source added in
+    /// this sitting: nothing is in the store under any name for it yet.
+    origin: Option<String>,
+    /// Whether the store held a secret under `origin` when the dialog opened — the shell's answer,
+    /// carried in rather than looked up, because this module never touches the store.
+    stored: bool,
+    /// What the reader typed in this sitting, if anything. `Some("")` is a reader saying the
+    /// source has none; `None` leaves the store alone.
+    typed: Option<String>,
+}
+
+impl Credential {
+    fn existing(name: &str, stored: bool) -> Self {
+        Self {
+            origin: Some(name.to_owned()),
+            stored,
+            typed: None,
+        }
+    }
+
+    /// Whether a secret would be behind this source once the sitting is written.
+    fn has_secret(&self) -> bool {
+        match &self.typed {
+            Some(typed) => !typed.is_empty(),
+            None => self.stored,
+        }
+    }
+}
+
+/// What the shell does to the store when the dialog closes, in the order the fields are listed.
+///
+/// **Forgets first, then moves, then writes.** A delete of `a` followed by a rename of `b` to `a`
+/// has to clear `a` before `b`'s credential lands there; a secret typed for a renamed source has
+/// to be written *after* the old name's entry has moved, so that the move carries the sign-in and
+/// the write then replaces the secret beside it. The moves are given as one `Renamed` per source,
+/// from its original name straight to its current one, and `settings::credential_plan` reads every
+/// value before writing any — so `a→b` and `b→a` in one sitting is two reads then two writes, and
+/// nothing is cleared that something landed on.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SecretPlan {
+    /// Names whose secret **and** sign-in go: the sources deleted this sitting, under the names
+    /// they were filed under.
+    pub forget: Vec<String>,
+    /// Sources renamed, original name to current name, for `secrets::follow_rename`.
+    pub moves: Vec<Renamed>,
+    /// `(name, secret)` to write.
+    pub store: Vec<(String, String)>,
+    /// Names whose secret alone goes: the reader emptied the box, or the source's mode has no use
+    /// for the secret the store holds. **Only the secret**, because a browser sign-in files its
+    /// refresh token under the same name, and a stale client secret beside it is no reason to sign
+    /// the reader out — the first version of this put such a source on `forget`, which would have
+    /// done exactly that to any signed-in source carrying an orphan from before 2026-10-21.
+    pub clear: Vec<String>,
+}
+
+impl SecretPlan {
+    pub fn is_empty(&self) -> bool {
+        self.forget.is_empty()
+            && self.moves.is_empty()
+            && self.store.is_empty()
+            && self.clear.is_empty()
+    }
 }
 
 impl Editor {
@@ -113,14 +195,68 @@ impl Editor {
     /// "does this have a secret" for a source the shell did not ask about is "not as far as we
     /// know".
     pub fn new(sources: Vec<Source>, tails: Vec<Tail>, stored: Vec<bool>) -> Self {
-        let mut stored = stored;
-        stored.resize(sources.len(), false);
+        let credentials = sources
+            .iter()
+            .enumerate()
+            .map(|(at, source)| {
+                Credential::existing(&source.name, stored.get(at).copied().unwrap_or(false))
+            })
+            .collect();
         Self {
             sources,
             tails,
-            stored,
+            credentials,
             ..Self::default()
         }
+    }
+
+    /// Records the secret the reader typed for the chosen source — `""` included, which says the
+    /// source has none. A later edit that types nothing leaves an earlier one in place, which is
+    /// why this is called only when something was typed.
+    pub fn secret_typed(&mut self, secret: String) {
+        if let Chosen::Source(at) = self.chosen {
+            if let Some(credential) = self.credentials.get_mut(at) {
+                credential.typed = Some(secret);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// What the store should do when the sitting is written. Pure: reads the rows as they stand.
+    ///
+    /// Per surviving source: a renamed source's entry moves to its current name — whether or not
+    /// a secret was there, because a browser sign-in's refresh token is filed under the same name
+    /// and has to follow too. Then a secret the mode has no use for is cleared under the current
+    /// name, the sign-in beside it untouched; for a mode that wants one, a typed value is written
+    /// under the current name and an emptied box clears what was there. Every deleted source's
+    /// original name is forgotten, secret and sign-in both.
+    pub fn secret_plan(&self) -> SecretPlan {
+        let mut plan = SecretPlan::default();
+        for name in &self.gone {
+            plan.forget.push(name.clone());
+        }
+        for (source, credential) in self.sources.iter().zip(&self.credentials) {
+            let now = source.name.as_str();
+            let wants = mode_of(source).needs_secret();
+            if let Some(from) = credential.origin.as_deref().filter(|origin| *origin != now) {
+                plan.moves.push(Renamed {
+                    now: now.to_owned(),
+                    was: vec![from.to_owned()],
+                });
+            }
+            if !wants {
+                if credential.stored {
+                    plan.clear.push(now.to_owned());
+                }
+                continue;
+            }
+            match credential.typed.as_deref() {
+                Some("") if credential.stored => plan.clear.push(now.to_owned()),
+                Some("") | None => {}
+                Some(typed) => plan.store.push((now.to_owned(), typed.to_owned())),
+            }
+        }
+        plan
     }
 
     pub fn is_open(&self) -> bool {
@@ -193,9 +329,15 @@ impl Editor {
         self.tails.get(at)
     }
 
-    /// Whether source `at` has a secret in the store.
+    /// Whether a secret will be behind source `at` once the sitting is written: one the store
+    /// holds or the reader typed, for a mode that uses one. A source whose mode has stopped
+    /// wanting its secret answers no, because [`Self::secret_plan`] forgets it at Close.
     pub fn source_has_secret(&self, at: usize) -> bool {
-        self.stored.get(at).copied().unwrap_or(false)
+        let wants = self
+            .sources
+            .get(at)
+            .is_some_and(|source| mode_of(source).needs_secret());
+        wants && self.credentials.get(at).is_some_and(Credential::has_secret)
     }
 
     /// The tree, flattened: each source followed by the tails that read it.
@@ -267,7 +409,7 @@ impl Editor {
             return false;
         }
         self.sources.push(source);
-        self.stored.push(false);
+        self.credentials.push(Credential::default());
         self.chosen = Chosen::Source(self.sources.len() - 1);
         self.dirty = true;
         true
@@ -288,7 +430,9 @@ impl Editor {
     ///
     /// **The tails follow the name.** A tail says which source it reads by *name*, so renaming a
     /// source without carrying its children would orphan every one of them — the same mistake, one
-    /// level up, as filing a credential under a view's name.
+    /// level up, as filing a credential under a view's name. **The credential follows too**: its
+    /// row's [`Credential`] keeps the original name, and [`Self::secret_plan`] moves the store's
+    /// entry when the sitting is written.
     pub fn replace_source(&mut self, source: Source) {
         let Chosen::Source(at) = self.chosen else {
             return;
@@ -300,11 +444,6 @@ impl Editor {
             let was = slot.name.clone();
             for tail in self.tails.iter_mut().filter(|t| t.source == was) {
                 tail.source = source.name.clone();
-            }
-            if let Some(stored) = self.stored.get_mut(at) {
-                // The credential is filed under the name, so a renamed source has none under the
-                // new one until it is written there.
-                *stored = false;
             }
         }
         if *slot != source {
@@ -327,30 +466,31 @@ impl Editor {
         }
     }
 
-    /// Removes what is chosen. **A source takes its tails with it**, and reports every name whose
-    /// credential should go — which for a source is its own, and for a tail is none at all.
-    pub fn remove(&mut self) -> Vec<String> {
+    /// Removes what is chosen. **A source takes its tails with it**, and its credential — filed
+    /// under the name it had when the dialog opened — goes when the sitting is written. A tail owns
+    /// no credential: one source, one credential, however many tails, so removing a tail never
+    /// reaches the store.
+    pub fn remove(&mut self) {
         match self.chosen {
             Chosen::Source(at) if at < self.sources.len() => {
                 let gone = self.sources.remove(at);
-                self.stored.remove(at);
+                let credential = self.credentials.remove(at);
+                if let Some(origin) = credential.origin {
+                    self.gone.push(origin);
+                }
                 self.tails.retain(|t| t.source != gone.name);
                 self.dirty = true;
                 self.chosen = match self.sources.is_empty() {
                     true => Chosen::Nothing,
                     false => Chosen::Source(at.min(self.sources.len() - 1)),
                 };
-                vec![gone.name]
             }
             Chosen::Tail(at) if at < self.tails.len() => {
                 self.tails.remove(at);
                 self.dirty = true;
-                // **A tail owns no credential.** One source, one credential, however many tails —
-                // so removing a tail must never reach the store.
                 self.chosen = Chosen::Nothing;
-                Vec::new()
             }
-            _ => Vec::new(),
+            _ => {}
         }
     }
 
@@ -460,9 +600,10 @@ impl Editor {
             })
             .collect();
         self.sources.push(Source { name, ..source });
-        // **No secret.** The flag is parallel to `sources`, and `false` is the only true answer:
-        // the store has nothing under a name that did not exist a moment ago.
-        self.stored.push(false);
+        // **No credential.** The store has nothing under a name that did not exist a moment ago,
+        // and a copy must not carry the original's row — renaming the copy would move the
+        // original's secret away from it.
+        self.credentials.push(Credential::default());
         self.tails.extend(copies);
         self.chosen = Chosen::Source(self.sources.len() - 1);
         self.dirty = true;
@@ -918,20 +1059,23 @@ mod tests {
         );
         assert!(editor.fault().is_none(), "nothing was orphaned: {reads:?}");
         assert!(
-            !editor.source_has_secret(0),
-            "the credential is filed under the name, so the new name has none yet"
+            editor.source_has_secret(0),
+            "the credential follows the row through a rename; until 2026-10-26 this asserted the \
+             opposite, and the row read `(no secret stored)` the moment a name was corrected"
         );
     }
 
-    /// **Deleting a source deletes its tails, and reports only its own credential.** A tail reading
+    /// **Deleting a source deletes its tails, and forgets only its own credential.** A tail reading
     /// a server that is gone has nowhere to ask; and a tail owns no credential, so removing one
     /// must never reach the store.
     #[test]
     fn deleting_a_source_takes_its_tails_and_names_one_credential() {
         let mut editor = opened();
         editor.choose(Chosen::Source(0));
-        let forget = editor.remove();
-        assert_eq!(forget, ["loki"], "its own name, and nothing else");
+        editor.remove();
+        let plan = editor.secret_plan();
+        assert_eq!(plan.forget, ["loki"], "its own name, and nothing else");
+        assert!(plan.moves.is_empty() && plan.store.is_empty() && plan.clear.is_empty());
         assert_eq!(editor.sources().len(), 1);
         let left: Vec<&str> = editor.tails().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
@@ -947,14 +1091,209 @@ mod tests {
         let mut editor = opened();
         let before = editor.tails().len();
         editor.choose(Chosen::Tail(1));
+        editor.remove();
         assert!(
-            editor.remove().is_empty(),
+            editor.secret_plan().is_empty(),
             "a tail has no credential of its own to forget"
         );
         assert_eq!(editor.tails().len(), before - 1, "exactly the one chosen");
         let left: Vec<&str> = editor.tails().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(left, ["ndc", "spare-view"], "and the others are untouched");
         assert_eq!(editor.sources().len(), 2, "the server it read stays");
+    }
+
+    fn renamed(name: &str) -> Renamed {
+        Renamed {
+            now: name.to_owned(),
+            was: Vec::new(),
+        }
+    }
+
+    fn moved(from: &str, to: &str) -> Renamed {
+        Renamed {
+            was: vec![from.to_owned()],
+            ..renamed(to)
+        }
+    }
+
+    /// A source that signs the reader in through a browser: no secret, but a refresh token filed
+    /// under its name once they have.
+    fn browser(name: &str) -> Source {
+        Source {
+            auth_url: "https://identity.example/connect/authorize".to_owned(),
+            ..source(name)
+        }
+    }
+
+    /// **The defect the review found on 2026-10-22:** a source created with a secret and renamed
+    /// before Close lost the secret, because the name it was typed under did not survive the
+    /// sitting. The row knows which source the secret belongs to; the name is where it ends up.
+    #[test]
+    fn a_secret_typed_for_a_new_source_survives_renaming_it_in_the_same_sitting() {
+        let mut editor = opened();
+        assert!(editor.add_source(source("fresh")));
+        editor.secret_typed("s3cret".to_owned());
+        assert!(editor.source_has_secret(2));
+        editor.replace_source(source("renamed"));
+        assert!(editor.source_has_secret(2), "the row still has it");
+        let plan = editor.secret_plan();
+        assert_eq!(plan.store, [("renamed".to_owned(), "s3cret".to_owned())]);
+        assert!(
+            plan.moves.is_empty() && plan.forget.is_empty(),
+            "nothing is in the store for a source that did not exist when the dialog opened: {plan:?}"
+        );
+    }
+
+    /// **A rename moves the credential, from the original name straight to the current one** —
+    /// however many names the source passed through. `a→b→c` used to move nothing, because the
+    /// move `a→b` was reconciled against the surviving names and `b` was not one of them.
+    #[test]
+    fn a_source_renamed_twice_moves_its_credential_once_from_where_it_started() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.replace_source(source("loki-b"));
+        editor.replace_source(source("loki-c"));
+        let plan = editor.secret_plan();
+        assert_eq!(plan.moves, [moved("loki", "loki-c")]);
+        assert!(plan.forget.is_empty() && plan.store.is_empty() && plan.clear.is_empty());
+        assert!(editor.source_has_secret(0));
+    }
+
+    /// Typing a new secret and then renaming, in one sitting: the old entry moves (it carries the
+    /// sign-in half too), and the new secret is written under the new name afterwards. The order of
+    /// the plan's fields is the order the shell applies them, so the write lands last.
+    #[test]
+    fn a_secret_typed_and_then_renamed_is_written_under_the_new_name_after_the_move() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.secret_typed("newer".to_owned());
+        editor.replace_source(source("loki-2"));
+        let plan = editor.secret_plan();
+        assert_eq!(plan.moves, [moved("loki", "loki-2")]);
+        assert_eq!(plan.store, [("loki-2".to_owned(), "newer".to_owned())]);
+        assert!(plan.forget.is_empty() && plan.clear.is_empty());
+    }
+
+    /// **A mode with no use for a secret gives the stored one up — and only the secret.** The
+    /// entry still moves with a rename, and the clear is under the name it moved to, because the
+    /// sign-in half is filed beside the secret and must survive: a browser source carrying a stale
+    /// client secret from before 2026-10-21 would otherwise be signed out by pressing Close.
+    #[test]
+    fn a_source_that_stops_wanting_a_secret_clears_only_the_secret_under_its_current_name() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.replace_source(browser("loki-browser"));
+        let plan = editor.secret_plan();
+        assert_eq!(plan.moves, [moved("loki", "loki-browser")]);
+        assert_eq!(plan.clear, ["loki-browser"]);
+        assert!(plan.forget.is_empty() && plan.store.is_empty(), "{plan:?}");
+        assert!(!editor.source_has_secret(0));
+    }
+
+    /// The case the review caught before it shipped: a browser source that already had a stale
+    /// secret in the store when the dialog opened, touched only by a rename. Its sign-in must
+    /// follow the rename and nothing may be forgotten; the stale secret is cleared where it landed.
+    #[test]
+    fn a_signed_in_source_with_a_stale_secret_is_renamed_without_being_signed_out() {
+        let mut editor = Editor::new(vec![browser("live")], Vec::new(), vec![true]);
+        editor.open();
+        assert!(
+            !editor.source_has_secret(0),
+            "a browser source has no secret to speak of"
+        );
+        assert_eq!(
+            editor.secret_plan().clear,
+            ["live"],
+            "untouched, the stale secret is still cleared, and nothing else happens: {:?}",
+            editor.secret_plan()
+        );
+        editor.choose(Chosen::Source(0));
+        editor.replace_source(browser("live-2"));
+        let plan = editor.secret_plan();
+        assert_eq!(plan.moves, [moved("live", "live-2")]);
+        assert_eq!(plan.clear, ["live-2"]);
+        assert!(
+            plan.forget.is_empty(),
+            "forgetting would take the refresh token: {plan:?}"
+        );
+        assert!(plan.store.is_empty());
+    }
+
+    /// **A browser sign-in has no secret but it has a refresh token under the same name**, so a
+    /// rename of one must still move the entry — this is why the plan moves on the row, not on
+    /// whether a secret was stored. And a secret typed into a mode that does not want one is not
+    /// written.
+    #[test]
+    fn a_browser_sign_in_renamed_moves_its_entry_and_a_secret_it_cannot_use_is_not_written() {
+        let mut editor = Editor::new(vec![browser("live")], Vec::new(), vec![false]);
+        editor.open();
+        editor.choose(Chosen::Source(0));
+        editor.secret_typed("ignored".to_owned());
+        editor.replace_source(browser("live-2"));
+        let plan = editor.secret_plan();
+        assert_eq!(plan.moves, [moved("live", "live-2")]);
+        assert!(plan.store.is_empty(), "{plan:?}");
+        assert!(plan.forget.is_empty() && plan.clear.is_empty());
+    }
+
+    /// Delete `loki`, then rename `spare` to `loki`: the deleted entry is forgotten **before** the
+    /// rename lands on its name, which is what the plan's field order promises. And a source added
+    /// under a deleted name is written after the forget for the same reason.
+    #[test]
+    fn a_deleted_name_is_forgotten_before_anything_lands_on_it() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.remove();
+        editor.choose(Chosen::Source(0));
+        editor.replace_source(source("loki"));
+        let plan = editor.secret_plan();
+        assert_eq!(plan.forget, ["loki"]);
+        assert_eq!(plan.moves, [moved("spare", "loki")]);
+
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.remove();
+        assert!(editor.add_source(source("loki")));
+        editor.secret_typed("again".to_owned());
+        let plan = editor.secret_plan();
+        assert_eq!(plan.forget, ["loki"]);
+        assert_eq!(plan.store, [("loki".to_owned(), "again".to_owned())]);
+        assert!(plan.moves.is_empty());
+    }
+
+    /// An emptied box clears the secret and only the secret — and only where there was one; a
+    /// source that never had one has nothing to clear.
+    #[test]
+    fn an_emptied_box_clears_a_stored_secret_and_nothing_else() {
+        let mut editor = opened();
+        editor.choose(Chosen::Source(0));
+        editor.secret_typed(String::new());
+        assert!(!editor.source_has_secret(0));
+        let plan = editor.secret_plan();
+        assert_eq!(plan.clear, ["loki"]);
+        assert!(plan.forget.is_empty() && plan.moves.is_empty() && plan.store.is_empty());
+
+        editor.choose(Chosen::Source(1));
+        editor.secret_typed(String::new());
+        assert_eq!(
+            editor.secret_plan().clear,
+            ["loki"],
+            "`spare` had none to clear"
+        );
+    }
+
+    /// Nothing touched, nothing planned; and a clone carries no credential into the plan.
+    #[test]
+    fn an_untouched_sitting_and_a_clone_plan_nothing() {
+        let mut editor = opened();
+        assert!(editor.secret_plan().is_empty());
+        editor.choose(Chosen::Source(0));
+        assert!(editor.clone_chosen());
+        assert!(
+            editor.secret_plan().is_empty(),
+            "{:?}",
+            editor.secret_plan()
+        );
     }
 
     /// What a confirmation has to be able to say before a delete, because the count is the whole

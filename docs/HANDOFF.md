@@ -1,5 +1,53 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-26, later: the credential is kept on the source, not on its name
+
+The one real defect the 2026-10-22 note carried is closed, and it was wider than recorded.
+
+### What it was
+
+`SourcesEdit` kept three flat lists of **names** — to store, to forget, to move — and the shell
+reconciled them at Close against the names that survived the sitting. Each list was right about the
+event it recorded and wrong about the source it belonged to:
+
+- a source created with a secret and renamed before Close **lost the secret** — the name it was
+  typed under had not survived, so `store.retain` dropped it;
+- a rename `a→b→c` **moved nothing** — `rename.retain` dropped `(a,b)` because `b` had not
+  survived, and `follow_rename(b→c)` found nothing under `b`;
+- a secret typed for `a` and then `a` renamed in the same sitting was dropped the same way;
+- a source added that sitting whose mode then stopped wanting a secret **kept it**, because
+  `add_source` pushed `stored = false` and `secret_to_forget` answered `None`.
+
+### What changed
+
+`sourceset::Editor` carries a private `Credential` per source — the name it was filed under when
+the dialog opened, whether a secret was there, and what has been typed since — plus the original
+names of the sources deleted. `Editor::secret_typed` records what the reader typed (`""` included).
+The pure **`Editor::secret_plan`** reads the rows as they stand and answers a `SecretPlan`:
+`forget` (deleted sources, secret and sign-in, under the *original* name), `moves` (one `Renamed`
+per source, original name straight to current name, whether or not a secret was stored — a browser
+sign-in's refresh token is filed under the same name and has to follow), `store`, `clear` (the
+secret alone: an emptied box, or a secret the mode has no use for, under the *current* name). The
+shell applies them **in that field order**, which is what makes "delete `a`, rename `b` to `a`"
+and "type a secret, then rename" come out right; `settings::credential_plan` reads every value
+before writing any, so `a→b→c` and a swap are safe. `SourcesEdit`'s three lists, the shell's
+reconciliation, and `Draft::secret_to_store` / `secret_to_forget` are gone — the decision has one
+home. Nine new tests in `sourceset.rs`, one per case above and per ordering promise.
+
+**The pre-commit review caught the first draft** putting a source whose mode no longer wants its
+secret on `forget` — which would have signed out any browser source carrying a stale client secret
+from before 2026-10-21 the moment Close was pressed, and deleted its sign-in instead of moving it
+on a rename. That is why `clear` exists and why `forget` is deleted sources only. **Pre-existing
+and left:** `credential_plan` treats a landing name that already holds a credential nothing is
+vacating as occupied and skips the move, so renaming onto the name of an old orphan in the store
+adopts the orphan; the old rename path did the same.
+
+### Not seen on screen
+
+Same as everything else in this dialog: the suite covers the decisions, and the only exercise of
+the store itself is a real sitting — create a source with a secret, rename it before Close, reopen
+the dialog, and the row should still read without `(no secret stored)`.
+
 ## ▶ Resume point — 2026-10-26: a screenful bigger than the budget now settles
 
 The owner, tailing Loki for the Starberry edge droplets, reported it live: *"I have selected a

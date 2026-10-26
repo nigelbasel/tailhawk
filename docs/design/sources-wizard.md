@@ -79,7 +79,8 @@ flowchart TD
 **Changing your mind takes the other path's fields with it.** `Source::signs_in` is literally
 `!auth_url.is_empty()`, so carrying a sign-in URL into a client-secret source would use the flow you
 had just rejected. `Draft::into_source` drops what the chosen mode has no use for, and
-`Draft::secret_to_forget` gives up a stored secret that the new mode will never send.
+`sourceset::Editor::secret_plan` clears a stored secret that the new mode will never send — the
+secret only, since 2026-10-26, because a browser sign-in's refresh token is filed beside it.
 
 **Every page complains about itself and nothing else.** `Draft::blocking(step)` is per page, which
 is what keeps a reader from being held on page 1 by a missing client id — the wall of fields again,

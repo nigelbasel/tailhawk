@@ -830,31 +830,17 @@ fn sources_dialog_items() -> Vec<Item> {
 /// sources they deleted, whose credentials must go with them. Nothing here ever carries a secret
 /// *read* from the store — see `sourceset`'s module note.
 pub struct SourcesEdit {
+    /// The rows, and **every credential decision of the sitting** — what was typed, what was
+    /// renamed, what was deleted — carried on the row it belongs to, so that
+    /// `Editor::secret_plan` can say what the store should do once Close is pressed. Three lists
+    /// of names lived here until 2026-10-26 and the shell reconciled them against the surviving
+    /// names; a renamed source lost the secret typed for it, because the name it was typed under
+    /// had not survived. The row had.
     pub editor: tailhawk_core::sourceset::Editor,
     pub accepted: bool,
-    /// `(name, secret)` to write, one for each source whose secret was typed. **A list, because
-    /// the list dialog outlives each editor that opens over it** — three sources can be given
-    /// secrets before Close is pressed, and a single slot kept only the last of them.
-    pub store: Vec<(String, String)>,
-    /// Names whose stored secret should be deleted.
-    pub forget: Vec<String>,
     /// The names of the tails `Open` was pressed on, for the shell to start once the dialog has
     /// gone and the settings are written.
     pub open: Vec<String>,
-    /// `(was, now)` for each source the reader renamed, so its credential can be **moved** rather
-    /// than deleted.
-    ///
-    /// **Renaming a source used to destroy its secret.** The old name went onto `forget` and
-    /// nothing went onto `store` — `Draft::secret_to_store` answers `None` unless a secret was
-    /// typed in that sitting — so a reader who corrected a typo in a name lost the credential with
-    /// nothing said, and the source then read `(no secret stored)` for ever. The doc comment here
-    /// claimed the opposite, and cited `Tailhawk/loki-tokens/nurtur-loki-live` — an orphan in this
-    /// machine's own store — as the thing it was preventing, while manufacturing more of them:
-    /// nothing has ever called `forget_refresh` on a rename, so the *sign-in* was orphaned too.
-    ///
-    /// `secrets::follow_rename` is the machinery that moves both, written for the settings
-    /// migration, and this is the second caller it should always have had.
-    pub rename: Vec<(String, String)>,
 }
 
 /// A probe's verdict, with the URL named when it is no longer the one in the box.
@@ -1040,7 +1026,6 @@ fn sources_new(hdlg: HWND) {
         return;
     };
     let data = unsafe { &mut *data };
-    let name = source.name.clone();
     if !data.editor.add_source(source) {
         set_dlg_text(
             hdlg,
@@ -1049,8 +1034,8 @@ fn sources_new(hdlg: HWND) {
         );
         return;
     }
-    if let Some(secret) = setup.draft.secret_to_store().map(|(_, secret)| secret) {
-        data.store.push((name, secret));
+    if let Some(secret) = setup.draft.secret.clone() {
+        data.editor.secret_typed(secret);
     }
     sources_redraw(hdlg, data);
     // **A source with no tails shows nothing**, so the last page offers one and this is where the
@@ -1202,38 +1187,20 @@ fn sources_edit_tail(hdlg: HWND) {
     sources_redraw(hdlg, data);
 }
 
-/// What an accepted source editor leaves behind: the source on the chosen row, and the secret to
-/// store.
+/// What an accepted source editor leaves behind: the source on the chosen row, and whatever the
+/// reader typed into the secret box.
 ///
 /// **A renamed source takes its credential with it**, which it did not until 2026-10-21 although
-/// this comment said so. The store is keyed on the name, and the old code put the old name on
-/// `forget` while nothing put the new one on `store` — so a reader correcting a typo in a name lost
-/// the secret, with nothing said, and the row then read `(no secret stored)` for ever. The sign-in
-/// was orphaned at the same moment, because nothing has ever called `forget_refresh` on a rename.
-/// `Tailhawk/loki-tokens/nurtur-loki-live` is one of those, in this machine's own store. The rename
-/// now goes on [`SourcesEdit::rename`] and the shell moves both halves through
-/// `secrets::follow_rename`.
+/// a comment here said so: the store is keyed on the name, and the old name went to be forgotten
+/// while nothing was stored under the new one, so a reader correcting a typo lost the secret and
+/// the row read `(no secret stored)` for ever. `Tailhawk/loki-tokens/nurtur-loki-live` is one of
+/// those, in this machine's own store. The row's credential record now carries the original name,
+/// and `Editor::secret_plan` moves both halves through `secrets::follow_rename` at Close.
 fn sources_took_source(hdlg: HWND, data: &mut SourcesEdit, edit: SourceEdit) {
-    let was = match data.editor.chosen() {
-        tailhawk_core::sourceset::Chosen::Source(at) => {
-            data.editor.source(at).map(|s| s.name.clone())
-        }
-        _ => None,
-    };
-    let source = edit.draft.into_source();
-    // **A rename moves the credential; it does not delete it.** See [`SourcesEdit::rename`].
-    if let Some(old) = was.filter(|old| !old.trim().is_empty() && *old != source.name) {
-        data.rename.push((old, source.name.clone()));
-    }
-    // **A mode with no use for a secret gives the stored one up.** Switching a source from a client
-    // secret to a browser sign-in otherwise left the credential in the store for ever, for a flow
-    // that will never send it.
-    if let Some(gone) = edit.draft.secret_to_forget(edit.has_secret) {
-        data.forget.push(gone);
-    }
-    data.editor.replace_source(source);
-    if let Some((name, secret)) = edit.draft.secret_to_store() {
-        data.store.push((name, secret));
+    let typed = edit.draft.secret.clone();
+    data.editor.replace_source(edit.draft.into_source());
+    if let Some(secret) = typed {
+        data.editor.secret_typed(secret);
     }
     sources_redraw(hdlg, data);
 }
@@ -1479,14 +1446,7 @@ fn sources_remove(hdlg: HWND) {
         return;
     };
     let data = unsafe { &mut *data };
-    // **The names are remembered so their credentials can be deleted too.** A source removed while
-    // its secret stayed in Credential Manager leaves a credential nobody can see and nobody will
-    // revoke. A tail reports none, because it has none.
-    for gone in data.editor.remove() {
-        if !gone.trim().is_empty() {
-            data.forget.push(gone);
-        }
-    }
+    data.editor.remove();
     sources_redraw(hdlg, data);
 }
 
@@ -1500,7 +1460,7 @@ fn sources_state(hdlg: HWND) -> Option<*mut SourcesEdit> {
 /// user can paste the secret into which will store it securely."*
 ///
 /// Reports whether the set was accepted. The caller writes `editor.sources()` into its settings and
-/// takes `store` and `forget` to Credential Manager.
+/// takes `editor.secret_plan()` to Credential Manager.
 pub fn show_sources_dialog(hwnd: HWND, data: &mut SourcesEdit) -> bool {
     // **The tree classes are asked for explicitly.** comctl32 is already loaded by the manifest and
     // the list views on the other dialogs work without this — but `SysTreeView32` is new to this
@@ -2371,7 +2331,8 @@ fn setup_read(hdlg: HWND, data: &mut SourceSetup) {
             //
             // **And a mode with no use for a secret holds none**, rather than keeping one typed
             // under another mode in plaintext for the rest of the dialog's life. The store was
-            // never at risk — `secret_to_store` gates on `needs_secret` — but the draft was.
+            // never at risk — `Editor::secret_plan` writes only for a mode that wants one — but
+            // the draft was.
             data.draft.secret = if data.draft.mode_now().needs_secret() {
                 Some(dlg_text(hdlg, ID_G_SECRET))
             } else {
@@ -2796,15 +2757,11 @@ pub struct SourceEdit {
     /// Whether this source already has a secret in the store, so the box can say so without the
     /// dialog ever being told what it is — `sourceset`'s rule, one source along.
     pub has_secret: bool,
-    /// The name this source had when the editor opened. **The stored secret belongs to that name**,
-    /// not to whatever is in the box now.
-    opened_as: String,
 }
 
 impl SourceEdit {
     pub fn new(draft: tailhawk_core::sourcesetup::Draft, has_secret: bool) -> Self {
         Self {
-            opened_as: draft.name.trim().to_owned(),
             draft,
             accepted: false,
             has_secret,
@@ -3047,11 +3004,11 @@ fn editor_quietly<R>(write: impl FnOnce() -> R) -> R {
 
 /// The fault line, and the one piece of state the secret box can honestly show.
 fn source_edit_say(hdlg: HWND, data: &SourceEdit) {
-    // **A renamed source has no secret yet, whatever the store held when this opened.** The
-    // credential is filed under the name, so the moment the name in the box differs the stored one
-    // belongs to a source that is about to stop existing — and saying "a secret is stored" right up
-    // to OK, after which it is deleted, tells the reader the opposite of what happens.
-    let stored = data.has_secret && data.draft.name.trim() == data.opened_as;
+    // **A renamed source keeps its secret**, since 2026-10-26: the credential record is on the
+    // row and `Editor::secret_plan` moves the store's entry with the name at Close. This used to
+    // say the source had none the moment the name in the box differed, which was true of the old
+    // reconciliation and would now invite the reader to retype a secret that is about to follow.
+    let stored = data.has_secret;
     let said = match data.draft.fault() {
         Some(why) => why.to_owned(),
         None => match (data.draft.mode_now().needs_secret(), stored) {

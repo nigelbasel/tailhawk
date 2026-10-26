@@ -397,32 +397,6 @@ impl Draft {
             Mode::SignIn => !self.client_id.trim().is_empty() && !self.auth_url.trim().is_empty(),
         }
     }
-
-    /// The secret to store, and the name to store it under — or `None` when nothing was typed or
-    /// this mode has no use for one.
-    ///
-    /// **A mode that does not use a secret hands none over**, so switching a source to the browser
-    /// flow cannot leave a client secret behind in the store for a flow that will never send it.
-    pub fn secret_to_store(&self) -> Option<(String, String)> {
-        let secret = self.secret.clone()?;
-        self.mode_now()
-            .needs_secret()
-            .then(|| (self.name.trim().to_owned(), secret))
-    }
-
-    /// The name whose stored secret should be **deleted**, if any.
-    ///
-    /// **Handing none over is what leaves one behind.** [`Self::secret_to_store`] returning `None`
-    /// for a mode with no use for a secret was described as preventing a credential being stranded
-    /// in the store; it is what causes it. A source switched from a client secret to a browser
-    /// sign-in kept its secret in Credential Manager indefinitely, for a flow that will never send
-    /// it — and nothing on screen said so.
-    ///
-    /// `stored` is the shell's answer to whether there is one, carried in rather than looked up,
-    /// for the reason this whole module takes its facts as arguments.
-    pub fn secret_to_forget(&self, stored: bool) -> Option<String> {
-        (stored && !self.mode_now().needs_secret()).then(|| self.name.trim().to_owned())
-    }
 }
 
 /// One box on a source's form, and what it is for.
@@ -928,10 +902,6 @@ mod tests {
             source.scope, "telemetry:read offline_access",
             "and no openid on a client-credentials exchange, where it means nothing"
         );
-        assert_eq!(
-            secret.secret_to_store(),
-            Some(("dev".to_owned(), "shh".to_owned()))
-        );
 
         let mut open = named("lab");
         open.tested(Reach::Answered);
@@ -939,11 +909,6 @@ mod tests {
         let source = open.into_source();
         assert_eq!(source.fault(), None, "{:?}", source.fault());
         assert!(source.token_url.is_empty() && source.client_id.is_empty());
-        assert_eq!(
-            open.secret_to_store(),
-            None,
-            "nothing to store for a mode with no secret"
-        );
     }
 
     /// **Changing your mind leaves nothing of the path not taken.** `Source::signs_in` is
@@ -968,11 +933,6 @@ mod tests {
         assert_eq!(source.fault(), None);
         assert!(source.token_url.is_empty(), "nor did the token URL");
         assert!(source.scope.is_empty());
-        assert_eq!(
-            draft.secret_to_store(),
-            None,
-            "and a typed secret is not filed against a source that will never send one"
-        );
     }
 
     /// **Discovery proposes; it does not overwrite what the reader has said.**

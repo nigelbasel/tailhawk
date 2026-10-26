@@ -11104,67 +11104,34 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         let mut edit = dialog::SourcesEdit {
             editor: tailhawk_core::sourceset::Editor::new(known, tails, stored),
             accepted: false,
-            store: Vec::new(),
-            forget: Vec::new(),
-            rename: Vec::new(),
             open: Vec::new(),
         };
         // No `STATE` borrow is held across this: the dialog pumps its own modal loop.
         if dialog::show_sources_dialog(hwnd, &mut edit) {
-            // **Reconciled against the set that is actually being saved, first.** Both lists are
-            // collected as the reader works, and a sitting can contradict itself: give `live` a
-            // secret and then delete `live`, and the naive order writes a credential for a source
-            // that no longer exists; rename `live` to `tmp` and back, and `forget` still holds
-            // `live` — the name the surviving source has — so a working source loses its secret
-            // with nothing on screen having said so. A name that survived is never forgotten, and
-            // a name that did not survive is never written.
-            let kept: Vec<&str> = edit
-                .editor
-                .sources()
-                .iter()
-                .map(|source| source.name.as_str())
-                .collect();
-            edit.forget.retain(|gone| !kept.contains(&gone.as_str()));
-            edit.store.retain(|(name, _)| kept.contains(&name.as_str()));
-            // **A rename only moves a credential onto a source that survived the sitting.** Rename
-            // `live` to `tmp` and then delete `tmp`, and moving the credential first would put it
-            // under a name nothing references — which is the orphan this exists to clear.
-            edit.rename.retain(|(_, now)| kept.contains(&now.as_str()));
-            // **Credential Manager first, settings second.** If the write fails, the source is not
-            // yet recorded as configured — the other order would leave a source that looks ready
-            // and has no secret behind it.
+            // **The editor decides, in `sourceset::Editor::secret_plan`; this only acts, in the
+            // order the plan's fields are declared.** Three name-keyed lists reconciled here
+            // against the surviving names lost a secret typed for a source renamed in the same
+            // sitting, moved nothing for a rename that passed through a middle name, and left a
+            // secret behind a source whose mode had stopped wanting one — see `Credential` there.
             //
-            // **Moves before deletes**, because a rename is a move and the name it moves *from* is
-            // not on `forget` — but a delete of some other source might name it, and taking the
-            // credential away before the move would make the move find nothing. `follow_rename`
-            // carries the client secret and the refresh token together, which is the half a rename
-            // has never done.
-            if !edit.rename.is_empty() {
-                let moves: Vec<tailhawk_core::settings::Renamed> = edit
-                    .rename
-                    .iter()
-                    .map(|(was, now)| tailhawk_core::settings::Renamed {
-                        now: now.clone(),
-                        was: vec![was.clone()],
-                    })
-                    .collect();
-                secrets::follow_rename(&moves);
-            }
-            for gone in &edit.forget {
+            // **Credential Manager first, settings second.** If a write fails, the source is not
+            // yet recorded as configured — the other order would leave a source that looks ready
+            // and has no secret behind it. A deleted source's **sign-in** goes with its secret:
+            // every source ever deleted before this left its refresh token under a name no longer
+            // in the settings file, invisible and unrevokable from inside the product.
+            let plan = edit.editor.secret_plan();
+            for gone in &plan.forget {
                 secrets::forget(gone);
-                // A deleted source's **sign-in** goes with it. Nothing did this, so every source
-                // ever deleted left its refresh token in the store under a name no longer in the
-                // settings file — invisible and unrevokable from inside the product.
                 secrets::forget_refresh(gone);
             }
-            // **Every secret typed in this sitting, not just the last.** The list dialog outlives
-            // each editor that opens over it, so three sources can be given one before Close.
-            for (name, secret) in edit.store.drain(..) {
-                if secret.is_empty() {
-                    secrets::forget(&name);
-                } else {
-                    secrets::store(&name, &secret);
-                }
+            if !plan.moves.is_empty() {
+                secrets::follow_rename(&plan.moves);
+            }
+            for (name, secret) in &plan.store {
+                secrets::store(name, secret);
+            }
+            for name in &plan.clear {
+                secrets::forget(name);
             }
             STATE.with(|s| {
                 if let Some(shell) = s.borrow_mut().as_mut() {
