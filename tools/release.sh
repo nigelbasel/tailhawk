@@ -95,21 +95,32 @@ auth=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.githu
 
 # `id` and `draft` of the release already carrying this tag, if any: a published one means a
 # re-run of a workflow that already did its job; a draft is a failed run's leftover.
-field() { python3 -c 'import json,sys
+#
+# The JSON is read by small Python programs kept free of nested quoting — a backslash inside an
+# f-string is a syntax error before Python 3.12, and a script that cannot be run on a developer's
+# box cannot be dry-run there either.
+field() {
+  python3 -c 'import json, sys
 try:
     print(json.load(sys.stdin).get(sys.argv[1], ""))
 except Exception:
-    print("")' "$1"; }
-existing=$(curl -sS "$api?per_page=50" "${auth[@]}" | python3 -c '
-import json, sys
+    print("")' "$1"
+}
+code=$(curl -sS -o "$out/releases.json" -w '%{http_code}' "$api?per_page=50" "${auth[@]}")
+if [ "$code" != "200" ]; then
+  echo "could not list the releases: HTTP $code" >&2
+  cat "$out/releases.json" >&2
+  exit 1
+fi
+existing=$(python3 -c 'import json, sys
 tag = sys.argv[1]
 try:
-    for r in json.load(sys.stdin):
+    for r in json.load(open(sys.argv[2])):
         if r.get("tag_name") == tag:
-            print(f"{r.get(\"id\")} {str(r.get(\"draft\")).lower()}")
+            print(str(r.get("id")) + " " + str(r.get("draft")).lower())
             break
 except Exception:
-    pass' "$tag")
+    pass' "$tag" "$out/releases.json")
 if [ -n "$existing" ]; then
   existing_id=${existing%% *}
   existing_draft=${existing##* }
@@ -122,11 +133,11 @@ if [ -n "$existing" ]; then
   [ "$code" = "204" ] || { echo "could not delete draft $existing_id: HTTP $code" >&2; exit 1; }
 fi
 
-code=$(curl -sS -o /tmp/create.json -w '%{http_code}' -X POST "$api" "${auth[@]}" -d "$request")
-release_id=$(field id < /tmp/create.json)
+code=$(curl -sS -o "$out/create.json" -w '%{http_code}' -X POST "$api" "${auth[@]}" -d "$request")
+release_id=$(field id < "$out/create.json")
 if [ "$code" != "201" ] || [ -z "$release_id" ]; then
   echo "the draft release was not created: HTTP $code" >&2
-  cat /tmp/create.json >&2
+  cat "$out/create.json" >&2
   exit 1
 fi
 echo "created draft release $release_id"
@@ -134,22 +145,22 @@ echo "created draft release $release_id"
 for asset in tailhawk-x64.exe tailhawk-arm64.exe tailhawk-x64.zip tailhawk-arm64.zip SHA256SUMS.txt; do
   type="application/octet-stream"
   [ "$asset" = "SHA256SUMS.txt" ] && type="text/plain"
-  code=$(curl -sS -o /tmp/upload.json -w '%{http_code}' -X POST \
+  code=$(curl -sS -o "$out/upload.json" -w '%{http_code}' -X POST \
     "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$asset" \
     "${auth[@]}" -H "Content-Type: $type" --data-binary "@$out/$asset")
   if [ "$code" != "201" ]; then
     echo "uploading $asset failed with HTTP $code; the draft $release_id is left for the next run to replace" >&2
-    cat /tmp/upload.json >&2
+    cat "$out/upload.json" >&2
     exit 1
   fi
   echo "uploaded $asset"
 done
 
-code=$(curl -sS -o /tmp/publish.json -w '%{http_code}' -X PATCH "$api/$release_id" "${auth[@]}" \
+code=$(curl -sS -o "$out/publish.json" -w '%{http_code}' -X PATCH "$api/$release_id" "${auth[@]}" \
   -d '{"draft": false, "make_latest": "true"}')
 if [ "$code" != "200" ]; then
   echo "publishing release $release_id failed with HTTP $code; it is still a draft" >&2
-  cat /tmp/publish.json >&2
+  cat "$out/publish.json" >&2
   exit 1
 fi
 echo "published https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag"
