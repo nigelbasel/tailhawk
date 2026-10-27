@@ -1,5 +1,39 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-27, evening: lifting a trace puts the view back
+
+The owner, on the deployed build: *"When I use the trace feature, and then undo it, the tail goes
+back to the top of the tail, not to the end."*
+
+**The cause was a pass that never runs.** Following a trace narrows the view through the filter
+machinery, and the pass that lands the survivors is what sizes the grid. Stopping the trace — a
+second press, or `Esc` — takes it off and calls `refilter`, which rightly does nothing for an
+unfiltered view; so nothing told the grid the view was the whole file again. It went on holding
+the trace's rows at row zero: the top of the file, or, on a live tail, the bottom at the next
+line to arrive, and never where the reader had been.
+
+- **`Origin { row, following }` on `Document`.** `note_origin` records the top row and the grid's
+  own `is_following` the moment a filter first narrows an unfiltered view (`follow_trace`,
+  `add_chip`, a history step); a second filter leaves it alone. `restore_origin` runs when the
+  last filter is lifted (`follow_trace`'s stop path, `clear_filter`): it sizes the grid to the
+  whole file, then resumes following or returns to the row. A reader who scrolled up *inside*
+  the trace view still goes back to the tail they left, because the origin was taken before.
+- **`Alt+←` now brings a stopped trace back.** The stop path called `remember` *after* taking
+  the trace off, so the history held the stopped view and the undo was empty — a second defect
+  in the same six lines, fixed by the same change and pinned by the same test.
+- **The pre-commit review found the two other doors.** `Ctrl+E` (the collapse, duplicated in
+  the key handler and the command) and the filters dialog's OK changed the filters outside the
+  protocol, so the origin could go stale and a later `Esc` would have yanked a reader who had
+  scrolled up to read to the bottom. Both now go through `Document` — `toggle_collapse` and
+  `replace_chips` — which note and restore like the rest; the duplicated collapse block is gone.
+  Neither resizes the grid before its pass lands any more, which also stops the pre-existing
+  `set_total_rows(0)` that made `is_following` false before the first chunk arrived.
+- **Test** `lifting_a_trace_puts_the_view_back_where_following_began`: failed on the grid's row
+  count before the fix; seven mutations watched fail after it (grid not resized, following not
+  resumed, row not restored, origin not noted, the old `remember` order, the filtered guard
+  dropped, the collapse not restoring). Knowingly left: `Esc` does not lift the collapse, so with
+  the collapse on, `Esc` after a trace leaves the view narrowed until the collapse is turned off.
+
 ## ▶ Resume point — 2026-10-27, later: every green push to master is a release
 
 The owner: *"update the pipeline on github to always give me a latest build that can be

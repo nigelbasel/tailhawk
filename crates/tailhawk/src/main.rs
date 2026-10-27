@@ -339,6 +339,8 @@ struct Document {
     labels: Vec<(u8, String)>,
     /// E27's back/forward through views.
     history: History,
+    /// Where the view stood when a filter first narrowed it, until the last filter is lifted.
+    origin: Option<Origin>,
     /// V10's record detail pane.
     detail: DetailPane,
     /// E21's export or live tee, while one is in progress.
@@ -938,6 +940,7 @@ impl Document {
             bookmarks: Default::default(),
             labels: Vec::new(),
             history: History::default(),
+            origin: None,
             detail: DetailPane::default(),
             tee: None,
             show_footer: true,
@@ -1017,6 +1020,7 @@ impl Document {
             bookmarks: Default::default(),
             labels: Vec::new(),
             history: History::default(),
+            origin: None,
             detail: DetailPane::default(),
             tee: None,
             show_footer: true,
@@ -1926,6 +1930,7 @@ impl Document {
             || self.filtering.records_only != state.records_only
             || self.filtering.trace != state.trace;
         if filter_changed {
+            self.note_origin();
             self.filtering.chips = state.chips;
             self.filtering.records_only = state.records_only;
             self.filtering.trace = state.trace;
@@ -1934,6 +1939,9 @@ impl Document {
             self.refilter();
             let rows = self.view_rows();
             self.view.grid_mut().set_total_rows(rows);
+            if !self.filtering.filtered() {
+                self.origin = None;
+            }
         }
         self.view.grid_mut().scroll_to_row(state.row);
     }
@@ -1952,10 +1960,15 @@ impl Document {
         // **Pressed again, it stops** — the owner's ask of 2026-09-21, and what every other state
         // button on the row already does. Following used to add an include chip, so a second press
         // added a second copy of the same id to the reader's own filter list.
-        if let Some(id) = self.filtering.trace.take() {
+        //
+        // **Remembered before the trace comes off.** `remember` after `take` recorded the stopped
+        // view, so `Alt+←` had nothing to bring back.
+        if let Some(id) = self.filtering.trace.clone() {
             self.remember();
+            self.filtering.trace = None;
             self.filtering.clear_results();
             self.refilter();
+            self.restore_origin();
             return Some(format!("Stopped following trace {id}"));
         }
         let row = self.caret_row()?;
@@ -1965,6 +1978,7 @@ impl Document {
             Some(id) => {
                 let id = id.to_owned();
                 self.remember();
+                self.note_origin();
                 self.filtering.error = None;
                 self.filtering.trace = Some(id.clone());
                 self.filtering.clear_results();
@@ -1989,6 +2003,7 @@ impl Document {
         match Chip::parse(text, polarity) {
             Ok(chip) => {
                 self.remember();
+                self.note_origin();
                 self.filtering.error = None;
                 self.filtering.chips.chips.push(chip);
                 self.filtering.clear_results();
@@ -2015,9 +2030,75 @@ impl Document {
         // And a pass, for the same reason `follow_trace` needs one: the survivors are gone until
         // something recomputes them, and an unfiltered view is still a row space to rebuild.
         self.refilter();
-        {
-            let rows = self.view_rows();
-            self.view.grid_mut().set_total_rows(rows);
+        self.restore_origin();
+    }
+
+    /// The filters dialog's Apply or OK: the chips become `chips`, whatever they were.
+    ///
+    /// **`clear_results` before `refilter`, as every other path that changes a chip does.**
+    /// `refilter` starts a pass only over rows no pass has covered, and `covered` is set to the
+    /// total the moment a pass begins, so without the clear it returned at once and left the
+    /// previous filter's survivors standing: editing a filter and pressing Apply or OK changed the
+    /// text and not the view. The grid is not resized here: the pass sizes it when it lands, as
+    /// `add_chip` leaves it, and lifting the last chip puts the view back where the first one
+    /// found it.
+    fn replace_chips(&mut self, chips: Chips) {
+        self.note_origin();
+        self.filtering.chips = chips;
+        self.filtering.error = None;
+        self.filtering.clear_results();
+        self.refilter();
+        self.restore_origin();
+    }
+
+    /// `Ctrl+E`: §6.4's collapse, as a toggle — only with a format, since only a format knows
+    /// what a first line is. Reports whether there was a format to collapse by.
+    ///
+    /// On the same footing as a chip: the collapse is one of the three things the pass composes,
+    /// so turning it on notes where the view stood and turning it off, when nothing else narrows
+    /// the view, puts it back there.
+    fn toggle_collapse(&mut self) -> bool {
+        if self.detection.accepted.is_none() {
+            return false;
+        }
+        self.remember();
+        self.note_origin();
+        self.filtering.records_only = !self.filtering.records_only;
+        self.filtering.clear_results();
+        self.refilter();
+        self.restore_origin();
+        true
+    }
+
+    /// Notes where the view stands before a filter narrows it — only the first filter, since a
+    /// second one narrows a view the reader has already left.
+    fn note_origin(&mut self) {
+        if self.filtering.filtered() {
+            return;
+        }
+        let grid = self.view.grid();
+        self.origin = Some(Origin {
+            row: grid.scroll().row,
+            following: grid.is_following(),
+        });
+    }
+
+    /// Once nothing narrows the view any more, tells the grid it is the whole file again and puts
+    /// it back where [`Origin`] says it stood. Nothing happens while a filter is still in force:
+    /// the pass that is running will size the grid when it lands.
+    fn restore_origin(&mut self) {
+        if self.filtering.filtered() {
+            return;
+        }
+        let rows = self.view_rows();
+        self.view.grid_mut().set_total_rows(rows);
+        let Some(origin) = self.origin.take() else {
+            return;
+        };
+        if origin.following {
+            self.view.grid_mut().scroll_to_bottom();
+        } else {
+            self.view.grid_mut().scroll_to_row(origin.row);
         }
     }
 
@@ -3708,6 +3789,20 @@ struct ViewState {
     /// collapse and left the trace exactly as it was, on or off.
     trace: Option<String>,
     row: u64,
+}
+
+/// Where the view stood the moment a filter first narrowed it: the top row, and whether the
+/// reader was following the tail.
+///
+/// **Lifting the last filter puts the view back here, and that needs saying because no pass
+/// does it.** Taking a trace off, or `Esc`, leaves nothing to sieve, so nothing told the grid the
+/// view was the whole file again: it went on holding the trace's few rows at row zero — the top of
+/// the file — which is what the owner saw on 2026-10-27. A reader who was following follows again,
+/// even after scrolling up inside the narrowed view; one who had scrolled up to a line is back on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Origin {
+    row: u64,
+    following: bool,
 }
 
 /// A native control that draws in the shell font, so the DPI pass can re-font them together.
@@ -6555,18 +6650,9 @@ impl Shell {
             return self.run(hwnd, Command::EditLastChip);
         }
         if key == VK_E.0 {
-            // §6.4's collapse, as a toggle: only with a format, since only a format knows what a
-            // first line is. Provisional binding, like `Ctrl+I`.
-            if doc.detection.accepted.is_none() {
+            // §6.4's collapse, as a toggle. Provisional binding, like `Ctrl+I`.
+            if !doc.toggle_collapse() {
                 return true;
-            }
-            doc.remember();
-            doc.filtering.records_only = !doc.filtering.records_only;
-            doc.filtering.clear_results();
-            doc.refilter();
-            {
-                let rows = doc.view_rows();
-                doc.view.grid_mut().set_total_rows(rows);
             }
             self.sync_scrollbar();
             self.retitle(hwnd);
@@ -7733,14 +7819,7 @@ impl Shell {
                 }
             }
             Command::ToggleCollapse => {
-                if doc.detection.accepted.is_some() {
-                    doc.remember();
-                    doc.filtering.records_only = !doc.filtering.records_only;
-                    doc.filtering.clear_results();
-                    doc.refilter();
-                    let rows = doc.view_rows();
-                    doc.view.grid_mut().set_total_rows(rows);
-                }
+                doc.toggle_collapse();
             }
             Command::RevealInvisibles => {
                 let cells = doc.view.cells_mut();
@@ -11991,20 +12070,7 @@ pub fn filters_apply(owner: HWND) {
         if let Some(shell) = s.borrow_mut().as_mut() {
             let chips = shell.filters_editor.commit();
             if let Some(doc) = shell.document.as_mut() {
-                doc.filtering.chips = chips;
-                doc.filtering.error = None;
-                // **`clear_results` before `refilter`, as every other path that changes a chip
-                // does** — `add_chip`, `clear_filter`, `follow_trace`, `apply_view_state` and the
-                // collapse all do, and this one did not. `refilter` starts a pass only over rows
-                // no pass has covered, and `covered` is set to the total the moment a pass begins,
-                // so without the clear it returned at once and left the previous filter's
-                // survivors standing: editing a filter and pressing Apply or OK changed the text
-                // and not the view. From a view a filter had emptied, the window stayed empty and
-                // the only thing that recovered it was removing every filter.
-                doc.filtering.clear_results();
-                doc.refilter();
-                let rows = doc.view_rows();
-                doc.view.grid_mut().set_total_rows(rows);
+                doc.replace_chips(chips);
             }
         }
     });
@@ -17778,6 +17844,146 @@ mod tests {
             !doc.filtering.filtered(),
             "and the view is no longer narrowed by anything"
         );
+    }
+
+    /// **Lifting a trace puts the view back where following began.**
+    ///
+    /// The owner, 2026-10-27: *"When I use the trace feature, and then undo it, the tail goes back
+    /// to the top of the tail, not to the end."* Stopping took the trace off and started no pass,
+    /// because an unfiltered view needs none — and so nothing told the grid the view was the whole
+    /// file again. It went on holding the trace's rows at row zero, which is the top of the file.
+    /// A reader who was following the tail follows it again, even after scrolling up inside the
+    /// trace view; one who had scrolled up to a line is back on that line; `Esc` does the same as
+    /// a second press; and `Alt+←` brings the trace back.
+    #[test]
+    fn lifting_a_trace_puts_the_view_back_where_following_began() {
+        let path = std::env::temp_dir().join("tailhawk_trace_origin_test.log");
+        let mut text = String::new();
+        for i in 0..200 {
+            let id = if i % 10 == 5 {
+                "0af7651916cd43dd8448eb211c80319c"
+            } else {
+                "4bf92f3577b34da6a3ce929d0e0e4736"
+            };
+            text.push_str(&format!("{{\"traceId\":\"{id}\",\"msg\":\"line {i}\"}}\n"));
+        }
+        std::fs::write(&path, text).expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        fn landed(doc: &mut Document) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+                doc.poll_filter();
+                std::thread::yield_now();
+            }
+            doc.poll_filter();
+        }
+
+        doc.view.grid_mut().scroll_to_bottom();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(
+            doc.view.grid().is_following(),
+            "the reader is following the tail"
+        );
+        assert!(doc.follow_trace().is_some());
+        landed(&mut doc);
+        assert_eq!(doc.view_rows(), 180, "the trace's own rows");
+        assert_eq!(doc.view.grid().total_rows(), 180);
+        doc.view.grid_mut().scroll_to_row(0);
+        assert!(doc.follow_trace().is_some(), "pressed again, it stops");
+        assert_eq!(
+            doc.view.grid().total_rows(),
+            200,
+            "the grid is the whole file again"
+        );
+        assert!(
+            doc.view.grid().is_following(),
+            "and the reader is at the tail they left, not the top"
+        );
+
+        assert!(doc.history_step(true), "Alt+← undoes the stop");
+        assert_eq!(
+            doc.filtering.trace.as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736"),
+            "so the trace is followed again"
+        );
+        assert!(doc.history_step(false), "and Alt+→ redoes it");
+        assert_eq!(doc.filtering.trace, None);
+
+        doc.view.grid_mut().scroll_to_row(50);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(doc.follow_trace().is_some());
+        landed(&mut doc);
+        doc.view.grid_mut().scroll_to_row(100);
+        assert!(doc.follow_trace().is_some());
+        assert_eq!(doc.view.grid().total_rows(), 200);
+        assert_eq!(
+            doc.view.grid().scroll().row,
+            50,
+            "a reader who had scrolled up is back on the line the trace was taken from"
+        );
+
+        doc.view.grid_mut().scroll_to_bottom();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(doc.follow_trace().is_some());
+        landed(&mut doc);
+        doc.view.grid_mut().scroll_to_row(0);
+        doc.clear_filter();
+        assert_eq!(
+            doc.view.grid().total_rows(),
+            200,
+            "Esc lifts it the same way"
+        );
+        assert!(doc.view.grid().is_following());
+
+        // A chip the reader wrote stays in force when the trace stops, and the origin waits
+        // for the last filter to go.
+        doc.view.grid_mut().scroll_to_bottom();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.add_chip("line", Polarity::Include);
+        landed(&mut doc);
+        assert!(doc.follow_trace().is_some());
+        landed(&mut doc);
+        doc.view.grid_mut().scroll_to_row(0);
+        assert!(doc.follow_trace().is_some());
+        assert!(
+            doc.filtering.filtered(),
+            "the reader's chip is still in force"
+        );
+        assert_eq!(
+            doc.origin.map(|o| o.following),
+            Some(true),
+            "so the origin waits for the last filter"
+        );
+        landed(&mut doc);
+        assert_eq!(
+            doc.view.grid().total_rows(),
+            200,
+            "every line carries the chip's word"
+        );
+        doc.view.grid_mut().scroll_to_row(0);
+        doc.clear_filter();
+        assert!(
+            doc.view.grid().is_following(),
+            "and Esc on the last of them goes back to the tail"
+        );
+
+        // The collapse is one of the three things the pass composes, so it is a filter here too.
+        doc.view.grid_mut().scroll_to_bottom();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(
+            doc.toggle_collapse(),
+            "the fixture is detected, so there is a format"
+        );
+        landed(&mut doc);
+        doc.view.grid_mut().scroll_to_row(0);
+        assert!(doc.toggle_collapse());
+        assert!(!doc.filtering.filtered());
+        assert!(
+            doc.view.grid().is_following(),
+            "turning the collapse off goes back to the tail"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// A log whose lines Serilog detection accepts, for the fitting tests.
