@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One run per branch at a time, and on master the newer push cancels the older run: two pushes a
+# minute apart would otherwise race to publish, and whichever finished *last* would be the release
+# the stable download address answers with — the older build, half the time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/master' }}
+
 env:
   CARGO_TERM_COLOR: always
   # SPEC.md §2: copy-and-run on a machine with no runtime installed. The dynamic build imports
@@ -74,6 +81,10 @@ jobs:
 
   build:
     runs-on: windows-latest
+    # Both legs stamp the same version (see "Pin the version stamp"), so whichever leg writes
+    # this last, the release job reads the one stamp.
+    outputs:
+      version: ${{ steps.stamp.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -102,8 +113,26 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
 
+      # build.rs stamps the exe with the date and a revision from the clock, so two runners would
+      # stamp two versions seconds apart and the release that carries both could name neither.
+      # SOURCE_DATE_EPOCH, the reproducible-builds convention build.rs honours, pins the stamp to
+      # the commit's own time: one version across both legs, and it names the commit.
+      - name: Pin the version stamp to the commit
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      # Read back out of the exe rather than recomputed here, so the release is named after what
+      # the file actually says of itself — the same call version::tests makes.
+      - name: Version stamp
+        id: stamp
+        shell: pwsh
+        run: |
+          $v = (Get-Item "target/${{ matrix.target }}/release/tailhawk.exe").VersionInfo.FileVersion
+          "tailhawk.exe (${{ matrix.arch }}) is $v"
+          "version=$v" >> $env:GITHUB_OUTPUT
 
       # Host-only: the runner cannot execute an ARM64 binary, and clippy/tests are
       # architecture-independent, so running them once on x64 is sufficient.
@@ -247,3 +276,38 @@ jobs:
           name: tailhawk-${{ matrix.arch }}-unsigned
           path: target/${{ matrix.target }}/release/tailhawk.exe
           if-no-files-found: error
+
+  # SPEC.md §2.3: GitHub Releases are the primary distribution — a bare exe per architecture plus
+  # a .zip. The owner, 2026-10-27: "always give me a latest build that can be downloaded ... I can
+  # point other developers to that". Every push to master that every job above passed becomes a
+  # release tagged with the build's own version stamp, and GitHub's `releases/latest/download/`
+  # redirect then always answers with the newest one:
+  #
+  #   https://github.com/nigelbasel/tailhawk/releases/latest/download/tailhawk-x64.exe
+  #
+  # Only after every other job is green on the same commit, so that address never hands out a
+  # build the gate refused; only on a push to master, so a pull request builds and is never
+  # published. The work is tools/release.sh, which has a --dry-run for a developer machine.
+  release:
+    needs: [deny, provenance, portable-core, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tailhawk-x64-unsigned
+          path: dist/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: tailhawk-arm64-unsigned
+          path: dist/arm64
+      - name: Publish the release
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          DIST: dist
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash tools/release.sh

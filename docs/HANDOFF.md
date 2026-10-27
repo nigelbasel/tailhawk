@@ -1,5 +1,38 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-27, later: every green push to master is a release
+
+The owner: *"update the pipeline on github to always give me a latest build that can be
+downloaded. Then I can point other developers to that."* `SPEC.md` §2.3 already named GitHub
+Releases as the primary distribution; nothing published one.
+
+- **`ci.yml`** gains a `release` job that runs only on a push to master, only after `deny`,
+  `provenance`, `portable-core` and both `build` legs are green on that commit, with
+  `contents: write`. It downloads the two artefacts and runs **`tools/release.sh`**, which
+  publishes a release tagged `v<version>` with `tailhawk-x64.exe`, `tailhawk-arm64.exe`, a `.zip`
+  of each and `SHA256SUMS.txt`, through `curl` against the REST API and the workflow's own token.
+  `--dry-run` builds the assets and prints the request without talking to GitHub.
+- **The address to give other developers:**
+  `https://github.com/nigelbasel/tailhawk/releases/latest/download/tailhawk-x64.exe` — GitHub's
+  own redirect to the newest release, so it never changes. Every build stays listed under its
+  version on the releases page.
+- **`build.rs` honours `SOURCE_DATE_EPOCH`**, which the build legs set to the commit's time, so
+  both legs stamp one version (it used to be the runner's clock, seconds apart per leg) and the
+  stamp names the commit. A developer build without the variable is unchanged.
+
+**Created as a draft, filled, then published** — the pre-commit review's one real finding: a
+release published first and filled second is *latest* for the seconds before its assets exist,
+and for ever if an upload fails, since the tag is pinned to the commit and a re-run cannot
+create it again. A draft has no tag and is not latest; a re-run deletes a leftover draft and
+starts again, and a run over a commit already released says so and stops. The workflow also
+cancels an older in-progress master run when a newer push arrives, so two quick pushes cannot
+race to be latest.
+
+**Not proven until the first release lands.** A workflow cannot run locally; the dry run proves
+the assets and the request body, and the first push after this is the proof of the rest — check
+the releases page and download the stable URL. Unsigned remains the v1 posture (PLAN §7.1), and
+the release body says so.
+
 ## ▶ Resume point — 2026-10-27: the columns a reader chose for a tail
 
 The create-liquidocean-firewall workstream's request, relayed by the owner:

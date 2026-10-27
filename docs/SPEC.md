@@ -133,6 +133,10 @@ public header comment and documentation.
 ### 2.3 Distribution
 
 - **Primary:** GitHub Releases — a bare `tailhawk.exe` per architecture, plus a `.zip`.
+  **Implemented 2026-10-27:** every push to master that passes every CI job is published as a release tagged
+  with the build's version stamp, carrying `tailhawk-x64.exe`, `tailhawk-arm64.exe`, a `.zip` of
+  each and `SHA256SUMS.txt`; the newest is always at
+  `https://github.com/nigelbasel/tailhawk/releases/latest/download/tailhawk-x64.exe`.
 - **scoop** first (bucket JSON manifest, zero friction for a portable exe, no signing requirement).
 - **winget** second (`InstallerType: portable`, supported since Package Manager 1.3).
 - **chocolatey** optional.

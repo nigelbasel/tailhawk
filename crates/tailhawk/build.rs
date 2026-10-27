@@ -69,11 +69,22 @@ fn main() {
 /// The UTC date, and how far into the day it is, without pulling in a date library for four
 /// numbers. Days-since-epoch to a civil date is Howard Hinnant's `civil_from_days`, which is public
 /// domain arithmetic rather than anyone's code.
+///
+/// **`SOURCE_DATE_EPOCH` is honoured** — the reproducible-builds convention, a Unix time in seconds.
+/// CI sets it to the commit's own time, so the x64 and arm64 legs, built on two runners seconds
+/// apart, stamp one version between them and the release that carries both can be named after it;
+/// and the stamp then says *which commit* rather than when a runner happened to link. Unset, which
+/// is every developer build, the clock is what it always was.
 fn now_utc() -> (u16, u16, u16, u32) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970")
-        .as_secs();
+    let secs = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|epoch| epoch.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_secs()
+        });
     let days = (secs / 86_400) as i64;
     let seconds_today = (secs % 86_400) as u32;
 
