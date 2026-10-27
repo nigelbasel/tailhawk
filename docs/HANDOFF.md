@@ -28,10 +28,15 @@ starts again, and a run over a commit already released says so and stops. The wo
 cancels an older in-progress master run when a newer push arrives, so two quick pushes cannot
 race to be latest.
 
-**Not proven until the first release lands.** A workflow cannot run locally; the dry run proves
-the assets and the request body, and the first push after this is the proof of the rest — check
-the releases page and download the stable URL. Unsigned remains the v1 posture (PLAN §7.1), and
-the release body says so.
+**Proven on the second push.** The first run failed before any call to GitHub: the runner's
+Python is older than 3.12 and refused a backslash-escaped quote inside an f-string in the release
+listing — a construct the dry run on a 3.11 developer box would have caught had that branch not
+been the one a dry run skips. Every JSON reader is now plain code fed by arguments. The second
+run, 40516413634, published **v2026.10.27.25070**; from a developer box,
+`https://github.com/nigelbasel/tailhawk/releases/latest/download/tailhawk-x64.exe` answered 200
+with 2,781,184 bytes whose SHA-256 matches the release's `SHA256SUMS.txt` and whose stamp is
+exactly what the commit's UTC time predicts. Every push to master now adds a release, this
+docs-only one included. Unsigned remains the v1 posture (PLAN §7.1), and the release body says so.
 
 ## ▶ Resume point — 2026-10-27: the columns a reader chose for a tail
 
