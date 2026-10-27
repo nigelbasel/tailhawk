@@ -1,5 +1,85 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-27: the columns a reader chose for a tail
+
+The create-liquidocean-firewall workstream's request, relayed by the owner:
+`C:\dev\tfsgit\TAILHAWK-REQUEST-loki-attribute-columns-2026-10-27.md` — attribute columns for
+Loki sources with a per-tail chooser, seven named defaults, the record kind keyed on `app` +
+`log_file_kind`, the choice persisted on the tail. Built, tested, **not yet seen on screen**.
+
+### What was missing
+
+A Loki window is a CLEF spill whose every label and metadata entry is a flat string key. Detection
+turns at most **six** of those into columns (`MAX_JSON_COLUMNS`, ranked by how many head rows carry
+them) and hides them until ticked, so a `p2s-access` record with thirty attributes never offered
+`status`, `method` or `path` to the chooser at all — the chooser only lists the layout's columns.
+`LOKI.md` §2's "detector keyed on `app`" was design intent with no code behind it: the body is
+never parsed.
+
+### What changed
+
+- **`chosen.rs`** (core, new): `keys_seen` — every text key a window's records carry, with the
+  rows and the record kinds (`kind_of`: `app/log_file_kind`, or the app alone) that carry it;
+  `DEFAULT_COLUMNS` / `default_columns` — the request's seven, kept where the window carries them;
+  `rows_of` / `choice_of` — the *Select columns* list for a remote window and what it hands back
+  (ticked keys in order, the display order naming every column once, the timestamp/level ticks);
+  `widen_to_titles` — a chosen column the sample never populated is shown at its title's width,
+  so an edge-only window has blank `method`/`path` columns rather than none.
+- **`format::json_chosen`**: a format whose columns are `[ts, level, chosen…, msg]`, read by
+  **`detect::json_fields`** — one scan of the line, shared with `json_keys` through `json_walk` —
+  instead of a lazy regex group per column. `Format` gains a private `scanned` flag that `fields`,
+  `parse` and `validity` branch on. No six-column cap, because the cap was the pattern's cost.
+- **`settings::Tail::columns`**, written as `columns = [...]` under `[[tail]]` only when non-empty;
+  empty means the defaults, so a later change to them still reaches an uncustomised tail.
+- **`filter.rs`**: an attribute carrying digits as text, asked a numeric question, answers as the
+  number — `status >= 500` and `bytes >= 1000` were text comparisons, and `"717" >= "1000"` is true
+  as text.
+- **Shell**: on a remote open the document adopts the tail's columns (or the defaults) *before*
+  the remembered widths are applied by position; the chooser's remote path lists `keys_seen` over
+  `Document::window_sample` (the head of the oldest and newest spill parts), draws a second list
+  column *Seen on* with the record kinds, and `remember_columns` writes the choice to the tail by
+  name. The dialog is 150 units wider when that column is present.
+
+### Not seen on screen, and what to look at
+
+The acceptance section of the request, against the owner's live tail
+`loki://starberry?apps=sb-edge,sb-gateway,sb-origin`: the seven defaults should appear without
+choosing anything; *Format ▸ Select columns…* should list ~30 keys with their kinds; a `p2s-stream`
+row blank under `method`/`path`; the `status` header sorts; *Filter on status…* with `>= 500`;
+the choice back after a restart (`columns = [...]` in `tailhawk.settings.toml`). The suite proves
+each decision and the end-to-end test in `main.rs` proves the grid, but the dialog's second column
+and its width have never been drawn, and a `Seen on` cell of four kinds may need the column wider.
+
+### What the pre-commit review caught
+
+Four things, all fixed before the commit: the numeric reading of a text attribute applied to `=`
+too, so `order = 88213` would have matched `0088213` — the gate's own identifier test caught it
+first, and the rule is now ordering operators only; `rows_of` read a chosen column's tick off its
+width, so a column the window's fit had hidden was unticked in the list and **dropped from the
+tail on the next OK** — a chosen column is ticked whatever the fit did; a chooser pass measured
+every width afresh and dropped the sort, undoing a drag and a sort with one tick — widths and the
+sort are carried across by the key's name; and the understood rows were named by title, which the
+catalogue's `ndjson` reader spells `timestamp`, so a spill with no extra keys would have written
+`columns = ["timestamp", "level"]` to its tail — they are named by role. Also from the review: a
+scanned format files an attribute under the key's own spelling (`service.name`, not
+`service_name`), which is what *Filter on …* names.
+
+### Knowingly left
+
+- The remembered widths (`[[file]]` → `columns`, by position, keyed `loki://tail?apps=…`) apply to
+  the chosen layout when the counts match; swapping one chosen key for another keeps the count and
+  so applies the old widths to the new column at that position. Cosmetic, and a resize fixes it.
+- Unticking every attribute writes an empty list, which reads as "the defaults" next time, not
+  "no attribute columns". `Option<Vec<String>>` with `columns = []` written would tell them apart.
+- The detail pane's *Fields* page lists the format's columns, so it now lists the chosen keys and
+  no others; the rest are on *Raw*, as before.
+- The chooser samples the heads of the oldest and newest spill parts, so a key that first appears
+  mid-window is not listed until it reaches a head.
+- A saved format definition whose glob claims the spill path still `adopt_format`s over the chosen
+  format at landing, as it did over detection's; nothing claims `%TEMP%` spill parts today.
+- After a chooser pass with the timestamp unticked, `column_defaults[0]` is `0`, so a reset of
+  that column resets it to hidden — unreachable from the header, which does not list it.
+
 ## ▶ Resume point — 2026-10-26, later: the credential is kept on the source, not on its name
 
 The one real defect the 2026-10-22 note carried is closed, and it was wider than recorded.

@@ -14,6 +14,7 @@ pub mod apps;
 pub mod atlas;
 pub mod bidi;
 pub mod cell;
+pub mod chosen;
 pub mod columns;
 pub mod detail;
 pub mod detect;

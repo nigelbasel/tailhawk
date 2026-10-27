@@ -150,9 +150,79 @@ pub fn apply(layout: &mut Layout, defaults: &[usize], rows: &[ColumnRow]) -> boo
     true
 }
 
+/// The chooser's rows for a remote window — [`tailhawk_core::chosen::rows_of`]'s list as the
+/// dialog draws it. `column` is the row's index in that list, which is all the dialog needs it
+/// for; [`remote_back`] reads it to put the answer in the list's order.
+pub fn remote_rows(rows: &[tailhawk_core::chosen::Row]) -> Vec<ColumnRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(at, row)| ColumnRow {
+            column: at,
+            title: row.title.clone(),
+            shown: row.shown,
+            locked: row.locked,
+        })
+        .collect()
+}
+
+/// The core's rows as the dialog left them: in the dialog's order, with the dialog's ticks. A
+/// row the dialog did not mention — a list that somehow came back short — is dropped, which for
+/// an attribute row means "not chosen" and for the three understood rows is what
+/// [`tailhawk_core::chosen::choice_of`] already allows for.
+pub fn remote_back(
+    rows: &[tailhawk_core::chosen::Row],
+    picked: &[ColumnRow],
+) -> Vec<tailhawk_core::chosen::Row> {
+    picked
+        .iter()
+        .filter_map(|pick| {
+            let mut row = rows.get(pick.column)?.clone();
+            row.shown = pick.shown || row.locked;
+            Some(row)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote(name: &str, shown: bool) -> tailhawk_core::chosen::Row {
+        tailhawk_core::chosen::Row {
+            name: name.to_owned(),
+            title: name.to_owned(),
+            seen_on: String::new(),
+            shown,
+            locked: name == "@m",
+        }
+    }
+
+    /// The dialog's rows are the core's, one for one, and what comes back is the core's rows in
+    /// the dialog's order with the dialog's ticks — a moved row moves, an unticked row unticks,
+    /// and the locked message stays ticked whatever the dialog says.
+    #[test]
+    fn a_remote_list_round_trips_through_the_dialogs_rows_in_the_dialogs_order() {
+        let rows = vec![
+            remote("@t", true),
+            remote("status", true),
+            remote("method", false),
+            remote("@m", true),
+        ];
+        let mut picked = remote_rows(&rows);
+        assert_eq!(picked.len(), 4);
+        assert!(picked[3].locked);
+        assert!(move_row(&mut picked, 2, true).is_some());
+        picked[0].shown = true;
+        picked[1].shown = false;
+        picked[3].shown = false;
+        let back = remote_back(&rows, &picked);
+        let names: Vec<&str> = back.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["@t", "method", "status", "@m"]);
+        assert_eq!(
+            back.iter().map(|r| r.shown).collect::<Vec<_>>(),
+            [true, false, true, true]
+        );
+    }
 
     fn layout_of(widths: Vec<usize>, order: Vec<usize>) -> Layout {
         // A real catalogue format, so the titles are the ones the dialog would draw. NLog has

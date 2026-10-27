@@ -821,6 +821,11 @@ attributes, where §6.1's lossless raw line still carries them. At most **6** ke
 understood three are shown — a limit on the grid's legibility and on §11's frame budget alike, since
 each column is another group in the pattern and the presentation is rebuilt per visible row.
 
+**The six are detection's choice, not the reader's cap.** A remote source's window (`LOKI.md` §2)
+shows the keys its tail *chose* — any number, in the chosen order, persisted on the tail by name —
+read by one scan of the line rather than a group per column, so the frame budget that justifies the
+six does not apply to it. Detection still decides the columns of a local JSON file.
+
 All of this is judged on the **head sample alone**. It is evidence about a file, not a proof about
 it: a file that changes shape a gigabyte in loses cells from that point and says nothing. Re-reading
 the format mid-file is stage 5, which is not built.

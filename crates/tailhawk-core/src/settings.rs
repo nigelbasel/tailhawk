@@ -171,6 +171,15 @@ pub struct Tail {
     /// if that is edited later — [`apps::with_apps`](crate::apps::with_apps) narrows at the moment
     /// of opening.
     pub apps: Vec<String>,
+    /// The attribute keys the reader chose as grid columns, in the order chosen — the Starberry
+    /// request of 2026-10-27: *"persist the chosen columns per tail … next to the tail's selector."*
+    ///
+    /// **Empty means "the defaults"** — [`chosen::default_columns`](crate::chosen::default_columns)
+    /// over whatever the window carries — and is what a tail nobody has customised writes, so a
+    /// later change to those defaults still reaches it. Names rather than widths by position,
+    /// because the same tail's windows differ by application set and a name survives a reorder;
+    /// the widths stay on the window's own `[[file]]` entry as before.
+    pub columns: Vec<String>,
 }
 
 /// One `[[source]]` section as every settings file written before 2026-10-21 holds it: a
@@ -260,6 +269,7 @@ pub fn split_sources(entries: &[LegacySource]) -> (Vec<Source>, Vec<Tail>, Vec<R
             source: name,
             query: entry.query.clone(),
             apps: entry.apps.clone(),
+            columns: Vec::new(),
         });
     }
     // A source whose new name is one of its own old ones needs nothing moved.
@@ -1047,6 +1057,10 @@ impl Settings {
                 let listed: Vec<String> = t.apps.iter().map(|a| quote(a)).collect();
                 out.push_str(&format!("apps = [{}]\n", listed.join(", ")));
             }
+            if !t.columns.is_empty() {
+                let listed: Vec<String> = t.columns.iter().map(|c| quote(c)).collect();
+                out.push_str(&format!("columns = [{}]\n", listed.join(", ")));
+            }
         }
         for f in &self.files {
             out.push_str("\n[[file]]\n");
@@ -1231,6 +1245,7 @@ impl Settings {
                             "source" => t.source = unquote(value),
                             "query" => t.query = unquote(value),
                             "apps" => t.apps = array(value),
+                            "columns" => t.columns = array(value),
                             _ => {}
                         }
                     }
@@ -1924,6 +1939,7 @@ mod tests {
                 source: "dev".to_owned(),
                 query: "{environment=\"dev\"}".to_owned(),
                 apps: Vec::new(),
+                columns: Vec::new(),
             }],
             theme: Some("light".to_owned()),
             font: Some("Cascadia Mono".to_owned()),
@@ -2066,6 +2082,7 @@ mod tests {
             source: "dev".to_owned(),
             query: "{environment=~\"live|production\"}".to_owned(),
             apps: vec!["ndc".to_owned()],
+            columns: Vec::new(),
         });
         s.sources.push(Source {
             name: "open".to_owned(),
@@ -2221,6 +2238,7 @@ mod tests {
                 "nurtur-gateway".to_owned(),
                 "campaign-editor-api".to_owned(),
             ],
+            columns: Vec::new(),
         });
         s.tails.push(Tail {
             name: "live-everything".to_owned(),
@@ -2248,6 +2266,44 @@ mod tests {
         // **Two views of one Loki: one server, one credential, two names.**
         assert_eq!(back.sources.len(), 1, "and only one connection for both");
         assert_eq!(back.tails[0].source, back.tails[1].source);
+    }
+
+    /// The columns a reader chose for a tail are written beside its selector, as names and in the
+    /// order chosen, and only for a tail that chose any — a tail left to the defaults writes
+    /// nothing, so a later change to the defaults still reaches it.
+    #[test]
+    fn a_tails_chosen_columns_come_back_in_order_and_an_unchosen_tail_writes_none() {
+        let mut s = Settings::default();
+        s.tails.push(Tail {
+            name: "starberry".to_owned(),
+            source: "telemetry".to_owned(),
+            query: "{environment=\"live\"}".to_owned(),
+            apps: vec!["sb-edge".to_owned(), "sb-gateway".to_owned()],
+            columns: vec![
+                "status".to_owned(),
+                "path".to_owned(),
+                "host_name".to_owned(),
+            ],
+        });
+        s.tails.push(Tail {
+            name: "everything".to_owned(),
+            columns: Vec::new(),
+            ..s.tails[0].clone()
+        });
+
+        let text = s.to_toml();
+        assert!(
+            text.contains("columns = [\"status\", \"path\", \"host_name\"]"),
+            "{text}"
+        );
+        let back = Settings::from_toml(&text);
+        assert_eq!(back.tails[0].columns, s.tails[0].columns);
+        assert!(back.tails[1].columns.is_empty());
+        let tails = text.split("[[tail]]").nth(2).expect("the second tail");
+        assert!(
+            !tails.contains("columns ="),
+            "a tail with no choice must not write the key: {tails}"
+        );
         assert_eq!(back.tails[0].query, back.tails[1].query);
         assert_ne!(back.tails[0].name, back.tails[1].name);
     }
@@ -2860,12 +2916,14 @@ mod tests {
                     source: "live".to_owned(),
                     query: "{application=\"ndc\"}".to_owned(),
                     apps: Vec::new(),
+                    columns: Vec::new(),
                 },
                 Tail {
                     name: "identity".to_owned(),
                     source: "live".to_owned(),
                     query: "{application=\"identity\"}".to_owned(),
                     apps: Vec::new(),
+                    columns: Vec::new(),
                 },
             ],
             ..Settings::default()
@@ -2876,6 +2934,7 @@ mod tests {
                 source: "live".to_owned(),
                 query: "{application=\"ndc\"} |= `error`".to_owned(),
                 apps: Vec::new(),
+                columns: Vec::new(),
             }],
             ..Settings::default()
         };

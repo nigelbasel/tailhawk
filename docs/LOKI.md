@@ -75,6 +75,25 @@ Where the model leaks:
    only for fields Loki did not supply, and key the detector on `app`/`service_name`. When detection
    fires on a body carrying a redundant timestamp/level prefix, strip it from display — a real
    quality win over Grafana Explore.
+
+   **Not built, and corrected 2026-10-27.** Nothing parses the body: a window is a CLEF spill in
+   which every label and metadata entry is a flat string key, and detection reads those keys from
+   every record alike, so there is no per-app detector to key. What *is* told apart per record is
+   its **kind, and the key for that is `app` together with `log_file_kind`** where the record
+   carries one (`sb-gateway/p2s-access`, `sb-gateway/nginx-error`), the app alone where it does not
+   — the Starberry edge tails ship three apps and four kinds of record per app, so the app alone no
+   longer says what a row is. `chosen::kind_of` is the rule; the column chooser says beside each
+   key which kinds carry it. If body-level detection is ever built, it is keyed the same way.
+
+   **The column half, built 2026-10-27.** Detection makes at most six keys columns, ranked by how
+   many head rows carry them and hidden until ticked, so a record kind with thirty attributes never
+   offered `status`, `method` or `path` at all. A remote window now shows the keys its **tail
+   chose** — `Tail::columns`, written beside the selector as `columns = [...]` — or, for a tail that
+   chose none, the seven the request names (`host_name`, `status`, `method`, `path`, `client_addr`,
+   `rt`, `trace_id`) where the window carries them; *Select columns…* lists every key the window's
+   records carry, says which kinds carry each, and writes the choice back to the tail by name. The
+   chosen format is read by one scan of the line (`detect::json_fields`), not by a regex group per
+   column, which is why it has no six-column cap: that cap was a frame budget for the pattern.
 3. **`raw` becomes subtly false.** Loki's `max_line_size` defaults to 256 KB and structured metadata
    is capped at 64 kB / 128 entries, so upstream truncation is possible and undetectable. Document
    `raw` for a Loki record as **"as received from Loki"**, not "as emitted". Keep `raw` = the log

@@ -411,6 +411,17 @@ fn compare(record: &Record, field: &Field, op: Op, value: &Value) -> Truth {
         match record.attribute(key) {
             Some(AttributeValue::Int(n)) => return compare_numbers(*n as f64, op, *wanted),
             Some(AttributeValue::Float(f)) => return compare_numbers(*f, op, *wanted),
+            // A Loki spill writes every attribute as text, so `status` arrives as `"444"`; text
+            // that reads as a number, asked which side of a number it falls, answers as the
+            // number. Equality stays textual: an all-digit identifier keeps the digits it was
+            // written with, and `0088213` is not `88213`.
+            Some(AttributeValue::String(text))
+                if matches!(op, Op::Lt | Op::Le | Op::Gt | Op::Ge) =>
+            {
+                if let Ok(actual) = text.trim().parse::<f64>() {
+                    return compare_numbers(actual, op, *wanted);
+                }
+            }
             None => return Truth::Unknown,
             _ => {}
         }
@@ -1808,6 +1819,56 @@ mod tests {
             byte_sorted,
             ["500", "90", "900"],
             "if a byte sort ordered these correctly the fixture would prove nothing"
+        );
+    }
+
+    /// A Loki spill writes every attribute as a string, so `status` arrives as `"444"` and `bytes`
+    /// as `"717"` — and `bytes >= 1000` compared as text says `"717" >= "1000"`, because `7` sorts
+    /// after `1`. A number typed against an attribute that reads as one is a numeric question.
+    #[test]
+    fn a_numeric_attribute_stored_as_text_compares_as_a_number() {
+        let small = parsed(
+            "req",
+            9,
+            &[("bytes", AttributeValue::String("717".to_owned()))],
+        );
+        let large = parsed(
+            "req",
+            9,
+            &[("bytes", AttributeValue::String("5794".to_owned()))],
+        );
+        let word = parsed(
+            "req",
+            9,
+            &[("bytes", AttributeValue::String("-".to_owned()))],
+        );
+        assert_eq!(truth("bytes >= 1000", &small), Truth::False);
+        assert_eq!(truth("bytes >= 1000", &large), Truth::True);
+        assert_eq!(
+            truth(
+                "status >= 500",
+                &parsed(
+                    "req",
+                    9,
+                    &[("status", AttributeValue::String("502".to_owned()))]
+                )
+            ),
+            Truth::True
+        );
+        assert_eq!(
+            truth("bytes >= 1000", &word),
+            Truth::False,
+            "a value that is not a number is still compared as the text it is"
+        );
+        let order = parsed(
+            "req",
+            9,
+            &[("order", AttributeValue::String("0088213".to_owned()))],
+        );
+        assert_eq!(
+            truth("order = 88213", &order),
+            Truth::False,
+            "equality is still the text: an identifier keeps its leading zero"
         );
     }
 

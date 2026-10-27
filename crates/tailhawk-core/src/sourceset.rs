@@ -888,6 +888,7 @@ mod tests {
             source: of.to_owned(),
             query: format!("{{application=\"{name}\"}}"),
             apps: Vec::new(),
+            columns: Vec::new(),
         }
     }
 
@@ -1894,6 +1895,7 @@ mod tests {
             source: "telemetry.nurtur.tech".to_owned(),
             query: String::new(),
             apps: vec!["job-dispatcher".to_owned()],
+            columns: Vec::new(),
         };
         assert_eq!(
             tail_row_fault(&his, &[source("telemetry.nurtur.tech")]),

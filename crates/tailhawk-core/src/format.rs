@@ -87,6 +87,10 @@ pub struct Format {
     /// Column titles, when they differ from the capture names — W3C's `cs(User-Agent)` cannot be a
     /// capture name. Parallel to [`columns`](Self::columns); `None` means the names are the titles.
     pub titles: Option<&'static [&'static str]>,
+    /// The fields are read by [`detect::json_fields`](crate::detect::json_fields) over the titles
+    /// — one scan of the line — and `first_line` only says whether the line is an object. See
+    /// [`json_chosen`], the one format built this way, for why.
+    scanned: bool,
 }
 
 impl Format {
@@ -162,41 +166,74 @@ impl Format {
 
     /// Parses a first line, or `None` if it is not one. `raw` is the whole line, always.
     pub fn parse(&self, line: &str) -> Option<Record> {
-        let caps = self.first_line.captures(line)?;
         let mut record = Record {
             raw: line.to_owned(),
             parse_state: ParseState::Parsed,
             format_id: Some(FormatId::new(self.id)),
             ..Record::default()
         };
-        for name in self.first_line.capture_names().flatten() {
-            let Some(m) = caps.name(name) else {
-                continue;
-            };
-            let text = m.as_str();
-            match name {
-                TS => record.timestamp = self.stamp.parse(text),
-                LEVEL => {
-                    record.severity_text = Some(text.to_owned());
-                    record.severity_number = self.level.parse(text);
+        let mut had_message = false;
+        let mut take = |name: &str, text: &str| match name {
+            TS => record.timestamp = self.stamp.parse(text),
+            LEVEL => {
+                record.severity_text = Some(text.to_owned());
+                record.severity_number = self.level.parse(text);
+            }
+            MSG => {
+                had_message = true;
+                record.body = text.to_owned();
+            }
+            _ => record
+                .attributes
+                .push((name.to_owned(), AttributeValue::String(text.to_owned()))),
+        };
+        if self.scanned {
+            // **Attributes under the key's own spelling, not the capture name.** A chip written
+            // from the header — `Filter on service.name…` — names the key as the file spells it,
+            // and a record that filed it as `service_name` would answer unknown.
+            let titles = self.titles.unwrap_or(self.columns);
+            for ((name, title), range) in self
+                .columns
+                .iter()
+                .zip(titles)
+                .zip(self.scanned_fields(line)?)
+            {
+                if let Some(range) = range {
+                    let role = matches!(*name, TS | LEVEL | MSG);
+                    take(if role { name } else { title }, &line[range]);
                 }
-                MSG => record.body = text.to_owned(),
-                _ => record
-                    .attributes
-                    .push((name.to_owned(), AttributeValue::String(text.to_owned()))),
+            }
+        } else {
+            let caps = self.first_line.captures(line)?;
+            for name in self.first_line.capture_names().flatten() {
+                if let Some(m) = caps.name(name) {
+                    take(name, m.as_str());
+                }
             }
         }
-        if record.body.is_empty() && caps.name(MSG).is_none() {
+        if record.body.is_empty() && !had_message {
             record.body = line.to_owned();
         }
         Some(record)
     }
 
+    /// The scanner's answer for a [`scanned`](Self::scanned) format: each column's value, by the
+    /// raw key its title names. `None` when the line is not an object.
+    fn scanned_fields(&self, line: &str) -> Option<Vec<Option<core::ops::Range<usize>>>> {
+        if !self.first_line.is_match(line) {
+            return None;
+        }
+        crate::detect::json_fields(line, self.titles.unwrap_or(self.columns))
+    }
+
     /// The byte range of each of [`columns`](Self::columns) in a first line, in column order —
-    /// `None` for a column whose capture did not participate, and `None` overall when the line is
-    /// not a first line. What a columnised presentation of the row is built from: byte ranges into
+    /// `None` for a column whose capture did not participate, or whose key the line does not
+    /// carry under a scanned format, and `None` overall when the line is not a first line. What a columnised presentation of the row is built from: byte ranges into
     /// the raw line, so a search match can be carried across.
     pub fn fields(&self, line: &str) -> Option<Vec<Option<core::ops::Range<usize>>>> {
+        if self.scanned {
+            return self.scanned_fields(line);
+        }
         let caps = self.first_line.captures(line)?;
         Some(
             self.columns
@@ -210,22 +247,37 @@ impl Format {
     /// one, and is the level a word this format declares. `None` when the line is not a first
     /// line.
     pub fn validity(&self, line: &str) -> Option<bool> {
-        let caps = self.first_line.captures(line)?;
-        let ts_ok = match (self.stamp, caps.name(TS)) {
+        let (ts, level) = if self.scanned {
+            let fields = self.scanned_fields(line)?;
+            let at = |role: &str| {
+                self.columns
+                    .iter()
+                    .position(|name| *name == role)
+                    .and_then(|i| fields.get(i).cloned().flatten())
+                    .map(|range| &line[range])
+            };
+            (at(TS), at(LEVEL))
+        } else {
+            let caps = self.first_line.captures(line)?;
+            (
+                caps.name(TS).map(|m| m.as_str()),
+                caps.name(LEVEL).map(|m| m.as_str()),
+            )
+        };
+        let ts_ok = match (self.stamp, ts) {
             (Stamp::None, _) => true,
             (Stamp::TimeOnly | Stamp::Bsd, Some(_)) => true,
-            (stamp, Some(m)) => stamp.parse(m.as_str()).is_some(),
+            (stamp, Some(text)) => stamp.parse(text).is_some(),
             // An optional group that did not participate: a mandatory one is always captured on a
             // match, so absence here is the format allowing it, as MEL Simple does.
             (_, None) => true,
         };
-        let level_ok = match (self.level, caps.name(LEVEL)) {
+        let level_ok = match (self.level, level) {
             (Level::None, _) => true,
-            (Level::Word, Some(m)) if !self.levels.is_empty() => self
-                .levels
-                .iter()
-                .any(|l| l.eq_ignore_ascii_case(m.as_str())),
-            (level, Some(m)) => level.parse(m.as_str()).is_some(),
+            (Level::Word, Some(text)) if !self.levels.is_empty() => {
+                self.levels.iter().any(|l| l.eq_ignore_ascii_case(text))
+            }
+            (level, Some(text)) => level.parse(text).is_some(),
             (_, None) => self.levels.is_empty(),
         };
         Some(ts_ok && level_ok)
@@ -316,6 +368,7 @@ macro_rules! fmt {
             samples: $samples,
             body_next_line: false,
             titles: None,
+            scanned: false,
         }
     };
 }
@@ -365,6 +418,7 @@ pub fn custom(spec: Custom) -> Result<&'static Format, String> {
         samples: &[],
         body_next_line: false,
         titles: None,
+        scanned: false,
     })))
 }
 
@@ -442,6 +496,7 @@ pub fn w3c(fields: &[String]) -> &'static Format {
         samples: &[],
         body_next_line: false,
         titles: Some(titles),
+        scanned: false,
     }))
 }
 
@@ -496,28 +551,97 @@ fn json_columns(keys: &[crate::detect::JsonKey]) -> Vec<(String, String)> {
             continue;
         }
         extras += 1;
-        let sanitised: String = key
-            .name
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        let mut stem = sanitised.trim_matches('_').to_owned();
-        if stem.is_empty() || stem.starts_with(|c: char| c.is_ascii_digit()) {
-            stem.insert(0, 'k');
-        }
-        let mut name = stem.clone();
-        let mut suffix = 2usize;
-        while roles
-            .iter()
-            .chain(out.iter())
-            .any(|(taken, _)| *taken == name)
-        {
-            name = format!("{stem}{suffix}");
-            suffix += 1;
-        }
+        let name = capture_name(&key.name, |name| {
+            roles
+                .iter()
+                .chain(out.iter())
+                .any(|(taken, _)| taken == name)
+        });
         out.push((name, key.name.clone()));
     }
     out
+}
+
+/// A raw JSON key as a capture name the pattern grammar accepts: non-alphanumerics become `_`, a
+/// name that would start with a digit or be empty gets a `k`, and a name `taken` already answers
+/// for gets a numeric suffix rather than being dropped — see [`json_columns`] for why.
+fn capture_name(raw: &str, taken: impl Fn(&str) -> bool) -> String {
+    let sanitised: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let mut stem = sanitised.trim_matches('_').to_owned();
+    if stem.is_empty() || stem.starts_with(|c: char| c.is_ascii_digit()) {
+        stem.insert(0, 'k');
+    }
+    let mut name = stem.clone();
+    let mut suffix = 2usize;
+    while taken(&name) {
+        name = format!("{stem}{suffix}");
+        suffix += 1;
+    }
+    name
+}
+
+/// A format whose columns are the keys a reader **chose**, in the order chosen — the Starberry
+/// request of 2026-10-27, for a Loki window whose records carry thirty attributes of which
+/// detection's six (ranked by how many head rows carry them) were never the ones wanted.
+///
+/// **Read by a scan, not by a pattern.** [`json_lines`] gives every column one lazy group, and
+/// [`MAX_JSON_COLUMNS`](crate::detect::MAX_JSON_COLUMNS) exists because eleven of those cost
+/// 2.45 ms a line; a chosen set has no such cap because [`detect::json_fields`](crate::detect::json_fields)
+/// finds every wanted key in one pass whatever the count. `first_line` only says whether the line
+/// is an object, which is what makes a spill line a record and a stack-trace line not one.
+///
+/// The timestamp and level are always columns, before the chosen keys, so a window that hides them
+/// still has a severity for its rules and an instant for its filters; the message is last and
+/// takes the rest of the row, as §2.5 asks. A chosen key spelled as one of the three understood
+/// roles is left out — it is already there. Leaked, for the reason [`json_lines`] is.
+pub fn json_chosen(keys: &[String]) -> &'static Format {
+    let mut columns: Vec<(String, String)> = vec![
+        (TS.to_owned(), "@t".to_owned()),
+        (LEVEL.to_owned(), "@l".to_owned()),
+    ];
+    for key in keys {
+        if understood_key(key).is_some() || columns.iter().any(|(_, raw)| raw == key) {
+            continue;
+        }
+        let name = capture_name(key, |name| {
+            name == MSG || columns.iter().any(|(taken, _)| taken == name)
+        });
+        columns.push((name, key.clone()));
+    }
+    columns.push((MSG.to_owned(), "@m".to_owned()));
+    let leak = |s: &str| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) };
+    let names: &'static [&'static str] = Box::leak(
+        columns
+            .iter()
+            .map(|(name, _)| leak(name))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let titles: &'static [&'static str] = Box::leak(
+        columns
+            .iter()
+            .map(|(_, raw)| leak(raw))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(Format {
+        id: "json-chosen",
+        name: "JSON lines",
+        specificity: 0.95,
+        first_line: re(r"^\s*\{.*\}\s*$"),
+        stamp: Stamp::Iso,
+        level: Level::Word,
+        levels: &[],
+        continuation: None,
+        columns: names,
+        samples: &[],
+        body_next_line: false,
+        titles: Some(titles),
+        scanned: true,
+    }))
 }
 
 /// Whether a JSON template is worth a format of its own.
@@ -594,6 +718,7 @@ pub fn json_lines(keys: &[crate::detect::JsonKey]) -> &'static Format {
         samples: &[],
         body_next_line: false,
         titles: Some(titles),
+        scanned: false,
     }))
 }
 
@@ -830,5 +955,96 @@ mod tests {
         let f = by_id("generic").expect("catalogue");
         assert!(f.is_first_line("2026-08-16 09:14:02 hello"));
         assert!(!f.is_first_line("at 2026-08-16 09:14:02 a date mid-line does not start a record"));
+    }
+
+    const ACCESS: &str = r#"{"@t":"2026-10-27T11:02:37.000000000Z","@l":"warn","app":"sb-gateway","client_addr":"203.0.113.9","host_name":"gate-fw-a","log_file_kind":"p2s-access","method":"GET","path":"/","rt":"0.000","status":"444","@m":"GET host/ -> 444"}"#;
+    const STREAM: &str = r#"{"@t":"2026-10-27T11:02:37.000000000Z","@l":"info","app":"sb-edge","client_addr":"203.0.113.9","host_name":"ip-edge-web107","log_file_kind":"p2s-stream","status":"200","@m":"203.0.113.9:62220 -> :443"}"#;
+
+    /// The columns are the chosen keys in the chosen order, between the timestamp and level the
+    /// grid understands and the message that takes the rest of the row; a key the row does not
+    /// carry is a blank cell and not a shifted one.
+    #[test]
+    fn a_chosen_format_shows_the_chosen_keys_in_order_and_blank_where_a_row_lacks_one() {
+        let f = json_chosen(&["status".to_owned(), "method".to_owned(), "path".to_owned()]);
+        assert_eq!(
+            f.columns,
+            ["ts", "level", "status", "method", "path", "msg"]
+        );
+        assert_eq!(
+            f.column_titles().collect::<Vec<_>>(),
+            ["@t", "@l", "status", "method", "path", "@m"]
+        );
+        let cell = |line: &str, i: usize| {
+            f.fields(line)
+                .expect("a record")
+                .get(i)
+                .cloned()
+                .flatten()
+                .map(|r| line[r].to_owned())
+        };
+        assert_eq!(cell(ACCESS, 2).as_deref(), Some("444"));
+        assert_eq!(cell(ACCESS, 3).as_deref(), Some("GET"));
+        assert_eq!(cell(ACCESS, 4).as_deref(), Some("/"));
+        assert_eq!(cell(ACCESS, 5).as_deref(), Some("GET host/ -> 444"));
+        assert_eq!(cell(STREAM, 2).as_deref(), Some("200"));
+        assert_eq!(cell(STREAM, 3), None, "an edge row has no method");
+        assert_eq!(cell(STREAM, 4), None, "and no path");
+        assert_eq!(
+            cell(STREAM, 5).as_deref(),
+            Some("203.0.113.9:62220 -> :443")
+        );
+        assert!(f.is_first_line(ACCESS));
+        assert!(!f.is_first_line("   at Api.Dispatch.Run()"));
+    }
+
+    /// Parsing reads the timestamp and the level the way the catalogue's reader does, and carries
+    /// every chosen key into the record's attributes under its capture name — which is what the
+    /// filter resolves `status >= 500` against.
+    #[test]
+    fn a_chosen_format_parses_the_level_the_timestamp_and_the_attributes() {
+        let f = json_chosen(&["status".to_owned(), "service.name".to_owned()]);
+        let r = f.parse(ACCESS).expect("parse");
+        assert_eq!(
+            r.severity_number.map(|s| s.band()),
+            Some(SeverityBand::Warn)
+        );
+        assert!(r.timestamp.is_some(), "the CLEF timestamp is read");
+        assert_eq!(r.body, "GET host/ -> 444");
+        assert_eq!(r.raw, ACCESS);
+        let dotted = ACCESS.replacen(
+            "\"status\":\"444\"",
+            "\"service.name\":\"edge\",\"status\":\"444\"",
+            1,
+        );
+        assert_eq!(
+            f.parse(&dotted).expect("parse").attribute("service.name"),
+            Some(&AttributeValue::String("edge".to_owned())),
+            "an attribute is filed under the key's own spelling, which is what a chip names"
+        );
+        assert_eq!(
+            r.attributes,
+            [(
+                "status".to_owned(),
+                AttributeValue::String("444".to_owned())
+            )]
+        );
+        assert_eq!(f.validity(ACCESS), Some(true));
+        assert_eq!(
+            f.columns[3], "service_name",
+            "a key the pattern grammar cannot name is sanitised, as json-lines does"
+        );
+        assert_eq!(f.column_titles().nth(3), Some("service.name"));
+    }
+
+    /// The six-column cap is detection's, not the reader's: a chosen set is read by one scan of
+    /// the line and shows every key it was given. And a chosen column is not an invented one, so
+    /// nothing hides it by default.
+    #[test]
+    fn a_chosen_set_is_not_capped_and_is_not_hidden_as_invented() {
+        let keys: Vec<String> = (0..9).map(|i| format!("k{i}")).collect();
+        let f = json_chosen(&keys);
+        assert_eq!(f.columns.len(), 9 + 3);
+        assert!(!f.has_invented_columns());
+        assert_eq!(f.id, "json-chosen");
     }
 }

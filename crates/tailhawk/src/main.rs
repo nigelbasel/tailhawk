@@ -768,6 +768,99 @@ impl Document {
         self.presented.clear();
     }
 
+    /// A sample of what the window holds, for [`tailhawk_core::chosen::keys_seen`]: the head of
+    /// the oldest part and the head of the newest, each bounded the way detection's sample is.
+    /// A spill is a rolling set of parts, so the two heads between them see the window's start
+    /// and its most recent part; what a key chosen from here is read from is every row, by name.
+    fn window_sample(&self) -> Vec<String> {
+        let parts = self.set.snapshot();
+        let mut lines = Vec::new();
+        if let Some(oldest) = parts.first() {
+            lines.extend(detect::head_lines(&*oldest.file, oldest.charset));
+        }
+        if parts.len() > 1 {
+            if let Some(newest) = parts.last() {
+                lines.extend(detect::head_lines(&*newest.file, newest.charset));
+            }
+        }
+        lines
+    }
+
+    /// Installs the columns a reader chose for a remote window: [`format::json_chosen`] over
+    /// `columns`, laid out from the head sample as [`Document::adopt_format`] lays a format out,
+    /// then every chosen column given at least its title's width, the timestamp and level hidden
+    /// where `shown` says so, and the display order `order` asked for — both as
+    /// [`tailhawk_core::chosen::choice_of`] answers them, or `None` for the natural order with
+    /// both shown, which is what an open does.
+    fn adopt_chosen(
+        &mut self,
+        columns: &[String],
+        shown: Option<(bool, bool)>,
+        order: Option<Vec<usize>>,
+    ) {
+        // **What the reader had is carried across by the key's name**: a width they dragged, and
+        // the sort in force. `adopt_format` measures a fresh layout from the sample and drops the
+        // sort — right for a format that replaces another, wrong for a choice that adds a column
+        // to the ones already on screen, where a tick would otherwise undo a drag and a sort.
+        let kept: Vec<(String, usize)> = self
+            .layout
+            .as_ref()
+            .map(|layout| {
+                (0..layout.widths.len().saturating_sub(1))
+                    .filter(|&c| layout.widths[c] > 0)
+                    .map(|c| (layout.title(c).to_owned(), layout.widths[c]))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sorted: Option<(String, bool, Option<usize>)> =
+            self.filtering.sort.as_ref().and_then(|sorting| {
+                let layout = self.layout.as_ref()?;
+                Some((
+                    layout.title(sorting.order.column).to_owned(),
+                    sorting.order.descending,
+                    sorting.order.top,
+                ))
+            });
+        self.adopt_format(tailhawk_core::format::json_chosen(columns));
+        let Some(layout) = self.layout.as_mut() else {
+            return;
+        };
+        tailhawk_core::chosen::widen_to_titles(layout);
+        if shown.is_some() {
+            for column in 0..layout.widths.len().saturating_sub(1) {
+                if let Some((_, width)) = kept.iter().find(|(t, _)| *t == layout.title(column)) {
+                    layout.widths[column] = *width;
+                }
+            }
+        }
+        if let Some((timestamp, level)) = shown {
+            if !timestamp {
+                layout.widths[0] = 0;
+            }
+            if !level {
+                layout.widths[1] = 0;
+            }
+        }
+        if let Some(order) = order {
+            layout.order = order;
+        }
+        self.column_defaults = Some(layout.widths.clone());
+        self.header = Some(layout.header());
+        // Left to the next frame's fit, from these defaults: a chosen column too wide for the
+        // row is trimmed, and one that cannot fit is hidden — and stays the reader's choice,
+        // which `chosen::rows_of` lists ticked whatever the fit did.
+        self.columns_customised = false;
+        if let Some((title, descending, top)) = sorted {
+            if let Some(column) = (0..layout.widths.len()).find(|&c| layout.title(c) == title) {
+                self.sort_by(sort::Order {
+                    column,
+                    descending,
+                    top,
+                });
+            }
+        }
+    }
+
     /// The height a chrome band is laid out and drawn against — the chrome face's line height, or
     /// the grid's row when no renderer has said what that is, which is a test.
     ///
@@ -5144,6 +5237,26 @@ impl Shell {
                             columns: Vec::new(),
                             column_order: Vec::new(),
                         });
+                    }
+                    // **A remote window shows the columns its tail chose**, or the defaults the
+                    // window carries, before the remembered widths are applied over them —
+                    // those are by position, and the positions are the chosen format's.
+                    if let Some(tail) = document.remote_source.as_ref().map(|q| q.tail.clone()) {
+                        let chosen = self
+                            .settings
+                            .tails
+                            .iter()
+                            .find(|t| t.name == tail)
+                            .map(|t| t.columns.clone())
+                            .filter(|columns| !columns.is_empty())
+                            .unwrap_or_else(|| {
+                                tailhawk_core::chosen::default_columns(
+                                    &tailhawk_core::chosen::keys_seen(&document.window_sample()),
+                                )
+                            });
+                        if !chosen.is_empty() {
+                            document.adopt_chosen(&chosen, None, None);
+                        }
                     }
                     // **`state_key`, not the path** — for a remote source those differ, and that
                     // is why its remembered columns never came back. `Document::remote` has
@@ -10331,6 +10444,38 @@ fn remember_apps(hwnd: HWND, name: &str, chosen: &[String]) {
     }
 }
 
+/// Writes the columns a reader chose onto the tail they chose them for — [`remember_apps`]'s
+/// twin, by name and saved outside the borrow for the same reasons. An empty choice is written
+/// as empty, which [`tailhawk_core::settings::Tail::columns`] reads as "the defaults".
+fn remember_columns(hwnd: HWND, name: &str, chosen: &[String]) {
+    let changed = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let Some(shell) = state.as_mut() else {
+            return false;
+        };
+        let Some(tail) = shell
+            .settings
+            .tails
+            .iter_mut()
+            .find(|tail| tail.name == name)
+        else {
+            return false;
+        };
+        if tail.columns == chosen {
+            return false;
+        }
+        tail.columns = chosen.to_vec();
+        true
+    });
+    if changed {
+        STATE.with(|s| {
+            if let Some(shell) = s.borrow_mut().as_mut() {
+                shell.save_settings(hwnd);
+            }
+        });
+    }
+}
+
 /// Opens a source the way its entry says to: straight into the applications it remembers, or by
 /// asking Loki which it has and showing the picker.
 ///
@@ -11470,6 +11615,51 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
             .is_some_and(|shell| std::mem::take(&mut shell.pending_columns))
     });
     if columns {
+        // A remote window's chooser lists every key its records carry, not only the layout's
+        // columns — the Starberry request of 2026-10-27 — and what it says back is a choice of
+        // keys the tail remembers by name. The rows and the sample are taken before the dialog
+        // runs, for the borrow reason every modal surface here shares.
+        let remote: Option<(String, Vec<tailhawk_core::chosen::Row>, Vec<String>)> =
+            STATE.with(|s| {
+                let state = s.borrow();
+                let doc = state.as_ref()?.document.as_ref()?;
+                let tail = doc.remote_source.as_ref()?.tail.clone();
+                let layout = doc.layout.as_ref()?;
+                let seen = tailhawk_core::chosen::keys_seen(&doc.window_sample());
+                let rows = tailhawk_core::chosen::rows_of(layout, &seen);
+                let seen_on = rows.iter().map(|row| row.seen_on.clone()).collect();
+                Some((tail, rows, seen_on))
+            });
+        if let Some((tail, rows, seen_on)) = remote {
+            let mut pick = dialog::ColumnsPick {
+                rows: chooser::remote_rows(&rows),
+                seen_on,
+                accepted: false,
+            };
+            if dialog::show_columns_dialog(hwnd, &mut pick) {
+                let choice =
+                    tailhawk_core::chosen::choice_of(&chooser::remote_back(&rows, &pick.rows));
+                let was = IN_WNDPROC.with(|flag| flag.replace(true));
+                STATE.with(|s| {
+                    if let Some(shell) = s.borrow_mut().as_mut() {
+                        if let Some(doc) = shell.document.as_mut() {
+                            doc.adopt_chosen(
+                                &choice.columns,
+                                Some((choice.timestamp_shown, choice.level_shown)),
+                                Some(choice.order.clone()),
+                            );
+                        }
+                        shell.retitle(hwnd);
+                    }
+                });
+                IN_WNDPROC.with(|flag| flag.set(was));
+                remember_columns(hwnd, &tail, &choice.columns);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            return true;
+        }
         let start = STATE.with(|s| {
             s.borrow()
                 .as_ref()
@@ -11480,6 +11670,7 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
         if let Some(rows) = start {
             let mut pick = dialog::ColumnsPick {
                 rows,
+                seen_on: Vec::new(),
                 accepted: false,
             };
             if dialog::show_columns_dialog(hwnd, &mut pick) {
@@ -14603,6 +14794,7 @@ mod tests {
             source: name.to_owned(),
             query: query.to_owned(),
             apps: Vec::new(),
+            columns: Vec::new(),
         }
     }
 
@@ -17941,6 +18133,127 @@ mod tests {
         assert_eq!(doc.row_text(298), Some("INFO line 298 fine"));
         assert!(bar(&doc).contains("● Following"), "{}", bar(&doc));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The Starberry request of 2026-10-27, end to end over a spill-shaped file: the chosen keys
+    /// are the grid's columns in the chosen order, a `p2s-access` row shows its status, method
+    /// and path, a `p2s-stream` row shows its status and leaves method and path blank in the same
+    /// columns, a key the window never carries is still a column, and the header sorts by
+    /// `status` as a number.
+    #[test]
+    fn a_remote_windows_chosen_keys_are_its_columns_and_a_row_without_one_is_blank_there() {
+        let path = std::env::temp_dir().join("tailhawk_chosen_columns.log");
+        let access = |status: u16| {
+            format!(
+                "{{\"@t\":\"2026-10-27T11:02:37Z\",\"@l\":\"warn\",\"app\":\"sb-gateway\",\
+                 \"client_addr\":\"203.0.113.9\",\"host_name\":\"gate-fw-a\",\
+                 \"log_file_kind\":\"p2s-access\",\"method\":\"GET\",\"path\":\"/x\",\
+                 \"status\":\"{status}\",\"@m\":\"GET host/x -> {status}\"}}"
+            )
+        };
+        let stream = "{\"@t\":\"2026-10-27T11:02:38Z\",\"@l\":\"info\",\"app\":\"sb-edge\",\
+                      \"client_addr\":\"203.0.113.9\",\"host_name\":\"ip-edge-web107\",\
+                      \"log_file_kind\":\"p2s-stream\",\"status\":\"200\",\
+                      \"@m\":\"203.0.113.9:62220 -> :443\"}";
+        std::fs::write(
+            &path,
+            format!("{}\n{stream}\n{}\n", access(444), access(302)),
+        )
+        .expect("write the fixture");
+        let mut doc = Document::open(&path).expect("open the fixture");
+        let chosen: Vec<String> = ["status", "method", "path", "referer"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        doc.adopt_chosen(&chosen, None, None);
+        doc.lay_out((8.0, 10.0), (2400, 300));
+
+        let titles: Vec<String> = doc
+            .header_columns()
+            .iter()
+            .map(|c| c.label.clone())
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Timestamp",
+                "Level",
+                "status",
+                "method",
+                "path",
+                "referer",
+                "Message"
+            ],
+            "the chosen keys, in the chosen order, between what the grid understands"
+        );
+        let row = |n: u64| {
+            doc.presented
+                .iter()
+                .find(|(r, _)| *r == n)
+                .map(|(_, p)| p.text.clone())
+                .unwrap_or_else(|| panic!("row {n} presented"))
+        };
+        let cells =
+            |text: &str| -> Vec<String> { text.split_whitespace().map(str::to_owned).collect() };
+        assert_eq!(
+            &cells(&row(0))[2..5],
+            ["444", "GET", "/x"],
+            "an access row shows its status, method and path: {}",
+            row(0)
+        );
+        let edge = row(1);
+        assert!(
+            edge.contains("200") && !edge.contains("GET"),
+            "an edge row shows its status and no method: {edge}"
+        );
+        let status_at = edge.find("200").expect("status cell");
+        let access_status_at = row(0).find("444").expect("status cell");
+        assert_eq!(
+            status_at, access_status_at,
+            "the status sits in the same column on both kinds of row"
+        );
+        let method_at = row(0).find("GET").expect("method cell");
+        assert!(
+            edge[method_at..]
+                .trim_start()
+                .starts_with("203.0.113.9:62220"),
+            "method and path are blank on an edge row and the message follows them: {edge}"
+        );
+
+        // A second pass through the chooser — the reader adds `host_name` — keeps the width
+        // they dragged `status` to and the sort they had, and leaves the window to fit the rest.
+        doc.set_column_width(2, 9);
+        assert!(doc.cycle_sort(2), "the status column sorts");
+        let more: Vec<String> = ["status", "method", "path", "referer", "host_name"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        doc.adopt_chosen(&more, Some((true, true)), Some(vec![0, 1, 2, 3, 4, 5, 6]));
+        doc.lay_out((8.0, 10.0), (2400, 300));
+        let layout = doc.layout.as_ref().expect("a layout");
+        assert_eq!(layout.widths[2], 9, "the dragged width survives the choice");
+        assert_eq!(
+            doc.filtering.sort.as_ref().map(|s| s.order.column),
+            Some(2),
+            "the sort survives the choice, on the column of the same name"
+        );
+        assert_eq!(
+            doc.header_columns().last().map(|c| c.label.as_str()),
+            Some("Message")
+        );
+        assert!(
+            doc.header_columns().iter().any(|c| c.label == "host_name"),
+            "the added column is there"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let sorted_rows = |doc: &Document| doc.filtering.sort.as_ref().and_then(|s| s.rows.clone());
+        while sorted_rows(&doc).is_none() && std::time::Instant::now() < deadline {
+            doc.poll_sort();
+            std::thread::yield_now();
+        }
+        let sorted = sorted_rows(&doc).expect("sorted");
+        assert_eq!(sorted, [1, 2, 0], "200, 302, 444 — as numbers, not as text");
         let _ = std::fs::remove_file(&path);
     }
 

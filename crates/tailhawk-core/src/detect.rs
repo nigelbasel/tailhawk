@@ -301,6 +301,46 @@ fn short_circuit(lines: &[String]) -> Option<SelfDescribed> {
 /// arrays by depth, so a `{` inside a value is not structure and a decoy key inside a nested
 /// object is not a key.
 pub fn json_keys(line: &str) -> Option<Vec<JsonKey>> {
+    let mut keys = Vec::new();
+    json_walk(line, |name, value, _| {
+        keys.push(JsonKey {
+            name: name.to_owned(),
+            value,
+        })
+    })
+    .then_some(keys)
+}
+
+/// The byte range of each of `wanted`'s values in `line`, in `wanted`'s order — the bytes
+/// **inside** the quotes, which is the range a column shows — and `None` for a key the line does
+/// not carry or carries as something other than a string. `None` overall when the line is not a
+/// complete object.
+///
+/// **One pass over the line, whatever the count of keys**, which is what lets a chosen column set
+/// go past [`MAX_JSON_COLUMNS`]: that cap is a frame budget for a pattern with one lazy group per
+/// column, and this walk costs the line's length once. The same walk [`json_keys`] runs, so what
+/// is a key here is what is a key there — a decoy inside a nested value, or a key spelled inside
+/// a string, is neither. The first occurrence of a key wins, as a regex group would have bound it.
+pub fn json_fields(line: &str, wanted: &[&str]) -> Option<Vec<Option<core::ops::Range<usize>>>> {
+    let mut fields: Vec<Option<core::ops::Range<usize>>> = vec![None; wanted.len()];
+    json_walk(line, |name, value, range| {
+        if value != JsonValue::Text {
+            return;
+        }
+        for (i, key) in wanted.iter().enumerate() {
+            if *key == name && fields[i].is_none() {
+                fields[i] = Some(range.clone());
+            }
+        }
+    })
+    .then_some(fields)
+}
+
+/// The walk under [`json_keys`] and [`json_fields`]: `each` is told every top-level key, what
+/// kind of value it carries, and where the value's bytes are — inside the quotes for a string,
+/// the whole token otherwise. `false` when the line is not a complete object, in which case what
+/// `each` was told before the break is not to be trusted.
+fn json_walk(line: &str, mut each: impl FnMut(&str, JsonValue, core::ops::Range<usize>)) -> bool {
     let bytes = line.as_bytes();
     let mut at = 0usize;
     let skip_ws = |bytes: &[u8], mut at: usize| {
@@ -323,22 +363,25 @@ pub fn json_keys(line: &str) -> Option<Vec<JsonKey>> {
     };
     at = skip_ws(bytes, at);
     if bytes.get(at) != Some(&b'{') {
-        return None;
+        return false;
     }
     at += 1;
-    let mut keys = Vec::new();
     loop {
         at = skip_ws(bytes, at);
         match bytes.get(at) {
-            Some(b'}') => return Some(keys),
+            Some(b'}') => return true,
             Some(b'"') => {}
-            _ => return None,
+            _ => return false,
         }
-        let key_end = end_of_string(bytes, at)?;
-        let name = line.get(at + 1..key_end - 1)?.to_owned();
+        let Some(key_end) = end_of_string(bytes, at) else {
+            return false;
+        };
+        let Some(name) = line.get(at + 1..key_end - 1) else {
+            return false;
+        };
         at = skip_ws(bytes, key_end);
         if bytes.get(at) != Some(&b':') {
-            return None;
+            return false;
         }
         at = skip_ws(bytes, at + 1);
         let value = match bytes.get(at) {
@@ -346,25 +389,33 @@ pub fn json_keys(line: &str) -> Option<Vec<JsonKey>> {
             Some(b'{') | Some(b'[') => JsonValue::Nested,
             _ => JsonValue::Scalar,
         };
-        at = match bytes.get(at) {
-            Some(b'"') => end_of_string(bytes, at)?,
+        let start = at;
+        let end = match bytes.get(at) {
+            Some(b'"') => match end_of_string(bytes, at) {
+                Some(end) => end,
+                None => return false,
+            },
             Some(b'{') | Some(b'[') => {
                 let mut depth = 0usize;
                 loop {
-                    match bytes.get(at)? {
-                        b'"' => at = end_of_string(bytes, at)?,
-                        b'{' | b'[' => {
+                    match bytes.get(at) {
+                        Some(b'"') => match end_of_string(bytes, at) {
+                            Some(end) => at = end,
+                            None => return false,
+                        },
+                        Some(b'{') | Some(b'[') => {
                             depth += 1;
                             at += 1;
                         }
-                        b'}' | b']' => {
+                        Some(b'}') | Some(b']') => {
                             depth -= 1;
                             at += 1;
                             if depth == 0 {
                                 break at;
                             }
                         }
-                        _ => at += 1,
+                        Some(_) => at += 1,
+                        None => return false,
                     }
                 }
             }
@@ -374,14 +425,19 @@ pub fn json_keys(line: &str) -> Option<Vec<JsonKey>> {
                 }
                 at
             }
-            None => return None,
+            None => return false,
         };
-        keys.push(JsonKey { name, value });
+        let range = match value {
+            JsonValue::Text => start + 1..end - 1,
+            _ => start..end,
+        };
+        each(name, value, range);
+        at = end;
         at = skip_ws(bytes, at);
         match bytes.get(at) {
             Some(b',') => at += 1,
-            Some(b'}') => return Some(keys),
-            _ => return None,
+            Some(b'}') => return true,
+            _ => return false,
         }
     }
 }
@@ -1234,6 +1290,38 @@ mod tests {
              {\"@t\":\"2026-09-03T07:00:01Z\",\"@l\":\"Error\",\"@m\":\"two\"}\n",
         );
         assert_eq!(detect(&sample).accepted.map(|f| f.id), Some("ndjson"));
+    }
+
+    /// The scanner answers each wanted key's value — the bytes *inside* the quotes, which is the
+    /// range a column shows — in the order the keys were asked for, not the order the line wrote
+    /// them, and `None` for a key the line does not carry.
+    #[test]
+    fn the_scanner_answers_each_wanted_key_by_name_whatever_the_line_order() {
+        let line = r#"{"@t":"2026-10-27T11:02:37Z","method":"GET","path":"/?x=1","status":"444","@m":"GET / -> 444"}"#;
+        let fields =
+            json_fields(line, &["status", "method", "host_name", "@m"]).expect("an object");
+        let text = |range: &Option<core::ops::Range<usize>>| range.clone().map(|r| &line[r]);
+        assert_eq!(text(&fields[0]), Some("444"));
+        assert_eq!(text(&fields[1]), Some("GET"));
+        assert_eq!(text(&fields[2]), None);
+        assert_eq!(text(&fields[3]), Some("GET / -> 444"));
+    }
+
+    /// A key spelled inside a value is a value, not a key, and a key whose value is not a string
+    /// has no range a column could show. A line that is not an object answers nothing at all.
+    #[test]
+    fn the_scanner_reads_keys_only_at_the_top_level_and_only_strings() {
+        let line = r#"{"@t":"a","user_agent":"\"status\": \"200\"","bytes":717,"ctx":{"status":"500"},"status":"301","@m":"m"}"#;
+        let fields = json_fields(line, &["status", "bytes", "user_agent"]).expect("an object");
+        assert_eq!(fields[0].clone().map(|r| &line[r]), Some("301"));
+        assert_eq!(fields[1], None, "a number has no quoted range");
+        assert_eq!(
+            fields[2].clone().map(|r| &line[r]),
+            Some(r#"\"status\": \"200\""#),
+            "the escaped quotes are inside the value and stay there"
+        );
+        assert_eq!(json_fields("not json", &["status"]), None);
+        assert_eq!(json_fields(r#"{"a":"b""#, &["a"]), None);
     }
 }
 

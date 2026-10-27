@@ -3542,15 +3542,32 @@ const ID_C_UP: u16 = 251;
 const ID_C_DOWN: u16 = 252;
 
 /// What the column chooser is handed and hands back: the rows as the dialog last had them, and
-/// whether the user committed. [`crate::chooser::apply`] is what turns them into a layout.
+/// whether the user committed. [`crate::chooser::apply`] is what turns them into a layout for a
+/// local file; [`crate::chooser::remote_back`] hands a remote window's back to the core.
 pub struct ColumnsPick {
     pub rows: Vec<crate::chooser::ColumnRow>,
+    /// For a remote window, what each row's key is seen on — the record kinds, by the row's
+    /// `column` index — drawn as a second list column. Empty for a local file, which has no
+    /// kinds to speak of and keeps the one-column list.
+    pub seen_on: Vec<String>,
     pub accepted: bool,
 }
 
+impl ColumnsPick {
+    /// Whether the list wants its second column — see [`ColumnsPick::seen_on`].
+    fn wide(&self) -> bool {
+        self.seen_on.iter().any(|s| !s.is_empty())
+    }
+}
+
+/// How much wider the dialog is when the list carries its *Seen on* column, in dialog units.
+const COLUMNS_WIDE_BY: i16 = 150;
+
 /// The chooser's layout — Explorer's *Choose details* is the shape being followed: a checkbox list
 /// of every column, `Move up` / `Move down` beside it, and the commit row right-aligned beneath.
-fn columns_dialog_items() -> Vec<Item> {
+/// `wide` gives the list room for a second column, and moves everything to its right along.
+fn columns_dialog_items(wide: bool) -> Vec<Item> {
+    let extra = if wide { COLUMNS_WIDE_BY } else { 0 };
     vec![
         Item::new(
             Class::Static,
@@ -3563,31 +3580,37 @@ fn columns_dialog_items() -> Vec<Item> {
             Class::Named("SysListView32"),
             "",
             ID_C_LIST,
-            (7, 20, 220, 150),
+            (7, 20, 220 + extra, 150),
             WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         ),
         Item::new(
             Class::Button,
             "Move &up",
             ID_C_UP,
-            (233, 20, 60, 14),
+            (233 + extra, 20, 60, 14),
             WS_TABSTOP,
         ),
         Item::new(
             Class::Button,
             "Move &down",
             ID_C_DOWN,
-            (233, 38, 60, 14),
+            (233 + extra, 38, 60, 14),
             WS_TABSTOP,
         ),
         Item::new(
             Class::Button,
             "OK",
             1,
-            (177, 178, 56, 14),
+            (177 + extra, 178, 56, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
-        Item::new(Class::Button, "Cancel", 2, (237, 178, 56, 14), WS_TABSTOP),
+        Item::new(
+            Class::Button,
+            "Cancel",
+            2,
+            (237 + extra, 178, 56, 14),
+            WS_TABSTOP,
+        ),
     ]
 }
 
@@ -3607,22 +3630,35 @@ fn columns_quietly<R>(write: impl FnOnce() -> R) -> R {
 
 /// Fills the list from the rows, keeping `select` selected — the row that just moved, so a person
 /// clicking `Move up` twice moves one column twice rather than two columns once each.
-fn columns_fill(hdlg: HWND, rows: &[crate::chooser::ColumnRow], select: Option<usize>) {
+fn columns_fill(
+    hdlg: HWND,
+    rows: &[crate::chooser::ColumnRow],
+    seen_on: &[String],
+    select: Option<usize>,
+) {
     let Ok(list) = (unsafe { GetDlgItem(hdlg, i32::from(ID_C_LIST)) }) else {
         return;
     };
+    let wide = seen_on.iter().any(|s| !s.is_empty());
     columns_quietly(|| {
         lv_reset(list);
         lv_column(list, 0, "Column", 190);
+        if wide {
+            lv_column(list, 1, "Seen on", 260);
+        }
         for (at, row) in rows.iter().enumerate() {
-            lv_row(list, at as i32, std::slice::from_ref(&row.title));
+            let mut cells = vec![row.title.clone()];
+            if wide {
+                cells.push(seen_on.get(row.column).cloned().unwrap_or_default());
+            }
+            lv_row(list, at as i32, &cells);
             lv_check(list, at as i32, row.shown);
         }
         unsafe {
             SendMessageW(
                 list,
                 LVM_SETCOLUMNWIDTH,
-                WPARAM(0),
+                WPARAM(if wide { 1 } else { 0 }),
                 LPARAM(LVSCW_AUTOSIZE_USEHEADER),
             );
         }
@@ -3679,9 +3715,9 @@ unsafe extern "system" fn columns_proc(
             }
             // Copied out before the fill, for the aliasing reason `APPS_QUIET` documents: the fill
             // re-enters this procedure once per row.
-            let rows: Vec<crate::chooser::ColumnRow> = {
+            let (rows, seen_on): (Vec<crate::chooser::ColumnRow>, Vec<String>) = {
                 let data = unsafe { &*(lparam.0 as *const ColumnsPick) };
-                data.rows.clone()
+                (data.rows.clone(), data.seen_on.clone())
             };
             if let Ok(list) = unsafe { GetDlgItem(hdlg, i32::from(ID_C_LIST)) } {
                 unsafe {
@@ -3693,7 +3729,7 @@ unsafe extern "system" fn columns_proc(
                     );
                 }
             }
-            columns_fill(hdlg, &rows, Some(0));
+            columns_fill(hdlg, &rows, &seen_on, Some(0));
             1
         }
         WM_NOTIFY => {
@@ -3728,7 +3764,8 @@ unsafe extern "system" fn columns_proc(
                     };
                     if let Some(to) = crate::chooser::move_row(&mut data.rows, at, id == ID_C_UP) {
                         let rows = data.rows.clone();
-                        columns_fill(hdlg, &rows, Some(to));
+                        let seen_on = data.seen_on.clone();
+                        columns_fill(hdlg, &rows, &seen_on, Some(to));
                     }
                     1
                 }
@@ -3769,7 +3806,9 @@ fn columns_state(hdlg: HWND) -> Option<*mut ColumnsPick> {
 /// The owner's ask of 2026-09-09: *"this is a non standard way to show and hide columns … a select
 /// columns dialog would be better"*. Reports whether the user committed.
 pub fn show_columns_dialog(hwnd: HWND, data: &mut ColumnsPick) -> bool {
-    let t = template("Select Columns", 300, 199, &columns_dialog_items());
+    let wide = data.wide();
+    let width = 300 + if wide { COLUMNS_WIDE_BY } else { 0 };
+    let t = template("Select Columns", width, 199, &columns_dialog_items(wide));
     unsafe {
         DialogBoxIndirectParamW(
             None,
@@ -8616,7 +8655,8 @@ mod tests {
             ("Tail", tail_edit_items()),
             ("New remote source", setup_items()),
             ("Applications", apps_dialog_items()),
-            ("Select Columns", columns_dialog_items()),
+            ("Select Columns", columns_dialog_items(false)),
+            ("Select Columns, seen on", columns_dialog_items(true)),
         ] {
             let mut seen = Vec::new();
             for item in &items {
@@ -9525,7 +9565,8 @@ mod tests {
             ("Tail", tail_edit_items()),
             ("New remote source", setup_items()),
             ("Applications", apps_dialog_items()),
-            ("Select Columns", columns_dialog_items()),
+            ("Select Columns", columns_dialog_items(false)),
+            ("Select Columns, seen on", columns_dialog_items(true)),
         ] {
             let t = template("x", 100, 100, &items);
             // Walk the template the way Windows does: header, then aligned items.
