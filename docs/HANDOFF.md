@@ -40,7 +40,23 @@ never parsed.
   column *Seen on* with the record kinds, and `remember_columns` writes the choice to the tail by
   name. The dialog is 150 units wider when that column is present.
 
-### Not seen on screen, and what to look at
+### Seen on screen, in part — and a trap that cost an hour
+
+**2026-10-27, later: the owner opened the live Starberry tail on the dogfood build and the seven
+defaults came up without choosing anything** — *"ok, that looks much better."* His first attempt
+was a black window: Loki had answered **zero records**, because the dogfood binary reads a second
+settings tier beside itself, `target/release/tailhawk.settings.toml`, written by earlier dogfood
+sittings, and **that tier wins the merge by name** (`settings::merged_under`, earlier tier over
+later) — its `starberry` tail still asked for app names the telemetry team had retired. The
+installed binary has no such tier, so the same tail worked there. If a remote tail opens empty on
+the dev build and works on the install, look beside the exe first. The spill being `0` bytes in
+`%TEMP%\tailhawk-spill-<pid>-NN` is the tell.
+
+Still not exercised by the owner: the chooser's second column and its width, the `status` header
+sort, *Filter on status…* with `>= 500`, and the choice after a restart. His ndc pick persisted
+to that same dev tier as `columns = [...]`, which is the persistence half working.
+
+### What to look at
 
 The acceptance section of the request, against the owner's live tail
 `loki://starberry?apps=sb-edge,sb-gateway,sb-origin`: the seven defaults should appear without
