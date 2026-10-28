@@ -229,8 +229,14 @@ any key of a JSON record, whether or not that key is a column, a number as a num
 can be tinted by an attribute the body never mentions. A record without the attribute is simply
 not matched. A rule has a `pattern` or a `where`, never both. Write paths and expressions in
 single quotes, as above: inside double quotes `\t` is a tab, which a Windows path does not want.
-The in-app editor shows and saves these sets but does not edit them yet; edit the file for now
-and **Rules ▸ Reload rules**.
+**In the editor** (`Ctrl+H`), the row across the top is the set in front: the switcher lists
+the Default set and every named one; **New set** makes an empty one and puts the caret in its
+name; **Apply to ▾** offers this file, files like it (the folder and the extension, or every tail
+of the source), and this format, each ticked while it is on, with anything else the set is bound
+to listed under them; **Delete set** removes the set and its rules. A rule's **Move to set ▾**
+sends it to the end of another set, and **Where** flips it between a pattern over the text and
+a predicate over the record, keeping what was typed. The status bar's format pane names the set
+in force for the file in front.
 
 Rules sit above the built-in colouring and below `Ctrl+Shift+n` labels; a background tints under
 the ink, so a timestamp keeps its colour on a highlighted line. Under Windows' High Contrast

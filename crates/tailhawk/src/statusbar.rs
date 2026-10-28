@@ -460,6 +460,9 @@ pub struct StatusFacts<'a> {
     /// Members the set left out, which are rows the reader is not being shown.
     pub omitted: usize,
     pub format: Option<&'a str>,
+    /// The highlight rule set bound to this document, when one is — `UI-DESIGN.md` §2.1's
+    /// "active highlight rule set" chip, beside the format it is most often bound to.
+    pub rule_set: Option<&'a str>,
     pub encoding: Option<&'a str>,
     pub tail: Tail<'a>,
     /// `LOKI.md` §6: the source answer was cut, so every count over it is a floor, not a total,
@@ -528,6 +531,9 @@ pub struct ShellFacts<'a> {
     /// A remote request still in flight, already counted — see [`StatusFacts::waiting`].
     pub waiting: Option<&'a str>,
     pub rules: Option<&'a str>,
+    /// The rule set bound to the document in front, resolved from the tiers the shell holds —
+    /// see [`StatusFacts::rule_set`].
+    pub rule_set: Option<&'a str>,
     pub contrast: bool,
 }
 
@@ -710,7 +716,11 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
         find,
         filter,
         view: view.join(" · "),
-        format: facts.format.unwrap_or_default().to_owned(),
+        format: match (facts.format, facts.rule_set) {
+            (Some(format), Some(set)) => format!("{format} · rules: {set}"),
+            (None, Some(set)) => format!("rules: {set}"),
+            (format, None) => format.unwrap_or_default().to_owned(),
+        },
         encoding: facts.encoding.unwrap_or_default().to_owned(),
         tail,
     }
@@ -1237,6 +1247,24 @@ mod tests {
             ..open()
         });
         assert_eq!(panes.message, "⇥ saving → out.log (12 lines)");
+    }
+
+    /// `UI-DESIGN.md` §2.1's active rule set, beside the format it is most often bound to.
+    #[test]
+    fn the_format_pane_names_the_rule_set_in_force() {
+        let panes = status_panes_of(StatusFacts {
+            rule_set: Some("Starberry edge"),
+            ..open()
+        });
+        assert_eq!(panes.format, "Serilog · rules: Starberry edge");
+        let panes = status_panes_of(StatusFacts {
+            format: None,
+            rule_set: Some("Starberry edge"),
+            ..open()
+        });
+        assert_eq!(panes.format, "rules: Starberry edge");
+        let panes = status_panes_of(open());
+        assert_eq!(panes.format, "Serilog", "no bound set, nothing said");
     }
 
     #[test]

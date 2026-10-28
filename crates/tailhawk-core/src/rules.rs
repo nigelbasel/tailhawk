@@ -423,6 +423,56 @@ pub fn for_document<'a>(
     out
 }
 
+/// One thing `Apply to ▾` can offer for the document in front: what to call it, and the binding
+/// it writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offer {
+    pub label: String,
+    pub binding: String,
+}
+
+/// What `Apply to ▾` offers for a document at `path` (a file path or a `loki://` URL, `None` for
+/// a pipe) with the format named `format`: this file, files like it, this format — each as the
+/// binding [`binds`] will later match. "Files like this" is the folder and the extension for a
+/// file, and every tail of the source for a remote one.
+pub fn offers(path: Option<&str>, format: Option<&str>) -> Vec<Offer> {
+    let mut out = Vec::new();
+    if let Some(path) = path {
+        if let Some(rest) = path.strip_prefix("loki://") {
+            let tail = rest.split(['?', '*']).next().unwrap_or(rest);
+            out.push(Offer {
+                label: "This tail".to_owned(),
+                binding: path.to_owned(),
+            });
+            out.push(Offer {
+                label: format!("Every tail of {tail}"),
+                binding: format!("loki://{tail}*"),
+            });
+        } else {
+            out.push(Offer {
+                label: "This file".to_owned(),
+                binding: path.to_owned(),
+            });
+            let (folder, name) = match path.rfind(['\\', '/']) {
+                Some(at) => (&path[..=at], &path[at + 1..]),
+                None => ("", path),
+            };
+            let extension = name.rfind('.').map_or("", |at| &name[at..]);
+            out.push(Offer {
+                label: format!("Files like this ({folder}*{extension})"),
+                binding: format!("{folder}*{extension}"),
+            });
+        }
+    }
+    if let Some(format) = format {
+        out.push(Offer {
+            label: format!("This format ({format})"),
+            binding: format!("format:{format}"),
+        });
+    }
+    out
+}
+
 /// The first bound set that takes the document — what the status bar names as active.
 pub fn active_set<'a>(
     files: &'a [File],
@@ -827,6 +877,64 @@ name = \"not a rule\"
         );
         assert!(binds("C:/logs/*.log", Some("C:\\logs\\app.log"), None));
         assert!(binds("C:\\logs\\app.log", Some("C:/logs/app.log"), None));
+    }
+
+    /// `UI-DESIGN.md` §5's `Apply to ▾`: this file, a glob, or a detected format — and each
+    /// offer is a binding [`binds`] then matches.
+    #[test]
+    fn apply_to_offers_this_file_files_like_it_and_this_format_and_each_offer_binds() {
+        let offered = offers(Some("C:\\logs\\jobs\\dispatcher.2026.log"), Some("Serilog"));
+        let bindings: Vec<&str> = offered.iter().map(|o| o.binding.as_str()).collect();
+        assert_eq!(
+            bindings,
+            [
+                "C:\\logs\\jobs\\dispatcher.2026.log",
+                "C:\\logs\\jobs\\*.log",
+                "format:Serilog"
+            ]
+        );
+        assert_eq!(offered[1].label, "Files like this (C:\\logs\\jobs\\*.log)");
+        for offer in &offered {
+            assert!(
+                binds(
+                    &offer.binding,
+                    Some("C:\\logs\\jobs\\dispatcher.2026.log"),
+                    Some("Serilog")
+                ),
+                "{offer:?} must take the document it was offered for"
+            );
+        }
+
+        let remote = offers(
+            Some("loki://starberry?apps=sb-edge,sb-gateway"),
+            Some("JSON lines"),
+        );
+        let bindings: Vec<&str> = remote.iter().map(|o| o.binding.as_str()).collect();
+        assert_eq!(
+            bindings,
+            [
+                "loki://starberry?apps=sb-edge,sb-gateway",
+                "loki://starberry*",
+                "format:JSON lines"
+            ]
+        );
+        assert_eq!(remote[1].label, "Every tail of starberry");
+        for offer in &remote {
+            assert!(binds(
+                &offer.binding,
+                Some("loki://starberry?apps=sb-edge,sb-gateway"),
+                Some("JSON lines")
+            ));
+        }
+
+        let piped = offers(None, Some("Serilog"));
+        assert_eq!(piped.len(), 1, "a pipe has no path, only a format");
+        assert!(offers(None, None).is_empty());
+        let bare = offers(Some("notes"), None);
+        assert_eq!(
+            bare[1].binding, "*",
+            "no folder and no extension is every file"
+        );
     }
 
     #[test]

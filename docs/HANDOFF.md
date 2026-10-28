@@ -1,5 +1,43 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-28, night: the rules editor edits every set, and the bar names the one in force
+
+Step (3) of `docs/PROPOSAL-block-selection-and-rule-sets.md` §2, after the model landed in
+507767b. **The decisions are in `ruleset::Editor`**, which now holds the whole file: one list in
+front (`specs`, as every verb always worked on it) and the other sets in their homes; `choose_set`
+puts the list back and takes the next out, `file()` is the whole file with the one in front put
+back, and that is what a preview applies and a save writes. `set_names` / `current_set` /
+`current_name`, `add_set` / `rename_set` / `remove_set`, `apply_to` / `toggle_binding`,
+`move_rule_to`, and `toggle_where` (the text crosses over; `Row::where_` says which kind a row
+is and the one cell shows the predicate). `rules::offers(path, format)` says what `Apply to ▾`
+offers — this file, files like it (folder and extension; every tail of a remote source), this
+format — each a binding `binds` then matches, which the test proves.
+
+- **The dialog** (`dialog.rs`): a top row with the set switcher (combo), the set's name (typing
+  renames; the Default set's is greyed), `New set` (named `Set N`, caret in the name), `Delete
+  set`, `Apply to ▾` (a popup of the offers and the set's other bindings, ticked when on; the
+  button's text counts them, or says *Applies everywhere* for the Default set); a `Move to set ▾`
+  verb (popup of the sets); a `Where` check box that retitles the pattern label and greys
+  whole-line, literal and ignore-case; the Kind column says `where`. Popups are
+  `TrackPopupMenu` with `TPM_RETURNCMD` under the button, so no command routing is needed.
+- **The status bar**: `ShellFacts::rule_set` → `StatusFacts::rule_set`, resolved by the shell
+  from its tiers (`rules::active_set`) for the document in front; the format pane reads
+  `JSON lines · rules: Starberry edge`.
+- **The pre-commit review found eight things, all taken.** The set-name label was drawn at
+  `R_LEFT` on top of *Set:* (the `label` closure fixes x); *Delete set* left keyboard focus on a
+  button about to be greyed (focus moves to the switcher first); *Apply to ▾ (nowhere yet)*
+  clipped at 83 units (now *(none)*); *New set* could mint a duplicate name and a rename could
+  be empty (`Editor::fresh_set_name` picks the first unused *Set N*, an empty rename is ignored,
+  both tested); re-picking the set already in front reset the list's selection under the fields
+  (skipped when nothing changes); an empty *Apply to ▾* opened an empty popup (skipped); the
+  *Where* label and check box shared `Alt+H`; after *New set* the name was not selected for
+  typing over (`EM_SETSEL`).
+- **Not seen on screen.** The dialog's new row has only been laid out in dialog units; the first
+  screen run checks the row fits at 420 units wide and that `Apply to ▾` opens under its button.
+- **Knowingly left**: a set added by hand to the file while the editor is open is not seen by
+  the editor's save (the editor is the truth while it is open, as for rules); chips still see
+  only the columns where rules see every key; no `Ctrl+click` column selection yet.
+
 ## ▶ Resume point — 2026-10-28, evening: rule sets bound to a file or a format, and `where` rules
 
 The owner: *"It would be good to be able to have multiple named sets and be able to apply each one

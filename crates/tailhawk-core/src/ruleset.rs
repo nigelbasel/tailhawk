@@ -59,7 +59,7 @@
 //! colour is currently a compile error, so "let the palette pick" cannot yet be asked for.
 
 use crate::highlight::{Colour, RuleSet};
-use crate::rules::{self, Spec};
+use crate::rules::{self, File, SetSpec, Spec};
 
 /// Which of a row's cells [`Editor::set_cell`] is writing. The flags and the order are not here:
 /// they are toggles and moves, not text.
@@ -75,7 +75,10 @@ pub enum Cell {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row<'a> {
     pub name: &'a str,
+    /// The pattern — or, for a `where` rule, the predicate, which is what the one cell shows.
     pub pattern: &'a str,
+    /// Whether this rule tests the record rather than the text.
+    pub where_: bool,
     pub fg: Option<Colour>,
     pub bg: Option<Colour>,
     pub whole_line: bool,
@@ -100,7 +103,14 @@ const NEW_RULE_FG: Colour = [1.0, 0.78, 0.36, 1.0];
 /// generous against any hand-written set and refuses the file rather than the frame.
 pub const MAX_IMPORTED_RULES: usize = 512;
 
-/// The set under edit: its name and binding, the rules, their errors, and the selection.
+/// The file under edit: the set whose rules are in front, the other sets kept beside it, the
+/// rules' errors, and the selection.
+///
+/// **One list in front, the rest in their homes.** `specs` is always the rules of the set under
+/// edit — the Default set until [`Editor::choose_set`] says otherwise — so every verb that moves,
+/// adds, removes or writes a rule works on it as it always did. Choosing another set puts the
+/// list back where it came from and takes the next one out; [`Editor::file`] is the whole file
+/// with the list in front put back, which is what a preview applies and a save writes.
 #[derive(Debug, Default)]
 pub struct Editor {
     /// §5's title — `Rules — "App production"`.
@@ -113,6 +123,12 @@ pub struct Editor {
     selected: usize,
     open: bool,
     dirty: bool,
+    /// The Default set's rules while a named set is in front; empty otherwise.
+    default_rules: Vec<Spec>,
+    /// The named sets. The one in front has its rules in `specs` and none here.
+    sets: Vec<SetSpec>,
+    /// Which named set is in front, or `None` for the Default set.
+    current: Option<usize>,
 }
 
 impl Editor {
@@ -125,6 +141,183 @@ impl Editor {
         };
         editor.revalidate_all();
         editor
+    }
+
+    /// An editor over a whole file, opened on its Default set.
+    pub fn from_file(name: impl Into<String>, file: File) -> Self {
+        let mut editor = Self::new(name, file.default);
+        editor.sets = file.sets;
+        editor
+    }
+
+    /// The whole file as it stands, the set in front put back in its place — what a preview
+    /// applies and a save writes.
+    pub fn file(&self) -> File {
+        let mut sets = self.sets.clone();
+        match self.current {
+            Some(at) => {
+                if let Some(set) = sets.get_mut(at) {
+                    set.rules = self.specs.clone();
+                }
+                File {
+                    default: self.default_rules.clone(),
+                    sets,
+                }
+            }
+            None => File {
+                default: self.specs.clone(),
+                sets,
+            },
+        }
+    }
+
+    /// The sets a switcher lists: the Default set first, then the named ones in file order.
+    pub fn set_names(&self) -> Vec<&str> {
+        std::iter::once("Default")
+            .chain(self.sets.iter().map(|s| s.name.as_str()))
+            .collect()
+    }
+
+    /// Which entry of [`set_names`](Self::set_names) is in front.
+    pub fn current_set(&self) -> usize {
+        self.current.map_or(0, |at| at + 1)
+    }
+
+    /// The name of the set in front.
+    pub fn current_name(&self) -> &str {
+        self.current
+            .and_then(|at| self.sets.get(at))
+            .map_or("Default", |s| s.name.as_str())
+    }
+
+    /// Puts entry `index` of [`set_names`](Self::set_names) in front: `0` is the Default set.
+    /// The list in front goes back where it came from first, so nothing is lost by switching.
+    pub fn choose_set(&mut self, index: usize) {
+        let next = index.checked_sub(1);
+        if next == self.current || next.is_some_and(|at| at >= self.sets.len()) {
+            return;
+        }
+        let in_front = std::mem::take(&mut self.specs);
+        match self.current {
+            Some(at) => self.sets[at].rules = in_front,
+            None => self.default_rules = in_front,
+        }
+        self.specs = match next {
+            Some(at) => std::mem::take(&mut self.sets[at].rules),
+            None => std::mem::take(&mut self.default_rules),
+        };
+        self.current = next;
+        self.selected = 0;
+        self.revalidate_all();
+    }
+
+    /// What the set in front applies to — nothing, for the Default set, which applies everywhere.
+    pub fn apply_to(&self) -> &[String] {
+        self.current
+            .and_then(|at| self.sets.get(at))
+            .map_or(&[], |s| s.apply_to.as_slice())
+    }
+
+    /// Adds `binding` to the set in front, or takes it off if it is already there. Nothing, for
+    /// the Default set.
+    pub fn toggle_binding(&mut self, binding: &str) {
+        let Some(set) = self.current.and_then(|at| self.sets.get_mut(at)) else {
+            return;
+        };
+        match set.apply_to.iter().position(|b| b == binding) {
+            Some(at) => {
+                set.apply_to.remove(at);
+            }
+            None => set.apply_to.push(binding.to_owned()),
+        }
+        self.dirty = true;
+    }
+
+    /// A new, empty, unbound set named `name`, put in front. Reports its switcher index.
+    pub fn add_set(&mut self, name: impl Into<String>) -> usize {
+        self.sets.push(SetSpec {
+            name: name.into(),
+            ..SetSpec::default()
+        });
+        let index = self.sets.len();
+        self.choose_set(index);
+        self.dirty = true;
+        index
+    }
+
+    /// Renames the set in front. The Default set keeps its name, and so does a set offered an
+    /// empty one: a set with no name would be written as `name = ""` and read back as `set N`.
+    pub fn rename_set(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(set) = self.current.and_then(|at| self.sets.get_mut(at)) {
+            if set.name != name {
+                set.name = name.to_owned();
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The first of `Set 1`, `Set 2`, … that no set is called — what *New set* names one, so two
+    /// sets never share a name and the switcher never shows the same entry twice.
+    pub fn fresh_set_name(&self) -> String {
+        (1..)
+            .map(|n| format!("Set {n}"))
+            .find(|candidate| !self.sets.iter().any(|s| &s.name == candidate))
+            .unwrap_or_default()
+    }
+
+    /// Removes the set in front with its rules and puts the Default set in front. The Default
+    /// set cannot be removed.
+    pub fn remove_set(&mut self) {
+        let Some(at) = self.current else {
+            return;
+        };
+        self.specs.clear();
+        self.errors.clear();
+        self.sets.remove(at);
+        self.current = None;
+        self.specs = std::mem::take(&mut self.default_rules);
+        self.selected = 0;
+        self.revalidate_all();
+        self.dirty = true;
+    }
+
+    /// Moves the selected rule to the end of entry `index` of [`set_names`](Self::set_names).
+    /// Nothing, when that is the set in front or there is no selected rule.
+    pub fn move_rule_to(&mut self, index: usize) {
+        let target = index.checked_sub(1);
+        if target == self.current
+            || target.is_some_and(|at| at >= self.sets.len())
+            || self.selected >= self.specs.len()
+        {
+            return;
+        }
+        let spec = self.specs.remove(self.selected);
+        self.errors.remove(self.selected);
+        match target {
+            Some(at) => self.sets[at].rules.push(spec),
+            None => self.default_rules.push(spec),
+        }
+        self.selected = self.selected.min(self.specs.len().saturating_sub(1));
+        self.dirty = true;
+    }
+
+    /// Flips the selected rule between a pattern over the text and a `where` over the record,
+    /// carrying its text across so a rule typed as one can be made the other without retyping.
+    pub fn toggle_where(&mut self) {
+        let row = self.selected;
+        let Some(spec) = self.specs.get_mut(row) else {
+            return;
+        };
+        match spec.where_.take() {
+            Some(predicate) => spec.pattern = predicate,
+            None => spec.where_ = Some(std::mem::take(&mut spec.pattern)),
+        }
+        self.dirty = true;
+        self.revalidate(row);
     }
 
     pub fn is_open(&self) -> bool {
@@ -192,6 +385,7 @@ impl Editor {
         };
         match cell {
             Cell::Name => spec.name = text.to_owned(),
+            Cell::Pattern if spec.where_.is_some() => spec.where_ = Some(text.to_owned()),
             Cell::Pattern => spec.pattern = text.to_owned(),
             Cell::Fg => spec.fg = rules::colour(text),
             Cell::Bg => spec.bg = rules::colour(text),
@@ -206,7 +400,8 @@ impl Editor {
             .enumerate()
             .map(|(i, spec)| Row {
                 name: &spec.name,
-                pattern: &spec.pattern,
+                pattern: spec.where_.as_deref().unwrap_or(&spec.pattern),
+                where_: spec.where_.is_some(),
                 fg: spec.fg,
                 bg: spec.bg,
                 whole_line: spec.whole_line,
@@ -370,9 +565,9 @@ impl Editor {
         self.dirty = true;
     }
 
-    /// What "Export…" writes.
+    /// What a save writes: the whole file, every set in it.
     pub fn to_toml(&self) -> String {
-        rules::to_toml(&self.specs)
+        rules::to_toml_file(&self.file())
     }
 
     fn revalidate(&mut self, row: usize) {
@@ -546,6 +741,175 @@ mod tests {
         let mut e = Editor::new("test", specs);
         e.open();
         e
+    }
+
+    fn names(editor: &Editor) -> Vec<String> {
+        editor.specs().iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// The owner, 2026-10-28: named sets, each applied to a file or a file type — and an editor
+    /// that can see them. The Default set is in front first; choosing another puts its rules in
+    /// front and loses nothing of the last; the file written is the whole file.
+    #[test]
+    fn the_editor_opens_on_the_default_set_and_switches_without_losing_a_rule() {
+        let file = rules::parse_file(
+            "[[rule]]\nname = \"d1\"\npattern = \"a\"\nfg = \"#fff\"\n\
+             [[set]]\nname = \"edge\"\napply_to = [\"*.edge.log\"]\n\
+             [[set.rule]]\nname = \"e1\"\npattern = \"b\"\nfg = \"#fff\"\n\
+             [[set.rule]]\nname = \"e2\"\nwhere = \"status = 413\"\nbg = \"#000\"\n\
+             [[set]]\nname = \"drafts\"\n",
+        );
+        let mut e = Editor::from_file("test", file.clone());
+        e.open();
+        assert_eq!(e.set_names(), ["Default", "edge", "drafts"]);
+        assert_eq!(e.current_set(), 0);
+        assert_eq!(names(&e), ["d1"]);
+        assert!(
+            e.apply_to().is_empty(),
+            "the Default set applies everywhere"
+        );
+
+        e.choose_set(1);
+        assert_eq!(e.current_name(), "edge");
+        assert_eq!(names(&e), ["e1", "e2"]);
+        assert_eq!(e.apply_to(), ["*.edge.log"]);
+        assert!(e.rows()[1].where_);
+        assert_eq!(
+            e.rows()[1].pattern,
+            "status = 413",
+            "the one cell shows the predicate"
+        );
+        e.select(1);
+        e.set_cell(Cell::Pattern, "status = 429");
+        assert_eq!(e.specs()[1].where_.as_deref(), Some("status = 429"));
+        assert!(
+            e.specs()[1].pattern.is_empty(),
+            "written to the where, not the pattern"
+        );
+
+        e.choose_set(2);
+        assert!(names(&e).is_empty());
+        e.add_rule();
+        e.set_cell(Cell::Name, "todo");
+        e.set_cell(Cell::Pattern, "TODO");
+        e.choose_set(0);
+        assert_eq!(names(&e), ["d1"], "the Default set is as it was");
+
+        let written = e.file();
+        assert_eq!(written.default.len(), 1);
+        assert_eq!(
+            written.sets[0].rules[1].where_.as_deref(),
+            Some("status = 429")
+        );
+        assert_eq!(written.sets[1].rules[0].pattern, "TODO");
+        let saved = rules::parse_file(&e.to_toml());
+        assert_eq!(saved.default.len(), 1, "the save is the whole file");
+        assert_eq!(saved.sets[0].apply_to, ["*.edge.log"]);
+        assert_eq!(
+            saved.sets[0].rules[1].where_.as_deref(),
+            Some("status = 429")
+        );
+        assert_eq!(saved.sets[1].rules[0].name, "todo");
+        assert_eq!(saved.sets[1].rules[0].pattern, "TODO");
+        assert!(e.is_dirty());
+    }
+
+    #[test]
+    fn a_set_is_made_named_bound_and_removed_and_a_rule_moves_between_sets() {
+        let mut e = editor(vec![spec("first", "ERROR"), spec("second", "WARN")]);
+        assert_eq!(e.add_set("Set 1"), 1);
+        assert_eq!(e.current_name(), "Set 1");
+        e.rename_set("Starberry");
+        assert_eq!(e.set_names(), ["Default", "Starberry"]);
+        e.toggle_binding("format:JSON lines");
+        e.toggle_binding("loki://starberry*");
+        assert_eq!(e.apply_to(), ["format:JSON lines", "loki://starberry*"]);
+        e.toggle_binding("format:JSON lines");
+        assert_eq!(
+            e.apply_to(),
+            ["loki://starberry*"],
+            "the same binding again takes it off"
+        );
+
+        e.choose_set(0);
+        e.select(1);
+        e.move_rule_to(1);
+        assert_eq!(names(&e), ["first"]);
+        e.choose_set(1);
+        assert_eq!(
+            names(&e),
+            ["second"],
+            "the rule is at the end of the set it moved to"
+        );
+        e.move_rule_to(1);
+        assert_eq!(
+            names(&e),
+            ["second"],
+            "moving to the set in front is nothing"
+        );
+        e.toggle_binding("x");
+        e.remove_set();
+        assert_eq!(e.set_names(), ["Default"]);
+        assert_eq!(names(&e), ["first"], "the removed set's rules go with it");
+        let saved = e.file();
+        assert!(saved.sets.is_empty() && saved.default.len() == 1);
+        e.remove_set();
+        assert_eq!(e.set_names(), ["Default"], "the Default set stays");
+        e.rename_set("nope");
+        assert_eq!(e.current_name(), "Default");
+
+        // Names: the next free `Set N`, never a duplicate, never empty.
+        assert_eq!(e.fresh_set_name(), "Set 1");
+        e.add_set(e.fresh_set_name());
+        e.choose_set(0);
+        e.add_set(e.fresh_set_name());
+        assert_eq!(e.set_names(), ["Default", "Set 1", "Set 2"]);
+        e.choose_set(1);
+        e.remove_set();
+        assert_eq!(
+            e.fresh_set_name(),
+            "Set 1",
+            "a deleted set's name is free again, and Set 2 is not minted twice"
+        );
+        e.choose_set(1);
+        e.rename_set("   ");
+        assert_eq!(e.current_name(), "Set 2", "an empty name is no rename");
+
+        // A rule that does not compile moves with its error, and the rows stay aligned.
+        e.choose_set(0);
+        e.add_rule();
+        e.set_cell(Cell::Pattern, "(");
+        assert!(e.rows()[e.selected()].error.is_some());
+        e.move_rule_to(1);
+        assert_eq!(e.rows().len(), e.specs().len());
+        e.choose_set(1);
+        assert_eq!(e.rows().len(), e.specs().len());
+        assert!(
+            e.rows().last().and_then(|r| r.error).is_some(),
+            "the moved rule still says why it does not compile"
+        );
+    }
+
+    /// The firewall workstream's rule tests the record, and the editor lets a rule be made one
+    /// without retyping: the text crosses over, and the row says which kind it is.
+    #[test]
+    fn a_rule_flips_between_a_pattern_and_a_where_keeping_its_text() {
+        let mut e = editor(vec![spec("attack", "-> 444 probe")]);
+        assert!(!e.rows()[0].where_);
+        e.toggle_where();
+        assert!(e.rows()[0].where_);
+        assert_eq!(e.specs()[0].where_.as_deref(), Some("-> 444 probe"));
+        assert!(
+            e.rows()[0].error.is_some(),
+            "that text is no predicate, and the row says so"
+        );
+        e.set_cell(Cell::Pattern, "reason in [\"probe\"]");
+        assert!(e.rows()[0].error.is_none(), "{:?}", e.rows()[0].error);
+        e.toggle_where();
+        assert!(!e.rows()[0].where_);
+        assert_eq!(e.specs()[0].pattern, "reason in [\"probe\"]");
+        assert_eq!(e.specs()[0].where_, None);
+        assert!(e.is_dirty());
     }
 
     /// A cell written straight from a control, with no begin-and-commit around it.

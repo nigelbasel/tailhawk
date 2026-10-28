@@ -32,12 +32,14 @@ use windows::Win32::UI::Controls::{
     TVS_CHECKBOXES, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateDialogIndirectParamW, DestroyWindow, DialogBoxIndirectParamW, EndDialog, GetClientRect,
-    GetDlgItem, GetDlgItemInt, GetDlgItemTextW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    IsWindowVisible, MapDialogRect, PostMessageW, SendDlgItemMessageW, SendMessageW, SetDlgItemInt,
-    SetDlgItemTextW, SetWindowLongPtrW, SetWindowPos, ShowWindow, DLGTEMPLATE, SM_CXVSCROLL,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_LONG_PTR_INDEX, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY,
+    AppendMenuW, CreateDialogIndirectParamW, CreatePopupMenu, DestroyMenu, DestroyWindow,
+    DialogBoxIndirectParamW, EndDialog, GetClientRect, GetDlgItem, GetDlgItemInt, GetDlgItemTextW,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, MapDialogRect,
+    PostMessageW, SendDlgItemMessageW, SendMessageW, SetDlgItemInt, SetDlgItemTextW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, DLGTEMPLATE, MF_CHECKED,
+    MF_STRING, SM_CXVSCROLL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY,
 };
 
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -124,6 +126,14 @@ const ID_R_CASE: u16 = 193;
 const ID_R_LITERAL: u16 = 194;
 const ID_R_ERROR: u16 = 195;
 const ID_R_SAVE: u16 = 196;
+const ID_R_SET: u16 = 197;
+const ID_R_SETNAME: u16 = 198;
+const ID_R_NEWSET: u16 = 199;
+const ID_R_DELSET: u16 = 200;
+const ID_R_APPLYTO: u16 = 201;
+const ID_R_MOVETO: u16 = 202;
+const ID_R_WHERE: u16 = 203;
+const ID_R_PATLABEL: u16 = 204;
 
 /// §12.4's remote sources dialog. A range of its own so a stray id cannot land on the rules
 /// editor's controls, which sit immediately below.
@@ -705,6 +715,8 @@ pub fn go_to_status(target: GoTo, total: u64) -> String {
 
 /// The rules editor's grid, in dialog units.
 const R_LEFT: i16 = 7;
+/// Where the rule list starts, under the row that names the set.
+const R_TOP: i16 = 25;
 const R_LIST_W: i16 = 300;
 const R_VERB_X: i16 = 313;
 const R_VERB_W: i16 = 100;
@@ -4170,7 +4182,7 @@ fn rules_dialog_items() -> Vec<Item> {
             Class::Button,
             text,
             id,
-            (R_VERB_X, 7 + row * 17, R_VERB_W, 14),
+            (R_VERB_X, R_TOP + row * 17, R_VERB_W, 14),
             WS_TABSTOP,
         )
     };
@@ -4188,60 +4200,105 @@ fn rules_dialog_items() -> Vec<Item> {
             Class::Button,
             text,
             id,
-            (x, 170, w, 10),
+            (x, R_TOP + 163, w, 10),
             WS_TABSTOP | BS_AUTOCHECKBOX,
         )
     };
+    let small = |text: &str, id: u16, x: i16, w: i16| {
+        Item::new(Class::Button, text, id, (x, 6, w, 14), WS_TABSTOP)
+    };
     vec![
+        // **The set in front, across the top**: which set these rules are, what it is called,
+        // and what it applies to — `UI-DESIGN.md` §5's `Apply to ▾`, beside the switcher §2.1
+        // reserves a chip for.
+        label("&Set:", 7, 18),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_R_SET,
+            (26, 6, 100, 90),
+            WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        ),
+        Item::new(Class::Static, "Na&me:", 0xFFFF, (131, 9, 24, 8), 0),
+        field(ID_R_SETNAME, 7, 157, 72),
+        small("New set", ID_R_NEWSET, 234, 42),
+        small("Delete set", ID_R_DELSET, 280, 46),
+        small("Appl&y to ▾", ID_R_APPLYTO, 330, 83),
         Item::new(
             Class::Named("SysListView32"),
             "",
             ID_R_LIST,
-            (R_LEFT, 7, R_LIST_W, 100),
+            (R_LEFT, R_TOP, R_LIST_W, 100),
             WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         ),
         verb("&Add", ID_R_ADD, 0),
         verb("&Remove", ID_R_REMOVE, 1),
         verb("Move &up", ID_R_UP, 2),
         verb("Move &down", ID_R_DOWN, 3),
-        label("&Name:", 114, 44),
-        field(ID_R_NAME, 114, R_FIELD_X, 252),
-        label("&Pattern:", 130, 44),
-        field(ID_R_PATTERN, 130, R_FIELD_X, 252),
+        verb("Move t&o set ▾", ID_R_MOVETO, 4),
+        label("&Name:", R_TOP + 107, 44),
+        field(ID_R_NAME, R_TOP + 107, R_FIELD_X, 252),
+        Item::new(
+            Class::Static,
+            "&Pattern:",
+            ID_R_PATLABEL,
+            (R_LEFT, R_TOP + 125, 44, 8),
+            0,
+        ),
+        field(ID_R_PATTERN, R_TOP + 123, R_FIELD_X, 252),
         Item::new(
             Class::Button,
             "Te&xt…",
             ID_R_FGPICK,
-            (R_LEFT, 147, 50, 14),
+            (R_LEFT, R_TOP + 140, 50, 14),
             WS_TABSTOP,
         ),
         // A bordered box the colour is painted into, not a field spelling it out.
-        Item::new(Class::Static, "", ID_R_FG, (60, 147, 55, 14), WS_BORDER),
+        Item::new(
+            Class::Static,
+            "",
+            ID_R_FG,
+            (60, R_TOP + 140, 55, 14),
+            WS_BORDER,
+        ),
         Item::new(
             Class::Button,
             "Bac&kground…",
             ID_R_BGPICK,
-            (125, 147, 70, 14),
+            (125, R_TOP + 140, 70, 14),
             WS_TABSTOP,
         ),
-        Item::new(Class::Static, "", ID_R_BG, (200, 147, 55, 14), WS_BORDER),
-        check("&Enabled", ID_R_ENABLED, R_LEFT, 60),
-        check("&Whole line", ID_R_WHOLE, 75, 70),
-        check("&Ignore case", ID_R_CASE, 150, 75),
-        check("&Literal", ID_R_LITERAL, 235, 60),
-        Item::new(Class::Static, "", ID_R_ERROR, (R_LEFT, 186, 400, 16), 0),
+        Item::new(
+            Class::Static,
+            "",
+            ID_R_BG,
+            (200, R_TOP + 140, 55, 14),
+            WS_BORDER,
+        ),
+        check("&Enabled", ID_R_ENABLED, R_LEFT, 50),
+        check("&Whole line", ID_R_WHOLE, 62, 56),
+        check("&Ignore case", ID_R_CASE, 122, 60),
+        check("&Literal", ID_R_LITERAL, 186, 44),
+        check("W&here (tests the record)", ID_R_WHERE, 234, 110),
+        Item::new(
+            Class::Static,
+            "",
+            ID_R_ERROR,
+            (R_LEFT, R_TOP + 179, 400, 16),
+            0,
+        ),
         Item::new(
             Class::Button,
             "OK",
             ID_R_SAVE,
-            (303, 211, 50, 14),
+            (303, R_TOP + 204, 50, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
         Item::new(
             Class::Button,
             "Cancel",
             IDCANCEL,
-            (357, 211, 56, 14),
+            (357, R_TOP + 204, 56, 14),
             WS_TABSTOP,
         ),
     ]
@@ -4650,7 +4707,7 @@ pub fn show_rules_dialog(owner: HWND) {
     unsafe {
         let _ = InitCommonControlsEx(&icc);
     }
-    let t = template("Highlight rules", 420, 232, &rules_dialog_items());
+    let t = template("Highlight rules", 420, 250, &rules_dialog_items());
     // Leaked deliberately: a modeless dialog outlives this call, and its proc reads this for as
     // long as the window is up. `rules_proc` frees it on `WM_NCDESTROY`.
     let state = Box::into_raw(Box::new(RulesState {
@@ -4719,7 +4776,12 @@ pub fn rules_row_cells(editor: &tailhawk_core::ruleset::Editor) -> Vec<[String; 
                 } else {
                     row.pattern.to_owned()
                 },
-                if row.literal { "Ab" } else { ".*" }.to_owned(),
+                match (row.where_, row.literal) {
+                    (true, _) => "where",
+                    (false, true) => "Ab",
+                    (false, false) => ".*",
+                }
+                .to_owned(),
                 colour,
                 one_line(row.error.unwrap_or_default()),
             ]
@@ -5237,6 +5299,101 @@ fn rules_refresh(hdlg: HWND, keep: Option<usize>) {
     rules_show_selected(hdlg);
 }
 
+/// Refills the set switcher from the editor, keeping the set in front selected.
+fn rules_fill_sets(hdlg: HWND) {
+    let Some((names, current)) = crate::rules_read(|editor| {
+        (
+            editor
+                .set_names()
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>(),
+            editor.current_set(),
+        )
+    }) else {
+        return;
+    };
+    rules_quietly(|| combo_fill(hdlg, ID_R_SET, &names, current));
+}
+
+/// Points the top row at the set in front: the switcher, its name, and what the Default set
+/// cannot have done to it — renamed, deleted, or bound, since it applies everywhere.
+fn rules_show_set(hdlg: HWND) {
+    rules_fill_sets(hdlg);
+    let Some((name, is_default, bound)) = crate::rules_read(|editor| {
+        (
+            editor.current_name().to_owned(),
+            editor.current_set() == 0,
+            editor.apply_to().len(),
+        )
+    }) else {
+        return;
+    };
+    rules_quietly(|| unsafe {
+        let w = wsz(if is_default { "" } else { name.as_str() });
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_R_SETNAME), PCWSTR(w.as_ptr()));
+        let apply = match (is_default, bound) {
+            (true, _) => "Applies everywhere".to_owned(),
+            (false, 0) => "Appl&y to ▾ (none)".to_owned(),
+            (false, n) => format!("Appl&y to ▾ ({n})"),
+        };
+        let w = wsz(&apply);
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_R_APPLYTO), PCWSTR(w.as_ptr()));
+    });
+    for id in [ID_R_SETNAME, ID_R_DELSET, ID_R_APPLYTO] {
+        unsafe {
+            let _ = EnableWindow(
+                GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(),
+                !is_default,
+            );
+        }
+    }
+}
+
+/// A popup menu of `items` under the control `anchor`, each ticked when its flag says so.
+/// Reports which was chosen, or `None` when the menu was dismissed.
+fn rules_popup(hdlg: HWND, anchor: u16, items: &[(String, bool)]) -> Option<usize> {
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return None;
+    };
+    for (i, (label, checked)) in items.iter().enumerate() {
+        let w = wsz(label);
+        let flags = if *checked {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        unsafe {
+            let _ = AppendMenuW(menu, flags, i + 1, PCWSTR(w.as_ptr()));
+        }
+    }
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(
+            GetDlgItem(hdlg, i32::from(anchor)).unwrap_or_default(),
+            &mut rect,
+        );
+    }
+    let chosen = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+            rect.left,
+            rect.bottom,
+            0,
+            hdlg,
+            None,
+        )
+    };
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+    usize::try_from(chosen.0)
+        .ok()
+        .filter(|&n| n > 0)
+        .map(|n| n - 1)
+}
+
 /// Points the fields, the check boxes and the fault line at the selected rule, and greys them all
 /// when there is no rule to point at — §10's empty state, which a set with every rule removed
 /// reaches in one press of Remove.
@@ -5253,6 +5410,7 @@ fn rules_show_selected(hdlg: HWND) {
                 row.whole_line,
                 row.case_insensitive,
                 row.literal,
+                row.where_,
                 one_line(row.error.unwrap_or_default()),
             )
         })
@@ -5261,30 +5419,40 @@ fn rules_show_selected(hdlg: HWND) {
     };
 
     let has = shown.is_some();
-    for id in [
-        ID_R_NAME,
-        ID_R_PATTERN,
-        ID_R_FG,
-        ID_R_BG,
-        ID_R_FGPICK,
-        ID_R_BGPICK,
-        ID_R_ENABLED,
-        ID_R_WHOLE,
-        ID_R_CASE,
-        ID_R_LITERAL,
-        ID_R_REMOVE,
-        ID_R_UP,
-        ID_R_DOWN,
+    let (name, pattern, fg, bg, enabled, whole, case, literal, where_, error) =
+        shown.unwrap_or_default();
+    // **A `where` rule has no text to be whole-line, literal or case-insensitive about**, so the
+    // three toggles are greyed for it rather than left to look as if they did something.
+    for (id, on) in [
+        (ID_R_NAME, has),
+        (ID_R_PATTERN, has),
+        (ID_R_FG, has),
+        (ID_R_BG, has),
+        (ID_R_FGPICK, has),
+        (ID_R_BGPICK, has),
+        (ID_R_ENABLED, has),
+        (ID_R_WHOLE, has && !where_),
+        (ID_R_CASE, has && !where_),
+        (ID_R_LITERAL, has && !where_),
+        (ID_R_WHERE, has),
+        (ID_R_REMOVE, has),
+        (ID_R_UP, has),
+        (ID_R_DOWN, has),
+        (ID_R_MOVETO, has),
     ] {
         unsafe {
-            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), has);
+            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), on);
         }
     }
 
-    let (name, pattern, fg, bg, enabled, whole, case, literal, error) = shown.unwrap_or_default();
     rules_quietly(|| unsafe {
         rules_set_swatches(hdlg, &fg, &bg);
-        for (id, text) in [(ID_R_NAME, name.as_str()), (ID_R_PATTERN, pattern.as_str())] {
+        let pattern_label = if where_ { "Where:" } else { "&Pattern:" };
+        for (id, text) in [
+            (ID_R_NAME, name.as_str()),
+            (ID_R_PATTERN, pattern.as_str()),
+            (ID_R_PATLABEL, pattern_label),
+        ] {
             let w = wsz(text);
             let _ = SetDlgItemTextW(hdlg, i32::from(id), PCWSTR(w.as_ptr()));
         }
@@ -5294,6 +5462,7 @@ fn rules_show_selected(hdlg: HWND) {
         (ID_R_WHOLE, whole),
         (ID_R_CASE, case),
         (ID_R_LITERAL, literal),
+        (ID_R_WHERE, where_),
     ] {
         unsafe {
             SendDlgItemMessageW(
@@ -5564,6 +5733,7 @@ unsafe extern "system" fn rules_proc(
                     );
                 }
             }
+            rules_show_set(hdlg);
             let at = crate::rules_read(|editor| editor.selected());
             rules_refresh(hdlg, at.or(Some(0)));
             1
@@ -5631,14 +5801,118 @@ unsafe extern "system" fn rules_proc(
                     rules_say_error(hdlg);
                     1
                 }
-                (ID_R_ENABLED | ID_R_WHOLE | ID_R_CASE | ID_R_LITERAL, BN_CLICKED) => {
+                (ID_R_ENABLED | ID_R_WHOLE | ID_R_CASE | ID_R_LITERAL | ID_R_WHERE, BN_CLICKED) => {
                     crate::rules_apply(owner, |editor| match id {
                         ID_R_ENABLED => editor.toggle_enabled(),
                         ID_R_WHOLE => editor.toggle_whole_line(),
                         ID_R_CASE => editor.toggle_case_insensitive(),
+                        ID_R_WHERE => editor.toggle_where(),
                         _ => editor.toggle_literal(),
                     });
                     rules_refresh(hdlg, selected);
+                    1
+                }
+                (ID_R_SET, CBN_SELCHANGE) => {
+                    let (count, current) = crate::rules_read(|editor| {
+                        (editor.set_names().len(), editor.current_set())
+                    })
+                    .unwrap_or((1, 0));
+                    // **Re-picking the set in front changes nothing**, and a refresh then would
+                    // reselect row 0 under fields still showing the row the reader had.
+                    if let Some(chosen) =
+                        combo_selected(hdlg, ID_R_SET, count).filter(|&at| at != current)
+                    {
+                        crate::rules_apply(owner, |editor| editor.choose_set(chosen));
+                        rules_show_set(hdlg);
+                        rules_refresh(hdlg, Some(0));
+                    }
+                    1
+                }
+                (ID_R_SETNAME, EN_CHANGE) => {
+                    let text = read_dlg_text(hdlg, id);
+                    crate::rules_apply(owner, |editor| editor.rename_set(&text));
+                    // **The switcher follows the name; the field being typed into is left
+                    // alone**, since a caret does not survive its text being replaced.
+                    rules_fill_sets(hdlg);
+                    1
+                }
+                (ID_R_NEWSET, BN_CLICKED) => {
+                    crate::rules_apply(owner, |editor| {
+                        let name = editor.fresh_set_name();
+                        editor.add_set(name);
+                    });
+                    rules_show_set(hdlg);
+                    rules_refresh(hdlg, Some(0));
+                    // The name, selected whole, so the first keystroke replaces `Set N`.
+                    unsafe {
+                        let field = GetDlgItem(hdlg, i32::from(ID_R_SETNAME)).unwrap_or_default();
+                        let _ = SetFocus(field);
+                        SendMessageW(field, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                    }
+                    1
+                }
+                (ID_R_DELSET, BN_CLICKED) => {
+                    // **Focus leaves the button before it is greyed**: Windows drops the focus
+                    // of a disabled control on the floor, and the keyboard would be stranded.
+                    unsafe {
+                        let _ = SetFocus(GetDlgItem(hdlg, i32::from(ID_R_SET)).unwrap_or_default());
+                    }
+                    crate::rules_apply(owner, |editor| editor.remove_set());
+                    rules_show_set(hdlg);
+                    rules_refresh(hdlg, Some(0));
+                    1
+                }
+                (ID_R_APPLYTO, BN_CLICKED) => {
+                    // **What the document in front offers, then whatever else the set is bound
+                    // to**, each ticked when it is on; choosing one toggles it.
+                    let offers = crate::rules_offers();
+                    let bound =
+                        crate::rules_read(|editor| editor.apply_to().to_vec()).unwrap_or_default();
+                    let mut items: Vec<(String, String)> = offers
+                        .iter()
+                        .map(|o| (o.label.clone(), o.binding.clone()))
+                        .collect();
+                    for binding in &bound {
+                        if !items.iter().any(|(_, b)| b == binding) {
+                            items.push((binding.clone(), binding.clone()));
+                        }
+                    }
+                    let shown: Vec<(String, bool)> = items
+                        .iter()
+                        .map(|(label, binding)| (label.clone(), bound.contains(binding)))
+                        .collect();
+                    if shown.is_empty() {
+                        return 1;
+                    }
+                    if let Some(at) = rules_popup(hdlg, ID_R_APPLYTO, &shown) {
+                        let binding = items[at].1.clone();
+                        crate::rules_apply(owner, |editor| editor.toggle_binding(&binding));
+                        rules_show_set(hdlg);
+                    }
+                    1
+                }
+                (ID_R_MOVETO, BN_CLICKED) => {
+                    let (names, current) = crate::rules_read(|editor| {
+                        (
+                            editor
+                                .set_names()
+                                .iter()
+                                .map(|s| (*s).to_owned())
+                                .collect::<Vec<_>>(),
+                            editor.current_set(),
+                        )
+                    })
+                    .unwrap_or_default();
+                    let shown: Vec<(String, bool)> = names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| (name.clone(), i == current))
+                        .collect();
+                    if let Some(at) = rules_popup(hdlg, ID_R_MOVETO, &shown) {
+                        crate::rules_apply(owner, |editor| editor.move_rule_to(at));
+                        let keep = crate::rules_read(|editor| editor.selected());
+                        rules_refresh(hdlg, keep);
+                    }
                     1
                 }
                 (ID_R_ADD, BN_CLICKED) => {

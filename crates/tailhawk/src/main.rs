@@ -5285,9 +5285,6 @@ struct Shell {
     /// Rules from tiers the editor cannot write — a curated file beside the exe. Applied under
     /// whatever the editor holds, so the preview shows the set that will actually be in force.
     rules_fixed: Vec<tailhawk_core::rules::File>,
-    /// The personal tier's named sets while the editor is open. The editor edits that tier's
-    /// Default set; the sets are written back as they were, so a save loses nothing.
-    rules_personal_sets: Vec<tailhawk_core::rules::SetSpec>,
     /// §14's first-run surface, kept while it is shown so a click on a recent file can be resolved.
     welcome: Option<Welcome>,
     /// The welcome entry the pointer is over, so the next frame underlines it.
@@ -5791,12 +5788,19 @@ impl Shell {
                 ..statusbar::StatusFacts::default()
             });
         };
+        let key = doc.state_key();
+        let active = tailhawk_core::rules::active_set(
+            &self.rule_files,
+            key.as_deref(),
+            doc.detection.accepted.map(|format| format.name),
+        );
         Shell::with_doc_facts(
             doc,
             statusbar::ShellFacts {
                 notice,
                 waiting,
                 rules: rules_note.as_deref(),
+                rule_set: active.map(|set| set.name.as_str()),
                 contrast: theme().suppress_rules,
             },
             statusbar::status_panes_of,
@@ -5918,6 +5922,7 @@ impl Shell {
             order_assumed: doc.set.newest().disagreed(),
             omitted: doc.set.omitted(),
             format: doc.detection.accepted.map(|format| format.name),
+            rule_set: shell.rule_set,
             encoding: Some(doc.set.charset().name()),
             tail,
             cut: doc.answers_cut,
@@ -7045,13 +7050,6 @@ impl Shell {
         let (specs, failed) = load_rule_files(&self.rules_tiers);
         self.rule_files = specs;
         self.rules_failed = failed;
-        // The editor's save writes the personal tier's sets back as they were read; a set added
-        // by hand while the editor is open must be what "as they were" means by then.
-        if self.rules_editor.is_open() {
-            if let Some(personal) = self.rule_files.last() {
-                self.rules_personal_sets = personal.sets.clone();
-            }
-        }
         let specs = self.rule_files.clone();
         for (_, doc) in self.document.all_mut() {
             rebuild_highlighter_from(doc, &specs);
@@ -7449,10 +7447,7 @@ impl Shell {
     /// the personal one with the editor's Default set and its own sets.
     fn rules_in_edit(&self) -> Vec<tailhawk_core::rules::File> {
         let mut files = self.rules_fixed.clone();
-        files.push(tailhawk_core::rules::File {
-            default: self.rules_editor.specs().to_vec(),
-            sets: self.rules_personal_sets.clone(),
-        });
+        files.push(self.rules_editor.file());
         files
     }
 
@@ -7474,9 +7469,8 @@ impl Shell {
             None => (tailhawk_core::rules::File::default(), Vec::new()),
         };
         self.rules_fixed = fixed;
-        self.rules_personal_sets = mine.sets;
         self.rules_editor =
-            tailhawk_core::ruleset::Editor::new(tailhawk_core::rules::FILE_NAME, mine.default);
+            tailhawk_core::ruleset::Editor::from_file(tailhawk_core::rules::FILE_NAME, mine);
         self.rules_editor.open();
     }
 
@@ -7509,11 +7503,7 @@ impl Shell {
         }
         // §10: a read-only profile is a state, not an impossibility. Say so rather than let the
         // title go on claiming the set is unsaved with no reason given.
-        let personal = tailhawk_core::rules::File {
-            default: self.rules_editor.specs().to_vec(),
-            sets: self.rules_personal_sets.clone(),
-        };
-        if let Err(e) = std::fs::write(&target, tailhawk_core::rules::to_toml_file(&personal)) {
+        if let Err(e) = std::fs::write(&target, self.rules_editor.to_toml()) {
             // **Name the file and give the remedy.** `std::io::Error`'s text on Windows is "Access
             // is denied. (os error 5)", which says nothing about *which* file or what to do; §10
             // treats a read-only profile as a state rather than an impossibility, and a state is
@@ -12216,6 +12206,24 @@ pub fn rules_read<R>(read: impl FnOnce(&tailhawk_core::ruleset::Editor) -> R) ->
     STATE.with(|s| s.borrow().as_ref().map(|shell| read(&shell.rules_editor)))
 }
 
+/// What the dialog's `Apply to ▾` offers for the document in front: its path, files like it,
+/// its format — `rules::offers`, from the document's own key and format.
+pub fn rules_offers() -> Vec<tailhawk_core::rules::Offer> {
+    STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|shell| shell.document.as_ref())
+            .map(|doc| {
+                let key = doc.state_key();
+                tailhawk_core::rules::offers(
+                    key.as_deref(),
+                    doc.detection.accepted.map(|format| format.name),
+                )
+            })
+            .unwrap_or_default()
+    })
+}
+
 /// Reads the filters dialog's editor, the shape `rules_read` has.
 pub fn filters_read<R>(read: impl FnOnce(&tailhawk_core::filter::Editor) -> R) -> Option<R> {
     STATE.with(|s| s.borrow().as_ref().map(|shell| read(&shell.filters_editor)))
@@ -14757,7 +14765,6 @@ fn main() -> Result<()> {
             wizard_found: Vec::new(),
             formats_tiers,
             rules_fixed: Vec::new(),
-            rules_personal_sets: Vec::new(),
             rule_files,
             rules_tiers,
             rules_failed,
@@ -20427,6 +20434,27 @@ mod tests {
             "the hidden column is still hidden"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The list's Kind column says what a rule tests: `.*` a regex, `Ab` plain text, `where`
+    /// the record — so a `where` rule is never mistaken for a pattern that happens to be empty.
+    #[test]
+    fn the_kind_column_says_where_for_a_rule_that_tests_the_record() {
+        let mut editor = rules_editor_with(vec![a_spec("attack", "reason in [\"probe\"]")]);
+        assert_eq!(dialog::rules_row_cells(&editor)[0][2], ".*");
+        editor.toggle_where();
+        let cells = dialog::rules_row_cells(&editor);
+        assert_eq!(cells[0][2], "where");
+        assert_eq!(
+            cells[0][1], "reason in [\"probe\"]",
+            "and the Pattern cell shows the predicate"
+        );
+        editor.toggle_literal();
+        assert_eq!(
+            dialog::rules_row_cells(&editor)[0][2],
+            "where",
+            "a where rule is where whatever the literal flag says"
+        );
     }
 
     fn rules_editor_with(specs: Vec<tailhawk_core::rules::Spec>) -> tailhawk_core::ruleset::Editor {
