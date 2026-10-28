@@ -12242,6 +12242,23 @@ pub fn filters_columns() -> Vec<dialog::FilterColumn> {
     })
 }
 
+/// The values `column` carries in the document in front, counted, most frequent first — what the
+/// composer's value box offers to pick from. From the window sample, the same lines the column
+/// chooser reads; nothing for a document with no format, where a column has no meaning.
+pub fn filters_values(column: &str) -> Vec<(String, usize)> {
+    STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|shell| shell.document.as_ref())
+            .and_then(|doc| {
+                doc.detection
+                    .accepted
+                    .map(|format| format.values_of(&doc.window_sample(), column))
+            })
+            .unwrap_or_default()
+    })
+}
+
 /// Edits it. Separate from [`filters_read`] because a `RefCell` will not lend both at once, and the
 /// dialog's verbs are writes with an answer — the fault from a text that would not parse.
 pub fn filters_write<R>(edit: impl FnOnce(&mut tailhawk_core::filter::Editor) -> R) -> Option<R> {

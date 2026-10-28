@@ -132,12 +132,18 @@ the grammar's only case-sensitive form, and the phrase box shows it happening. O
 that is not a phrase at all — `level >= Warning` — both boxes are greyed and the list says `—`
 rather than `No`.
 
-**Edit…** opens the **Filter dialog**, which is where a filter is composed against the columns this
-file actually has: a column to scope it to (or *any column*), one of ten operators — contains,
-equals, does not equal, less than, at most, greater than, at least, like, starts with, ends with —
-the value, an include/exclude choice, and **Regex** and **Match case** for the any-column case. The
-expression it builds is always visible and always editable, and a line under it says whether what
-you have typed parses and whether it names a column this format does not have.
+The **…** button opens the **Filter dialog**, which is where a filter is composed against the
+columns this file actually has: a column to scope it to (or *any column*), one of thirteen
+operators — contains, equals, does not equal, less than, at most, greater than, at least, like,
+starts with, ends with, is one of, is empty, is not empty — the value, an include/exclude choice,
+and **Regex** and **Match case** for the any-column case. The value box lists the values the
+chosen column carries in the window, most common first, so a status or a reason is one pick rather
+than something to know; typing is still typing, and *is one of* takes a comma list (`403, 444`)
+and writes `status in [403, 444]`. The last three operators ask about a column, so over *any
+column* the list stops at ten. *Is empty* finds a row whose column is present and empty; a row
+without the column at all answers *unknown*, which an include leaves out. The expression it builds is always
+visible and always editable, and a line under it says whether what you have typed parses and
+whether it names a column this format does not have.
 
 Typed by hand, the expression language is wider than the dialog's operators:
 

@@ -1,5 +1,41 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-28, last: the filter composer offers a column's values, *is one of*, empty / not empty
+
+The owner: *"some sort of filter helper in the dialog to easily pick columns and select operators
+and possibly values and build regexes."* Proposal §4's first increment. The composer (the `…`
+beside the phrase box, and a header's *Filter on this column…*) already had every column, ten
+operators and the live expression; it gains:
+
+- **`Format::values_of(lines, column)`** (`format.rs`, tested): the distinct values a column
+  carries across a sample, counted, most frequent first and alphabetical among equals; `level`
+  answers the severity as written, `body` and `timestamp` nothing, any other name the attribute —
+  every key of a JSON record, through `parse_every_key`. `main.rs`'s `filters_values(column)`
+  runs it over `Document::window_sample()`, the two head samples the column chooser reads.
+- **The value field is a `CBS_DROPDOWN` combo** (`dialog.rs`): filled on open and on every
+  scope change with the bare values, most frequent first (the count is the order, not a suffix:
+  the review found a combo copies the picked item into its box *after* it notifies the pick, so
+  a `value (count)` entry would have landed in the box as typed text); a pick posts itself a
+  `CBN_EDITCHANGE` so the recompose reads the box once the copy has happened. Typing is
+  `CBN_EDITCHANGE`, which the `EN_CHANGE` arm became; `CB_RESETCONTENT` empties the box too,
+  so what was typed is put back, under `busy` so the refill never reads back as typing.
+- **Three operators**: *is one of* → `column in [...]` from a comma list (`split_list`: commas
+  outside double quotes, so `"Smith, John", Jane` is two items); *is empty* → `column = ""`;
+  *is not empty* → `column != ""`. `op_takes_no_value` greys the box for the last two. The
+  operator list is refilled per scope (`filter_fill_ops`): ten over *(any column)*, thirteen
+  over a column, since the three ask about a column; nothing typed under *is one of* writes no
+  expression, because `in []` is not one the grammar accepts.
+- **`values_of` offers nothing for an identifier column** — more than fifty distinct values
+  each seen once — and answers `severity` as it answers `level`.
+- **Knowingly left.** *is empty* is `column = ""`, which §7.2 judges *unknown* on a record
+  without the column, and an include chip leaves an unknown row out: on a JSON file, *reason is
+  empty* keeps lines whose `reason` is present and empty, not lines with no `reason` at all. The
+  grammar has no `exists`; adding one is a `SPEC.md` §7.2 decision, not a dialog's. A JSON key
+  literally named `trace` or `span` is offered by `values_of` and can never match, because the
+  filter reads the record's trace context under those names.
+- **Next increment**: the regex templates and *Quote this text* on the whole-record case
+  (proposal §4). **Not seen on screen.**
+
 ## ▶ Resume point — 2026-10-28, latest: the headers repaint when a dialog takes the window; the Filters dialog regrouped
 
 Two more from the owner on the Filters dialog, after the `new` row (below, now `7fff16c`).

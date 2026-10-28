@@ -649,7 +649,43 @@ pub const FILTER_OPS: &[&str] = &[
     "like",
     "starts with",
     "ends with",
+    "is one of",
+    "is empty",
+    "is not empty",
 ];
+
+/// How many of [`FILTER_OPS`] apply to the whole record: *is one of*, *is empty* and *is not
+/// empty* ask about a column, so the op list is this long while the scope is *(any column)*.
+pub const FILTER_OPS_ANY: usize = 10;
+
+/// The operators that take no value, so the value field has nothing to say and is greyed.
+pub fn op_takes_no_value(op: usize) -> bool {
+    op >= 11
+}
+
+/// The items of a comma list as typed for *is one of*: split on the commas outside double
+/// quotes, trimmed, the quotes around an item taken off (the composer puts its own back), empty
+/// items dropped — so `"Smith, John", Jane` is two items and not three.
+pub fn split_list(value: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut item = String::new();
+    let mut quoted = false;
+    for c in value.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                items.push(std::mem::take(&mut item));
+            }
+            c => item.push(c),
+        }
+    }
+    items.push(item);
+    items
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
 
 /// What the Go to line dialog makes of what has been typed, before anything is jumped to.
 ///
@@ -6236,6 +6272,11 @@ pub fn compose_filter(
 ) -> String {
     let value = value.trim();
     let Some(column) = column else {
+        // **The three column-only operators have no whole-record meaning**, and the dialog does
+        // not offer them there; asked anyway, there is no expression to write.
+        if op >= 10 {
+            return String::new();
+        }
         // **The whole-record case is `filter::phrase_source`**, which is the same decision the
         // Filters dialog's own `Regular expression` and `Match case` boxes make — and it is in the
         // model so that the reading beside it, `phrase_of`, is the exact inverse of one function
@@ -6244,17 +6285,32 @@ pub fn compose_filter(
     };
     // A column value: numbers and severity-looking names ride bare (severity banding needs the
     // bare name), anything else is quoted.
-    let bare = value.parse::<f64>().is_ok()
-        || matches!(
-            value.to_ascii_lowercase().as_str(),
-            "trace" | "debug" | "info" | "information" | "warn" | "warning" | "error" | "fatal"
-        );
-    let formed = if bare {
-        value.to_owned()
-    } else {
-        format!("\"{}\"", value.replace('"', ""))
+    let form = |value: &str| {
+        let bare = value.parse::<f64>().is_ok()
+            || matches!(
+                value.to_ascii_lowercase().as_str(),
+                "trace" | "debug" | "info" | "information" | "warn" | "warning" | "error" | "fatal"
+            );
+        if bare {
+            value.to_owned()
+        } else {
+            format!("\"{}\"", value.replace('"', ""))
+        }
     };
+    let formed = form(value);
     match op {
+        // **One of: a comma list in the value field, each entry formed as a value is.** The
+        // grammar's own `in`, which was a thing to know and type; the dialog writes it. Nothing
+        // typed is no expression yet, since `in []` is not one the grammar accepts.
+        10 => {
+            let items: Vec<String> = split_list(value).iter().map(|v| form(v)).collect();
+            if items.is_empty() {
+                return String::new();
+            }
+            format!("{column} in [{}]", items.join(", "))
+        }
+        11 => format!("{column} = \"\""),
+        12 => format!("{column} != \"\""),
         0 => format!("contains({column}, {formed})"),
         1 => format!("{column} = {formed}"),
         2 => format!("{column} != {formed}"),
@@ -6474,6 +6530,7 @@ const EN_KILLFOCUS: u32 = 0x0200;
 /// easy warning to read past.
 const BN_CLICKED: u32 = 0;
 const CBN_SELCHANGE: u32 = 1;
+const CBN_EDITCHANGE: u32 = 5;
 /// A box taking the focus, which is what moves the source editor's help line.
 const EN_SETFOCUS: u32 = 0x0100;
 const CBN_SETFOCUS: u32 = 3;
@@ -6963,6 +7020,103 @@ struct FilterState {
     busy: bool,
 }
 
+/// Fills the operator combo for the scope in force: every operator over a column, the first
+/// [`FILTER_OPS_ANY`] over the whole record, where *is one of* and the two empties have no
+/// meaning. The operator chosen stays chosen where it still exists.
+unsafe fn filter_fill_ops(hdlg: HWND) {
+    let scope = unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_F_SCOPE),
+            CB_GETCURSEL,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .0
+    };
+    let chosen = unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(ID_F_OP), CB_GETCURSEL, WPARAM(0), LPARAM(0)).0
+    };
+    let offered = if scope <= 0 {
+        &FILTER_OPS[..FILTER_OPS_ANY]
+    } else {
+        FILTER_OPS
+    };
+    let keep = usize::try_from(chosen)
+        .unwrap_or(0)
+        .min(offered.len().saturating_sub(1));
+    unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_F_OP),
+            CB_RESETCONTENT,
+            WPARAM(0),
+            LPARAM(0),
+        );
+        for op in offered {
+            let text = wsz(op);
+            SendDlgItemMessageW(
+                hdlg,
+                i32::from(ID_F_OP),
+                CB_ADDSTRING,
+                WPARAM(0),
+                LPARAM(text.as_ptr() as isize),
+            );
+        }
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_F_OP),
+            CB_SETCURSEL,
+            WPARAM(keep),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Fills the value combo with the values the chosen column carries, most frequent first — and
+/// keeps whatever was typed, since `CB_RESETCONTENT` empties the box too. Under `busy`, because
+/// emptying and refilling the box must not read back as typing.
+unsafe fn filter_fill_values(hdlg: HWND, state: &mut FilterState) {
+    let edit = unsafe { &*state.edit };
+    let scope = unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_F_SCOPE),
+            CB_GETCURSEL,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .0
+    };
+    let typed = read_dlg_text(hdlg, ID_F_VALUE);
+    let counted = scope_name(&edit.columns, scope as i32)
+        .map(crate::filters_values)
+        .unwrap_or_default();
+    state.busy = true;
+    unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_F_VALUE),
+            CB_RESETCONTENT,
+            WPARAM(0),
+            LPARAM(0),
+        );
+        for (value, _) in &counted {
+            let text = wsz(value);
+            SendDlgItemMessageW(
+                hdlg,
+                i32::from(ID_F_VALUE),
+                CB_ADDSTRING,
+                WPARAM(0),
+                LPARAM(text.as_ptr() as isize),
+            );
+        }
+        let text = wsz(&typed);
+        let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_VALUE), PCWSTR(text.as_ptr()));
+    }
+    state.busy = false;
+}
+
 unsafe fn filter_recompose(hdlg: HWND, state: &mut FilterState) {
     let edit = unsafe { &mut *state.edit };
     let scope = unsafe {
@@ -6983,13 +7137,15 @@ unsafe fn filter_recompose(hdlg: HWND, state: &mut FilterState) {
     };
     let value = read_dlg_text(hdlg, ID_F_VALUE);
     let column = scope_name(&edit.columns, scope as i32);
-    let expression = compose_filter(
-        column,
-        op.max(0) as usize,
-        &value,
-        checked(ID_F_REGEX),
-        checked(ID_F_CASE),
-    );
+    let op = op.max(0) as usize;
+    // **An operator that takes no value greys the box** rather than reading a value it ignores.
+    unsafe {
+        let _ = EnableWindow(
+            GetDlgItem(hdlg, i32::from(ID_F_VALUE)).unwrap_or_default(),
+            !op_takes_no_value(op),
+        );
+    }
+    let expression = compose_filter(column, op, &value, checked(ID_F_REGEX), checked(ID_F_CASE));
     state.busy = true;
     let text = wsz(&expression);
     unsafe {
@@ -7066,17 +7222,6 @@ unsafe extern "system" fn filter_proc(
                     WPARAM(0),
                     LPARAM(0),
                 );
-                for op in FILTER_OPS {
-                    let text = wsz(op);
-                    SendDlgItemMessageW(
-                        hdlg,
-                        i32::from(ID_F_OP),
-                        CB_ADDSTRING,
-                        WPARAM(0),
-                        LPARAM(text.as_ptr() as isize),
-                    );
-                }
-                SendDlgItemMessageW(hdlg, i32::from(ID_F_OP), CB_SETCURSEL, WPARAM(0), LPARAM(0));
                 let radio = if data.include {
                     ID_F_INCLUDE
                 } else {
@@ -7104,6 +7249,8 @@ unsafe extern "system" fn filter_proc(
                     let text = wsz(&data.expression);
                     let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_EXPR), PCWSTR(text.as_ptr()));
                 }
+                filter_fill_ops(hdlg);
+                filter_fill_values(hdlg, &mut *state);
                 filter_validate(hdlg, &*state);
                 // Focus lands in the Value box — typing a filter is what the dialog is for, and
                 // the default first-tabstop focus would land on the Include radio instead.
@@ -7169,12 +7316,36 @@ unsafe extern "system" fn filter_proc(
                     }
                     1
                 }
-                (ID_F_VALUE, EN_CHANGE) => {
+                (ID_F_VALUE, CBN_EDITCHANGE) => {
+                    if !state.busy {
+                        unsafe { &mut *state.edit }.manual = false;
+                        unsafe { filter_recompose(hdlg, state) };
+                    }
+                    1
+                }
+                (ID_F_VALUE, CBN_SELCHANGE) => {
+                    // **The box still reads the old text when this arrives**: a combo notifies
+                    // the pick first and copies the picked item into its box after. So the
+                    // recompose is posted to run once that copy has happened, as the keystroke
+                    // it amounts to.
+                    unsafe {
+                        let _ = PostMessageW(
+                            hdlg,
+                            WM_COMMAND,
+                            WPARAM(((CBN_EDITCHANGE as usize) << 16) | usize::from(ID_F_VALUE)),
+                            LPARAM(0),
+                        );
+                    }
+                    1
+                }
+                (ID_F_SCOPE, CBN_SELCHANGE) => {
+                    unsafe { filter_fill_ops(hdlg) };
+                    unsafe { filter_fill_values(hdlg, state) };
                     unsafe { &mut *state.edit }.manual = false;
                     unsafe { filter_recompose(hdlg, state) };
                     1
                 }
-                (ID_F_SCOPE | ID_F_OP, CBN_SELCHANGE) => {
+                (ID_F_OP, CBN_SELCHANGE) => {
                     unsafe { &mut *state.edit }.manual = false;
                     unsafe { filter_recompose(hdlg, state) };
                     1
@@ -7215,6 +7386,8 @@ unsafe extern "system" fn filter_proc(
 fn filter_dialog_items() -> Vec<Item> {
     const BS_AUTORADIOBUTTON: u32 = 0x0009;
     const WS_GROUP: u32 = 0x0002_0000;
+    const CBS_DROPDOWN: u32 = 0x0002;
+    const CBS_AUTOHSCROLL: u32 = 0x0040;
     vec![
         Item::new(
             Class::Button,
@@ -7259,12 +7432,15 @@ fn filter_dialog_items() -> Vec<Item> {
             (F_LABEL_X, 45, F_LABEL_W, 8),
             0,
         ),
+        // **A combo, not a field: the values the column carries are there to pick from**, most
+        // frequent first with their counts, and typing is still typing — the owner's helper of
+        // 2026-10-28, "easily pick columns and select operators and possibly values".
         Item::new(
-            Class::Edit,
+            Class::ComboBox,
             "",
             ID_F_VALUE,
-            (F_FIELD_X, 43, F_RIGHT - F_FIELD_X, 12),
-            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+            (F_FIELD_X, 43, F_RIGHT - F_FIELD_X, 110),
+            CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP,
         ),
         Item::new(
             Class::Button,
@@ -10035,6 +10211,34 @@ mod tests {
                 false,
                 "source like \"api\"",
             ),
+            // The owner's helper, 2026-10-28: one of, from a comma list; empty and not empty
+            // with no value at all.
+            (
+                Some("reason"),
+                10,
+                "probe, payload , scanner,",
+                false,
+                false,
+                "reason in [\"probe\", \"payload\", \"scanner\"]",
+            ),
+            (
+                Some("status"),
+                10,
+                "403,444",
+                false,
+                false,
+                "status in [403, 444]",
+            ),
+            (
+                Some("name"),
+                10,
+                "\"Smith, John\", Jane",
+                false,
+                false,
+                "name in [\"Smith, John\", \"Jane\"]",
+            ),
+            (Some("trace"), 11, "ignored", false, false, "trace = \"\""),
+            (Some("trace"), 12, "", false, false, "trace != \"\""),
         ];
         for (column, op, value, regex, case, want) in cases {
             let got = compose_filter(column, op, value, regex, case);
@@ -10044,6 +10248,32 @@ mod tests {
                 "{got:?} does not parse"
             );
         }
+    }
+
+    /// What the three column-only operators write when there is nothing to write: nothing, so
+    /// the status line asks for a filter rather than showing one the grammar rejects.
+    #[test]
+    fn one_of_with_nothing_to_list_and_a_column_operator_over_any_column_write_nothing() {
+        assert_eq!(compose_filter(Some("status"), 10, "", false, false), "");
+        assert_eq!(compose_filter(Some("status"), 10, " , ,", false, false), "");
+        assert_eq!(compose_filter(None, 10, "a, b", false, false), "");
+        assert_eq!(compose_filter(None, 11, "", false, false), "");
+        assert_eq!(compose_filter(None, 12, "", false, false), "");
+        assert_eq!(
+            compose_filter(None, 0, "a, b", false, false),
+            "\"a, b\"",
+            "the whole-record operators still write the phrase, quoted as a phrase is"
+        );
+        assert!(!op_takes_no_value(10));
+        assert!(op_takes_no_value(11));
+        assert!(op_takes_no_value(12));
+        assert_eq!(FILTER_OPS.len(), 13);
+        assert_eq!(FILTER_OPS_ANY, 10);
+        assert_eq!(
+            split_list("\"a, b\", c,, d "),
+            ["a, b", "c", "d"],
+            "commas inside quotes are the value's own"
+        );
     }
 
     /// **The scope list shows the readable name and the expression says the file's own.**

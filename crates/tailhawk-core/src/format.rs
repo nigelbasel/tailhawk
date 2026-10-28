@@ -260,6 +260,47 @@ impl Format {
         Some(record)
     }
 
+    /// The distinct values `column` carries across `lines`, with how many lines carry each, most
+    /// frequent first and alphabetical among equals — what a filter composer offers to pick from.
+    ///
+    /// `level` answers with the severity as written, `body` with nothing (every message differs),
+    /// `timestamp` with nothing (so does every instant), and any other name with the attribute
+    /// of that name, every key of a JSON record in reach as [`parse_every_key`](Self::parse_every_key)
+    /// makes it. A line the format does not parse contributes nothing.
+    pub fn values_of(&self, lines: &[String], column: &str) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for line in lines {
+            let Some(record) = self.parse_every_key(line) else {
+                continue;
+            };
+            let value = match column {
+                MSG | "body" | TS | "timestamp" => None,
+                LEVEL | "severity" => record.severity_text.clone(),
+                _ => record.attribute(column).map(|v| match v {
+                    AttributeValue::String(s) => s.clone(),
+                    AttributeValue::Int(n) => n.to_string(),
+                    AttributeValue::Float(f) => f.to_string(),
+                    AttributeValue::Bool(b) => b.to_string(),
+                }),
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            match counts.iter_mut().find(|(v, _)| *v == value) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((value, 1)),
+            }
+        }
+        // **An identifier is not a thing to pick from.** A request id or a trace id differs on
+        // every line, and a list of hundreds of values each seen once is a list nobody wants
+        // dropped in front of them; a handful seen once each is still a list worth having.
+        if counts.len() > 50 && counts.iter().all(|(_, n)| *n == 1) {
+            return Vec::new();
+        }
+        counts.sort_by(|(a, n), (b, m)| m.cmp(n).then_with(|| a.cmp(b)));
+        counts
+    }
+
     /// The scanner's answer for a [`scanned`](Self::scanned) format: each column's value, by the
     /// raw key its title names. `None` when the line is not an object.
     fn scanned_fields(&self, line: &str) -> Option<Vec<Option<core::ops::Range<usize>>>> {
@@ -932,6 +973,65 @@ mod tests {
             plain.attribute("status").is_none(),
             "parse keeps to the columns: {:?}",
             plain.attributes
+        );
+    }
+
+    /// What the filter composer offers to pick from: a column's values with their counts, the
+    /// common ones first.
+    #[test]
+    fn the_values_of_a_column_come_counted_and_most_frequent_first() {
+        let lines: Vec<String> = [
+            r#"{"level":"info","status":200,"msg":"a"}"#,
+            r#"{"level":"warn","status":403,"msg":"b"}"#,
+            r#"{"level":"info","status":200,"msg":"c"}"#,
+            r#"{"level":"error","status":500,"msg":"d"}"#,
+            r#"{"level":"info","status":403,"msg":"e"}"#,
+            "not json at all",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let keys = crate::detect::json_keys(&lines[0]).expect("an object");
+        let format = json_lines(&keys);
+        assert_eq!(
+            format.values_of(&lines, "status"),
+            [
+                ("200".to_owned(), 2),
+                ("403".to_owned(), 2),
+                ("500".to_owned(), 1)
+            ],
+            "a number as written, counted, ties alphabetical"
+        );
+        assert_eq!(
+            format.values_of(&lines, "level"),
+            [
+                ("info".to_owned(), 3),
+                ("error".to_owned(), 1),
+                ("warn".to_owned(), 1)
+            ]
+        );
+        assert!(
+            format.values_of(&lines, "msg").is_empty(),
+            "every message differs, so none is offered"
+        );
+        assert!(format.values_of(&lines, "nothing").is_empty());
+        assert_eq!(
+            format.values_of(&lines, "severity"),
+            format.values_of(&lines, "level"),
+            "the filter language's other name for the level answers the same"
+        );
+
+        // An identifier column: hundreds of values each seen once is nothing to pick from.
+        let ids: Vec<String> = (0..60)
+            .map(|i| format!(r#"{{"level":"info","id":"req-{i}","msg":"x"}}"#))
+            .collect();
+        let keys = crate::detect::json_keys(&ids[0]).expect("an object");
+        let format = json_lines(&keys);
+        assert!(format.values_of(&ids, "id").is_empty());
+        assert_eq!(
+            format.values_of(&ids[..5], "id").len(),
+            5,
+            "a handful seen once each is still offered"
         );
     }
 
