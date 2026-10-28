@@ -559,6 +559,9 @@ pub struct Editor {
     /// The row that is only an offer: it exists so the field has somewhere to write, and it is not
     /// a filter until something is typed into it. [`Self::commit`] leaves it out.
     offered: Option<usize>,
+    /// A dialog opened to add, before anything is typed: the polarity the row typing makes will
+    /// carry. Not a row, so nothing is listed and nothing reaches [`Self::commit`].
+    pending: Option<Polarity>,
 }
 
 /// What an offered row reads until it is typed into. **A word the grammar accepts**, because the
@@ -573,20 +576,31 @@ impl Editor {
             selected: (!chips.chips.is_empty()).then_some(0),
             dirty: false,
             offered: None,
+            pending: None,
         }
     }
 
-    /// Opens it with a row already waiting to be typed into, carrying `polarity`.
+    /// Opens it ready for a filter to be typed, carrying `polarity` for the row that typing makes.
     ///
     /// **This is what `Filter: include` opens.** The owner asked for a filter and was given a form
     /// holding that one filter and nothing else: *"the filter dialog does not show me a list of
     /// filters, and no way to delete, edit or activate/deactivate them"*. There is one filter
     /// surface, and asking to add arrives at the same list as asking to manage — the only
-    /// difference being the row already there, and which way round it is.
+    /// difference being that the field is live with nothing selected, and which way round the
+    /// row it makes will be. **No row is listed until something is typed**: this used to offer a
+    /// row reading `new`, and the owner, 2026-10-28: *"every time I open it it appends an entry
+    /// called new on the bottom, we really dont need to do that."*
     pub fn opened_to_add(chips: &Chips, polarity: Polarity) -> Self {
         let mut editor = Self::open(chips);
-        editor.offer(polarity);
+        editor.selected = None;
+        editor.pending = Some(polarity);
         editor
+    }
+
+    /// The polarity a row typed into the empty field would carry, while nothing is selected and
+    /// the dialog was opened to add.
+    pub fn pending(&self) -> Option<Polarity> {
+        self.pending
     }
 
     /// Offers a row to type into, selects it, and says where it went.
@@ -598,6 +612,9 @@ impl Editor {
     ///
     /// `None` only if [`OFFERED`] ever stops parsing, which a test holds it to.
     pub fn offer(&mut self, polarity: Polarity) -> Option<usize> {
+        // **A row asked for by the button is the row the pending polarity was waiting to make**,
+        // so nothing is left waiting beside it.
+        self.pending = None;
         // **One offer at a time.** The dialog a `Ctrl+L` opens has an Add button in it, and a
         // second offer would displace the first — which would stop being an offer at that moment
         // and go into force on OK as a filter reading `new`. Asking again answers with the row
@@ -642,6 +659,9 @@ impl Editor {
     /// list control's notifications and this model can disagree for one message after a removal.
     pub fn select(&mut self, at: Option<usize>) {
         self.selected = at.filter(|n| *n < self.rows.len());
+        if self.selected.is_some() {
+            self.pending = None;
+        }
     }
 
     /// Adds a filter, selects it, and reports where it went — or says why the text is not one.
@@ -662,6 +682,17 @@ impl Editor {
     /// half-typed expression never destroys the one it is replacing.
     pub fn retext(&mut self, text: &str) -> Result<(), ParseError> {
         let Some(at) = self.selected else {
+            // **Typing into the empty field of a dialog opened to add makes the row**, with the
+            // polarity the command named; until then there is nothing in the list. A text that
+            // does not parse makes nothing and keeps the polarity waiting.
+            let Some(polarity) = self.pending else {
+                return Ok(());
+            };
+            if text.trim().is_empty() {
+                return Ok(());
+            }
+            self.add(text, polarity)?;
+            self.pending = None;
             return Ok(());
         };
         let old = &self.rows[at];
@@ -688,6 +719,9 @@ impl Editor {
     /// already has every time it refills its controls.
     pub fn set_polarity(&mut self, polarity: Polarity) {
         let Some(at) = self.selected else {
+            if self.pending.is_some() {
+                self.pending = Some(polarity);
+            }
             return;
         };
         if let Some(row) = self.rows.get_mut(at) {
@@ -2099,100 +2133,154 @@ mod tests {
         }
     }
 
-    /// **Asking for a filter opens the list the filter is going into, with the new row waiting.**
+    /// **Asking for a filter opens the list the filter is going into, with nothing listed until
+    /// something is typed.**
     ///
     /// The owner added one and got a form with a single filter in it: *"the filter dialog does not
     /// show me a list of filters, and no way to delete, edit or activate/deactivate them"*. There is
     /// one filter surface, and `Filter: include` arrives at it the same way `Filters…` does — the
-    /// difference being only that a row is already there to type into, carrying the polarity the
-    /// command named.
-    ///
-    /// **Not dirty from the seed row alone**, for the reason the sources editor is not: Cancel has
-    /// to be able to discard an offered row that nobody typed into.
+    /// difference being that the field is live with nothing selected, and the row it makes
+    /// carries the polarity the command named. **And no row until then**, the owner again on
+    /// 2026-10-28: *"every time I open it it appends an entry called new on the bottom, we really
+    /// dont need to do that."*
     #[test]
-    fn asking_to_add_a_filter_opens_the_whole_list_with_a_row_waiting() {
+    fn asking_to_add_a_filter_opens_the_whole_list_and_lists_nothing_until_typed() {
         let live = chips_of(&[("error", Polarity::Include)]);
-        let editor = Editor::opened_to_add(&live, Polarity::Exclude);
+        let mut editor = Editor::opened_to_add(&live, Polarity::Exclude);
 
         assert_eq!(
             editor.rows().len(),
-            2,
-            "the filters already in force are shown, not replaced by the new one"
+            1,
+            "the filters already in force are shown, and nothing called `new` under them"
         );
         assert_eq!(
             editor.selected(),
-            Some(1),
-            "and the new row is the selected one, so the field types into it"
+            None,
+            "nothing selected: the field is for the new one"
         );
         assert_eq!(
-            editor.rows()[1].polarity,
-            Polarity::Exclude,
-            "it carries the polarity the command asked for"
+            editor.pending(),
+            Some(Polarity::Exclude),
+            "the polarity the command asked for waits for the text"
         );
+        assert!(!editor.dirty(), "nothing has happened yet");
+
+        editor.retext("retry").expect("parses");
+        assert_eq!(editor.rows().len(), 2, "the first text typed makes the row");
+        assert_eq!(
+            editor.selected(),
+            Some(1),
+            "and it is the selected one, so typing goes on"
+        );
+        assert_eq!(editor.rows()[1].polarity, Polarity::Exclude);
         assert!(
             editor.rows()[1].enabled,
             "a filter you just asked for is on"
         );
+        assert_eq!(editor.pending(), None);
+        assert!(editor.dirty());
+        editor.retext("retrying").expect("parses");
+        assert_eq!(
+            editor.rows().len(),
+            2,
+            "the next keystroke edits that row, not another"
+        );
+        assert_eq!(editor.rows()[1].source, "retrying");
 
-        // An empty set is the case the sources dialog got wrong: the row has to exist for the
-        // field to have somewhere to write.
-        let first = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+        // An empty set: still no row until typed, and typing makes the first.
+        let mut first = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+        assert!(first.rows().is_empty());
+        first.retext("x").expect("parses");
         assert_eq!(first.rows().len(), 1);
         assert_eq!(first.selected(), Some(0));
     }
 
-    /// **The offered row is not a filter until something is typed into it.**
-    ///
-    /// Pressing OK straight over it would otherwise put a filter reading `new` in force — a filter
-    /// the reader never asked for, hiding every line that does not contain the word.
+    /// **Nothing typed, nothing in force**: OK over the empty field puts exactly what was there.
+    /// A text that does not parse makes no row and keeps the polarity waiting; a blank one is not
+    /// a text.
     #[test]
     fn a_row_nobody_typed_into_is_not_a_filter() {
         let live = chips_of(&[("error", Polarity::Include)]);
 
         let mut untouched = Editor::opened_to_add(&live, Polarity::Exclude);
-        assert!(
-            !untouched.dirty(),
-            "an offer is not a change: there is nothing to apply yet"
-        );
+        assert!(!untouched.dirty(), "opening to add is not a change");
         assert_eq!(
             untouched.commit().chips,
             live.chips,
-            "OK over an untouched offer puts exactly what was already in force"
+            "OK over the empty field puts exactly what was already in force"
         );
         assert_eq!(
             untouched.rows().len(),
-            2,
-            "and the row stays in the list, because this is Apply as well as OK"
+            1,
+            "and lists nothing it did not have"
         );
+        assert_eq!(untouched.offered(), None, "no offered row either");
 
+        let mut blank = Editor::opened_to_add(&live, Polarity::Exclude);
+        blank
+            .retext("   ")
+            .expect("a blank is nothing, not an error");
+        assert_eq!(blank.rows().len(), 1);
+        assert_eq!(blank.pending(), Some(Polarity::Exclude));
+        assert!(
+            blank.retext("/(/").is_err(),
+            "a text that does not parse is reported"
+        );
+        assert_eq!(blank.rows().len(), 1, "and makes no row");
         assert_eq!(
-            untouched.offered(),
-            Some(1),
-            "and it says which row it is, because the caret belongs in that row's field"
+            blank.pending(),
+            Some(Polarity::Exclude),
+            "the polarity goes on waiting for a text that does"
         );
 
         let mut typed = Editor::opened_to_add(&live, Polarity::Exclude);
         typed.retext("retry").expect("parses");
-        assert!(typed.dirty(), "typing into it is a change");
-        assert_eq!(typed.offered(), None, "typed into, so no longer an offer");
         let applied = typed.commit();
-        assert_eq!(applied.chips.len(), 2, "and it is a filter now");
+        assert_eq!(applied.chips.len(), 2, "typed, it is a filter");
         assert_eq!(applied.chips[1].source, "retry");
         assert_eq!(applied.chips[1].polarity, Polarity::Exclude);
+
+        // Picking a row is editing that row: nothing is left waiting beside it, and typing goes
+        // into the row picked rather than making another.
+        let mut picked = Editor::opened_to_add(&live, Polarity::Exclude);
+        picked.select(Some(0));
+        assert_eq!(picked.pending(), None, "a row picked, nothing pending");
+        picked.retext("errors").expect("parses");
+        assert_eq!(picked.rows().len(), 1, "edited, not added");
+        assert_eq!(picked.rows()[0].source, "errors");
     }
 
-    /// **Asking twice for a row to type into leaves one row, not two.**
+    /// **The Add button still offers a row, and asking twice leaves one row, not two.**
     ///
-    /// `Ctrl+L` offers a row, and the dialog it opens has an **Add** button right there. Press it
-    /// without typing and a second offer would displace the first — which would stop being an
-    /// offer at that moment and go into force on OK as a filter reading `new`, hiding every line
-    /// without that word. There is one offer at a time.
+    /// A button pressed is a row asked for, so `Add` lists one reading `new` to type into; a
+    /// second press would displace the first — which would stop being an offer at that moment and
+    /// go into force on OK as a filter reading `new`. There is one offer at a time, and pressing
+    /// `Add` in a dialog opened to add is the row the pending polarity was waiting to make.
     #[test]
     fn asking_twice_for_a_row_to_type_into_leaves_one() {
         let live = chips_of(&[("error", Polarity::Include)]);
-        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
-        let first = editor.offered().expect("a row is waiting");
+        let mut editor = Editor::opened_to_add(&live, Polarity::Exclude);
+        let first = editor.offer(Polarity::Exclude).expect("a row is offered");
+        assert_eq!(editor.rows().len(), 2);
+        assert_eq!(
+            editor.rows()[first].polarity,
+            Polarity::Exclude,
+            "the button's row is the one the pending polarity was waiting to make"
+        );
+        assert_eq!(
+            editor.pending(),
+            None,
+            "so nothing is left waiting beside it"
+        );
+        editor.retext("x").expect("parses");
+        assert_eq!(
+            editor.rows().len(),
+            2,
+            "typing edits the offered row, not a pending one"
+        );
 
+        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        let first = editor.offer(Polarity::Include).expect("a row is offered");
         assert_eq!(
             editor.offer(Polarity::Exclude),
             Some(first),
@@ -2223,16 +2311,32 @@ mod tests {
         );
     }
 
-    /// **Turning the offered row round, or turning it off, is typing into it too.**
+    /// **Turning the pair round before typing turns the row that typing makes**; turning an
+    /// offered row round, or off, is typing into it.
     ///
-    /// Three verbs can change that row and only one of them retired the offer, so clicking
+    /// Three verbs can change an offered row and only one of them retired the offer, so clicking
     /// `Exclude matching lines` on a waiting row and pressing OK produced no filter at all, and
     /// unticking `Enabled` made the row vanish instead of becoming a disabled filter — which §7.1
     /// says keeps its place *and* its text. The dialog acknowledged the press and OK did nothing.
     #[test]
     fn turning_the_offered_row_round_or_off_makes_it_a_filter() {
-        let turned = {
+        let turned_before_typing = {
             let mut editor = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+            editor.set_polarity(Polarity::Exclude);
+            assert!(
+                editor.rows().is_empty(),
+                "turning the pair makes no row by itself"
+            );
+            assert_eq!(editor.pending(), Some(Polarity::Exclude));
+            editor.retext("x").expect("parses");
+            editor.commit()
+        };
+        assert_eq!(turned_before_typing.chips.len(), 1);
+        assert_eq!(turned_before_typing.chips[0].polarity, Polarity::Exclude);
+
+        let turned = {
+            let mut editor = Editor::open(&Chips::default());
+            editor.offer(Polarity::Include);
             editor.set_polarity(Polarity::Exclude);
             assert_eq!(
                 editor.offered(),
@@ -2245,7 +2349,8 @@ mod tests {
         assert_eq!(turned.chips[0].polarity, Polarity::Exclude);
 
         let switched_off = {
-            let mut editor = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+            let mut editor = Editor::open(&Chips::default());
+            editor.offer(Polarity::Include);
             editor.set_enabled(0, false);
             assert_eq!(editor.offered(), None);
             editor.commit()
@@ -2259,7 +2364,8 @@ mod tests {
 
         // The programmatic refills are what the dialog's quiet flag is for, and they ask for the
         // value the row already has — which must leave the offer alone.
-        let mut untouched = Editor::opened_to_add(&Chips::default(), Polarity::Include);
+        let mut untouched = Editor::open(&Chips::default());
+        untouched.offer(Polarity::Include);
         untouched.set_polarity(Polarity::Include);
         untouched.set_enabled(0, true);
         assert_eq!(
@@ -2294,7 +2400,8 @@ mod tests {
     #[test]
     fn removing_a_row_below_the_offer_does_not_move_the_offer() {
         let live = chips_of(&[("a", Polarity::Include), ("b", Polarity::Include)]);
-        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        let mut editor = Editor::open(&live);
+        editor.offer(Polarity::Include);
         assert_eq!(editor.selected(), Some(2));
 
         editor.select(Some(0));
@@ -2411,7 +2518,8 @@ mod tests {
     #[test]
     fn moving_a_row_past_the_offer_keeps_the_offer_on_its_own_row() {
         let live = chips_of(&[("a", Polarity::Include), ("b", Polarity::Include)]);
-        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        let mut editor = Editor::open(&live);
+        editor.offer(Polarity::Include);
         assert_eq!(editor.offered(), Some(2));
         editor.select(Some(1));
         assert!(editor.move_selected(true), "b swaps with the offered row");
@@ -2436,7 +2544,8 @@ mod tests {
             ("b", Polarity::Exclude),
             ("c", Polarity::Include),
         ]);
-        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        let mut editor = Editor::open(&live);
+        editor.offer(Polarity::Include);
         assert_eq!(editor.offered(), Some(3));
 
         editor.set_all(Polarity::Include, false);
@@ -2462,7 +2571,8 @@ mod tests {
     #[test]
     fn remove_all_empties_the_list() {
         let live = chips_of(&[("a", Polarity::Include), ("b", Polarity::Exclude)]);
-        let mut editor = Editor::opened_to_add(&live, Polarity::Include);
+        let mut editor = Editor::open(&live);
+        editor.offer(Polarity::Include);
         editor.remove_all();
         assert!(editor.rows().is_empty());
         assert_eq!(editor.selected(), None);

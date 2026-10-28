@@ -4417,14 +4417,23 @@ unsafe extern "system" fn filters_proc(
                     );
                 }
             }
+            // **Only the row the model selected is highlighted.** Opened to manage, that is row 0
+            // of a non-empty list; opened to add, nothing — and a list highlighting row 0 beside
+            // an empty field for a row not yet made would have the screen and the model disagree
+            // from the first glance.
             let at = crate::filters_read(|editor| editor.selected()).flatten();
-            filters_refresh(hdlg, at.or(Some(0)));
+            filters_refresh(hdlg, at);
             // **A dialog opened to add exists so a filter can be typed.** `Ctrl+L` is one gesture,
-            // and it stays one only if the caret is already in the field — and the field already
-            // holds the offered row's placeholder, so it is selected too, or the first thing typed
-            // lands beside that word instead of over it. Returning 0 is how a dialog says it set
-            // the focus itself; the dialog manager would otherwise put it on the list.
-            if crate::filters_read(|editor| editor.offered().is_some()).unwrap_or(false) {
+            // and it stays one only if the caret is already in the field: empty, for the row the
+            // first keystroke makes, or holding a button's offered row, selected whole so the
+            // first thing typed lands over the placeholder rather than beside it. Returning 0 is
+            // how a dialog says it set the focus itself; the dialog manager would otherwise put it
+            // on the list.
+            if crate::filters_read(|editor| {
+                editor.offered().is_some() || editor.pending().is_some()
+            })
+            .unwrap_or(false)
+            {
                 if let Ok(field) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_TEXT)) } {
                     unsafe {
                         let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(field);
@@ -4524,7 +4533,28 @@ unsafe extern "system" fn filters_proc(
             }
             match (id, code) {
                 (ID_V_TEXT, EN_CHANGE) => {
+                    let before = crate::filters_read(|e| e.rows().len()).unwrap_or(0);
                     filters_take_field(hdlg);
+                    let after = crate::filters_read(|e| e.rows().len()).unwrap_or(0);
+                    // **The first keystroke of a dialog opened to add makes the row**, and a row
+                    // that did not exist a moment ago has to be listed and selected: the one
+                    // refresh that writes the text box back, which this keystroke can afford.
+                    // Writing the text puts the caret at the start; select-all then collapse
+                    // puts it back at the end, because a collapse lands on the selection's
+                    // active end and `EM_SETSEL` with a start of -1 alone only collapses.
+                    if after > before {
+                        let at = crate::filters_read(|e| e.selected()).flatten();
+                        filters_refresh(hdlg, at);
+                        if let Ok(field) = unsafe { GetDlgItem(hdlg, i32::from(ID_V_TEXT)) } {
+                            unsafe {
+                                let _ =
+                                    windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(field);
+                                SendMessageW(field, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                                SendMessageW(field, EM_SETSEL, WPARAM(usize::MAX), LPARAM(0));
+                            }
+                        }
+                        return 1;
+                    }
                     // **The row and the two option boxes keep up, and the text box is not
                     // touched.** `/err/i` typed into the phrase box is a regular expression from
                     // the moment it parses, and the row and the boxes should say so — but a full
@@ -4539,8 +4569,12 @@ unsafe extern "system" fn filters_proc(
                 }
                 (ID_V_INCLUDE | ID_V_EXCLUDE, _) => {
                     filters_take_field(hdlg);
+                    // **With no row selected the pair has only turned the pending polarity**, and
+                    // a refresh would write an empty text over whatever was half-typed.
                     let at = crate::filters_read(|e| e.selected()).flatten();
-                    filters_refresh(hdlg, at);
+                    if at.is_some() {
+                        filters_refresh(hdlg, at);
+                    }
                     1
                 }
                 (ID_V_ENABLED, _) => {
@@ -4606,7 +4640,11 @@ unsafe extern "system" fn filters_proc(
                     // becomes a filter until something is.
                     filters_take_field(hdlg);
                     crate::filters_write(|editor| {
-                        editor.offer(tailhawk_core::filter::Polarity::Include)
+                        // The row the pending polarity was waiting to make, or an include.
+                        let polarity = editor
+                            .pending()
+                            .unwrap_or(tailhawk_core::filter::Polarity::Include);
+                        editor.offer(polarity)
                     });
                     set_dlg_text(hdlg, ID_V_FAULT, "");
                     let at = crate::filters_read(|e| e.selected()).flatten();
@@ -5079,12 +5117,16 @@ fn filters_fill_selected(hdlg: HWND) {
     let has = shown.is_some();
     let rows = crate::filters_read(|editor| editor.rows().len()).unwrap_or(0);
     let at = crate::filters_read(|editor| editor.selected()).flatten();
+    // **A dialog opened to add has a live field and pair with nothing selected**: the row they
+    // describe is the one the first keystroke will make, carrying the pair's polarity.
+    let pending = crate::filters_read(|editor| editor.pending()).flatten();
+    let typing = has || pending.is_some();
     // **The moves grey at the ends of the list rather than disappearing**, so the pair keeps its
     // shape from row to row — and `Remove all` is nothing to press with nothing in the list.
     for (id, on) in [
-        (ID_V_TEXT, has),
-        (ID_V_INCLUDE, has),
-        (ID_V_EXCLUDE, has),
+        (ID_V_TEXT, typing),
+        (ID_V_INCLUDE, typing),
+        (ID_V_EXCLUDE, typing),
         (ID_V_ENABLED, has),
         (ID_V_REMOVE, has),
         (ID_V_EDIT, has),
@@ -5113,14 +5155,15 @@ fn filters_fill_selected(hdlg: HWND) {
         }
     }
     let (text, include, enabled, _) = shown.unwrap_or_default();
+    let include = include || pending == Some(tailhawk_core::filter::Polarity::Include);
     // **The pair and the boxes first, the text last.** `FILTERS_QUIET` is what actually makes this
     // safe, and this order is what makes it safe without it: the text box is the only control here
     // whose write notifies, and the handler it reaches reads the others. In the other order — which
     // is how this was written — the re-entry read a radio pair still describing the row being left
     // and wrote that answer onto the row just selected.
     for (id, on) in [
-        (ID_V_INCLUDE, include && has),
-        (ID_V_EXCLUDE, !include && has),
+        (ID_V_INCLUDE, include && typing),
+        (ID_V_EXCLUDE, !include && typing),
         (ID_V_ENABLED, enabled && has),
     ] {
         unsafe {

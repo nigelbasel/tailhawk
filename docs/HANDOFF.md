@@ -1,5 +1,37 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-28, late: opening the filters to add lists no row called `new`
+
+The owner: *"in the filter dialog, every time I open it it appends an entry called new on the
+bottom, we really dont need to do that. Even if I edit the new entry, save it, then next time
+there is another new on the bottom."* `Ctrl+L` / `Ctrl+Shift+L` opened the dialog with an
+*offered* row reading `new` — a word the grammar had to accept — which `commit` left out unless
+typed into. Correct, and still a row called `new` at the bottom of his list on every open.
+
+- **The decision is in `filter::Editor`**: `opened_to_add` holds the asked polarity as `pending`
+  and selects nothing; `retext` with nothing selected and a polarity pending makes the row (a
+  blank is nothing, a text that does not parse makes nothing and keeps the polarity waiting);
+  `set_polarity` with nothing selected turns the pending one; `offer` (the `Add` button) and
+  `select(Some)` drop it. `Add` still offers a row reading `new`, because a button pressed is a
+  row asked for.
+- **The dialog**: the text field and the Include/Exclude pair are live with nothing selected
+  while a polarity is pending, the pair showing it; the first keystroke lists the row it made
+  and keeps the caret at the end (the one refresh that writes the text box back).
+- **The pre-commit review found five things, all taken.** The caret landed at the *start*
+  after the first keystroke — `EM_SETSEL` with a start of -1 alone collapses to the active end,
+  which a text write has just put at 0; select-all then collapse puts it at the end. Opened
+  over existing filters, the list highlighted row 0 (the old `at.or(Some(0))` fallback) beside
+  an empty field for a row not yet made, so a later check-box click selected row 0 and dropped
+  the pending polarity; only the row the model selected is highlighted now. `Add` offered an
+  include whatever was pending. A radio click with nothing selected refreshed an empty text
+  over a half-typed one. And the asking-twice test started from a plain `open`, so it could not
+  fail on the pending being dropped.
+- **Tests**: the four that pinned the offered row now pin the pending one, the three
+  offer-bookkeeping tests make their offer with the button, and picking a row dropping the
+  pending polarity is pinned. Not seen on screen: the first screen run is `Ctrl+L` over one
+  filter in force — nothing highlighted, the caret in the empty field, type two letters and see
+  them in order.
+
 ## ▶ Resume point — 2026-10-28, night: the rules editor edits every set, and the bar names the one in force
 
 Step (3) of `docs/PROPOSAL-block-selection-and-rule-sets.md` §2, after the model landed in
