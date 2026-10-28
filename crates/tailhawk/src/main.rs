@@ -81,7 +81,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, GetSysColor, InvalidateRect, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+    CreateSolidBrush, GetSysColor, InvalidateRect, RedrawWindow, COLOR_HIGHLIGHT, COLOR_WINDOW,
+    COLOR_WINDOWTEXT, RDW_ALLCHILDREN, RDW_INVALIDATE,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -13178,6 +13179,19 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // The system caret, for the clients that follow it rather than UI Automation's text
         // events: a one-pixel bar a row high, never shown — the painter rules the current row
         // itself — and moved after every frame by `uia::raise_selection_changes`.
+        windows::Win32::UI::WindowsAndMessaging::WM_NCACTIVATE
+        | windows::Win32::UI::WindowsAndMessaging::WM_ENABLE => {
+            let answered = def_proc(hwnd, msg, wparam, lparam);
+            // **A modal dialog deactivates and disables this window, and the composition it
+            // gets back shows the flip-model swapchain without the header control's last
+            // painting** — the owner's "the column headers all go black until I hover over
+            // them". The hover was the control painting itself again; this asks every child to,
+            // once the frame has answered. `tabstrip.rs` records the risk and the fallback.
+            unsafe {
+                let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+            }
+            answered
+        }
         windows::Win32::UI::WindowsAndMessaging::WM_SETFOCUS => {
             let row_h = STATE
                 .with(|s| {

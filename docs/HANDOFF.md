@@ -1,5 +1,33 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-28, latest: the headers repaint when a dialog takes the window; the Filters dialog regrouped
+
+Two more from the owner on the Filters dialog, after the `new` row (below, now `7fff16c`).
+
+- **"When the filter dialog comes up, the column headers all go all black until I hover over
+  them."** A modal dialog deactivates and disables its owner, and the composition the window
+  gets back shows the flip-model swapchain without the header control's last painting — the risk
+  `tabstrip.rs` recorded when the first child window went over that swapchain. `WM_NCACTIVATE`
+  and `WM_ENABLE` now ask every child to paint once the frame has answered, which is what the
+  hover did by accident. **No test can see it; his eye is the check.** If a build disagrees, the
+  tab strip's fallback stands: the swapchain on a child window of its own, the chrome its siblings.
+- **"The edit button is bottom right, and not associated with the small edit box"** and **"some
+  buttons operate on the list, and some on the selected filter … it should be obvious what each
+  button is associated with."** The composer opens from a `…` button at the end of the phrase
+  box; the right-hand column is OK / Cancel / Apply and then, under a *Selected filter* heading,
+  Remove, Up, Down; under the list, an *All filters* heading over New, Remove all and the four
+  enable-all / disable-all buttons; the dialog is 259 units tall. Layout only; the mnemonic test
+  holds the keys unique. **Not seen on screen.**
+- **Open question to the owner**: in the dark theme the Include / Exclude labels read black. The
+  two dialogs declare the pair identically and the dressing note of 2026-09-21 says radio buttons
+  came back dark, so the cause is state, not class — likely the pair greyed with no row selected
+  (which the pending-row change already alters) — or the theme not dressing radio text after
+  all. Asked whether the check boxes beside them read fine and whether the composer's pair does;
+  if only the radio labels are black, draw the pair as push-style toggles (`BS_PUSHLIKE`), which
+  the theme does dress.
+- **Proposal §4** records his filter-helper ask (values to pick from, *is one of*, empty / not
+  empty, regex templates and a quote-this-text button) over the composer that already exists.
+
 ## ▶ Resume point — 2026-10-28, late: opening the filters to add lists no row called `new`
 
 The owner: *"in the filter dialog, every time I open it it appends an entry called new on the
