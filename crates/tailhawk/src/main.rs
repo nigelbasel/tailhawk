@@ -1539,8 +1539,7 @@ impl Document {
             }
         }
         if self.filtering.filtered() {
-            self.filtering.clear_results();
-            self.refilter();
+            self.restart_pass();
         }
     }
 
@@ -1799,8 +1798,7 @@ impl Document {
             self.finder.clear();
             // And the survivors: a filtered view over renumbered rows would show the wrong lines.
             // The chips stay, and the pass restarts over what the file now is.
-            self.filtering.clear_results();
-            self.refilter();
+            self.restart_pass();
             // **A bookmark is moved, not dropped.** E20's bookmarks are row numbers and nothing
             // else, so unlike a selection or a match there is an honest answer to where they went:
             // a mark above a retired stretch moves down by its length, a mark inside one is gone
@@ -1935,8 +1933,7 @@ impl Document {
             self.filtering.records_only = state.records_only;
             self.filtering.trace = state.trace;
             self.filtering.error = None;
-            self.filtering.clear_results();
-            self.refilter();
+            self.restart_pass();
             let rows = self.view_rows();
             self.view.grid_mut().set_total_rows(rows);
             if !self.filtering.filtered() {
@@ -1966,8 +1963,7 @@ impl Document {
         if let Some(id) = self.filtering.trace.clone() {
             self.remember();
             self.filtering.trace = None;
-            self.filtering.clear_results();
-            self.refilter();
+            self.restart_pass();
             self.restore_origin();
             return Some(format!("Stopped following trace {id}"));
         }
@@ -1981,13 +1977,11 @@ impl Document {
                 self.note_origin();
                 self.filtering.error = None;
                 self.filtering.trace = Some(id.clone());
-                self.filtering.clear_results();
-                // **Without this the button does nothing**, which is the failure the owner
+                // **Without the pass the button does nothing**, which is the failure the owner
                 // reported about Filter and which this change all but reintroduced for Trace:
-                // `clear_results` empties the survivors and only a pass refills them, so the state
+                // emptying the survivors leaves them empty until a pass refills them, so the state
                 // would say "following" while the grid went on showing what it showed before.
-                // `add_chip` — what this replaced — ended with the same call.
-                self.refilter();
+                self.restart_pass();
                 Some(format!("Following trace {id}"))
             }
             None => Some("That line carries no trace id.".to_owned()),
@@ -2006,8 +2000,7 @@ impl Document {
                 self.note_origin();
                 self.filtering.error = None;
                 self.filtering.chips.chips.push(chip);
-                self.filtering.clear_results();
-                self.refilter();
+                self.restart_pass();
             }
             Err(e) => self.filtering.error = Some(format!("{text}: {e}")),
         }
@@ -2026,28 +2019,26 @@ impl Document {
         // into a blank grid that no pass would refill. "Clear filters" means all of them.
         self.filtering.trace = None;
         self.filtering.error = None;
-        self.filtering.clear_results();
-        // And a pass, for the same reason `follow_trace` needs one: the survivors are gone until
-        // something recomputes them, and an unfiltered view is still a row space to rebuild.
-        self.refilter();
+        // And a restart, for the same reason `follow_trace` needs one: only a pass rebuilds the
+        // survivors, and an unfiltered view is still a row space to rebuild.
+        self.restart_pass();
         self.restore_origin();
     }
 
     /// The filters dialog's Apply or OK: the chips become `chips`, whatever they were.
     ///
-    /// **`clear_results` before `refilter`, as every other path that changes a chip does.**
+    /// **A restart and not a bare `refilter`, as every other path that changes a chip does.**
     /// `refilter` starts a pass only over rows no pass has covered, and `covered` is set to the
-    /// total the moment a pass begins, so without the clear it returned at once and left the
-    /// previous filter's survivors standing: editing a filter and pressing Apply or OK changed the
-    /// text and not the view. The grid is not resized here: the pass sizes it when it lands, as
+    /// total the moment a pass begins, so a bare call returned at once and left the previous
+    /// filter's survivors standing: editing a filter and pressing Apply or OK changed the text
+    /// and not the view. The grid is not resized here: the pass sizes it when it lands, as
     /// `add_chip` leaves it, and lifting the last chip puts the view back where the first one
     /// found it.
     fn replace_chips(&mut self, chips: Chips) {
         self.note_origin();
         self.filtering.chips = chips;
         self.filtering.error = None;
-        self.filtering.clear_results();
-        self.refilter();
+        self.restart_pass();
         self.restore_origin();
     }
 
@@ -2064,8 +2055,7 @@ impl Document {
         self.remember();
         self.note_origin();
         self.filtering.records_only = !self.filtering.records_only;
-        self.filtering.clear_results();
-        self.refilter();
+        self.restart_pass();
         self.restore_origin();
         true
     }
@@ -2100,6 +2090,41 @@ impl Document {
         } else {
             self.view.grid_mut().scroll_to_row(origin.row);
         }
+    }
+
+    /// Empties the survivors and starts the pass over — what every change to a chip, the trace or
+    /// the collapse does — noting first whether the reader was following, because the grid is
+    /// about to be sized to no rows at all and will have forgotten by the time the rows land. A
+    /// restart while the last one is still in flight keeps the note it made.
+    fn restart_pass(&mut self) {
+        self.filtering.follow_pending =
+            self.filtering.follow_pending || self.view.grid().is_following();
+        self.filtering.clear_results();
+        self.refilter();
+        if self.filtering.running.is_none() {
+            self.filtering.follow_pending = false;
+        }
+    }
+
+    /// The filters dialog's edit of one chip: the chip at `at` becomes `chip`, if it is still the
+    /// one the dialog was opened on. Reports whether it was.
+    ///
+    /// **Identity, not just bounds**: the list can move under a modal dialog (an automation client
+    /// removing chips), and replacing whatever now sits at the index would edit the wrong filter.
+    fn edit_chip(&mut self, at: usize, original: &str, chip: Chip) -> bool {
+        let still_there = self
+            .filtering
+            .chips
+            .chips
+            .get(at)
+            .is_some_and(|c| c.source == original);
+        if !still_there {
+            return false;
+        }
+        self.remember();
+        self.filtering.chips.chips[at] = chip;
+        self.restart_pass();
+        true
     }
 
     /// Starts a pass over whatever rows no pass has covered yet — all of them after a chip
@@ -2148,7 +2173,7 @@ impl Document {
         if updates.is_empty() {
             return false;
         }
-        let was_following = self.view.grid().is_following();
+        let was_following = self.view.grid().is_following() || self.filtering.follow_pending;
         let mut finished = false;
         for update in updates {
             match update {
@@ -2167,12 +2192,13 @@ impl Document {
             // Growth that arrived while the pass ran is the next pass.
             self.refilter();
         }
-        {
-            let rows = self.view_rows();
-            self.view.grid_mut().set_total_rows(rows);
-        }
+        let rows = self.view_rows();
+        self.view.grid_mut().set_total_rows(rows);
         if was_following {
             self.view.grid_mut().scroll_to_bottom();
+        }
+        if rows > 0 {
+            self.filtering.follow_pending = false;
         }
         true
     }
@@ -3557,6 +3583,13 @@ struct Filtering {
     covered: u64,
     scanned: u64,
     outcome: Option<Outcome>,
+    /// The reader was following when the pass was last restarted, and no rows have landed since.
+    ///
+    /// **The grid cannot carry this across a restart.** `clear_results` empties the survivors, the
+    /// next frame sizes the grid to those zero rows, and a grid with no rows is by its own rule not
+    /// following — so by the time the first rows land the answer "were they at the bottom" is
+    /// always no. Noted here at the restart and consumed at the landing instead.
+    follow_pending: bool,
     /// A chip that did not parse. Held, like the finder's, because the window is not modal.
     error: Option<String>,
     /// E22's sort, layered over the survivors (or the whole file). See [`Sorting`].
@@ -11606,24 +11639,8 @@ fn run_pending_dialogs(hwnd: HWND) -> bool {
                     if let Some(shell) = s.borrow_mut().as_mut() {
                         if let Some(doc) = shell.document.as_mut() {
                             if let Ok(mut chip) = Chip::parse(&edit.expression, polarity) {
-                                // Identity, not just bounds: the list can move under a modal
-                                // dialog (an automation client removing chips), and replacing
-                                // whatever now sits at the index would edit the wrong filter.
-                                let still_there = doc
-                                    .filtering
-                                    .chips
-                                    .chips
-                                    .get(at)
-                                    .is_some_and(|c| c.source == original);
-                                if still_there {
-                                    doc.remember();
-                                    chip.enabled = enabled;
-                                    doc.filtering.chips.chips[at] = chip;
-                                    doc.filtering.clear_results();
-                                    doc.refilter();
-                                    let rows = doc.view_rows();
-                                    doc.view.grid_mut().set_total_rows(rows);
-                                }
+                                chip.enabled = enabled;
+                                doc.edit_chip(at, &original, chip);
                             }
                         }
                         shell.sync_scrollbar();
@@ -17982,6 +17999,130 @@ mod tests {
         assert!(
             doc.view.grid().is_following(),
             "turning the collapse off goes back to the tail"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The owner, 2026-10-28, with 19e5ac2 deployed: still at the top after a trace comes off.
+    /// His tail carries a chip, so the trace came off onto a view that was still filtered — and
+    /// between the restart of the pass and its landing there is a frame, whose `lay_out` sizes
+    /// the grid to the survivors there are: none. A grid with no rows is not following, so when
+    /// the pass landed the reader was left at row zero. A chip added, or a trace started, while
+    /// following lost the tail the same way.
+    #[test]
+    fn a_pass_restarted_while_following_lands_following() {
+        let path = std::env::temp_dir().join("tailhawk_restart_following_test.log");
+        let mut text = String::new();
+        for i in 0..200 {
+            let id = if i % 10 == 5 {
+                "0af7651916cd43dd8448eb211c80319c"
+            } else {
+                "4bf92f3577b34da6a3ce929d0e0e4736"
+            };
+            text.push_str(&format!("{{\"traceId\":\"{id}\",\"msg\":\"line {i}\"}}\n"));
+        }
+        std::fs::write(&path, text).expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        /// A frame before the pass lands, as the window draws one, and a frame after.
+        fn frame_then_landed(doc: &mut Document) {
+            doc.lay_out((8.0, 10.0), (800, 200));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while doc.filtering.running.is_some() && std::time::Instant::now() < deadline {
+                doc.poll_filter();
+                std::thread::yield_now();
+            }
+            doc.poll_filter();
+            doc.lay_out((8.0, 10.0), (800, 200));
+        }
+
+        doc.view.grid_mut().scroll_to_bottom();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(doc.view.grid().is_following());
+
+        doc.add_chip("line", Polarity::Include);
+        frame_then_landed(&mut doc);
+        assert_eq!(
+            doc.view.grid().total_rows(),
+            200,
+            "every line carries the word"
+        );
+        assert!(
+            doc.view.grid().is_following(),
+            "a chip added while following keeps the tail"
+        );
+
+        assert!(doc.follow_trace().is_some());
+        frame_then_landed(&mut doc);
+        assert_eq!(doc.view.grid().total_rows(), 180, "the trace's own rows");
+        assert!(
+            doc.view.grid().is_following(),
+            "a trace started while following keeps the tail"
+        );
+
+        assert!(doc.follow_trace().is_some(), "pressed again, it stops");
+        frame_then_landed(&mut doc);
+        assert_eq!(
+            doc.view.grid().total_rows(),
+            200,
+            "the chip is still in force"
+        );
+        assert!(
+            doc.view.grid().is_following(),
+            "and the reader is at the tail, not at row zero"
+        );
+
+        doc.view.grid_mut().scroll_to_row(0);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(!doc.view.grid().is_following());
+        doc.add_chip("line", Polarity::Include);
+        frame_then_landed(&mut doc);
+        assert_eq!(doc.view.grid().total_rows(), 200);
+        assert!(
+            !doc.view.grid().is_following(),
+            "a reader who had scrolled up is not dragged to the tail by a restart"
+        );
+
+        doc.clear_filter();
+        doc.view.grid_mut().scroll_to_bottom();
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert!(doc.view.grid().is_following());
+        doc.add_chip("growth", Polarity::Include);
+        frame_then_landed(&mut doc);
+        assert_eq!(
+            doc.view.grid().total_rows(),
+            0,
+            "no line carries the word yet"
+        );
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            for i in 0..40 {
+                writeln!(
+                    file,
+                    "{{\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"msg\":\"growth {i}\"}}"
+                )
+                .expect("write");
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while doc.set.total_rows() < 240 && std::time::Instant::now() < deadline {
+            doc.poll_follow();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(doc.set.total_rows(), 240, "the growth is seen");
+        frame_then_landed(&mut doc);
+        assert_eq!(
+            doc.view.grid().total_rows(),
+            40,
+            "the growth carries the word"
+        );
+        assert!(
+            doc.view.grid().is_following(),
+            "a reader following when the pass found nothing follows the rows that then arrive"
         );
         std::fs::remove_file(&path).ok();
     }

@@ -1,0 +1,3 @@
+# deploy.cmd runs under cmd.exe, whose goto and label handling misbehaves in a file with LF line
+# endings; a Windows clone with autocrlf off would otherwise check it out broken.
+*.cmd text eol=crlf

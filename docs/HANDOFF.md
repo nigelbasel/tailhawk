@@ -1,5 +1,49 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-28: a pass restarted while following lands following
+
+The owner deployed the release of 19e5ac2 and the trace bug was still there — on the release, and
+not on the dev build beside it: *"it definitely behaves differently."* Same commit, same source,
+and the release binary was verified byte for byte against the release's own sums.
+
+**The difference was a settings tier, and it uncovered the older defect.** His starberry tail in
+`%APPDATA%` carries a *disabled* chip (`#+p2s_role = "edge"`), which the dev build never sees
+because the tier beside `target\release\tailhawk.exe` wins by name. So on the release the trace
+came off onto a view that was still filtered — and that path, any restart of the pass on a
+filtered view, was broken for every chip change: `clear_results` empties the survivors, the next
+frame's `lay_out` sizes the grid to those zero rows, and `Grid::is_following` is by its own rule
+false on a grid with no rows. When the pass landed, `poll_filter` asked the grid whether the reader
+had been following, was told no, and left them at row zero. A chip added, or a trace started,
+while following lost the tail the same way; yesterday's `Origin` fix covered only the last filter
+coming off, which is why the dev build looked right.
+
+- **`Filtering::follow_pending`, noted by `Document::restart_pass`, consumed by `poll_filter`.**
+  `restart_pass` is now the only place that empties the survivors and starts over, and every
+  restart goes through it: `follow_trace` (both ways), `add_chip`, `clear_filter`,
+  `replace_chips`, `toggle_collapse`, `apply_view_state`, `apply_state` (a format change), the
+  follow tick's reset and retirement, and the filters dialog's edit of one chip — the last restart
+  still in the shell, folded into `Document::edit_chip` with its identity check. The note is kept
+  while a pass is in flight and no rows have landed, and dropped when no pass starts, so there is
+  no window in which a reader who has scrolled up can be dragged down. The grid's rule about
+  empty grids is untouched.
+- **Test** `a_pass_restarted_while_following_lands_following`: a frame before each landing; failed
+  on `is_following` at its first step (a chip added while following) before the fix. The review
+  asked for the negative case (a reader who scrolled up stays put) and the mutation run for the
+  growth case (a chip that matched nothing, then rows that do): both in. Four mutations watched
+  fail.
+- **Knowingly left.** A disabled chip still counts as a filter (`Filtering::filtered`), so a view
+  with only disabled chips runs a pass that keeps everything; that is why his tail was on this
+  path at all. `Alt+←` to a filtered view lands at the tail if the reader was following and at
+  row zero otherwise — `state.row` is applied to a grid that has just been sized to zero — which
+  is older than this change.
+- **`deploy.cmd` fetches the latest release now**, at the owner's ask: `tailhawk-x64.exe` from the
+  stable URL, verified against the release's `SHA256SUMS.txt`, copied in as `tailhawk.exe`;
+  `deploy.cmd local` is the old path. Two things the dry runs taught: an `exit /b` inside a
+  parenthesised block set `ERRORLEVEL` but came out of `cmd /c` as 0, so every failure goes
+  through a `:failed` label; and an empty hash would have matched the sums line, so an undefined
+  hash refuses. The file is CRLF on disk and must stay so: `sed` in Git Bash writes LF copies, and
+  `goto` misbehaves in an LF batch file.
+
 ## ▶ Resume point — 2026-10-27, evening: lifting a trace puts the view back
 
 The owner, on the deployed build: *"When I use the trace feature, and then undo it, the tail goes
