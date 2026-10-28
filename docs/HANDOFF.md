@@ -36,6 +36,18 @@ coming off, which is why the dev build looked right.
   path at all. `Alt+←` to a filtered view lands at the tail if the reader was following and at
   row zero otherwise — `state.row` is applied to a grid that has just been sized to zero — which
   is older than this change.
+- **Two ideas from the owner, analysed in `docs/PROPOSAL-block-selection-and-rule-sets.md`:**
+  Alt+drag rectangular selection (the core's `SelectionMode::Block` is finished and tested; the
+  shell never reads `Alt` on mouse-down, `copy_text` joins block rows with nothing) and named
+  highlight-rule sets bound to a file, a glob or a format (`SPEC.md` §7.1 promises it,
+  `RuleSet::bound_to` is carried and never matched on). The recommendation is block selection
+  first, as a pure `Selecting::from_click` plus block copy, then a `Ctrl+click` on a header to
+  select a column; rule sets as `[[set]]` tables with `apply_to` in the same rules file, the old
+  flat file reading as the Default set. Awaiting the owner's choice.
+- **Mouse selection reported different between the release and the dev build on the same tail.**
+  Not the disabled chip: a headless probe started a selection on a view with exactly that chip.
+  A copy of the dev build was launched from a tier-less folder so it reads only his roaming
+  settings, like the release; the comparison was with him when this was written.
 - **`deploy.cmd` fetches the latest release now**, at the owner's ask: `tailhawk-x64.exe` from the
   stable URL, verified against the release's `SHA256SUMS.txt`, copied in as `tailhawk.exe`;
   `deploy.cmd local` is the old path. Two things the dry runs taught: an `exit /b` inside a
