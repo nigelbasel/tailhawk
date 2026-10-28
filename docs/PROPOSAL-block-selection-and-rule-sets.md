@@ -182,8 +182,61 @@ is every log — the format is the type that means something); no per-set colour
 
 ---
 
-## Order between the two
+---
+
+## 3. Rules that test an attribute, not the text
+
+`C:\dev\tfsgit\TAILHAWK-REQUEST-attribute-highlight-rules-2026-10-28.md`, from the
+create-liquidocean-firewall workstream, 2026-10-28: the Starberry gateway classifies every refused
+request in two structured-metadata attributes, `reason` (`probe`, `payload`, `scanner`,
+`proxy-abuse`, `method`, `multipart`, `unknown-host`, `badrequest`) and `status`, and they want to
+tint attacks, policy blocks and raw-IP noise by *those*, not by a text match on the body that
+happens to carry the same words today. Their workaround (`-> 444 probe` as a literal) works and is
+fragile. They ask for a rule with a match target: the line text as now, or an attribute with
+`=`, `one-of` or `contains`.
+
+**The recommendation is to reuse the language the product already has, not to add a second one.**
+`SPEC.md` §7.2's filter expressions already name attributes (`p2s_role = "edge"`, which is the chip
+the owner's own settings carry), already have `in` and `contains`, and already answer *unknown* for
+a field the record does not produce — which is exactly the request's "if absent, the rule simply
+does not match". So a rule's match becomes one of two things:
+
+```toml
+[[set.rule]]
+name = "attack"
+where = 'reason in ("probe", "payload", "scanner", "proxy-abuse")'
+bg = "#7a1010"
+whole_line = true
+
+[[set.rule]]
+name = "oversize"
+where = "status = 413"
+bg = "#8a5a00"
+whole_line = true
+```
+
+`pattern` is today's text rule, unchanged; `where` is a §7.2 predicate evaluated on the parsed
+record; a rule has one or the other. A `where` rule is whole-line by nature — there is no span in
+the text to colour — and the editor says so by greying the toggle rather than by a third kind of
+rule. List order stays the precedence, so an attack rule above a noise rule wins as the request
+asks. The editor offers *Match: text | where*, and for `where` the attribute keys come from the same
+per-tail list the column chooser already has.
+
+**The one real change is where the record is.** The highlighter is fed the row's *text*
+(`Document::colour_beneath` → `Highlighter::line(text, …)`), and a predicate needs the parsed
+`Record`. The columns feature already parses the visible rows for their presentation, so the record
+is at hand in the same frame; the highlighter's entry point gains it, the memo keys stay as they
+are (the text is still what a span is over), and a `where` rule is one attribute lookup and compare
+per row — cheaper than a regex over a 32 KB line, as the request notes.
+
+This is step (1) of the rule-sets work above, done at the same time as the set model, because both
+change the rules file's schema once.
+
+---
+
+## Order between the three
 
 Block selection first: it is a day's shell work on a finished core, it needs no file format, and
-the owner has columns on his screen today. Rule sets second, in the three steps above, with the
-model landing before any UI so the resolution is tested before it is drawn.
+the owner has columns on his screen today. Rule sets and attribute rules second, together, in the
+three steps above, with the model landing before any UI so the resolution is tested before it is
+drawn. The owner chose this order on 2026-10-28.

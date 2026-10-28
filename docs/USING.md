@@ -69,6 +69,7 @@ drop it on that window, or press `Ctrl+O`.
 | `Ctrl+\` , `F6` | Split the pane (a second view of the file with its own filter); swap focus |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab`, `Ctrl+W` | Next / previous tab, close tab (middle-click closes too) |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copy raw / copy as TSV with columns |
+| `Alt`+drag, `Shift+Alt`+click | Select a rectangle: the same columns on every row. `Ctrl+C` copies it one row per line; `Ctrl+Shift+C` copies only the columns it touches |
 | `Ctrl+I` | Reveal invisible characters |
 | `Ctrl+Home` / `Ctrl+End` | Top of file / jump to the tail and follow |
 | `PgUp` `PgDn` `Space` `b` `Home` `End` `↑↓←→` | Move; scrolling up pauses following, `Ctrl+End` resumes |

@@ -1,5 +1,39 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-28, later: Alt+drag selects a rectangle
+
+The owner: *"Many editors support column selection using alt + left mouse drag. This would be
+useful as well when we have columns."* He chose it first of the two ideas in
+`docs/PROPOSAL-block-selection-and-rule-sets.md`; the highlight change (rule sets bound to a file
+or a format, and rules that test an attribute, §2 and §3 there) is next.
+
+- **The core was finished; the shell never asked for it.** `selection.rs` had `SelectionMode::Block`
+  and its geometry tested, and the painter fills whatever span a row reports. Mouse-down read
+  `Shift` and the button from `wparam` and never `Alt`.
+- **`Selecting::from_click(shift, alt, triple)`** is the decision, pure and tested: `Alt` starts a
+  rectangle, `Shift+Alt` turns what is selected into one from the same anchor, a triple click is a
+  line whatever is held. The shell reads `Alt` with `GetKeyState(VK_MENU)` and asks.
+  `Document::select_at` is `select` after the click has resolved, so the gesture is tested without
+  a pixel; a drag keeps the mode it began in because `set_focus` keeps it.
+- **Copy.** `copy_block`: the band from each row, one row per line, a row the band misses as an
+  empty line, trailing padding trimmed under columns because it is the presentation's. `copy_tsv`
+  on a block copies only the layout columns the band touches (`columns_touched`, in shown order);
+  a band wholly in a gap falls back to the text. Found on the way and fixed: `copy_tsv` on a
+  triple-clicked line copied the next row too, because the selection ends at that row's first
+  cell; a row reached with nothing on it is skipped now.
+- **The pre-commit review found four things, all taken and all pinned by the tests.** The
+  padding trim ate a message's own trailing spaces (now `band_ends_in_a_gap`: trimmed only when
+  the band runs out of a column into its gap); a continuation row under a block went into the TSV
+  as its whole raw line (now an empty line, as on screen); a whitespace-only block copied nothing
+  (it copies); a plain `Shift+click` after an `Alt` drag went on extending the rectangle (a stream
+  again once the drag has ended — only `Shift+Alt` extends a rectangle).
+- **Not asserted anywhere: that `Alt` alone still focuses the menu bar after an `Alt` drag.**
+  Windows cancels the Alt-release menu activation when a button is pressed while `Alt` is held;
+  the first screen run of this is the check, and if a build disagrees the answer is to swallow
+  `SC_KEYMENU` with `lparam == 0` during a drag.
+- **Next, if wanted:** `Ctrl+click` on a column title to select that column top to bottom
+  (proposal §1, increment 2).
+
 ## ▶ Resume point — 2026-10-28: a pass restarted while following lands following
 
 The owner deployed the release of 19e5ac2 and the trace bug was still there — on the release, and

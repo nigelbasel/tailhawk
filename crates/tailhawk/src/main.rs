@@ -112,7 +112,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_B, VK_C,
     VK_CONTROL, VK_D, VK_DOWN, VK_E, VK_END, VK_ESCAPE, VK_F, VK_F2, VK_F3, VK_F6, VK_G, VK_HOME,
-    VK_I, VK_L, VK_LEFT, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_I, VK_L, VK_LEFT, VK_MENU, VK_NEXT, VK_O, VK_OEM_5, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
     VK_SPACE, VK_T, VK_TAB, VK_UP, VK_W,
 };
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
@@ -2344,17 +2344,42 @@ impl Document {
         let Some(at) = self.view.position_at(x, y) else {
             return false;
         };
+        self.select_at(at, what)
+    }
+
+    /// [`select`](Self::select) once the click has resolved to a position. A drag extends in the
+    /// mode it began in: `set_focus` keeps the mode, so an `Alt` drag stays a rectangle without
+    /// the shell having to remember anything.
+    fn select_at(&mut self, at: Position, what: Selecting) -> bool {
         let before = self.selection;
         match what {
             Selecting::Start => {
                 self.selection = Some(Selection::at(at));
                 self.dragging = true;
             }
+            Selecting::BlockStart => {
+                self.selection = Some(Selection::block(at, at));
+                self.dragging = true;
+            }
             Selecting::Extend => {
                 if let Some(sel) = self.selection.as_mut() {
+                    // **A drag keeps its mode; a later Shift+click does not.** Without `Alt`,
+                    // extending a rectangle left over from an earlier drag makes a stream again,
+                    // as the gesture table says: only `Shift+Alt` extends a rectangle.
+                    if !self.dragging {
+                        sel.set_mode(tailhawk_core::selection::SelectionMode::Stream);
+                    }
                     sel.set_focus(at);
                 } else {
                     self.selection = Some(Selection::at(at));
+                }
+            }
+            Selecting::BlockExtend => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.set_mode(tailhawk_core::selection::SelectionMode::Block);
+                    sel.set_focus(at);
+                } else {
+                    self.selection = Some(Selection::block(at, at));
                 }
             }
             Selecting::Word => {
@@ -2390,6 +2415,9 @@ impl Document {
         if sel.is_empty() {
             return None;
         }
+        if sel.mode() == tailhawk_core::selection::SelectionMode::Block {
+            return self.copy_block(&sel);
+        }
         let mut out = String::new();
         for row in sel.first_row()..=sel.last_row() {
             let Some(line) = self.row_text(row) else {
@@ -2418,6 +2446,44 @@ impl Document {
             }
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// A rectangle's text: the band from each row, one row per line, which is the newline the
+    /// core's `RowSpan` says the caller supplies. A row the band misses contributes an empty line,
+    /// so the rows copied are the rows selected. Under columns a band that runs out past a column
+    /// into its gap carries that gap's padding, which is the presentation's and not the file's,
+    /// and goes; a band that ends inside a column keeps every character, trailing spaces of the
+    /// message included.
+    fn copy_block(&self, sel: &Selection) -> Option<String> {
+        let padded = self.band_ends_in_a_gap(sel.end().cell);
+        let mut rows = Vec::new();
+        for row in sel.first_row()..=sel.last_row() {
+            let Some(line) = self.row_text(row) else {
+                continue;
+            };
+            let piece = sel
+                .byte_range(self.view.cells(), row, line)
+                .map(|bytes| &line[bytes])
+                .unwrap_or("");
+            rows.push(if padded { piece.trim_end() } else { piece });
+        }
+        let out = rows.join("\n");
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Whether a band whose exclusive end is `end` stops in the padding between columns, or past
+    /// the last one, rather than inside a column's own cells. Never, without a layout.
+    fn band_ends_in_a_gap(&self, end: usize) -> bool {
+        if self.layout.is_none() {
+            return false;
+        }
+        let Some(last) = end.checked_sub(1) else {
+            return false;
+        };
+        !self
+            .header_columns()
+            .iter()
+            .any(|c| c.start <= last && last < c.start + c.content)
     }
 
     /// `Ctrl+Shift+1…9` — `UI-DESIGN.md` §12's ad-hoc colour label on the selection: every line
@@ -2574,8 +2640,21 @@ impl Document {
             return None;
         }
         let format = self.detection.accepted;
+        let touched = self.columns_touched(&sel);
+        if touched.as_ref().is_some_and(Vec::is_empty) {
+            return self.copy_text();
+        }
         let mut out = String::new();
         for row in sel.first_row()..=sel.last_row() {
+            // **A row the selection reaches with nothing on it is not a row of the copy.** A
+            // triple-clicked line ends at the start of the next row, and this copied that row too.
+            let reached = sel.row_span(row).is_some_and(|s| match s.end {
+                RowEnd::ToLineEnd => true,
+                RowEnd::Cell(end) => end > s.start_cell,
+            });
+            if !reached {
+                continue;
+            }
             let Some(raw) = self
                 .filtering
                 .file_row(row)
@@ -2584,6 +2663,14 @@ impl Document {
                 continue;
             };
             match format.and_then(|f| f.fields(raw).map(|r| (f, r))) {
+                Some((_, ranges)) if touched.is_some() => {
+                    let cells: Vec<&str> = touched
+                        .iter()
+                        .flatten()
+                        .map(|&i| ranges.get(i).cloned().flatten().map_or("", |r| &raw[r]))
+                        .collect();
+                    out.push_str(&cells.join("\t"));
+                }
                 Some((format, ranges)) => {
                     let mut cells: Vec<&str> = Vec::new();
                     let mut msg = None;
@@ -2600,11 +2687,33 @@ impl Document {
                     }
                     out.push_str(&cells.join("\t"));
                 }
+                // **A row the format does not parse has nothing in the band's columns**, so under
+                // a block it is an empty line, as it is on screen; copying the raw line there put
+                // a stack-trace line in the middle of a column of levels.
+                None if touched.is_some() => {}
                 None => out.push_str(raw),
             }
             out.push('\n');
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// The layout columns a rectangle's band touches, in the order they are shown — `None` for a
+    /// stream selection, or with no layout, so `copy_tsv` copies every field as it always has. A
+    /// band that lies entirely in a gap touches nothing, and the caller falls back to the text.
+    fn columns_touched(&self, sel: &Selection) -> Option<Vec<usize>> {
+        if sel.mode() != tailhawk_core::selection::SelectionMode::Block {
+            return None;
+        }
+        self.layout.as_ref()?;
+        let band = sel.start().cell..sel.end().cell;
+        Some(
+            self.header_columns()
+                .iter()
+                .filter(|c| c.start < band.end && band.start < c.start + c.content)
+                .map(|c| c.column)
+                .collect(),
+        )
     }
 
     /// The header band's column boundaries, in cells from the row's left edge: the cell after each
@@ -4878,10 +4987,30 @@ enum Selecting {
     Start,
     /// Dragging, or shift-clicking: move the focus and keep the anchor.
     Extend,
+    /// Alt and the left button down: the corner of a rectangle a drag will extend from.
+    BlockStart,
+    /// Shift+Alt-click: the selection there is becomes a rectangle to here.
+    BlockExtend,
     /// Double-click.
     Word,
     /// Triple-click.
     Line,
+}
+
+impl Selecting {
+    /// What a button-down means, from what was held when it landed. **The mode is decided here
+    /// and kept for the drag**, as VS Code and Sublime decide it: `Alt` makes the rectangle,
+    /// `Shift` extends what is there, and a triple click is a line whatever else is held. The
+    /// shell reads the keys and asks; it decides nothing.
+    fn from_click(shift: bool, alt: bool, triple: bool) -> Self {
+        match (triple, shift, alt) {
+            (true, _, _) => Self::Line,
+            (false, true, true) => Self::BlockExtend,
+            (false, true, false) => Self::Extend,
+            (false, false, true) => Self::BlockStart,
+            (false, false, false) => Self::Start,
+        }
+    }
 }
 
 struct Shell {
@@ -13573,15 +13702,13 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                                 && (x - dx).abs() < 4.0
                                 && (y - dy).abs() < 4.0
                         });
-                        let what = if triple {
+                        if triple {
                             shell.last_double = None;
-                            Selecting::Line
-                        } else if shift {
-                            Selecting::Extend
-                        } else {
-                            Selecting::Start
-                        };
-                        shell.select(x, y, what)
+                        }
+                        // **`Alt` is not among `wparam`'s key flags**, so it is read from the
+                        // keyboard state, as the digit keys read `Shift`.
+                        let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+                        shell.select(x, y, Selecting::from_click(shift, alt, triple))
                     }
                     WM_LBUTTONDBLCLK => {
                         shell.last_double = Some((now_ms(), x, y));
@@ -15457,6 +15584,166 @@ mod tests {
         // A caret selects no columns anywhere, so nothing is tinted.
         doc.selection = Some(Selection::at(Position::new(0, 3)));
         assert_eq!(doc.row_selection(0), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The owner, 2026-10-28: *"Many editors support column selection using alt + left mouse
+    /// drag."* The mode is decided at button-down, as VS Code and Sublime decide it, and the
+    /// shell only asks.
+    #[test]
+    fn what_a_click_means_is_decided_from_its_modifiers() {
+        assert_eq!(Selecting::from_click(false, false, false), Selecting::Start);
+        assert_eq!(Selecting::from_click(true, false, false), Selecting::Extend);
+        assert_eq!(
+            Selecting::from_click(false, true, false),
+            Selecting::BlockStart
+        );
+        assert_eq!(
+            Selecting::from_click(true, true, false),
+            Selecting::BlockExtend
+        );
+        assert_eq!(
+            Selecting::from_click(false, false, true),
+            Selecting::Line,
+            "a triple click is a line whatever else is held"
+        );
+        assert_eq!(Selecting::from_click(true, true, true), Selecting::Line);
+    }
+
+    /// An Alt+drag selects the same column band on every row, the drag keeps the mode it began
+    /// in, and the copy is one row per line.
+    #[test]
+    fn an_alt_drag_selects_the_same_columns_on_every_row() {
+        use tailhawk_core::selection::SelectionMode;
+        let path = std::env::temp_dir().join("tailhawk_block_test.log");
+        std::fs::write(&path, "alpha beta gamma\nsecond line here\nthird one\n").expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+
+        assert!(doc.select_at(Position::new(0, 6), Selecting::BlockStart));
+        assert!(doc.dragging, "a block drag is a drag");
+        assert!(doc.select_at(Position::new(2, 10), Selecting::Extend));
+        let sel = doc.selection.expect("a selection");
+        assert_eq!(sel.mode(), SelectionMode::Block, "the drag keeps its mode");
+        assert_eq!(doc.row_selection(0), Some(6..10));
+        assert_eq!(doc.row_selection(1), Some(6..10));
+        assert_eq!(doc.row_selection(2), Some(6..10));
+        assert_eq!(
+            doc.copy_text().as_deref(),
+            Some("beta\n lin\none"),
+            "the band from each row, one row per line, a short row clamped"
+        );
+        assert!(doc.select_at(Position::new(0, 12), Selecting::BlockStart));
+        assert!(doc.select_at(Position::new(2, 16), Selecting::Extend));
+        assert_eq!(
+            doc.copy_text().as_deref(),
+            Some("amma\nhere\n"),
+            "a row the band misses is an empty line, so the rows copied are the rows selected"
+        );
+
+        // Once the drag has ended, a plain Shift+click extends as a stream again.
+        doc.dragging = false;
+        assert!(doc.select_at(Position::new(1, 3), Selecting::Extend));
+        assert_eq!(
+            doc.selection.map(|s| s.mode()),
+            Some(SelectionMode::Stream),
+            "only Shift+Alt extends a rectangle"
+        );
+
+        // Shift+Alt on an ordinary selection turns it into a block from the same anchor.
+        doc.selection = Some(Selection::stream(Position::new(0, 2), Position::new(0, 4)));
+        assert!(doc.select_at(Position::new(1, 8), Selecting::BlockExtend));
+        let sel = doc.selection.expect("a selection");
+        assert_eq!(sel.mode(), SelectionMode::Block);
+        assert_eq!(sel.anchor(), Position::new(0, 2));
+        assert_eq!(doc.row_selection(1), Some(2..8));
+
+        // Shift+Alt with nothing selected is a block caret, as Shift+click is a stream caret.
+        doc.selection = None;
+        assert!(doc.select_at(Position::new(1, 3), Selecting::BlockExtend));
+        assert_eq!(doc.selection.map(|s| s.mode()), Some(SelectionMode::Block));
+
+        // An ordinary drag is untouched.
+        assert!(doc.select_at(Position::new(0, 6), Selecting::Start));
+        assert!(doc.select_at(Position::new(1, 6), Selecting::Extend));
+        assert_eq!(doc.selection.map(|s| s.mode()), Some(SelectionMode::Stream));
+        assert_eq!(doc.copy_text().as_deref(), Some("beta gamma\nsecond"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Under columns a block is a column band, and copying it as TSV gives only the columns the
+    /// band touches — the "lift the status column out" case the owner named.
+    #[test]
+    fn a_block_copied_as_tsv_gives_only_the_columns_it_touches() {
+        let path = std::env::temp_dir().join("tailhawk_block_tsv_test.log");
+        // Row 0's message ends in two spaces of its own; row 2 is a continuation the format does
+        // not parse.
+        let mut text = String::new();
+        for i in 0..30 {
+            let msg = if i == 0 {
+                "line 0  ".to_owned()
+            } else {
+                format!("line {i}")
+            };
+            text.push_str(&format!(
+                "{{\"level\":\"info\",\"status\":{},\"msg\":\"{msg}\"}}\n",
+                200 + i
+            ));
+            if i == 1 {
+                text.push_str("  at Foo.bar()\n");
+            }
+        }
+        std::fs::write(&path, text).expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.view.grid_mut().scroll_to_row(0);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        let columns = doc.header_columns();
+        let level = columns
+            .iter()
+            .find(|c| c.title == "level")
+            .expect("the fixture is detected with a level column")
+            .clone();
+        let message = columns.last().expect("the message column is last").clone();
+        let block = |rows: std::ops::RangeInclusive<u64>, cells: std::ops::Range<usize>| {
+            Selection::block(
+                Position::new(*rows.start(), cells.start),
+                Position::new(*rows.end(), cells.end),
+            )
+        };
+
+        doc.selection = Some(block(0..=3, level.start..level.start + 2));
+        assert_eq!(
+            doc.copy_tsv().as_deref(),
+            Some("info\ninfo\n\ninfo\n"),
+            "the touched column whole, one row per line, the continuation an empty one"
+        );
+        doc.selection = Some(block(0..=1, level.start..level.start + 2));
+        assert_eq!(
+            doc.copy_text().as_deref(),
+            Some("in\nin"),
+            "plain copy is the band as drawn"
+        );
+        doc.selection = Some(block(0..=1, level.start..level.start + level.content + 1));
+        assert_eq!(
+            doc.copy_text().as_deref(),
+            Some("info\ninfo"),
+            "a band that runs into the gap drops the gap's padding"
+        );
+        doc.selection = Some(block(0..=0, message.start..message.start + 8));
+        assert_eq!(
+            doc.copy_text().as_deref(),
+            Some("line 0  "),
+            "a band inside the message keeps the message's own trailing spaces"
+        );
+
+        // A whole-row stream selection still copies every field, the message last — and only
+        // the row selected: a triple-clicked line ends at the start of the next row, and the
+        // copy used to carry that row too.
+        doc.selection = Some(Selection::line(0));
+        assert_eq!(doc.copy_tsv().as_deref(), Some("\tinfo\tline 0  \n"));
 
         let _ = std::fs::remove_file(&path);
     }
