@@ -114,11 +114,22 @@ pub fn derived_colour(text: &str) -> Colour {
     palette[(hash % palette.len() as u64) as usize]
 }
 
+/// What a rule tests: the text, or the record. `SPEC.md` §7.1 for the first, and the firewall
+/// workstream's ask of 2026-10-28 for the second — tint by the `reason` attribute, whatever the
+/// body happens to say — met with §7.2's predicate language rather than a second one.
+pub enum Matcher {
+    /// A pattern over the row's text, matched wherever it occurs.
+    Text(Pattern),
+    /// A predicate over the parsed record. Whole-line by nature: there is no span in the text to
+    /// colour. Unknown is no match, so a record without the attribute, or no record, is left.
+    Where(crate::filter::Predicate),
+}
+
 /// One highlight rule. §7.1's unit.
 pub struct Rule {
     /// What the user called it. Shown in the rule list and used by nothing else.
     pub name: String,
-    pub pattern: Pattern,
+    pub matcher: Matcher,
     pub fg: Option<Colour>,
     pub bg: Option<Colour>,
     /// §7.1's "stable derived colours for recurring identifiers": the foreground comes from
@@ -140,13 +151,35 @@ impl Rule {
     pub fn new(name: impl Into<String>, pattern: Pattern) -> Self {
         Self {
             name: name.into(),
-            pattern,
+            matcher: Matcher::Text(pattern),
             fg: None,
             bg: None,
             derived: false,
             whole_line: false,
             enabled: true,
             groups: Vec::new(),
+        }
+    }
+
+    /// A rule that colours the whole line of every record `predicate` holds for.
+    pub fn where_(name: impl Into<String>, predicate: crate::filter::Predicate) -> Self {
+        Self {
+            name: name.into(),
+            matcher: Matcher::Where(predicate),
+            fg: None,
+            bg: None,
+            derived: false,
+            whole_line: true,
+            enabled: true,
+            groups: Vec::new(),
+        }
+    }
+
+    /// The pattern a text rule matches with; `None` for a rule that tests the record.
+    pub fn pattern(&self) -> Option<&Pattern> {
+        match &self.matcher {
+            Matcher::Text(pattern) => Some(pattern),
+            Matcher::Where(_) => None,
         }
     }
 
@@ -179,6 +212,12 @@ impl Rule {
         self.groups[n - 1] = Some(fg);
         self
     }
+}
+
+/// Whether a `where` rule fires: the predicate holds for the record, definitely. §7.2's unknown
+/// — no such attribute, or no record to ask — is not a match, as the firewall request asks.
+fn holds(predicate: &crate::filter::Predicate, record: Option<&crate::record::Record>) -> bool {
+    record.is_some_and(|r| predicate.eval(r) == crate::filter::Truth::True)
 }
 
 /// A named, ordered set of rules. §7.1's importable/exportable unit.
@@ -289,9 +328,18 @@ impl Highlighter {
     ///
     /// `out` is cleared and reused, so a painter holds one `Vec` for the whole frame instead of
     /// allocating per row — at fifty rows a frame that is fifty allocations a frame for nothing.
-    pub fn line(&self, line: &str, out: &mut Vec<Span>) {
+    pub fn line(&self, line: &str, record: Option<&crate::record::Record>, out: &mut Vec<Span>) {
         out.clear();
-        self.beneath(line, out);
+        self.beneath(line, record, out);
+    }
+
+    /// Whether any rule in force tests the record, so a caller knows whether parsing one for
+    /// each row would buy anything.
+    pub fn needs_records(&self) -> bool {
+        self.set
+            .rules
+            .iter()
+            .any(|r| r.enabled && matches!(r.matcher, Matcher::Where(_)))
     }
 
     /// The spans for one line, **added beneath whatever `out` already holds.**
@@ -301,7 +349,7 @@ impl Highlighter {
     /// that orders the set — so a match the user asked for is never hidden by a timestamp colour,
     /// and everything a match does not cover is still coloured. `out` must be sorted and
     /// non-overlapping on entry, which is what every producer of spans in this crate emits.
-    pub fn beneath(&self, line: &str, out: &mut Vec<Span>) {
+    pub fn beneath(&self, line: &str, record: Option<&crate::record::Record>, out: &mut Vec<Span>) {
         let budget = self.budget.get();
         if line.len() > budget {
             // **Charged before the work, so an over-budget row costs nothing.** Charging afterwards
@@ -328,7 +376,7 @@ impl Highlighter {
             .iter()
             .filter(|r| r.enabled && !(r.fg.is_none() && !r.derived && r.bg.is_some()))
         {
-            self.apply(rule, line, out);
+            self.apply(rule, line, record, out);
         }
         for rule in self
             .set
@@ -337,21 +385,53 @@ impl Highlighter {
             .filter(|r| r.enabled && r.fg.is_none() && !r.derived && r.bg.is_some())
         {
             let bg = rule.bg;
-            rule.pattern.each_match(line, |whole, _groups| {
-                let (start, end) = if rule.whole_line {
-                    (0, line.len())
-                } else {
-                    (whole.start, whole.end)
-                };
-                claim_bg(out, start, end, bg);
-            });
+            match &rule.matcher {
+                Matcher::Text(pattern) => {
+                    pattern.each_match(line, |whole, _groups| {
+                        let (start, end) = if rule.whole_line {
+                            (0, line.len())
+                        } else {
+                            (whole.start, whole.end)
+                        };
+                        claim_bg(out, start, end, bg);
+                    });
+                }
+                Matcher::Where(predicate) => {
+                    if holds(predicate, record) {
+                        claim_bg(out, 0, line.len(), bg);
+                    }
+                }
+            }
         }
     }
 
     /// One rule's claims, in precedence order with the others: groups first, then the match.
-    fn apply(&self, rule: &Rule, line: &str, out: &mut Vec<Span>) {
+    fn apply(
+        &self,
+        rule: &Rule,
+        line: &str,
+        record: Option<&crate::record::Record>,
+        out: &mut Vec<Span>,
+    ) {
+        let pattern = match &rule.matcher {
+            Matcher::Text(pattern) => pattern,
+            Matcher::Where(predicate) => {
+                if holds(predicate, record) && (rule.fg.is_some() || rule.bg.is_some()) {
+                    claim(
+                        out,
+                        Span {
+                            start: 0,
+                            end: line.len(),
+                            fg: rule.fg,
+                            bg: rule.bg,
+                        },
+                    );
+                }
+                return;
+            }
+        };
         {
-            rule.pattern.each_match(line, |whole, groups| {
+            pattern.each_match(line, |whole, groups| {
                 // **Groups first.** Under first-claim-wins that is the whole of "a sub-highlight
                 // sits above its rule"; see the module note.
                 for (n, range) in groups.iter().enumerate() {
@@ -616,8 +696,72 @@ mod tests {
         let h = Highlighter::new(set);
         h.begin_frame();
         let mut out = Vec::new();
-        h.line(line, &mut out);
+        h.line(line, None, &mut out);
         out
+    }
+
+    fn record_with(raw: &str, attributes: &[(&str, &str)]) -> crate::record::Record {
+        crate::record::Record {
+            raw: raw.to_owned(),
+            body: raw.to_owned(),
+            attributes: attributes
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        (*k).to_owned(),
+                        crate::record::AttributeValue::String((*v).to_owned()),
+                    )
+                })
+                .collect(),
+            ..crate::record::Record::default()
+        }
+    }
+
+    /// A rule may test the record instead of the text — the firewall workstream's ask: tint by
+    /// the `reason` attribute, whatever the body says. Unknown is no match, so a record without
+    /// the attribute, or no record at all, is left alone; and a `where` rule with ink runs with
+    /// the inked rules, one with a background alone fills under them.
+    #[test]
+    fn a_where_rule_tints_the_line_by_the_record_not_the_text() {
+        let predicate = crate::filter::parse("reason in [\"probe\", \"payload\"]").expect("parses");
+        let set = RuleSet::new("s").with(Rule::where_("attack", predicate).bg(RED));
+        let h = Highlighter::new(set);
+        let probe = record_with("GET /x -> 444 from 1.2.3.4", &[("reason", "probe")]);
+        let served = record_with("GET /probe -> 200 from 1.2.3.4", &[("reason", "-")]);
+        let bgs = |out: &[Span]| {
+            out.iter()
+                .map(|s| (s.start, s.end, s.bg))
+                .collect::<Vec<_>>()
+        };
+        let mut out = Vec::new();
+        h.begin_frame();
+        h.line(&probe.raw, Some(&probe), &mut out);
+        assert_eq!(bgs(&out), [(0, probe.raw.len(), Some(RED))]);
+        h.line(&served.raw, Some(&served), &mut out);
+        assert!(out.is_empty(), "the body says probe; the record does not");
+        let bare = record_with("GET /probe -> 200", &[("status", "200")]);
+        h.line(&bare.raw, Some(&bare), &mut out);
+        assert!(
+            out.is_empty(),
+            "no such attribute is unknown, and unknown is no match"
+        );
+        h.line(&probe.raw, None, &mut out);
+        assert!(out.is_empty(), "no record, no answer");
+        assert!(h.needs_records());
+
+        let predicate = crate::filter::parse("status = 413").expect("parses");
+        let set = RuleSet::new("s")
+            .with(Rule::where_("oversize", predicate).fg(GREEN))
+            .with(rule("num", "413").fg(RED));
+        let h = Highlighter::new(set);
+        let big = record_with("POST /u -> 413 from 1.2.3.4", &[("status", "413")]);
+        h.begin_frame();
+        h.line(&big.raw, Some(&big), &mut out);
+        assert_eq!(
+            ranges(&out),
+            [(0, big.raw.len(), Some(GREEN))],
+            "a where rule with ink is first-claim-wins like any other"
+        );
     }
 
     fn ranges(spans: &[Span]) -> Vec<(usize, usize, Option<Colour>)> {
@@ -714,12 +858,12 @@ mod tests {
         h.set_mut().rules[0].enabled = false;
         h.begin_frame();
         let mut out = Vec::new();
-        h.line("a ERROR b", &mut out);
+        h.line("a ERROR b", None, &mut out);
         assert_eq!(ranges(&out), [(0, 9, Some(GREEN))]);
 
         h.set_mut().rules[0].enabled = true;
         h.begin_frame();
-        h.line("a ERROR b", &mut out);
+        h.line("a ERROR b", None, &mut out);
         assert_eq!(
             ranges(&out),
             [(0, 2, Some(GREEN)), (2, 7, Some(RED)), (7, 9, Some(GREEN))],
@@ -752,13 +896,13 @@ mod tests {
         let h = Highlighter::new(RuleSet::new("s").with(rule("x", "x").fg(RED)));
         h.begin_frame();
         let mut out = Vec::new();
-        h.line(&long, &mut out);
+        h.line(&long, None, &mut out);
         assert!(out.is_empty());
         assert_eq!(h.skipped(), 1);
 
         // A new frame starts with a full budget, or one bad row would poison every frame after it.
         h.begin_frame();
-        h.line("short x", &mut out);
+        h.line("short x", None, &mut out);
         assert!(!out.is_empty());
         assert_eq!(h.skipped(), 0);
     }
@@ -771,9 +915,9 @@ mod tests {
         let mut out = Vec::new();
         // Two rows that individually fit and together do not.
         let each = "x".repeat(FRAME_BUDGET_BYTES * 2 / 3);
-        h.line(&each, &mut out);
+        h.line(&each, None, &mut out);
         assert!(!out.is_empty(), "the first fits");
-        h.line(&each, &mut out);
+        h.line(&each, None, &mut out);
         assert!(out.is_empty(), "the second must not be examined");
         assert_eq!(h.skipped(), 1);
     }
@@ -787,11 +931,11 @@ mod tests {
         h.begin_frame();
         let mut out = Vec::new();
         let each = "x".repeat(FRAME_BUDGET_BYTES * 2 / 3);
-        h.line(&each, &mut out);
+        h.line(&each, None, &mut out);
         assert!(!out.is_empty(), "the first fits");
-        h.line(&each, &mut out);
+        h.line(&each, None, &mut out);
         assert!(out.is_empty(), "the second does not");
-        h.line("short x", &mut out);
+        h.line("short x", None, &mut out);
         assert!(!out.is_empty(), "the third fits in what the second left");
         assert_eq!(h.skipped(), 1, "only the row that did not fit is counted");
     }
@@ -938,8 +1082,8 @@ mod tests {
         let h = Highlighter::new(set);
         let mut a = Vec::new();
         let mut b = Vec::new();
-        h.line("req-1a2b then req-9f then req-1a2b", &mut a);
-        h.line("later: req-1a2b", &mut b);
+        h.line("req-1a2b then req-9f then req-1a2b", None, &mut a);
+        h.line("later: req-1a2b", None, &mut b);
 
         assert_eq!(a.len(), 3);
         assert_eq!(a[0].fg, a[2].fg, "same text, same colour on one line");
@@ -985,7 +1129,7 @@ mod tests {
             fg: None,
             bg: Some(BLUE),
         }];
-        h.beneath("abc defgh ij", &mut out);
+        h.beneath("abc defgh ij", None, &mut out);
         assert_eq!(
             out.iter()
                 .map(|s| (s.start, s.end, s.fg, s.bg))
@@ -1024,11 +1168,11 @@ mod tests {
             fg: None,
             bg: Some(BLUE),
         }];
-        h.line("abc", &mut out);
+        h.line("abc", None, &mut out);
         assert_eq!(ranges(&out), [(0, 3, Some(RED))], "line starts from empty");
 
         let long = "x".repeat(FRAME_BUDGET_BYTES);
-        h.beneath(&long, &mut out);
+        h.beneath(&long, None, &mut out);
         assert_eq!(
             h.skipped(),
             1,

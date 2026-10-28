@@ -9783,6 +9783,7 @@ mod tests {
         tailhawk_core::rules::Spec {
             name: name.to_owned(),
             pattern: name.to_owned(),
+            where_: None,
             fg,
             bg,
             whole_line: false,

@@ -217,6 +217,49 @@ impl Format {
         Some(record)
     }
 
+    /// [`parse`](Self::parse), and for a scanned record every other text key of the object as an
+    /// attribute too. What a highlight rule's `where` is judged on: a key need not be a column
+    /// to be tested, since a tail's columns are the reader's choice of what to *see*, and a Loki
+    /// spill writes every attribute as text. Two more walks over the line, so it is for the rows
+    /// on screen, not the sieve.
+    pub fn parse_every_key(&self, line: &str) -> Option<Record> {
+        let mut record = self.parse(line)?;
+        // Whatever the format's own machinery — a scanned JSON format or a pattern over a JSON
+        // line — a line that is an object has keys to offer; one that is not has none.
+        let Some(keys) = crate::detect::json_keys(line) else {
+            return Some(record);
+        };
+        let known = self.titles.unwrap_or(self.columns);
+        let extra: Vec<&str> = keys
+            .iter()
+            .filter(|k| k.value != crate::detect::JsonValue::Nested)
+            .map(|k| k.name.as_str())
+            .filter(|name| !known.contains(name) && !self.columns.contains(name))
+            .collect();
+        if extra.is_empty() {
+            return Some(record);
+        }
+        for (name, found) in extra.iter().zip(crate::detect::json_values(line, &extra)?) {
+            let Some((range, kind)) = found else {
+                continue;
+            };
+            let token = &line[range];
+            // **A number is a number**, so `status = 413` and `bytes > 500` compare as
+            // `filter.rs` compares an `Int` — a plain JSON log writes `"status":413`, where a Loki
+            // spill writes every attribute as text. `true`, `false` and `null` stay as written.
+            let value = match kind {
+                crate::detect::JsonValue::Text => AttributeValue::String(token.to_owned()),
+                _ => token
+                    .parse::<i64>()
+                    .map(AttributeValue::Int)
+                    .or_else(|_| token.parse::<f64>().map(AttributeValue::Float))
+                    .unwrap_or_else(|_| AttributeValue::String(token.to_owned())),
+            };
+            record.attributes.push(((*name).to_owned(), value));
+        }
+        Some(record)
+    }
+
     /// The scanner's answer for a [`scanned`](Self::scanned) format: each column's value, by the
     /// raw key its title names. `None` when the line is not an object.
     fn scanned_fields(&self, line: &str) -> Option<Vec<Option<core::ops::Range<usize>>>> {
@@ -854,6 +897,43 @@ fn build() -> Vec<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a highlight rule's `where` is judged on: every key of the record, a number as a
+    /// number, where `parse` keeps to the columns a reader chose to see.
+    #[test]
+    fn every_key_of_a_json_record_is_an_attribute_and_a_number_is_a_number() {
+        let line = r#"{"level":"info","status":413,"ratio":0.5,"ok":true,"msg":"line 5","nested":{"a":1}}"#;
+        let keys = crate::detect::json_keys(line).expect("an object");
+        let format = json_lines(&keys);
+        let record = format.parse_every_key(line).expect("a first line");
+        assert_eq!(
+            record.attribute("status"),
+            Some(&AttributeValue::Int(413)),
+            "{:?}",
+            record.attributes
+        );
+        assert_eq!(record.attribute("ratio"), Some(&AttributeValue::Float(0.5)));
+        assert_eq!(
+            record.attribute("ok"),
+            Some(&AttributeValue::String("true".to_owned()))
+        );
+        assert!(
+            record.attribute("nested").is_none(),
+            "an object is not a value"
+        );
+        assert_eq!(
+            crate::filter::parse("status = 413")
+                .expect("parses")
+                .eval(&record),
+            crate::filter::Truth::True
+        );
+        let plain = format.parse(line).expect("a first line");
+        assert!(
+            plain.attribute("status").is_none(),
+            "parse keeps to the columns: {:?}",
+            plain.attributes
+        );
+    }
 
     #[test]
     fn every_format_parses_its_own_samples_to_the_expected_band() {

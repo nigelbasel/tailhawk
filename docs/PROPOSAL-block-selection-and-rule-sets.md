@@ -204,7 +204,7 @@ does not match". So a rule's match becomes one of two things:
 ```toml
 [[set.rule]]
 name = "attack"
-where = 'reason in ("probe", "payload", "scanner", "proxy-abuse")'
+where = 'reason in ["probe", "payload", "scanner", "proxy-abuse"]'
 bg = "#7a1010"
 whole_line = true
 

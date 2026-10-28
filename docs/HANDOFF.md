@@ -1,5 +1,56 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-28, evening: rule sets bound to a file or a format, and `where` rules
+
+The owner: *"It would be good to be able to have multiple named sets and be able to apply each one
+to a particular file or file type."* And the create-liquidocean-firewall workstream's request
+(`C:\dev\tfsgit\TAILHAWK-REQUEST-attribute-highlight-rules-2026-10-28.md`): a rule keyed on the
+`reason` / `status` attributes rather than the body text. Steps (1) and (2) of
+`docs/PROPOSAL-block-selection-and-rule-sets.md` §2–3 are built; step (3), the editor, is next.
+
+- **The file.** `[[set]]` with `name` and `apply_to = [...]`, then `[[set.rule]]`s; rules outside
+  any set are the Default set, so every file written before this reads exactly as it did. A
+  binding is a path or `loki://` URL (whole, case-folded), a glob (the format wizard's own
+  semantics: a bare pattern is the file name, one with a separator the whole path), or
+  `format:<name>`. A rule has `pattern` or `where`, never both; `where` is a §7.2 predicate —
+  `reason in ["probe", "payload"]`, `status = 413` — and the list syntax is square brackets.
+  `rules::parse_file` / `to_toml_file` round-trip the whole file; `rules::parse` is the Default
+  set alone, as before.
+- **Resolution is pure**: `rules::for_document(files, path, format)` gives every bound set that
+  takes the document (tier order) then every tier's Default set; `active_set` is the first bound
+  set, for the status chip when it is built. `rebuild_highlighter_from` resolves per document from
+  `state_key()` and the accepted format's name.
+- **A `where` rule** is `highlight::Matcher::Where` beside `Matcher::Text`; the highlighter is
+  handed the parsed record beside the line and `holds` says a predicate fires only when it is
+  definitely true. `Document::colour_beneath` parses the record only when a rule in force needs
+  one (`needs_records`), through `Format::parse_every_key`, so **every text key of a JSON record
+  is in reach, not only the columns** — the chooser's columns are what the reader sees, not what
+  a rule may test. The sieve's chips still see only the columns; that difference is knowingly
+  left and is the next thing to make consistent.
+- **The editor is not set-aware yet.** It edits the personal tier's Default set; the tier's sets
+  are read at open (`rules_personal_sets`) and written back untouched at save
+  (`rules_in_edit`, `to_toml_file`), so nothing is lost. A `where` rule in the Default set shows
+  an empty pattern cell there. The switcher, `Apply to ▾`, `Move to ▾` and the `Match: text |
+  where` toggle are step (3).
+- **The pre-commit review found six things; all taken but the editor's.** A format change
+  (the chip menu's Adopt or Plain text, the wizard's save) never re-resolved the sets, so a set
+  bound to a format did not follow the format until a reload — it does now. A numeric JSON value
+  (`"status":413`, as a plain JSON log writes it, where a Loki spill writes text) was never an
+  attribute, so `status = 413` could not match — `detect::json_values` and `parse_every_key` now
+  make a number an `Int` or `Float`, as `filter.rs` compares them. A `#` inside a single-quoted
+  string was taken for a comment; an `apply_to` array over several lines (what every TOML
+  formatter writes) bound nothing; a forward slash never matched a backslash. All fixed and
+  pinned. The file's header now says to write paths and expressions in single quotes, because
+  a double-quoted `"C:\temp\*.log"` reads `\t` as a tab. Left as stated: a `where` rule in the
+  Default set shows an empty pattern cell in the editor, and typing there gives the inline
+  "both a pattern and a where" error until the editor learns `where` in step (3).
+- **Tests** written first: three in `rules.rs` (round trip, bindings, precedence; then the
+  hand-written file's hashes, long arrays and slashes), one in `highlight.rs` (a `where` rule by
+  the record, including no such attribute), one in `format.rs` (every key of a JSON record, a
+  number as a number), one document-level in `main.rs` (a set bound to `format:JSON lines` tints
+  a row by a numeric `status` that is not a column; a set bound elsewhere does not apply; the
+  Default set applies everywhere), the tiers test extended to a set surviving a save.
+
 ## ▶ Resume point — 2026-10-28, later: Alt+drag selects a rectangle
 
 The owner: *"Many editors support column selection using alt + left mouse drag. This would be

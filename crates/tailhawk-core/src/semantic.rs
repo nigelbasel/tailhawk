@@ -255,7 +255,7 @@ mod tests {
         let h = Highlighter::new(catalogue_for(&crate::theme::Theme::dark()));
         h.begin_frame();
         let mut out: Vec<Span> = Vec::new();
-        h.line(line, &mut out);
+        h.line(line, None, &mut out);
         out.iter()
             .map(|s| {
                 (
@@ -295,11 +295,12 @@ mod tests {
         let set = catalogue_for(&crate::theme::Theme::dark());
         assert!(set.rules.len() >= 20);
         for rule in &set.rules {
+            let pattern = rule.pattern().expect("a catalogue rule matches text");
             assert!(
-                !rule.pattern.backtracking(),
+                !pattern.backtracking(),
                 "{:?} fell back to the backtracker: {}",
                 rule.name,
-                rule.pattern.source()
+                pattern.source()
             );
         }
     }
@@ -528,10 +529,10 @@ mod tests {
         let line = r#"2026-08-16 09:14:02.117 INFO  Api.Controller line 41982 returned 412 rows in 88ms for /api/users?x=1 from 10.0.0.1 status=200 id=3f2504e0-4f89-11d3-9a0c-0305e82c3301"#;
         let mut out = Vec::new();
         h.begin_frame();
-        h.line(line, &mut out);
+        h.line(line, None, &mut out);
         let started = std::time::Instant::now();
         for _ in 0..100 {
-            h.line(line, &mut out);
+            h.line(line, None, &mut out);
         }
         let per_row = started.elapsed() / 100;
         eprintln!(

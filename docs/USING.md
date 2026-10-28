@@ -199,6 +199,39 @@ enabled = true
 case_insensitive = true
 ```
 
+**Named sets, applied to a file or a file type.** Rules outside any set are the *Default* set and
+apply everywhere. A `[[set]]` names rules that apply only where its `apply_to` says: a path or a
+`loki://` tail, a glob (`*.log` matches by file name, `C:\logs\jobs\*.log` by the whole path), or
+`format:<name>` for a detected or chosen format — which is the "file type" that means something,
+since a Serilog file in any folder, or every `sb-edge` tail, is a format. A set with no `apply_to`
+applies nowhere until the editor can choose it. The first set that takes a file wins ties with the
+Default set; among the rules of one set, list order is precedence as always.
+
+```toml
+[[set]]
+name = "Starberry edge"
+apply_to = ["loki://starberry*", "format:JSON lines"]
+
+[[set.rule]]
+name = "attack"
+where = 'reason in ["probe", "payload", "scanner", "proxy-abuse"]'
+bg = "#7a1010"
+
+[[set.rule]]
+name = "oversize"
+where = "status = 413"
+bg = "#8a5a00"
+```
+
+**A rule that tests the record, not the text.** `where` takes a filter expression — the same
+language the filter chips use — and colours the whole line of every record it holds for. It reads
+any key of a JSON record, whether or not that key is a column, a number as a number, so a tail
+can be tinted by an attribute the body never mentions. A record without the attribute is simply
+not matched. A rule has a `pattern` or a `where`, never both. Write paths and expressions in
+single quotes, as above: inside double quotes `\t` is a tab, which a Windows path does not want.
+The in-app editor shows and saves these sets but does not edit them yet; edit the file for now
+and **Rules ▸ Reload rules**.
+
 Rules sit above the built-in colouring and below `Ctrl+Shift+n` labels; a background tints under
 the ink, so a timestamp keeps its colour on a highlighted line. Under Windows' High Contrast
 themes, rules are suppressed and the status bar says so.

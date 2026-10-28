@@ -648,7 +648,17 @@ impl Document {
         if memo.recall(file_row, text, generation).is_none() {
             let refused = self.highlighter.skipped();
             let mut fresh = Vec::new();
-            self.highlighter.line(text, &mut fresh);
+            // **The record, only when a rule in force tests one**: a parse per row per frame is
+            // the columns' price, and a set of text rules should not pay it.
+            let record = if self.highlighter.needs_records() {
+                self.detection
+                    .accepted
+                    .zip(self.set.row_text(file_row))
+                    .and_then(|(format, raw)| format.parse_every_key(raw))
+            } else {
+                None
+            };
+            self.highlighter.line(text, record.as_ref(), &mut fresh);
             if self.highlighter.skipped() == refused {
                 memo.keep(file_row, text, generation, fresh);
                 self.coloured_more.set(true);
@@ -2509,10 +2519,11 @@ impl Document {
         }
         let name = format!("Label {n}");
         let rules = &mut self.highlighter.set_mut().rules;
-        if let Some(at) = rules
-            .iter()
-            .position(|r| r.name == name && r.pattern.source() == Pattern::escape(text))
-        {
+        if let Some(at) = rules.iter().position(|r| {
+            r.name == name
+                && r.pattern()
+                    .is_some_and(|p| p.source() == Pattern::escape(text))
+        }) {
             rules.remove(at);
             self.labels.retain(|(k, t)| !(*k == n && t == text));
             return true;
@@ -5244,7 +5255,7 @@ struct Shell {
     fling_on: Option<(usize, usize)>,
     /// §7.1's user highlight rules, as written in `tailhawk.rules.toml`, and the tiers they came
     /// from; compiled into every document's highlighter above the catalogue, below the labels.
-    rule_specs: Vec<tailhawk_core::rules::Spec>,
+    rule_files: Vec<tailhawk_core::rules::File>,
     /// §6.5.1's remembered format definitions, read once at start-up. **Read, never compiled**
     /// here — `wizard::load` says why: a file of forty definitions would otherwise leak forty
     /// `Format`s for the one the opened file needs. See [`in_force`].
@@ -5273,7 +5284,10 @@ struct Shell {
     formats_tiers: Vec<PathBuf>,
     /// Rules from tiers the editor cannot write — a curated file beside the exe. Applied under
     /// whatever the editor holds, so the preview shows the set that will actually be in force.
-    rules_fixed: Vec<tailhawk_core::rules::Spec>,
+    rules_fixed: Vec<tailhawk_core::rules::File>,
+    /// The personal tier's named sets while the editor is open. The editor edits that tier's
+    /// Default set; the sets are written back as they were, so a save loses nothing.
+    rules_personal_sets: Vec<tailhawk_core::rules::SetSpec>,
     /// §14's first-run surface, kept while it is shown so a click on a recent file can be resolved.
     welcome: Option<Welcome>,
     /// The welcome entry the pointer is over, so the next frame underlines it.
@@ -7023,17 +7037,24 @@ impl Shell {
     /// over it, its labels over those. Called when a document arrives, when the theme changes and
     /// when the rules file is reloaded.
     fn rebuild_highlighter(&self, doc: &mut Document) {
-        rebuild_highlighter_with(doc, &self.rule_specs);
+        rebuild_highlighter_from(doc, &self.rule_files);
     }
 
     /// Reads the rules file again and rebuilds every document. The failures go to the status bar.
     fn reload_rules(&mut self, hwnd: HWND) {
-        let (specs, failed) = load_rule_specs(&self.rules_tiers);
-        self.rule_specs = specs;
+        let (specs, failed) = load_rule_files(&self.rules_tiers);
+        self.rule_files = specs;
         self.rules_failed = failed;
-        let specs = self.rule_specs.clone();
+        // The editor's save writes the personal tier's sets back as they were read; a set added
+        // by hand while the editor is open must be what "as they were" means by then.
+        if self.rules_editor.is_open() {
+            if let Some(personal) = self.rule_files.last() {
+                self.rules_personal_sets = personal.sets.clone();
+            }
+        }
+        let specs = self.rule_files.clone();
         for (_, doc) in self.document.all_mut() {
-            rebuild_highlighter_with(doc, &specs);
+            rebuild_highlighter_from(doc, &specs);
         }
         self.retitle(hwnd);
         unsafe {
@@ -7132,9 +7153,9 @@ impl Shell {
         // resolved to today loses the instruction.
         self.theme_name = Some(name.to_owned());
         self.settings.theme = self.theme_name.clone();
-        let specs = self.rule_specs.clone();
+        let specs = self.rule_files.clone();
         for (_, doc) in self.document.all_mut() {
-            rebuild_highlighter_with(doc, &specs);
+            rebuild_highlighter_from(doc, &specs);
         }
         let (r, g, b) = next.background_rgb8();
         unsafe {
@@ -7418,30 +7439,44 @@ impl Shell {
     /// Every tab, not just the visible one, for the reason the rules live on the shell: they are
     /// the estate's, and a tab behind this one must not be left showing the set as it was.
     fn preview_rules(&mut self) {
-        let mut specs = self.rules_fixed.clone();
-        specs.extend(self.rules_editor.specs().iter().cloned());
+        let files = self.rules_in_edit();
         for (_, doc) in self.document.all_mut() {
-            rebuild_highlighter_with(doc, &specs);
+            rebuild_highlighter_from(doc, &files);
         }
+    }
+
+    /// The tiers as they would be in force if the editor were saved now: the fixed tiers, then
+    /// the personal one with the editor's Default set and its own sets.
+    fn rules_in_edit(&self) -> Vec<tailhawk_core::rules::File> {
+        let mut files = self.rules_fixed.clone();
+        files.push(tailhawk_core::rules::File {
+            default: self.rules_editor.specs().to_vec(),
+            sets: self.rules_personal_sets.clone(),
+        });
+        files
     }
 
     /// Opens V9's editor on **the personal tier only** — the one file `save_rules` can write.
     ///
-    /// `load_rule_specs` merges every tier, so the applied set can include rules from a curated
+    /// `load_rule_files` merges every tier, so the applied set can include rules from a curated
     /// file beside the exe. Those are not editable here: writing the merged set back into the
     /// personal tier would duplicate them on the next load, and deleting one would only have it
     /// return. They stay in [`Self::rules_fixed`], applied under whatever the editor holds.
     fn open_rules_editor(&mut self) {
         let (mine, fixed) = match self.rules_tiers.split_last() {
             Some((personal, earlier)) => (
-                load_rule_specs(std::slice::from_ref(personal)).0,
-                load_rule_specs(earlier).0,
+                load_rule_files(std::slice::from_ref(personal))
+                    .0
+                    .pop()
+                    .unwrap_or_default(),
+                load_rule_files(earlier).0,
             ),
-            None => (Vec::new(), Vec::new()),
+            None => (tailhawk_core::rules::File::default(), Vec::new()),
         };
         self.rules_fixed = fixed;
+        self.rules_personal_sets = mine.sets;
         self.rules_editor =
-            tailhawk_core::ruleset::Editor::new(tailhawk_core::rules::FILE_NAME, mine);
+            tailhawk_core::ruleset::Editor::new(tailhawk_core::rules::FILE_NAME, mine.default);
         self.rules_editor.open();
     }
 
@@ -7455,9 +7490,9 @@ impl Shell {
             self.say("rules closed unsaved — Ctrl+K, Ctrl+S to save".to_owned());
         }
         self.rules_editor.close();
-        let specs = self.rule_specs.clone();
+        let specs = self.rule_files.clone();
         for (_, doc) in self.document.all_mut() {
-            rebuild_highlighter_with(doc, &specs);
+            rebuild_highlighter_from(doc, &specs);
         }
     }
 
@@ -7474,7 +7509,11 @@ impl Shell {
         }
         // §10: a read-only profile is a state, not an impossibility. Say so rather than let the
         // title go on claiming the set is unsaved with no reason given.
-        if let Err(e) = std::fs::write(&target, self.rules_editor.to_toml()) {
+        let personal = tailhawk_core::rules::File {
+            default: self.rules_editor.specs().to_vec(),
+            sets: self.rules_personal_sets.clone(),
+        };
+        if let Err(e) = std::fs::write(&target, tailhawk_core::rules::to_toml_file(&personal)) {
             // **Name the file and give the remedy.** `std::io::Error`'s text on Windows is "Access
             // is denied. (os error 5)", which says nothing about *which* file or what to do; §10
             // treats a read-only profile as a state rather than an impossibility, and a state is
@@ -7486,23 +7525,28 @@ impl Shell {
             return;
         }
         self.rules_editor.mark_saved();
-        let (specs, failed) = load_rule_specs(&self.rules_tiers);
-        self.rule_specs = specs;
+        let (specs, failed) = load_rule_files(&self.rules_tiers);
+        self.rule_files = specs;
         self.rules_failed = failed;
         self.retitle(hwnd);
     }
 
     /// §6.1's choices: take a format, drop back to plain text, or open one of the wizard's doors.
     fn run_format_action(&mut self, action: FormatAction) {
+        // **A set bound to a format follows the format**, so the rules are resolved again the
+        // moment the document's format changes, as they are when the rules file does.
+        let files = self.rule_files.clone();
         match action {
             FormatAction::Adopt(format) => {
                 if let Some(doc) = self.document.as_mut() {
                     doc.adopt_format(format);
+                    rebuild_highlighter_from(doc, &files);
                 }
             }
             FormatAction::PlainText => {
                 if let Some(doc) = self.document.as_mut() {
                     doc.show_as_written();
+                    rebuild_highlighter_from(doc, &files);
                 }
             }
             FormatAction::Define => self.open_wizard(),
@@ -7633,8 +7677,10 @@ impl Shell {
             ));
             return;
         }
+        let files = self.rule_files.clone();
         if let Some(doc) = self.document.as_mut() {
             doc.adopt_format(format);
+            rebuild_highlighter_from(doc, &files);
         }
         self.wizard = None;
         self.say(format!("format saved to {}", target.display()));
@@ -9747,27 +9793,18 @@ mod uia {
     }
 }
 
-/// The user's rules from every tier, and the failures by name.
-fn load_rule_specs(tiers: &[PathBuf]) -> (Vec<tailhawk_core::rules::Spec>, Vec<String>) {
-    let mut specs = Vec::new();
-    let mut failed = Vec::new();
-    for path in tiers {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for spec in tailhawk_core::rules::parse(&text) {
-            match spec.compile() {
-                Ok(_) => specs.push(spec),
-                Err(why) => failed.push(why),
-            }
-        }
-    }
-    (specs, failed)
+/// The user's rules files from every tier, exe-adjacent first, and the failures by name.
+fn load_rule_files(tiers: &[PathBuf]) -> (Vec<tailhawk_core::rules::File>, Vec<String>) {
+    tailhawk_core::rules::load_files(tiers)
 }
 
-/// The catalogue, then the user's rules in front of it, then the document's labels in front of
-/// those — the precedence §7.1 gives them, rebuilt from the specs so nothing needs to be cloned.
-fn rebuild_highlighter_with(doc: &mut Document, specs: &[tailhawk_core::rules::Spec]) {
+/// The catalogue, then the rules this document gets in front of it — the sets bound to its path
+/// or its format, then every tier's Default set, as `rules::for_document` orders them — then the
+/// document's labels in front of those: the precedence §7.1 gives them.
+fn rebuild_highlighter_from(doc: &mut Document, files: &[tailhawk_core::rules::File]) {
+    let key = doc.state_key();
+    let format = doc.detection.accepted.map(|f| f.name);
+    let specs = tailhawk_core::rules::for_document(files, key.as_deref(), format);
     let mut set = semantic::catalogue();
     for spec in specs.iter().rev() {
         if let Ok(rule) = spec.compile() {
@@ -14584,7 +14621,7 @@ fn main() -> Result<()> {
         exe_dir.as_deref(),
         roaming.as_deref(),
     ));
-    let (rule_specs, rules_failed) = load_rule_specs(&rules_tiers);
+    let (rule_files, rules_failed) = load_rule_files(&rules_tiers);
     // §6.5: the wizard's definitions, from the same tiers again. Compiled once, here, so a format
     // defined in one session is detected in the next; a definition that no longer compiles is
     // dropped rather than allowed to stop the others being read.
@@ -14720,7 +14757,8 @@ fn main() -> Result<()> {
             wizard_found: Vec::new(),
             formats_tiers,
             rules_fixed: Vec::new(),
-            rule_specs,
+            rules_personal_sets: Vec::new(),
+            rule_files,
             rules_tiers,
             rules_failed,
             frames: Frames::new(),
@@ -18605,8 +18643,13 @@ mod tests {
             "[[rule]]\nname = \"jobs\"\npattern = \"job \\d+\"\nfg = \"#ffd166\"\n\n[[rule]]\nname = \"retry lines\"\npattern = \"Retrying\"\nbg = \"#1e3a2f\"\nwhole_line = true\n\n[[rule]]\nname = \"broken\"\npattern = \"(\"\nfg = \"#fff\"\n",
         )
         .expect("write");
-        let (specs, failed) = load_rule_specs(std::slice::from_ref(&rules));
-        assert_eq!(specs.len(), 2);
+        let (specs, failed) = load_rule_files(std::slice::from_ref(&rules));
+        assert_eq!(specs.len(), 1, "one tier, one file");
+        assert_eq!(
+            specs[0].default.len(),
+            3,
+            "the broken rule stays in the file"
+        );
         assert_eq!(failed.len(), 1);
         assert!(failed[0].starts_with("broken:"));
 
@@ -18618,7 +18661,7 @@ mod tests {
         .expect("write");
         let mut doc = Document::open(&path).expect("open");
         doc.lay_out((8.0, 10.0), (800, 200));
-        rebuild_highlighter_with(&mut doc, &specs);
+        rebuild_highlighter_from(&mut doc, &specs);
         let names: Vec<_> = doc
             .highlighter
             .set()
@@ -19641,9 +19684,9 @@ mod tests {
                     doc.selection = Some(Selection::at(Position::new(row, 0)));
                 }
                 "rules" => {
-                    let (specs, failed) = load_rule_specs(&[PathBuf::from(arg)]);
+                    let (specs, failed) = load_rule_files(&[PathBuf::from(arg)]);
                     assert!(failed.is_empty(), "{failed:?}");
-                    rebuild_highlighter_with(&mut doc, &specs);
+                    rebuild_highlighter_from(&mut doc, &specs);
                 }
                 "order" => {
                     let (from, to) = arg.split_once(':').expect("order:<from>:<to>");
@@ -20396,6 +20439,7 @@ mod tests {
         tailhawk_core::rules::Spec {
             name: name.to_owned(),
             pattern: pattern.to_owned(),
+            where_: None,
             fg: Some([1.0, 0.4, 0.4, 1.0]),
             bg: None,
             whole_line: false,
@@ -20547,9 +20591,88 @@ mod tests {
         assert!(close[1].label.contains("log4net"));
     }
 
+    /// The owner, 2026-10-28: named sets applied to a file or a file type; and the firewall
+    /// workstream's rule on an attribute. A set bound to the document's format colours its rows
+    /// by the record; a set bound to another format does not apply; the Default set applies to
+    /// everything.
+    #[test]
+    fn a_set_bound_to_the_documents_format_colours_its_rows_by_the_record() {
+        let dir = std::env::temp_dir().join("tailhawk_bound_sets_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let rules = dir.join("tailhawk.rules.toml");
+        std::fs::write(
+            &rules,
+            "[[rule]]\nname = \"every line\"\npattern = \"line\"\nfg = \"#ffd166\"\n\n\
+             [[set]]\nname = \"json\"\napply_to = [\"format:JSON lines\"]\n\
+             [[set.rule]]\nname = \"oversize\"\nwhere = \"status = 413\"\nbg = \"#ff0000\"\n\n\
+             [[set]]\nname = \"elsewhere\"\napply_to = [\"format:Serilog\", \"*.edge.log\"]\n\
+             [[set.rule]]\nname = \"never here\"\nwhere = \"status = 413\"\nbg = \"#00ff00\"\n",
+        )
+        .expect("write");
+        let (files, failed) = load_rule_files(std::slice::from_ref(&rules));
+        assert!(failed.is_empty(), "{failed:?}");
+
+        let path = dir.join("in.log");
+        let mut text = String::new();
+        for i in 0..30 {
+            // A number, as a plain JSON log writes it — so not a column, and only in reach of
+            // a rule because every key of the record is.
+            let status = if i == 5 { 413 } else { 200 };
+            text.push_str(&format!(
+                "{{\"level\":\"info\",\"status\":{status},\"msg\":\"line {i}\"}}\n"
+            ));
+        }
+        std::fs::write(&path, text).expect("write");
+        let mut doc = Document::open(&path).expect("open");
+        doc.lay_out((8.0, 10.0), (800, 200));
+        doc.view.grid_mut().scroll_to_row(0);
+        doc.lay_out((8.0, 10.0), (800, 200));
+        assert_eq!(doc.detection.accepted.map(|f| f.name), Some("JSON lines"));
+        rebuild_highlighter_from(&mut doc, &files);
+        let names: Vec<_> = doc
+            .highlighter
+            .set()
+            .rules
+            .iter()
+            .map(|r| r.name.as_str())
+            .take(2)
+            .collect();
+        assert_eq!(
+            names,
+            ["oversize", "every line"],
+            "the bound set's rule, then the Default set's, above the catalogue"
+        );
+        assert!(doc.highlighter.needs_records());
+
+        let red = tailhawk_core::rules::colour("#ff0000");
+        let green = tailhawk_core::rules::colour("#00ff00");
+        let mut out = Vec::new();
+        doc.highlighter.begin_frame();
+        doc.row_spans(5, &mut out);
+        assert!(
+            out.iter().any(|s| s.bg == red && s.start == 0),
+            "the 413 row is tinted by its status attribute: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|s| s.bg == green),
+            "the set bound to another format does not apply"
+        );
+        doc.row_spans(4, &mut out);
+        assert!(
+            !out.iter().any(|s| s.bg == red),
+            "a 200 row is not: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|s| s.fg == tailhawk_core::rules::colour("#ffd166")),
+            "and the Default set's rule applies everywhere"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn editing_the_personal_tier_does_not_duplicate_the_curated_one() {
-        // `load_rule_specs` merges every tier. If the editor held the merged set and wrote it
+        // `load_rule_files` merges every tier. If the editor held the merged set and wrote it
         // back to the personal file, the exe-adjacent rules would be written into it too and
         // reload twice — growing on every save, and resurrecting anything deleted.
         let dir = std::env::temp_dir().join("tailhawk_rules_tiers");
@@ -20568,34 +20691,59 @@ mod tests {
         .expect("write the personal tier");
         let tiers = vec![curated.clone(), personal.clone()];
 
-        let merged = load_rule_specs(&tiers).0;
+        let merged = load_rule_files(&tiers).0;
         assert_eq!(merged.len(), 2, "both tiers are in force");
 
         let (mine, fixed) = match tiers.split_last() {
             Some((last, earlier)) => (
-                load_rule_specs(std::slice::from_ref(last)).0,
-                load_rule_specs(earlier).0,
+                load_rule_files(std::slice::from_ref(last))
+                    .0
+                    .pop()
+                    .expect("the personal tier"),
+                load_rule_files(earlier).0,
             ),
             None => unreachable!("two tiers"),
         };
-        assert_eq!(mine.len(), 1, "the editor gets only what it can write");
-        assert_eq!(mine[0].name, "mine");
+        assert_eq!(
+            mine.default.len(),
+            1,
+            "the editor gets only what it can write"
+        );
+        assert_eq!(mine.default[0].name, "mine");
         assert_eq!(
             fixed.len(),
             1,
             "and the curated rule stays out of its hands"
         );
 
-        let editor = tailhawk_core::ruleset::Editor::new("tailhawk.rules.toml", mine);
-        std::fs::write(&personal, editor.to_toml()).expect("save");
-        let reloaded = load_rule_specs(&tiers).0;
+        // The personal tier's own sets are not the editor's either, and a save keeps them.
+        let with_set = format!(
+            "{}\n[[set]]\nname = \"edge\"\napply_to = [\"*.edge.log\"]\n[[set.rule]]\nname = \"edge rule\"\npattern = \"x\"\nfg = \"#fff\"\n",
+            std::fs::read_to_string(&personal).expect("read")
+        );
+        std::fs::write(&personal, with_set).expect("write the set");
+        let mine = load_rule_files(std::slice::from_ref(&personal))
+            .0
+            .pop()
+            .expect("the personal tier");
+        assert_eq!(mine.sets.len(), 1);
+        let editor = tailhawk_core::ruleset::Editor::new("tailhawk.rules.toml", mine.default);
+        let saved = tailhawk_core::rules::File {
+            default: editor.specs().to_vec(),
+            sets: mine.sets,
+        };
+        std::fs::write(&personal, tailhawk_core::rules::to_toml_file(&saved)).expect("save");
+        let reloaded = load_rule_files(&tiers).0;
         assert_eq!(
             reloaded.len(),
             2,
-            "a save-and-reload round trip leaves the same two rules, not three"
+            "a save-and-reload round trip leaves the same two tiers"
         );
-        assert_eq!(reloaded[0].name, "curated");
-        assert_eq!(reloaded[1].name, "mine");
+        assert_eq!(reloaded[0].default[0].name, "curated");
+        assert_eq!(reloaded[1].default.len(), 1, "one Default rule, not two");
+        assert_eq!(reloaded[1].default[0].name, "mine");
+        assert_eq!(reloaded[1].sets.len(), 1, "and the set survives the save");
+        assert_eq!(reloaded[1].sets[0].name, "edge");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

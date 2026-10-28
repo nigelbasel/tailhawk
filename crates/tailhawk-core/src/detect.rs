@@ -336,6 +336,28 @@ pub fn json_fields(line: &str, wanted: &[&str]) -> Option<Vec<Option<core::ops::
     .then_some(fields)
 }
 
+/// Where one key's value sits in the line, and what kind of value it is.
+pub type JsonValueAt = (core::ops::Range<usize>, JsonValue);
+
+/// [`json_fields`] for strings **and** scalars: the bytes of each of `wanted`'s values and what
+/// kind it is — inside the quotes for a string, the whole token for a number, `true`, `false`
+/// or `null` — and `None` for a key the line does not carry or carries as an object or array.
+/// What a highlight rule's `where` is judged on, where a column can only ever show a string.
+pub fn json_values(line: &str, wanted: &[&str]) -> Option<Vec<Option<JsonValueAt>>> {
+    let mut values: Vec<Option<JsonValueAt>> = vec![None; wanted.len()];
+    json_walk(line, |name, value, range| {
+        if value == JsonValue::Nested {
+            return;
+        }
+        for (i, key) in wanted.iter().enumerate() {
+            if *key == name && values[i].is_none() {
+                values[i] = Some((range.clone(), value));
+            }
+        }
+    })
+    .then_some(values)
+}
+
 /// The walk under [`json_keys`] and [`json_fields`]: `each` is told every top-level key, what
 /// kind of value it carries, and where the value's bytes are — inside the quotes for a string,
 /// the whole token otherwise. `false` when the line is not a complete object, in which case what

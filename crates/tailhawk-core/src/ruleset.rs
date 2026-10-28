@@ -325,6 +325,7 @@ impl Editor {
         let spec = Spec {
             name: String::new(),
             pattern: String::new(),
+            where_: None,
             fg: Some(NEW_RULE_FG),
             bg: None,
             whole_line: false,
@@ -386,9 +387,10 @@ impl Editor {
 }
 
 /// The keys a `[[rule]]` may carry. Anything else is refused rather than ignored, per §13.1.
-const KNOWN: [&str; 8] = [
+const KNOWN: [&str; 9] = [
     "name",
     "pattern",
+    "where",
     "fg",
     "bg",
     "whole_line",
@@ -470,6 +472,7 @@ pub fn import(text: &str) -> Result<Vec<Spec>, String> {
         match key {
             "name" => spec.name = text,
             "pattern" => spec.pattern = text,
+            "where" => spec.where_ = Some(text),
             "fg" => spec.fg = Some(hex_value(&text, raw_value, at, key)?),
             "bg" => spec.bg = Some(hex_value(&text, raw_value, at, key)?),
             "whole_line" => spec.whole_line = boolean(value, at, key)?,
@@ -535,6 +538,7 @@ mod tests {
             enabled: true,
             case_insensitive: true,
             literal: false,
+            where_: None,
         }
     }
 
