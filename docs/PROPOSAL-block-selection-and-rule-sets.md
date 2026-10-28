@@ -234,6 +234,49 @@ change the rules file's schema once.
 
 ---
 
+## 4. A filter helper: pick a column, an operator, a value; build a regex
+
+The owner, 2026-10-28: *"It would also be good to have some sort of filter helper in the dialog to
+easily pick columns and select operators and possibly values and build regexes."*
+
+### What exists
+
+The Filters dialog's **Edit…** (and a column header's *Filter on this column…*) opens the
+composer, `dialog::show_filter_dialog` over `FilterEdit`: an Include/Exclude pair, a **scope**
+combo of every column the format has (hidden ones included, the owner's rule of 2026-09-22, plus
+the model's own `level`, `timestamp`, `body`, `source`, `trace`, `span`), a **Match** combo of ten
+operators (contains, equals, is not, <, ≤, >, ≥, like, starts with, ends with), a value field,
+*Regular expression* and *Match case* for the whole-record case, and the expression itself always
+visible and editable, validated live by the parser that will run it. `compose_filter` turns the
+choices into §7.2 text — `contains(status, "413")`, `level >= warning` — so nothing the helper
+writes is a second language.
+
+### What is missing, and the recommendation
+
+- **Values to pick from.** The value field is a plain edit. Make it an editable combo whose list
+  is the distinct values the chosen column carries in the rows on screen and the head sample —
+  the walk the column chooser and the `where` rules already make — most frequent first, with the
+  count beside each (`403 (212)`). Typing still works; picking is one click. Opened from a cell's
+  context menu the value is pre-filled with the cell's.
+- **One of.** An operator *is one of*, writing `status in ["403", "444"]`, with the value list
+  multi-select while it is chosen. The grammar has `in`; the composer does not offer it.
+- **Empty / not empty**, as *is empty* → `column = ""` and *is not empty* → `column != ""`,
+  because "rows with no trace" is a daily question with no button.
+- **A regex builder** on the whole-record case, shown when *Regular expression* is ticked: a
+  short list of templates that write the pattern and leave it editable — *any of these words*
+  (`\b(a|b|c)\b` from a comma list), *starts with* / *ends with* (`^…`, `…$`), *a status in a
+  range* (`\b(4\d\d|5\d\d)\b` from `4xx, 5xx`), *an IPv4 address*, *a GUID*, *a timestamp* — and
+  a **Quote this text** button that escapes the metacharacters of what was typed, which is the
+  mistake a hand-written regex over a path or a URL makes most. The expression line shows the
+  result and the parser's verdict as it does now.
+- **What not to do.** No wizard with pages; no second expression language; no hiding the text.
+  The helper only ever writes the expression the reader could have typed.
+
+**Order of work.** Values and *one of* first (the daily win, and the value walk exists); empty /
+not empty with them; the regex templates second. Small to medium.
+
+---
+
 ## Order between the three
 
 Block selection first: it is a day's shell work on a finished core, it needs no file format, and

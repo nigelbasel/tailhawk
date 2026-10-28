@@ -84,9 +84,10 @@ oversight: Tailhawk opens files read-only and nothing in it edits a log.
 
 **Every filter lives in one dialog**, and every way of asking for one opens it: `Ctrl+L`,
 `Ctrl+Shift+L`, the toolbar's **Filter** button, **Edit ▸ Filter: include**, **Edit ▸ Filter:
-exclude** and **Edit ▸ All filters…**. The first five arrive with an empty row already waiting and
-the caret in the phrase box, so adding a filter is still one gesture; the last opens on what is
-already in force. A row nobody types into is not a filter and is not added.
+exclude** and **Edit ▸ All filters…**. The first five arrive with the caret in an empty phrase box
+and nothing selected, so adding a filter is still one gesture: the row appears in the list with
+the first letter typed, carrying the polarity the command named, and nothing typed is nothing
+added. The last opens on what is already in force.
 
 Across the top is the selected filter: its **phrase**, whether it is **enabled**, whether it is a
 **regular expression**, whether **case** matters, and whether it **includes** or **excludes**. The
@@ -111,11 +112,12 @@ whose spill keeps the most recent 512 MB and deletes older parts. For a single o
 that file's length, less a byte-order mark if it has one, and up to 4 MB behind a writer the follow
 pass is still catching up with.
 
-Down the right: **New**, **Remove**, **Remove all**, **Up** and **Down** (order is display order —
-it does not change which lines survive), and **Edit…**, which opens the composer described below on
-the selected row. Under the list, **Enable all include**, **Enable all exclude**, **Disable all
-include** and **Disable all exclude** act on one polarity at a time, so every excluding filter can
-be turned off to see what it was hiding and turned back on afterwards.
+The **…** button at the end of the phrase box opens the composer described below on the selected
+row. Down the right, under **Selected filter**: **Remove**, **Up** and **Down** (order is display
+order — it does not change which lines survive). Under the list, under **All filters**: **New**,
+**Remove all**, and **Enable all include**, **Enable all exclude**, **Disable all include** and
+**Disable all exclude**, which act on one polarity at a time, so every excluding filter can be
+turned off to see what it was hiding and turned back on afterwards.
 
 **Apply** shows the effect without closing the dialog; **OK** applies and closes; **Cancel** closes
 without applying what is on screen. **Apply is a commit**, as it is everywhere in Windows: filters

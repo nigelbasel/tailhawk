@@ -237,7 +237,7 @@ const ID_V_OFF_EXCLUDE: u16 = 268;
 
 /// The Filters dialog's own grid, in dialog units.
 const V_DIALOG_W: i16 = 420;
-const V_DIALOG_H: i16 = 233;
+const V_DIALOG_H: i16 = 259;
 const V_LEFT: i16 = 7;
 const V_FIELD_X: i16 = 61;
 const V_LIST_W: i16 = 300;
@@ -4096,6 +4096,9 @@ fn filters_dialog_items() -> Vec<Item> {
     let bulk = |text: &str, id: u16, x: i16, y: i16| {
         Item::new(Class::Button, text, id, (x, y, V_BULK_W, 14), WS_TABSTOP)
     };
+    // A heading over a group of buttons: a static, so the dialog's own ink colours it.
+    let heading =
+        |text: &str, x: i16, y: i16| Item::new(Class::Static, text, 0xFFFF, (x, y, 100, 8), 0);
     vec![
         Item::new(
             Class::Static,
@@ -4108,8 +4111,21 @@ fn filters_dialog_items() -> Vec<Item> {
             Class::Edit,
             "",
             ID_V_TEXT,
-            (V_FIELD_X, 7, V_LEFT + V_LIST_W - V_FIELD_X, 12),
+            (V_FIELD_X, 7, V_LEFT + V_LIST_W - V_FIELD_X - 16, 12),
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        ),
+        // **The expression builder, at the end of the expression it edits.** The phrase box
+        // holds the expression as text, which is enough to change a word and no help at all in
+        // writing `level >= Warning` against a column whose spelling differs from its heading;
+        // the door to the builder used to be the last button of the right-hand column, which the
+        // owner found "not associated with the small edit box". A `…` beside a field is how
+        // Windows says a chooser opens for it.
+        Item::new(
+            Class::Button,
+            "…",
+            ID_V_EDIT,
+            (V_LEFT + V_LIST_W - 14, 7, 14, 12),
+            WS_TABSTOP,
         ),
         option("E&nable", ID_V_ENABLED, V_LEFT, 35),
         option("&Match case", ID_V_CASE, 48, 51),
@@ -4135,15 +4151,23 @@ fn filters_dialog_items() -> Vec<Item> {
             (V_LEFT, 42, V_LIST_W, 126),
             WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         ),
-        bulk("Ena&ble all include", ID_V_ON_INCLUDE, V_LEFT, 173),
-        bulk("Enabl&e all exclude", ID_V_ON_EXCLUDE, 159, 173),
-        bulk("Disab&le all include", ID_V_OFF_INCLUDE, V_LEFT, 190),
-        bulk("Disable all ex&clude", ID_V_OFF_EXCLUDE, 159, 190),
+        // **Two groups, each under a heading that names what its buttons act on** — the owner,
+        // 2026-10-28: "some buttons operate on the list, and some on the selected filter; it
+        // should be obvious what each button is associated with." The selected filter's verbs
+        // stand in the right-hand column beside the row they act on; the whole list's stand
+        // under the list, New and Remove all with the four that turn a polarity on or off.
+        heading("All filters", V_LEFT, 172),
+        bulk("Ne&w", ID_V_ADD, V_LEFT, 182),
+        bulk("Remove &all", ID_V_REMOVE_ALL, 159, 182),
+        bulk("Ena&ble all include", ID_V_ON_INCLUDE, V_LEFT, 199),
+        bulk("Enabl&e all exclude", ID_V_ON_EXCLUDE, 159, 199),
+        bulk("Disab&le all include", ID_V_OFF_INCLUDE, V_LEFT, 216),
+        bulk("Disable all ex&clude", ID_V_OFF_EXCLUDE, 159, 216),
         Item::new(
             Class::Static,
             "",
             ID_V_FAULT,
-            (V_LEFT, 210, V_LIST_W, 16),
+            (V_LEFT, 236, V_LIST_W, 16),
             0,
         ),
         Item::new(
@@ -4161,15 +4185,10 @@ fn filters_dialog_items() -> Vec<Item> {
             WS_TABSTOP,
         ),
         verb("A&pply", ID_V_APPLY, 41),
-        verb("Ne&w", ID_V_ADD, 65),
-        verb("&Remove", ID_V_REMOVE, 82),
-        verb("Remove &all", ID_V_REMOVE_ALL, 99),
-        verb("&Up", ID_V_UP, 123),
-        verb("&Down", ID_V_DOWN, 140),
-        // **The expression builder, on the row the list has selected.** The phrase box holds the
-        // expression as text, which is enough to change a word and no help at all in writing
-        // `level >= Warning` against a column whose spelling differs from its heading.
-        verb("Edi&t…", ID_V_EDIT, 164),
+        heading("Selected filter", V_VERB_X, 66),
+        verb("&Remove", ID_V_REMOVE, 76),
+        verb("&Up", ID_V_UP, 93),
+        verb("&Down", ID_V_DOWN, 110),
     ]
 }
 
