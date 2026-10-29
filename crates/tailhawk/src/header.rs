@@ -98,6 +98,10 @@ pub unsafe fn custom_draw(lparam: LPARAM, ink: u32) -> Option<isize> {
         return None;
     }
     let draw = unsafe { &*(lparam.0 as *const NMCUSTOMDRAW) };
+    trace(&format!(
+        "header.custom_draw stage={:#x} item={} state={:#x} ink={ink:#08x}",
+        draw.dwDrawStage.0, draw.dwItemSpec, draw.uItemState.0
+    ));
     match draw.dwDrawStage {
         CDDS_PREPAINT => Some(CDRF_NOTIFYITEMDRAW),
         CDDS_ITEMPREPAINT => {
@@ -108,6 +112,27 @@ pub unsafe fn custom_draw(lparam: LPARAM, ink: u32) -> Option<isize> {
         }
         _ => Some(CDRF_DODEFAULT),
     }
+}
+
+/// Whether a `WM_NOTIFY` is a header's `NM_CUSTOMDRAW`, which the window procedure answers
+/// **before its re-entry guard**.
+///
+/// **A modal dialog runs its loop inside the handler that opened it**, and for as long as it is
+/// up every message to the main window arrives nested and goes to `DefWindowProcW` — the guard
+/// that keeps a second borrow of the shell's state from happening. The header repaints under the
+/// dialog all the same, asks its parent for the ink, hears nothing, and draws its titles in the
+/// dark theme's black: the owner's *"the column headers all go black until I hover over them"*,
+/// twice. The answer reads only the theme and borrows nothing, so it is the one notification
+/// that is safe to answer nested, and this says which one it is.
+pub fn answers_nested(id_from: usize, code: u32) -> bool {
+    is_header(id_from) && code == NM_CUSTOMDRAW
+}
+
+/// Whether a notification's `idFrom` is one of the header controls, which answer as
+/// `ID_HEADER_BASE + pane`.
+pub fn is_header(id_from: usize) -> bool {
+    let pane = id_from as i64 - ID_HEADER_BASE as i64;
+    (0..MAX_HEADERS as i64).contains(&pane)
 }
 
 /// The theme's header ink as a `COLORREF` — `0x00BBGGRR`, which is the byte order GDI wants and
@@ -547,6 +572,27 @@ unsafe impl Send for Header {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one notification answered under a dialog is a header's custom draw, for every pane
+    /// slot the headers can occupy — not another control's custom draw, and not a header's
+    /// other notifications, which do borrow the shell's state.
+    #[test]
+    fn only_a_headers_custom_draw_is_answered_nested() {
+        use windows::Win32::UI::Controls::HDN_ITEMCHANGINGW;
+        for pane in 0..MAX_HEADERS {
+            assert!(
+                answers_nested(ID_HEADER_BASE as usize + pane as usize, NM_CUSTOMDRAW),
+                "pane {pane}"
+            );
+        }
+        assert!(!answers_nested(
+            ID_HEADER_BASE as usize + MAX_HEADERS as usize,
+            NM_CUSTOMDRAW
+        ));
+        assert!(!answers_nested(ID_HEADER_BASE as usize - 1, NM_CUSTOMDRAW));
+        assert!(!answers_nested(ID_HEADER_BASE as usize, HDN_ITEMCHANGINGW));
+        assert!(!answers_nested(0, NM_CUSTOMDRAW));
+    }
 
     /// **A hidden column is why this is a read and not a subtraction.** The boxes skip what is
     /// hidden, so with column 1 hidden the second visible box still names column 2 — and a context

@@ -81,8 +81,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, GetSysColor, InvalidateRect, RedrawWindow, COLOR_HIGHLIGHT, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, RDW_ALLCHILDREN, RDW_INVALIDATE,
+    CreateSolidBrush, GetSysColor, InvalidateRect, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -12904,7 +12903,21 @@ thread_local! {
 /// straight to `DefWindowProcW`. Nothing this window handles needs to be handled *nested* — a
 /// nested `WM_PAINT` under a dialog is the class brush for a moment, a nested `WM_TIMER` is the
 /// next tick's — and anything that did would today be the crash this prevents.
+///
+/// **One exception**: a header's `NM_CUSTOMDRAW` is answered before the guard, because a modal
+/// dialog runs its loop inside the handler that opened it and the header repaints under it; with
+/// the guard in the way its titles came out in the dark theme's black until a hover — the owner's
+/// report, twice. The answer reads only the theme and borrows nothing; `header::answers_nested`
+/// says which notification it is.
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_NOTIFY && lparam.0 != 0 {
+        let notify = unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::NMHDR) };
+        if header::answers_nested(notify.idFrom, notify.code) {
+            if let Some(answer) = unsafe { header::custom_draw(lparam, header::header_ink()) } {
+                return LRESULT(answer);
+            }
+        }
+    }
     if IN_WNDPROC.with(|flag| flag.replace(true)) {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
@@ -13204,19 +13217,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // The system caret, for the clients that follow it rather than UI Automation's text
         // events: a one-pixel bar a row high, never shown — the painter rules the current row
         // itself — and moved after every frame by `uia::raise_selection_changes`.
-        windows::Win32::UI::WindowsAndMessaging::WM_NCACTIVATE
-        | windows::Win32::UI::WindowsAndMessaging::WM_ENABLE => {
-            let answered = def_proc(hwnd, msg, wparam, lparam);
-            // **A modal dialog deactivates and disables this window, and the composition it
-            // gets back shows the flip-model swapchain without the header control's last
-            // painting** — the owner's "the column headers all go black until I hover over
-            // them". The hover was the control painting itself again; this asks every child to,
-            // once the frame has answered. `tabstrip.rs` records the risk and the fallback.
-            unsafe {
-                let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
-            }
-            answered
-        }
         windows::Win32::UI::WindowsAndMessaging::WM_SETFOCUS => {
             let row_h = STATE
                 .with(|s| {
@@ -14058,18 +14058,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             // gestures go down the model paths the drawn band used — resize, reorder, sort — and
             // the control decides nothing: a width comes back in cells, rounded, and the control is
             // told the rounded width so it never shows a boundary the grid does not honour.
-            let pane = header.idFrom as i64 - header::ID_HEADER_BASE as i64;
-            if (0..header::MAX_HEADERS as i64).contains(&pane) {
-                // §2.5: the header draws its own titles, and the ink it uses is the device
-                // context's. The dark class darkens the band and leaves the text alone, so the
-                // colour is set here, at the stage the control asks about.
-                if header.code == header::NM_CUSTOMDRAW {
-                    if let Some(answer) =
-                        unsafe { header::custom_draw(lparam, header::header_ink()) }
-                    {
-                        return LRESULT(answer);
-                    }
-                }
+            if header::is_header(header.idFrom) {
+                header::trace(&format!(
+                    "header.notify code={} from={:?}",
+                    header.code as i32, header.hwndFrom.0
+                ));
                 let request = unsafe { header::request_from_notify(lparam) };
                 let from_control = header.hwndFrom;
                 if let Some(request) = request {

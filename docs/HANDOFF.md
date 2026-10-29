@@ -1,5 +1,37 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-29, latest: the column headers keep their ink while a dialog is up
+
+The owner, twice: *"the column headers all go all black until I hover over them"*, and after
+`58d15c2`, *"opening the filter dialog still blacks out the column headers"*. **Seen and measured
+on screen with his leave** (`tools`-style probe in the session scratchpad): the titles' light
+pixels fall from 294 to none the moment the Filters dialog opens, in every capture while it is
+up, and after it closes until a hover. A run under `TAILHAWK_ATLAS_LOG` showed no message the
+main window *handled* for the dialog's whole life.
+
+- **The cause was the window procedure's re-entry guard, not the swapchain and not a missed
+  repaint.** `wndproc` sends any message that arrives while a handler is running to
+  `DefWindowProcW`, so a second borrow of `STATE` cannot happen; a modal dialog runs its loop
+  inside the handler that opened it (`run_pending_dialogs`), so for as long as it is up the
+  header's `NM_CUSTOMDRAW` goes to the default handler and `SysHeader32` draws its titles in
+  the dark theme's black. The hover was the first paint after the guard cleared. `58d15c2`'s
+  redraw on `WM_NCACTIVATE` / `WM_ENABLE` sat behind the same guard and never ran under a
+  dialog; its rationale (the flip-model composition dropping the control's pixels) was wrong,
+  the arm is removed (it cost a full redraw on every activation change outside a dialog, for
+  nothing), and the resume point below that records it is superseded by this one.
+- **The fix**: `wndproc` answers the header's custom draw *before* the guard
+  (`header::answers_nested(id_from, code)`, pure and tested; `header::custom_draw` reads only
+  the theme). Verified by the same probe on the fixed build: no dark title pixel in any capture,
+  eight custom draws answered under the dialog.
+- **Diagnostics kept**: `custom_draw`, the `WM_NOTIFY` header arm and the activation arm trace
+  under `TAILHAWK_ATLAS_LOG`, which is what found this. The probe scripts live in the session
+  scratchpad, not the repo; `tools/shot-window.ps1` and `Dialog.ps1` are the pieces they reuse.
+- **Knowingly left**: every *other* message the main window would handle is still defaulted
+  under a modal dialog — a nested `WM_PAINT` is the class brush, a nested `WM_TIMER` is lost —
+  as the guard's own note says. Opening dialogs outside the handler (a posted message rather
+  than `run_pending_dialogs` inside it) would lift all of that at once and is the next thing to
+  consider if another symptom of it appears.
+
 ## ▶ Resume point — 2026-10-29, latest: the include filters match all or any
 
 The owner: *"currently they are all anded together, it would be good to be able to select either
