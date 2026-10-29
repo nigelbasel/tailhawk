@@ -418,6 +418,11 @@ pub struct StatusFacts<'a> {
     /// the collapse or a trace**, neither of which `Ctrl+L` can reach — it opens a dialog seeded
     /// from chips alone.
     pub chips: usize,
+    /// Whether the include chips combine under *any* rather than §7.2's *all* **and there is more
+    /// than one of them for it to matter** — `Chips::any_in_force`, the owner's choice of
+    /// 2026-10-29, which the pane names because a list that reads the same under both rules and
+    /// means something different is the one thing it must not become.
+    pub any: bool,
     /// Whether a filter pass is outstanding, so the survivors are still arriving.
     ///
     /// **Without this the bar cannot tell "kept nothing" from "has not looked yet"**, and the two
@@ -575,6 +580,14 @@ fn hiding_everything(facts: &StatusFacts<'_>) -> bool {
         && matches!(facts.filter, Some((0, total)) if total > 0)
 }
 
+/// The filter pane's count, naming the *any* rule when it is in force: `Filtered 12 of 1,192 ·
+/// any include filter`. The default rule gets no word, because it is what the pane has always
+/// meant.
+pub fn filter_words(kept: u64, total: &str, any: bool) -> String {
+    let rule = if any { " · any include filter" } else { "" };
+    format!("Filtered {} of {total}{rule}", with_separators(kept))
+}
+
 pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
     // **What just happened, then what is happening, then what is wrong — and all of them, not
     // whichever was checked first.** The composed sentence gave the notice and the rules warning
@@ -670,9 +683,7 @@ pub fn status_panes_of(facts: StatusFacts<'_>) -> StatusPanes {
 
     let filter = match (facts.filter_error, facts.filter) {
         (Some(why), _) => format!("▼ {why}"),
-        (None, Some((kept, total))) => {
-            format!("Filtered {} of {}", with_separators(kept), floor(total))
-        }
+        (None, Some((kept, total))) => filter_words(kept, &floor(total), facts.any),
         (None, None) => String::new(),
     };
 
@@ -1247,6 +1258,17 @@ mod tests {
             ..open()
         });
         assert_eq!(panes.message, "⇥ saving → out.log (12 lines)");
+    }
+
+    /// The owner, 2026-10-29: the filter pane says when the include chips combine under *any*,
+    /// and says nothing under the rule it has always meant.
+    #[test]
+    fn the_filter_pane_names_the_any_rule_and_only_that_rule() {
+        assert_eq!(filter_words(12, "1,192", false), "Filtered 12 of 1,192");
+        assert_eq!(
+            filter_words(12, "1,192", true),
+            "Filtered 12 of 1,192 · any include filter"
+        );
     }
 
     /// `UI-DESIGN.md` §2.1's active rule set, beside the format it is most often bound to.

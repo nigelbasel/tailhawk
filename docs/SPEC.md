@@ -1021,7 +1021,8 @@ It is defined here.
 filters* and *multiple composing text filters*. A single text box cannot express them, so the filter
 surface is a **row of chips**, each chip being one independent predicate object with its own
 include/exclude polarity (§UI-DESIGN 3.1). The grammar below is what a single chip contains; chips
-compose with implicit AND.
+compose with AND, or with OR under the Filters dialog's *any include filter* rule (Precedence,
+below).
 
 ```
 predicate  := bare_text | quoted | regex | comparison | membership | function
@@ -1053,8 +1054,11 @@ one source's column must not silently delete every row from the others.
 
 **Precedence and composition.** Within a chip: functions and comparisons bind tighter than `and`,
 which binds tighter than `or`; parentheses permitted. Across chips: include chips AND together, then
-exclude chips are subtracted (TextAnalysisTool's model). Order of chips is display order and does not
-affect the result.
+exclude chips are subtracted (TextAnalysisTool's model) — or, under the Filters dialog's *any include
+filter* rule (2026-10-29), any one include chip is enough and the exclude chips still subtract. The
+rule is one choice for the whole list, kept beside the chips (`filters = "any"`; absent is *all*), so
+no chip carries a conjunction of its own. Order of chips is display order and does not affect the
+result under either rule.
 
 **Provenance.** A chip created by UI-DESIGN §8's per-field *"filter for this value"* is a normal
 comparison chip and is editable as text — there is no hidden second representation.

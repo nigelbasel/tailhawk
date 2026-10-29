@@ -250,6 +250,7 @@ fn the_filter_worker_streams_survivors_from_a_snapshot_of_ten_gigabytes() {
             Chip::parse("/CANARY_[A-Z]+/", Polarity::Include).expect("chip"),
             Chip::parse("buried", Polarity::Exclude).expect("chip"),
         ],
+        combine: Default::default(),
     };
 
     let began = Instant::now();

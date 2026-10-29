@@ -299,7 +299,7 @@ reader to think: one row per thing to look for.
   go on subtracting whichever is chosen, because "hide retries" and "hide heartbeats" are never
   meant as "hide rows that are both". Stored beside the chips in the file's `[[file]]` table as
   `filters = "any"`, absent meaning *all*, so every settings file written so far reads as it did.
-  The status pane and the Filters dialog's title say which is in force (`3 filters, any`), because
+  The status pane says which is in force (`· any include filter` beside the count), because
   a list that reads the same under both rules and means something different is the one thing
   this must not become.
 - **A per-filter conjunction** — each row after the first carries *and* / *or* with the row above,

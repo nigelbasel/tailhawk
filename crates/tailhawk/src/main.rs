@@ -1475,6 +1475,7 @@ impl Document {
         Some(settings::FileState {
             path,
             chips,
+            any: self.filtering.chips.combine == tailhawk_core::filter::Combine::Any,
             collapse: self.filtering.records_only,
             bookmarks: self.bookmarks.iter().copied().collect(),
             labels: self
@@ -1503,6 +1504,11 @@ impl Document {
     /// Restores a remembered view: the chips and the collapse, then one pass. A chip that no
     /// longer parses is dropped quietly — the file is being opened, not edited.
     fn apply_state(&mut self, state: &settings::FileState) {
+        self.filtering.chips.combine = if state.any {
+            tailhawk_core::filter::Combine::Any
+        } else {
+            tailhawk_core::filter::Combine::All
+        };
         for text in &state.chips {
             let (polarity, enabled, body) = chip_read(text);
             if let Ok(mut chip) = Chip::parse(body, polarity) {
@@ -5500,6 +5506,7 @@ impl Shell {
                         document.apply_state(&settings::FileState {
                             path: String::new(),
                             chips: self.initial_chips.clone(),
+                            any: false,
                             collapse: false,
                             bookmarks: Vec::new(),
                             labels: Vec::new(),
@@ -5902,6 +5909,7 @@ impl Shell {
             (shown, layout.widths.len())
         });
         f(statusbar::StatusFacts {
+            any: doc.filtering.chips.any_in_force(),
             notice: shell.notice,
             waiting: shell.waiting,
             rules: shell.rules,
@@ -16608,12 +16616,19 @@ mod tests {
         doc.lay_out((8.0, 10.0), (800, 200));
         filter_for(&mut doc, "line", Polarity::Include);
         assert_eq!(doc.filtering.chips.chips.len(), 1);
+        doc.filtering.chips.combine = tailhawk_core::filter::Combine::Any;
 
         let saved = doc.file_state().expect("a path to key by");
+        assert!(saved.any, "the rule is written beside the chips");
 
         let mut again = Document::open(&path).expect("reopen");
         again.lay_out((8.0, 10.0), (800, 200));
         again.apply_state(&saved);
+        assert_eq!(
+            again.filtering.chips.combine,
+            tailhawk_core::filter::Combine::Any,
+            "and the rule came back with them"
+        );
         assert_eq!(
             again.filtering.chips.chips.len(),
             1,

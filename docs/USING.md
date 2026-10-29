@@ -123,7 +123,12 @@ turned off to see what it was hiding and turned back on afterwards.
 without applying what is on screen. **Apply is a commit**, as it is everywhere in Windows: filters
 already applied stay in force, and Cancel does not take them back.
 
-Including filters AND together, and then excluding filters are subtracted.
+Including filters AND together, and then excluding filters are subtracted — unless **Rows must
+match: any include filter** is chosen under the list, in which case one including filter is enough
+and the excluding filters still subtract. It is one rule for the whole list, remembered with the
+filters for that file, and the status bar says `· any include filter` beside the count while it
+is in force. A row that needs *and* and *or* together is one filter with both words in it:
+`status = 500 or status = 502` has always been writable in the expression line.
 
 **Match case** and **Regular expression** are readings of the filter's own text rather than
 settings stored beside it — the text is always the filter. Ticking **Regular expression** puts the

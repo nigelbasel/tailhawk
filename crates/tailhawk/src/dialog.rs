@@ -236,10 +236,12 @@ const ID_V_ON_INCLUDE: u16 = 265;
 const ID_V_ON_EXCLUDE: u16 = 266;
 const ID_V_OFF_INCLUDE: u16 = 267;
 const ID_V_OFF_EXCLUDE: u16 = 268;
+const ID_V_ALL: u16 = 269;
+const ID_V_ANY: u16 = 270;
 
 /// The Filters dialog's own grid, in dialog units.
 const V_DIALOG_W: i16 = 420;
-const V_DIALOG_H: i16 = 259;
+const V_DIALOG_H: i16 = 276;
 const V_LEFT: i16 = 7;
 const V_FIELD_X: i16 = 61;
 const V_LIST_W: i16 = 300;
@@ -4325,12 +4327,37 @@ fn filters_dialog_items() -> Vec<Item> {
         bulk("Enabl&e all exclude", ID_V_ON_EXCLUDE, 159, 199),
         bulk("Disab&le all include", ID_V_OFF_INCLUDE, V_LEFT, 216),
         bulk("Disable all ex&clude", ID_V_OFF_EXCLUDE, 159, 216),
+        // **The rule the include filters combine under, as one choice for the whole list** —
+        // the owner, 2026-10-29: "currently they are all anded together, it would be good to be
+        // able to select either and or or." Explorer's search and Outlook's rules put it the
+        // same way; the excludes subtract under either.
+        Item::new(
+            Class::Static,
+            "Rows must match:",
+            0xFFFF,
+            (V_LEFT, 237, 64, 8),
+            0,
+        ),
+        Item::new(
+            Class::Button,
+            "all include fil&ters",
+            ID_V_ALL,
+            (73, 235, 84, 10),
+            WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON,
+        ),
+        Item::new(
+            Class::Button,
+            "an&y include filter",
+            ID_V_ANY,
+            (165, 235, 84, 10),
+            BS_AUTORADIOBUTTON,
+        ),
         Item::new(
             Class::Static,
             "",
             ID_V_FAULT,
-            (V_LEFT, 236, V_LIST_W, 16),
-            0,
+            (V_LEFT, 253, V_LIST_W, 16),
+            WS_GROUP,
         ),
         Item::new(
             Class::Button,
@@ -4799,6 +4826,18 @@ unsafe extern "system" fn filters_proc(
                     crate::filters_write(|editor| editor.remove_all());
                     set_dlg_text(hdlg, ID_V_FAULT, "");
                     filters_refresh(hdlg, None);
+                    1
+                }
+                (ID_V_ALL | ID_V_ANY, _) => {
+                    filters_take_field(hdlg);
+                    let combine = if id == ID_V_ANY {
+                        tailhawk_core::filter::Combine::Any
+                    } else {
+                        tailhawk_core::filter::Combine::All
+                    };
+                    crate::filters_write(|editor| editor.set_combine(combine));
+                    let at = crate::filters_read(|e| e.selected()).flatten();
+                    filters_refresh(hdlg, at);
                     1
                 }
                 (ID_V_ON_INCLUDE | ID_V_ON_EXCLUDE | ID_V_OFF_INCLUDE | ID_V_OFF_EXCLUDE, _) => {
@@ -5274,7 +5313,8 @@ fn filters_fill_list(hdlg: HWND, keep: Option<usize>) {
 }
 
 /// Points the field, the polarity pair and the enabled box at the selected filter, greying them all
-/// when there is none — §10's empty state, one press of Remove away.
+/// when there is none — §10's empty state, one press of Remove away — and sets the all / any pair
+/// for the whole list, which is not a row's but is read from the same editor in the same pass.
 fn filters_show_selected(hdlg: HWND) {
     filters_quietly(|| filters_fill_selected(hdlg));
 }
@@ -5342,10 +5382,14 @@ fn filters_fill_selected(hdlg: HWND) {
     // whose write notifies, and the handler it reaches reads the others. In the other order — which
     // is how this was written — the re-entry read a radio pair still describing the row being left
     // and wrote that answer onto the row just selected.
+    let any = crate::filters_read(|e| e.combine()).unwrap_or_default()
+        == tailhawk_core::filter::Combine::Any;
     for (id, on) in [
         (ID_V_INCLUDE, include && typing),
         (ID_V_EXCLUDE, !include && typing),
         (ID_V_ENABLED, enabled && has),
+        (ID_V_ALL, !any),
+        (ID_V_ANY, any),
     ] {
         unsafe {
             SendDlgItemMessageW(
@@ -9498,10 +9542,19 @@ mod tests {
             (ID_V_REGEX, "say it is a regular expression"),
             (ID_V_ON_INCLUDE, "turn every include filter on"),
             (ID_V_ON_EXCLUDE, "turn every exclude filter on"),
+            (ID_V_ALL, "match every include filter"),
+            (ID_V_ANY, "match any include filter"),
             (ID_V_OFF_INCLUDE, "turn every include filter off"),
             (ID_V_OFF_EXCLUDE, "turn every exclude filter off"),
         ] {
             assert!(matches!(at(id).class, Class::Button), "no way to {what}");
+        }
+        const BS_AUTORADIOBUTTON: u32 = 0x0009;
+        for id in [ID_V_ALL, ID_V_ANY] {
+            assert!(
+                at(id).style & BS_AUTORADIOBUTTON != 0,
+                "the rule is a choice between two, not a button"
+            );
         }
 
         // §7.1 keeps a disabled filter's place *and* its text rather than dropping it, so "off"
@@ -9514,6 +9567,7 @@ mod tests {
                 chip("/drop/", Polarity::Exclude),
                 chip("level >= Warning", Polarity::Include),
             ],
+            combine: Default::default(),
         });
         let rows = filter_row_cells(&editor);
         assert_eq!(rows.len(), 3, "one row per filter");

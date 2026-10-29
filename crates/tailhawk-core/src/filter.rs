@@ -501,24 +501,47 @@ impl Chip {
     }
 }
 
+/// How the include chips combine: every one must hold, or any one is enough.
+///
+/// **The owner, 2026-10-29**: *"currently they are all anded together, it would be good to be
+/// able to select either and or or."* §7.2's rule — include chips AND together, then exclude
+/// chips are subtracted — is [`Combine::All`]; [`Combine::Any`] ORs the include chips instead.
+/// The excludes subtract under either, because "hide retries" and "hide heartbeats" are never
+/// meant as "hide rows that are both". One rule for the whole list rather than a conjunction on
+/// each row: `a and b or c` would need a precedence the list cannot show, and the promise that
+/// row order does not change the result would stop being true.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Combine {
+    #[default]
+    All,
+    Any,
+}
+
 /// A row of chips, composed as §7.2 specifies.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Chips {
     pub chips: Vec<Chip>,
+    pub combine: Combine,
 }
 
 impl Chips {
     /// Whether a record survives. §7.2: "include chips AND together, then exclude chips are
-    /// subtracted", and "order of chips is display order and does not affect the result".
+    /// subtracted", and "order of chips is display order and does not affect the result" — or,
+    /// under [`Combine::Any`], any one include chip is enough and the excludes still subtract.
     ///
-    /// **No chips means everything survives**, which is the unfiltered view and not an empty one.
+    /// **No chips means everything survives**, which is the unfiltered view and not an empty one;
+    /// and so does a list of excludes alone, under either rule. An *unknown* answer is not a
+    /// match under *any*, exactly as it is not under *all*.
     pub fn keeps(&self, record: &Record) -> bool {
         let mut any_include = false;
+        let mut one_held = false;
         for chip in self.chips.iter().filter(|c| c.enabled) {
             match chip.polarity {
                 Polarity::Include => {
                     any_include = true;
-                    if !chip.predicate.eval(record).acts() {
+                    if chip.predicate.eval(record).acts() {
+                        one_held = true;
+                    } else if self.combine == Combine::All {
                         return false;
                     }
                 }
@@ -529,8 +552,21 @@ impl Chips {
                 }
             }
         }
-        let _ = any_include;
-        true
+        !any_include || self.combine == Combine::All || one_held
+    }
+
+    /// Whether the *any* rule is doing anything: it is chosen, and more than one enabled include
+    /// chip is in force for it to choose between. The status pane names the rule on this answer
+    /// and not on the choice alone, because over one include chip, or over excludes only, the
+    /// list reads the same under both rules — which is the one state the word exists to prevent.
+    pub fn any_in_force(&self) -> bool {
+        self.combine == Combine::Any
+            && self
+                .chips
+                .iter()
+                .filter(|c| c.enabled && c.polarity == Polarity::Include)
+                .count()
+                > 1
     }
 }
 
@@ -562,6 +598,8 @@ pub struct Editor {
     /// A dialog opened to add, before anything is typed: the polarity the row typing makes will
     /// carry. Not a row, so nothing is listed and nothing reaches [`Self::commit`].
     pending: Option<Polarity>,
+    /// The rule the include rows combine under, edited like a row and committed with them.
+    combine: Combine,
 }
 
 /// What an offered row reads until it is typed into. **A word the grammar accepts**, because the
@@ -577,6 +615,7 @@ impl Editor {
             dirty: false,
             offered: None,
             pending: None,
+            combine: chips.combine,
         }
     }
 
@@ -846,6 +885,20 @@ impl Editor {
                 .filter(|(at, _)| self.offered != Some(*at))
                 .map(|(_, chip)| chip.clone())
                 .collect(),
+            combine: self.combine,
+        }
+    }
+
+    /// The rule the include rows combine under.
+    pub fn combine(&self) -> Combine {
+        self.combine
+    }
+
+    /// Sets the rule; the same rule again is not a change.
+    pub fn set_combine(&mut self, combine: Combine) {
+        if self.combine != combine {
+            self.combine = combine;
+            self.dirty = true;
         }
     }
 }
@@ -1583,7 +1636,97 @@ mod tests {
                 .iter()
                 .map(|(t, p)| Chip::parse(t, *p).expect("a plain word parses"))
                 .collect(),
+            combine: Combine::All,
         }
+    }
+
+    /// The owner, 2026-10-29: *"currently they are all anded together, it would be good to be
+    /// able to select either and or or."* Under *any*, a record survives when any enabled
+    /// include chip answers true; the excludes subtract under either rule; an *unknown* answer
+    /// is not a match; a disabled chip takes no part; and a list of excludes alone keeps what it
+    /// does not name, as before.
+    #[test]
+    fn under_any_a_record_survives_when_one_include_chip_answers_true() {
+        let r = record("timeout contacting billing");
+        let mut chips = chips_of(&[
+            ("timeout", Polarity::Include),
+            ("payment", Polarity::Include),
+        ]);
+        assert!(!chips.keeps(&r), "under all, both must hold");
+        chips.combine = Combine::Any;
+        assert!(chips.keeps(&r), "under any, one is enough");
+        chips
+            .chips
+            .push(Chip::parse("billing", Polarity::Exclude).expect("parse"));
+        assert!(!chips.keeps(&r), "an exclude subtracts under any too");
+
+        let mut unknown = chips_of(&[
+            ("level >= Warning", Polarity::Include),
+            ("zzz", Polarity::Include),
+        ]);
+        unknown.combine = Combine::Any;
+        assert!(
+            !unknown.keeps(&record("a line nothing parsed")),
+            "an unknown answer is not a match under any"
+        );
+
+        let mut off = chips_of(&[("timeout", Polarity::Include), ("zzz", Polarity::Include)]);
+        off.combine = Combine::Any;
+        off.chips[0].enabled = false;
+        assert!(!off.keeps(&r), "a disabled chip takes no part under any");
+
+        let mut excludes = chips_of(&[("zzz", Polarity::Exclude)]);
+        excludes.combine = Combine::Any;
+        assert!(
+            excludes.keeps(&r),
+            "excludes alone keep what they do not name"
+        );
+
+        let mut mixed = chips_of(&[
+            ("level >= Warning", Polarity::Include),
+            ("timeout", Polarity::Include),
+        ]);
+        mixed.combine = Combine::Any;
+        assert!(
+            mixed.keeps(&record("timeout, nothing parsed")),
+            "an unknown beside a yes does not block it under any"
+        );
+    }
+
+    /// The pane's word is earned by a choice between include chips, not by the choice alone.
+    #[test]
+    fn the_any_rule_is_in_force_only_over_more_than_one_enabled_include_chip() {
+        let mut chips = chips_of(&[("a", Polarity::Include), ("b", Polarity::Include)]);
+        assert!(!chips.any_in_force(), "all is the rule");
+        chips.combine = Combine::Any;
+        assert!(chips.any_in_force());
+        chips.chips[1].enabled = false;
+        assert!(
+            !chips.any_in_force(),
+            "one enabled include reads the same under both"
+        );
+        let mut excludes = chips_of(&[("a", Polarity::Exclude), ("b", Polarity::Exclude)]);
+        excludes.combine = Combine::Any;
+        assert!(
+            !excludes.any_in_force(),
+            "excludes only: nothing to choose between"
+        );
+    }
+
+    /// The editor carries the rule like a row: opened with it, changed by a radio, committed
+    /// with the chips — and the same rule again is not a change, so Apply has nothing to do.
+    #[test]
+    fn the_editor_carries_the_rule_and_commits_it() {
+        let mut live = chips_of(&[("a", Polarity::Include)]);
+        live.combine = Combine::Any;
+        let mut editor = Editor::open(&live);
+        assert_eq!(editor.combine(), Combine::Any);
+        assert!(!editor.dirty());
+        editor.set_combine(Combine::Any);
+        assert!(!editor.dirty(), "the same rule is no change");
+        editor.set_combine(Combine::All);
+        assert!(editor.dirty());
+        assert_eq!(editor.commit().combine, Combine::All);
     }
 
     /// **The editor adds, edits and removes, and nothing takes effect until it is committed.**
@@ -1776,11 +1919,13 @@ mod tests {
         let r = record("a line nothing parsed");
         let include = Chips {
             chips: vec![Chip::parse("level >= Warning", Polarity::Include).expect("parse")],
+            combine: Combine::All,
         };
         assert!(!include.keeps(&r), "an include chip needs a definite yes");
 
         let exclude = Chips {
             chips: vec![Chip::parse("level >= Warning", Polarity::Exclude).expect("parse")],
+            combine: Combine::All,
         };
         assert!(
             exclude.keeps(&r),
@@ -1951,9 +2096,11 @@ mod tests {
 
         let one = Chips {
             chips: vec![include.clone(), exclude.clone()],
+            combine: Combine::All,
         };
         let other = Chips {
             chips: vec![exclude, include],
+            combine: Combine::All,
         };
         assert!(!one.keeps(&r));
         assert_eq!(one.keeps(&r), other.keeps(&r));

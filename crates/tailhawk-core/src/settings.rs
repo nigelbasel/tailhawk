@@ -22,7 +22,8 @@
 //!   overrides with any duration, not only one the menu offers.
 //! - `[window]` — `x`, `y`, `width`, `height`, `maximized`: where the window was.
 //! - `[[file]]` — `path`, `chips` (each `+text` or `-text`, with a leading `#` when the chip is
-//!   switched off), `collapse`, `bookmarks` (file rows),
+//!   switched off), `filters` (`"any"` when the include chips OR together; absent means all),
+//!   `collapse`, `bookmarks` (file rows),
 //!   `labels` (each `n:text`), `columns` (widths in cells, zero meaning hidden) and `column_order`
 //!   (display order before the message): what a file was being
 //!   looked at through, so opening it again shows the same view. Keyed by **path**; §12.4 says
@@ -60,6 +61,10 @@ pub struct FileState {
     pub path: String,
     /// Chip texts with their polarity as the first character: `+error`, `-retry`.
     pub chips: Vec<String>,
+    /// Whether the include chips combine under *any* rather than *all* — written as
+    /// `filters = "any"` and absent otherwise, so every file written before the rule existed
+    /// reads as it did.
+    pub any: bool,
     pub collapse: bool,
     /// E20's bookmarks, as physical (zero-based) file rows.
     pub bookmarks: Vec<u64>,
@@ -866,6 +871,7 @@ impl Settings {
         let key = fold_key(&state.path);
         self.files.retain(|f| fold_key(&f.path) != key);
         if !state.chips.is_empty()
+            || state.any
             || state.collapse
             || !state.bookmarks.is_empty()
             || !state.labels.is_empty()
@@ -1068,6 +1074,9 @@ impl Settings {
             if !f.chips.is_empty() {
                 let chips: Vec<String> = f.chips.iter().map(|c| quote(c)).collect();
                 out.push_str(&format!("chips = [{}]\n", chips.join(", ")));
+            }
+            if f.any {
+                out.push_str("filters = \"any\"\n");
             }
             if f.collapse {
                 out.push_str("collapse = true\n");
@@ -1278,6 +1287,7 @@ impl Settings {
                         match key {
                             "path" => f.path = unquote(value),
                             "chips" => f.chips = array(value),
+                            "filters" => f.any = unquote(value) == "any",
                             "collapse" => f.collapse = value == "true",
                             "bookmarks" => {
                                 f.bookmarks =
@@ -1954,6 +1964,7 @@ mod tests {
         s.set_file(FileState {
             path: r"C:\logs\app.log".to_owned(),
             chips: vec!["+error".to_owned(), "-retry \"quoted\"".to_owned()],
+            any: false,
             collapse: true,
             bookmarks: vec![0, 42, 1_000_000],
             labels: vec!["1:Exception".to_owned(), "9:a \"quoted\" one".to_owned()],
@@ -1963,6 +1974,7 @@ mod tests {
         s.set_file(FileState {
             path: r"C:\logs\other.log".to_owned(),
             chips: vec!["+job".to_owned()],
+            any: false,
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
@@ -1970,6 +1982,45 @@ mod tests {
             column_order: Vec::new(),
         });
         s
+    }
+
+    /// The owner, 2026-10-29: the rule the include chips combine under rides beside them as
+    /// `filters = "any"`, and a file written before the rule existed — or one under *all* —
+    /// says nothing and reads as *all*.
+    #[test]
+    fn the_any_rule_is_written_beside_the_chips_and_absent_means_all() {
+        let mut s = Settings::default();
+        s.set_file(FileState {
+            path: r"C:\logs\app.log".to_owned(),
+            chips: vec!["+a".to_owned(), "+b".to_owned()],
+            any: true,
+            ..Default::default()
+        });
+        let text = s.to_toml();
+        assert!(text.contains("filters = \"any\"\n"), "{text}");
+        let back = Settings::from_toml(&text);
+        assert!(back.file(r"C:\logs\app.log").expect("the entry").any);
+
+        let old = Settings::from_toml(concat!(
+            "[[file]]\n",
+            "path = \"C:\\\\logs\\\\app.log\"\n",
+            "chips = [\"+a\"]\n",
+        ));
+        assert!(!old.file(r"C:\logs\app.log").expect("the entry").any);
+        assert!(
+            !old.to_toml().contains("filters"),
+            "all is said by saying nothing"
+        );
+
+        // A rule chosen with no chips to apply it to is a preference, kept as `collapse` is.
+        let mut alone = Settings::default();
+        alone.set_file(FileState {
+            path: r"C:\logs\bare.log".to_owned(),
+            any: true,
+            ..Default::default()
+        });
+        let back = Settings::from_toml(&alone.to_toml());
+        assert!(back.file(r"C:\logs\bare.log").expect("kept").any);
     }
 
     /// **A key this version no longer knows costs the file nothing.**
@@ -2043,6 +2094,7 @@ mod tests {
         s.set_file(FileState {
             path: r"C:\logs\app.log".to_owned(),
             chips: Vec::new(),
+            any: false,
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
@@ -2053,6 +2105,7 @@ mod tests {
         s.set_file(FileState {
             path: r"c:\LOGS\other.log".to_owned(),
             chips: vec!["+x".to_owned()],
+            any: false,
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
@@ -2530,6 +2583,7 @@ mod tests {
         personal.set_file(FileState {
             path: "a.log".into(),
             chips: vec!["+a".into()],
+            any: false,
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),
@@ -2545,6 +2599,7 @@ mod tests {
         curated.set_file(FileState {
             path: "a.log".into(),
             chips: vec!["+curated".into()],
+            any: false,
             collapse: true,
             bookmarks: Vec::new(),
             labels: Vec::new(),
@@ -2554,6 +2609,7 @@ mod tests {
         curated.set_file(FileState {
             path: "b.log".into(),
             chips: vec!["+b".into()],
+            any: false,
             collapse: false,
             bookmarks: Vec::new(),
             labels: Vec::new(),

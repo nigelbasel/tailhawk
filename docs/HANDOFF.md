@@ -1,5 +1,32 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-29, latest: the include filters match all or any
+
+The owner: *"currently they are all anded together, it would be good to be able to select either
+and or or."* Proposal §5 weighed a per-list choice, a per-row conjunction and groups and
+recommended the first; built as recommended, without waiting for his word on the shape — the
+recommendation was given and the build is small enough to redo.
+
+- **`filter::Combine::{All, Any}` on `Chips`** (`filter.rs`, tested): under *Any* a record
+  survives when any enabled include chip answers *true*; an *unknown* answer is not a match; the
+  excludes subtract under either rule; a list of excludes alone keeps what it does not name, as
+  before. The editor carries the rule (`combine()`, `set_combine()`, dirty only on a change) and
+  `commit()` writes it with the chips.
+- **`filters = "any"`** in the file's `[[file]]` table (`settings.rs`, tested): written only
+  under *Any*, read as *All* when absent, so every settings file on disk reads as it did.
+  `main.rs` writes it in `file_state` and reads it in `apply_state`, before the chips.
+- **Two radios under *All filters*** in the Filters dialog (`dialog.rs`): *Rows must match: all
+  include filters / any include filter*, a row above the fault line; the dialog is 276 units
+  tall (was 259). The arm sets the editor's rule and refreshes; the refresh sets the pair from
+  the editor, so Cancel leaves the rule as it was. The purpose table and the mnemonic test hold
+  the two ids.
+- **The status pane** says `Filtered 12 of 1,192 · any include filter` while the rule is in
+  force (`statusbar::filter_words`, tested); the default rule gets no word.
+- **`SPEC.md` §7.2** records the rule beside TextAnalysisTool's. **Not seen on screen.**
+- **Knowingly left**: a per-row *and/or* and groups (§5's reasons); the rule is not in the
+  `--filter=` command line; the radios stay live with no include filter in the list, where the
+  choice changes nothing.
+
 ## ▶ Resume point — 2026-10-29, last: the filter composer builds a regex from a template, and quotes typed text
 
 Proposal §4's second increment, the owner's *"build regexes"*. Over *(any column)* with *Regular
