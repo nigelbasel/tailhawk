@@ -54,13 +54,14 @@ Two more from the owner on the Filters dialog, after the `new` row (below, now `
   Remove, Up, Down; under the list, an *All filters* heading over New, Remove all and the four
   enable-all / disable-all buttons; the dialog is 259 units tall. Layout only; the mnemonic test
   holds the keys unique. **Not seen on screen.**
-- **Open question to the owner**: in the dark theme the Include / Exclude labels read black. The
-  two dialogs declare the pair identically and the dressing note of 2026-09-21 says radio buttons
-  came back dark, so the cause is state, not class — likely the pair greyed with no row selected
-  (which the pending-row change already alters) — or the theme not dressing radio text after
-  all. Asked whether the check boxes beside them read fine and whether the composer's pair does;
-  if only the radio labels are black, draw the pair as push-style toggles (`BS_PUSHLIKE`), which
-  the theme does dress.
+- **Dark-theme radio labels, answered and fixed (2026-10-29).** The owner: *"the radio buttons
+  are visible, but the labels are not. the check box labels are all visible."* So the cause is
+  the class, not state: `DarkMode_Explorer` dresses a radio's glyph and leaves its label the
+  theme's black. `controls::button_keeps_theme(style, dark)` now answers no for a radio in the
+  dark theme; `dress_child` turns visual styles off for it (`SetWindowTheme(hwnd, "", "")`) and
+  the classic control takes the ink the dialog already answers under `WM_CTLCOLORSTATIC`. Pure,
+  tested; the light theme and every other button are untouched. **Not seen on screen** — the
+  owner's deploy is the check.
 - **Proposal §4** records his filter-helper ask (values to pick from, *is one of*, empty / not
   empty, regex templates and a quote-this-text button) over the composer that already exists.
 
@@ -263,10 +264,10 @@ coming off, which is why the dev build looked right.
   first, as a pure `Selecting::from_click` plus block copy, then a `Ctrl+click` on a header to
   select a column; rule sets as `[[set]]` tables with `apply_to` in the same rules file, the old
   flat file reading as the Default set. Awaiting the owner's choice.
-- **Mouse selection reported different between the release and the dev build on the same tail.**
-  Not the disabled chip: a headless probe started a selection on a view with exactly that chip.
-  A copy of the dev build was launched from a tier-less folder so it reads only his roaming
-  settings, like the release; the comparison was with him when this was written.
+- **Mouse selection reported different between the release and the dev build — closed.** A
+  headless probe cleared the disabled chip; the owner, 2026-10-29: *"the mouse selection seems
+  to be working now on the installed version."* Nothing was changed for it; the release he first
+  tried predated `ca75e81`'s follow fix, and no cause beyond that was established.
 - **`deploy.cmd` fetches the latest release now**, at the owner's ask: `tailhawk-x64.exe` from the
   stable URL, verified against the release's `SHA256SUMS.txt`, copied in as `tailhawk.exe`;
   `deploy.cmd local` is the old path. Two things the dry runs taught: an `exit /b` inside a

@@ -57,10 +57,12 @@ unsafe extern "system" fn dress_child(
     use windows::core::w;
     use windows::Win32::Foundation::{BOOL, LPARAM, WPARAM};
     use windows::Win32::UI::Controls::{
-        LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
-        TVM_SETTEXTCOLOR,
+        SetWindowTheme, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, TVM_SETBKCOLOR,
+        TVM_SETLINECOLOR, TVM_SETTEXTCOLOR,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SendMessageW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetWindowLongPtrW, SendMessageW, GWL_STYLE,
+    };
 
     let (dark, list_bg, list_ink) = unsafe { *(lparam.0 as *const (bool, u32, u32)) };
     let mut buffer = [0u16; 64];
@@ -110,15 +112,54 @@ unsafe extern "system" fn dress_child(
         // **Statics fall through to `Explorer` and take no visible harm from it** — what actually
         // colours them is their parent's `WM_CTLCOLORSTATIC` answer.
         //
-        // **Buttons take `Explorer`, and it is enough** — check boxes, radio buttons *and* push
-        // buttons all come back dark. That is worth saying because the expectation was the
+        // **Buttons take `Explorer`, and for a check box and a push button it is enough** — both
+        // come back dark with readable text. That is worth saying because the expectation was the
         // opposite: the menu bar's note in `docs/HANDOFF.md` records that Win32 offers no
         // supported route to a dark menu, and the same was assumed of a push button. It is not so
         // here, because `darkmode.rs` has already called `SetPreferredAppMode(ForceDark)` before
         // any window exists, which is what lets comctl32 dress them. Screenshotted 2026-09-21.
+        // A radio button is the exception [`button_theme`] makes: the owner's dialog of
+        // 2026-10-28 had dark radio glyphs beside black labels.
+        "Button" => {
+            let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+            if button_keeps_theme(style, dark) {
+                apply_theme(hwnd, dark);
+            } else {
+                unsafe {
+                    let _ = SetWindowTheme(hwnd, w!(""), w!(""));
+                }
+            }
+        }
         _ => apply_theme(hwnd, dark),
     }
     BOOL(1)
+}
+
+const BS_TYPEMASK: u32 = 0x000F;
+const BS_RADIOBUTTON: u32 = 0x0004;
+const BS_AUTORADIOBUTTON: u32 = 0x0009;
+const BS_PUSHLIKE: u32 = 0x1000;
+
+/// Whether a `Button` child keeps a visual style, or paints classic so its label takes the ink
+/// its parent answers `WM_CTLCOLORSTATIC` with.
+///
+/// **A radio button in the dark theme takes no visual style**, because `DarkMode_Explorer`
+/// dresses its glyph dark and leaves its label the theme's black — the owner's Filters dialog,
+/// 2026-10-28: *"the radio buttons are visible, but the labels are not. the check box labels are
+/// all visible."* Without a style the control paints classic and takes the ink its parent
+/// answers `WM_CTLCOLORSTATIC` with, which is how every static in the dialog is already readable.
+/// A check box and a push button come back dark with readable text under the class, so they keep
+/// it, and so does a push-like radio, which is drawn as a push button; in the light theme every
+/// button keeps the system's own look.
+///
+/// **Knowingly left**: the classic glyph is drawn in the system colours, so a dark dialog shows
+/// a light radio circle beside its dark check boxes; and a disabled classic radio embosses its
+/// label in the system's greys rather than the ink, which is legible on the dark ground and is
+/// not the theme's grey.
+pub fn button_keeps_theme(style: u32, dark: bool) -> bool {
+    let radio = matches!(style & BS_TYPEMASK, BS_RADIOBUTTON | BS_AUTORADIOBUTTON)
+        && style & BS_PUSHLIKE == 0;
+    !dark || !radio
 }
 
 /// The same, for a control whose dark class is not `Explorer`'s.
@@ -138,5 +179,41 @@ pub fn apply_theme_class(
     let name = if dark { when_dark } else { when_light };
     unsafe {
         let _ = SetWindowTheme(hwnd, name, PCWSTR::null());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BS_PUSHBUTTON: u32 = 0x0000;
+    const BS_AUTOCHECKBOX: u32 = 0x0003;
+    const BS_GROUPBOX: u32 = 0x0007;
+    const WS_TABSTOP: u32 = 0x0001_0000;
+    const WS_GROUP: u32 = 0x0002_0000;
+
+    /// A radio button's label was black on the dark dialog while the check boxes beside it read
+    /// fine: the dark Explorer class has no readable radio part, so a radio takes no style at all
+    /// in the dark theme and paints with the ink its parent answers. Everything else keeps its
+    /// class — a push-like radio is a push button to the theme — and the light theme is untouched.
+    #[test]
+    fn a_radio_button_takes_no_visual_style_in_the_dark_theme_and_nothing_else_changes() {
+        for radio in [
+            WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON,
+            BS_AUTORADIOBUTTON,
+            BS_RADIOBUTTON,
+        ] {
+            assert!(!button_keeps_theme(radio, true), "style {radio:#x}");
+            assert!(button_keeps_theme(radio, false), "style {radio:#x}");
+        }
+        for other in [
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_PUSHBUTTON,
+            WS_GROUP | BS_GROUPBOX,
+            WS_TABSTOP | BS_PUSHLIKE | BS_AUTORADIOBUTTON,
+        ] {
+            assert!(button_keeps_theme(other, true), "style {other:#x}");
+            assert!(button_keeps_theme(other, false), "style {other:#x}");
+        }
     }
 }
