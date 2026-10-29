@@ -141,9 +141,17 @@ chosen column carries in the window, most common first, so a status or a reason 
 than something to know; typing is still typing, and *is one of* takes a comma list (`403, 444`)
 and writes `status in [403, 444]`. The last three operators ask about a column, so over *any
 column* the list stops at ten. *Is empty* finds a row whose column is present and empty; a row
-without the column at all answers *unknown*, which an include leaves out. The expression it builds is always
-visible and always editable, and a line under it says whether what you have typed parses and
-whether it names a column this format does not have.
+without the column at all answers *unknown*, which an include leaves out. With **Regular
+expression** ticked over *any column*, a **Template** row offers a pattern written from the words
+in the value box — *any of these words* (`(\btimeout\b|\brefused\b)` from a comma list, each
+word bounded where it has an edge to bound), *starts with this text*, *ends with this text*, *a
+status like 4xx or 503* (`(\b4\d\d\b|\b503\b)`), and three that need no words: *an IPv4
+address*, *a GUID*, *a timestamp*. A template treats the words as words, so a path's backslashes
+and dots are quoted for you; **Quote text** does the same to whatever is typed when no template
+is chosen, which is the mistake a hand-written pattern over a path or a URL makes most, and it
+greys once the text is quoted so it never quotes the quotes. The expression it builds is always visible and always
+editable, and a line under it says whether what you have typed parses and whether it names a
+column this format does not have.
 
 Typed by hand, the expression language is wider than the dialog's operators:
 

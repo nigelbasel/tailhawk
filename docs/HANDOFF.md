@@ -1,5 +1,43 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-29, last: the filter composer builds a regex from a template, and quotes typed text
+
+Proposal §4's second increment, the owner's *"build regexes"*. Over *(any column)* with *Regular
+expression* ticked — the one place §7.2 runs a regex — the composer gains:
+
+- **A Template row** (`REGEX_TEMPLATES`, `dialog.rs`): *any of these words* (`(\ba\b|\bb\b)`
+  from a comma list through `split_list`), *starts with this text* / *ends with this text* (`^…`
+  / `…$`), *a status like 4xx or 503* (`(\b4\d\d\b|\b503\b)`, `status_range` escaping the item
+  and mapping `x` to `\d`), and three shapes that ignore the value box and grey it — *an IPv4
+  address*, *a GUID*, *a timestamp*. **`composer_value(column, regex, template, value)` is the
+  pure decision**: the value as typed unless a template applies, else the pattern written from
+  the words, every word escaped (`Pattern::escape`), so a path's backslashes and dots are quoted.
+  **Each word is bounded on its own, and only where it has an edge to bound** (`bounded`): the
+  review found `\b(\(retry\))\b` matches nothing, since `\b` wants a word character on one side.
+  A list template with no words writes nothing, so the status line asks for a filter.
+- **A Quote text button** beside Match case: escapes the value box in place, recomposes, and
+  puts the caret back at the end; live only with no template chosen, since a template quotes
+  its own words, and only while the text is not already its own quoted form (`is_quoted`), so
+  it never quotes the quotes — the review's double-escape.
+- **`composer_enabling(any_column, regex, op, template, value)`** is the pure answer to which
+  of the value box, the Template row and Quote text are live; `filter_enable` applies it, from
+  the recompose, from `WM_INITDIALOG`, and from the check-box arm in *both* branches — so
+  ticking *Regular expression* while hand-editing an expression lights the Template row without
+  the recompose that would overwrite the edit. The first draft recomposed at open, which wrote
+  `""` on an empty Add Filter and `contains(level, "")` on *Filter on this column…*; the review
+  caught it, and nothing recomposes at open now.
+- **The dialog is 156 units tall** (was 138); the Expression, status and OK / Cancel rows moved
+  down 18; *Regular expression* has 84 units, which the review judged tight — look at it.
+- **Tests**: each template's pattern parses as a whole-record regex and matches the line it
+  names and not its neighbour (`a_regex_template_writes_a_pattern_that_matches_what_it_names`,
+  through `Predicate::eval` on `Record::unparsed`, including under the `i` flag); a template
+  over a column, without the box, or at index 0 leaves the value alone, no words write nothing,
+  and the template names are pinned at their indices; `quote_text_quotes_once` holds `is_quoted`
+  and the enabling table. The layout test holds the new row to the one column and right edge.
+- **Knowingly left**: the GUID shape is case-tolerant (`[0-9A-Fa-f]`) even under Match case;
+  the timestamp shape is ISO date + time only; a value pre-filled from a cell's context menu
+  (proposal §4) is not built. **Not seen on screen.**
+
 ## ▶ Resume point — 2026-10-28, last: the filter composer offers a column's values, *is one of*, empty / not empty
 
 The owner: *"some sort of filter helper in the dialog to easily pick columns and select operators

@@ -70,6 +70,8 @@ const ID_F_REGEX: u16 = 125;
 const ID_F_CASE: u16 = 126;
 const ID_F_EXPR: u16 = 127;
 const ID_F_STATUS: u16 = 128;
+const ID_F_TEMPLATE: u16 = 129;
+const ID_F_QUOTE: u16 = 130;
 /// The Filter dialog's grid, in dialog units. The label column is sized for the **longest** label
 /// — `Expression:` — so that every field can start in one place; sizing it for the shortest is
 /// what put the Expression box six units right of the Value box above it.
@@ -685,6 +687,130 @@ pub fn split_list(value: &str) -> Vec<String> {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// The regex templates the composer offers over the whole record, in combo order. The first is
+/// no template at all: the value rides as typed. The next four write a pattern from the words
+/// typed; the last three name a shape and read nothing.
+pub const REGEX_TEMPLATES: &[&str] = &[
+    "(no template)",
+    "any of these words",
+    "starts with this text",
+    "ends with this text",
+    "a status like 4xx or 503",
+    "an IPv4 address",
+    "a GUID",
+    "a timestamp",
+];
+
+/// The templates that name a shape and ignore the value box, which is greyed while one is chosen.
+pub fn template_takes_no_value(template: usize) -> bool {
+    template >= 5
+}
+
+/// The value [`compose_filter`] is handed: what was typed, or the pattern a template writes from
+/// it. A template has meaning only where §7.2 runs a regex — the whole record, with *Regular
+/// expression* ticked — and anywhere else the value is what it was.
+///
+/// **A template treats the value as the words it names, not as a regex**: *starts with this text*
+/// over `C:\Temp` writes `^C:\\Temp`, which is the mistake a hand-written pattern over a path
+/// makes most. The expression line stays editable for the reader who meant a regex.
+pub fn composer_value(column: Option<&str>, regex: bool, template: usize, value: &str) -> String {
+    if column.is_some() || !regex || template == 0 {
+        return value.to_owned();
+    }
+    let escape = tailhawk_core::search::Pattern::escape;
+    let alternatives = |items: Vec<String>| {
+        if items.is_empty() {
+            String::new()
+        } else {
+            format!("({})", items.join("|"))
+        }
+    };
+    let text = value.trim();
+    match template {
+        1 => alternatives(
+            split_list(value)
+                .iter()
+                .map(|w| bounded(w, escape(w)))
+                .collect(),
+        ),
+        2 if text.is_empty() => String::new(),
+        2 => format!("^{}", escape(text)),
+        3 if text.is_empty() => String::new(),
+        3 => format!("{}$", escape(text)),
+        4 => alternatives(
+            split_list(value)
+                .iter()
+                .map(|w| bounded(w, status_range(w)))
+                .collect(),
+        ),
+        5 => r"\b(?:\d{1,3}\.){3}\d{1,3}\b".to_owned(),
+        6 => r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b"
+            .to_owned(),
+        7 => r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}".to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
+/// A word's pattern, bounded where the word has an edge to bound: `\b` is a boundary between
+/// a word character and not one, so a `\b` beside `(retry)` or `[ERROR]` would match nothing
+/// — the review's case — and a list of words is bounded item by item rather than as a group.
+fn bounded(word: &str, pattern: String) -> String {
+    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let before = if edge(word.chars().next()) { r"\b" } else { "" };
+    let after = if edge(word.chars().next_back()) {
+        r"\b"
+    } else {
+        ""
+    };
+    format!("{before}{pattern}{after}")
+}
+
+/// One item of *a status like 4xx or 503*: the item escaped, with each `x` a digit, so `404`,
+/// `5xx` and `40x` sit in one list.
+fn status_range(item: &str) -> String {
+    tailhawk_core::search::Pattern::escape(item).replace(['x', 'X'], r"\d")
+}
+
+/// Whether the value box already holds the quoted form of its own text, so *Quote text* has
+/// nothing to do: quoting twice would quote the quotes (`a\.b` to `a\\\.b`), and the button is
+/// greyed instead. Empty text and text with nothing to quote count as quoted.
+pub fn is_quoted(value: &str) -> bool {
+    let mut plain = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if !(next.is_ascii_alphanumeric() || next == '_') {
+                    plain.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        plain.push(c);
+    }
+    tailhawk_core::search::Pattern::escape(&plain) == value
+}
+
+/// Which of the composer's helpers are live — the value box, the Template row, *Quote text* —
+/// for the choices as they stand. A template runs only where §7.2 runs a regex, the whole
+/// record with *Regular expression* ticked; a shape template and the two empties read no
+/// value; *Quote text* quotes only what a template has not already quoted, and only once.
+pub fn composer_enabling(
+    any_column: bool,
+    regex: bool,
+    op: usize,
+    template: usize,
+    value: &str,
+) -> (bool, bool, bool) {
+    let templated = any_column && regex;
+    (
+        !op_takes_no_value(op) && !(templated && template_takes_no_value(template)),
+        templated,
+        templated && template == 0 && !is_quoted(value),
+    )
 }
 
 /// What the Go to line dialog makes of what has been typed, before anything is jumped to.
@@ -7138,14 +7264,21 @@ unsafe fn filter_recompose(hdlg: HWND, state: &mut FilterState) {
     let value = read_dlg_text(hdlg, ID_F_VALUE);
     let column = scope_name(&edit.columns, scope as i32);
     let op = op.max(0) as usize;
-    // **An operator that takes no value greys the box** rather than reading a value it ignores.
-    unsafe {
-        let _ = EnableWindow(
-            GetDlgItem(hdlg, i32::from(ID_F_VALUE)).unwrap_or_default(),
-            !op_takes_no_value(op),
-        );
-    }
-    let expression = compose_filter(column, op, &value, checked(ID_F_REGEX), checked(ID_F_CASE));
+    let regex = checked(ID_F_REGEX);
+    let template = usize::try_from(unsafe {
+        SendDlgItemMessageW(
+            hdlg,
+            i32::from(ID_F_TEMPLATE),
+            CB_GETCURSEL,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .0
+    })
+    .unwrap_or(0);
+    unsafe { filter_enable(hdlg, state) };
+    let value = composer_value(column, regex, template, &value);
+    let expression = compose_filter(column, op, &value, regex, checked(ID_F_CASE));
     state.busy = true;
     let text = wsz(&expression);
     unsafe {
@@ -7153,6 +7286,35 @@ unsafe fn filter_recompose(hdlg: HWND, state: &mut FilterState) {
     }
     state.busy = false;
     unsafe { filter_validate(hdlg, state) };
+}
+
+/// Applies [`composer_enabling`] to the three helpers. Called by the recompose and by the
+/// check-box arm in both of its branches, so ticking *Regular expression* while hand-editing an
+/// expression lights the Template row without the recompose that would overwrite the edit.
+unsafe fn filter_enable(hdlg: HWND, state: &FilterState) {
+    let edit = unsafe { &*state.edit };
+    let item = |id: u16| unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(id), CB_GETCURSEL, WPARAM(0), LPARAM(0)).0
+    };
+    let checked = |id: u16| unsafe {
+        SendDlgItemMessageW(hdlg, i32::from(id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
+    };
+    let (value, template, quote) = composer_enabling(
+        scope_name(&edit.columns, item(ID_F_SCOPE) as i32).is_none(),
+        checked(ID_F_REGEX),
+        usize::try_from(item(ID_F_OP)).unwrap_or(0),
+        usize::try_from(item(ID_F_TEMPLATE)).unwrap_or(0),
+        &read_dlg_text(hdlg, ID_F_VALUE),
+    );
+    for (id, on) in [
+        (ID_F_VALUE, value),
+        (ID_F_TEMPLATE, template),
+        (ID_F_QUOTE, quote),
+    ] {
+        unsafe {
+            let _ = EnableWindow(GetDlgItem(hdlg, i32::from(id)).unwrap_or_default(), on);
+        }
+    }
 }
 
 unsafe fn filter_validate(hdlg: HWND, state: &FilterState) {
@@ -7249,9 +7411,27 @@ unsafe extern "system" fn filter_proc(
                     let text = wsz(&data.expression);
                     let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_EXPR), PCWSTR(text.as_ptr()));
                 }
+                for name in REGEX_TEMPLATES {
+                    let text = wsz(name);
+                    SendDlgItemMessageW(
+                        hdlg,
+                        i32::from(ID_F_TEMPLATE),
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(text.as_ptr() as isize),
+                    );
+                }
+                SendDlgItemMessageW(
+                    hdlg,
+                    i32::from(ID_F_TEMPLATE),
+                    CB_SETCURSEL,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
                 filter_fill_ops(hdlg);
                 filter_fill_values(hdlg, &mut *state);
                 filter_validate(hdlg, &*state);
+                filter_enable(hdlg, &*state);
                 // Focus lands in the Value box — typing a filter is what the dialog is for, and
                 // the default first-tabstop focus would land on the Include radio instead.
                 if let Ok(value) = GetDlgItem(hdlg, i32::from(ID_F_VALUE)) {
@@ -7345,15 +7525,48 @@ unsafe extern "system" fn filter_proc(
                     unsafe { filter_recompose(hdlg, state) };
                     1
                 }
-                (ID_F_OP, CBN_SELCHANGE) => {
+                (ID_F_OP, CBN_SELCHANGE) | (ID_F_TEMPLATE, CBN_SELCHANGE) => {
                     unsafe { &mut *state.edit }.manual = false;
                     unsafe { filter_recompose(hdlg, state) };
+                    1
+                }
+                (ID_F_QUOTE, BN_CLICKED) => {
+                    // **Quote text escapes what was typed, in the box the reader typed it in**,
+                    // so the value stays theirs to edit and the expression follows as it would
+                    // from a keystroke — and the caret goes back where the typing was, at the
+                    // end, by the same select-all-then-collapse that the Filters dialog uses.
+                    const CB_SETEDITSEL: u32 = 0x0142;
+                    let quoted =
+                        tailhawk_core::search::Pattern::escape(&read_dlg_text(hdlg, ID_F_VALUE));
+                    state.busy = true;
+                    let text = wsz(&quoted);
+                    unsafe {
+                        let _ = SetDlgItemTextW(hdlg, i32::from(ID_F_VALUE), PCWSTR(text.as_ptr()));
+                    }
+                    state.busy = false;
+                    unsafe { &mut *state.edit }.manual = false;
+                    unsafe { filter_recompose(hdlg, state) };
+                    unsafe {
+                        if let Ok(value) = GetDlgItem(hdlg, i32::from(ID_F_VALUE)) {
+                            let _ = SetFocus(value);
+                        }
+                        let combo = i32::from(ID_F_VALUE);
+                        SendDlgItemMessageW(
+                            hdlg,
+                            combo,
+                            CB_SETEDITSEL,
+                            WPARAM(0),
+                            LPARAM(0xFFFF << 16),
+                        );
+                        SendDlgItemMessageW(hdlg, combo, CB_SETEDITSEL, WPARAM(0), LPARAM(0xFFFF));
+                    }
                     1
                 }
                 (ID_F_REGEX | ID_F_CASE | ID_F_INCLUDE | ID_F_EXCLUDE, 0) => {
                     if !unsafe { &*state.edit }.manual {
                         unsafe { filter_recompose(hdlg, state) };
                     } else {
+                        unsafe { filter_enable(hdlg, state) };
                         unsafe { filter_validate(hdlg, state) };
                     }
                     1
@@ -7446,49 +7659,73 @@ fn filter_dialog_items() -> Vec<Item> {
             Class::Button,
             "&Regular expression",
             ID_F_REGEX,
-            (F_FIELD_X, 61, 90, 10),
+            (F_FIELD_X, 61, 84, 10),
             WS_TABSTOP | BS_AUTOCHECKBOX,
         ),
         Item::new(
             Class::Button,
             "Match c&ase",
             ID_F_CASE,
-            (146, 61, 70, 10),
+            (138, 61, 58, 10),
             WS_TABSTOP | BS_AUTOCHECKBOX,
+        ),
+        // **Quote text and a template row, live only over a whole-record regex** — the owner's
+        // "build regexes" of 2026-10-28. A template writes the pattern from the words in the
+        // value box; Quote text escapes those words where no template is chosen.
+        Item::new(
+            Class::Button,
+            "&Quote text",
+            ID_F_QUOTE,
+            (F_RIGHT - 50, 59, 50, 14),
+            WS_TABSTOP,
+        ),
+        Item::new(
+            Class::Static,
+            "&Template:",
+            0xFFFF,
+            (F_LABEL_X, 81, F_LABEL_W, 8),
+            0,
+        ),
+        Item::new(
+            Class::ComboBox,
+            "",
+            ID_F_TEMPLATE,
+            (F_FIELD_X, 79, F_RIGHT - F_FIELD_X, 110),
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
         ),
         Item::new(
             Class::Static,
             "&Expression:",
             0xFFFF,
-            (F_LABEL_X, 79, F_LABEL_W, 8),
+            (F_LABEL_X, 97, F_LABEL_W, 8),
             0,
         ),
         Item::new(
             Class::Edit,
             "",
             ID_F_EXPR,
-            (F_FIELD_X, 77, F_RIGHT - F_FIELD_X, 12),
+            (F_FIELD_X, 95, F_RIGHT - F_FIELD_X, 12),
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
         ),
         Item::new(
             Class::Static,
             "",
             ID_F_STATUS,
-            (F_LABEL_X, 95, F_RIGHT - F_LABEL_X, 18),
+            (F_LABEL_X, 113, F_RIGHT - F_LABEL_X, 18),
             0,
         ),
         Item::new(
             Class::Button,
             "OK",
             IDOK,
-            (182, 117, 50, 14),
+            (182, 135, 50, 14),
             WS_TABSTOP | BS_DEFPUSHBUTTON,
         ),
         Item::new(
             Class::Button,
             "Cancel",
             IDCANCEL,
-            (242, 117, 50, 14),
+            (242, 135, 50, 14),
             WS_TABSTOP,
         ),
     ]
@@ -7503,7 +7740,7 @@ pub fn show_filter_dialog(hwnd: HWND, data: &mut FilterEdit) -> bool {
     } else {
         "Edit Filter"
     };
-    let t = template(title, 299, 138, &filter_dialog_items());
+    let t = template(title, 299, 156, &filter_dialog_items());
     unsafe {
         DialogBoxIndirectParamW(
             None,
@@ -10011,18 +10248,25 @@ mod tests {
     fn the_filter_dialogs_fields_share_one_column_and_one_right_edge() {
         let items = filter_dialog_items();
         let at = |id: u16| items.iter().find(|i| i.id == id).expect("control present");
-        for id in [ID_F_SCOPE, ID_F_VALUE, ID_F_REGEX, ID_F_EXPR] {
+        for id in [ID_F_SCOPE, ID_F_VALUE, ID_F_REGEX, ID_F_TEMPLATE, ID_F_EXPR] {
             assert_eq!(
                 at(id).x,
                 F_FIELD_X,
                 "control {id} starts outside the field column"
             );
         }
-        for id in [ID_F_VALUE, ID_F_EXPR, ID_F_OP, ID_F_STATUS] {
+        for id in [
+            ID_F_VALUE,
+            ID_F_TEMPLATE,
+            ID_F_EXPR,
+            ID_F_OP,
+            ID_F_STATUS,
+            ID_F_QUOTE,
+        ] {
             let it = at(id);
             assert_eq!(it.x + it.w, F_RIGHT, "control {id} ends off the right edge");
         }
-        for id in [ID_F_SCOPE, ID_F_VALUE, ID_F_EXPR] {
+        for id in [ID_F_SCOPE, ID_F_VALUE, ID_F_TEMPLATE, ID_F_EXPR] {
             assert!(
                 at(id).x >= F_LABEL_X + F_LABEL_W,
                 "control {id} overlaps its label"
@@ -10258,6 +10502,192 @@ mod tests {
         assert_eq!(compose_filter(Some("status"), 10, " , ,", false, false), "");
         assert_eq!(compose_filter(None, 10, "a, b", false, false), "");
         assert_eq!(compose_filter(None, 11, "", false, false), "");
+    }
+
+    /// Each template writes a pattern the grammar accepts as a whole-record regex, and the
+    /// pattern matches the line it names and not its neighbour — the owner's "build regexes",
+    /// 2026-10-28. The words typed are words: a path's backslash and a dot are quoted, not read.
+    #[test]
+    fn a_regex_template_writes_a_pattern_that_matches_what_it_names() {
+        use tailhawk_core::filter::{Chip, Polarity, Truth};
+        use tailhawk_core::record::Record;
+        let cases: &[(usize, &str, &str, &str, &str)] = &[
+            (
+                1,
+                "timeout, refused,",
+                r"(\btimeout\b|\brefused\b)",
+                "connection refused by peer",
+                "the timeouts were raised",
+            ),
+            (
+                1,
+                "C:\\Temp, a.b",
+                r"(\bC:\\Temp\b|\ba\.b\b)",
+                "wrote C:\\Temp\\x.log",
+                "wrote C:\\Temporary",
+            ),
+            // A word with no edge to bound takes no boundary, or it would match nothing.
+            (
+                1,
+                "timeout, (retry)",
+                r"(\btimeout\b|\(retry\))",
+                "sending (retry) now",
+                "sending retry now",
+            ),
+            (
+                2,
+                "GET /api",
+                r"^GET /api",
+                "GET /api/v1 200",
+                "a GET /api/v1 200",
+            ),
+            (2, "[api]", r"^\[api\]", "[api] up", "x [api] up"),
+            (
+                3,
+                "(retry)",
+                r"\(retry\)$",
+                "sending (retry)",
+                "sending (retry) now",
+            ),
+            (
+                4,
+                "4xx, 503",
+                r"(\b4\d\d\b|\b503\b)",
+                "status 404 returned",
+                "status 200 returned, 5030 bytes",
+            ),
+            (
+                4,
+                "40x, 4xx-5xx",
+                r"(\b40\d\b|\b4\d\d\-5\d\d\b)",
+                "code 404-503",
+                "code 4045",
+            ),
+            (
+                5,
+                "ignored",
+                r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+                "from 10.0.42.7:443",
+                "from host-10-0-42 port 443",
+            ),
+            (
+                6,
+                "",
+                r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b",
+                "trace 3F2504E0-4F89-11D3-9A0C-0305E82C3301 ok",
+                "trace 3F2504E0-4F89-11D3 ok",
+            ),
+            (
+                7,
+                "",
+                r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}",
+                "[2026-10-29 08:15:03.112] started",
+                "started at 08:15",
+            ),
+        ];
+        for (template, value, want, hit, miss) in cases {
+            let got = composer_value(None, true, *template, value);
+            assert_eq!(&got, want, "template {template} over {value:?}");
+            let expression = compose_filter(None, 0, &got, true, true);
+            let chip = Chip::parse(&expression, Polarity::Include)
+                .unwrap_or_else(|e| panic!("{expression:?} does not parse: {e}"));
+            let keeps = |line: &str| chip.predicate.eval(&Record::unparsed(line)) == Truth::True;
+            assert!(keeps(hit), "{expression} misses {hit:?}");
+            assert!(!keeps(miss), "{expression} takes {miss:?}");
+        }
+        // And under the grammar's `i` flag, which is the composer's default, a boundary still
+        // bounds.
+        let relaxed = compose_filter(
+            None,
+            0,
+            &composer_value(None, true, 1, "timeout"),
+            true,
+            false,
+        );
+        assert_eq!(relaxed, r"/(\btimeout\b)/i");
+        let chip = Chip::parse(&relaxed, Polarity::Include).expect("parses");
+        assert_eq!(
+            chip.predicate.eval(&Record::unparsed("The TIMEOUT fired")),
+            Truth::True
+        );
+        assert_eq!(
+            chip.predicate.eval(&Record::unparsed("The TIMEOUTS fired")),
+            Truth::False
+        );
+    }
+
+    /// *Quote text* quotes once: the quoted form of a value counts as quoted, so the button
+    /// greys rather than quoting the quotes; a regex typed by hand is not quoted, and empty
+    /// text has nothing to quote.
+    #[test]
+    fn quote_text_quotes_once() {
+        use tailhawk_core::search::Pattern;
+        assert!(!is_quoted("a.b"));
+        assert!(is_quoted(&Pattern::escape("a.b")));
+        assert!(is_quoted(&Pattern::escape("C:\\Temp\\x.log (1)")));
+        assert!(!is_quoted(r"\d+"));
+        assert!(is_quoted(""));
+        assert!(is_quoted("plain words"));
+        assert_eq!(
+            composer_enabling(true, true, 0, 0, "a.b"),
+            (true, true, true),
+            "a whole-record regex with words to quote"
+        );
+        assert_eq!(
+            composer_enabling(true, true, 0, 0, r"a\.b"),
+            (true, true, false),
+            "already quoted"
+        );
+        assert_eq!(
+            composer_enabling(true, true, 0, 5, "x"),
+            (false, true, false),
+            "a shape template reads no value"
+        );
+        assert_eq!(
+            composer_enabling(true, true, 0, 1, "x"),
+            (true, true, false),
+            "a word template quotes its own words"
+        );
+        assert_eq!(
+            composer_enabling(true, false, 0, 1, "x"),
+            (true, false, false),
+            "no regex, no template"
+        );
+        assert_eq!(
+            composer_enabling(false, true, 11, 1, "x"),
+            (false, false, false),
+            "a column, and an operator that takes no value"
+        );
+    }
+
+    /// Where no regex runs — a column, or the box unticked — or no template is chosen, the value
+    /// is what was typed; and a template with no words to write from writes nothing, so the
+    /// status line asks for a filter rather than showing `\b()\b`.
+    #[test]
+    fn a_template_applies_only_to_a_whole_record_regex_and_needs_words_to_write_from() {
+        assert_eq!(composer_value(Some("status"), true, 1, "a, b"), "a, b");
+        assert_eq!(composer_value(None, false, 1, "a, b"), "a, b");
+        assert_eq!(composer_value(None, true, 0, "a|b"), "a|b");
+        for template in [1, 4] {
+            assert_eq!(
+                composer_value(None, true, template, " , "),
+                "",
+                "{template}"
+            );
+        }
+        for template in [2, 3] {
+            assert_eq!(
+                composer_value(None, true, template, "   "),
+                "",
+                "{template}"
+            );
+        }
+        assert!(!template_takes_no_value(4));
+        assert!(template_takes_no_value(5));
+        assert_eq!(REGEX_TEMPLATES.len(), 8);
+        assert_eq!(REGEX_TEMPLATES[1], "any of these words");
+        assert_eq!(REGEX_TEMPLATES[4], "a status like 4xx or 503");
+        assert_eq!(REGEX_TEMPLATES[5], "an IPv4 address");
         assert_eq!(compose_filter(None, 12, "", false, false), "");
         assert_eq!(
             compose_filter(None, 0, "a, b", false, false),
