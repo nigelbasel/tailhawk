@@ -100,7 +100,10 @@ echo "=== test ==="
 if cargo test --release --workspace > "$root/target/check-test.log" 2>&1; then
   echo "ok"
 else
-  failures=$(grep -E '^test .* FAILED' "$root/target/check-test.log" \
+  # A test's own line, `test name ... FAILED`, and not the summary `test result: FAILED. …`,
+  # which the looser pattern also matched — so on 2026-10-29 a lone documented flake arrived
+  # here as two failures, one of them unknown, and the rerun-alone path never ran.
+  failures=$(grep -E '^test [^ ]+ \.\.\. FAILED' "$root/target/check-test.log" \
     | sed 's/^test //; s/ \.\.\. FAILED.*//' | sort -u)
   unknown=0
   for name in $failures; do
@@ -132,7 +135,7 @@ else
     fi
   else
     echo "FAILED"
-    grep -E '^test .* FAILED' "$root/target/check-test.log" || true
+    grep -E '^test [^ ]+ \.\.\. FAILED' "$root/target/check-test.log" || true
     fail=1
   fi
   echo "full output: target/check-test.log"
