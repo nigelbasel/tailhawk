@@ -277,6 +277,49 @@ not empty with them; the regex templates second. Small to medium.
 
 ---
 
+## 5. Filters that OR as well as AND
+
+The owner, 2026-10-29: *"currently they are all anded together, it would be good to be able to
+select either and or or."*
+
+### What exists
+
+`SPEC.md` §7.2, after TextAnalysisTool: *include chips AND together, then exclude chips are
+subtracted; order of chips is display order and does not affect the result.* `Chips::keeps` is
+that rule in eleven lines. Within **one** filter the grammar already has both words — `status =
+500 or status = 502`, `level >= Warning and not contains(message, "retry")`, `and` binding
+tighter than `or`, parentheses allowed — so an OR of two things has always been writable as one
+chip. What is missing is an OR *between* filters in the list, which is how the dialog invites a
+reader to think: one row per thing to look for.
+
+### Three shapes, and which one
+
+- **A per-list choice, as Explorer's search and Outlook's rules put it: rows must match *all*
+  include filters, or *any* include filter.** Two radios under the *All filters* heading. Excludes
+  go on subtracting whichever is chosen, because "hide retries" and "hide heartbeats" are never
+  meant as "hide rows that are both". Stored beside the chips in the file's `[[file]]` table as
+  `filters = "any"`, absent meaning *all*, so every settings file written so far reads as it did.
+  The status pane and the Filters dialog's title say which is in force (`3 filters, any`), because
+  a list that reads the same under both rules and means something different is the one thing
+  this must not become.
+- **A per-filter conjunction** — each row after the first carries *and* / *or* with the row above,
+  as a spreadsheet's advanced filter does. Expressive, but `a and b or c` then needs a precedence
+  rule the list cannot show, and the dialog's own promise that order does not change the result
+  stops being true. Not recommended until the first shape proves too small.
+- **Groups** — sub-lists that AND inside and OR between. The most general, a tree control's worth
+  of UI, and the case it serves (`(a and b) or (c and d)`) is one chip in the grammar today.
+
+**The recommendation is the first.** It is one decision in the model (`Chips::keeps` reads a
+`Combine::All | Any` beside the rows, pure, tested on the truth table including *unknown*
+answers, which under *any* must not count as a match), one key in the settings file, two radios
+in the dialog, and a word in the status pane. A reader who needs the second shape writes that
+one row with `and`/`or` in the composer's expression line, which the grammar accepts and the
+status line validates. Small; a morning.
+
+**What not to do.** No implicit change of rule when a second include is added; no *or* that
+spans an include and an exclude; no rewriting the stored chips into one expression, which would
+lose the per-row enable and the per-row edit the dialog was asked for.
+
 ## Order between the three
 
 Block selection first: it is a day's shell work on a finished core, it needs no file format, and
