@@ -14720,6 +14720,7 @@ fn main() -> Result<()> {
     }
 
     let chosen_face = settings.font.clone();
+    let _shell_drops_before_exit = ShellDropsBeforeExit;
     STATE.with(|s| {
         *s.borrow_mut() = Some(Shell {
             tabs: None,
@@ -14950,6 +14951,27 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Drops the shell when `main` leaves, by whichever path, **while the process is whole**.
+///
+/// Left in its thread-local, the shell was dropped by the thread-local destructor that process
+/// shutdown runs — after `ExitProcess` has terminated every other thread — and releasing the
+/// Direct3D device from there spun forever in the graphics driver on a lock whose owner thread
+/// was already gone: the owner's install, found a day later with one thread, no window and the
+/// CPU still climbing (2026-10-30). A guard rather than a line after the message loop, so the two
+/// `?` returns between the shell's creation and the loop are covered too. Everything the shell
+/// owns — device, swapchain, scanners, spills — is released here; a tail is told to stop and
+/// not waited for, as its own `Drop` says.
+struct ShellDropsBeforeExit;
+
+impl Drop for ShellDropsBeforeExit {
+    fn drop(&mut self) {
+        header::trace("main: dropping shell");
+        let shell = STATE.with(|s| s.borrow_mut().take());
+        drop(shell);
+        header::trace("main: shell dropped before exit");
+    }
 }
 
 #[cfg(test)]

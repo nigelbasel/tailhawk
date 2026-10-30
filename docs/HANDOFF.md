@@ -1,5 +1,42 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-10-30, latest: the process exits when its window closes
+
+The owner: *"I closed the window, and yet the process is still running. this points at a defect
+somewhere ... I have noticed this behaviour a number of time now."* His install (v2026.10.29.15315)
+was still alive a day after its window went: one thread, state Ready, CPU still climbing, no
+window at all. **Read from a full minidump of that process** (`rundll32 comsvcs.dll, MiniDump`;
+the dump's ACL had to be granted to the user before it could be read), with
+`tools/read-dump.py` — a standard-library parser: threads, modules, the Memory64List for the
+stack, and ntdll's export table for the nearest name:
+
+- **Where it was**: `ntdll!RtlAcquireSRWLockExclusive+0x22`. The stack, bottom-up:
+  `RtlUserThreadStart` → `BaseThreadInitThunk` → the Rust runtime and `main` → `kernel32`
+  (`ExitProcess`) → `ntdll` (`LdrShutdownProcess`, the thread-local destructors) → **five frames
+  in `tailhawk.exe`** → `d3d11.dll` → `igd10um64xe.DLL` (the Intel user-mode driver) → the lock.
+- **The cause**: `STATE` is a `thread_local!` holding the whole `Shell`, renderer included, and
+  nothing dropped it before `main` returned. So the Direct3D device was released from a TLS
+  destructor during process shutdown, after `ExitProcess` had terminated every other thread,
+  and the driver's release path waited on a lock whose owner thread was already dead.
+  Intermittent because it is a race with where that worker was when it died. The **spin** (CPU
+  climbing, state Ready) is the SRW acquire's spin phase re-entered by the driver.
+- **The fix**: a guard in `main`, `ShellDropsBeforeExit`, takes the shell out of its thread-local
+  and drops it when `main` leaves by any path — the message loop ending or either `?` after the
+  shell exists — so device, swapchain, scanners and spills are released while the process is
+  whole. Verified with `tools/verify-exit.ps1` (close the window with and without a UI
+  Automation client holding the tree; run it with `-NoUia` too): exits within seconds either
+  way, before and after, since the race itself cannot be forced. The installed binary does not
+  rebuild byte for byte from its commit (size differs), so the five frames are named by position,
+  not by symbol.
+- **Not the cause, checked**: UI Automation. `uiautomationcore.dll` is loaded and the provider is
+  never disconnected (`UiaDisconnectAllProviders` is never called), which is a documented way to
+  hang at exit — but the stack does not pass through it, and a UIA client holding the tree did
+  not reproduce. Worth a disconnect in `WM_CLOSE` one day as cheap insurance; not done here, to
+  keep this to what the dump shows.
+- **Knowingly left**: the `WM_DESTROY`-nested-under-the-guard path the `WM_CLOSE` comment
+  describes is unchanged; the header fix's note about dialogs running inside the handler still
+  stands as the next structural item.
+
 ## ▶ Resume point — 2026-10-29, latest: the column headers keep their ink while a dialog is up
 
 The owner, twice: *"the column headers all go all black until I hover over them"*, and after
