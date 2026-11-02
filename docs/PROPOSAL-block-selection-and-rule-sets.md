@@ -369,8 +369,34 @@ reader's **source roots** and a probe for existence:
    *Map this path…*. That dialog proposes the mapping from the frame and the folder they pick, so
    every later frame from that build resolves too.
 
-The roots and mappings belong to the reader's settings, not a file's, because one checkout serves
-every log from that service. A rule set can carry them later if per-file roots prove necessary.
+### Where it is kept
+
+The owner, 2026-11-02, asked how this would be stored, since *"developers all have differnt
+preferences"*. Then: *"dont worry about team vs individual, it is unlikely that a team will share a
+config"*. So every part of it is personal, and lives in the user's own
+`%APPDATA%\Tailhawk\tailhawk.settings.toml`:
+
+```toml
+[editor]
+command = 'code --goto "{path}:{line}:{column}"'
+
+[[source_root]]
+path = 'C:\dev\tfsgit\Nurtur.Direct.Communications'
+
+[[path_map]]
+from = "/src/"
+to = 'C:\dev\tfsgit\Nurtur.Direct.Communications\'
+```
+
+- **There is no team tier and no join by name.** A mapping says where the code is directly.
+- **Source roots, without any mapping, are the common case.** The tail search finds
+  `Api/Controllers/Foo.cs` under a root without being told what `/src/` meant. *Map this path…*
+  writes a `path_map` only when the tail is ambiguous or absent.
+- **The editor is asked for once.** The first F12 with no `[editor]` lists what is found installed
+  (VS Code on the `PATH`, Visual Studio through `vswhere`, Rider, Notepad++), plus *Default app*
+  and *Other…*, and saves the choice.
+
+Keyed per reader, not per file, because one checkout serves every log from that service.
 
 **Opening it.** This is where the owner offered two answers, and the recommendation is both, in
 this order:
@@ -390,7 +416,7 @@ this order:
   - Visual Studio: `devenv.exe /Edit "{path}"`, which cannot take a line, so it opens at the top
     and the page says so.
 
-  With nothing configured, Enter opens the file with its default application, at the top.
+  With nothing configured, the first Enter asks which editor, as *Where it is kept* says.
 
 ### What a log may not do
 
@@ -424,8 +450,8 @@ wrote. So:
 - **Increment 2, about half a day.** Mappings, the tail search over source roots, and *Map this
   path…*. That is what makes container and build-agent traces from Loki open.
 
-Two answers from the owner change details, not the shape: which editor he uses day to day, which
-sets the default preset; and where the traces he wants this for come from, a local run or Loki.
+Which editor and where the traces come from no longer need asking: the editor is each reader's
+own choice, asked once, and local paths and Loki paths are increments 1 and 2.
 
 ## Order between the three
 
