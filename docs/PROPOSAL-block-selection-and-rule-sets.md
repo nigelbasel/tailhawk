@@ -320,6 +320,113 @@ status line validates. Small; a morning.
 spans an include and an exclude; no rewriting the stored chips into one expression, which would
 lose the per-row enable and the per-row edit the dialog was asked for.
 
+## 6. From a stack frame to its source
+
+The owner, 2026-11-02: *"another featuer that would be useful is to be able to navigate to source
+code from a stack trace is the file info is preset. This could be in a TailHawk popup, or possibly
+nabigating to a text editor."*
+
+### What exists
+
+Nothing that reads a frame. The detail window (`detailwin.rs`) already shows a record with its
+continuation lines under it, which is where a stack trace ends up, and the grid's context menu
+already carries record-scoped commands (*Follow this trace*, Ctrl+T). The corpus has the case:
+the migration log's Node frames name local absolute paths with line and column, such as
+`(C:\dev\…\harness\tsc-merge.js:80:8)`. Those would open today with no configuration at all.
+
+### Three problems, and they are separate
+
+**Finding the frames.** This is a pure function over a record's text, `frames_of(text) ->
+Vec<Frame>`. Each `Frame` carries the span it came from, the path as written, a line, and a column
+when there is one. The shapes worth recognising are few, and each is a fixed pattern:
+
+| Runtime | Shape |
+|---|---|
+| .NET | `at Ns.Type.Method() in C:\src\Foo.cs:line 42` (also `/src/Foo.cs:line 42` from a Linux container) |
+| Node / JS | `at fn (C:\x\a.js:80:8)` and the bare `at C:\x\a.js:80:8` |
+| Python | `File "C:\x\a.py", line 10, in fn` |
+| Rust, Go, gcc, clang | `src/main.rs:12:5` |
+| MSBuild, csc, tsc | `C:\x\Foo.cs(42,7): error CS1002` |
+| Java, Kotlin | `at com.acme.Foo.bar(Foo.java:42)`: a file name and a package, no path |
+
+The table is the test: one row per shape, with the near misses beside each. A timestamp `12:05:33`
+is not a line and column, a URL's `:443` is not a line, and `line 42` without a path is not a frame.
+
+**Resolving the path.** This is the real work. A path in a log says where the code was built, not
+where it is on this machine: `/src/Nurtur.X/Foo.cs` from a container, `D:\a\1\s\…` from a build
+agent, a bare `Foo.java` from Java. Resolution is a second pure function, given the frame, the
+reader's **source roots** and a probe for existence:
+
+1. If the path is absolute and exists, it is used as written. The migration log takes this path.
+2. If a **mapping** applies, the prefix is rewritten. For example, `/src/` becomes
+   `C:\dev\tfsgit\Nurtur.Direct.Communications\` and `D:\a\1\s\` becomes a checkout. Mappings are
+   prefix pairs in settings, tried longest first.
+3. Otherwise the **longest tail that exists** under one of the source roots is used: for
+   `/app/Api/Controllers/Foo.cs`, try `Api/Controllers/Foo.cs` under each root, then
+   `Controllers/Foo.cs`. A tail of the bare file name alone is used only if it is unique under the
+   roots, so a common name never opens a guess. A Java package plus file name is tried as a tail.
+4. Otherwise the frame is shown as **unresolved**, with what was tried, and the reader is offered
+   *Map this path…*. That dialog proposes the mapping from the frame and the folder they pick, so
+   every later frame from that build resolves too.
+
+The roots and mappings belong to the reader's settings, not a file's, because one checkout serves
+every log from that service. A rule set can carry them later if per-file roots prove necessary.
+
+**Opening it.** This is where the owner offered two answers, and the recommendation is both, in
+this order:
+
+- **A *Source* page in the detail window.** It is a list view of the record's frames: function,
+  file, line, and whether each one resolved. Selecting a frame shows the file around that line
+  below the list in a read-only edit control, with the frame's line selected and scrolled to the
+  middle. This needs no editor and no configuration, it appears the moment a record with frames is
+  on the caret, and it is built from controls the window already uses. Standard controls throughout.
+- **Open in editor**, on Enter or double-click in that list, and as *Go to source* on the grid's
+  context menu (first resolved frame), F12: Ctrl+G is already *Go to line*, and F12 is *Go to
+  Definition* in both Visual Studio and VS Code. The editor is a command line in settings with
+  `{path}`, `{line}` and `{column}` in it, and a preset is filled in for what is found installed:
+  - VS Code: `code --goto "{path}:{line}:{column}"`
+  - Rider: `rider64.exe --line {line} "{path}"`
+  - Notepad++: `notepad++.exe -n{line} "{path}"`
+  - Visual Studio: `devenv.exe /Edit "{path}"`, which cannot take a line, so it opens at the top
+    and the page says so.
+
+  With nothing configured, Enter opens the file with its default application, at the top.
+
+### What a log may not do
+
+Log text is untrusted: a Loki tail is production output, and a frame is a string someone else
+wrote. So:
+
+- **Nothing in a frame is ever run.** The editor command comes from settings. The path is
+  substituted as one argument and started with `CreateProcessW`, never through `cmd.exe`, and never
+  with a `ShellExecute` verb on the raw string.
+- **Only a file that exists on a local fixed drive is opened or read.** UNC paths (`\\host\share`),
+  device paths (`\\?\`, `\\.\`) and URLs are refused at resolution. Merely *probing* a UNC path for
+  existence makes Windows authenticate to that host, which leaks the reader's NTLM hash to whoever
+  wrote the log. So they are refused before any probe, not after.
+- **The source page reads a bounded window** around the line, and only text files. A frame
+  pointing at a 2 GB file or a binary shows the frame, not the file.
+
+### Knowingly left out
+
+- **The checkout may not be the build.** A line number from yesterday's release can point at a
+  different line in today's checkout. The page shows the file's own path and modification time, so
+  a mismatch can be seen. Fetching the exact revision (`git show <sha>:<path>` when the log carries
+  a commit) is the natural follow-up, not the first step.
+- **Symbol servers, PDBs and source links** are a debugger's job, not a viewer's.
+
+### Size, and the order inside it
+
+- **Increment 1, about a day.** `frames_of` and the resolver, pure, with the shape table and the
+  near misses as tests. This is a new core module, so the `CLEANROOM.md` row comes first. Then the
+  Source page and *Open in editor* with the presets. That opens the migration log's frames and any
+  local run's .NET frames with no configuration.
+- **Increment 2, about half a day.** Mappings, the tail search over source roots, and *Map this
+  path…*. That is what makes container and build-agent traces from Loki open.
+
+Two answers from the owner change details, not the shape: which editor he uses day to day, which
+sets the default preset; and where the traces he wants this for come from, a local run or Loki.
+
 ## Order between the three
 
 Block selection first: it is a day's shell work on a finished core, it needs no file format, and
