@@ -392,9 +392,15 @@ to = 'C:\dev\tfsgit\Nurtur.Direct.Communications\'
 - **Source roots, without any mapping, are the common case.** The tail search finds
   `Api/Controllers/Foo.cs` under a root without being told what `/src/` meant. *Map this path…*
   writes a `path_map` only when the tail is ambiguous or absent.
-- **The editor is asked for once.** The first F12 with no `[editor]` lists what is found installed
-  (VS Code on the `PATH`, Visual Studio through `vswhere`, Rider, Notepad++), plus *Default app*
-  and *Other…*, and saves the choice.
+- **The editor is chosen, not asked for.** With no `[editor]`, the first installed editor in the
+  order VS Code, Rider, Visual Studio, Notepad++ is used, Notepad last because it is always there,
+  and the status bar names it. *Tools ▸ Options* changes it, beside the theme and the font, and
+  takes any command line as well as the presets. Asking on the first F12 was the first design; it
+  was dropped on 2026-11-02 because the answer is nearly always the editor that is installed, and
+  a modal question in the middle of reading a trace is the wrong moment to be asked anything.
+- **There is no *default application* choice.** It was in the first design. On Windows the
+  default action for `.js`, `.vbs` and `.ps1` files is to *run* them, and a Node frame names a
+  `.js` file, so opening a frame's file with its association would execute code a log pointed at.
 
 Keyed per reader, not per file, because one checkout serves every log from that service.
 
@@ -415,8 +421,9 @@ this order:
   - Notepad++: `notepad++.exe -n{line} "{path}"`
   - Visual Studio: `devenv.exe /Edit "{path}"`, which cannot take a line, so it opens at the top
     and the page says so.
+  - Notepad: `notepad.exe "{path}"`, the same, and always present.
 
-  With nothing configured, the first Enter asks which editor, as *Where it is kept* says.
+  With nothing configured, the best installed editor is used, as *Where it is kept* says.
 
 ### What a log may not do
 
