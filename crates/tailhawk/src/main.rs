@@ -20,6 +20,10 @@ mod controls;
 mod darkmode;
 mod detailwin;
 mod dialog;
+/// Which editor opens a stack frame's file, and its command line. **Nothing calls it yet** — Go
+/// to source is the next slice — so the unused warnings are suppressed here, at the declaration.
+#[allow(dead_code)]
+mod editor;
 mod gridtext;
 mod header;
 mod icon;

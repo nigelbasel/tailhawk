@@ -24,6 +24,7 @@ pub mod filter;
 pub mod fling;
 pub mod follow;
 pub mod format;
+pub mod frames;
 pub mod glob;
 pub mod grid;
 pub mod hgrid;
