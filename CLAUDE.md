@@ -7,6 +7,7 @@ renderer. `SPEC.md` §2.1 scopes v1 to Windows 10 1809+ — **Linux and macOS ar
 
 | File | What it is |
 |---|---|
+| `docs/RELAY.md` | **How the sessions on the owner's machines talk, by commit, and which one holds the baton.** `git pull --rebase` and read it at the start of every turn; only the holder commits code. |
 | `docs/HANDOFF.md` | **The resume point is the top section.** Current state, what is next, what is knowingly left undone. Read it before anything else and keep it current. |
 | `docs/SPEC.md` | The contract. Behaviour is settled here, not in code review. |
 | `CLEANROOM.md` | The provenance record and the rule that governs how components may be written. |

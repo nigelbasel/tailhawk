@@ -1,5 +1,82 @@
 # Handoff — resume here
 
+## ▶ Resume point — 2026-11-09, latest: Go to source, increment 1 core; the work moves machine
+
+**The work is moving to the owner's other machine.** Read `docs/RELAY.md` first: it is how the
+two machines' sessions talk (by commit, `[skip ci]` for messages), and who holds the baton —
+only the holder commits code.
+
+The owner, 2026-11-02: *"navigate to source code from a stack trace if the file info is present.
+This could be in a TailHawk popup, or possibly navigating to a text editor."* Then: *"developers
+all have different preferences. how would you store the information?"* and *"dont worry about
+team vs individual, it is unlikely that a team will share a config"* — so every setting here is
+personal. The design is `docs/PROPOSAL-block-selection-and-rule-sets.md` §6, committed
+(`5418443`, `9780aaf`, `9958143`); CLEANROOM rows for both new files are in (`85cb472`,
+`9958143`).
+
+**Built and committed:**
+
+- **`crates/tailhawk-core/src/frames.rs`** — `frames_of(text)` finds frames: .NET (`at … in
+  path:line N`), Python (`File "…", line N`), Java/Kotlin/Scala (path built from the package,
+  loader and module prefixes skipped), Node (parenthesised and bare), MSBuild-style diagnostics
+  (`path(l,c): error …`, with `1>` and `##[error]` prefixes), and a bare `path:line` that counts
+  only with a directory or a column and a source extension. The most specific shape claims its
+  text first, so a location is one frame. `resolve(frame, exists)` decides on the text, before
+  any probe: UNC, `//`, `\\?\`, `\\.\`, URLs other than `file:///C:/`, reserved device names in
+  any component, ADS colons, quotes and control characters are refused, because probing a UNC
+  path sends the NTLM hash to its host. A path on no drive is `NotFound`, unprobed, until
+  increment 2's source roots. What is probed and returned is the path with `.` and `..` collapsed
+  (`collapsed`), so `C:\src\B.cs\<junk>\..` cannot carry log-written text to an editor.
+- **`crates/tailhawk/src/editor.rs`** — `PRESETS` in the order the best installed one is chosen
+  (VS Code `--goto`, Rider `--line --column`, Visual Studio `/Edit` with no line, Notepad++
+  `-n -c`, Notepad); `preferred(found)`; `command_line(command, path, line, column)` fills
+  `{path}`, `{line}`, `{column}` (missing column is 1), quotes an unquoted `{path}`, appends one
+  when the command has none, and refuses a path with a quote, a WorstFit quote or backslash
+  lookalike (`LOOKALIKES`), a control character or a trailing backslash. **Not wired in yet**, so
+  `mod editor` carries `#[allow(dead_code)]` the way `loopback` and `net` did.
+- Both reviewed by a subagent, every finding taken but the three below; every mutation caught. The hex-digit check in `percent_decoded` was removed as an equivalent
+  mutant: `from_str_radix` accepts `+X`, which can only decode to a control character, refused
+  after decoding.
+
+**Next, in order — the shell half of increment 1** (§6 has the detail):
+
+1. `[editor] command` in `tailhawk-core` `settings.rs`, in `%APPDATA%\Tailhawk\tailhawk.settings.toml`
+   (the exe-adjacent tier still wins per key, §12.4 — accepted, no team config expected).
+2. Editor detection: fixed install paths plus `vswhere` for devenv; `preferred` picks. Launch with
+   `CreateProcessW` and an **explicit `lpApplicationName`** — never `cmd.exe`, never
+   `ShellExecute` on a frame's file (`.js`, `.vbs`, `.ps1` default to *running*).
+3. The detail window's **Source** page: the record's frames listed, a read-only excerpt with the
+   line selected, the file read bounded and as text only.
+4. `Command::GoToSource` on **F12** (and Enter / double-click on the Source page), the Edit menu,
+   the context menu and the keymap.
+5. Tools ▸ Options: an editor combo plus a command field. No question on first F12 — the status
+   bar names the editor used.
+6. A CLEANROOM "— no new file" row before each of these lands in an existing file.
+
+Increment 2, later: `[[source_root]]` and `[[path_map]]`, and *Map this path…* from a frame that
+did not resolve.
+
+**Knowingly left from the reviews:**
+
+- A reader's own command with a backslash-escaped quote before `{path}` (`ed \"{path}`) fools the
+  quote-parity count; a reader's command naming an unquoted exe path with spaces would let
+  `CreateProcessW` try `C:\Program.exe` — the explicit `lpApplicationName` in step 2 closes that.
+- Rider's `--column` base (0 or 1) is unconfirmed until it is run against a real Rider.
+- Localised .NET frames (`:Zeile`, `:ligne`) are not recognised.
+- A `file:///C:/dir/` frame resolves to a directory and is refused by `command_line` (trailing
+  backslash); the Source page should say why rather than do nothing.
+
+**Waiting on the owner, carried from 2026-10-30:** his results on v2026.10.30.15752 (the exit
+fix, `02c49b9`), and which backlog item comes after Go to source — dialogs opened inside the
+wndproc guard (the structural one), a UIA disconnect at `WM_CLOSE`, Ctrl+click to select a
+column, the composer prefilled from a cell. **Loki tailing remains the standing priority**
+(CLAUDE.md); never logcli.
+
+**Traps worth repeating:** `cargo test <bare name> -- --exact` in the shell crate runs zero tests
+and passes; use the full path `editor::tests::<name>`. A core rebuild for one test took ~90 s on
+osprey under load — not a hang. Don't run `cargo fmt` or edit a file while a mutation script
+holds it: the script writes its saved copy back at the end and the edit is lost.
+
 ## ▶ Resume point — 2026-10-30, latest: the process exits when its window closes
 
 The owner: *"I closed the window, and yet the process is still running. this points at a defect
