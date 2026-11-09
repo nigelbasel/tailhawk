@@ -35,6 +35,9 @@ that says so, and by editing the line above in the same commit.
    not a release. A code commit is never `[skip ci]`. **GitHub reads the skip from the newest
    commit of a push**, so a relay commit pushed on top of unpushed code skips CI for the code
    too: push the code first and wait for its CI, or leave `[skip ci]` off that one entry.
+   **And GitHub finds the token anywhere in the message, body included.** A code or docs commit
+   whose message merely *mentions* the token — `dadde95`, describing this protocol — runs no CI
+   at all; write "the skip marker" in prose instead.
 4. **Push at once**, and if the push is rejected, `git pull --rebase` and push again. Entries only
    ever append, so the rebase is clean unless both wrote at the same moment; then keep both.
 5. **Acknowledge** an entry that asks for something, even if only to say when you will get to it.
