@@ -2,9 +2,9 @@
 
 ## ▶ Resume point — 2026-11-09, latest: Go to source, increment 1 core; the work moves machine
 
-**The work is moving to the owner's other machine.** Read `docs/RELAY.md` first: it is how the
-two machines' sessions talk (by commit, `[skip ci]` for messages), and who holds the baton —
-only the holder commits code.
+**The work moved to the owner's other machine on 2026-11-09.** This repository is public, so it
+carries no messages between machines and nothing about the owner's estate: notes that are not the
+project's own travel outside it, in a folder he copies across.
 
 The owner, 2026-11-02: *"navigate to source code from a stack trace if the file info is present.
 This could be in a TailHawk popup, or possibly navigating to a text editor."* Then: *"developers
@@ -74,7 +74,7 @@ column, the composer prefilled from a cell. **Loki tailing remains the standing 
 
 **Traps worth repeating:** `cargo test <bare name> -- --exact` in the shell crate runs zero tests
 and passes; use the full path `editor::tests::<name>`. A core rebuild for one test took ~90 s on
-osprey under load — not a hang. Don't run `cargo fmt` or edit a file while a mutation script
+a loaded machine — not a hang. Don't run `cargo fmt` or edit a file while a mutation script
 holds it: the script writes its saved copy back at the end and the edit is lost.
 
 ## ▶ Resume point — 2026-10-30, latest: the process exits when its window closes
